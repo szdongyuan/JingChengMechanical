@@ -1,0 +1,65 @@
+---
+description: JingChenMechanical 项目约定与结构（全局规则）
+alwaysApply: true
+---
+
+# JingChenMechanical - Cursor Rules
+
+## 项目概述
+本项目是一个本地桌面应用，使用 **PyQt6** 搭建 UI，用于设备选择、声学/信号相关的展示与后续扩展（测试流程、校准、分析等）。
+
+## 技术栈（以仓库现状为准）
+- **Python**: 3.10+（本机可更高版本）
+- **GUI**: PyQt6
+- **音频/信号**: NumPy / Librosa / PyQtGraph（部分功能模块可能按需引入）
+- **数据存储**: SQLite（`data/jingchen.db`）
+
+## 项目结构（以当前目录为准）
+```
+JingChenMechanical/
+├── main.py
+├── app/
+│   ├── main_window.py
+│   ├── services_container.py
+│   └── service/
+│       ├── db_connection_service.py
+│       ├── hardwareselect_service.py
+│       ├── input_calibration_service.py
+│       └── log_manager.py
+├── ui/
+│   ├── modules/
+│   │   ├── control.py
+│   │   ├── hardware.py
+│   │   ├── log.py
+│   │   ├── octave.py
+│   │   ├── result.py
+│   │   ├── spectrum.py
+│   │   ├── spl.py
+│   │   ├── stft.py
+│   │   ├── video.py
+│   │   └── workorder.py
+│   ├── widgets/
+│   │   ├── cards.py
+│   │   └── fake_plots.py
+│   └── popups/
+│       └── analysis_overview.py
+├── consts/
+│   ├── error_code.py
+│   ├── running_consts.py
+│   ├── style.py
+│   └── time_consts.py
+├── model/
+│   ├── base_mode.py
+│   ├── audio_data_table.py
+│   ├── device_table.py
+│   ├── system_info_table.py
+│   ├── training_model_table.py
+│   └── users_table.py
+├── base/
+│   └── sound_device_manager.py
+├── data/
+│   ├── jingchen.db
+│   └── jingchen.sql
+└── log/
+    └── main.log
+```
