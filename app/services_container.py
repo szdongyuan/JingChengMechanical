@@ -27,6 +27,8 @@ class EventBus(QObject):
 
     # 测试结果变化（ResultModule 监听该信号并在槽函数刷新结果摘要）
     result_changed = pyqtSignal(dict)
+    # 刷新通道
+    refresh_channels = pyqtSignal()
 
 
 class TestService(QObject):

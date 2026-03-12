@@ -128,6 +128,20 @@ QTextEdit {
   padding: 8px;
 }
 
+QGroupBox {
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  margin-top: 10px;
+  padding-top: 6px;
+}
+QGroupBox::title {
+  subcontrol-origin: margin;
+  left: 12px;
+  padding: 0 6px;
+  color: #334155;
+  font-weight: 700;
+}
+
 QMessageBox { background: white; }
 """
 combo_qss = (

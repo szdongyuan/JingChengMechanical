@@ -25,6 +25,7 @@ from ui.modules.result import ResultModule
 from ui.modules.video import VideoModule
 from ui.modules.log import LogModule
 from ui.modules.hardware import HardwareModule
+from ui.modules.input_calibration import InputCalibrationModule
 
 
 class MainWindow(QMainWindow):
@@ -204,18 +205,22 @@ class MainWindow(QMainWindow):
         main_lay.setContentsMargins(0, 0, 0, 0)
         main_lay.setSpacing(12)
 
-        main_lay.addWidget(self._build_calibration_placeholder(), 0)
+        cal = InputCalibrationModule(self.services)
+        cal_card = Card("输入校准", cal)
+        # 让右侧校准区域更紧凑（类似参考图）
+        cal_card.setMaximumWidth(560)
+        cal_card.setFixedHeight(420)
+
+        cal_row = QWidget()
+        cal_row_lay = QHBoxLayout(cal_row)
+        cal_row_lay.setContentsMargins(0, 0, 0, 0)
+        cal_row_lay.setSpacing(0)
+        cal_row_lay.addWidget(cal_card, 0)
+        cal_row_lay.addStretch(1)
+
+        main_lay.addWidget(cal_row, 0)
         main_lay.addStretch(1)
         content_lay.addWidget(main, 1)
         return page
 
-    def _build_calibration_placeholder(self) -> QWidget:
-        body = QLabel("输入校准界面（待实现）")
-        body.setObjectName("Muted")
-        body.setStyleSheet(
-            "background: white; border: 1px solid #e5e7eb; border-radius: 10px; padding: 18px;"
-        )
-        card = Card("输入校准", body)
-        card.setFixedHeight(220)
-        return card
 

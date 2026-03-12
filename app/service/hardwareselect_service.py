@@ -136,7 +136,7 @@ class HardwareSelectService:
           "id": 12,
           "name": "UMC ASIO Driver",
           "type": "ASIO",
-          "samplerate": "44100 Hz",
+          "samplerate": "44100",
           "channel_count": 2
         }
         """
@@ -168,7 +168,7 @@ class HardwareSelectService:
             # type：驱动后端名称（MME/WASAPI/ASIO/...）
             "type": self._hostapi_name(hostapis, int(device.get("hostapi", 0) or 0)),
             # samplerate：默认采样率（字符串化，便于直接展示）
-            "samplerate": f"{sr} Hz" if sr else "N/A",
+            "samplerate": f"{sr}" if sr else "N/A",
             # channel_count：输入/输出通道数（由 kind 决定）
             "channel_count": ch,
         }
