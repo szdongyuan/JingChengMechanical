@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+log/
+.claude/
+.superpowers/
+rules/
+docs/
+PROJECT_RESEARCH_REPORT.md
+image.png
