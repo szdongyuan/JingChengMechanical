@@ -119,7 +119,7 @@ class ConfigService:
                     updated_time=now_str(),
                 ).where(TestConfigTable.config_id == config_id).execute()
 
-                if channels:
+                if self.get_channel_count() > 0:
                     ChannelConfigTable.delete().where(
                         ChannelConfigTable.config == config_id
                     ).execute()
@@ -257,6 +257,9 @@ class ConfigService:
     @staticmethod
     def _parse_json(text: str, default):
         try:
-            return json.loads(text) if text else default
+            result = json.loads(text) if text else default
+            if not isinstance(result, type(default)):
+                return default
+            return result
         except (json.JSONDecodeError, TypeError):
             return default
