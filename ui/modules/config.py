@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QWheelEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -8,6 +9,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox,
     QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QLineEdit,
@@ -16,6 +18,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -28,6 +31,35 @@ from ui.widgets.cards import Card
 from ui.widgets.collapsible_group_box import CollapsibleGroupBox
 
 
+class _NoWheelSpinBox(QDoubleSpinBox):
+    """QDoubleSpinBox that ignores mouse wheel events."""
+
+    def wheelEvent(self, event: QWheelEvent):
+        event.ignore()
+
+
+class _FloatDelegate(QStyledItemDelegate):
+    """单元格编辑器限制为浮点数输入。"""
+
+    def createEditor(self, parent, option, index):
+        editor = _NoWheelSpinBox(parent)
+        editor.setRange(-999999.0, 999999.0)
+        editor.setDecimals(2)
+        editor.setFrame(False)
+        editor.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
+        return editor
+
+    def setEditorData(self, editor, index):
+        try:
+            value = float(index.data())
+        except (TypeError, ValueError):
+            value = 0.0
+        editor.setValue(value)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, str(editor.value()))
+
+
 class ConfigModule(QWidget):
     module_id = "config"
 
@@ -35,6 +67,7 @@ class ConfigModule(QWidget):
         super().__init__()
         self.services = services
         self._current_config_id: int | None = None
+        self._skip_reload = False
 
         self._init_ui()
         self._connect_signals()
@@ -43,6 +76,7 @@ class ConfigModule(QWidget):
     # ── UI construction ─────────────────────────────────────
 
     def _init_ui(self):
+        self.setStyleSheet("QWidget { font-size: 14px; }")
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(14)
@@ -110,19 +144,27 @@ class ConfigModule(QWidget):
         self.ed_name = QLineEdit()
         gf_lay.addRow("配置名称", self.ed_name)
 
-        self.spin_record = QDoubleSpinBox()
+        self.spin_record = _NoWheelSpinBox()
         self.spin_record.setRange(0.1, 3600.0)
         self.spin_record.setSingleStep(0.5)
         self.spin_record.setSuffix(" 秒")
         self.spin_record.setValue(5.0)
         gf_lay.addRow("录音时长", self.spin_record)
 
-        self.spin_analysis = QDoubleSpinBox()
+        self.spin_analysis = _NoWheelSpinBox()
         self.spin_analysis.setRange(0.1, 3600.0)
         self.spin_analysis.setSingleStep(0.5)
         self.spin_analysis.setSuffix(" 秒")
         self.spin_analysis.setValue(3.0)
         gf_lay.addRow("分析时长", self.spin_analysis)
+
+        # 分析时长 <= 录音时长 实时约束
+        self.spin_analysis.valueChanged.connect(
+            lambda v: self.spin_record.setValue(max(self.spin_record.value(), v))
+        )
+        self.spin_record.valueChanged.connect(
+            lambda v: self.spin_analysis.setValue(min(self.spin_analysis.value(), v))
+        )
 
         self.chk_scan = QCheckBox("扫码枪直接触发测试")
         gf_lay.addRow("扫码触发", self.chk_scan)
@@ -151,6 +193,16 @@ class ConfigModule(QWidget):
 
         # Channel tabs
         self.tab_channels = QTabWidget()
+        self.tab_channels.setStyleSheet(
+            "QTabBar::tab { padding: 8px 18px; border: 1px solid #e5e7eb; "
+            "border-bottom: none; border-radius: 8px 8px 0 0; "
+            "background: #f1f5f9; color: #64748b; margin-right: 2px; }"
+            "QTabBar::tab:selected { background: white; color: #2563eb; "
+            "font-weight: 700; border-bottom: 2px solid #2563eb; }"
+            "QTabBar::tab:hover:!selected { background: #e0edff; color: #334155; }"
+            "QTabWidget::pane { border: 1px solid #e5e7eb; border-radius: 0 0 8px 8px; "
+            "background: white; }"
+        )
         detail_lay.addWidget(self.tab_channels, 1)
 
         # Save button
@@ -239,10 +291,6 @@ class ConfigModule(QWidget):
         combo_overlap.setCurrentIndex(idx if idx >= 0 else 1)
         sf_lay.addRow("重叠率", combo_overlap)
 
-        lb_window = QLabel("Hann（固定）")
-        lb_window.setObjectName("Muted")
-        sf_lay.addRow("窗函数", lb_window)
-
         stft.add_widget(stft_form)
         lay.addWidget(stft)
 
@@ -263,7 +311,7 @@ class ConfigModule(QWidget):
         combo_spl_w.setCurrentIndex(idx if idx >= 0 else 0)
         sp_lay.addRow("计权模式", combo_spl_w)
 
-        spin_tc = QDoubleSpinBox()
+        spin_tc = _NoWheelSpinBox()
         spin_tc.setObjectName("spl_time_constant")
         spin_tc.setRange(0.001, 10.0)
         spin_tc.setDecimals(3)
@@ -272,19 +320,27 @@ class ConfigModule(QWidget):
         spin_tc.setValue(data.get("spl_time_constant", 0.125) if data else 0.125)
         sp_lay.addRow("时间常数", spin_tc)
 
-        spin_lo = QDoubleSpinBox()
+        spin_lo = _NoWheelSpinBox()
         spin_lo.setObjectName("spl_lower_limit")
         spin_lo.setRange(-200.0, 200.0)
         spin_lo.setSuffix(" dB")
         spin_lo.setValue(data.get("spl_lower_limit", 40.0) if data else 40.0)
         sp_lay.addRow("SPL 下限", spin_lo)
 
-        spin_hi = QDoubleSpinBox()
+        spin_hi = _NoWheelSpinBox()
         spin_hi.setObjectName("spl_upper_limit")
         spin_hi.setRange(-200.0, 200.0)
         spin_hi.setSuffix(" dB")
         spin_hi.setValue(data.get("spl_upper_limit", 85.0) if data else 85.0)
         sp_lay.addRow("SPL 上限", spin_hi)
+
+        # 下限 < 上限 实时约束
+        spin_lo.valueChanged.connect(
+            lambda v: spin_hi.setValue(max(spin_hi.value(), v + 0.1))
+        )
+        spin_hi.valueChanged.connect(
+            lambda v: spin_lo.setValue(min(spin_lo.value(), v - 0.1))
+        )
 
         spl.add_widget(spl_form)
         lay.addWidget(spl)
@@ -347,16 +403,27 @@ class ConfigModule(QWidget):
 
         table = QTableWidget()
         table.setObjectName(object_name)
-        table.setColumnCount(3)
-        table.setHorizontalHeaderLabels(["频率 (Hz)", "下限 (dB)", "上限 (dB)"])
-        table.verticalHeader().setVisible(False)
-        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setRowCount(3)
+        table.setVerticalHeaderLabels(["频率 (Hz)", "下限 (dB)", "上限 (dB)"])
+        table.horizontalHeader().setVisible(False)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectColumns)
         table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        table.setMinimumHeight(120)
+        table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        table.setItemDelegate(_FloatDelegate(table))
+
+        row_h = 42
+        table.verticalHeader().setDefaultSectionSize(row_h)
+        table.setStyleSheet(
+            "QTableView::item { padding: 2px 4px; }"
+        )
 
         for band in bands:
-            self._add_band_row(table, band.get("freq", 1000), band.get("lower", 0), band.get("upper", 100))
+            self._add_band_col(table, band.get("freq", 1000), band.get("lower", 0), band.get("upper", 100))
 
+        # 精确高度 = 3行 + 2px 边框
+        table.setFixedHeight(3 * row_h + 2)
         w_lay.addWidget(table)
 
         btn_row = QWidget()
@@ -370,17 +437,17 @@ class ConfigModule(QWidget):
         br_lay.addWidget(btn_del)
         br_lay.addStretch(1)
 
-        btn_add.clicked.connect(lambda: self._add_band_row(table, 1000, 0, 100))
-        btn_del.clicked.connect(lambda: self._delete_selected_rows(table))
+        btn_add.clicked.connect(lambda: self._add_band_col(table, 1000, 0, 100))
+        btn_del.clicked.connect(lambda: self._delete_selected_cols(table))
 
         w_lay.addWidget(btn_row)
         return wrapper
 
     @staticmethod
-    def _add_band_row(table: QTableWidget, freq: float, lower: float, upper: float):
-        row = table.rowCount()
-        table.insertRow(row)
-        for col, val in enumerate([freq, lower, upper]):
+    def _add_band_col(table: QTableWidget, freq: float, lower: float, upper: float):
+        col = table.columnCount()
+        table.insertColumn(col)
+        for row, val in enumerate([freq, lower, upper]):
             item = QTableWidgetItem(str(val))
             item.setTextAlignment(
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter
@@ -388,10 +455,10 @@ class ConfigModule(QWidget):
             table.setItem(row, col, item)
 
     @staticmethod
-    def _delete_selected_rows(table: QTableWidget):
-        rows = sorted(set(idx.row() for idx in table.selectedIndexes()), reverse=True)
-        for r in rows:
-            table.removeRow(r)
+    def _delete_selected_cols(table: QTableWidget):
+        cols = sorted(set(idx.column() for idx in table.selectedIndexes()), reverse=True)
+        for c in cols:
+            table.removeColumn(c)
 
     # ── Data collection ─────────────────────────────────────
 
@@ -447,13 +514,13 @@ class ConfigModule(QWidget):
         if not table:
             return []
         bands = []
-        for r in range(table.rowCount()):
+        for c in range(table.columnCount()):
             try:
-                freq = float(table.item(r, 0).text()) if table.item(r, 0) else 0
-                lower = float(table.item(r, 1).text()) if table.item(r, 1) else 0
-                upper = float(table.item(r, 2).text()) if table.item(r, 2) else 0
+                freq = float(table.item(0, c).text()) if table.item(0, c) else 0
+                lower = float(table.item(1, c).text()) if table.item(1, c) else 0
+                upper = float(table.item(2, c).text()) if table.item(2, c) else 0
             except ValueError:
-                # Preserve row with sentinel values — validate() will flag freq <= 0
+                # Preserve column with sentinel values — validate() will flag freq <= 0
                 freq, lower, upper = -1, 0, 0
             bands.append({"freq": freq, "lower": lower, "upper": upper})
         return bands
@@ -499,6 +566,8 @@ class ConfigModule(QWidget):
 
     def _on_item_changed(self, current: QListWidgetItem | None, _prev):
         if current is None:
+            return
+        if self._skip_reload:
             return
         config_id = current.data(Qt.ItemDataRole.UserRole)
         self._current_config_id = config_id
@@ -550,10 +619,13 @@ class ConfigModule(QWidget):
         try:
             saved_id = self._current_config_id
             self.services.config_service.save_config(data)
+            self._skip_reload = True
             self._refresh_list()
             self._select_config_by_id(saved_id)
+            self._skip_reload = False
             self.services.bus.status.emit("配置已保存")
         except ValueError as e:
+            self._skip_reload = False
             QMessageBox.warning(self, "保存失败", str(e))
 
     def _on_hardware_changed(self):
