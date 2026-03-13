@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -18,7 +19,6 @@ from PyQt6.QtWidgets import (
 )
 
 from app.service.log_manager import LogManager
-from base import utils
 from base.audio_thd_frequency_response_analysis import AudioThdFrequencyResponseAnalysis
 from consts.style import combo_qss
 
@@ -91,8 +91,8 @@ class InputCalibrationModule(QWidget):
 
         # 声压偏差：最终校准结果（标准声压 - 测得平均 SPL），用于展示与写入 mic_calibration.json
         self.deviation_lineedit = QLineEdit()
-        self.deviation_lineedit.setReadOnly(True)
-        # self.deviation_lineedit.setPlaceholderText("—")
+        self.deviation_lineedit.setPlaceholderText("—")
+        self.deviation_lineedit.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter)
         self.deviation_lineedit.setMinimumHeight(34)
         self.deviation_lineedit.setFixedWidth(90)
 
@@ -161,18 +161,31 @@ class InputCalibrationModule(QWidget):
     def init_fun(self):
         self.cal_button.clicked.connect(self.input_calibration)
         self.reset_button.clicked.connect(self.clicked_reset_button)
-        self.save_button.clicked.connect(self.save_btn_clicked)
-        self.services.bus.refresh_channels.connect(self.init_channel_combobox)  # 或 connect(self._reload_channels)
+        self.save_button.clicked.connect(self.save_mic_deviation_value)
+        self.services.bus.refresh_channels.connect(self.init_channel_combobox)
 
     def init_channel_combobox(self):
         self.combo_channel.clear()
-        saved_devices = self.services.hss_service.load_io_devices()
-        channel_count = int(saved_devices["input"]["channel_count"])
+        device_info = self.services.hss_service.load_io_devices()
+        channel_count = int(device_info["input"]["channel_count"])
         for i in range(1, channel_count + 1):
             self.combo_channel.addItem(f"In{i}", i - 1)
 
-    def save_btn_clicked(self):
-        pass
+    def save_mic_deviation_value(self):
+        selected_channel = self.combo_channel.currentText()
+        deviation_lineedit_text = self.deviation_lineedit.text()
+        if not deviation_lineedit_text:
+            QMessageBox.warning(self, "警告", "请先校准Mic！")
+            return
+
+        flag, data = self.services.input_calibration_service.save_mic_cal_data(
+            selected_channel, deviation_lineedit_text
+        )
+        if not flag:
+            QMessageBox.warning(self, "错误", data)
+            return
+        self.logger.info(f"成功保存 {selected_channel} 的偏差值 {data} Pa/V")
+        QMessageBox.information(self, "成功", f"保存成功！{selected_channel} 的偏差值 {data} Pa/V ！")
 
     def clicked_reset_button(self):
         self.record_state.setText("待录制")
@@ -189,7 +202,7 @@ class InputCalibrationModule(QWidget):
         device_info = self.services.hss_service.load_io_devices()
         samplerate = int(device_info["input"]["samplerate"])
         channels_counts = int(device_info["input"]["channel_count"])
-        seconds = 2
+        seconds = 5
         recorded_dict = {"channels": channels_counts,
                          "sample_rate": samplerate,
                          "num_frames": seconds * samplerate,
@@ -197,25 +210,19 @@ class InputCalibrationModule(QWidget):
                          }
         # 获取下拉框通道数据
         channel_number_text = self.combo_channel.currentText()
-        _, config = utils.get_config_content("mic_calibration.json")
-        channel_index = config[channel_number_text]["binding_index"]
+        mic_cal = (device_info.get("mic_cal") or {})
+        channel_index = int(mic_cal.get(channel_number_text, {}).get("binding_index", 0))
         # 计算平均声压级（SPL）
-        result, self.average_value = AudioThdFrequencyResponseAnalysis.calculate_average_spl(recorded_dict, channel_index)
-        if not result:
+        flag, average_spl = AudioThdFrequencyResponseAnalysis.calculate_average_spl(recorded_dict, channel_index)
+        if not flag:
             self.record_state.setText("待录制")
             self.record_state.setStyleSheet("color: rgb(255, 170, 0);")
-            self.logger.error(self.average_value)
-            QMessageBox.critical(self, "录音错误", f"{self.average_value}")
+            self.logger.error(average_spl)
+            QMessageBox.critical(self, "录音错误", f"{average_spl}")
             return
+        deviation_value = self.calculate_deviation(average_spl)
         # 计算偏差值
-        deviation_value = self.calculate_deviation(self.average_value)
-        self.deviation_lineedit.setText(f"{deviation_value} dBSPL")
-        if str(deviation_value) == "inf":
-            QMessageBox.critical(self, "错误", f"校准失败：偏差值为{deviation_value}")
-            self.logger.error(f"校准失败：偏差值为{deviation_value}")
-        else:
-            QMessageBox.information(self, "成功", "校准成功！请保存数据！")
-            self.logger.info(f"校准成功！")
+        self.deviation_lineedit.setText(f"{deviation_value} Pa/V")
         self.record_state.setText("待录制")
         self.record_state.setStyleSheet("color: rgb(255, 170, 0);")
 
@@ -224,9 +231,9 @@ class InputCalibrationModule(QWidget):
         计算偏差值
         """
         if self.rb_94.isChecked():
-            deviation_value = round(94 - average_value, 1)
+            deviation_value = average_value
         else:
-            deviation_value = round(114 - average_value, 1)
+            deviation_value = average_value * 10
         return deviation_value
 
 

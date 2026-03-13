@@ -51,7 +51,7 @@ class HardwareModule(QWidget):
         bar_lay.setSpacing(8)
 
         self.lb_current = QLabel("当前保存：—")
-        self.lb_current.setObjectName("Muted")
+        self.lb_current.setObjectName("CurrentDevice")
         bar_lay.addWidget(self.lb_current, 1)
 
         self.btn_refresh = QPushButton("刷新设备")
@@ -94,15 +94,15 @@ class HardwareModule(QWidget):
     def _load_saved(self):
         # 从“硬件服务”（DB）读取上次保存的输入/输出设备信息，并显示在顶部“当前保存”标签里
         try:
-            saved_devices = self.services.hss_service.load_io_devices() or {}
+            device_info = self.services.hss_service.load_io_devices()
         except Exception as e:
             # 读取失败时不阻塞页面，其它功能仍可用；给用户一个提示，同时写日志方便排查
             self.lb_current.setText("当前保存：—（数据库未就绪）")
             self.services.bus.log.emit(f"[Hardware] 读取已保存设备失败: {e}")
             return
 
-        in_dev = saved_devices.get("input") or {}
-        out_dev = saved_devices.get("output") or {}
+        in_dev = device_info.get("input")
+        out_dev = device_info.get("output")
         if not (in_dev or out_dev):
             # DB 里没有保存过任何选择
             self.lb_current.setText("当前保存：—")

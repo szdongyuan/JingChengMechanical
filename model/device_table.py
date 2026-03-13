@@ -24,6 +24,7 @@ class DeviceTable(BaseModel):
     output_selected_device_type = TextField(null=True)
     output_selected_device_samplerate = TextField(null=True)
     output_channel_count = TextField(null=True)
+    mic_cal = TextField(null=True)
 
     class Meta:
         table_name = "device_table"

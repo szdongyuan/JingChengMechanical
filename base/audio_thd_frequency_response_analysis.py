@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 from scipy.ndimage import maximum_filter
 
@@ -47,17 +49,30 @@ class AudioThdFrequencyResponseAnalysis(object):
         返回:
         True, 平均SPL值。
         """
-        rec_code, recorded_data = SoundcardAudioProcessor().sd_rec(recorded_dict, channel_index)
-        step = 100
-        if rec_code == True:
-            spl_smooth = AudioThdFrequencyResponseAnalysis().spl_calculation(recorded_data)
-            spl_smooth_mid = len(spl_smooth) // 2
-            spl_smooth_start = spl_smooth_mid - step
-            spl_smooth_end = spl_smooth_mid + step
-            spl_sample = spl_smooth[spl_smooth_start:spl_smooth_end]
-            average_value = np.sum(spl_sample) / (step * 2)
-            return True, average_value
-        else:
-            # recorded_data 这里其实是错误信息字符串
-            err_msg = recorded_data
-            return False, err_msg
+        flag, recorded_data = SoundcardAudioProcessor().sd_rec(recorded_dict, channel_index)
+        if not flag:
+            msg = recorded_data
+            return False, msg
+        # 取recorded_dict中间1秒 数据
+        sr = int(recorded_dict["sample_rate"])
+        x = np.asarray(recorded_data, dtype=np.float64).reshape(-1)
+        mid = x.size // 2
+        half = sr // 2
+        start = max(0, mid - half)
+        end = min(x.size, mid + half)
+        x_mid_1s = x[start:end]
+        rms = AudioThdFrequencyResponseAnalysis.rms_steps(x_mid_1s)
+        average_spl = 1/rms
+        return True, round(average_spl, 1)
+
+    @staticmethod
+    def rms_steps(recorded_data):
+        data = list(recorded_data)
+        N = len(data)
+        if N == 0:
+            return 0.0
+        squares = [x * x for x in data]  # 1) 平方
+        sum_sq = sum(squares)  # 2) 相加
+        mean_sq = sum_sq / N  # 3) 除以长度
+        rms = math.sqrt(mean_sq)  # 4) 开根号
+        return rms

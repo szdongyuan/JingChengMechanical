@@ -29,6 +29,12 @@ QLabel#CardTitle {
   font-size: 13px;
 }
 QLabel#Muted { color: #64748b; }
+QLabel#CurrentDevice {
+  color: #1d4ed8;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 8px;
+}
 
 QLabel#ResultBadge {
   padding: 6px 14px;
