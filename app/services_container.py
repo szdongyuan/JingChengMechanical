@@ -6,6 +6,7 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from app.service.db_connection_service import DbConnectionService
 from app.service.hardwareselect_service import HardwareSelectService
 from app.service.input_calibration_service import InputCalibrationService
+from app.service.config_service import ConfigService
 
 
 class EventBus(QObject):
@@ -29,6 +30,9 @@ class EventBus(QObject):
     result_changed = pyqtSignal(dict)
     # 刷新通道
     refresh_channels = pyqtSignal()
+
+    # 配置变化（供外部模块监听，如工单模块刷新可选配置列表）
+    config_changed = pyqtSignal()
 
 
 class TestService(QObject):
@@ -115,3 +119,6 @@ class ServiceContainer:
 
         # 输入校准服务（后续扩展）
         self.input_calibration_service = InputCalibrationService(self.bus)
+
+        # 配置服务
+        self.config_service = ConfigService(self.bus)
