@@ -31,7 +31,7 @@ class EventBus(QObject):
     # 刷新通道
     refresh_channels = pyqtSignal()
 
-    # 配置变化（ConfigModule 监听该信号刷新配置列表）
+    # 配置变化（供外部模块监听，如工单模块刷新可选配置列表）
     config_changed = pyqtSignal()
 
 

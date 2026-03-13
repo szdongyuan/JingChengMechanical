@@ -558,8 +558,11 @@ class ConfigModule(QWidget):
 
     def _on_hardware_changed(self):
         if self._current_config_id is not None:
-            try:
-                data = self.services.config_service.load_config(self._current_config_id)
-                self._populate_detail(data)
-            except Exception:
-                pass
+            ch_count = self.services.config_service.get_channel_count()
+            if ch_count <= 0:
+                self._build_channel_tabs(0)
+                return
+            # Collect current channel data from UI to preserve unsaved edits
+            current_data = self._collect_data()
+            current_channels = current_data.get("channels", [])
+            self._build_channel_tabs(ch_count, current_channels if current_channels else None)
