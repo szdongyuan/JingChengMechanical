@@ -139,7 +139,7 @@ Collapsible sections are implemented as custom `CollapsibleGroupBox` widgets: a 
 
 **FFT Band Limits Section** — `CollapsibleGroupBox`:
 - `QTableWidget` with columns: 频率(Hz), 下限(dB), 上限(dB)
-- Cells are editable `QDoubleSpinBox` delegates
+- Cells are plain editable `QTableWidgetItem` (matching existing `QTableWidget` pattern in `hardware.py`). Invalid text is caught during data collection and flagged by `ConfigService.validate()`.
 - "添加频带" inserts a new row with defaults: freq=1000, lower=0.0, upper=100.0
 - "删除选中" removes selected rows
 - Frequencies must be positive. Duplicate frequencies are allowed (for flexibility). Rows need not be sorted — display order matches insertion order.
