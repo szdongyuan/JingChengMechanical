@@ -16,8 +16,10 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
@@ -170,6 +172,42 @@ class ConfigModule(QWidget):
         gf_lay.addRow("扫码触发", self.chk_scan)
 
         detail_lay.addWidget(Card("全局参数", global_form))
+
+        # AI binding card (test-level, not per-channel)
+        ai_bind_form = QWidget()
+        ab_lay = QFormLayout(ai_bind_form)
+        ab_lay.setContentsMargins(0, 0, 0, 0)
+        ab_lay.setHorizontalSpacing(10)
+        ab_lay.setVerticalSpacing(8)
+
+        self.chk_ai_enabled = QCheckBox("启用 AI 分析")
+        ab_lay.addRow("启用 AI", self.chk_ai_enabled)
+
+        self.combo_ai_toolchain = QComboBox()
+        self.combo_ai_toolchain.setStyleSheet(combo_qss)
+        ab_lay.addRow("AI 工具链", self.combo_ai_toolchain)
+
+        self.spin_ai_timeout = QSpinBox()
+        self.spin_ai_timeout.setRange(0, 600000)
+        self.spin_ai_timeout.setSingleStep(1000)
+        self.spin_ai_timeout.setSuffix(" ms")
+        self.spin_ai_timeout.setSpecialValueText("使用工具链默认值")
+        self.spin_ai_timeout.setValue(0)
+        ab_lay.addRow("超时(ms)", self.spin_ai_timeout)
+
+        self.spin_ai_window_offset = QSpinBox()
+        self.spin_ai_window_offset.setRange(0, 3600000)
+        self.spin_ai_window_offset.setSingleStep(100)
+        self.spin_ai_window_offset.setSuffix(" ms")
+        self.spin_ai_window_offset.setValue(0)
+        ab_lay.addRow("默认分析窗起始偏移(ms)", self.spin_ai_window_offset)
+
+        self.txt_ai_params = QPlainTextEdit()
+        self.txt_ai_params.setPlaceholderText('{"key": "value"}')
+        self.txt_ai_params.setMaximumHeight(80)
+        ab_lay.addRow("参数(JSON)", self.txt_ai_params)
+
+        detail_lay.addWidget(Card("AI 工具链绑定", ai_bind_form))
 
         # Channel warning
         self.channel_warning = QLabel("请先在硬件页面选择并保存输入设备")
@@ -382,15 +420,6 @@ class ConfigModule(QWidget):
         oct_section.add_widget(oct_form)
         lay.addWidget(oct_section)
 
-        # AI placeholder
-        ai_section = CollapsibleGroupBox("AI 分析")
-        ai_label = QLabel("待配置，后续扩展")
-        ai_label.setObjectName("Muted")
-        ai_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ai_label.setStyleSheet("padding: 16px;")
-        ai_section.add_widget(ai_label)
-        lay.addWidget(ai_section)
-
         lay.addStretch(1)
         scroll.setWidget(container)
         return scroll
@@ -460,6 +489,51 @@ class ConfigModule(QWidget):
         for c in cols:
             table.removeColumn(c)
 
+    def _refresh_ai_toolchains(self, bound_toolchain_id: str | None = None):
+        """Populate the AI toolchain combobox from enabled toolchains.
+
+        If bound_toolchain_id refers to a disabled/missing toolchain, it is
+        still injected into the list (marked as unavailable) so that
+        load→save round-trips do not silently erase persisted bindings.
+        """
+        self.combo_ai_toolchain.clear()
+        self.combo_ai_toolchain.addItem("（未选择）", None)
+        toolchains = self.services.ai_service.list_enabled_toolchains()
+        known_ids = {tc["toolchain_id"] for tc in toolchains}
+        for tc in toolchains:
+            label = f"{tc['display_name']} (v{tc['version']})"
+            self.combo_ai_toolchain.addItem(label, tc["toolchain_id"])
+
+        # If the bound toolchain is not in the enabled list, inject it so
+        # the user sees the current selection instead of silently losing it.
+        if bound_toolchain_id and bound_toolchain_id not in known_ids:
+            tc_row = self.services.ai_service.get_toolchain(bound_toolchain_id)
+            if tc_row:
+                label = f"{tc_row.display_name} (v{tc_row.version}) [不可用]"
+            else:
+                label = f"{bound_toolchain_id} [已删除]"
+            self.combo_ai_toolchain.addItem(label, bound_toolchain_id)
+
+    def _populate_ai_binding(self, config_id: int):
+        """Load AI binding for config_id into the UI card."""
+        binding = self.services.ai_service.resolve_binding(config_id)
+        bound_tc_id = binding["toolchain_id"] if binding else None
+        self._refresh_ai_toolchains(bound_tc_id)
+        if binding is None:
+            self.chk_ai_enabled.setChecked(False)
+            self.combo_ai_toolchain.setCurrentIndex(0)
+            self.spin_ai_timeout.setValue(0)
+            self.spin_ai_window_offset.setValue(0)
+            self.txt_ai_params.setPlainText("{}")
+            return
+
+        self.chk_ai_enabled.setChecked(binding["enabled"])
+        idx = self.combo_ai_toolchain.findData(binding["toolchain_id"])
+        self.combo_ai_toolchain.setCurrentIndex(idx if idx >= 0 else 0)
+        self.spin_ai_timeout.setValue(binding["timeout_ms"] or 0)
+        self.spin_ai_window_offset.setValue(binding["analysis_window_offset_ms"])
+        self.txt_ai_params.setPlainText(binding["params_json"])
+
     # ── Data collection ─────────────────────────────────────
 
     def _collect_data(self) -> dict:
@@ -508,6 +582,18 @@ class ConfigModule(QWidget):
 
         return data
 
+    def _collect_ai_binding(self) -> dict:
+        """Collect AI binding data from the UI card."""
+        tc_id = self.combo_ai_toolchain.currentData()
+        timeout = self.spin_ai_timeout.value()
+        return {
+            "enabled": self.chk_ai_enabled.isChecked(),
+            "toolchain_id": tc_id,
+            "timeout_ms": timeout if timeout > 0 else None,
+            "analysis_window_offset_ms": self.spin_ai_window_offset.value(),
+            "params_json": self.txt_ai_params.toPlainText().strip() or "{}",
+        }
+
     @staticmethod
     def _read_band_table(container: QWidget, table_name: str) -> list[dict]:
         table = container.findChild(QTableWidget, table_name)
@@ -535,6 +621,7 @@ class ConfigModule(QWidget):
 
         ch_count = self.services.config_service.get_channel_count()
         self._build_channel_tabs(ch_count, data.get("channels"))
+        self._populate_ai_binding(data["config_id"])
 
     # ── Interactions ────────────────────────────────────────
 
@@ -617,8 +704,24 @@ class ConfigModule(QWidget):
             QMessageBox.warning(self, "验证失败", "\n".join(errors))
             return
         try:
-            saved_id = self._current_config_id
-            self.services.config_service.save_config(data)
+            # Validate AI window offset before saving anything
+            ai_data = self._collect_ai_binding()
+            offset_ms = ai_data.get("analysis_window_offset_ms", 0)
+            analysis_ms = round(data["analysis_duration"] * 1000)
+            record_ms = round(data["record_duration"] * 1000)
+            if offset_ms + analysis_ms > record_ms:
+                QMessageBox.warning(
+                    self,
+                    "AI 配置错误",
+                    f"分析窗起始偏移({offset_ms}ms) + 分析时长({analysis_ms}ms) "
+                    f"不能超过录音时长({record_ms}ms)",
+                )
+                return
+
+            from model.base_mode import db
+            with db.atomic():
+                saved_id = self.services.config_service.save_config(data)
+                self.services.ai_service.save_binding(saved_id, ai_data)
             self._skip_reload = True
             self._refresh_list()
             self._select_config_by_id(saved_id)
