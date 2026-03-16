@@ -1,0 +1,28 @@
+"""Shared pytest fixtures for all tests."""
+from __future__ import annotations
+
+import pytest
+from peewee import SqliteDatabase
+
+from model.test_config_table import TestConfigTable
+from model.channel_config_table import ChannelConfigTable
+from model.ai_toolchain_table import AiToolchainTable
+
+ALL_TABLES = [
+    TestConfigTable,
+    ChannelConfigTable,
+    AiToolchainTable,
+]
+
+_test_db = SqliteDatabase(":memory:", pragmas={"foreign_keys": 1})
+
+
+@pytest.fixture(autouse=True)
+def setup_test_db():
+    """Bind all models to an in-memory DB, create tables, yield, then drop."""
+    _test_db.bind(ALL_TABLES)
+    _test_db.connect()
+    _test_db.create_tables(ALL_TABLES)
+    yield _test_db
+    _test_db.drop_tables(ALL_TABLES)
+    _test_db.close()
