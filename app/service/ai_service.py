@@ -336,7 +336,8 @@ class AiService:
                     "status": "invalid_output",
                     "error": f"artifact relative_path is invalid or escapes artifacts dir: {rel}",
                 }
-            if os.path.isabs(rel):
+            # Reject absolute paths and Windows drive-relative paths (e.g. "C:file.txt")
+            if os.path.isabs(rel) or os.path.splitdrive(rel)[0]:
                 return {
                     "status": "invalid_output",
                     "error": f"artifact relative_path must not be absolute: {rel}",

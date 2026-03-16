@@ -119,7 +119,14 @@ class TestValidateResponse:
         result = ai_service.validate_response(p, "req_1")
         assert result["status"] == "invalid_output"
 
-    def test_artifacts_not_list_rejected(self, ai_service, tmp_path):
+    def test_artifact_windows_drive_path_rejected(self, ai_service, tmp_path):
+        """Windows drive-relative paths like C:file.txt should be rejected."""
+        p = str(tmp_path / "resp.json")
+        _write_json(p, {"protocol_version": 1, "request_id": "req_1",
+                        "ai_result": {"ai_label": "PASS",
+                                      "artifacts": [{"type": "report", "relative_path": "C:report.json"}]}})
+        result = ai_service.validate_response(p, "req_1")
+        assert result["status"] == "invalid_output"
         p = str(tmp_path / "resp.json")
         _write_json(p, {"protocol_version": 1, "request_id": "req_1",
                         "ai_result": {"ai_label": "PASS", "artifacts": "not_a_list"}})
