@@ -45,7 +45,7 @@ class ResultModule(QWidget):
         lay.addWidget(top)
 
         # 表格：项目 / 结果
-        self.table = QTableWidget(2, 2)
+        self.table = QTableWidget(8, 2)
         self.table.setHorizontalHeaderLabels(["项目", "结果"])
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
@@ -56,13 +56,20 @@ class ResultModule(QWidget):
         self.table.setColumnWidth(0, 120)
         self.table.horizontalHeader().setStretchLastSection(True)
 
-        self._set_row(0, "AI评分", "-")
-        self._set_row(1, "声压级", "-")
+        # Row map: 0=AI标签, 1=AI评分, 2=AI简述, 3=工具链, 4=AI状态, 5=错误信息, 6=详情/产物, 7=声压级
+        self._set_row(0, "AI 标签", "-")
+        self._set_row(1, "AI 评分", "-")
+        self._set_row(2, "AI 简述", "-")
+        self._set_row(3, "工具链", "-")
+        self._set_row(4, "AI 状态", "-")
+        self._set_row(5, "错误信息", "-")
+        self._set_row(6, "详情/产物", "-")
+        self._set_row(7, "声压级", "-")
         self.table.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
         self.table.setFixedHeight(
-            self.table.horizontalHeader().height() + self.table.rowHeight(0) * 2 + 18
+            self.table.horizontalHeader().height() + self.table.rowHeight(0) * 8 + 18
         )
         lay.addWidget(self.table)
 
@@ -117,25 +124,77 @@ class ResultModule(QWidget):
         else:
             self.lb_overall.setText("-")
             self.lb_overall.setProperty("resultLevel", "unknown")
-        # 触发 QSS 重新计算
         self.lb_overall.style().unpolish(self.lb_overall)
         self.lb_overall.style().polish(self.lb_overall)
 
-        ai = r.get("ai_score", "-")
+        # AI fields — consume get_ai_view_model() fields from the payload
+        ai_label = r.get("ai_label", "-") or "-"
+        ai_score = r.get("ai_score", "-")
+        ai_summary = r.get("ai_summary", "-") or "-"
+        ai_status = r.get("display_status") or r.get("ai_status") or "-"
+
         try:
-            ai_text = f"{float(ai):.1f}"
-        except Exception:
-            ai_text = str(ai) if ai not in (None, "") else "-"
+            ai_score_text = f"{float(ai_score):.2f}"
+        except (TypeError, ValueError):
+            ai_score_text = str(ai_score) if ai_score not in (None, "") else "-"
+
+        _AI_STATUS_DISPLAY = {
+            "success": "分析完成",
+            "not_enabled": "AI 未启用",
+            "not_configured": "AI 未配置",
+            "preflight_error": "前置校验失败",
+            "timeout": "超时",
+            "process_error": "执行错误",
+            "protocol_error": "协议错误",
+            "invalid_output": "输出无效",
+            "cancelled": "已取消",
+            "no_result": "-",
+            "window_invalidated": "窗口已变更，结果已失效，请确认后重新分析",
+        }
+        ai_status_text = _AI_STATUS_DISPLAY.get(ai_status, ai_status)
+
+        # Toolchain info
+        tc_name = r.get("toolchain_name", "")
+        tc_version = r.get("toolchain_version", "")
+        if tc_name:
+            tc_text = f"{tc_name} (v{tc_version})" if tc_version else tc_name
+        else:
+            tc_text = "-"
+
+        self._set_row(0, "AI 标签", str(ai_label))
+        self._set_row(1, "AI 评分", ai_score_text)
+        self._set_row(2, "AI 简述", str(ai_summary))
+        self._set_row(3, "工具链", tc_text)
+        self._set_row(4, "AI 状态", ai_status_text)
+
+        error_summary = r.get("error_summary", "-") or "-"
+        self._set_row(5, "错误信息", str(error_summary))
+
+        # Detail/artifact entry — show artifact count or "-"
+        artifacts_json = r.get("artifacts_json")
+        if artifacts_json and ai_status == "success":
+            import json as _json
+            try:
+                arts = _json.loads(artifacts_json) if isinstance(artifacts_json, str) else artifacts_json
+                detail_text = f"{len(arts)} 个产物" if arts else "无产物"
+            except Exception:
+                detail_text = "-"
+        else:
+            detail_text = "-"
+        self._set_row(6, "详情/产物", detail_text)
 
         spl = r.get("spl_db", "-")
         try:
             spl_text = f"{float(spl):.1f} dB"
-        except Exception:
+        except (TypeError, ValueError):
             spl_text = f"{spl} dB" if spl not in (None, "", "-") else "-"
+        self._set_row(7, "声压级", spl_text)
 
-        self._set_row(0, "AI评分", ai_text)
-        self._set_row(1, "声压级", spl_text)
-
-        has_data = overall in ("合格", "不合格") or ai_text != "-" or spl_text != "-"
+        has_data = (
+            overall in ("合格", "不合格")
+            or ai_label != "-"
+            or spl_text != "-"
+            or ai_status not in ("-", "no_result")
+        )
         self._set_empty_visible(not has_data)
 
