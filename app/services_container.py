@@ -7,6 +7,7 @@ from app.service.db_connection_service import DbConnectionService
 from app.service.hardwareselect_service import HardwareSelectService
 from app.service.input_calibration_service import InputCalibrationService
 from app.service.config_service import ConfigService
+from app.service.ai_service import AiService
 
 
 class EventBus(QObject):
@@ -122,3 +123,5 @@ class ServiceContainer:
 
         # 配置服务
         self.config_service = ConfigService(self.bus)
+
+        self.ai_service = AiService()
