@@ -704,8 +704,17 @@ class ConfigModule(QWidget):
             QMessageBox.warning(self, "验证失败", "\n".join(errors))
             return
         try:
-            # Validate AI window offset before saving anything
+            # Validate AI binding before saving anything
             ai_data = self._collect_ai_binding()
+            params_text = ai_data.get("params_json", "{}")
+            try:
+                import json as _json
+                parsed = _json.loads(params_text)
+                if not isinstance(parsed, dict):
+                    raise ValueError("JSON 必须是对象")
+            except (ValueError, _json.JSONDecodeError) as e:
+                QMessageBox.warning(self, "AI 配置错误", f"参数(JSON) 格式无效：{e}")
+                return
             offset_ms = ai_data.get("analysis_window_offset_ms", 0)
             analysis_ms = round(data["analysis_duration"] * 1000)
             record_ms = round(data["record_duration"] * 1000)
