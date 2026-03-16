@@ -27,6 +27,7 @@ from ui.modules.log import LogModule
 from ui.modules.hardware import HardwareModule
 from ui.modules.input_calibration import InputCalibrationModule
 from ui.modules.config import ConfigModule
+from ui.modules.channel_select import ChannelSelectModule
 
 
 class MainWindow(QMainWindow):
@@ -229,7 +230,14 @@ class MainWindow(QMainWindow):
         cal_row_lay.addWidget(cal_card, 0)
         cal_row_lay.addStretch(1)
 
+        channel = ChannelSelectModule(self.services)
+        channel_card = Card("通道选择", channel)
+        channel_card.setMaximumWidth(380)
+        channel_card.setFixedHeight(100)
+
+        main_lay.addWidget(channel_card, 0)
         main_lay.addWidget(cal_row, 0)
+
         main_lay.addStretch(1)
         content_lay.addWidget(main, 1)
         return page

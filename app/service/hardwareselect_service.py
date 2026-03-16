@@ -1,10 +1,13 @@
 from __future__ import annotations
+
+import json
 import os
 
 # 必须在 import sounddevice 之前设置（开启 ASIO 枚举）
 os.environ.setdefault("SD_ENABLE_ASIO", "1")
 import sounddevice as sd
 
+from app.service.log_manager import LogManager
 from model.device_table import DeviceTable
 
 
@@ -14,6 +17,7 @@ class HardwareSelectService:
     - 刷新/枚举 sounddevice 设备与 hostapi（驱动后端）
     - 读取/保存已选输入/输出设备到 DB（device_table.id=1）
     """
+    logger = LogManager.set_log_handler("硬件选择")
 
     # -------- sounddevice：刷新/查询 --------
     @staticmethod
@@ -105,7 +109,21 @@ class HardwareSelectService:
                 "samplerate": row.output_selected_device_samplerate,
                 "channel_count": row.output_channel_count,
             },
+            "mic_cal": json.loads(row.mic_cal),
         }
+
+    @staticmethod
+    def save_mic_cal(mic_cal_dict):
+        """保存通道配置到 DB（device_table.id=1 的 mic_cal）。"""
+        mic_cal_str = json.dumps(mic_cal_dict, ensure_ascii=False, indent=4)
+        updated = (
+            DeviceTable.update(mic_cal=mic_cal_str)
+            .where(DeviceTable.id == 1)
+            .execute()
+        )
+        if updated > 0:
+            HardwareSelectService.logger.info(f"保存通道配置成功: {mic_cal_dict}")
+        return updated > 0
 
     @staticmethod
     def _hostapi_name(hostapis: list[dict], hostapi_index: int) -> str:
@@ -191,7 +209,11 @@ class HardwareSelectService:
 
         in_dev = self._device_to_saved(input_device_id, devices, hostapis, kind="input")
         out_dev = self._device_to_saved(output_device_id, devices, hostapis, kind="output")
-
+        mic_cal_dict = {
+            f"In{i}": {"deviation_value": "0", "binding_index": i - 1, "is_selected": 1}
+            for i in range(1, int(in_dev.get("channel_count") or 1) + 1)
+        }
+        mic_cal_str = json.dumps(mic_cal_dict, ensure_ascii=False, indent=4)
         updated = (
             DeviceTable.update(
                 input_selected_device_id=in_dev.get("id"),
@@ -204,6 +226,7 @@ class HardwareSelectService:
                 output_selected_device_type=out_dev.get("type"),
                 output_selected_device_samplerate=out_dev.get("samplerate"),
                 output_channel_count=out_dev.get("channel_count"),
+                mic_cal=mic_cal_str,
             )
             .where(DeviceTable.id == 1)
             .execute()
