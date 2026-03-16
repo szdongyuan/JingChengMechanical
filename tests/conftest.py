@@ -7,11 +7,13 @@ from peewee import SqliteDatabase
 from model.test_config_table import TestConfigTable
 from model.channel_config_table import ChannelConfigTable
 from model.ai_toolchain_table import AiToolchainTable
+from model.test_config_ai_binding_table import TestConfigAiBindingTable
 
 ALL_TABLES = [
     TestConfigTable,
     ChannelConfigTable,
     AiToolchainTable,
+    TestConfigAiBindingTable,
 ]
 
 _test_db = SqliteDatabase(":memory:", pragmas={"foreign_keys": 1})
