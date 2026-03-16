@@ -131,7 +131,7 @@ class ResultModule(QWidget):
         ai_label = r.get("ai_label", "-") or "-"
         ai_score = r.get("ai_score", "-")
         ai_summary = r.get("ai_summary", "-") or "-"
-        ai_status = r.get("ai_status") or r.get("display_status") or "-"
+        ai_status = r.get("display_status") or r.get("ai_status") or "-"
 
         try:
             ai_score_text = f"{float(ai_score):.2f}"
