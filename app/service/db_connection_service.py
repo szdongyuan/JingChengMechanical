@@ -3,6 +3,9 @@ from __future__ import annotations
 from model.base_mode import db
 from model.test_config_table import TestConfigTable
 from model.channel_config_table import ChannelConfigTable
+from model.ai_toolchain_table import AiToolchainTable
+from model.test_config_ai_binding_table import TestConfigAiBindingTable
+from model.ai_execution_table import AiExecutionTable
 
 
 class DbConnectionService:
@@ -17,7 +20,16 @@ class DbConnectionService:
 
     def connect(self):
         db.connect(reuse_if_open=True)
-        db.create_tables([TestConfigTable, ChannelConfigTable], safe=True)
+        db.create_tables(
+            [
+                TestConfigTable,
+                ChannelConfigTable,
+                AiToolchainTable,
+                TestConfigAiBindingTable,
+                AiExecutionTable,
+            ],
+            safe=True,
+        )
 
     def close(self):
         if not db.is_closed():
