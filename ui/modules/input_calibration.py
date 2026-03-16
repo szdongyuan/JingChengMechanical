@@ -167,7 +167,11 @@ class InputCalibrationModule(QWidget):
     def init_channel_combobox(self):
         self.combo_channel.clear()
         device_info = self.services.hss_service.load_io_devices()
-        channel_count = int(device_info["input"]["channel_count"])
+        input_info = device_info.get("input", {})
+        raw = input_info.get("channel_count")
+        if not raw:
+            return
+        channel_count = int(raw)
         for i in range(1, channel_count + 1):
             self.combo_channel.addItem(f"In{i}", i - 1)
 

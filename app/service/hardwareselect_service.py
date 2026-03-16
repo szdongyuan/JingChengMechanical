@@ -109,7 +109,7 @@ class HardwareSelectService:
                 "samplerate": row.output_selected_device_samplerate,
                 "channel_count": row.output_channel_count,
             },
-            "mic_cal": json.loads(row.mic_cal),
+            "mic_cal": json.loads(row.mic_cal) if row.mic_cal else {},
         }
 
     @staticmethod
