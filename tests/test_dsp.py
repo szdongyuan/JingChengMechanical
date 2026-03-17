@@ -159,6 +159,13 @@ class TestComputeStft:
         peak_freq = freqs[np.argmax(avg_mag)]
         assert abs(peak_freq - 1000.0) < 50
 
+    def test_short_signal_does_not_crash(self):
+        """Signal shorter than nfft should not raise."""
+        sig = np.random.randn(128)
+        times, freqs, mag_db = compute_stft(sig, 44100.0, 1024, 0.5)
+        assert times.ndim == 1
+        assert freqs.ndim == 1
+
 
 class TestComputeFftSpectrum:
     def test_output_shapes(self):
@@ -224,6 +231,11 @@ class TestApplyMicCalibration:
     def test_zero_sensitivity_returns_raw(self):
         sig = np.array([1.0, 2.0])
         result = apply_mic_calibration(sig, sensitivity_pa_per_v=0.0)
+        np.testing.assert_array_equal(result, sig)
+
+    def test_none_sensitivity_returns_raw(self):
+        sig = np.array([1.0, 2.0])
+        result = apply_mic_calibration(sig, sensitivity_pa_per_v=None)
         np.testing.assert_array_equal(result, sig)
 
     def test_unity_sensitivity(self):

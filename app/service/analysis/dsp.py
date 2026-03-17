@@ -149,12 +149,13 @@ def compute_stft(signal: np.ndarray, sample_rate: float, nfft: int,
         magnitudes_db : 2-D array (n_freq, n_times) in dB
     """
     sig = np.asarray(signal, dtype=np.float64)
-    noverlap = int(nfft * overlap)
+    actual_nperseg = min(nfft, len(sig))
+    noverlap = int(actual_nperseg * overlap)
     freqs, times, zxx = scipy_signal.stft(
         sig,
         fs=sample_rate,
         window="hann",
-        nperseg=nfft,
+        nperseg=actual_nperseg,
         noverlap=noverlap,
         return_onesided=True,
     )
@@ -257,14 +258,14 @@ def compute_octave_bands(signal: np.ndarray, sample_rate: float,
 
 
 def apply_mic_calibration(signal: np.ndarray,
-                          sensitivity_pa_per_v: float) -> np.ndarray:
+                          sensitivity_pa_per_v: float | None) -> np.ndarray:
     """Apply microphone calibration sensitivity.
 
     The existing mic_cal stores deviation_value as a string in Pa/V units.
     This multiplies the raw voltage signal by the sensitivity to get pressure.
-    If sensitivity is 0, returns the raw signal unchanged.
+    If sensitivity is None or 0, returns the raw signal unchanged.
     """
     calibrated = np.asarray(signal, dtype=np.float64)
-    if sensitivity_pa_per_v == 0.0:
+    if sensitivity_pa_per_v is None or sensitivity_pa_per_v == 0.0:
         return calibrated
     return calibrated * sensitivity_pa_per_v
