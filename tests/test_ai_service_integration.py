@@ -1,0 +1,359 @@
+"""Integration test for AiService.run_ai_analysis end-to-end."""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import tempfile
+
+import pytest
+
+from model.test_config_table import TestConfigTable
+from model.ai_toolchain_table import AiToolchainTable
+from model.test_config_ai_binding_table import TestConfigAiBindingTable
+from model.ai_execution_table import AiExecutionTable
+from app.service.ai_service import AiService
+
+
+@pytest.fixture
+def ai_service():
+    return AiService()
+
+
+@pytest.fixture
+def fake_audio_file():
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+        f.write(b"\x00" * 100)
+        path = f.name
+    yield path
+    if os.path.exists(path):
+        os.unlink(path)
+
+
+@pytest.fixture
+def fake_toolchain_script(tmp_path):
+    """Python script that acts as a fake AI toolchain."""
+    script = tmp_path / "fake_toolchain.py"
+    script.write_text(
+        '''
+import json, sys
+
+args = {}
+i = 1
+while i < len(sys.argv):
+    if sys.argv[i] == "--request":
+        args["request"] = sys.argv[i+1]; i += 2
+    elif sys.argv[i] == "--response":
+        args["response"] = sys.argv[i+1]; i += 2
+    elif sys.argv[i] == "--artifacts-dir":
+        args["artifacts_dir"] = sys.argv[i+1]; i += 2
+    else:
+        i += 1
+
+with open(args["request"], "r", encoding="utf-8") as f:
+    req = json.load(f)
+
+response = {
+    "protocol_version": 1,
+    "request_id": req["request_id"],
+    "toolchain_name": "Fake Motor AI",
+    "toolchain_version": "0.1.0",
+    "ai_result": {
+        "ai_label": "PASS",
+        "score": 0.95,
+        "summary": "All good",
+        "confidence": 0.9,
+        "artifacts": [],
+        "extra": {"test_key": "test_value"},
+    },
+}
+
+with open(args["response"], "w", encoding="utf-8") as f:
+    json.dump(response, f, ensure_ascii=False, indent=2)
+''',
+        encoding="utf-8",
+    )
+    return str(script)
+
+
+class TestRunAiAnalysis:
+    def test_success_end_to_end(
+        self, ai_service, fake_audio_file, fake_toolchain_script, tmp_path
+    ):
+        cfg = TestConfigTable.create(config_name="E2E Test")
+        tc = AiToolchainTable.create(
+            toolchain_id="fake-tc",
+            display_name="Fake TC",
+            version="0.1.0",
+            entrypoint=f"{sys.executable} {fake_toolchain_script}",
+            default_timeout_ms=10000,
+        )
+        TestConfigAiBindingTable.create(
+            config=cfg, toolchain=tc, enabled=True, params_json="{}"
+        )
+
+        segments = [{
+            "segment_id": "dev_1", "role": "device_1",
+            "audio_path": fake_audio_file, "channels": [1],
+            "duration_ms": 5000, "sample_rate": 48000, "metadata": {},
+        }]
+
+        result = ai_service.run_ai_analysis(
+            config_id=cfg.config_id,
+            test_run_id="run_e2e_001",
+            segments=segments,
+            context={"config_id": cfg.config_id, "config_name": "E2E Test"},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+
+        assert result["module_status"] == "success"
+        assert result["ai_label"] == "PASS"
+        assert result["score"] == 0.95
+        assert result["is_current_effective"] is True
+
+        # Verify persisted
+        record = AiExecutionTable.get_by_id(result["request_id"])
+        assert record.module_status == "success"
+        assert record.is_current_effective is True
+
+    def test_preflight_failure_persisted(self, ai_service, tmp_path):
+        cfg = TestConfigTable.create(config_name="PF Fail")
+        result = ai_service.run_ai_analysis(
+            config_id=cfg.config_id,
+            test_run_id="run_pf_fail",
+            segments=[{"audio_path": "/fake.wav"}],
+            context={},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+        assert result["module_status"] == "not_configured"
+        record = AiExecutionTable.get_by_id(result["request_id"])
+        assert record.module_status == "not_configured"
+
+    def test_replaces_current_effective(
+        self, ai_service, fake_audio_file, fake_toolchain_script, tmp_path
+    ):
+        """Second run on same test_run_id replaces the first as current effective."""
+        cfg = TestConfigTable.create(config_name="Replace Test")
+        tc = AiToolchainTable.create(
+            toolchain_id="replace-tc",
+            display_name="Replace TC",
+            version="1",
+            entrypoint=f"{sys.executable} {fake_toolchain_script}",
+            default_timeout_ms=10000,
+        )
+        TestConfigAiBindingTable.create(
+            config=cfg, toolchain=tc, enabled=True, params_json="{}"
+        )
+
+        segments = [{
+            "segment_id": "d1", "role": "device_1",
+            "audio_path": fake_audio_file, "channels": [1],
+            "duration_ms": 5000, "sample_rate": 48000, "metadata": {},
+        }]
+
+        r1 = ai_service.run_ai_analysis(
+            config_id=cfg.config_id, test_run_id="run_replace",
+            segments=segments, context={},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+        assert r1["is_current_effective"] is True
+
+        r2 = ai_service.run_ai_analysis(
+            config_id=cfg.config_id, test_run_id="run_replace",
+            segments=segments, context={},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+        assert r2["is_current_effective"] is True
+
+        # First should no longer be effective
+        old = AiExecutionTable.get_by_id(r1["request_id"])
+        assert old.is_current_effective is False
+
+        # Exactly one effective per test_run
+        effective_count = (
+            AiExecutionTable.select()
+            .where(
+                AiExecutionTable.test_run_id == "run_replace",
+                AiExecutionTable.is_current_effective == True,
+            )
+            .count()
+        )
+        assert effective_count == 1
+
+    def test_view_model_after_success(
+        self, ai_service, fake_audio_file, fake_toolchain_script, tmp_path
+    ):
+        cfg = TestConfigTable.create(config_name="VM Test")
+        tc = AiToolchainTable.create(
+            toolchain_id="vm-tc",
+            display_name="VM TC", version="1",
+            entrypoint=f"{sys.executable} {fake_toolchain_script}",
+            default_timeout_ms=10000,
+        )
+        TestConfigAiBindingTable.create(
+            config=cfg, toolchain=tc, enabled=True, params_json="{}"
+        )
+
+        segments = [{
+            "segment_id": "d1", "role": "device_1",
+            "audio_path": fake_audio_file, "channels": [1],
+            "duration_ms": 5000, "sample_rate": 48000, "metadata": {},
+        }]
+
+        ai_service.run_ai_analysis(
+            config_id=cfg.config_id, test_run_id="run_vm",
+            segments=segments, context={},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+
+        vm = ai_service.get_ai_view_model("run_vm")
+        assert vm["has_result"] is True
+        assert vm["display_status"] == "success"
+        assert vm["ai_label"] == "PASS"
+        assert vm["ai_score"] == 0.95
+        assert vm["ai_status"] == "success"
+
+    def test_view_model_no_result(self, ai_service):
+        vm = ai_service.get_ai_view_model("nonexistent_run")
+        assert vm["has_result"] is False
+
+    def test_malformed_response_yields_invalid_output(
+        self, ai_service, fake_audio_file, tmp_path
+    ):
+        """Toolchain writes bad JSON response => invalid_output."""
+        bad_script = tmp_path / "bad_toolchain.py"
+        bad_script.write_text(
+            '''
+import sys
+# Parse --response arg
+resp_path = None
+for i, a in enumerate(sys.argv):
+    if a == "--response":
+        resp_path = sys.argv[i+1]
+with open(resp_path, "w") as f:
+    f.write("NOT VALID JSON")
+''',
+            encoding="utf-8",
+        )
+
+        cfg = TestConfigTable.create(config_name="Bad Resp Test")
+        tc = AiToolchainTable.create(
+            toolchain_id="bad-resp-tc",
+            display_name="Bad Resp TC", version="1",
+            entrypoint=f"{sys.executable} {bad_script}",
+            default_timeout_ms=10000,
+        )
+        TestConfigAiBindingTable.create(
+            config=cfg, toolchain=tc, enabled=True, params_json="{}"
+        )
+
+        segments = [{
+            "segment_id": "d1", "role": "device_1",
+            "audio_path": fake_audio_file, "channels": [1],
+            "duration_ms": 5000, "sample_rate": 48000, "metadata": {},
+        }]
+
+        result = ai_service.run_ai_analysis(
+            config_id=cfg.config_id, test_run_id="run_bad_resp",
+            segments=segments, context={},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+        assert result["module_status"] == "invalid_output"
+        assert result["request_json_path"] is not None
+        assert result["artifacts_dir"] is not None
+
+    def test_not_enabled_short_circuit_no_process(self, ai_service, fake_audio_file, tmp_path):
+        """not_enabled should not launch any process."""
+        cfg = TestConfigTable.create(config_name="Disabled Test")
+        tc = AiToolchainTable.create(
+            toolchain_id="dis-tc-int",
+            display_name="Dis TC Int", version="1",
+            entrypoint="this_should_not_run",
+            default_timeout_ms=10000,
+        )
+        TestConfigAiBindingTable.create(
+            config=cfg, toolchain=tc, enabled=False, params_json="{}"
+        )
+
+        result = ai_service.run_ai_analysis(
+            config_id=cfg.config_id, test_run_id="run_disabled",
+            segments=[{"audio_path": fake_audio_file}],
+            context={},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+        assert result["module_status"] == "not_enabled"
+        # No process launched, so no file paths
+        assert result.get("request_json_path") is None
+        assert result.get("artifacts_dir") is None
+
+    def test_success_then_failure_clears_effective(
+        self, ai_service, fake_audio_file, fake_toolchain_script, tmp_path
+    ):
+        """After a successful run, a failed rerun leaves no current_effective record."""
+        cfg = TestConfigTable.create(config_name="Fail After Success")
+        tc = AiToolchainTable.create(
+            toolchain_id="fas-tc",
+            display_name="FAS TC", version="1",
+            entrypoint=f"{sys.executable} {fake_toolchain_script}",
+            default_timeout_ms=10000,
+        )
+        TestConfigAiBindingTable.create(
+            config=cfg, toolchain=tc, enabled=True, params_json="{}"
+        )
+        segments = [{
+            "segment_id": "d1", "role": "device_1",
+            "audio_path": fake_audio_file, "channels": [1],
+            "duration_ms": 5000, "sample_rate": 48000, "metadata": {},
+        }]
+
+        # First run succeeds
+        r1 = ai_service.run_ai_analysis(
+            config_id=cfg.config_id, test_run_id="run_fas",
+            segments=segments, context={},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+        assert r1["module_status"] == "success"
+        assert r1["is_current_effective"] is True
+
+        # Switch to a bad toolchain for the second run
+        bad_script = tmp_path / "bad_tc.py"
+        bad_script.write_text(
+            'import sys\n'
+            'resp = None\n'
+            'for i, a in enumerate(sys.argv):\n'
+            '    if a == "--response": resp = sys.argv[i+1]\n'
+            'with open(resp, "w") as f: f.write("NOT JSON")\n',
+            encoding="utf-8",
+        )
+        tc.entrypoint = f"{sys.executable} {bad_script}"
+        tc.save()
+
+        # Second run fails
+        r2 = ai_service.run_ai_analysis(
+            config_id=cfg.config_id, test_run_id="run_fas",
+            segments=segments, context={},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+        assert r2["module_status"] == "invalid_output"
+        assert r2["is_current_effective"] is False
+
+        # Old success record should also be cleared
+        old = AiExecutionTable.get_by_id(r1["request_id"])
+        assert old.is_current_effective is False
+
+        # No effective record at all
+        effective_count = (
+            AiExecutionTable.select()
+            .where(
+                AiExecutionTable.test_run_id == "run_fas",
+                AiExecutionTable.is_current_effective == True,
+            )
+            .count()
+        )
+        assert effective_count == 0
+
+        # ViewModel falls back to latest failed execution
+        vm = ai_service.get_ai_view_model("run_fas")
+        assert vm["has_result"] is True
+        assert vm["display_status"] == "invalid_output"
+        assert vm["error_summary"] is not None

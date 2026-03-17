@@ -43,7 +43,11 @@ class ChannelSelectModule(QWidget):
 
     def init_channel_select(self):
         device_info = self.services.hss_service.load_io_devices()
-        channel_count = int(device_info.get("input").get("channel_count"))
+        input_info = device_info.get("input", {})
+        raw = input_info.get("channel_count")
+        if not raw:
+            return
+        channel_count = int(raw)
         if channel_count <= 0:
             channel_count = 1
 

@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -16,12 +17,14 @@ from PyQt6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QScrollArea,
+    QSpinBox,
+    QStackedWidget,
     QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -33,6 +36,27 @@ from ui.widgets.collapsible_group_box import CollapsibleGroupBox
 
 class _NoWheelSpinBox(QDoubleSpinBox):
     """QDoubleSpinBox that ignores mouse wheel events."""
+
+    def wheelEvent(self, event: QWheelEvent):
+        event.ignore()
+
+
+class _NoWheelSpinBoxInt(QSpinBox):
+    """QSpinBox that ignores mouse wheel events."""
+
+    def wheelEvent(self, event: QWheelEvent):
+        event.ignore()
+
+
+class _NoWheelComboBox(QComboBox):
+    """QComboBox that ignores mouse wheel events."""
+
+    def wheelEvent(self, event: QWheelEvent):
+        event.ignore()
+
+
+class _NoWheelPlainTextEdit(QPlainTextEdit):
+    """QPlainTextEdit that ignores mouse wheel events."""
 
     def wheelEvent(self, event: QWheelEvent):
         event.ignore()
@@ -134,6 +158,12 @@ class ConfigModule(QWidget):
         detail_lay.setContentsMargins(0, 0, 0, 0)
         detail_lay.setSpacing(10)
 
+        # Scrollable content wrapper
+        scroll_content = QWidget()
+        scroll_lay = QVBoxLayout(scroll_content)
+        scroll_lay.setContentsMargins(0, 0, 0, 0)
+        scroll_lay.setSpacing(10)
+
         # Global params
         global_form = QWidget()
         gf_lay = QFormLayout(global_form)
@@ -166,13 +196,82 @@ class ConfigModule(QWidget):
             lambda v: self.spin_analysis.setValue(min(self.spin_analysis.value(), v))
         )
 
+        self.spin_ai_window_offset = _NoWheelSpinBoxInt()
+        self.spin_ai_window_offset.setRange(0, 3600000)
+        self.spin_ai_window_offset.setSingleStep(100)
+        self.spin_ai_window_offset.setSuffix(" ms")
+        self.spin_ai_window_offset.setValue(0)
+        gf_lay.addRow("默认分析窗起始偏移(ms)", self.spin_ai_window_offset)
+
         self.chk_scan = QCheckBox("扫码枪直接触发测试")
         gf_lay.addRow("扫码触发", self.chk_scan)
 
-        detail_lay.addWidget(Card("全局参数", global_form))
+        scroll_lay.addWidget(Card("全局参数", global_form))
+
+        # Hardware settings card
+        hw_form = QWidget()
+        hw_lay = QFormLayout(hw_form)
+        hw_lay.setContentsMargins(0, 0, 0, 0)
+        hw_lay.setHorizontalSpacing(10)
+        hw_lay.setVerticalSpacing(8)
+
+        self.combo_trigger = _NoWheelComboBox()
+        self.combo_trigger.setStyleSheet(combo_qss)
+        self.combo_trigger.addItem("（未选择）", None)
+        self.combo_trigger.addItem("PLC 设备关联 (待定)", "plc")
+        model = self.combo_trigger.model()
+        plc_item = model.item(1)
+        plc_item.setEnabled(False)
+        hw_lay.addRow("PLC 设备", self.combo_trigger)
+
+        self.combo_input_dev = _NoWheelComboBox()
+        self.combo_input_dev.setStyleSheet(combo_qss)
+        hw_lay.addRow("输入设备", self.combo_input_dev)
+
+        self.combo_output_dev = _NoWheelComboBox()
+        self.combo_output_dev.setStyleSheet(combo_qss)
+        hw_lay.addRow("输出设备", self.combo_output_dev)
+
+        self._channel_check_container = QWidget()
+        self._channel_check_layout = QGridLayout(self._channel_check_container)
+        self._channel_check_layout.setContentsMargins(0, 0, 0, 0)
+        self._channel_check_layout.setSpacing(4)
+        self._channel_checkboxes = []
+        hw_lay.addRow("通道选择", self._channel_check_container)
+
+        scroll_lay.addWidget(Card("硬件设置", hw_form))
+
+        # AI binding card (test-level, not per-channel)
+        ai_bind_form = QWidget()
+        ab_lay = QFormLayout(ai_bind_form)
+        ab_lay.setContentsMargins(0, 0, 0, 0)
+        ab_lay.setHorizontalSpacing(10)
+        ab_lay.setVerticalSpacing(8)
+
+        self.chk_ai_enabled = QCheckBox("启用 AI 分析")
+        ab_lay.addRow("启用 AI", self.chk_ai_enabled)
+
+        self.combo_ai_toolchain = _NoWheelComboBox()
+        self.combo_ai_toolchain.setStyleSheet(combo_qss)
+        ab_lay.addRow("AI 工具链", self.combo_ai_toolchain)
+
+        self.spin_ai_timeout = _NoWheelSpinBoxInt()
+        self.spin_ai_timeout.setRange(0, 600000)
+        self.spin_ai_timeout.setSingleStep(1000)
+        self.spin_ai_timeout.setSuffix(" ms")
+        self.spin_ai_timeout.setSpecialValueText("使用工具链默认值")
+        self.spin_ai_timeout.setValue(0)
+        ab_lay.addRow("超时(ms)", self.spin_ai_timeout)
+
+        self.txt_ai_params = _NoWheelPlainTextEdit()
+        self.txt_ai_params.setPlaceholderText('{"key": "value"}')
+        self.txt_ai_params.setMaximumHeight(80)
+        ab_lay.addRow("参数(JSON)", self.txt_ai_params)
+
+        scroll_lay.addWidget(Card("AI 工具链绑定", ai_bind_form))
 
         # Channel warning
-        self.channel_warning = QLabel("请先在硬件页面选择并保存输入设备")
+        self.channel_warning = QLabel("请先选择输入设备")
         self.channel_warning.setObjectName("Muted")
         self.channel_warning.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.channel_warning.setStyleSheet(
@@ -180,7 +279,7 @@ class ConfigModule(QWidget):
             "border-radius: 8px; padding: 12px;"
         )
         self.channel_warning.setVisible(False)
-        detail_lay.addWidget(self.channel_warning)
+        scroll_lay.addWidget(self.channel_warning)
 
         # Channel count mismatch note
         self.channel_mismatch_note = QLabel(
@@ -189,21 +288,47 @@ class ConfigModule(QWidget):
         self.channel_mismatch_note.setObjectName("Muted")
         self.channel_mismatch_note.setStyleSheet("color: #ca8a04; font-size: 11px;")
         self.channel_mismatch_note.setVisible(False)
-        detail_lay.addWidget(self.channel_mismatch_note)
+        scroll_lay.addWidget(self.channel_mismatch_note)
 
-        # Channel tabs
-        self.tab_channels = QTabWidget()
-        self.tab_channels.setStyleSheet(
-            "QTabBar::tab { padding: 8px 18px; border: 1px solid #e5e7eb; "
+        # Channel tab-like selector + stacked content
+        self.channel_host = QWidget()
+        ch_host_lay = QVBoxLayout(self.channel_host)
+        ch_host_lay.setContentsMargins(0, 0, 0, 0)
+        ch_host_lay.setSpacing(0)
+
+        self.channel_tab_bar = QWidget()
+        self.channel_tab_bar.setStyleSheet(
+            "QPushButton { padding: 8px 18px; border: 1px solid #e5e7eb; "
             "border-bottom: none; border-radius: 8px 8px 0 0; "
             "background: #f1f5f9; color: #64748b; margin-right: 2px; }"
-            "QTabBar::tab:selected { background: white; color: #2563eb; "
+            "QPushButton:checked { background: white; color: #2563eb; "
             "font-weight: 700; border-bottom: 2px solid #2563eb; }"
-            "QTabBar::tab:hover:!selected { background: #e0edff; color: #334155; }"
-            "QTabWidget::pane { border: 1px solid #e5e7eb; border-radius: 0 0 8px 8px; "
+            "QPushButton:hover:!checked { background: #e0edff; color: #334155; }"
+        )
+        self._channel_tab_bar_lay = QHBoxLayout(self.channel_tab_bar)
+        self._channel_tab_bar_lay.setContentsMargins(0, 0, 0, 0)
+        self._channel_tab_bar_lay.setSpacing(0)
+        self._channel_tab_buttons = []
+        ch_host_lay.addWidget(self.channel_tab_bar)
+
+        self.channel_stack = QStackedWidget()
+        self.channel_stack.setStyleSheet(
+            "QStackedWidget { border: 1px solid #e5e7eb; border-radius: 0 0 8px 8px; "
             "background: white; }"
         )
-        detail_lay.addWidget(self.tab_channels, 1)
+        ch_host_lay.addWidget(self.channel_stack)
+
+        self._channel_containers = []
+        scroll_lay.addWidget(self.channel_host)
+
+        scroll_lay.addStretch(1)
+
+        # Scroll area wrapping all content above
+        self.detail_scroll = QScrollArea()
+        self.detail_scroll.setWidgetResizable(True)
+        self.detail_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.detail_scroll.setWidget(scroll_content)
+        detail_lay.addWidget(self.detail_scroll, 1)
 
         # Save button
         save_row = QWidget()
@@ -224,39 +349,125 @@ class ConfigModule(QWidget):
         self.btn_delete.clicked.connect(self._on_delete)
         self.btn_save.clicked.connect(self._on_save)
         self.config_list.currentItemChanged.connect(self._on_item_changed)
+        self.combo_input_dev.currentIndexChanged.connect(self._on_input_device_changed)
         self.services.bus.refresh_channels.connect(self._on_hardware_changed)
+
+    def _populate_devices(self):
+        """Populate input/output device combos from hss_service."""
+        try:
+            devices, hostapis = self.services.hss_service.query_devices_and_hostapis(refresh=False)
+        except Exception:
+            return
+
+        hostapi_names = {}
+        for i, api in enumerate(hostapis):
+            hostapi_names[i] = api.get("name", "N/A")
+
+        self.combo_input_dev.clear()
+        self.combo_input_dev.addItem("（未选择）", None)
+        self.combo_output_dev.clear()
+        self.combo_output_dev.addItem("（未选择）", None)
+
+        for dev in devices:
+            hostapi_idx = dev.get("hostapi", 0)
+            api_name = hostapi_names.get(hostapi_idx, "N/A")
+            label = f"{dev.get('name', '?')} ({api_name})"
+            dev_info = {
+                "name": dev.get("name", ""),
+                "hostapi": api_name,
+                "default_samplerate": dev.get("default_samplerate"),
+                "max_input_channels": dev.get("max_input_channels", 0),
+                "max_output_channels": dev.get("max_output_channels", 0),
+            }
+            if dev.get("max_input_channels", 0) > 0:
+                self.combo_input_dev.addItem(label, dev_info)
+            if dev.get("max_output_channels", 0) > 0:
+                self.combo_output_dev.addItem(label, dev_info)
+
+    def _on_input_device_changed(self, index):
+        """Rebuild channel checkboxes and tabs when input device changes."""
+        for cb in self._channel_checkboxes:
+            cb.deleteLater()
+        self._channel_checkboxes = []
+
+        while self._channel_check_layout.count():
+            self._channel_check_layout.takeAt(0)
+
+        dev_info = self.combo_input_dev.currentData()
+        if not dev_info or not isinstance(dev_info, dict):
+            self._build_channel_tabs([], None)
+            return
+
+        max_ch = dev_info.get("max_input_channels", 0)
+        for i in range(max_ch):
+            cb = QCheckBox(f"In{i + 1}")
+            cb.toggled.connect(self._on_channel_selection_changed)
+            row, col = divmod(i, 6)
+            self._channel_check_layout.addWidget(cb, row, col)
+            self._channel_checkboxes.append(cb)
+
+        # Rebuild tabs for ALL channels, not just checked ones
+        all_indices = list(range(max_ch))
+        self._build_channel_tabs(all_indices, None)
+
+    def _on_channel_selection_changed(self):
+        """Channel checkbox toggled — tabs are built by _on_input_device_changed."""
+        pass
 
     # ── Channel tab building ────────────────────────────────
 
-    def _build_channel_tabs(self, ch_count: int, channel_data: list[dict] | None = None):
-        self.tab_channels.clear()
-        if ch_count <= 0:
+    def _build_channel_tabs(self, channel_indices: list[int], channel_data: list[dict] | None = None):
+        # Clear previous tab buttons and stretch
+        while self._channel_tab_bar_lay.count():
+            item = self._channel_tab_bar_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._channel_tab_buttons = []
+        # Clear stack
+        while self.channel_stack.count():
+            w = self.channel_stack.widget(0)
+            self.channel_stack.removeWidget(w)
+            w.deleteLater()
+        self._channel_containers = []
+
+        if not channel_indices:
             self.channel_warning.setVisible(True)
-            self.tab_channels.setVisible(False)
+            self.channel_host.setVisible(False)
             return
 
         self.channel_warning.setVisible(False)
-        self.tab_channels.setVisible(True)
+        self.channel_host.setVisible(True)
 
-        saved_count = len(channel_data) if channel_data else 0
-        self.channel_mismatch_note.setVisible(
-            saved_count > 0 and saved_count > ch_count
-        )
+        ch_data_map = {}
+        if channel_data:
+            for ch in channel_data:
+                ch_data_map[ch["channel_index"]] = ch
 
-        for i in range(ch_count):
-            ch = (
-                channel_data[i]
-                if channel_data and i < len(channel_data)
-                else None
-            )
-            tab = self._build_channel_tab(i, ch)
-            self.tab_channels.addTab(tab, f"通道 {i + 1}")
+        self.channel_mismatch_note.setVisible(False)
+
+        for page_idx, ch_idx in enumerate(channel_indices):
+            ch = ch_data_map.get(ch_idx)
+            btn = QPushButton(f"In{ch_idx + 1} (通道 {ch_idx + 1})")
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda _checked, idx=page_idx: self._on_channel_tab_clicked(idx))
+            self._channel_tab_bar_lay.addWidget(btn)
+            self._channel_tab_buttons.append(btn)
+
+            container = self._build_channel_tab(ch_idx, ch)
+            self.channel_stack.addWidget(container)
+            self._channel_containers.append(container)
+
+        self._channel_tab_bar_lay.addStretch(1)
+        if self._channel_tab_buttons:
+            self._channel_tab_buttons[0].setChecked(True)
+            self.channel_stack.setCurrentIndex(0)
+
+    def _on_channel_tab_clicked(self, idx: int):
+        for i, btn in enumerate(self._channel_tab_buttons):
+            btn.setChecked(i == idx)
+        self.channel_stack.setCurrentIndex(idx)
 
     def _build_channel_tab(self, ch_index: int, data: dict | None) -> QWidget:
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-
         container = QWidget()
         container.setProperty("channel_index", ch_index)
         lay = QVBoxLayout(container)
@@ -271,7 +482,7 @@ class ConfigModule(QWidget):
         sf_lay.setHorizontalSpacing(10)
         sf_lay.setVerticalSpacing(6)
 
-        combo_nfft = QComboBox()
+        combo_nfft = _NoWheelComboBox()
         combo_nfft.setStyleSheet(combo_qss)
         for v in [256, 512, 1024, 2048, 4096, 8192]:
             combo_nfft.addItem(str(v), v)
@@ -281,7 +492,7 @@ class ConfigModule(QWidget):
         combo_nfft.setCurrentIndex(idx if idx >= 0 else 2)
         sf_lay.addRow("FFT 点数", combo_nfft)
 
-        combo_overlap = QComboBox()
+        combo_overlap = _NoWheelComboBox()
         combo_overlap.setStyleSheet(combo_qss)
         for v in [0.25, 0.5, 0.75]:
             combo_overlap.addItem(str(v), v)
@@ -302,7 +513,7 @@ class ConfigModule(QWidget):
         sp_lay.setHorizontalSpacing(10)
         sp_lay.setVerticalSpacing(6)
 
-        combo_spl_w = QComboBox()
+        combo_spl_w = _NoWheelComboBox()
         combo_spl_w.setStyleSheet(combo_qss)
         combo_spl_w.addItems(["A", "C", "Z"])
         combo_spl_w.setObjectName("spl_weighting")
@@ -364,7 +575,7 @@ class ConfigModule(QWidget):
         oct_w_row = QWidget()
         ow_lay = QFormLayout(oct_w_row)
         ow_lay.setContentsMargins(0, 0, 0, 0)
-        combo_oct_w = QComboBox()
+        combo_oct_w = _NoWheelComboBox()
         combo_oct_w.setStyleSheet(combo_qss)
         combo_oct_w.addItems(["A", "C", "Z"])
         combo_oct_w.setObjectName("oct_weighting")
@@ -382,18 +593,7 @@ class ConfigModule(QWidget):
         oct_section.add_widget(oct_form)
         lay.addWidget(oct_section)
 
-        # AI placeholder
-        ai_section = CollapsibleGroupBox("AI 分析")
-        ai_label = QLabel("待配置，后续扩展")
-        ai_label.setObjectName("Muted")
-        ai_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        ai_label.setStyleSheet("padding: 16px;")
-        ai_section.add_widget(ai_label)
-        lay.addWidget(ai_section)
-
-        lay.addStretch(1)
-        scroll.setWidget(container)
-        return scroll
+        return container
 
     def _build_band_table(self, object_name: str, bands: list[dict]) -> QWidget:
         wrapper = QWidget()
@@ -460,21 +660,163 @@ class ConfigModule(QWidget):
         for c in cols:
             table.removeColumn(c)
 
+    def _refresh_ai_toolchains(self, bound_toolchain_id: str | None = None):
+        """Populate the AI toolchain combobox from enabled toolchains.
+
+        If bound_toolchain_id refers to a disabled/missing toolchain, it is
+        still injected into the list (marked as unavailable) so that
+        load→save round-trips do not silently erase persisted bindings.
+        """
+        self.combo_ai_toolchain.clear()
+        self.combo_ai_toolchain.addItem("（未选择）", None)
+        toolchains = self.services.ai_service.list_enabled_toolchains()
+        known_ids = {tc["toolchain_id"] for tc in toolchains}
+        for tc in toolchains:
+            label = f"{tc['display_name']} (v{tc['version']})"
+            self.combo_ai_toolchain.addItem(label, tc["toolchain_id"])
+
+        # If the bound toolchain is not in the enabled list, inject it so
+        # the user sees the current selection instead of silently losing it.
+        if bound_toolchain_id and bound_toolchain_id not in known_ids:
+            tc_row = self.services.ai_service.get_toolchain(bound_toolchain_id)
+            if tc_row:
+                label = f"{tc_row.display_name} (v{tc_row.version}) [不可用]"
+            else:
+                label = f"{bound_toolchain_id} [已删除]"
+            self.combo_ai_toolchain.addItem(label, bound_toolchain_id)
+
+    def _populate_ai_binding(self, config_id: int):
+        """Load AI binding for config_id into the UI card."""
+        binding = self.services.ai_service.resolve_binding(config_id)
+        bound_tc_id = binding["toolchain_id"] if binding else None
+        self._refresh_ai_toolchains(bound_tc_id)
+        if binding is None:
+            self.chk_ai_enabled.setChecked(False)
+            self.combo_ai_toolchain.setCurrentIndex(0)
+            self.spin_ai_timeout.setValue(0)
+            self.spin_ai_window_offset.setValue(0)
+            self.txt_ai_params.setPlainText("{}")
+            return
+
+        self.chk_ai_enabled.setChecked(binding["enabled"])
+        idx = self.combo_ai_toolchain.findData(binding["toolchain_id"])
+        self.combo_ai_toolchain.setCurrentIndex(idx if idx >= 0 else 0)
+        self.spin_ai_timeout.setValue(binding["timeout_ms"] or 0)
+        self.spin_ai_window_offset.setValue(binding["analysis_window_offset_ms"])
+        self.txt_ai_params.setPlainText(binding["params_json"])
+
+    def _populate_hardware_card(self, data: dict):
+        """Load saved device/trigger/channel selections into hardware card widgets."""
+        # Block input device signal to prevent _on_input_device_changed during population
+        self.combo_input_dev.blockSignals(True)
+
+        self._populate_devices()
+
+        trigger = data.get("trigger_type")
+        idx = self.combo_trigger.findData(trigger)
+        if idx >= 0:
+            self.combo_trigger.setCurrentIndex(idx)
+        else:
+            self.combo_trigger.setCurrentIndex(0)
+
+        saved_input = data.get("input_device_name")
+        saved_input_api = data.get("input_device_hostapi")
+        saved_input_sr = data.get("input_device_samplerate")
+        self._match_device_combo(
+            self.combo_input_dev, saved_input, saved_input_api, saved_input_sr
+        )
+
+        saved_output = data.get("output_device_name")
+        saved_output_api = data.get("output_device_hostapi")
+        saved_output_sr = data.get("output_device_samplerate")
+        self._match_device_combo(
+            self.combo_output_dev, saved_output, saved_output_api, saved_output_sr
+        )
+
+        self._rebuild_channel_checkboxes_silent()
+
+        self.combo_input_dev.blockSignals(False)
+
+        selected = data.get("selected_channels", [])
+        for i, cb in enumerate(self._channel_checkboxes):
+            cb.blockSignals(True)
+            cb.setChecked(i in selected)
+            cb.blockSignals(False)
+
+    def _match_device_combo(self, combo, name, hostapi, samplerate):
+        """Match saved device against combo items. Inject unavailable device if not found."""
+        if not name:
+            combo.setCurrentIndex(0)
+            return
+
+        for i in range(1, combo.count()):
+            dev = combo.itemData(i)
+            if dev and isinstance(dev, dict):
+                if dev.get("name") == name and dev.get("hostapi") == hostapi:
+                    combo.setCurrentIndex(i)
+                    return
+
+        label = f"{name} ({hostapi}) (设备不可用)"
+        dev_info = {
+            "name": name,
+            "hostapi": hostapi,
+            "default_samplerate": samplerate,
+            "max_input_channels": 0,
+            "max_output_channels": 0,
+        }
+        combo.addItem(label, dev_info)
+        combo.setCurrentIndex(combo.count() - 1)
+
+    def _rebuild_channel_checkboxes_silent(self):
+        """Rebuild channel checkboxes without triggering _on_channel_selection_changed."""
+        for cb in self._channel_checkboxes:
+            cb.deleteLater()
+        self._channel_checkboxes = []
+        while self._channel_check_layout.count():
+            self._channel_check_layout.takeAt(0)
+
+        dev_info = self.combo_input_dev.currentData()
+        if not dev_info or not isinstance(dev_info, dict):
+            return
+
+        max_ch = dev_info.get("max_input_channels", 0)
+        for i in range(max_ch):
+            cb = QCheckBox(f"In{i + 1}")
+            cb.toggled.connect(self._on_channel_selection_changed)
+            row, col = divmod(i, 6)
+            self._channel_check_layout.addWidget(cb, row, col)
+            self._channel_checkboxes.append(cb)
+
     # ── Data collection ─────────────────────────────────────
 
     def _collect_data(self) -> dict:
+        trigger_data = self.combo_trigger.currentData()
+
+        input_dev = self.combo_input_dev.currentData()
+        output_dev = self.combo_output_dev.currentData()
+
+        selected_channels = [
+            i for i, cb in enumerate(self._channel_checkboxes) if cb.isChecked()
+        ]
+
         data = {
             "config_id": self._current_config_id,
             "config_name": self.ed_name.text(),
             "record_duration": self.spin_record.value(),
             "analysis_duration": self.spin_analysis.value(),
             "scan_triggers_test": self.chk_scan.isChecked(),
+            "trigger_type": trigger_data if trigger_data else None,
+            "input_device_name": input_dev.get("name") if isinstance(input_dev, dict) else None,
+            "input_device_hostapi": input_dev.get("hostapi") if isinstance(input_dev, dict) else None,
+            "input_device_samplerate": input_dev.get("default_samplerate") if isinstance(input_dev, dict) else None,
+            "output_device_name": output_dev.get("name") if isinstance(output_dev, dict) else None,
+            "output_device_hostapi": output_dev.get("hostapi") if isinstance(output_dev, dict) else None,
+            "output_device_samplerate": output_dev.get("default_samplerate") if isinstance(output_dev, dict) else None,
+            "selected_channels": selected_channels,
             "channels": [],
         }
 
-        for tab_idx in range(self.tab_channels.count()):
-            scroll = self.tab_channels.widget(tab_idx)
-            container = scroll.widget()
+        for container in self._channel_containers:
             ch_index = container.property("channel_index")
 
             ch = {"channel_index": ch_index}
@@ -508,6 +850,18 @@ class ConfigModule(QWidget):
 
         return data
 
+    def _collect_ai_binding(self) -> dict:
+        """Collect AI binding data from the UI card."""
+        tc_id = self.combo_ai_toolchain.currentData()
+        timeout = self.spin_ai_timeout.value()
+        return {
+            "enabled": self.chk_ai_enabled.isChecked(),
+            "toolchain_id": tc_id,
+            "timeout_ms": timeout if timeout > 0 else None,
+            "analysis_window_offset_ms": self.spin_ai_window_offset.value(),
+            "params_json": self.txt_ai_params.toPlainText().strip() or "{}",
+        }
+
     @staticmethod
     def _read_band_table(container: QWidget, table_name: str) -> list[dict]:
         table = container.findChild(QTableWidget, table_name)
@@ -533,8 +887,20 @@ class ConfigModule(QWidget):
         self.spin_analysis.setValue(data["analysis_duration"])
         self.chk_scan.setChecked(data["scan_triggers_test"])
 
-        ch_count = self.services.config_service.get_channel_count()
-        self._build_channel_tabs(ch_count, data.get("channels"))
+        self._populate_hardware_card(data)
+
+        # Build tabs for ALL channels of the device, not just selected ones
+        dev_info = self.combo_input_dev.currentData()
+        if dev_info and isinstance(dev_info, dict):
+            max_ch = dev_info.get("max_input_channels", 0)
+            all_indices = list(range(max_ch))
+        else:
+            all_indices = []
+        # For legacy configs with no device, use channel data indices
+        if not all_indices and data.get("channels"):
+            all_indices = [ch["channel_index"] for ch in data["channels"]]
+        self._build_channel_tabs(all_indices, data.get("channels"))
+        self._populate_ai_binding(data["config_id"])
 
     # ── Interactions ────────────────────────────────────────
 
@@ -617,8 +983,33 @@ class ConfigModule(QWidget):
             QMessageBox.warning(self, "验证失败", "\n".join(errors))
             return
         try:
-            saved_id = self._current_config_id
-            self.services.config_service.save_config(data)
+            # Validate AI binding before saving anything
+            ai_data = self._collect_ai_binding()
+            params_text = ai_data.get("params_json", "{}")
+            try:
+                import json as _json
+                parsed = _json.loads(params_text)
+                if not isinstance(parsed, dict):
+                    raise ValueError("JSON 必须是对象")
+            except (ValueError, _json.JSONDecodeError) as e:
+                QMessageBox.warning(self, "AI 配置错误", f"参数(JSON) 格式无效：{e}")
+                return
+            offset_ms = ai_data.get("analysis_window_offset_ms", 0)
+            analysis_ms = round(data["analysis_duration"] * 1000)
+            record_ms = round(data["record_duration"] * 1000)
+            if offset_ms + analysis_ms > record_ms:
+                QMessageBox.warning(
+                    self,
+                    "AI 配置错误",
+                    f"分析窗起始偏移({offset_ms}ms) + 分析时长({analysis_ms}ms) "
+                    f"不能超过录音时长({record_ms}ms)",
+                )
+                return
+
+            from model.base_mode import db
+            with db.atomic():
+                saved_id = self.services.config_service.save_config(data)
+                self.services.ai_service.save_binding(saved_id, ai_data)
             self._skip_reload = True
             self._refresh_list()
             self._select_config_by_id(saved_id)
@@ -629,12 +1020,35 @@ class ConfigModule(QWidget):
             QMessageBox.warning(self, "保存失败", str(e))
 
     def _on_hardware_changed(self):
-        if self._current_config_id is not None:
-            ch_count = self.services.config_service.get_channel_count()
-            if ch_count <= 0:
-                self._build_channel_tabs(0)
-                return
-            # Collect current channel data from UI to preserve unsaved edits
-            current_data = self._collect_data()
-            current_channels = current_data.get("channels", [])
-            self._build_channel_tabs(ch_count, current_channels if current_channels else None)
+        """Global hardware changed — refresh device combos, preserve current selection."""
+        if self._current_config_id is None:
+            return
+
+        # Save current selections before repopulating
+        cur_input = self.combo_input_dev.currentData()
+        cur_output = self.combo_output_dev.currentData()
+
+        # Block signals to prevent _on_input_device_changed from firing
+        self.combo_input_dev.blockSignals(True)
+        self.combo_output_dev.blockSignals(True)
+
+        self._populate_devices()
+
+        # Restore previous selections
+        if cur_input and isinstance(cur_input, dict):
+            self._match_device_combo(
+                self.combo_input_dev,
+                cur_input.get("name"),
+                cur_input.get("hostapi"),
+                cur_input.get("default_samplerate"),
+            )
+        if cur_output and isinstance(cur_output, dict):
+            self._match_device_combo(
+                self.combo_output_dev,
+                cur_output.get("name"),
+                cur_output.get("hostapi"),
+                cur_output.get("default_samplerate"),
+            )
+
+        self.combo_input_dev.blockSignals(False)
+        self.combo_output_dev.blockSignals(False)

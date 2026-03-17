@@ -51,6 +51,14 @@ class ConfigService:
             "record_duration": cfg.record_duration,
             "analysis_duration": cfg.analysis_duration,
             "scan_triggers_test": bool(cfg.scan_triggers_test),
+            "trigger_type": cfg.trigger_type,
+            "input_device_name": cfg.input_device_name,
+            "input_device_hostapi": cfg.input_device_hostapi,
+            "input_device_samplerate": cfg.input_device_samplerate,
+            "output_device_name": cfg.output_device_name,
+            "output_device_hostapi": cfg.output_device_hostapi,
+            "output_device_samplerate": cfg.output_device_samplerate,
+            "selected_channels": self._parse_json(cfg.selected_channels, []),
             "channels": [],
         }
         ch_rows = (
@@ -74,6 +82,11 @@ class ConfigService:
                     "ai_config": self._parse_json(ch.ai_config, {}),
                 }
             )
+        # Legacy fallback: infer selected_channels from existing channel rows
+        if not result["selected_channels"] and result["channels"]:
+            result["selected_channels"] = [
+                ch["channel_index"] for ch in result["channels"]
+            ]
         return result
 
     def create_config(self, config_name: str) -> int:
@@ -89,11 +102,6 @@ class ConfigService:
                     created_time=now_str(),
                     updated_time=now_str(),
                 )
-                ch_count = self.get_channel_count()
-                for i in range(ch_count):
-                    ChannelConfigTable.create(
-                        config=cfg, channel_index=i, **_CHANNEL_DEFAULTS
-                    )
         except IntegrityError:
             raise ValueError(f"配置名称「{name}」已存在")
         self.bus.config_changed.emit()
@@ -116,28 +124,35 @@ class ConfigService:
                     record_duration=data["record_duration"],
                     analysis_duration=data["analysis_duration"],
                     scan_triggers_test=data["scan_triggers_test"],
+                    trigger_type=data.get("trigger_type"),
+                    input_device_name=data.get("input_device_name"),
+                    input_device_hostapi=data.get("input_device_hostapi"),
+                    input_device_samplerate=data.get("input_device_samplerate"),
+                    output_device_name=data.get("output_device_name"),
+                    output_device_hostapi=data.get("output_device_hostapi"),
+                    output_device_samplerate=data.get("output_device_samplerate"),
+                    selected_channels=json.dumps(data.get("selected_channels", [])),
                     updated_time=now_str(),
                 ).where(TestConfigTable.config_id == config_id).execute()
 
-                if self.get_channel_count() > 0:
-                    ChannelConfigTable.delete().where(
-                        ChannelConfigTable.config == config_id
-                    ).execute()
-                    for ch in channels:
-                        ChannelConfigTable.create(
-                            config=config_id,
-                            channel_index=ch["channel_index"],
-                            stft_nfft=ch["stft_nfft"],
-                            stft_overlap=ch["stft_overlap"],
-                            spl_weighting=ch["spl_weighting"],
-                            spl_time_constant=ch["spl_time_constant"],
-                            spl_upper_limit=ch["spl_upper_limit"],
-                            spl_lower_limit=ch["spl_lower_limit"],
-                            fft_band_limits=json.dumps(ch["fft_band_limits"]),
-                            oct_weighting=ch["oct_weighting"],
-                            oct_band_limits=json.dumps(ch["oct_band_limits"]),
-                            ai_config=json.dumps(ch.get("ai_config", {})),
-                        )
+                ChannelConfigTable.delete().where(
+                    ChannelConfigTable.config == config_id
+                ).execute()
+                for ch in channels:
+                    ChannelConfigTable.create(
+                        config=config_id,
+                        channel_index=ch["channel_index"],
+                        stft_nfft=ch["stft_nfft"],
+                        stft_overlap=ch["stft_overlap"],
+                        spl_weighting=ch["spl_weighting"],
+                        spl_time_constant=ch["spl_time_constant"],
+                        spl_upper_limit=ch["spl_upper_limit"],
+                        spl_lower_limit=ch["spl_lower_limit"],
+                        fft_band_limits=json.dumps(ch["fft_band_limits"]),
+                        oct_weighting=ch["oct_weighting"],
+                        oct_band_limits=json.dumps(ch["oct_band_limits"]),
+                        ai_config=json.dumps(ch.get("ai_config", {})),
+                    )
         except IntegrityError:
             raise ValueError(f"配置名称「{data['config_name']}」已存在")
 
@@ -188,13 +203,17 @@ class ConfigService:
         if not isinstance(data.get("scan_triggers_test"), bool):
             errors.append("扫码触发必须为布尔值")
 
+        input_dev = data.get("input_device_name")
+        sel_ch = data.get("selected_channels", [])
+        if input_dev and not sel_ch:
+            errors.append("已选择输入设备但未选择任何通道")
+
         channels = data.get("channels", [])
         if not isinstance(channels, list):
             errors.append("通道数据格式无效")
             return errors
 
         seen_idx = set()
-        ch_count = self.get_channel_count()
         for i, ch in enumerate(channels):
             if not isinstance(ch, dict):
                 errors.append(f"通道 {i + 1}: 数据格式无效")
@@ -204,7 +223,7 @@ class ConfigService:
                 errors.append(f"通道 {i + 1}: 通道序号无效")
                 continue
             prefix = f"通道 {idx + 1}"
-            if idx < 0 or (ch_count > 0 and idx >= ch_count):
+            if idx < 0:
                 errors.append(f"{prefix}: 通道序号无效")
             if idx in seen_idx:
                 errors.append(f"{prefix}: 通道序号重复")
