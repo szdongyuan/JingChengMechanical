@@ -5,9 +5,11 @@ import numpy as np
 import pytest
 
 from app.service.analysis.dsp import (
+    OCTAVE_CENTER_FREQS,
     a_weighting,
     c_weighting,
     compute_fft_spectrum,
+    compute_octave_bands,
     compute_spl,
     compute_stft,
 )
@@ -176,3 +178,37 @@ class TestComputeFftSpectrum:
         freqs, _ = compute_fft_spectrum(np.zeros(1024), 44100.0, 1024)
         assert freqs[0] == pytest.approx(0.0)
         assert freqs[-1] == pytest.approx(44100.0 / 2)
+
+
+class TestComputeOctaveBands:
+    def test_output_shapes(self):
+        sr = 44100.0
+        sig = np.random.randn(int(sr * 0.5))
+        centers, levels = compute_octave_bands(sig, sr, weighting="Z")
+        assert centers.ndim == 1
+        assert levels.shape == centers.shape
+        assert len(centers) > 0
+        assert centers[-1] <= sr / 2
+
+    def test_z_weighting_white_noise(self):
+        """White noise should have roughly equal levels across bands (Z-weighted)."""
+        sr = 44100.0
+        rng = np.random.default_rng(42)
+        sig = rng.standard_normal(int(sr * 2.0))
+        centers, levels = compute_octave_bands(sig, sr, weighting="Z")
+        mid_levels = levels[2:-2]
+        assert mid_levels.max() - mid_levels.min() < 15
+
+    def test_a_weighting_applied(self):
+        """A-weighted octave levels at low freq should be less than Z-weighted."""
+        sr = 44100.0
+        rng = np.random.default_rng(42)
+        sig = rng.standard_normal(int(sr * 1.0))
+        _, levels_z = compute_octave_bands(sig, sr, weighting="Z")
+        _, levels_a = compute_octave_bands(sig, sr, weighting="A")
+        assert levels_a[0] < levels_z[0] - 5
+
+    def test_center_freqs_are_standard(self):
+        """Center frequencies should follow IEC 61260 standard values."""
+        assert 1000.0 in OCTAVE_CENTER_FREQS
+        assert 31.5 in OCTAVE_CENTER_FREQS

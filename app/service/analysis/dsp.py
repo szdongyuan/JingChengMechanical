@@ -187,3 +187,65 @@ def compute_fft_spectrum(signal: np.ndarray, sample_rate: float,
     mag_db = 20.0 * np.log10(np.maximum(mag, 1e-30))
     freqs = np.fft.rfftfreq(nfft, d=1.0 / sample_rate)
     return freqs, mag_db
+
+
+# ---------------------------------------------------------------------------
+# 1/3-octave band analysis (IEC 61260)
+# ---------------------------------------------------------------------------
+
+
+OCTAVE_CENTER_FREQS = np.array([
+    25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500,
+    630, 800, 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300,
+    8000, 10000, 12500, 16000, 20000,
+], dtype=np.float64)
+
+
+def compute_octave_bands(signal: np.ndarray, sample_rate: float,
+                         weighting: str) -> tuple[np.ndarray, np.ndarray]:
+    """Compute 1/3-octave band levels.
+
+    Parameters
+    ----------
+    signal : 1-D array
+    sample_rate : Hz
+    weighting : "A", "C", or "Z"
+
+    Returns
+    -------
+    (center_frequencies, levels_db)
+        Only bands whose upper edge is below Nyquist are returned.
+    """
+    sig = np.asarray(signal, dtype=np.float64)
+    nyquist = sample_rate / 2.0
+    n = sig.size
+    freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+    spectrum = np.fft.rfft(sig)
+    power = (np.abs(spectrum) / n) ** 2
+
+    if weighting == "A":
+        w_db = a_weighting(freqs)
+    elif weighting == "C":
+        w_db = c_weighting(freqs)
+    else:
+        w_db = np.zeros_like(freqs)
+    w_linear = 10.0 ** (w_db / 10.0)
+    power = power * w_linear
+
+    factor = 2.0 ** (1.0 / 6.0)
+    valid_mask = OCTAVE_CENTER_FREQS * factor < nyquist
+    centers = OCTAVE_CENTER_FREQS[valid_mask]
+    levels = np.empty(len(centers))
+
+    for i, fc in enumerate(centers):
+        f_lo = fc / factor
+        f_hi = fc * factor
+        band_mask = (freqs >= f_lo) & (freqs < f_hi)
+        band_width = f_hi - f_lo
+        band_power_density = power[band_mask].sum() / band_width
+        if band_power_density > 0:
+            levels[i] = 10.0 * np.log10(band_power_density)
+        else:
+            levels[i] = -np.inf
+
+    return centers, levels
