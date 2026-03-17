@@ -1,0 +1,177 @@
+"""Test session — one test run lifecycle for a single config.
+
+Orchestrates: recorder -> pipelines -> judgment -> result.
+"""
+from __future__ import annotations
+
+import os
+import uuid
+from datetime import datetime, timedelta, timezone
+
+import numpy as np
+from scipy.io import wavfile
+
+from app.service.analysis.frames import JudgmentResult
+from app.service.analysis.judgment import JudgmentEngine
+from app.service.analysis.pipeline import AnalysisPipeline
+from model.audio_data_table import AudioDataTable
+
+_TZ8 = timezone(timedelta(hours=8))
+
+
+class TestSession:
+    """Lifecycle manager for a single test run bound to one config."""
+
+    __test__ = False
+
+    def __init__(
+        self,
+        config: dict,
+        bus,
+        ai_service,
+        mic_cal: dict,
+        workorder: dict,
+        audio_dir: str,
+    ):
+        self._config = config
+        self._bus = bus
+        self._ai_service = ai_service
+        self._mic_cal = mic_cal
+        self._workorder = workorder
+        self._audio_dir = audio_dir
+
+        self.config_id: int = config["config_id"]
+        self._record_duration: float = config.get("record_duration", 5.0)
+        self._analysis_duration: float = config.get("analysis_duration", 3.0)
+        self._sample_rate: float = float(config.get("input_device_samplerate", 44100))
+
+        self._pipelines: list[AnalysisPipeline] = []
+        self._buffer: np.ndarray | None = None
+        self._judgment: JudgmentEngine = JudgmentEngine(ai_service)
+        self._last_result: JudgmentResult | None = None
+        self._audio_file_path: str | None = None
+        self._audio_data_id: str | None = None
+
+    def _setup_pipelines(self):
+        """Create one AnalysisPipeline per selected channel."""
+        selected = self._config.get("selected_channels", [])
+        channels_cfg = {ch["channel_index"]: ch for ch in self._config.get("channels", [])}
+        self._pipelines = []
+        for ch_idx in selected:
+            ch_cfg = channels_cfg.get(ch_idx)
+            if ch_cfg is None:
+                continue
+            sensitivity = self._get_sensitivity(ch_idx)
+            self._pipelines.append(
+                AnalysisPipeline(
+                    channel_index=ch_idx,
+                    channel_config=ch_cfg,
+                    sample_rate=self._sample_rate,
+                    mic_sensitivity=sensitivity,
+                )
+            )
+
+    def _on_chunk(self, chunk: np.ndarray, chunk_index: int):
+        """Process one audio chunk through all pipelines and emit results."""
+        elapsed = chunk_index * 0.05
+
+        for pipeline in self._pipelines:
+            ch_idx = pipeline.channel_index
+            if chunk.ndim == 2 and ch_idx < chunk.shape[1]:
+                mono = chunk[:, ch_idx]
+            elif chunk.ndim == 1:
+                mono = chunk
+            else:
+                continue
+
+            result = pipeline.process_chunk(mono, elapsed)
+
+            if result["stft"] is not None:
+                self._bus.stft_updated.emit(self.config_id, ch_idx, result["stft"])
+            if result["spl"] is not None:
+                self._bus.spl_updated.emit(self.config_id, ch_idx, result["spl"])
+            if result["octave"] is not None:
+                self._bus.octave_updated.emit(self.config_id, ch_idx, result["octave"])
+            if result["fft"] is not None:
+                self._bus.fft_updated.emit(self.config_id, ch_idx, result["fft"])
+
+        self._bus.recording_progress.emit(self.config_id, elapsed)
+
+    def _run_judgment(self) -> JudgmentResult:
+        """Run judgment on the recorded buffer."""
+        if self._buffer is None:
+            return JudgmentResult(
+                overall="不合格",
+                limit_pass=False,
+                ai_pass=None,
+                ai_score=None,
+            )
+
+        self._audio_file_path = self._save_wav(self._buffer, self._sample_rate)
+
+        result = self._judgment.judge(
+            self._config,
+            self._buffer,
+            self._sample_rate,
+            self._mic_cal,
+            self._audio_file_path,
+        )
+        self._last_result = result
+        return result
+
+    def _save_wav(self, buffer: np.ndarray, sample_rate: float) -> str:
+        """Save buffer to WAV file, insert AudioDataTable record, return path."""
+        os.makedirs(self._audio_dir, exist_ok=True)
+        ts = datetime.now(_TZ8).strftime("%Y%m%d_%H%M%S")
+        barcode = self._workorder.get("sn", "") or uuid.uuid4().hex[:8]
+        filename = f"{self.config_id}_{ts}_{barcode}.wav"
+        filepath = os.path.join(self._audio_dir, filename)
+        data = buffer.astype(np.float32)
+        wavfile.write(filepath, int(sample_rate), data)
+
+        audio_id = uuid.uuid4().hex
+        AudioDataTable.create(
+            audio_data_id=audio_id,
+            file_path=filepath,
+            product_model=self._workorder.get("model", ""),
+            sample_rate=int(sample_rate),
+            record_date=datetime.now(_TZ8).isoformat(),
+            labels=None,
+            barcode=self._workorder.get("sn", ""),
+        )
+        self._audio_data_id = audio_id
+        return filepath
+
+    def rejudge(self, start_sec: float, end_sec: float) -> JudgmentResult | None:
+        """Re-run judgment on a user-selected window."""
+        if self._buffer is None or self._audio_file_path is None:
+            return None
+        result = self._judgment.rejudge(
+            self._config,
+            self._buffer,
+            self._sample_rate,
+            self._mic_cal,
+            self._audio_file_path,
+            start_sec,
+            end_sec,
+        )
+        self._last_result = result
+        return result
+
+    def _get_sensitivity(self, channel_index: int) -> float:
+        """Get mic sensitivity (Pa/V) for a channel from mic_cal."""
+        key = f"In{channel_index + 1}"
+        entry = self._mic_cal.get(key, {})
+        raw = entry.get("deviation_value", "0")
+        try:
+            return float(raw)
+        except (ValueError, TypeError):
+            return 0.0
+
+    @property
+    def last_result(self) -> JudgmentResult | None:
+        return self._last_result
+
+    @property
+    def buffer(self) -> np.ndarray | None:
+        return self._buffer
