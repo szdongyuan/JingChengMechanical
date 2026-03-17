@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from app.service.analysis.dsp import a_weighting, c_weighting
+from app.service.analysis.dsp import a_weighting, c_weighting, compute_spl
 
 
 class TestAWeighting:
@@ -80,3 +80,39 @@ class TestCWeighting:
             assert abs(gains[0] - expected) < 0.5, (
                 f"C-weight at {freq} Hz: got {gains[0]:.1f}, expected {expected}"
             )
+
+
+class TestComputeSpl:
+    def test_sine_wave_z_weight(self):
+        """A full-scale sine wave should give ~91 dB SPL (Z-weighted, ref 20 µPa)."""
+        sr = 44100.0
+        t = np.arange(int(sr * 1.0)) / sr
+        sig = np.sin(2 * np.pi * 1000 * t)
+        spl = compute_spl(sig, sr, weighting="Z", time_constant=0.125)
+        assert isinstance(spl, float)
+        assert np.isfinite(spl)
+
+    def test_z_weighting_is_flat(self):
+        """Z-weighted SPL should equal unweighted RMS-based SPL."""
+        sr = 44100.0
+        t = np.arange(int(sr * 0.5)) / sr
+        sig = 0.5 * np.sin(2 * np.pi * 1000 * t)
+        spl_z = compute_spl(sig, sr, weighting="Z", time_constant=0.125)
+        rms = 0.5 / np.sqrt(2)
+        expected = 20 * np.log10(rms / 20e-6)
+        assert abs(spl_z - expected) < 1.0
+
+    def test_a_weighting_attenuates_low_freq(self):
+        """A-weighted SPL of a low-freq tone should be less than Z-weighted."""
+        sr = 44100.0
+        t = np.arange(int(sr * 1.0)) / sr
+        sig = 0.5 * np.sin(2 * np.pi * 100 * t)
+        spl_z = compute_spl(sig, sr, weighting="Z", time_constant=0.125)
+        spl_a = compute_spl(sig, sr, weighting="A", time_constant=0.125)
+        assert spl_a < spl_z - 10
+
+    def test_silence_returns_very_low(self):
+        """Silent signal should return a very low SPL."""
+        sig = np.zeros(44100)
+        spl = compute_spl(sig, 44100.0, weighting="Z", time_constant=0.125)
+        assert spl < -50

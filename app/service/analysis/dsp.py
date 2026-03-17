@@ -70,3 +70,56 @@ def _c_weight_linear(f: float) -> float:
     num = 12194.0 ** 2 * f2
     den = (f2 + 20.6 ** 2) * (f2 + 12194.0 ** 2)
     return num / den
+
+
+# ---------------------------------------------------------------------------
+# SPL computation
+# ---------------------------------------------------------------------------
+
+
+_REF_PRESSURE = 20e-6
+
+
+def compute_spl(signal: np.ndarray, sample_rate: float,
+                weighting: str, time_constant: float) -> float:
+    """Compute weighted Sound Pressure Level in dB.
+
+    Parameters
+    ----------
+    signal : 1-D array of audio samples (float, arbitrary units treated as Pa)
+    sample_rate : Hz
+    weighting : "A", "C", or "Z" (flat)
+    time_constant : exponential averaging time constant in seconds
+        (0.125 = Fast, 1.0 = Slow)
+
+    Returns
+    -------
+    SPL in dB re 20 µPa
+    """
+    sig = np.asarray(signal, dtype=np.float64)
+    if sig.size == 0:
+        return -np.inf
+
+    if weighting in ("A", "C"):
+        n = sig.size
+        freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+        spectrum = np.fft.rfft(sig)
+        if weighting == "A":
+            gains_db = a_weighting(freqs)
+        else:
+            gains_db = c_weighting(freqs)
+        gains_linear = 10.0 ** (gains_db / 20.0)
+        spectrum *= gains_linear
+        sig = np.fft.irfft(spectrum, n=n)
+
+    alpha = 1.0 - np.exp(-1.0 / (sample_rate * time_constant))
+    sq = sig ** 2
+    filtered = np.empty_like(sq)
+    filtered[0] = sq[0]
+    for i in range(1, len(sq)):
+        filtered[i] = alpha * sq[i] + (1.0 - alpha) * filtered[i - 1]
+    rms = np.sqrt(filtered[-1])
+
+    if rms <= 0:
+        return -np.inf
+    return 20.0 * np.log10(rms / _REF_PRESSURE)
