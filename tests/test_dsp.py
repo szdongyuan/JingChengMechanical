@@ -7,6 +7,7 @@ import pytest
 from app.service.analysis.dsp import (
     OCTAVE_CENTER_FREQS,
     a_weighting,
+    apply_mic_calibration,
     c_weighting,
     compute_fft_spectrum,
     compute_octave_bands,
@@ -212,3 +213,20 @@ class TestComputeOctaveBands:
         """Center frequencies should follow IEC 61260 standard values."""
         assert 1000.0 in OCTAVE_CENTER_FREQS
         assert 31.5 in OCTAVE_CENTER_FREQS
+
+
+class TestApplyMicCalibration:
+    def test_scales_signal(self):
+        sig = np.array([1.0, 2.0, -1.0])
+        result = apply_mic_calibration(sig, sensitivity_pa_per_v=0.5)
+        np.testing.assert_array_almost_equal(result, [0.5, 1.0, -0.5])
+
+    def test_zero_sensitivity_returns_raw(self):
+        sig = np.array([1.0, 2.0])
+        result = apply_mic_calibration(sig, sensitivity_pa_per_v=0.0)
+        np.testing.assert_array_equal(result, sig)
+
+    def test_unity_sensitivity(self):
+        sig = np.array([3.0, -3.0])
+        result = apply_mic_calibration(sig, sensitivity_pa_per_v=1.0)
+        np.testing.assert_array_equal(result, sig)

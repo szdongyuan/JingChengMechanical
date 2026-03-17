@@ -249,3 +249,22 @@ def compute_octave_bands(signal: np.ndarray, sample_rate: float,
             levels[i] = -np.inf
 
     return centers, levels
+
+
+# ---------------------------------------------------------------------------
+# Mic calibration
+# ---------------------------------------------------------------------------
+
+
+def apply_mic_calibration(signal: np.ndarray,
+                          sensitivity_pa_per_v: float) -> np.ndarray:
+    """Apply microphone calibration sensitivity.
+
+    The existing mic_cal stores deviation_value as a string in Pa/V units.
+    This multiplies the raw voltage signal by the sensitivity to get pressure.
+    If sensitivity is 0, returns the raw signal unchanged.
+    """
+    calibrated = np.asarray(signal, dtype=np.float64)
+    if sensitivity_pa_per_v == 0.0:
+        return calibrated
+    return calibrated * sensitivity_pa_per_v
