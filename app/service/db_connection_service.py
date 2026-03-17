@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from peewee import OperationalError
+
 from model.base_mode import db
 from model.test_config_table import TestConfigTable
 from model.channel_config_table import ChannelConfigTable
@@ -30,6 +32,26 @@ class DbConnectionService:
             ],
             safe=True,
         )
+        self._migrate()
+
+    def _migrate(self):
+        columns = [
+            ("trigger_type", "TEXT DEFAULT 'manual'"),
+            ("input_device_name", "TEXT"),
+            ("input_device_hostapi", "TEXT"),
+            ("input_device_samplerate", "REAL"),
+            ("output_device_name", "TEXT"),
+            ("output_device_hostapi", "TEXT"),
+            ("output_device_samplerate", "REAL"),
+            ("selected_channels", "TEXT DEFAULT '[]'"),
+        ]
+        for column_name, type_spec in columns:
+            try:
+                db.execute_sql(
+                    f"ALTER TABLE test_config_table ADD COLUMN {column_name} {type_spec}"
+                )
+            except OperationalError:
+                pass
 
     def close(self):
         if not db.is_closed():
