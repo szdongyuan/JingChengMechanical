@@ -9,6 +9,8 @@ from model.channel_config_table import ChannelConfigTable
 from model.ai_execution_table import AiExecutionTable
 from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable
+from model.device_table import DeviceTable
+from model.audio_data_table import AudioDataTable
 
 ALL_TABLES = [
     TestConfigTable,
@@ -16,6 +18,8 @@ ALL_TABLES = [
     AiToolchainTable,
     TestConfigAiBindingTable,
     AiExecutionTable,
+    DeviceTable,
+    AudioDataTable,
 ]
 
 _test_db = SqliteDatabase(":memory:", pragmas={"foreign_keys": 1})
