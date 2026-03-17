@@ -123,3 +123,41 @@ def compute_spl(signal: np.ndarray, sample_rate: float,
     if rms <= 0:
         return -np.inf
     return 20.0 * np.log10(rms / _REF_PRESSURE)
+
+
+# ---------------------------------------------------------------------------
+# STFT
+# ---------------------------------------------------------------------------
+
+
+def compute_stft(signal: np.ndarray, sample_rate: float, nfft: int,
+                 overlap: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Compute Short-Time Fourier Transform.
+
+    Parameters
+    ----------
+    signal : 1-D array
+    sample_rate : Hz
+    nfft : FFT window size (e.g. 1024)
+    overlap : fraction 0..1 (e.g. 0.5 = 50 %)
+
+    Returns
+    -------
+    (times, frequencies, magnitudes_db)
+        times : 1-D array of time stamps (seconds)
+        frequencies : 1-D array of frequency bins (Hz), length nfft//2+1
+        magnitudes_db : 2-D array (n_freq, n_times) in dB
+    """
+    sig = np.asarray(signal, dtype=np.float64)
+    noverlap = int(nfft * overlap)
+    freqs, times, zxx = scipy_signal.stft(
+        sig,
+        fs=sample_rate,
+        window="hann",
+        nperseg=nfft,
+        noverlap=noverlap,
+        return_onesided=True,
+    )
+    mag = np.abs(zxx)
+    mag_db = 20.0 * np.log10(np.maximum(mag, 1e-30))
+    return times, freqs, mag_db

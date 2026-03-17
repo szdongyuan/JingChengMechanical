@@ -2,8 +2,14 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
-from app.service.analysis.dsp import a_weighting, c_weighting, compute_spl
+from app.service.analysis.dsp import (
+    a_weighting,
+    c_weighting,
+    compute_spl,
+    compute_stft,
+)
 
 
 class TestAWeighting:
@@ -116,3 +122,35 @@ class TestComputeSpl:
         sig = np.zeros(44100)
         spl = compute_spl(sig, 44100.0, weighting="Z", time_constant=0.125)
         assert spl < -50
+
+
+class TestComputeStft:
+    def test_output_shapes(self):
+        """STFT output arrays should have correct shapes."""
+        sr = 44100.0
+        n = int(sr * 1.0)
+        sig = np.random.randn(n)
+        nfft = 1024
+        overlap = 0.5
+        times, freqs, mag_db = compute_stft(sig, sr, nfft, overlap)
+        assert freqs.shape[0] == nfft // 2 + 1
+        assert times.ndim == 1
+        assert mag_db.shape == (freqs.shape[0], times.shape[0])
+
+    def test_frequency_axis(self):
+        """Frequency axis should range from 0 to Nyquist."""
+        sr = 44100.0
+        sig = np.zeros(int(sr * 0.5))
+        times, freqs, mag_db = compute_stft(sig, sr, 1024, 0.5)
+        assert freqs[0] == pytest.approx(0.0)
+        assert freqs[-1] == pytest.approx(sr / 2)
+
+    def test_sine_peak(self):
+        """A 1 kHz sine should produce a peak near 1 kHz in the STFT."""
+        sr = 44100.0
+        t = np.arange(int(sr * 0.5)) / sr
+        sig = np.sin(2 * np.pi * 1000 * t)
+        times, freqs, mag_db = compute_stft(sig, sr, 1024, 0.5)
+        avg_mag = mag_db.mean(axis=1)
+        peak_freq = freqs[np.argmax(avg_mag)]
+        assert abs(peak_freq - 1000.0) < 50
