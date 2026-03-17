@@ -35,6 +35,18 @@ class EventBus(QObject):
     # 配置变化（供外部模块监听，如工单模块刷新可选配置列表）
     config_changed = pyqtSignal()
 
+    # ── Analysis kernel real-time signals ──
+    # Real-time analysis frames (~20 Hz per channel)
+    stft_updated = pyqtSignal(int, int, object)     # config_id, channel_idx, StftFrame
+    spl_updated = pyqtSignal(int, int, object)      # config_id, channel_idx, SplFrame
+    octave_updated = pyqtSignal(int, int, object)   # config_id, channel_idx, OctaveFrame
+    fft_updated = pyqtSignal(int, int, object)      # config_id, channel_idx, FftFrame
+
+    # Session lifecycle
+    recording_progress = pyqtSignal(int, float)     # config_id, elapsed_sec
+    test_started = pyqtSignal(int)                  # config_id
+    test_finished = pyqtSignal(int, dict)           # config_id, JudgmentResult as dict
+
 
 class TestService(QObject):
     """
