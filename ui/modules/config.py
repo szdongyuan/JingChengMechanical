@@ -217,12 +217,12 @@ class ConfigModule(QWidget):
 
         self.combo_trigger = _NoWheelComboBox()
         self.combo_trigger.setStyleSheet(combo_qss)
-        self.combo_trigger.addItem("手动触发", "manual")
-        self.combo_trigger.addItem("PLC 触发 (待定)", "plc")
+        self.combo_trigger.addItem("（未选择）", None)
+        self.combo_trigger.addItem("PLC 设备关联 (待定)", "plc")
         model = self.combo_trigger.model()
         plc_item = model.item(1)
         plc_item.setEnabled(False)
-        hw_lay.addRow("触发方式", self.combo_trigger)
+        hw_lay.addRow("PLC 设备", self.combo_trigger)
 
         self.combo_input_dev = _NoWheelComboBox()
         self.combo_input_dev.setStyleSheet(combo_qss)
@@ -271,7 +271,7 @@ class ConfigModule(QWidget):
         scroll_lay.addWidget(Card("AI 工具链绑定", ai_bind_form))
 
         # Channel warning
-        self.channel_warning = QLabel("请先选择输入设备并勾选通道")
+        self.channel_warning = QLabel("请先选择输入设备")
         self.channel_warning.setObjectName("Muted")
         self.channel_warning.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.channel_warning.setStyleSheet(
@@ -385,7 +385,7 @@ class ConfigModule(QWidget):
                 self.combo_output_dev.addItem(label, dev_info)
 
     def _on_input_device_changed(self, index):
-        """Rebuild channel checkboxes when input device changes."""
+        """Rebuild channel checkboxes and tabs when input device changes."""
         for cb in self._channel_checkboxes:
             cb.deleteLater()
         self._channel_checkboxes = []
@@ -406,14 +406,13 @@ class ConfigModule(QWidget):
             self._channel_check_layout.addWidget(cb, row, col)
             self._channel_checkboxes.append(cb)
 
+        # Rebuild tabs for ALL channels, not just checked ones
+        all_indices = list(range(max_ch))
+        self._build_channel_tabs(all_indices, None)
+
     def _on_channel_selection_changed(self):
-        """Rebuild channel tabs based on currently checked channel checkboxes."""
-        checked_indices = [
-            i for i, cb in enumerate(self._channel_checkboxes) if cb.isChecked()
-        ]
-        current_data = self._collect_data()
-        current_channels = current_data.get("channels", [])
-        self._build_channel_tabs(checked_indices, current_channels if current_channels else None)
+        """Channel checkbox toggled — tabs are built by _on_input_device_changed."""
+        pass
 
     # ── Channel tab building ────────────────────────────────
 
@@ -448,7 +447,7 @@ class ConfigModule(QWidget):
 
         for page_idx, ch_idx in enumerate(channel_indices):
             ch = ch_data_map.get(ch_idx)
-            btn = QPushButton(f"通道 {ch_idx + 1}")
+            btn = QPushButton(f"In{ch_idx + 1} (通道 {ch_idx + 1})")
             btn.setCheckable(True)
             btn.clicked.connect(lambda _checked, idx=page_idx: self._on_channel_tab_clicked(idx))
             self._channel_tab_bar_lay.addWidget(btn)
@@ -713,12 +712,12 @@ class ConfigModule(QWidget):
 
         self._populate_devices()
 
-        trigger = data.get("trigger_type", "manual")
+        trigger = data.get("trigger_type")
         idx = self.combo_trigger.findData(trigger)
         if idx >= 0:
             self.combo_trigger.setCurrentIndex(idx)
-        elif trigger == "plc":
-            self.combo_trigger.setCurrentIndex(1)
+        else:
+            self.combo_trigger.setCurrentIndex(0)
 
         saved_input = data.get("input_device_name")
         saved_input_api = data.get("input_device_hostapi")
@@ -806,7 +805,7 @@ class ConfigModule(QWidget):
             "record_duration": self.spin_record.value(),
             "analysis_duration": self.spin_analysis.value(),
             "scan_triggers_test": self.chk_scan.isChecked(),
-            "trigger_type": trigger_data or "manual",
+            "trigger_type": trigger_data if trigger_data else None,
             "input_device_name": input_dev.get("name") if isinstance(input_dev, dict) else None,
             "input_device_hostapi": input_dev.get("hostapi") if isinstance(input_dev, dict) else None,
             "input_device_samplerate": input_dev.get("default_samplerate") if isinstance(input_dev, dict) else None,
@@ -890,8 +889,17 @@ class ConfigModule(QWidget):
 
         self._populate_hardware_card(data)
 
-        selected = data.get("selected_channels", [])
-        self._build_channel_tabs(selected, data.get("channels"))
+        # Build tabs for ALL channels of the device, not just selected ones
+        dev_info = self.combo_input_dev.currentData()
+        if dev_info and isinstance(dev_info, dict):
+            max_ch = dev_info.get("max_input_channels", 0)
+            all_indices = list(range(max_ch))
+        else:
+            all_indices = []
+        # For legacy configs with no device, use channel data indices
+        if not all_indices and data.get("channels"):
+            all_indices = [ch["channel_index"] for ch in data["channels"]]
+        self._build_channel_tabs(all_indices, data.get("channels"))
         self._populate_ai_binding(data["config_id"])
 
     # ── Interactions ────────────────────────────────────────
