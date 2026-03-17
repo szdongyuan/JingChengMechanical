@@ -708,6 +708,9 @@ class ConfigModule(QWidget):
 
     def _populate_hardware_card(self, data: dict):
         """Load saved device/trigger/channel selections into hardware card widgets."""
+        # Block input device signal to prevent _on_input_device_changed during population
+        self.combo_input_dev.blockSignals(True)
+
         self._populate_devices()
 
         trigger = data.get("trigger_type", "manual")
@@ -732,6 +735,8 @@ class ConfigModule(QWidget):
         )
 
         self._rebuild_channel_checkboxes_silent()
+
+        self.combo_input_dev.blockSignals(False)
 
         selected = data.get("selected_channels", [])
         for i, cb in enumerate(self._channel_checkboxes):
@@ -1007,6 +1012,35 @@ class ConfigModule(QWidget):
             QMessageBox.warning(self, "保存失败", str(e))
 
     def _on_hardware_changed(self):
-        """Global hardware changed — refresh device combos but don't touch channel tabs."""
-        if self._current_config_id is not None:
-            self._populate_devices()
+        """Global hardware changed — refresh device combos, preserve current selection."""
+        if self._current_config_id is None:
+            return
+
+        # Save current selections before repopulating
+        cur_input = self.combo_input_dev.currentData()
+        cur_output = self.combo_output_dev.currentData()
+
+        # Block signals to prevent _on_input_device_changed from firing
+        self.combo_input_dev.blockSignals(True)
+        self.combo_output_dev.blockSignals(True)
+
+        self._populate_devices()
+
+        # Restore previous selections
+        if cur_input and isinstance(cur_input, dict):
+            self._match_device_combo(
+                self.combo_input_dev,
+                cur_input.get("name"),
+                cur_input.get("hostapi"),
+                cur_input.get("default_samplerate"),
+            )
+        if cur_output and isinstance(cur_output, dict):
+            self._match_device_combo(
+                self.combo_output_dev,
+                cur_output.get("name"),
+                cur_output.get("hostapi"),
+                cur_output.get("default_samplerate"),
+            )
+
+        self.combo_input_dev.blockSignals(False)
+        self.combo_output_dev.blockSignals(False)
