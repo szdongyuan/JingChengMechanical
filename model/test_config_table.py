@@ -12,6 +12,14 @@ class TestConfigTable(BaseModel):
     scan_triggers_test = BooleanField(default=False)
     created_time = TextField(default=now_str)
     updated_time = TextField(default=now_str)
+    trigger_type = TextField(default='manual')
+    input_device_name = TextField(null=True)
+    input_device_hostapi = TextField(null=True)
+    input_device_samplerate = FloatField(null=True)
+    output_device_name = TextField(null=True)
+    output_device_hostapi = TextField(null=True)
+    output_device_samplerate = FloatField(null=True)
+    selected_channels = TextField(default='[]')
 
     class Meta:
         table_name = "test_config_table"
