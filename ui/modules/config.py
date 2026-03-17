@@ -20,10 +20,10 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QStackedWidget,
     QStyledItemDelegate,
     QTableWidget,
     QTableWidgetItem,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -35,6 +35,27 @@ from ui.widgets.collapsible_group_box import CollapsibleGroupBox
 
 class _NoWheelSpinBox(QDoubleSpinBox):
     """QDoubleSpinBox that ignores mouse wheel events."""
+
+    def wheelEvent(self, event: QWheelEvent):
+        event.ignore()
+
+
+class _NoWheelSpinBoxInt(QSpinBox):
+    """QSpinBox that ignores mouse wheel events."""
+
+    def wheelEvent(self, event: QWheelEvent):
+        event.ignore()
+
+
+class _NoWheelComboBox(QComboBox):
+    """QComboBox that ignores mouse wheel events."""
+
+    def wheelEvent(self, event: QWheelEvent):
+        event.ignore()
+
+
+class _NoWheelPlainTextEdit(QPlainTextEdit):
+    """QPlainTextEdit that ignores mouse wheel events."""
 
     def wheelEvent(self, event: QWheelEvent):
         event.ignore()
@@ -136,6 +157,12 @@ class ConfigModule(QWidget):
         detail_lay.setContentsMargins(0, 0, 0, 0)
         detail_lay.setSpacing(10)
 
+        # Scrollable content wrapper
+        scroll_content = QWidget()
+        scroll_lay = QVBoxLayout(scroll_content)
+        scroll_lay.setContentsMargins(0, 0, 0, 0)
+        scroll_lay.setSpacing(10)
+
         # Global params
         global_form = QWidget()
         gf_lay = QFormLayout(global_form)
@@ -168,10 +195,17 @@ class ConfigModule(QWidget):
             lambda v: self.spin_analysis.setValue(min(self.spin_analysis.value(), v))
         )
 
+        self.spin_ai_window_offset = _NoWheelSpinBoxInt()
+        self.spin_ai_window_offset.setRange(0, 3600000)
+        self.spin_ai_window_offset.setSingleStep(100)
+        self.spin_ai_window_offset.setSuffix(" ms")
+        self.spin_ai_window_offset.setValue(0)
+        gf_lay.addRow("默认分析窗起始偏移(ms)", self.spin_ai_window_offset)
+
         self.chk_scan = QCheckBox("扫码枪直接触发测试")
         gf_lay.addRow("扫码触发", self.chk_scan)
 
-        detail_lay.addWidget(Card("全局参数", global_form))
+        scroll_lay.addWidget(Card("全局参数", global_form))
 
         # AI binding card (test-level, not per-channel)
         ai_bind_form = QWidget()
@@ -183,11 +217,11 @@ class ConfigModule(QWidget):
         self.chk_ai_enabled = QCheckBox("启用 AI 分析")
         ab_lay.addRow("启用 AI", self.chk_ai_enabled)
 
-        self.combo_ai_toolchain = QComboBox()
+        self.combo_ai_toolchain = _NoWheelComboBox()
         self.combo_ai_toolchain.setStyleSheet(combo_qss)
         ab_lay.addRow("AI 工具链", self.combo_ai_toolchain)
 
-        self.spin_ai_timeout = QSpinBox()
+        self.spin_ai_timeout = _NoWheelSpinBoxInt()
         self.spin_ai_timeout.setRange(0, 600000)
         self.spin_ai_timeout.setSingleStep(1000)
         self.spin_ai_timeout.setSuffix(" ms")
@@ -195,19 +229,12 @@ class ConfigModule(QWidget):
         self.spin_ai_timeout.setValue(0)
         ab_lay.addRow("超时(ms)", self.spin_ai_timeout)
 
-        self.spin_ai_window_offset = QSpinBox()
-        self.spin_ai_window_offset.setRange(0, 3600000)
-        self.spin_ai_window_offset.setSingleStep(100)
-        self.spin_ai_window_offset.setSuffix(" ms")
-        self.spin_ai_window_offset.setValue(0)
-        ab_lay.addRow("默认分析窗起始偏移(ms)", self.spin_ai_window_offset)
-
-        self.txt_ai_params = QPlainTextEdit()
+        self.txt_ai_params = _NoWheelPlainTextEdit()
         self.txt_ai_params.setPlaceholderText('{"key": "value"}')
         self.txt_ai_params.setMaximumHeight(80)
         ab_lay.addRow("参数(JSON)", self.txt_ai_params)
 
-        detail_lay.addWidget(Card("AI 工具链绑定", ai_bind_form))
+        scroll_lay.addWidget(Card("AI 工具链绑定", ai_bind_form))
 
         # Channel warning
         self.channel_warning = QLabel("请先在硬件页面选择并保存输入设备")
@@ -218,7 +245,7 @@ class ConfigModule(QWidget):
             "border-radius: 8px; padding: 12px;"
         )
         self.channel_warning.setVisible(False)
-        detail_lay.addWidget(self.channel_warning)
+        scroll_lay.addWidget(self.channel_warning)
 
         # Channel count mismatch note
         self.channel_mismatch_note = QLabel(
@@ -227,21 +254,47 @@ class ConfigModule(QWidget):
         self.channel_mismatch_note.setObjectName("Muted")
         self.channel_mismatch_note.setStyleSheet("color: #ca8a04; font-size: 11px;")
         self.channel_mismatch_note.setVisible(False)
-        detail_lay.addWidget(self.channel_mismatch_note)
+        scroll_lay.addWidget(self.channel_mismatch_note)
 
-        # Channel tabs
-        self.tab_channels = QTabWidget()
-        self.tab_channels.setStyleSheet(
-            "QTabBar::tab { padding: 8px 18px; border: 1px solid #e5e7eb; "
+        # Channel tab-like selector + stacked content
+        self.channel_host = QWidget()
+        ch_host_lay = QVBoxLayout(self.channel_host)
+        ch_host_lay.setContentsMargins(0, 0, 0, 0)
+        ch_host_lay.setSpacing(0)
+
+        self.channel_tab_bar = QWidget()
+        self.channel_tab_bar.setStyleSheet(
+            "QPushButton { padding: 8px 18px; border: 1px solid #e5e7eb; "
             "border-bottom: none; border-radius: 8px 8px 0 0; "
             "background: #f1f5f9; color: #64748b; margin-right: 2px; }"
-            "QTabBar::tab:selected { background: white; color: #2563eb; "
+            "QPushButton:checked { background: white; color: #2563eb; "
             "font-weight: 700; border-bottom: 2px solid #2563eb; }"
-            "QTabBar::tab:hover:!selected { background: #e0edff; color: #334155; }"
-            "QTabWidget::pane { border: 1px solid #e5e7eb; border-radius: 0 0 8px 8px; "
+            "QPushButton:hover:!checked { background: #e0edff; color: #334155; }"
+        )
+        self._channel_tab_bar_lay = QHBoxLayout(self.channel_tab_bar)
+        self._channel_tab_bar_lay.setContentsMargins(0, 0, 0, 0)
+        self._channel_tab_bar_lay.setSpacing(0)
+        self._channel_tab_buttons = []
+        ch_host_lay.addWidget(self.channel_tab_bar)
+
+        self.channel_stack = QStackedWidget()
+        self.channel_stack.setStyleSheet(
+            "QStackedWidget { border: 1px solid #e5e7eb; border-radius: 0 0 8px 8px; "
             "background: white; }"
         )
-        detail_lay.addWidget(self.tab_channels, 1)
+        ch_host_lay.addWidget(self.channel_stack)
+
+        self._channel_containers = []
+        scroll_lay.addWidget(self.channel_host)
+
+        scroll_lay.addStretch(1)
+
+        # Scroll area wrapping all content above
+        self.detail_scroll = QScrollArea()
+        self.detail_scroll.setWidgetResizable(True)
+        self.detail_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.detail_scroll.setWidget(scroll_content)
+        detail_lay.addWidget(self.detail_scroll, 1)
 
         # Save button
         save_row = QWidget()
@@ -267,14 +320,26 @@ class ConfigModule(QWidget):
     # ── Channel tab building ────────────────────────────────
 
     def _build_channel_tabs(self, ch_count: int, channel_data: list[dict] | None = None):
-        self.tab_channels.clear()
+        # Clear previous tab buttons and stretch
+        while self._channel_tab_bar_lay.count():
+            item = self._channel_tab_bar_lay.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._channel_tab_buttons = []
+        # Clear stack
+        while self.channel_stack.count():
+            w = self.channel_stack.widget(0)
+            self.channel_stack.removeWidget(w)
+            w.deleteLater()
+        self._channel_containers = []
+
         if ch_count <= 0:
             self.channel_warning.setVisible(True)
-            self.tab_channels.setVisible(False)
+            self.channel_host.setVisible(False)
             return
 
         self.channel_warning.setVisible(False)
-        self.tab_channels.setVisible(True)
+        self.channel_host.setVisible(True)
 
         saved_count = len(channel_data) if channel_data else 0
         self.channel_mismatch_note.setVisible(
@@ -287,14 +352,27 @@ class ConfigModule(QWidget):
                 if channel_data and i < len(channel_data)
                 else None
             )
-            tab = self._build_channel_tab(i, ch)
-            self.tab_channels.addTab(tab, f"通道 {i + 1}")
+            btn = QPushButton(f"通道 {i + 1}")
+            btn.setCheckable(True)
+            btn.clicked.connect(lambda _checked, idx=i: self._on_channel_tab_clicked(idx))
+            self._channel_tab_bar_lay.addWidget(btn)
+            self._channel_tab_buttons.append(btn)
+
+            container = self._build_channel_tab(i, ch)
+            self.channel_stack.addWidget(container)
+            self._channel_containers.append(container)
+
+        self._channel_tab_bar_lay.addStretch(1)
+        if ch_count > 0:
+            self._channel_tab_buttons[0].setChecked(True)
+            self.channel_stack.setCurrentIndex(0)
+
+    def _on_channel_tab_clicked(self, idx: int):
+        for i, btn in enumerate(self._channel_tab_buttons):
+            btn.setChecked(i == idx)
+        self.channel_stack.setCurrentIndex(idx)
 
     def _build_channel_tab(self, ch_index: int, data: dict | None) -> QWidget:
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
-
         container = QWidget()
         container.setProperty("channel_index", ch_index)
         lay = QVBoxLayout(container)
@@ -309,7 +387,7 @@ class ConfigModule(QWidget):
         sf_lay.setHorizontalSpacing(10)
         sf_lay.setVerticalSpacing(6)
 
-        combo_nfft = QComboBox()
+        combo_nfft = _NoWheelComboBox()
         combo_nfft.setStyleSheet(combo_qss)
         for v in [256, 512, 1024, 2048, 4096, 8192]:
             combo_nfft.addItem(str(v), v)
@@ -319,7 +397,7 @@ class ConfigModule(QWidget):
         combo_nfft.setCurrentIndex(idx if idx >= 0 else 2)
         sf_lay.addRow("FFT 点数", combo_nfft)
 
-        combo_overlap = QComboBox()
+        combo_overlap = _NoWheelComboBox()
         combo_overlap.setStyleSheet(combo_qss)
         for v in [0.25, 0.5, 0.75]:
             combo_overlap.addItem(str(v), v)
@@ -340,7 +418,7 @@ class ConfigModule(QWidget):
         sp_lay.setHorizontalSpacing(10)
         sp_lay.setVerticalSpacing(6)
 
-        combo_spl_w = QComboBox()
+        combo_spl_w = _NoWheelComboBox()
         combo_spl_w.setStyleSheet(combo_qss)
         combo_spl_w.addItems(["A", "C", "Z"])
         combo_spl_w.setObjectName("spl_weighting")
@@ -402,7 +480,7 @@ class ConfigModule(QWidget):
         oct_w_row = QWidget()
         ow_lay = QFormLayout(oct_w_row)
         ow_lay.setContentsMargins(0, 0, 0, 0)
-        combo_oct_w = QComboBox()
+        combo_oct_w = _NoWheelComboBox()
         combo_oct_w.setStyleSheet(combo_qss)
         combo_oct_w.addItems(["A", "C", "Z"])
         combo_oct_w.setObjectName("oct_weighting")
@@ -420,9 +498,7 @@ class ConfigModule(QWidget):
         oct_section.add_widget(oct_form)
         lay.addWidget(oct_section)
 
-        lay.addStretch(1)
-        scroll.setWidget(container)
-        return scroll
+        return container
 
     def _build_band_table(self, object_name: str, bands: list[dict]) -> QWidget:
         wrapper = QWidget()
@@ -546,9 +622,7 @@ class ConfigModule(QWidget):
             "channels": [],
         }
 
-        for tab_idx in range(self.tab_channels.count()):
-            scroll = self.tab_channels.widget(tab_idx)
-            container = scroll.widget()
+        for container in self._channel_containers:
             ch_index = container.property("channel_index")
 
             ch = {"channel_index": ch_index}
