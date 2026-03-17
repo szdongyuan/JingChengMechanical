@@ -124,7 +124,7 @@ class ConfigService:
                     record_duration=data["record_duration"],
                     analysis_duration=data["analysis_duration"],
                     scan_triggers_test=data["scan_triggers_test"],
-                    trigger_type=data.get("trigger_type", "manual"),
+                    trigger_type=data.get("trigger_type"),
                     input_device_name=data.get("input_device_name"),
                     input_device_hostapi=data.get("input_device_hostapi"),
                     input_device_samplerate=data.get("input_device_samplerate"),
