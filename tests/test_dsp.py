@@ -7,6 +7,7 @@ import pytest
 from app.service.analysis.dsp import (
     a_weighting,
     c_weighting,
+    compute_fft_spectrum,
     compute_spl,
     compute_stft,
 )
@@ -154,3 +155,24 @@ class TestComputeStft:
         avg_mag = mag_db.mean(axis=1)
         peak_freq = freqs[np.argmax(avg_mag)]
         assert abs(peak_freq - 1000.0) < 50
+
+
+class TestComputeFftSpectrum:
+    def test_output_shapes(self):
+        sig = np.random.randn(4096)
+        freqs, mag_db = compute_fft_spectrum(sig, 44100.0, 4096)
+        assert freqs.shape[0] == 4096 // 2 + 1
+        assert mag_db.shape == freqs.shape
+
+    def test_sine_peak(self):
+        sr = 44100.0
+        t = np.arange(4096) / sr
+        sig = np.sin(2 * np.pi * 1000 * t)
+        freqs, mag_db = compute_fft_spectrum(sig, sr, 4096)
+        peak_freq = freqs[np.argmax(mag_db)]
+        assert abs(peak_freq - 1000.0) < 20
+
+    def test_frequency_range(self):
+        freqs, _ = compute_fft_spectrum(np.zeros(1024), 44100.0, 1024)
+        assert freqs[0] == pytest.approx(0.0)
+        assert freqs[-1] == pytest.approx(44100.0 / 2)

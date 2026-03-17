@@ -161,3 +161,29 @@ def compute_stft(signal: np.ndarray, sample_rate: float, nfft: int,
     mag = np.abs(zxx)
     mag_db = 20.0 * np.log10(np.maximum(mag, 1e-30))
     return times, freqs, mag_db
+
+
+# ---------------------------------------------------------------------------
+# FFT spectrum (single-shot)
+# ---------------------------------------------------------------------------
+
+
+def compute_fft_spectrum(signal: np.ndarray, sample_rate: float,
+                         nfft: int) -> tuple[np.ndarray, np.ndarray]:
+    """Compute single-sided FFT magnitude spectrum.
+
+    Returns
+    -------
+    (frequencies, magnitudes_db) -- both 1-D, length nfft//2+1
+    """
+    sig = np.asarray(signal, dtype=np.float64)
+    if sig.size < nfft:
+        sig = np.pad(sig, (0, nfft - sig.size))
+    else:
+        sig = sig[:nfft]
+    window = np.hanning(nfft)
+    spectrum = np.fft.rfft(sig * window)
+    mag = np.abs(spectrum) * 2.0 / nfft
+    mag_db = 20.0 * np.log10(np.maximum(mag, 1e-30))
+    freqs = np.fft.rfftfreq(nfft, d=1.0 / sample_rate)
+    return freqs, mag_db
