@@ -1,0 +1,314 @@
+"""Tests for JudgmentEngine limit checks and verdict logic."""
+from __future__ import annotations
+
+import numpy as np
+import pytest
+from unittest.mock import MagicMock
+
+from app.service.analysis.judgment import JudgmentEngine
+from app.service.analysis.frames import JudgmentResult, ChannelJudgment, BandResult
+
+
+def _make_config(channels=None, **overrides) -> dict:
+    """Minimal config dict for judgment testing."""
+    cfg = {
+        "config_id": 1,
+        "config_name": "Test",
+        "record_duration": 5.0,
+        "analysis_duration": 3.0,
+        "selected_channels": [0],
+        "channels": channels or [_make_channel_config(0)],
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+def _make_channel_config(idx, **overrides) -> dict:
+    cfg = {
+        "channel_index": idx,
+        "stft_nfft": 1024,
+        "stft_overlap": 0.5,
+        "spl_weighting": "Z",
+        "spl_time_constant": 0.125,
+        "spl_upper_limit": 85.0,
+        "spl_lower_limit": 40.0,
+        "fft_band_limits": [],
+        "oct_weighting": "Z",
+        "oct_band_limits": [],
+    }
+    cfg.update(overrides)
+    return cfg
+
+
+class TestLimitChecks:
+    def _make_engine(self):
+        mock_ai = MagicMock()
+        mock_ai.resolve_binding.return_value = None  # no AI configured
+        return JudgmentEngine(mock_ai)
+
+    def test_spl_within_limits_passes(self):
+        engine = self._make_engine()
+        # Generate a signal that produces SPL within [40, 85] dB
+        sr = 44100.0
+        t = np.arange(int(sr * 3.0)) / sr
+        # ~60 dB SPL signal (Z-weighted)
+        amplitude = 20e-6 * 10 ** (60 / 20)  # 0.02 Pa
+        sig = amplitude * np.sin(2 * np.pi * 1000 * t)
+        buf = sig.reshape(-1, 1)  # single channel
+        config = _make_config()
+        result = engine.judge(config, buf, sr, mic_cal={},
+                              audio_file_path="/tmp/test.wav")
+        assert isinstance(result, JudgmentResult)
+        assert len(result.channel_results) == 1
+        assert result.channel_results[0].spl_pass is True
+
+    def test_spl_above_upper_limit_fails(self):
+        engine = self._make_engine()
+        sr = 44100.0
+        t = np.arange(int(sr * 3.0)) / sr
+        # Very loud signal → SPL well above 85 dB
+        sig = 10.0 * np.sin(2 * np.pi * 1000 * t)
+        buf = sig.reshape(-1, 1)
+        config = _make_config()
+        result = engine.judge(config, buf, sr, mic_cal={},
+                              audio_file_path="/tmp/test.wav")
+        assert result.channel_results[0].spl_pass is False
+        assert result.limit_pass is False
+
+    def test_spl_below_lower_limit_fails(self):
+        engine = self._make_engine()
+        sr = 44100.0
+        # Very quiet signal → SPL below 40 dB
+        buf = np.full((int(sr * 3), 1), 1e-10)
+        config = _make_config()
+        result = engine.judge(config, buf, sr, mic_cal={},
+                              audio_file_path="/tmp/test.wav")
+        assert result.channel_results[0].spl_pass is False
+
+    def test_fft_band_limit_pass(self):
+        engine = self._make_engine()
+        sr = 44100.0
+        t = np.arange(int(sr * 3.0)) / sr
+        sig = 0.01 * np.sin(2 * np.pi * 1000 * t)
+        buf = sig.reshape(-1, 1)
+        ch_cfg = _make_channel_config(0, fft_band_limits=[
+            {"freq": 1000.0, "lower": -100.0, "upper": 100.0},
+        ])
+        config = _make_config(channels=[ch_cfg])
+        result = engine.judge(config, buf, sr, mic_cal={},
+                              audio_file_path="/tmp/test.wav")
+        assert len(result.channel_results[0].fft_band_results) == 1
+        assert result.channel_results[0].fft_band_results[0].passed is True
+
+    def test_fft_band_limit_fail(self):
+        engine = self._make_engine()
+        sr = 44100.0
+        t = np.arange(int(sr * 3.0)) / sr
+        sig = 10.0 * np.sin(2 * np.pi * 1000 * t)
+        buf = sig.reshape(-1, 1)
+        ch_cfg = _make_channel_config(0, fft_band_limits=[
+            {"freq": 1000.0, "lower": -200.0, "upper": -100.0},  # impossibly low
+        ])
+        config = _make_config(channels=[ch_cfg])
+        result = engine.judge(config, buf, sr, mic_cal={},
+                              audio_file_path="/tmp/test.wav")
+        assert result.channel_results[0].fft_band_results[0].passed is False
+
+    def test_no_ai_configured(self):
+        engine = self._make_engine()
+        sr = 44100.0
+        t = np.arange(int(sr * 3.0)) / sr
+        amplitude = 20e-6 * 10 ** (60 / 20)
+        sig = amplitude * np.sin(2 * np.pi * 1000 * t)
+        buf = sig.reshape(-1, 1)
+        config = _make_config()
+        result = engine.judge(config, buf, sr, mic_cal={},
+                              audio_file_path="/tmp/test.wav")
+        assert result.ai_pass is None
+        assert result.ai_score is None
+
+    def test_all_pass_verdict(self):
+        engine = self._make_engine()
+        sr = 44100.0
+        t = np.arange(int(sr * 3.0)) / sr
+        amplitude = 20e-6 * 10 ** (60 / 20)
+        sig = amplitude * np.sin(2 * np.pi * 1000 * t)
+        buf = sig.reshape(-1, 1)
+        config = _make_config()
+        result = engine.judge(config, buf, sr, mic_cal={},
+                              audio_file_path="/tmp/test.wav")
+        # With no AI and SPL within limits → pass
+        assert result.overall == "合格"
+
+    def test_octave_band_limit_fail(self):
+        """A signal exceeding an octave band limit should produce a fail verdict."""
+        engine = self._make_engine()
+        sr = 44100.0
+        t = np.arange(int(sr * 3.0)) / sr
+        # Strong 1 kHz tone — should produce high energy in the 1 kHz band
+        amplitude = 20e-6 * 10 ** (80 / 20)  # ~80 dB
+        sig = amplitude * np.sin(2 * np.pi * 1000 * t)
+        buf = sig.reshape(-1, 1)
+        # Set octave band limit: 1 kHz upper = 50 dB (will be exceeded)
+        config = _make_config(
+            channels=[_make_channel_config(0,
+                oct_band_limits=[{"freq": 1000, "lower": -100, "upper": 50}],
+            )],
+        )
+        result = engine.judge(config, buf, sr, mic_cal={},
+                              audio_file_path="/tmp/test.wav")
+        assert result.limit_pass is False
+        assert result.overall == "不合格"
+        # Verify the band result details
+        ch_result = result.channel_results[0]
+        assert any(not br.passed for br in ch_result.oct_band_results)
+
+    def test_fft_band_limit_fail(self):
+        """A signal exceeding an FFT band limit should produce a fail verdict."""
+        engine = self._make_engine()
+        sr = 44100.0
+        t = np.arange(int(sr * 3.0)) / sr
+        amplitude = 20e-6 * 10 ** (80 / 20)
+        sig = amplitude * np.sin(2 * np.pi * 1000 * t)
+        buf = sig.reshape(-1, 1)
+        # Set FFT band limit: 1 kHz upper = 50 dB (will be exceeded)
+        config = _make_config(
+            channels=[_make_channel_config(0,
+                fft_band_limits=[{"freq": 1000, "lower": -100, "upper": 50}],
+            )],
+        )
+        result = engine.judge(config, buf, sr, mic_cal={},
+                              audio_file_path="/tmp/test.wav")
+        assert result.limit_pass is False
+
+    def test_analysis_window_extraction(self):
+        """Should analyze only the last analysis_duration seconds."""
+        engine = self._make_engine()
+        sr = 44100.0
+        config = _make_config(record_duration=5.0, analysis_duration=3.0)
+        # 5 seconds of audio, single channel
+        buf = np.random.randn(int(sr * 5), 1) * 0.001
+        result = engine.judge(config, buf, sr, mic_cal={},
+                              audio_file_path="/tmp/test.wav")
+        # Window should be (2.0, 5.0)
+        assert result.analysis_window[0] == pytest.approx(2.0, abs=0.1)
+        assert result.analysis_window[1] == pytest.approx(5.0, abs=0.1)
+
+    def test_multi_channel(self):
+        engine = self._make_engine()
+        sr = 44100.0
+        t = np.arange(int(sr * 3.0)) / sr
+        amplitude = 20e-6 * 10 ** (60 / 20)
+        ch0 = amplitude * np.sin(2 * np.pi * 1000 * t)
+        ch1 = amplitude * np.sin(2 * np.pi * 500 * t)
+        buf = np.column_stack([ch0, ch1])
+        config = _make_config(
+            selected_channels=[0, 1],
+            channels=[_make_channel_config(0), _make_channel_config(1)],
+        )
+        result = engine.judge(config, buf, sr, mic_cal={},
+                              audio_file_path="/tmp/test.wav")
+        assert len(result.channel_results) == 2
+
+
+class TestRejudge:
+    def test_custom_window(self):
+        mock_ai = MagicMock()
+        mock_ai.resolve_binding.return_value = None
+        engine = JudgmentEngine(mock_ai)
+        sr = 44100.0
+        buf = np.random.randn(int(sr * 5), 1) * 0.001
+        config = _make_config()
+        result = engine.rejudge(config, buf, sr, mic_cal={},
+                                audio_file_path="/tmp/test.wav",
+                                start_sec=1.0, end_sec=4.0)
+        assert result.analysis_window == pytest.approx((1.0, 4.0), abs=0.01)
+
+    def test_reversed_window_clamped(self):
+        """start_sec > end_sec should be clamped, not crash."""
+        mock_ai = MagicMock()
+        mock_ai.resolve_binding.return_value = None
+        engine = JudgmentEngine(mock_ai)
+        sr = 44100.0
+        buf = np.random.randn(int(sr * 5), 1) * 0.001
+        config = _make_config()
+        result = engine.rejudge(config, buf, sr, mic_cal={},
+                                audio_file_path="/tmp/test.wav",
+                                start_sec=4.0, end_sec=1.0)
+        # end_sec gets clamped to start_sec (empty window), should not crash
+        assert isinstance(result, JudgmentResult)
+
+    def test_out_of_bounds_clamped(self):
+        """Window beyond buffer length should be clamped."""
+        mock_ai = MagicMock()
+        mock_ai.resolve_binding.return_value = None
+        engine = JudgmentEngine(mock_ai)
+        sr = 44100.0
+        buf = np.random.randn(int(sr * 2), 1) * 0.001
+        config = _make_config()
+        result = engine.rejudge(config, buf, sr, mic_cal={},
+                                audio_file_path="/tmp/test.wav",
+                                start_sec=0.0, end_sec=100.0)
+        assert result.analysis_window[1] == pytest.approx(2.0, abs=0.1)
+
+
+class TestMissingChannelConfig:
+    def test_missing_config_uses_defaults(self):
+        """Selected channel with no config should use defaults, not skip."""
+        mock_ai = MagicMock()
+        mock_ai.resolve_binding.return_value = None
+        engine = JudgmentEngine(mock_ai)
+        sr = 44100.0
+        t = np.arange(int(sr * 3.0)) / sr
+        amplitude = 20e-6 * 10 ** (60 / 20)
+        sig = amplitude * np.sin(2 * np.pi * 1000 * t)
+        buf = sig.reshape(-1, 1)
+        # Config says channel 0 selected, but no channel configs provided
+        config = _make_config(selected_channels=[0], channels=[])
+        result = engine.judge(config, buf, sr, mic_cal={},
+                              audio_file_path="/tmp/test.wav")
+        # Should still analyze channel 0 using defaults, not skip it
+        assert len(result.channel_results) == 1
+
+
+class TestRunAiDeferral:
+    """_run_ai() intentionally returns (None, None) in JudgmentEngine.
+
+    AI integration requires full context (test_run_id, segments, etc.) that only
+    TestSession has. JudgmentEngine delegates AI to TestSession via the deferred
+    pattern — _run_ai() validates binding exists but does not call AiService.run_ai_analysis().
+    """
+
+    def test_ai_returns_none_when_no_config_id(self):
+        mock_ai = MagicMock()
+        engine = JudgmentEngine(mock_ai)
+        config = _make_config(config_id=None)
+        result = engine.judge(config, np.zeros((44100, 1)), 44100.0,
+                              mic_cal={}, audio_file_path="/tmp/test.wav")
+        assert result.ai_pass is None
+        assert result.ai_score is None
+
+    def test_ai_returns_none_when_binding_disabled(self):
+        mock_ai = MagicMock()
+        mock_ai.resolve_binding.return_value = {"enabled": False}
+        engine = JudgmentEngine(mock_ai)
+        config = _make_config()
+        result = engine.judge(config, np.zeros((44100 * 3, 1)), 44100.0,
+                              mic_cal={}, audio_file_path="/tmp/test.wav")
+        assert result.ai_pass is None
+        assert result.ai_score is None
+        # Confirm resolve_binding was called (integration validated)
+        mock_ai.resolve_binding.assert_called_once_with(config["config_id"])
+
+    def test_ai_returns_none_when_binding_enabled(self):
+        """Even with a valid binding, _run_ai defers to TestSession."""
+        mock_ai = MagicMock()
+        mock_ai.resolve_binding.return_value = {"enabled": True}
+        engine = JudgmentEngine(mock_ai)
+        config = _make_config()
+        result = engine.judge(config, np.zeros((44100 * 3, 1)), 44100.0,
+                              mic_cal={}, audio_file_path="/tmp/test.wav")
+        assert result.ai_pass is None
+        assert result.ai_score is None
+        # Confirm run_ai_analysis was NOT called (deferred to TestSession)
+        mock_ai.run_ai_analysis.assert_not_called()
