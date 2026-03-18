@@ -132,7 +132,51 @@ class TestSession:
             self._mic_cal,
             self._audio_file_path,
         )
+        result = self._run_ai(result)
         self._last_result = result
+        return result
+
+    def _run_ai(self, result: JudgmentResult) -> JudgmentResult:
+        """Patch AI result into judgment when an enabled binding exists."""
+        try:
+            binding = self._ai_service.resolve_binding(self.config_id)
+        except Exception:
+            return result
+
+        if not binding or not binding.get("enabled"):
+            return result
+
+        segments = [{
+            "segment_id": self._audio_data_id,
+            "role": "device_1",
+            "audio_path": self._audio_file_path,
+            "channels": self._config.get("selected_channels", []),
+            "duration_ms": int(self._analysis_duration * 1000),
+            "sample_rate": int(self._sample_rate),
+            "metadata": {},
+        }]
+        context = {
+            "config_id": self.config_id,
+            "workorder": self._workorder,
+        }
+        ai_runs_dir = os.path.abspath(os.path.join(self._audio_dir, "..", "ai_runs"))
+
+        try:
+            ai_result = self._ai_service.run_ai_analysis(
+                config_id=self.config_id,
+                test_run_id=uuid.uuid4().hex,
+                segments=segments,
+                context=context,
+                ai_runs_dir=ai_runs_dir,
+            )
+        except Exception:
+            return result
+
+        ai_pass = ai_result.get("pass")
+        ai_score = ai_result.get("score")
+        result.ai_pass = ai_pass
+        result.ai_score = ai_score
+        result.overall = "合格" if result.limit_pass and (ai_pass is True or ai_pass is None) else "不合格"
         return result
 
     def _save_wav(self, buffer: np.ndarray, sample_rate: float) -> str:
@@ -141,7 +185,7 @@ class TestSession:
         ts = datetime.now(_TZ8).strftime("%Y%m%d_%H%M%S")
         barcode = self._workorder.get("sn", "") or uuid.uuid4().hex[:8]
         filename = f"{self.config_id}_{ts}_{barcode}.wav"
-        filepath = os.path.join(self._audio_dir, filename)
+        filepath = os.path.abspath(os.path.join(self._audio_dir, filename))
         data = buffer.astype(np.float32)
         wavfile.write(filepath, int(sample_rate), data)
 

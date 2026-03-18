@@ -132,6 +132,73 @@ class TestTestSessionJudgment:
         assert isinstance(result, JudgmentResult)
         assert result.overall in ("合格", "不合格")
 
+    def test_run_judgment_runs_ai_analysis_when_binding_enabled(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = {"enabled": True}
+        ai.run_ai_analysis.return_value = {"pass": True, "score": 0.91}
+        session = TestSession(
+            config=_make_config(), bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+        )
+
+        result = session._run_judgment()
+
+        ai.run_ai_analysis.assert_called_once()
+        kwargs = ai.run_ai_analysis.call_args.kwargs
+        assert kwargs["config_id"] == session.config_id
+        assert kwargs["context"] == {"config_id": session.config_id, "workorder": session._workorder}
+        assert os.path.normpath(kwargs["ai_runs_dir"]).endswith(os.path.normpath("ai_runs"))
+        assert len(kwargs["segments"]) == 1
+        segment = kwargs["segments"][0]
+        assert segment["segment_id"] == session._audio_data_id
+        assert segment["role"] == "device_1"
+        assert segment["audio_path"] == session._audio_file_path
+        assert segment["channels"] == [0]
+        assert segment["duration_ms"] == 1000
+        assert segment["sample_rate"] == 44100
+        assert result.ai_pass is True
+        assert result.ai_score == 0.91
+        assert result.overall == "合格"
+
+    def test_run_judgment_keeps_limit_result_when_ai_analysis_fails(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = {"enabled": True}
+        ai.run_ai_analysis.side_effect = RuntimeError("AI unavailable")
+        session = TestSession(
+            config=_make_config(), bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+        )
+
+        result = session._run_judgment()
+
+        ai.run_ai_analysis.assert_called_once()
+        assert result.limit_pass is True
+        assert result.ai_pass is None
+        assert result.ai_score is None
+        assert result.overall == "合格"
+
 
 class TestTestSessionWavSave:
     def test_save_wav(self, tmp_path):
@@ -157,3 +224,20 @@ class TestTestSessionWavSave:
         assert rec.audio_data_id
         assert rec.record_date
         assert rec.labels is None
+
+    def test_save_wav_returns_absolute_path(self, tmp_path, monkeypatch):
+        monkeypatch.chdir(tmp_path)
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        session = TestSession(
+            config=_make_config(), bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "SN001", "model": "M1"},
+            audio_dir="audio",
+        )
+        sr = 44100.0
+        buf = np.random.randn(int(sr * 1), 1).astype(np.float32)
+
+        path = session._save_wav(buf, sr)
+
+        assert os.path.isabs(path)
+        assert os.path.isfile(path)
