@@ -155,7 +155,6 @@ class InputCalibrationModule(QWidget):
         bottom_lay.addStretch(1)
         root.addStretch(1)
         root.addWidget(bottom)
-
         self.init_channel_combobox()
 
     def init_fun(self):
@@ -163,6 +162,14 @@ class InputCalibrationModule(QWidget):
         self.reset_button.clicked.connect(self.clicked_reset_button)
         self.save_button.clicked.connect(self.save_mic_deviation_value)
         self.services.bus.refresh_channels.connect(self.init_channel_combobox)
+        self.combo_channel.currentIndexChanged.connect(self.on_channel_changed)
+
+    def on_channel_changed(self):
+        device_info = self.services.hss_service.load_io_devices()
+        mic_cal = device_info.get("mic_cal") or {}
+        channel_name = self.combo_channel.currentText()
+        value = mic_cal.get(channel_name, {}).get("deviation_value", "")
+        self.deviation_lineedit.setText(str(value))
 
     def init_channel_combobox(self):
         self.combo_channel.clear()
@@ -174,6 +181,7 @@ class InputCalibrationModule(QWidget):
         channel_count = int(raw)
         for i in range(1, channel_count + 1):
             self.combo_channel.addItem(f"In{i}", i - 1)
+        self.on_channel_changed()
 
     def save_mic_deviation_value(self):
         selected_channel = self.combo_channel.currentText()
