@@ -75,7 +75,6 @@ class TestManager(QObject):
 
         device_key = self._device_key(config)
         input_info = device_info.get("input", {})
-        device_index = input_info.get("id", 0)
         config_sr = float(config.get("input_device_samplerate", 44100))
         device_sr = float(input_info.get("default_samplerate", config_sr))
         if config_sr != device_sr:
@@ -99,7 +98,8 @@ class TestManager(QObject):
                     recorder._buffer = new_buf
         else:
             recorder = AudioRecorder(
-                device_index=device_index,
+                device_name=config.get("input_device_name", ""),
+                hostapi=config.get("input_device_hostapi", ""),
                 sample_rate=sample_rate,
                 n_channels=n_channels,
                 record_duration=record_duration,
@@ -115,15 +115,15 @@ class TestManager(QObject):
 
         output_name = config.get("output_device_name")
         if output_name:
-            output_info = device_info.get("output", {})
-            output_id = output_info.get("id", 0)
             output_sr = float(config.get("output_device_samplerate", sample_rate))
             monitor = AudioMonitor(
-                device_index=output_id,
+                device_name=config.get("output_device_name", ""),
+                hostapi=config.get("output_device_hostapi", ""),
                 sample_rate=output_sr,
                 monitor_channel=0,
             )
             recorder.chunk_ready.connect(lambda data, idx, m=monitor: m.feed(data))
+            monitor.error_occurred.connect(lambda msg, cid=config_id: self._on_error(cid, msg))
             self._monitors[config_id] = monitor
             monitor.start()
 

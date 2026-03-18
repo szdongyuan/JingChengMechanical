@@ -15,6 +15,21 @@ from PyQt6.QtCore import QThread, pyqtSignal
 os.environ.setdefault("SD_ENABLE_ASIO", "1")
 
 
+def _resolve_device_index(device_name: str, hostapi: str) -> int:
+    hostapis = sd.query_hostapis()
+    hostapi_idx = None
+    for i, api in enumerate(hostapis):
+        if api["name"] == hostapi:
+            hostapi_idx = i
+            break
+    if hostapi_idx is None:
+        raise ValueError(f"Host API not found: {hostapi}")
+    for i, dev in enumerate(sd.query_devices()):
+        if dev["name"] == device_name and dev["hostapi"] == hostapi_idx:
+            return i
+    raise ValueError(f"Device not found: {device_name} ({hostapi})")
+
+
 class AudioRecorder(QThread):
     """Record multi-channel audio into a pre-allocated ring buffer.
 
@@ -32,17 +47,19 @@ class AudioRecorder(QThread):
     recording_done = pyqtSignal()
     error_occurred = pyqtSignal(str)
 
-    CHUNK_DURATION = 0.05  # 50 ms default chunk size
+    CHUNK_DURATION = 0.05
 
     def __init__(
         self,
-        device_index: int,
+        device_name: str,
+        hostapi: str,
         sample_rate: float,
         n_channels: int,
         record_duration: float,
     ):
         super().__init__()
-        self._device_index = device_index
+        self._device_name = device_name
+        self._hostapi = hostapi
         self._sample_rate = sample_rate
         self._n_channels = n_channels
         self._record_duration = record_duration
@@ -60,8 +77,14 @@ class AudioRecorder(QThread):
         """Open sounddevice stream and drain chunks until done."""
         self._stop_flag = False
         try:
+            device_index = _resolve_device_index(self._device_name, self._hostapi)
+        except ValueError as exc:
+            self.error_occurred.emit(str(exc))
+            return
+
+        try:
             with sd.InputStream(
-                device=self._device_index,
+                device=device_index,
                 samplerate=self._sample_rate,
                 channels=self._n_channels,
                 dtype="float32",
@@ -93,14 +116,10 @@ class AudioRecorder(QThread):
         """Return the recorded audio (only the written portion)."""
         return self._buffer[: self._write_pos].copy()
 
-    def get_total_buffer(self) -> np.ndarray:
-        """Return the full pre-allocated buffer."""
-        return self._buffer
-
     def _sd_callback(self, indata, frames, time_info, status):
-        """sounddevice callback — runs on PortAudio thread."""
+        """sounddevice callback. Runs on the PortAudio thread."""
         if status:
-            pass
+            self.error_occurred.emit(f"PortAudio status: {status}")
         self._queue.put(indata.copy())
 
     def _feed_chunk(self, data: np.ndarray):

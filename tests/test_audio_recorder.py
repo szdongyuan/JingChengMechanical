@@ -1,6 +1,6 @@
 """Tests for AudioRecorder.
 
-sounddevice is mocked — these tests verify the recorder's state machine,
+sounddevice is mocked. These tests verify the recorder's state machine,
 ring buffer accumulation, and signal emission, not actual hardware I/O.
 """
 from __future__ import annotations
@@ -10,7 +10,7 @@ import importlib.util
 import numpy as np
 import pytest
 
-from app.service.analysis.audio_recorder import AudioRecorder
+from app.service.analysis.audio_recorder import AudioRecorder, _resolve_device_index
 
 
 HAS_PYTEST_QT = importlib.util.find_spec("pytestqt") is not None
@@ -19,26 +19,71 @@ HAS_PYTEST_QT = importlib.util.find_spec("pytestqt") is not None
 class TestAudioRecorderInit:
     def test_creates_ring_buffer(self):
         rec = AudioRecorder(
-            device_index=0, sample_rate=44100.0,
-            n_channels=2, record_duration=5.0,
+            device_name="TestMic",
+            hostapi="TestAPI",
+            sample_rate=44100.0,
+            n_channels=2,
+            record_duration=5.0,
         )
         assert rec._buffer.shape == (int(44100 * 5), 2)
         assert rec._write_pos == 0
 
     def test_default_chunk_duration(self):
         rec = AudioRecorder(
-            device_index=0, sample_rate=44100.0,
-            n_channels=1, record_duration=3.0,
+            device_name="TestMic",
+            hostapi="TestAPI",
+            sample_rate=44100.0,
+            n_channels=1,
+            record_duration=3.0,
         )
-        # Default chunk ~50 ms
         assert rec._chunk_samples == int(44100 * 0.05)
+
+    def test_stores_device_identity(self):
+        rec = AudioRecorder(
+            device_name="TestMic",
+            hostapi="TestAPI",
+            sample_rate=44100.0,
+            n_channels=1,
+            record_duration=3.0,
+        )
+        assert rec._device_name == "TestMic"
+        assert rec._hostapi == "TestAPI"
+
+
+class TestResolveDeviceIndex:
+    def test_returns_matching_device_index(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.service.analysis.audio_recorder.sd.query_hostapis",
+            lambda: [{"name": "Other"}, {"name": "TestAPI"}],
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.audio_recorder.sd.query_devices",
+            lambda: [
+                {"name": "MicA", "hostapi": 0},
+                {"name": "TestMic", "hostapi": 1},
+            ],
+        )
+
+        assert _resolve_device_index("TestMic", "TestAPI") == 1
+
+    def test_raises_when_hostapi_missing(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.service.analysis.audio_recorder.sd.query_hostapis",
+            lambda: [{"name": "Other"}],
+        )
+
+        with pytest.raises(ValueError, match="Host API not found: TestAPI"):
+            _resolve_device_index("TestMic", "TestAPI")
 
 
 class TestAudioRecorderBuffer:
     def test_feed_writes_to_buffer(self):
         rec = AudioRecorder(
-            device_index=0, sample_rate=44100.0,
-            n_channels=1, record_duration=1.0,
+            device_name="TestMic",
+            hostapi="TestAPI",
+            sample_rate=44100.0,
+            n_channels=1,
+            record_duration=1.0,
         )
         chunk = np.ones((100, 1), dtype=np.float32)
         rec._feed_chunk(chunk)
@@ -47,8 +92,11 @@ class TestAudioRecorderBuffer:
 
     def test_feed_multiple_chunks(self):
         rec = AudioRecorder(
-            device_index=0, sample_rate=44100.0,
-            n_channels=2, record_duration=1.0,
+            device_name="TestMic",
+            hostapi="TestAPI",
+            sample_rate=44100.0,
+            n_channels=2,
+            record_duration=1.0,
         )
         chunk1 = np.ones((50, 2), dtype=np.float32)
         chunk2 = np.ones((50, 2), dtype=np.float32) * 2.0
@@ -59,8 +107,11 @@ class TestAudioRecorderBuffer:
 
     def test_get_buffer_returns_written_portion(self):
         rec = AudioRecorder(
-            device_index=0, sample_rate=44100.0,
-            n_channels=1, record_duration=1.0,
+            device_name="TestMic",
+            hostapi="TestAPI",
+            sample_rate=44100.0,
+            n_channels=1,
+            record_duration=1.0,
         )
         chunk = np.ones((200, 1), dtype=np.float32)
         rec._feed_chunk(chunk)
@@ -69,22 +120,71 @@ class TestAudioRecorderBuffer:
 
     def test_buffer_does_not_overflow(self):
         rec = AudioRecorder(
-            device_index=0, sample_rate=100.0,
-            n_channels=1, record_duration=1.0,
+            device_name="TestMic",
+            hostapi="TestAPI",
+            sample_rate=100.0,
+            n_channels=1,
+            record_duration=1.0,
         )
-        # Buffer holds 100 samples. Feed 150.
         chunk = np.ones((150, 1), dtype=np.float32)
         rec._feed_chunk(chunk)
-        # Should clamp at buffer size
         assert rec._write_pos == 100
+
+
+class TestAudioRecorderErrors:
+    def test_sd_callback_emits_portaudio_status(self):
+        rec = AudioRecorder(
+            device_name="TestMic",
+            hostapi="TestAPI",
+            sample_rate=44100.0,
+            n_channels=1,
+            record_duration=1.0,
+        )
+        errors = []
+        rec.error_occurred.connect(errors.append)
+
+        rec._sd_callback(
+            np.ones((10, 1), dtype=np.float32),
+            10,
+            None,
+            "input overflow",
+        )
+
+        assert errors == ["PortAudio status: input overflow"]
+
+    def test_run_emits_error_when_device_is_unknown(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.service.analysis.audio_recorder.sd.query_hostapis",
+            lambda: [{"name": "Other"}],
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.audio_recorder.sd.query_devices",
+            lambda: [],
+        )
+        rec = AudioRecorder(
+            device_name="TestMic",
+            hostapi="TestAPI",
+            sample_rate=44100.0,
+            n_channels=1,
+            record_duration=1.0,
+        )
+        errors = []
+        rec.error_occurred.connect(errors.append)
+
+        rec.run()
+
+        assert errors == ["Host API not found: TestAPI"]
 
 
 @pytest.mark.skipif(not HAS_PYTEST_QT, reason="pytest-qt not installed")
 class TestAudioRecorderSignals:
     def test_chunk_ready_signal_emitted(self, qtbot):
         rec = AudioRecorder(
-            device_index=0, sample_rate=44100.0,
-            n_channels=1, record_duration=1.0,
+            device_name="TestMic",
+            hostapi="TestAPI",
+            sample_rate=44100.0,
+            n_channels=1,
+            record_duration=1.0,
         )
         signals = []
         rec.chunk_ready.connect(lambda data, idx: signals.append((data, idx)))
@@ -92,16 +192,18 @@ class TestAudioRecorderSignals:
         rec._feed_chunk(chunk)
         rec._emit_chunk()
         assert len(signals) == 1
-        assert signals[0][1] == 0  # chunk_index
+        assert signals[0][1] == 0
 
     def test_recording_done_signal(self, qtbot):
         rec = AudioRecorder(
-            device_index=0, sample_rate=100.0,
-            n_channels=1, record_duration=0.5,
+            device_name="TestMic",
+            hostapi="TestAPI",
+            sample_rate=100.0,
+            n_channels=1,
+            record_duration=0.5,
         )
         done = []
         rec.recording_done.connect(lambda: done.append(True))
-        # Fill buffer completely
         chunk = np.ones((50, 1), dtype=np.float32)
         rec._feed_chunk(chunk)
         assert rec._is_buffer_full()

@@ -1,4 +1,4 @@
-"""Audio monitoring playback — plays one channel to output device.
+"""Audio monitoring playback. Plays one channel to the output device.
 
 Receives multi-channel audio chunks and plays a single selected channel
 through the configured output device for real-time monitoring.
@@ -10,7 +10,9 @@ import queue
 
 import numpy as np
 import sounddevice as sd
-from PyQt6.QtCore import QThread
+from PyQt6.QtCore import QThread, pyqtSignal
+
+from app.service.analysis.audio_recorder import _resolve_device_index
 
 os.environ.setdefault("SD_ENABLE_ASIO", "1")
 
@@ -18,21 +20,25 @@ os.environ.setdefault("SD_ENABLE_ASIO", "1")
 class AudioMonitor(QThread):
     """Play a single channel to the output device for monitoring."""
 
+    error_occurred = pyqtSignal(str)
+
     def __init__(
         self,
-        device_index: int,
+        device_name: str,
+        hostapi: str,
         sample_rate: float,
         monitor_channel: int,
     ):
         super().__init__()
-        self._device_index = device_index
+        self._device_name = device_name
+        self._hostapi = hostapi
         self._sample_rate = sample_rate
         self._monitor_channel = monitor_channel
         self._queue: queue.Queue = queue.Queue(maxsize=50)
         self._stop_flag = False
 
     def feed(self, chunk: np.ndarray):
-        """Feed a multi-channel chunk for playback. Non-blocking, drops if full."""
+        """Feed a multi-channel chunk for playback. Drops if the queue is full."""
         mono = self._extract_channel(chunk)
         try:
             self._queue.put_nowait(mono)
@@ -43,8 +49,14 @@ class AudioMonitor(QThread):
         """Open output stream and play queued chunks."""
         self._stop_flag = False
         try:
+            device_index = _resolve_device_index(self._device_name, self._hostapi)
+        except ValueError as exc:
+            self.error_occurred.emit(str(exc))
+            return
+
+        try:
             with sd.OutputStream(
-                device=self._device_index,
+                device=device_index,
                 samplerate=self._sample_rate,
                 channels=1,
                 dtype="float32",
@@ -55,8 +67,10 @@ class AudioMonitor(QThread):
                         stream.write(mono)
                     except queue.Empty:
                         continue
-        except (sd.PortAudioError, Exception):
-            pass
+        except sd.PortAudioError as exc:
+            self.error_occurred.emit(f"Audio device error: {exc}")
+        except Exception as exc:
+            self.error_occurred.emit(f"Monitoring error: {exc}")
 
     def stop(self):
         self._stop_flag = True
