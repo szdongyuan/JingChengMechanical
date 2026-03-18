@@ -114,6 +114,29 @@ class TestLimitChecks:
                               audio_file_path="/tmp/test.wav")
         assert result.channel_results[0].fft_band_results[0].passed is False
 
+    def test_missing_channel_in_buffer_fails(self):
+        """Selected channel not in buffer should produce a fail verdict."""
+        engine = self._make_engine()
+        sr = 44100.0
+        buf = np.zeros((int(sr * 3), 1))
+        config = _make_config(selected_channels=[1])
+        result = engine.judge(config, buf, sr, mic_cal={}, audio_file_path="/tmp/test.wav")
+        assert result.limit_pass is False
+        assert result.overall == "不合格"
+
+    def test_mic_calibration_changes_spl(self):
+        """Mic calibration should affect the SPL calculation."""
+        engine = self._make_engine()
+        sr = 44100.0
+        t = np.arange(int(sr * 3.0)) / sr
+        sig = 0.001 * np.sin(2 * np.pi * 1000 * t)
+        buf = sig.reshape(-1, 1)
+        config = _make_config()
+        r_raw = engine.judge(config, buf, sr, mic_cal={}, audio_file_path="/tmp/test.wav")
+        mic_cal = {"In1": {"deviation_value": "2.0"}}
+        r_cal = engine.judge(config, buf, sr, mic_cal=mic_cal, audio_file_path="/tmp/test.wav")
+        assert r_cal.channel_results[0].spl_db > r_raw.channel_results[0].spl_db
+
     def test_no_ai_configured(self):
         engine = self._make_engine()
         sr = 44100.0
@@ -163,7 +186,7 @@ class TestLimitChecks:
         ch_result = result.channel_results[0]
         assert any(not br.passed for br in ch_result.oct_band_results)
 
-    def test_fft_band_limit_fail(self):
+    def test_fft_band_limit_fail_high_amplitude(self):
         """A signal exceeding an FFT band limit should produce a fail verdict."""
         engine = self._make_engine()
         sr = 44100.0
@@ -312,3 +335,20 @@ class TestRunAiDeferral:
         assert result.ai_score is None
         # Confirm run_ai_analysis was NOT called (deferred to TestSession)
         mock_ai.run_ai_analysis.assert_not_called()
+
+    def test_ai_returns_none_when_resolve_binding_throws(self):
+        """If resolve_binding raises, judgment should still produce a result."""
+        mock_ai = MagicMock()
+        mock_ai.resolve_binding.side_effect = RuntimeError("db unavailable")
+        engine = JudgmentEngine(mock_ai)
+        config = _make_config()
+        result = engine.judge(
+            config,
+            np.zeros((44100 * 3, 1)),
+            44100.0,
+            mic_cal={},
+            audio_file_path="/tmp/test.wav",
+        )
+        assert result.ai_pass is None
+        assert result.ai_score is None
+        assert isinstance(result, JudgmentResult)

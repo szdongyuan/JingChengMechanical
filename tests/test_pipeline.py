@@ -72,6 +72,17 @@ class TestAnalysisPipeline:
         result = p.process_chunk(chunk, elapsed_time=0.0)
         assert result["stft"] is None
 
+    def test_stft_accumulation_across_chunks(self):
+        """Two sub-nfft chunks should accumulate and produce STFT on second call."""
+        cfg = _make_config(stft_nfft=1024, stft_overlap=0.5)
+        p = AnalysisPipeline(channel_index=0, channel_config=cfg, sample_rate=44100.0)
+        chunk1 = np.random.randn(600).astype(np.float32)
+        chunk2 = np.random.randn(600).astype(np.float32)
+        r1 = p.process_chunk(chunk1, elapsed_time=0.0)
+        assert r1["stft"] is None
+        r2 = p.process_chunk(chunk2, elapsed_time=0.05)
+        assert r2["stft"] is not None
+
     def test_mic_calibration_applied(self):
         """Non-zero sensitivity should change the SPL value."""
         cfg = _make_config()

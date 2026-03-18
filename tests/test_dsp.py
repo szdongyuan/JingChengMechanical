@@ -221,6 +221,12 @@ class TestComputeOctaveBands:
         assert 1000.0 in OCTAVE_CENTER_FREQS
         assert 31.5 in OCTAVE_CENTER_FREQS
 
+    def test_empty_signal_returns_empty_arrays(self):
+        """Empty input should return empty octave band outputs instead of failing."""
+        centers, levels = compute_octave_bands(np.array([]), 44100.0, weighting="Z")
+        assert centers.size == 0
+        assert levels.size == 0
+
 
 class TestApplyMicCalibration:
     def test_scales_signal(self):

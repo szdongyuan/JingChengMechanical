@@ -165,6 +165,9 @@ class JudgmentEngine:
                 oct_band_results=oct_bands,
             ))
 
+        if selected and not channel_results:
+            all_pass = False
+
         # AI analysis
         ai_pass, ai_score = self._run_ai(config, audio_file_path)
 
@@ -252,7 +255,10 @@ class JudgmentEngine:
         if config_id is None:
             return None, None
 
-        binding = self._ai.resolve_binding(config_id)
+        try:
+            binding = self._ai.resolve_binding(config_id)
+        except Exception:
+            return None, None
         if binding is None or not binding.get("enabled"):
             return None, None
 

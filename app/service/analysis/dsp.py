@@ -218,6 +218,9 @@ def compute_octave_bands(signal: np.ndarray, sample_rate: float,
         Only bands whose upper edge is below Nyquist are returned.
     """
     sig = np.asarray(signal, dtype=np.float64)
+    if sig.size == 0:
+        return np.array([]), np.array([])
+
     nyquist = sample_rate / 2.0
     n = sig.size
     freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
