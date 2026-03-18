@@ -130,6 +130,82 @@ class TestAudioRecorderBuffer:
         rec._feed_chunk(chunk)
         assert rec._write_pos == 100
 
+    def test_extend_duration_grows_buffer_and_preserves_recorded_audio(self):
+        rec = AudioRecorder(
+            device_name="TestMic",
+            hostapi="TestAPI",
+            sample_rate=100.0,
+            n_channels=1,
+            record_duration=1.0,
+        )
+        chunk = np.arange(10, dtype=np.float32).reshape(-1, 1)
+
+        rec._feed_chunk(chunk)
+        rec.extend_duration(2.0)
+
+        assert rec._record_duration == 2.0
+        assert rec._buffer.shape == (200, 1)
+        assert rec._write_pos == 10
+        np.testing.assert_array_equal(rec._buffer[:10], chunk)
+
+    def test_attach_session_returns_atomic_boundary_and_extends_total_duration(self):
+        rec = AudioRecorder(
+            device_name="TestMic",
+            hostapi="TestAPI",
+            sample_rate=100.0,
+            n_channels=1,
+            record_duration=3.0,
+        )
+        pre_attach = np.arange(20, dtype=np.float32).reshape(-1, 1)
+        rec._feed_chunk(pre_attach)
+        rec._emit_chunk()
+        rec._chunk_index = 4
+        rec._emitted_chunk_index = 4
+
+        snapshot = rec.attach_session(record_duration=5.0)
+
+        assert snapshot.chunk_index == 4
+        assert snapshot.sample_index == 20
+        assert rec._record_duration == 5.2
+        assert rec._buffer.shape == (520, 1)
+        np.testing.assert_array_equal(rec.get_buffer_from(snapshot), rec.get_buffer()[20:])
+
+    def test_attach_session_uses_last_emitted_boundary_when_chunk_is_written_but_not_emitted(self):
+        rec = AudioRecorder(
+            device_name="TestMic",
+            hostapi="TestAPI",
+            sample_rate=100.0,
+            n_channels=1,
+            record_duration=4.0,
+        )
+        first_chunk = np.arange(10, dtype=np.float32).reshape(-1, 1)
+        second_chunk = np.arange(10, 20, dtype=np.float32).reshape(-1, 1)
+        rec._feed_chunk(first_chunk)
+        rec._emit_chunk()
+        rec._feed_chunk(second_chunk)
+
+        snapshot = rec.attach_session(record_duration=2.0)
+
+        assert snapshot.chunk_index == 1
+        assert snapshot.sample_index == 10
+        assert rec._record_duration == 4.0
+
+    def test_get_buffer_from_returns_only_post_attach_audio(self):
+        rec = AudioRecorder(
+            device_name="TestMic",
+            hostapi="TestAPI",
+            sample_rate=100.0,
+            n_channels=1,
+            record_duration=4.0,
+        )
+        rec._feed_chunk(np.arange(12, dtype=np.float32).reshape(-1, 1))
+        rec._emit_chunk()
+        snapshot = rec.attach_session(record_duration=2.0)
+        post_attach = np.arange(12, 18, dtype=np.float32).reshape(-1, 1)
+        rec._feed_chunk(post_attach)
+
+        np.testing.assert_array_equal(rec.get_buffer_from(snapshot), post_attach)
+
 
 class TestAudioRecorderErrors:
     def test_sd_callback_emits_portaudio_status(self):

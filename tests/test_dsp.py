@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import app.service.analysis.dsp as dsp_module
 from app.service.analysis.dsp import (
     OCTAVE_CENTER_FREQS,
     a_weighting,
@@ -14,6 +15,17 @@ from app.service.analysis.dsp import (
     compute_spl,
     compute_stft,
 )
+
+
+def _level_for_center(
+    centers: np.ndarray,
+    levels: np.ndarray,
+    target_freq: float,
+) -> float:
+    """Return the level for a specific IEC center frequency."""
+    idx = np.where(np.isclose(centers, target_freq))[0]
+    assert idx.size == 1
+    return float(levels[idx[0]])
 
 
 class TestAWeighting:
@@ -198,14 +210,19 @@ class TestComputeOctaveBands:
         assert len(centers) > 0
         assert centers[-1] <= sr / 2
 
-    def test_z_weighting_white_noise(self):
-        """White noise should have roughly equal levels across bands (Z-weighted)."""
+    def test_z_weighting_white_noise_rises_with_bandwidth(self):
+        """A filter bank should report higher broadband levels for wider bands."""
         sr = 44100.0
         rng = np.random.default_rng(42)
-        sig = rng.standard_normal(int(sr * 2.0))
+        sig = rng.standard_normal(int(sr * 5.0))
         centers, levels = compute_octave_bands(sig, sr, weighting="Z")
-        mid_levels = levels[2:-2]
-        assert mid_levels.max() - mid_levels.min() < 15
+
+        level_100 = _level_for_center(centers, levels, 100.0)
+        level_1000 = _level_for_center(centers, levels, 1000.0)
+        level_5000 = _level_for_center(centers, levels, 5000.0)
+
+        assert level_1000 > level_100 + 6.0
+        assert level_5000 > level_1000 + 4.0
 
     def test_a_weighting_applied(self):
         """A-weighted octave levels at low freq should be less than Z-weighted."""
@@ -226,6 +243,46 @@ class TestComputeOctaveBands:
         centers, levels = compute_octave_bands(np.array([]), 44100.0, weighting="Z")
         assert centers.size == 0
         assert levels.size == 0
+
+    @pytest.mark.parametrize("n_samples", [8, 16])
+    def test_short_non_empty_signal_does_not_crash(self, n_samples):
+        """Very short non-empty inputs should return octave levels without pad errors."""
+        sample_rate = 48000.0
+        rng = np.random.default_rng(123)
+        sig = rng.standard_normal(n_samples)
+
+        try:
+            centers, levels = compute_octave_bands(sig, sample_rate, weighting="Z")
+        except ValueError as exc:
+            pytest.fail(f"compute_octave_bands raised for n={n_samples}: {exc}")
+
+        factor = 2.0 ** (1.0 / 6.0)
+        expected_centers = OCTAVE_CENTER_FREQS[OCTAVE_CENTER_FREQS * factor < sample_rate / 2.0]
+        np.testing.assert_array_equal(centers, expected_centers)
+        assert levels.shape == centers.shape
+        assert np.all(np.isfinite(levels) | np.isneginf(levels))
+
+    def test_reuses_filter_bank_for_same_sample_rate(self, monkeypatch):
+        """Repeated calls at the same sample rate should reuse precomputed SOS filters."""
+        original_butter = dsp_module.scipy_signal.butter
+        butter_calls = 0
+
+        def counting_butter(*args, **kwargs):
+            nonlocal butter_calls
+            butter_calls += 1
+            return original_butter(*args, **kwargs)
+
+        monkeypatch.setattr(dsp_module.scipy_signal, "butter", counting_butter)
+
+        sample_rate_a = 47987.0
+        sample_rate_b = 32001.0
+        sig = np.random.default_rng(456).standard_normal(2400)
+
+        centers_a, _ = compute_octave_bands(sig, sample_rate_a, weighting="Z")
+        compute_octave_bands(sig, sample_rate_a, weighting="A")
+        centers_b, _ = compute_octave_bands(sig, sample_rate_b, weighting="Z")
+
+        assert butter_calls == len(centers_a) + len(centers_b)
 
 
 class TestApplyMicCalibration:

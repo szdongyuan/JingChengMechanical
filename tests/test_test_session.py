@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import os
+import re
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import numpy as np
 
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.test_session import TestSession
+from app.service.config_service import _CHANNEL_DEFAULTS
 from model.audio_data_table import AudioDataTable
 
 
@@ -76,6 +79,26 @@ class TestTestSessionInit:
 
 
 class TestTestSessionProcessing:
+    def test_setup_pipelines_uses_channel_defaults_when_selected_channel_config_missing(self):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        config = _make_config()
+        config["selected_channels"] = [1]
+        config["channels"] = []
+        session = TestSession(
+            config=config, bus=bus, ai_service=ai,
+            mic_cal={}, workorder={},
+            audio_dir="/tmp/audio",
+        )
+
+        session._setup_pipelines()
+
+        assert len(session._pipelines) == 1
+        pipeline = session._pipelines[0]
+        assert pipeline.channel_index == 1
+        assert pipeline._cfg["stft_nfft"] == _CHANNEL_DEFAULTS["stft_nfft"]
+        assert pipeline._cfg["spl_weighting"] == _CHANNEL_DEFAULTS["spl_weighting"]
+
     def test_on_chunk_emits_analysis_signals(self):
         bus = _make_mock_bus()
         ai = MagicMock()
@@ -109,6 +132,30 @@ class TestTestSessionProcessing:
 
         session._on_session_done_cb.assert_called_once_with(1)
 
+    def test_on_chunk_ignores_pre_attach_chunks_and_uses_attach_boundary_elapsed_time(self):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        config = _make_config()
+        config["record_duration"] = 0.1
+        session = TestSession(
+            config=config, bus=bus, ai_service=ai,
+            mic_cal={}, workorder={},
+            audio_dir="/tmp/audio",
+        )
+        session._setup_pipelines()
+        session._on_session_done_cb = MagicMock()
+        session.attach_to_recorder(chunk_index=4)
+
+        chunk = np.random.randn(2048, 1).astype(np.float32)
+
+        session._on_chunk(chunk, 3)
+        bus.recording_progress.emit.assert_not_called()
+        session._on_chunk(chunk, 4)
+        session._on_chunk(chunk, 5)
+        bus.recording_progress.emit.assert_any_call(1, 0.05)
+        bus.recording_progress.emit.assert_any_call(1, 0.1)
+        session._on_session_done_cb.assert_called_once_with(1)
+
 
 class TestTestSessionJudgment:
     def test_run_judgment_produces_result(self, tmp_path):
@@ -135,8 +182,69 @@ class TestTestSessionJudgment:
     def test_run_judgment_runs_ai_analysis_when_binding_enabled(self, tmp_path):
         bus = _make_mock_bus()
         ai = MagicMock()
+        ai.resolve_binding.return_value = {
+            "enabled": True,
+            "analysis_window_offset_ms": 250,
+        }
+        ai.run_ai_analysis.return_value = {
+            "module_status": "success",
+            "ai_label": "PASS",
+            "score": 0.91,
+            "error_summary": None,
+        }
+        session = TestSession(
+            config=_make_config(), bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+            analysis_window=(0.25, 1.25),
+        )
+
+        result = session._run_judgment()
+
+        ai.run_ai_analysis.assert_called_once()
+        kwargs = ai.run_ai_analysis.call_args.kwargs
+        assert kwargs["config_id"] == session.config_id
+        assert re.fullmatch(r"run_1_\d+", kwargs["test_run_id"])
+        assert kwargs["context"] == {"config_id": session.config_id, "workorder": session._workorder}
+        assert os.path.normpath(kwargs["ai_runs_dir"]).endswith(os.path.normpath("ai_runs"))
+        assert len(kwargs["segments"]) == 1
+        segment = kwargs["segments"][0]
+        assert segment["segment_id"] == session._audio_data_id
+        assert segment["role"] == "device_1"
+        assert segment["audio_path"] == session._audio_file_path
+        assert segment["channels"] == [0]
+        assert segment["duration_ms"] == 1000
+        assert segment["sample_rate"] == 44100
+        assert kwargs["window_info"] == {
+            "window_overridden": False,
+            "default_window_offset_ms": 250,
+            "default_window_duration_ms": 1000,
+            "final_window_offset_ms": 250,
+            "final_window_duration_ms": 1000,
+        }
+        assert result.ai_pass is True
+        assert result.ai_score == 0.91
+        assert result.overall == "合格"
+
+    def test_run_judgment_marks_result_failed_when_ai_label_is_fail(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
         ai.resolve_binding.return_value = {"enabled": True}
-        ai.run_ai_analysis.return_value = {"pass": True, "score": 0.91}
+        ai.run_ai_analysis.return_value = {
+            "module_status": "success",
+            "ai_label": "FAIL",
+            "score": 0.12,
+            "error_summary": None,
+        }
         session = TestSession(
             config=_make_config(), bus=bus, ai_service=ai,
             mic_cal={}, workorder={"sn": "test", "model": "M"},
@@ -154,22 +262,45 @@ class TestTestSessionJudgment:
 
         result = session._run_judgment()
 
-        ai.run_ai_analysis.assert_called_once()
-        kwargs = ai.run_ai_analysis.call_args.kwargs
-        assert kwargs["config_id"] == session.config_id
-        assert kwargs["context"] == {"config_id": session.config_id, "workorder": session._workorder}
-        assert os.path.normpath(kwargs["ai_runs_dir"]).endswith(os.path.normpath("ai_runs"))
-        assert len(kwargs["segments"]) == 1
-        segment = kwargs["segments"][0]
-        assert segment["segment_id"] == session._audio_data_id
-        assert segment["role"] == "device_1"
-        assert segment["audio_path"] == session._audio_file_path
-        assert segment["channels"] == [0]
-        assert segment["duration_ms"] == 1000
-        assert segment["sample_rate"] == 44100
-        assert result.ai_pass is True
-        assert result.ai_score == 0.91
+        assert result.ai_pass is False
+        assert result.ai_score == 0.12
+        assert result.overall == "不合格"
+
+    def test_run_judgment_logs_warning_and_preserves_limit_result_when_ai_envelope_not_success(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = {"enabled": True}
+        ai.run_ai_analysis.return_value = {
+            "module_status": "timeout",
+            "ai_label": None,
+            "score": None,
+            "error_summary": "Process timed out",
+        }
+        session = TestSession(
+            config=_make_config(), bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+        )
+
+        result = session._run_judgment()
+
+        assert result.limit_pass is True
+        assert result.ai_pass is None
+        assert result.ai_score is None
         assert result.overall == "合格"
+        bus.log.emit.assert_called_with(
+            "[TestSession] WARNING: AI analysis did not succeed for config=1: "
+            "module_status=timeout ai_label=None error=Process timed out"
+        )
 
     def test_run_judgment_keeps_limit_result_when_ai_analysis_fails(self, tmp_path):
         bus = _make_mock_bus()
@@ -198,6 +329,217 @@ class TestTestSessionJudgment:
         assert result.ai_pass is None
         assert result.ai_score is None
         assert result.overall == "合格"
+        bus.log.emit.assert_called_with("[TestSession] WARNING: AI analysis failed for config=1: AI unavailable")
+
+    def test_run_judgment_logs_warning_when_ai_binding_resolution_fails(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.side_effect = RuntimeError("binding lookup failed")
+        session = TestSession(
+            config=_make_config(), bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+        )
+
+        result = session._run_judgment()
+
+        assert result.limit_pass is True
+        assert result.ai_pass is None
+        assert result.ai_score is None
+        assert result.overall == "合格"
+        bus.log.emit.assert_called_with(
+            "[TestSession] WARNING: failed to resolve AI binding for config=1: binding lookup failed"
+        )
+
+    def test_rejudge_reruns_ai_and_patches_result(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = {"enabled": True}
+        ai.run_ai_analysis.return_value = {
+            "module_status": "success",
+            "ai_label": "FAIL",
+            "score": 0.12,
+            "error_summary": None,
+        }
+        session = TestSession(
+            config=_make_config(), bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+        session._audio_file_path = str(tmp_path / "existing.wav")
+        session._audio_data_id = "audio-123"
+        session._judgment = MagicMock()
+        session._judgment.rejudge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+        )
+
+        result = session.rejudge(0.1, 0.5)
+
+        session._judgment.rejudge.assert_called_once_with(
+            session._config,
+            session._buffer,
+            session._sample_rate,
+            session._mic_cal,
+            session._audio_file_path,
+            0.1,
+            0.5,
+        )
+        ai.run_ai_analysis.assert_called_once()
+        assert result is not None
+        assert result is session.last_result
+        assert result.ai_pass is False
+        assert result.ai_score == 0.12
+        assert result.overall == "不合格"
+
+    def test_rejudge_uses_same_ai_envelope_normalization_as_run_judgment(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = {"enabled": True}
+        ai.run_ai_analysis.return_value = {
+            "module_status": "success",
+            "ai_label": "PASS",
+            "score": 0.88,
+            "error_summary": None,
+        }
+        session = TestSession(
+            config=_make_config(), bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+        session._audio_file_path = str(tmp_path / "existing.wav")
+        session._audio_data_id = "audio-123"
+        session._judgment = MagicMock()
+        session._judgment.rejudge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+        )
+
+        result = session.rejudge(0.1, 0.5)
+
+        assert result is not None
+        assert result.ai_pass is True
+        assert result.ai_score == 0.88
+        assert result.overall == "合格"
+
+    def test_rejudge_passes_selected_window_to_ai_analysis(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = {
+            "enabled": True,
+            "analysis_window_offset_ms": 250,
+        }
+        ai.run_ai_analysis.return_value = {
+            "module_status": "success",
+            "ai_label": "PASS",
+            "score": 0.88,
+            "error_summary": None,
+        }
+        session = TestSession(
+            config=_make_config(), bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+        session._audio_file_path = str(tmp_path / "existing.wav")
+        session._audio_data_id = "audio-123"
+        session._judgment = MagicMock()
+        session._judgment.rejudge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+            analysis_window=(0.1, 0.5),
+        )
+
+        session.rejudge(0.1, 0.5)
+
+        kwargs = ai.run_ai_analysis.call_args.kwargs
+        assert kwargs["segments"][0]["duration_ms"] == 400
+        assert kwargs["window_info"] == {
+            "window_overridden": True,
+            "default_window_offset_ms": 250,
+            "default_window_duration_ms": 1000,
+            "final_window_offset_ms": 100,
+            "final_window_duration_ms": 400,
+        }
+
+    def test_repeated_ai_attempts_in_same_session_reuse_test_run_id(self, tmp_path, monkeypatch):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = {"enabled": True}
+        ai.run_ai_analysis.return_value = {
+            "module_status": "success",
+            "ai_label": "PASS",
+            "score": 0.91,
+            "error_summary": None,
+        }
+        session = TestSession(
+            config=_make_config(), bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+            analysis_window=(1.0, 2.0),
+        )
+        session._judgment.rejudge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+            analysis_window=(0.1, 0.5),
+        )
+
+        base = datetime(2026, 3, 18, 12, 0, 0, tzinfo=timezone(timedelta(hours=8)))
+        timestamps = iter([
+            base,
+            base + timedelta(milliseconds=1),
+            base + timedelta(milliseconds=2),
+            base + timedelta(milliseconds=25),
+        ])
+
+        class _FixedDateTime:
+            @staticmethod
+            def now(tz=None):
+                current = next(timestamps)
+                if tz is None:
+                    return current.replace(tzinfo=None)
+                return current.astimezone(tz)
+
+        monkeypatch.setattr("app.service.analysis.test_session.datetime", _FixedDateTime)
+
+        session._run_judgment()
+        first_run_id = ai.run_ai_analysis.call_args.kwargs["test_run_id"]
+        session.rejudge(0.1, 0.5)
+        second_run_id = ai.run_ai_analysis.call_args.kwargs["test_run_id"]
+
+        assert re.fullmatch(r"run_1_\d+", first_run_id)
+        assert second_run_id == first_run_id
 
 
 class TestTestSessionWavSave:

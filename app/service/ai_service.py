@@ -202,6 +202,7 @@ class AiService:
         segments: list[dict],
         context: dict,
         params: dict,
+        window_info: dict | None = None,
     ) -> dict:
         return {
             "protocol_version": 1,
@@ -211,6 +212,7 @@ class AiService:
             "segments": segments,
             "context": context,
             "params": params,
+            "window_info": window_info or {},
         }
 
     # ── Executor (oneshot process) ──────────────────────────
@@ -453,6 +455,7 @@ class AiService:
             segments=segments,
             context=context,
             params=params,
+            window_info=window_info,
         )
         with open(request_json_path, "w", encoding="utf-8") as f:
             json.dump(request_data, f, ensure_ascii=False, indent=2)

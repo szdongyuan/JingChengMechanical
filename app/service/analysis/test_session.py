@@ -14,7 +14,7 @@ import numpy as np
 from scipy.io import wavfile
 
 from app.service.analysis.frames import JudgmentResult
-from app.service.analysis.judgment import JudgmentEngine
+from app.service.analysis.judgment import JudgmentEngine, _runtime_channel_defaults
 from app.service.analysis.pipeline import AnalysisPipeline
 from model.audio_data_table import AudioDataTable
 
@@ -53,7 +53,12 @@ class TestSession:
         self._last_result: JudgmentResult | None = None
         self._audio_file_path: str | None = None
         self._audio_data_id: str | None = None
+        self._test_run_id: str | None = None
         self._finished: bool = False
+        self._attach_chunk_index: int = 0
+        self._attach_snapshot: Any | None = None
+        self._attach_pending: bool = False
+        self._pending_attach_chunks: list[tuple[np.ndarray, int]] = []
         self._on_session_done_cb: Callable[[int], Any] | None = None
 
         # Connection refs set by TestManager for signal disconnection
@@ -71,7 +76,7 @@ class TestSession:
         for ch_idx in selected:
             ch_cfg = channels_cfg.get(ch_idx)
             if ch_cfg is None:
-                continue
+                ch_cfg = _runtime_channel_defaults(ch_idx)
             sensitivity = self._get_sensitivity(ch_idx)
             self._pipelines.append(
                 AnalysisPipeline(
@@ -82,9 +87,33 @@ class TestSession:
                 )
             )
 
+    def prepare_for_attach(self):
+        """Buffer chunks until the recorder-owned attach boundary is known."""
+        self._attach_pending = True
+        self._pending_attach_chunks = []
+
+    def attach_to_recorder(self, *, chunk_index: int, snapshot: Any | None = None):
+        """Record the chunk boundary where this session becomes live."""
+        self._attach_chunk_index = max(0, int(chunk_index))
+        self._attach_snapshot = snapshot
+        pending_chunks = self._pending_attach_chunks
+        self._pending_attach_chunks = []
+        self._attach_pending = False
+        for pending_chunk, pending_index in pending_chunks:
+            self._process_chunk(pending_chunk, pending_index)
+
     def _on_chunk(self, chunk: np.ndarray, chunk_index: int):
         """Process one audio chunk through all pipelines and emit results."""
-        elapsed = chunk_index * 0.05
+        if self._attach_pending:
+            self._pending_attach_chunks.append((chunk.copy(), chunk_index))
+            return
+        self._process_chunk(chunk, chunk_index)
+
+    def _process_chunk(self, chunk: np.ndarray, chunk_index: int):
+        if chunk_index < self._attach_chunk_index:
+            return
+
+        elapsed = max(0, chunk_index - self._attach_chunk_index + 1) * 0.05
 
         for pipeline in self._pipelines:
             ch_idx = pipeline.channel_index
@@ -140,18 +169,26 @@ class TestSession:
         """Patch AI result into judgment when an enabled binding exists."""
         try:
             binding = self._ai_service.resolve_binding(self.config_id)
-        except Exception:
+        except Exception as exc:
+            self._bus.log.emit(
+                f"[TestSession] WARNING: failed to resolve AI binding for config={self.config_id}: {exc}"
+            )
             return result
 
         if not binding or not binding.get("enabled"):
             return result
 
+        analysis_start, analysis_end = result.analysis_window
+        default_window_offset_ms = int(binding.get("analysis_window_offset_ms", 0) or 0)
+        default_window_duration_ms = int(self._analysis_duration * 1000)
+        final_window_offset_ms = int(analysis_start * 1000)
+        final_window_duration_ms = max(0, int((analysis_end - analysis_start) * 1000))
         segments = [{
             "segment_id": self._audio_data_id,
             "role": "device_1",
             "audio_path": self._audio_file_path,
             "channels": self._config.get("selected_channels", []),
-            "duration_ms": int(self._analysis_duration * 1000),
+            "duration_ms": final_window_duration_ms or default_window_duration_ms,
             "sample_rate": int(self._sample_rate),
             "metadata": {},
         }]
@@ -160,22 +197,54 @@ class TestSession:
             "workorder": self._workorder,
         }
         ai_runs_dir = os.path.abspath(os.path.join(self._audio_dir, "..", "ai_runs"))
+        test_run_id = self._get_or_create_test_run_id()
+        effective_final_window_duration_ms = final_window_duration_ms or default_window_duration_ms
+        window_info = {
+            "window_overridden": (
+                final_window_offset_ms != default_window_offset_ms
+                or effective_final_window_duration_ms != default_window_duration_ms
+            ),
+            "default_window_offset_ms": default_window_offset_ms,
+            "default_window_duration_ms": default_window_duration_ms,
+            "final_window_offset_ms": final_window_offset_ms,
+            "final_window_duration_ms": effective_final_window_duration_ms,
+        }
 
         try:
-            ai_result = self._ai_service.run_ai_analysis(
+            envelope = self._ai_service.run_ai_analysis(
                 config_id=self.config_id,
-                test_run_id=uuid.uuid4().hex,
+                test_run_id=test_run_id,
                 segments=segments,
                 context=context,
                 ai_runs_dir=ai_runs_dir,
+                window_info=window_info,
             )
-        except Exception:
+        except Exception as exc:
+            self._bus.log.emit(
+                f"[TestSession] WARNING: AI analysis failed for config={self.config_id}: {exc}"
+            )
             return result
 
-        ai_pass = ai_result.get("pass")
-        ai_score = ai_result.get("score")
+        module_status = envelope.get("module_status")
+        if module_status != "success":
+            self._bus.log.emit(
+                f"[TestSession] WARNING: AI analysis did not succeed for config={self.config_id}: "
+                f"module_status={module_status} ai_label={envelope.get('ai_label')} "
+                f"error={envelope.get('error_summary')}"
+            )
+            return result
+
+        ai_label = envelope.get("ai_label")
+        ai_pass = None
+        if isinstance(ai_label, str):
+            label = ai_label.strip().upper()
+            if label == "PASS":
+                ai_pass = True
+            elif label == "FAIL":
+                ai_pass = False
+
         result.ai_pass = ai_pass
-        result.ai_score = ai_score
+        result.ai_score = envelope.get("score")
         result.overall = "合格" if result.limit_pass and (ai_pass is True or ai_pass is None) else "不合格"
         return result
 
@@ -215,8 +284,16 @@ class TestSession:
             start_sec,
             end_sec,
         )
+        result = self._run_ai(result)
         self._last_result = result
         return result
+
+    def _get_or_create_test_run_id(self) -> str:
+        """Return the stable AI test_run_id for this session."""
+        if self._test_run_id is None:
+            timestamp_ms = int(datetime.now(_TZ8).timestamp() * 1000)
+            self._test_run_id = f"run_{self.config_id}_{timestamp_ms}"
+        return self._test_run_id
 
     def _get_sensitivity(self, channel_index: int) -> float:
         """Get mic sensitivity (Pa/V) for a channel from mic_cal."""

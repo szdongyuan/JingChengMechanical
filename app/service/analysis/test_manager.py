@@ -63,17 +63,6 @@ class TestManager(QObject):
         mic_cal = device_info.get("mic_cal", {})
         audio_dir = os.path.join(base_dir, "data", "audio")
 
-        session = TestSession(
-            config=config,
-            bus=self._bus,
-            ai_service=self._services.ai_service,
-            mic_cal=mic_cal,
-            workorder=workorder,
-            audio_dir=audio_dir,
-        )
-        session._setup_pipelines()
-        session._on_session_done_cb = self._on_session_done
-
         device_key = self._device_key(config)
         input_info = device_info.get("input", {})
         config_sr = float(config.get("input_device_samplerate", 44100))
@@ -87,21 +76,18 @@ class TestManager(QObject):
         n_channels = int(input_info.get("channel_count", 1))
         record_duration = config.get("record_duration", 5.0)
 
+        session = TestSession(
+            config=config,
+            bus=self._bus,
+            ai_service=self._services.ai_service,
+            mic_cal=mic_cal,
+            workorder=workorder,
+            audio_dir=audio_dir,
+        )
+        session._on_session_done_cb = self._on_session_done
+
         if device_key in self._shared_recorders:
             recorder = self._shared_recorders[device_key]
-            if record_duration > recorder._record_duration and not recorder.isRunning():
-                recorder._record_duration = record_duration
-                new_total = int(sample_rate * record_duration)
-                old_buf = recorder._buffer
-                if new_total > old_buf.shape[0]:
-                    new_buf = np.zeros((new_total, n_channels), dtype=np.float32)
-                    new_buf[: old_buf.shape[0]] = old_buf
-                    recorder._buffer = new_buf
-            elif record_duration > recorder._record_duration:
-                self._bus.log.emit(
-                    f"[TestManager] WARNING: recorder already running, cannot extend "
-                    f"buffer from {recorder._record_duration}s to {record_duration}s"
-                )
         else:
             recorder = AudioRecorder(
                 device_name=config.get("input_device_name", ""),
@@ -112,10 +98,21 @@ class TestManager(QObject):
             )
             self._shared_recorders[device_key] = recorder
 
+        session._sample_rate = recorder._sample_rate
+        session._setup_pipelines()
+
         session._chunk_conn = session._on_chunk
         session._done_lambda = lambda cid=config_id: self._on_recording_done(cid)
         session._error_lambda = lambda msg, cid=config_id: self._on_error(cid, msg)
+        prepare_for_attach = getattr(session, "prepare_for_attach", None)
+        if callable(prepare_for_attach):
+            prepare_for_attach()
         recorder.chunk_ready.connect(session._chunk_conn)
+        attach_snapshot = recorder.attach_session(record_duration=record_duration)
+        session.attach_to_recorder(
+            chunk_index=attach_snapshot.chunk_index,
+            snapshot=attach_snapshot,
+        )
         recorder.recording_done.connect(session._done_lambda)
         recorder.error_occurred.connect(session._error_lambda)
 
@@ -163,7 +160,7 @@ class TestManager(QObject):
             self._disconnect_session_signals(session, rec, mon)
 
         if session is not None and rec is not None and not silent:
-            partial_buf = rec.get_buffer()
+            partial_buf = rec.get_buffer_from(getattr(session, "_attach_snapshot", None))
             if isinstance(partial_buf, np.ndarray) and partial_buf.size > 0:
                 session._buffer = partial_buf
                 session._sample_rate = rec._sample_rate
@@ -219,7 +216,7 @@ class TestManager(QObject):
         rec = self._recorders.get(config_id)
         mon = self._monitors.get(config_id)
         if rec is not None:
-            session._buffer = rec.get_buffer()
+            session._buffer = rec.get_buffer_from(getattr(session, "_attach_snapshot", None))
             session._sample_rate = rec._sample_rate
             self._disconnect_session_signals(session, rec, mon)
 

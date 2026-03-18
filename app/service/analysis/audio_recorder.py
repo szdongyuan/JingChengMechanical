@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import os
 import queue
+import threading
+from dataclasses import dataclass
 
 import numpy as np
 import sounddevice as sd
@@ -28,6 +30,12 @@ def _resolve_device_index(device_name: str, hostapi: str) -> int:
         if dev["name"] == device_name and dev["hostapi"] == hostapi_idx:
             return i
     raise ValueError(f"Device not found: {device_name} ({hostapi})")
+
+
+@dataclass(frozen=True)
+class RecorderAttachSnapshot:
+    chunk_index: int
+    sample_index: int
 
 
 class AudioRecorder(QThread):
@@ -69,9 +77,50 @@ class AudioRecorder(QThread):
         self._write_pos = 0
         self._chunk_samples = int(sample_rate * self.CHUNK_DURATION)
         self._chunk_index = 0
+        self._emitted_chunk_index = 0
+        self._emitted_sample_index = 0
+        self._state_lock = threading.Lock()
 
         self._queue: queue.Queue = queue.Queue()
         self._stop_flag = False
+
+    def extend_duration(self, record_duration: float):
+        """Grow the backing buffer to a longer duration if needed."""
+        with self._state_lock:
+            self._ensure_duration_locked(record_duration)
+
+    def attach_session(self, *, record_duration: float) -> RecorderAttachSnapshot:
+        """Atomically capture a late-attach boundary and ensure sufficient capacity."""
+        with self._state_lock:
+            sample_index = self._emitted_sample_index
+            chunk_index = self._emitted_chunk_index
+            total_duration = (sample_index / self._sample_rate) + float(record_duration)
+            self._ensure_duration_locked(total_duration)
+            return RecorderAttachSnapshot(
+                chunk_index=chunk_index,
+                sample_index=sample_index,
+            )
+
+    def get_buffer_from(self, snapshot: RecorderAttachSnapshot | None) -> np.ndarray:
+        """Return audio written at or after a recorder-owned attach snapshot."""
+        with self._state_lock:
+            start_index = 0 if snapshot is None else int(snapshot.sample_index)
+            start = max(0, min(start_index, self._write_pos))
+            return self._buffer[start : self._write_pos].copy()
+
+    def _ensure_duration_locked(self, record_duration: float):
+        if record_duration <= self._record_duration:
+            return
+
+        new_total = int(self._sample_rate * record_duration)
+        if new_total <= self._buffer.shape[0]:
+            self._record_duration = record_duration
+            return
+
+        new_buffer = np.zeros((new_total, self._n_channels), dtype=np.float32)
+        new_buffer[: self._write_pos] = self._buffer[: self._write_pos]
+        self._buffer = new_buffer
+        self._record_duration = record_duration
 
     def run(self):
         """Open sounddevice stream and drain chunks until done."""
@@ -114,7 +163,8 @@ class AudioRecorder(QThread):
 
     def get_buffer(self) -> np.ndarray:
         """Return the recorded audio (only the written portion)."""
-        return self._buffer[: self._write_pos].copy()
+        with self._state_lock:
+            return self._buffer[: self._write_pos].copy()
 
     def _sd_callback(self, indata, frames, time_info, status):
         """sounddevice callback. Runs on the PortAudio thread."""
@@ -124,24 +174,32 @@ class AudioRecorder(QThread):
 
     def _feed_chunk(self, data: np.ndarray):
         """Write chunk to ring buffer."""
-        n_samples = data.shape[0]
-        space = self._buffer.shape[0] - self._write_pos
-        if space <= 0:
-            return
-        n_write = min(n_samples, space)
-        self._buffer[self._write_pos : self._write_pos + n_write] = data[:n_write]
-        self._write_pos += n_write
+        with self._state_lock:
+            n_samples = data.shape[0]
+            space = self._buffer.shape[0] - self._write_pos
+            if space <= 0:
+                return
+            n_write = min(n_samples, space)
+            self._buffer[self._write_pos : self._write_pos + n_write] = data[:n_write]
+            self._write_pos += n_write
 
     def _emit_chunk(self):
         """Emit the latest chunk via signal."""
-        start = max(0, self._write_pos - self._chunk_samples)
-        chunk = self._buffer[start : self._write_pos]
-        self.chunk_ready.emit(chunk, self._chunk_index)
-        self._chunk_index += 1
+        with self._state_lock:
+            start = max(0, self._write_pos - self._chunk_samples)
+            end = self._write_pos
+            chunk = self._buffer[start:end].copy()
+            chunk_index = self._chunk_index
+            self._chunk_index += 1
+            self._emitted_chunk_index = self._chunk_index
+            self._emitted_sample_index = end
+        self.chunk_ready.emit(chunk, chunk_index)
 
     def _is_buffer_full(self) -> bool:
-        return self._write_pos >= self._buffer.shape[0]
+        with self._state_lock:
+            return self._write_pos >= self._buffer.shape[0]
 
     @property
     def elapsed_seconds(self) -> float:
-        return self._write_pos / self._sample_rate
+        with self._state_lock:
+            return self._write_pos / self._sample_rate

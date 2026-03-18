@@ -4,6 +4,8 @@ All functions operate on numpy arrays and have no side effects.
 """
 from __future__ import annotations
 
+from functools import lru_cache
+
 import numpy as np
 from scipy import signal as scipy_signal
 
@@ -202,9 +204,39 @@ OCTAVE_CENTER_FREQS = np.array([
 ], dtype=np.float64)
 
 
+@lru_cache(maxsize=None)
+def _octave_filter_bank(sample_rate: float) -> tuple[np.ndarray, tuple[np.ndarray, ...], int]:
+    """Return valid octave centers, precomputed SOS filters, and default padlen."""
+    nyquist = sample_rate / 2.0
+    factor = 2.0 ** (1.0 / 6.0)
+    valid_mask = OCTAVE_CENTER_FREQS * factor < nyquist
+    centers = OCTAVE_CENTER_FREQS[valid_mask]
+
+    sos_filters: list[np.ndarray] = []
+    default_padlen: int | None = None
+    for fc in centers:
+        f_lo = fc / factor
+        f_hi = fc * factor
+        sos = scipy_signal.butter(
+            4,
+            [f_lo, f_hi],
+            btype="bandpass",
+            fs=sample_rate,
+            output="sos",
+        )
+        if default_padlen is None:
+            n_sections = sos.shape[0]
+            ntaps = 2 * n_sections + 1
+            ntaps -= min((sos[:, 2] == 0).sum(), (sos[:, 5] == 0).sum())
+            default_padlen = int(ntaps * 3)
+        sos_filters.append(sos)
+
+    return centers, tuple(sos_filters), default_padlen or 0
+
+
 def compute_octave_bands(signal: np.ndarray, sample_rate: float,
                          weighting: str) -> tuple[np.ndarray, np.ndarray]:
-    """Compute 1/3-octave band levels.
+    """Compute 1/3-octave band levels with an IEC-style filter bank.
 
     Parameters
     ----------
@@ -221,36 +253,23 @@ def compute_octave_bands(signal: np.ndarray, sample_rate: float,
     if sig.size == 0:
         return np.array([]), np.array([])
 
-    nyquist = sample_rate / 2.0
-    n = sig.size
-    freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
-    spectrum = np.fft.rfft(sig)
-    power = (np.abs(spectrum) / n) ** 2
+    centers, sos_filters, default_padlen = _octave_filter_bank(float(sample_rate))
+    levels = np.empty(len(centers), dtype=np.float64)
+    padlen = min(default_padlen, sig.size - 1) if sig.size > 1 else 0
 
-    if weighting == "A":
-        w_db = a_weighting(freqs)
-    elif weighting == "C":
-        w_db = c_weighting(freqs)
-    else:
-        w_db = np.zeros_like(freqs)
-    w_linear = 10.0 ** (w_db / 10.0)
-    power = power * w_linear
-
-    factor = 2.0 ** (1.0 / 6.0)
-    valid_mask = OCTAVE_CENTER_FREQS * factor < nyquist
-    centers = OCTAVE_CENTER_FREQS[valid_mask]
-    levels = np.empty(len(centers))
-
-    for i, fc in enumerate(centers):
-        f_lo = fc / factor
-        f_hi = fc * factor
-        band_mask = (freqs >= f_lo) & (freqs < f_hi)
-        band_width = f_hi - f_lo
-        band_power_density = power[band_mask].sum() / band_width
-        if band_power_density > 0:
-            levels[i] = 10.0 * np.log10(band_power_density)
-        else:
+    for i, (fc, sos) in enumerate(zip(centers, sos_filters, strict=False)):
+        filtered = scipy_signal.sosfiltfilt(sos, sig, padlen=padlen)
+        rms = np.sqrt(np.mean(filtered ** 2))
+        if rms <= 0.0:
             levels[i] = -np.inf
+            continue
+
+        level_db = 20.0 * np.log10(rms)
+        if weighting == "A":
+            level_db += float(a_weighting(np.array([fc]))[0])
+        elif weighting == "C":
+            level_db += float(c_weighting(np.array([fc]))[0])
+        levels[i] = level_db
 
     return centers, levels
 
