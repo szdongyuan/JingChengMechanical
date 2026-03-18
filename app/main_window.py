@@ -67,6 +67,8 @@ class MainWindow(QMainWindow):
         try:
             # 关闭 DB 长连接
             self.services.db.close()
+            # 视频关闭
+            self.video.stop_camera()
         except Exception:
             pass
         super().closeEvent(event)

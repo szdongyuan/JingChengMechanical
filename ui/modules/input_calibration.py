@@ -169,7 +169,7 @@ class InputCalibrationModule(QWidget):
         mic_cal = device_info.get("mic_cal") or {}
         channel_name = self.combo_channel.currentText()
         value = mic_cal.get(channel_name, {}).get("deviation_value", "")
-        self.deviation_lineedit.setText(str(value))
+        self.deviation_lineedit.setText(f"{value} Pa/V" if value != "" else "")
 
     def init_channel_combobox(self):
         self.combo_channel.clear()

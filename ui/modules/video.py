@@ -1,10 +1,52 @@
 from __future__ import annotations
 
 import cv2
+import time
 
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import QThread, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QImage, QPixmap
 from PyQt6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
+
+
+class CameraThread(QThread):
+    frame_ready = pyqtSignal(object)
+    opened = pyqtSignal()
+    failed = pyqtSignal(str)
+    disconnected = pyqtSignal(str)
+
+    def __init__(self, camera_index=0):
+        super().__init__()
+        self.camera_index = camera_index
+        self.running = False
+        self.cap = None
+
+    def run(self):
+        self.running = True
+        self.cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+        if not self.cap.isOpened():
+            self.failed.emit("摄像头打开失败")
+            return
+
+        # 设置一个常用预览分辨率
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        self.opened.emit()
+
+        while self.running:
+            ret, frame = self.cap.read()
+            if not ret:
+                self.disconnected.emit("摄像头已断开")
+                break
+            # 更新图像
+            self.frame_ready.emit(frame)
+            time.sleep(0.03)
+
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+
+    def stop(self):
+        self.running = False
 
 
 class VideoModule(QWidget):
@@ -13,9 +55,7 @@ class VideoModule(QWidget):
     def __init__(self, services):
         super().__init__()
         self.services = services
-        self.cap = None
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_frame)
+        self.camera_thread = None
 
         self.init_ui()
         self.start_camera()
@@ -40,33 +80,37 @@ class VideoModule(QWidget):
 
     def start_camera(self):
         # Windows 下优先用 DirectShow 打开 USB
-        self.timer.stop()
-        if self.cap is not None:
-            self.cap.release()
-            self.cap = None
-        self.cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        self.stop_camera()
+        self.camera_thread = CameraThread(0)
+        self.camera_thread.frame_ready.connect(self.update_frame)
+        self.camera_thread.opened.connect(self.on_camera_opened)
+        self.camera_thread.failed.connect(self.on_camera_failed)
+        self.camera_thread.disconnected.connect(self.on_camera_disconnected)
+        self.camera_thread.start()
 
-        if self.cap.isOpened():
-            self.services.bus.log.emit("[Video] 摄像头打开成功")
-        else:
-            self.services.bus.log.emit("[Video] 摄像头打开失败")
-            self.set_text("摄像头打开失败")
-            return
+    def stop_camera(self):
+        if self.camera_thread is not None:
+            self.camera_thread.stop()
+            self.camera_thread.wait()
+            self.camera_thread = None
 
-        # 设置一个常用预览分辨率
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-        self.timer.start(30)
+    @pyqtSlot()
+    def on_camera_opened(self):
+        self.services.bus.log.emit("[Video] 摄像头打开成功")
 
-    def update_frame(self):
-        if self.cap is None:
-            return
-        ret, frame = self.cap.read()
-        if not ret:
-            self.timer.stop()
-            self.cap.release()
-            self.cap = None
-            self.set_text("摄像头已断开")
+    @pyqtSlot(str)
+    def on_camera_failed(self, message):
+        self.services.bus.log.emit("[Video] 摄像头打开失败")
+        self.set_text(message)
+
+    @pyqtSlot(str)
+    def on_camera_disconnected(self, message):
+        self.services.bus.log.emit("[Video] 摄像头已断开")
+        self.set_text(message)
+
+    @pyqtSlot(object)
+    def update_frame(self, frame):
+        if frame is None:
             return
 
         # OpenCV 是 BGR，Qt 显示前要转成 RGB
@@ -91,9 +135,7 @@ class VideoModule(QWidget):
     def refresh_camera(self, _link=None):
         self.start_camera()
 
-    def closeEvent(self, event):
-        # 关闭页面时释放摄像头
-        self.timer.stop()
-        if self.cap is not None:
-            self.cap.release()
-        super().closeEvent(event)
+    # def closeEvent(self, event):
+    #     # 关闭页面时释放摄像头
+    #     self.stop_camera()
+    #     super().closeEvent(event)
