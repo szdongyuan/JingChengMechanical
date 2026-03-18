@@ -89,6 +89,26 @@ class TestTestSessionProcessing:
         session._on_chunk(chunk, 0)
         bus.spl_updated.emit.assert_called()
 
+    def test_on_chunk_notifies_when_session_duration_expires(self):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        config = _make_config()
+        config["record_duration"] = 0.1
+        session = TestSession(
+            config=config, bus=bus, ai_service=ai,
+            mic_cal={}, workorder={},
+            audio_dir="/tmp/audio",
+        )
+        session._setup_pipelines()
+        session._on_session_done_cb = MagicMock()
+
+        chunk = np.random.randn(2048, 1).astype(np.float32)
+
+        session._on_chunk(chunk, 2)
+        session._on_chunk(chunk, 3)
+
+        session._on_session_done_cb.assert_called_once_with(1)
+
 
 class TestTestSessionJudgment:
     def test_run_judgment_produces_result(self, tmp_path):

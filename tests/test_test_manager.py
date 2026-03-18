@@ -15,12 +15,21 @@ class _DummySignal:
     def connect(self, callback):
         self._callbacks.append(callback)
 
+    def disconnect(self, callback):
+        self._callbacks.remove(callback)
+
+    def emit(self, *args, **kwargs):
+        for callback in list(self._callbacks):
+            callback(*args, **kwargs)
+
 
 class _FakeSession:
     def __init__(self, config, bus, ai_service, mic_cal, workorder, audio_dir):
         self.config_id = config["config_id"]
         self._buffer = None
         self._sample_rate = None
+        self._finished = False
+        self._on_session_done_cb = None
 
     def _setup_pipelines(self):
         return None
@@ -540,62 +549,194 @@ class TestSampleRateMismatch:
 
 
 class TestSharedRecorderMaxDuration:
-    def test_shared_recorder_extends_duration(self):
-        """When a second config starts with longer duration, recorder buffer extends."""
+    def test_shared_recorder_extends_duration_before_start(self, monkeypatch):
+        """When a second config starts with longer duration before start, buffer extends."""
         bus = _mock_bus()
         services = _mock_services(bus)
-        services.config_service.load_config.return_value = {
-            "config_id": 1,
-            "config_name": "Short",
-            "record_duration": 3.0,
-            "analysis_duration": 1.0,
-            "selected_channels": [0],
-            "channels": [{
-                "channel_index": 0,
-                "stft_nfft": 1024,
-                "stft_overlap": 0.5,
-                "spl_weighting": "Z",
-                "spl_time_constant": 0.125,
-                "spl_upper_limit": 85.0,
-                "spl_lower_limit": 40.0,
-                "fft_band_limits": [],
-                "oct_weighting": "Z",
-                "oct_band_limits": [],
-            }],
-            "input_device_name": "Mic",
-            "input_device_hostapi": "MME",
-            "input_device_samplerate": 44100,
-            "output_device_name": None,
-        }
+        services.config_service.load_config.side_effect = [
+            {
+                "config_id": 1,
+                "config_name": "Short",
+                "record_duration": 3.0,
+                "analysis_duration": 1.0,
+                "selected_channels": [0],
+                "channels": [{
+                    "channel_index": 0,
+                    "stft_nfft": 1024,
+                    "stft_overlap": 0.5,
+                    "spl_weighting": "Z",
+                    "spl_time_constant": 0.125,
+                    "spl_upper_limit": 85.0,
+                    "spl_lower_limit": 40.0,
+                    "fft_band_limits": [],
+                    "oct_weighting": "Z",
+                    "oct_band_limits": [],
+                }],
+                "input_device_name": "Mic",
+                "input_device_hostapi": "MME",
+                "input_device_samplerate": 44100,
+                "output_device_name": None,
+            },
+            {
+                "config_id": 2,
+                "config_name": "Long",
+                "record_duration": 5.0,
+                "analysis_duration": 2.0,
+                "selected_channels": [0],
+                "channels": [{
+                    "channel_index": 0,
+                    "stft_nfft": 1024,
+                    "stft_overlap": 0.5,
+                    "spl_weighting": "Z",
+                    "spl_time_constant": 0.125,
+                    "spl_upper_limit": 85.0,
+                    "spl_lower_limit": 40.0,
+                    "fft_band_limits": [],
+                    "oct_weighting": "Z",
+                    "oct_band_limits": [],
+                }],
+                "input_device_name": "Mic",
+                "input_device_hostapi": "MME",
+                "input_device_samplerate": 44100,
+                "output_device_name": None,
+            },
+        ]
+
+        class FakeRecorder:
+            instances = []
+
+            def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+                self._sample_rate = sample_rate
+                self._record_duration = record_duration
+                self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
+                self.chunk_ready = _DummySignal()
+                self.recording_done = _DummySignal()
+                self.error_occurred = _DummySignal()
+                self._running = False
+                FakeRecorder.instances.append(self)
+
+            def isRunning(self):
+                return self._running
+
+            def start(self):
+                return None
+
+            def stop(self):
+                self._running = False
+
+            def wait(self, timeout):
+                return True
+
+            def get_buffer(self):
+                return self._buffer
+
+        monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
+        monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
+
         mgr = TestManager(bus, services)
         mgr.start({"config_id": 1, "sn": "SN1"})
-        services.config_service.load_config.return_value = {
-            "config_id": 2,
-            "config_name": "Long",
-            "record_duration": 5.0,
-            "analysis_duration": 2.0,
-            "selected_channels": [0],
-            "channels": [{
-                "channel_index": 0,
-                "stft_nfft": 1024,
-                "stft_overlap": 0.5,
-                "spl_weighting": "Z",
-                "spl_time_constant": 0.125,
-                "spl_upper_limit": 85.0,
-                "spl_lower_limit": 40.0,
-                "fft_band_limits": [],
-                "oct_weighting": "Z",
-                "oct_band_limits": [],
-            }],
-            "input_device_name": "Mic",
-            "input_device_hostapi": "MME",
-            "input_device_samplerate": 44100,
-            "output_device_name": None,
-        }
         mgr.start({"config_id": 2, "sn": "SN2"})
+
         assert mgr._recorders[1] is mgr._recorders[2]
         shared_rec = mgr._recorders[1]
         assert shared_rec._record_duration == 5.0
+        assert shared_rec._buffer.shape[0] == 44100 * 5
+
+    def test_shared_recorder_does_not_extend_duration_while_running(self, monkeypatch):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        services.config_service.load_config.side_effect = [
+            {
+                "config_id": 1,
+                "config_name": "Short",
+                "record_duration": 3.0,
+                "analysis_duration": 1.0,
+                "selected_channels": [0],
+                "channels": [{
+                    "channel_index": 0,
+                    "stft_nfft": 1024,
+                    "stft_overlap": 0.5,
+                    "spl_weighting": "Z",
+                    "spl_time_constant": 0.125,
+                    "spl_upper_limit": 85.0,
+                    "spl_lower_limit": 40.0,
+                    "fft_band_limits": [],
+                    "oct_weighting": "Z",
+                    "oct_band_limits": [],
+                }],
+                "input_device_name": "Mic",
+                "input_device_hostapi": "MME",
+                "input_device_samplerate": 44100,
+                "output_device_name": None,
+            },
+            {
+                "config_id": 2,
+                "config_name": "Long",
+                "record_duration": 5.0,
+                "analysis_duration": 2.0,
+                "selected_channels": [0],
+                "channels": [{
+                    "channel_index": 0,
+                    "stft_nfft": 1024,
+                    "stft_overlap": 0.5,
+                    "spl_weighting": "Z",
+                    "spl_time_constant": 0.125,
+                    "spl_upper_limit": 85.0,
+                    "spl_lower_limit": 40.0,
+                    "fft_band_limits": [],
+                    "oct_weighting": "Z",
+                    "oct_band_limits": [],
+                }],
+                "input_device_name": "Mic",
+                "input_device_hostapi": "MME",
+                "input_device_samplerate": 44100,
+                "output_device_name": None,
+            },
+        ]
+
+        class FakeRecorder:
+            instances = []
+
+            def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+                self._sample_rate = sample_rate
+                self._record_duration = record_duration
+                self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
+                self.chunk_ready = _DummySignal()
+                self.recording_done = _DummySignal()
+                self.error_occurred = _DummySignal()
+                self._running = False
+                FakeRecorder.instances.append(self)
+
+            def isRunning(self):
+                return self._running
+
+            def start(self):
+                self._running = True
+
+            def stop(self):
+                self._running = False
+
+            def wait(self, timeout):
+                return True
+
+            def get_buffer(self):
+                return self._buffer
+
+        monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
+        monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
+
+        mgr = TestManager(bus, services)
+        mgr.start({"config_id": 1, "sn": "SN1"})
+        shared_rec = mgr._recorders[1]
+        old_shape = shared_rec._buffer.shape
+
+        mgr.start({"config_id": 2, "sn": "SN2"})
+
+        assert mgr._recorders[1] is mgr._recorders[2]
+        assert shared_rec._record_duration == 3.0
+        assert shared_rec._buffer.shape == old_shape
+        calls = [call.args[0] for call in bus.log.emit.call_args_list]
+        assert any("WARNING" in msg and "cannot extend buffer" in msg for msg in calls)
 
 
 class TestUserStopPartialSave:
@@ -618,3 +759,110 @@ class TestUserStopPartialSave:
         assert session._buffer is partial_buf
         assert session._sample_rate == 44100.0
         session._save_wav.assert_called_once_with(partial_buf, 44100.0)
+
+
+class TestSignalDisconnection:
+    def test_stop_disconnects_session_and_monitor_callbacks(self, monkeypatch):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        services.config_service.load_config.return_value = {
+            "config_id": 1,
+            "config_name": "Test",
+            "record_duration": 2.0,
+            "analysis_duration": 1.0,
+            "selected_channels": [0],
+            "channels": [{
+                "channel_index": 0,
+                "stft_nfft": 1024,
+                "stft_overlap": 0.5,
+                "spl_weighting": "Z",
+                "spl_time_constant": 0.125,
+                "spl_upper_limit": 85.0,
+                "spl_lower_limit": 40.0,
+                "fft_band_limits": [],
+                "oct_weighting": "Z",
+                "oct_band_limits": [],
+            }],
+            "input_device_name": "InputMic",
+            "input_device_hostapi": "InputAPI",
+            "input_device_samplerate": 44100,
+            "output_device_name": "OutputSpeaker",
+            "output_device_hostapi": "OutputAPI",
+            "output_device_samplerate": 48000,
+        }
+
+        class FakeRecorder:
+            instances = []
+
+            def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+                self._sample_rate = sample_rate
+                self._record_duration = record_duration
+                self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
+                self.chunk_ready = _DummySignal()
+                self.recording_done = _DummySignal()
+                self.error_occurred = _DummySignal()
+                self._running = False
+                FakeRecorder.instances.append(self)
+
+            def isRunning(self):
+                return self._running
+
+            def start(self):
+                self._running = True
+
+            def stop(self):
+                self._running = False
+
+            def wait(self, timeout):
+                return True
+
+            def get_buffer(self):
+                return self._buffer
+
+        class FakeMonitor:
+            instances = []
+
+            def __init__(self, *, device_name, hostapi, sample_rate, monitor_channel):
+                self.error_occurred = _DummySignal()
+                FakeMonitor.instances.append(self)
+
+            def feed(self, chunk):
+                return None
+
+            def start(self):
+                return None
+
+            def stop(self):
+                return None
+
+            def wait(self, timeout):
+                return True
+
+        monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
+        monkeypatch.setattr("app.service.analysis.test_manager.AudioMonitor", FakeMonitor)
+        monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
+
+        mgr = TestManager(bus, services)
+        mgr.start({"config_id": 1, "sn": "SN1"})
+
+        recorder = FakeRecorder.instances[0]
+        monitor = FakeMonitor.instances[0]
+        session = mgr._sessions[1]
+        done_lambda = getattr(session, "_done_lambda", None)
+        error_lambda = getattr(session, "_error_lambda", None)
+        monitor_lambda = getattr(session, "_monitor_lambda", None)
+        monitor_error_lambda = getattr(session, "_monitor_error_lambda", None)
+
+        assert session._on_chunk in recorder.chunk_ready._callbacks
+        assert done_lambda in recorder.recording_done._callbacks
+        assert error_lambda in recorder.error_occurred._callbacks
+        assert monitor_lambda in recorder.chunk_ready._callbacks
+        assert monitor_error_lambda in monitor.error_occurred._callbacks
+
+        mgr.stop(config_id=1)
+
+        assert session._on_chunk not in recorder.chunk_ready._callbacks
+        assert done_lambda not in recorder.recording_done._callbacks
+        assert error_lambda not in recorder.error_occurred._callbacks
+        assert monitor_lambda not in recorder.chunk_ready._callbacks
+        assert monitor_error_lambda not in monitor.error_occurred._callbacks

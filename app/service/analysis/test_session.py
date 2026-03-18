@@ -6,7 +6,9 @@ from __future__ import annotations
 
 import os
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import numpy as np
 from scipy.io import wavfile
@@ -51,6 +53,15 @@ class TestSession:
         self._last_result: JudgmentResult | None = None
         self._audio_file_path: str | None = None
         self._audio_data_id: str | None = None
+        self._finished: bool = False
+        self._on_session_done_cb: Callable[[int], Any] | None = None
+
+        # Connection refs set by TestManager for signal disconnection
+        self._chunk_conn: Callable | None = None
+        self._done_lambda: Callable | None = None
+        self._error_lambda: Callable | None = None
+        self._monitor_lambda: Callable | None = None
+        self._monitor_error_lambda: Callable | None = None
 
     def _setup_pipelines(self):
         """Create one AnalysisPipeline per selected channel."""
@@ -96,6 +107,11 @@ class TestSession:
                 self._bus.fft_updated.emit(self.config_id, ch_idx, result["fft"])
 
         self._bus.recording_progress.emit(self.config_id, elapsed)
+
+        if not self._finished and elapsed >= self._record_duration:
+            self._finished = True
+            if self._on_session_done_cb is not None:
+                self._on_session_done_cb(self.config_id)
 
     def _run_judgment(self) -> JudgmentResult:
         """Run judgment on the recorded buffer."""

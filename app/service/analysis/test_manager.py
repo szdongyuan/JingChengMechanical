@@ -72,6 +72,7 @@ class TestManager(QObject):
             audio_dir=audio_dir,
         )
         session._setup_pipelines()
+        session._on_session_done_cb = self._on_session_done
 
         device_key = self._device_key(config)
         input_info = device_info.get("input", {})
@@ -88,7 +89,7 @@ class TestManager(QObject):
 
         if device_key in self._shared_recorders:
             recorder = self._shared_recorders[device_key]
-            if record_duration > recorder._record_duration:
+            if record_duration > recorder._record_duration and not recorder.isRunning():
                 recorder._record_duration = record_duration
                 new_total = int(sample_rate * record_duration)
                 old_buf = recorder._buffer
@@ -96,6 +97,11 @@ class TestManager(QObject):
                     new_buf = np.zeros((new_total, n_channels), dtype=np.float32)
                     new_buf[: old_buf.shape[0]] = old_buf
                     recorder._buffer = new_buf
+            elif record_duration > recorder._record_duration:
+                self._bus.log.emit(
+                    f"[TestManager] WARNING: recorder already running, cannot extend "
+                    f"buffer from {recorder._record_duration}s to {record_duration}s"
+                )
         else:
             recorder = AudioRecorder(
                 device_name=config.get("input_device_name", ""),
@@ -106,9 +112,12 @@ class TestManager(QObject):
             )
             self._shared_recorders[device_key] = recorder
 
-        recorder.chunk_ready.connect(session._on_chunk)
-        recorder.recording_done.connect(lambda cid=config_id: self._on_recording_done(cid))
-        recorder.error_occurred.connect(lambda msg, cid=config_id: self._on_error(cid, msg))
+        session._chunk_conn = session._on_chunk
+        session._done_lambda = lambda cid=config_id: self._on_recording_done(cid)
+        session._error_lambda = lambda msg, cid=config_id: self._on_error(cid, msg)
+        recorder.chunk_ready.connect(session._chunk_conn)
+        recorder.recording_done.connect(session._done_lambda)
+        recorder.error_occurred.connect(session._error_lambda)
 
         self._sessions[config_id] = session
         self._recorders[config_id] = recorder
@@ -122,8 +131,10 @@ class TestManager(QObject):
                 sample_rate=output_sr,
                 monitor_channel=config.get("selected_channels", [0])[0],
             )
-            recorder.chunk_ready.connect(lambda data, idx, m=monitor: m.feed(data))
-            monitor.error_occurred.connect(lambda msg, cid=config_id: self._on_error(cid, msg))
+            session._monitor_lambda = lambda data, idx, m=monitor: m.feed(data)
+            session._monitor_error_lambda = lambda msg, cid=config_id: self._on_error(cid, msg)
+            recorder.chunk_ready.connect(session._monitor_lambda)
+            monitor.error_occurred.connect(session._monitor_error_lambda)
             self._monitors[config_id] = monitor
             monitor.start()
 
@@ -148,6 +159,9 @@ class TestManager(QObject):
         rec = self._recorders.pop(config_id, None)
         mon = self._monitors.pop(config_id, None)
 
+        if session is not None and rec is not None:
+            self._disconnect_session_signals(session, rec, mon)
+
         if session is not None and rec is not None and not silent:
             partial_buf = rec.get_buffer()
             if isinstance(partial_buf, np.ndarray) and partial_buf.size > 0:
@@ -163,13 +177,7 @@ class TestManager(QObject):
             mon.wait(1000)
 
         if rec is not None:
-            still_used = any(r is rec for r in self._recorders.values())
-            if not still_used:
-                rec.stop()
-                rec.wait(3000)
-                for key, shared_rec in list(self._shared_recorders.items()):
-                    if shared_rec is rec:
-                        del self._shared_recorders[key]
+            self._stop_recorder_if_unused(rec)
 
         if not silent:
             self._bus.log.emit(f"[TestManager] stopped config={config_id}")
@@ -195,6 +203,13 @@ class TestManager(QObject):
     def _on_recording_done(self, config_id: int):
         """Called when a recorder fills its buffer."""
         session = self._sessions.get(config_id)
+        if session is None or getattr(session, "_finished", False):
+            return
+        session._finished = True
+        self._on_session_done(config_id)
+
+    def _on_session_done(self, config_id: int):
+        session = self._sessions.get(config_id)
         if session is None:
             return
 
@@ -202,9 +217,11 @@ class TestManager(QObject):
         self._bus.log.emit(f"[TestManager] recording done for config={config_id}")
 
         rec = self._recorders.get(config_id)
+        mon = self._monitors.get(config_id)
         if rec is not None:
             session._buffer = rec.get_buffer()
             session._sample_rate = rec._sample_rate
+            self._disconnect_session_signals(session, rec, mon)
 
         result = session._run_judgment()
         result_dict = asdict(result)
@@ -219,24 +236,44 @@ class TestManager(QObject):
         if session is not None:
             self._completed_sessions[config_id] = session
 
-        rec = self._recorders.pop(config_id, None)
+        self._recorders.pop(config_id, None)
         mon = self._monitors.pop(config_id, None)
         if mon is not None:
             mon.stop()
             mon.wait(1000)
         if rec is not None:
-            still_used = any(r is rec for r in self._recorders.values())
-            if not still_used:
-                rec.stop()
-                rec.wait(3000)
-                for key, shared_rec in list(self._shared_recorders.items()):
-                    if shared_rec is rec:
-                        del self._shared_recorders[key]
+            self._stop_recorder_if_unused(rec)
 
     def _on_error(self, config_id: int, message: str):
         self._bus.log.emit(f"[TestManager] ERROR config={config_id}: {message}")
         self._bus.status.emit(f"Error: {message}")
         self._stop_one(config_id, silent=True)
+
+    @staticmethod
+    def _disconnect(signal, callback):
+        if callback is None:
+            return
+        try:
+            signal.disconnect(callback)
+        except (TypeError, RuntimeError, ValueError):
+            pass
+
+    def _disconnect_session_signals(self, session, recorder, monitor=None):
+        self._disconnect(recorder.chunk_ready, getattr(session, "_chunk_conn", None))
+        self._disconnect(recorder.recording_done, getattr(session, "_done_lambda", None))
+        self._disconnect(recorder.error_occurred, getattr(session, "_error_lambda", None))
+        self._disconnect(recorder.chunk_ready, getattr(session, "_monitor_lambda", None))
+        if monitor is not None:
+            self._disconnect(monitor.error_occurred, getattr(session, "_monitor_error_lambda", None))
+
+    def _stop_recorder_if_unused(self, recorder):
+        still_used = any(r is recorder for r in self._recorders.values())
+        if not still_used:
+            recorder.stop()
+            recorder.wait(3000)
+            for key, shared_rec in list(self._shared_recorders.items()):
+                if shared_rec is recorder:
+                    del self._shared_recorders[key]
 
     @staticmethod
     def _device_key(config: dict) -> str:
