@@ -76,7 +76,7 @@ class TestManager(QObject):
         device_key = self._device_key(config)
         input_info = device_info.get("input", {})
         config_sr = float(config.get("input_device_samplerate", 44100))
-        device_sr = float(input_info.get("default_samplerate", config_sr))
+        device_sr = float(input_info.get("samplerate", config_sr))
         if config_sr != device_sr:
             self._bus.log.emit(
                 f"[TestManager] WARNING: config sample rate {config_sr} differs "
@@ -120,7 +120,7 @@ class TestManager(QObject):
                 device_name=config.get("output_device_name", ""),
                 hostapi=config.get("output_device_hostapi", ""),
                 sample_rate=output_sr,
-                monitor_channel=0,
+                monitor_channel=config.get("selected_channels", [0])[0],
             )
             recorder.chunk_ready.connect(lambda data, idx, m=monitor: m.feed(data))
             monitor.error_occurred.connect(lambda msg, cid=config_id: self._on_error(cid, msg))

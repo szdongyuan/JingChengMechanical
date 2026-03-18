@@ -356,6 +356,90 @@ class TestTestManagerStartStop:
         assert monitor.hostapi == "OutputAPI"
         assert monitor.sample_rate == 48000.0
 
+    def test_start_uses_first_selected_channel_for_monitor(self, monkeypatch):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        services.config_service.load_config.return_value = {
+            "config_id": 1,
+            "config_name": "Test",
+            "record_duration": 2.0,
+            "analysis_duration": 1.0,
+            "selected_channels": [1],
+            "channels": [{
+                "channel_index": 1,
+                "stft_nfft": 1024,
+                "stft_overlap": 0.5,
+                "spl_weighting": "Z",
+                "spl_time_constant": 0.125,
+                "spl_upper_limit": 85.0,
+                "spl_lower_limit": 40.0,
+                "fft_band_limits": [],
+                "oct_weighting": "Z",
+                "oct_band_limits": [],
+            }],
+            "input_device_name": "InputMic",
+            "input_device_hostapi": "InputAPI",
+            "input_device_samplerate": 44100,
+            "output_device_name": "OutputSpeaker",
+            "output_device_hostapi": "OutputAPI",
+            "output_device_samplerate": 48000,
+        }
+
+        class FakeRecorder:
+            def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+                self._sample_rate = sample_rate
+                self._record_duration = record_duration
+                self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
+                self.chunk_ready = _DummySignal()
+                self.recording_done = _DummySignal()
+                self.error_occurred = _DummySignal()
+                self._running = False
+
+            def isRunning(self):
+                return self._running
+
+            def start(self):
+                self._running = True
+
+            def stop(self):
+                self._running = False
+
+            def wait(self, timeout):
+                return True
+
+            def get_buffer(self):
+                return self._buffer
+
+        class FakeMonitor:
+            instances = []
+
+            def __init__(self, *, device_name, hostapi, sample_rate, monitor_channel):
+                self.monitor_channel = monitor_channel
+                self.error_occurred = _DummySignal()
+                FakeMonitor.instances.append(self)
+
+            def feed(self, chunk):
+                return None
+
+            def start(self):
+                return None
+
+            def stop(self):
+                return None
+
+            def wait(self, timeout):
+                return True
+
+        monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
+        monkeypatch.setattr("app.service.analysis.test_manager.AudioMonitor", FakeMonitor)
+        monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
+
+        mgr = TestManager(bus, services)
+        mgr.start({"config_id": 1, "sn": "SN1"})
+
+        monitor = FakeMonitor.instances[0]
+        assert monitor.monitor_channel == 1
+
 
 class TestTestManagerRejudge:
     def test_rejudge_delegates_to_session(self):
@@ -412,7 +496,6 @@ class TestSampleRateMismatch:
                 "type": "MME",
                 "samplerate": "48000",
                 "channel_count": "2",
-                "default_samplerate": 48000.0,
             },
             "output": {
                 "id": 1,
