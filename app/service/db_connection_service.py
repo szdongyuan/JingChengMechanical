@@ -53,6 +53,18 @@ class DbConnectionService:
             except OperationalError:
                 pass
 
+        # AI binding table migrations
+        binding_columns = [
+            ("score_threshold", "REAL DEFAULT NULL"),
+        ]
+        for column_name, type_spec in binding_columns:
+            try:
+                db.execute_sql(
+                    f"ALTER TABLE test_config_ai_binding_table ADD COLUMN {column_name} {type_spec}"
+                )
+            except OperationalError:
+                pass
+
     def close(self):
         if not db.is_closed():
             db.close()
