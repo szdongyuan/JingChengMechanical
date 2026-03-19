@@ -162,6 +162,20 @@ class TestScoreThresholdCrud:
         binding = ai_service.resolve_binding(config.config_id)
         assert binding["score_threshold"] == 0.8
 
+    def test_save_binding_updates_existing_threshold(self, ai_service, config, toolchain):
+        ai_service.save_binding(config.config_id, {
+            "enabled": True,
+            "toolchain_id": "motor-ai",
+            "score_threshold": 0.8,
+        })
+        ai_service.save_binding(config.config_id, {
+            "enabled": True,
+            "toolchain_id": "motor-ai",
+            "score_threshold": 0.5,
+        })
+        binding = ai_service.resolve_binding(config.config_id)
+        assert binding["score_threshold"] == 0.5
+
     def test_save_binding_absent_key_preserves_existing_threshold(self, ai_service, config, toolchain):
         ai_service.save_binding(config.config_id, {
             "enabled": True,
