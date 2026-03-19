@@ -4,6 +4,7 @@ Orchestrates: recorder -> pipelines -> judgment -> result.
 """
 from __future__ import annotations
 
+import math
 import os
 import uuid
 from collections.abc import Callable
@@ -234,9 +235,20 @@ class TestSession:
             )
             return result
 
+        score = envelope.get("score")
         ai_label = envelope.get("ai_label")
+        score_threshold = binding.get("score_threshold")
+
+        # Guard: treat NaN/inf score as "no score"
+        if score is not None and (math.isnan(score) or math.isinf(score)):
+            score = None
+
+        # Primary: score + threshold
         ai_pass = None
-        if isinstance(ai_label, str):
+        if score is not None and score_threshold is not None:
+            ai_pass = (score >= score_threshold)
+        # Fallback: ai_label (legacy toolchains without numeric score)
+        elif isinstance(ai_label, str):
             label = ai_label.strip().upper()
             if label == "PASS":
                 ai_pass = True
