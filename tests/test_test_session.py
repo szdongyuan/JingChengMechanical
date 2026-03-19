@@ -693,6 +693,7 @@ class TestScoreThresholdDecision:
         })
         result = session._run_ai(self._make_base_result())
         assert result.ai_pass is True
+        assert result.ai_score is None
 
     def test_inf_score_falls_back_to_label(self, tmp_path):
         ai = MagicMock()
@@ -705,3 +706,4 @@ class TestScoreThresholdDecision:
         })
         result = session._run_ai(self._make_base_result())
         assert result.ai_pass is False
+        assert result.ai_score is None

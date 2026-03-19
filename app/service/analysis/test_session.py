@@ -256,7 +256,7 @@ class TestSession:
                 ai_pass = False
 
         result.ai_pass = ai_pass
-        result.ai_score = envelope.get("score")
+        result.ai_score = score
         result.overall = "合格" if result.limit_pass and (ai_pass is True or ai_pass is None) else "不合格"
         return result
 
