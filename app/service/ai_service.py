@@ -7,6 +7,7 @@ and UI ViewModel adaptation.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -17,7 +18,6 @@ from datetime import datetime, timedelta, timezone
 
 from peewee import DoesNotExist
 
-from model.base_mode import db
 from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable
 from model.ai_execution_table import AiExecutionTable
@@ -94,7 +94,16 @@ class AiService:
         if not isinstance(offset, int) or offset < 0:
             raise ValueError("analysis_window_offset_ms must be a non-negative integer")
 
-        with db.atomic():
+        if "score_threshold" in data:
+            st = data["score_threshold"]
+            if st is not None:
+                if isinstance(st, bool) or not isinstance(st, (int, float)):
+                    raise ValueError("score_threshold must be numeric (int or float, not bool)")
+                if math.isnan(st) or math.isinf(st):
+                    raise ValueError("score_threshold must be finite (not NaN or inf)")
+
+        database = TestConfigAiBindingTable._meta.database
+        with database.atomic():
             try:
                 existing = TestConfigAiBindingTable.get(
                     TestConfigAiBindingTable.config == config_id
@@ -106,6 +115,8 @@ class AiService:
                     "analysis_window_offset_ms", 0
                 )
                 existing.params_json = data.get("params_json", "{}")
+                if "score_threshold" in data:
+                    existing.score_threshold = data["score_threshold"]
                 from consts.time_consts import now_str
                 existing.updated_time = now_str()
                 existing.save()
@@ -120,6 +131,7 @@ class AiService:
                         "analysis_window_offset_ms", 0
                     ),
                     params_json=data.get("params_json", "{}"),
+                    score_threshold=data.get("score_threshold"),
                 )
                 return row.binding_id
 
