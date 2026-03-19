@@ -80,6 +80,7 @@ class AiService:
             "effective_timeout_ms": effective_timeout,
             "analysis_window_offset_ms": binding.analysis_window_offset_ms,
             "params_json": binding.params_json,
+            "score_threshold": binding.score_threshold,
         }
 
     # ── Binding CRUD (for config UI) ────────────────────────

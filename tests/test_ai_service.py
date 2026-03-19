@@ -78,6 +78,20 @@ class TestBindingResolver:
         assert binding["timeout_ms"] is None
         assert binding["effective_timeout_ms"] == 30000
 
+    def test_resolve_binding_includes_score_threshold(self, ai_service, config, toolchain):
+        AiBindingTable.create(
+            config=config, toolchain=toolchain, enabled=True, score_threshold=0.8
+        )
+        binding = ai_service.resolve_binding(config.config_id)
+        assert binding["score_threshold"] == 0.8
+
+    def test_resolve_binding_score_threshold_defaults_none(self, ai_service, config, toolchain):
+        AiBindingTable.create(
+            config=config, toolchain=toolchain, enabled=True
+        )
+        binding = ai_service.resolve_binding(config.config_id)
+        assert binding["score_threshold"] is None
+
     def test_resolve_binding_with_null_toolchain(self, ai_service):
         """Binding with no toolchain should still be resolvable."""
         cfg = ConfigTable.create(config_name="NullTC")
