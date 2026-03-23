@@ -78,7 +78,6 @@ class AiService:
             "toolchain_id": tc_id,
             "timeout_ms": binding.timeout_ms,
             "effective_timeout_ms": effective_timeout,
-            "analysis_window_offset_ms": binding.analysis_window_offset_ms,
             "params_json": binding.params_json,
             "score_threshold": binding.score_threshold,
         }
@@ -87,13 +86,7 @@ class AiService:
 
     def save_binding(self, config_id: int, data: dict) -> int:
         """Create or update the AI binding for a test config.
-
-        Validates analysis_window_offset_ms >= 0.
         """
-        offset = data.get("analysis_window_offset_ms", 0)
-        if not isinstance(offset, int) or offset < 0:
-            raise ValueError("analysis_window_offset_ms must be a non-negative integer")
-
         if "score_threshold" in data:
             st = data["score_threshold"]
             if st is not None:
@@ -111,9 +104,6 @@ class AiService:
                 existing.enabled = data.get("enabled", False)
                 existing.toolchain_id = data.get("toolchain_id")
                 existing.timeout_ms = data.get("timeout_ms")
-                existing.analysis_window_offset_ms = data.get(
-                    "analysis_window_offset_ms", 0
-                )
                 existing.params_json = data.get("params_json", "{}")
                 if "score_threshold" in data:
                     existing.score_threshold = data["score_threshold"]
@@ -127,9 +117,6 @@ class AiService:
                     enabled=data.get("enabled", False),
                     toolchain=data.get("toolchain_id"),
                     timeout_ms=data.get("timeout_ms"),
-                    analysis_window_offset_ms=data.get(
-                        "analysis_window_offset_ms", 0
-                    ),
                     params_json=data.get("params_json", "{}"),
                     score_threshold=data.get("score_threshold"),
                 )

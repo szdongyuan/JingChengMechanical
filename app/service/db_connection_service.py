@@ -60,7 +60,15 @@ class DbConnectionService:
             except OperationalError:
                 pass
 
-        # AI binding table migrations
+        self._backfill_analysis_window_offset_once()
+        self._rebuild_ai_binding_table_without_analysis_window_offset()
+        self._ensure_ai_binding_columns()
+
+    def _get_table_columns(self, table_name: str) -> set[str]:
+        cursor = db.execute_sql(f"PRAGMA table_info({table_name})")
+        return {row[1] for row in cursor.fetchall()}
+
+    def _ensure_ai_binding_columns(self):
         binding_columns = [
             ("score_threshold", "REAL DEFAULT NULL"),
         ]
@@ -71,8 +79,6 @@ class DbConnectionService:
                 )
             except OperationalError:
                 pass
-
-        self._backfill_analysis_window_offset_once()
 
     def _backfill_analysis_window_offset_once(self):
         db.execute_sql(
@@ -89,6 +95,15 @@ class DbConnectionService:
             (self._ANALYSIS_OFFSET_BACKFILL_MARKER,),
         ).fetchone()
         if marker_row:
+            return
+
+        if "analysis_window_offset_ms" not in self._get_table_columns(
+            "test_config_ai_binding_table"
+        ):
+            db.execute_sql(
+                "INSERT OR IGNORE INTO migration_marker_table (marker_key) VALUES (?)",
+                (self._ANALYSIS_OFFSET_BACKFILL_MARKER,),
+            )
             return
 
         with db.atomic():
@@ -112,6 +127,58 @@ class DbConnectionService:
             db.execute_sql(
                 "INSERT INTO migration_marker_table (marker_key) VALUES (?)",
                 (self._ANALYSIS_OFFSET_BACKFILL_MARKER,),
+            )
+
+    def _rebuild_ai_binding_table_without_analysis_window_offset(self):
+        columns = self._get_table_columns("test_config_ai_binding_table")
+        if "analysis_window_offset_ms" not in columns:
+            return
+
+        score_threshold_select = "score_threshold" if "score_threshold" in columns else "NULL"
+
+        with db.atomic():
+            db.execute_sql("DROP TABLE IF EXISTS test_config_ai_binding_table__new")
+            db.execute_sql(
+                """
+                CREATE TABLE test_config_ai_binding_table__new (
+                    binding_id INTEGER PRIMARY KEY,
+                    config_id INTEGER NOT NULL UNIQUE REFERENCES test_config_table(config_id) ON DELETE CASCADE,
+                    enabled INTEGER NOT NULL DEFAULT 0,
+                    toolchain_id TEXT REFERENCES ai_toolchain_table(toolchain_id) ON DELETE SET NULL,
+                    timeout_ms INTEGER,
+                    params_json TEXT NOT NULL DEFAULT '{}',
+                    score_threshold REAL DEFAULT NULL,
+                    updated_time TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            db.execute_sql(
+                f"""
+                INSERT INTO test_config_ai_binding_table__new (
+                    binding_id,
+                    config_id,
+                    enabled,
+                    toolchain_id,
+                    timeout_ms,
+                    params_json,
+                    score_threshold,
+                    updated_time
+                )
+                SELECT
+                    binding_id,
+                    config_id,
+                    enabled,
+                    toolchain_id,
+                    timeout_ms,
+                    params_json,
+                    {score_threshold_select},
+                    updated_time
+                FROM test_config_ai_binding_table
+                """
+            )
+            db.execute_sql("DROP TABLE test_config_ai_binding_table")
+            db.execute_sql(
+                "ALTER TABLE test_config_ai_binding_table__new RENAME TO test_config_ai_binding_table"
             )
 
     def close(self):
