@@ -485,3 +485,122 @@ def test_migrate_does_not_overwrite_existing_analysis_window_offset_when_marker_
             os.unlink(db_path)
         except OSError:
             pass
+
+
+def test_migrate_recovers_binding_analysis_window_offset_when_marker_missing_and_config_value_is_default(
+    monkeypatch,
+):
+    """connect() must recover legacy binding offsets before recording the marker."""
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        tmp_db = SqliteDatabase(db_path, pragmas={"foreign_keys": 1})
+        import model.base_mode as base_mod
+
+        monkeypatch.setattr(base_mod, "db", tmp_db)
+
+        from app.service.db_connection_service import DbConnectionService
+
+        svc = DbConnectionService()
+        import app.service.db_connection_service as svc_mod
+
+        monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+        _bind_all_models(tmp_db)
+
+        tmp_db.connect()
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE test_config_table (
+                config_id INTEGER PRIMARY KEY,
+                config_name TEXT NOT NULL UNIQUE,
+                record_duration REAL NOT NULL DEFAULT 5.0,
+                analysis_duration REAL NOT NULL DEFAULT 3.0,
+                scan_triggers_test INTEGER NOT NULL DEFAULT 0,
+                plc_device_key TEXT DEFAULT NULL,
+                plc_device_label TEXT DEFAULT NULL,
+                analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0,
+                created_time TEXT NOT NULL DEFAULT '',
+                updated_time TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE ai_toolchain_table (
+                toolchain_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                version TEXT NOT NULL DEFAULT '',
+                entrypoint TEXT NOT NULL,
+                default_timeout_ms INTEGER NOT NULL DEFAULT 30000,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_time TEXT NOT NULL DEFAULT '',
+                updated_time TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE test_config_ai_binding_table (
+                binding_id INTEGER PRIMARY KEY,
+                config_id INTEGER NOT NULL UNIQUE REFERENCES test_config_table(config_id) ON DELETE CASCADE,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                toolchain_id TEXT REFERENCES ai_toolchain_table(toolchain_id) ON DELETE SET NULL,
+                timeout_ms INTEGER,
+                analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0,
+                params_json TEXT NOT NULL DEFAULT '{}',
+                updated_time TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO test_config_table (
+                config_id,
+                config_name,
+                record_duration,
+                analysis_duration,
+                scan_triggers_test,
+                plc_device_key,
+                plc_device_label,
+                analysis_window_offset_ms,
+                created_time,
+                updated_time
+            ) VALUES (1, 'Partial Migration', 5.0, 3.0, 0, 'plc-a', 'PLC A', 0, '', '')
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO test_config_ai_binding_table (
+                binding_id,
+                config_id,
+                enabled,
+                timeout_ms,
+                analysis_window_offset_ms,
+                params_json,
+                updated_time
+            ) VALUES (1, 1, 1, NULL, 250, '{}', '')
+            """
+        )
+        tmp_db.close()
+
+        svc.connect()
+
+        cursor = tmp_db.execute_sql(
+            "SELECT analysis_window_offset_ms FROM test_config_table WHERE config_id = 1"
+        )
+        assert cursor.fetchone()[0] == 250
+
+        marker_row = tmp_db.execute_sql(
+            "SELECT 1 FROM migration_marker_table WHERE marker_key = ?",
+            (svc._ANALYSIS_OFFSET_BACKFILL_MARKER,),
+        ).fetchone()
+        assert marker_row == (1,)
+
+        svc.close()
+        tmp_db.close()
+    finally:
+        try:
+            os.unlink(db_path)
+        except OSError:
+            pass
