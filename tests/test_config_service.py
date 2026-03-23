@@ -67,6 +67,23 @@ def test_load_config_returns_hardware_fields():
     assert result["selected_channels"] == [0, 2]
 
 
+def test_load_config_returns_plc_binding_and_analysis_offset_fields():
+    svc = _service()
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        trigger_type="plc",
+        plc_device_key="plc-a",
+        plc_device_label="PLC A",
+        analysis_window_offset_ms=250,
+    )
+
+    result = svc.load_config(cfg.config_id)
+
+    assert result["plc_device_key"] == "plc-a"
+    assert result["plc_device_label"] == "PLC A"
+    assert result["analysis_window_offset_ms"] == 250
+
+
 def test_save_config_persists_hardware_fields():
     svc = _service()
     config_id = ConfigTable.create(config_name="Cfg1").config_id
@@ -102,6 +119,39 @@ def test_save_config_persists_hardware_fields():
     assert loaded["selected_channels"] == [0, 2]
 
 
+def test_save_config_persists_analysis_window_offset_ms_and_plc_fields():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+
+    svc.save_config(
+        {
+            "config_id": config_id,
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "analysis_window_offset_ms": 500,
+            "scan_triggers_test": False,
+            "trigger_type": "plc",
+            "plc_device_key": "plc-a",
+            "plc_device_label": "PLC A",
+            "input_device_name": "Mic 1",
+            "input_device_hostapi": "ASIO",
+            "input_device_samplerate": 48000,
+            "output_device_name": "Speaker 1",
+            "output_device_hostapi": "WASAPI",
+            "output_device_samplerate": 44100,
+            "selected_channels": [0],
+            "channels": [_channel_payload(0)],
+        }
+    )
+
+    loaded = svc.load_config(config_id)
+
+    assert loaded["analysis_window_offset_ms"] == 500
+    assert loaded["plc_device_key"] == "plc-a"
+    assert loaded["plc_device_label"] == "PLC A"
+
+
 def test_legacy_fallback_infers_selected_channels():
     svc = _service()
     cfg = ConfigTable.create(config_name="Cfg1", selected_channels="[]")
@@ -129,3 +179,52 @@ def test_validate_device_without_channels_error():
     )
 
     assert "已选择输入设备但未选择任何通道" in errors
+
+
+def test_validate_rejects_negative_analysis_window_offset():
+    svc = _service()
+
+    errors = svc.validate(
+        {
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "analysis_window_offset_ms": -1,
+            "scan_triggers_test": False,
+            "selected_channels": [],
+            "channels": [],
+        }
+    )
+
+    assert any("偏移" in err for err in errors)
+
+
+def test_validate_factory_runtime_rejects_analysis_window_offset_plus_duration_beyond_record_duration():
+    svc = _service()
+
+    errors = svc.validate_factory_runtime(
+        {
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "analysis_window_offset_ms": 2500,
+            "trigger_type": "manual",
+        }
+    )
+
+    assert any("分析" in err for err in errors)
+
+
+def test_validate_factory_runtime_requires_plc_device_key_for_plc_trigger():
+    svc = _service()
+
+    errors = svc.validate_factory_runtime(
+        {
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "analysis_window_offset_ms": 0,
+            "trigger_type": "plc",
+            "plc_device_key": "",
+        }
+    )
+
+    assert any("PLC" in err for err in errors)

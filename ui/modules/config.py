@@ -196,12 +196,12 @@ class ConfigModule(QWidget):
             lambda v: self.spin_analysis.setValue(min(self.spin_analysis.value(), v))
         )
 
-        self.spin_ai_window_offset = _NoWheelSpinBoxInt()
-        self.spin_ai_window_offset.setRange(0, 3600000)
-        self.spin_ai_window_offset.setSingleStep(100)
-        self.spin_ai_window_offset.setSuffix(" ms")
-        self.spin_ai_window_offset.setValue(0)
-        gf_lay.addRow("默认分析窗起始偏移(ms)", self.spin_ai_window_offset)
+        self.spin_analysis_window_offset = _NoWheelSpinBoxInt()
+        self.spin_analysis_window_offset.setRange(0, 3600000)
+        self.spin_analysis_window_offset.setSingleStep(100)
+        self.spin_analysis_window_offset.setSuffix(" ms")
+        self.spin_analysis_window_offset.setValue(0)
+        gf_lay.addRow("默认分析窗起始偏移(ms)", self.spin_analysis_window_offset)
 
         self.chk_scan = QCheckBox("扫码枪直接触发测试")
         gf_lay.addRow("扫码触发", self.chk_scan)
@@ -218,11 +218,18 @@ class ConfigModule(QWidget):
         self.combo_trigger = _NoWheelComboBox()
         self.combo_trigger.setStyleSheet(combo_qss)
         self.combo_trigger.addItem("（未选择）", None)
-        self.combo_trigger.addItem("PLC 设备关联 (待定)", "plc")
-        model = self.combo_trigger.model()
-        plc_item = model.item(1)
-        plc_item.setEnabled(False)
-        hw_lay.addRow("PLC 设备", self.combo_trigger)
+        self.combo_trigger.addItem("手动触发", "manual")
+        self.combo_trigger.addItem("硬件触发", "hardware")
+        self.combo_trigger.addItem("PLC 触发", "plc")
+        hw_lay.addRow("触发类型", self.combo_trigger)
+
+        self.ed_plc_device_key = QLineEdit()
+        self.ed_plc_device_key.setPlaceholderText("例如: plc-a")
+        hw_lay.addRow("PLC 设备标识", self.ed_plc_device_key)
+
+        self.ed_plc_device_label = QLineEdit()
+        self.ed_plc_device_label.setPlaceholderText("例如: PLC A")
+        hw_lay.addRow("PLC 显示名称", self.ed_plc_device_label)
 
         self.combo_input_dev = _NoWheelComboBox()
         self.combo_input_dev.setStyleSheet(combo_qss)
@@ -694,7 +701,6 @@ class ConfigModule(QWidget):
             self.chk_ai_enabled.setChecked(False)
             self.combo_ai_toolchain.setCurrentIndex(0)
             self.spin_ai_timeout.setValue(0)
-            self.spin_ai_window_offset.setValue(0)
             self.txt_ai_params.setPlainText("{}")
             return
 
@@ -702,7 +708,6 @@ class ConfigModule(QWidget):
         idx = self.combo_ai_toolchain.findData(binding["toolchain_id"])
         self.combo_ai_toolchain.setCurrentIndex(idx if idx >= 0 else 0)
         self.spin_ai_timeout.setValue(binding["timeout_ms"] or 0)
-        self.spin_ai_window_offset.setValue(binding["analysis_window_offset_ms"])
         self.txt_ai_params.setPlainText(binding["params_json"])
 
     def _populate_hardware_card(self, data: dict):
@@ -804,8 +809,11 @@ class ConfigModule(QWidget):
             "config_name": self.ed_name.text(),
             "record_duration": self.spin_record.value(),
             "analysis_duration": self.spin_analysis.value(),
+            "analysis_window_offset_ms": self.spin_analysis_window_offset.value(),
             "scan_triggers_test": self.chk_scan.isChecked(),
             "trigger_type": trigger_data if trigger_data else None,
+            "plc_device_key": self.ed_plc_device_key.text(),
+            "plc_device_label": self.ed_plc_device_label.text(),
             "input_device_name": input_dev.get("name") if isinstance(input_dev, dict) else None,
             "input_device_hostapi": input_dev.get("hostapi") if isinstance(input_dev, dict) else None,
             "input_device_samplerate": input_dev.get("default_samplerate") if isinstance(input_dev, dict) else None,
@@ -858,7 +866,6 @@ class ConfigModule(QWidget):
             "enabled": self.chk_ai_enabled.isChecked(),
             "toolchain_id": tc_id,
             "timeout_ms": timeout if timeout > 0 else None,
-            "analysis_window_offset_ms": self.spin_ai_window_offset.value(),
             "params_json": self.txt_ai_params.toPlainText().strip() or "{}",
         }
 
@@ -885,7 +892,12 @@ class ConfigModule(QWidget):
         self.ed_name.setText(data["config_name"])
         self.spin_record.setValue(data["record_duration"])
         self.spin_analysis.setValue(data["analysis_duration"])
+        self.spin_analysis_window_offset.setValue(
+            data.get("analysis_window_offset_ms", 0)
+        )
         self.chk_scan.setChecked(data["scan_triggers_test"])
+        self.ed_plc_device_key.setText(data.get("plc_device_key") or "")
+        self.ed_plc_device_label.setText(data.get("plc_device_label") or "")
 
         self._populate_hardware_card(data)
 
@@ -993,17 +1005,6 @@ class ConfigModule(QWidget):
                     raise ValueError("JSON 必须是对象")
             except (ValueError, _json.JSONDecodeError) as e:
                 QMessageBox.warning(self, "AI 配置错误", f"参数(JSON) 格式无效：{e}")
-                return
-            offset_ms = ai_data.get("analysis_window_offset_ms", 0)
-            analysis_ms = round(data["analysis_duration"] * 1000)
-            record_ms = round(data["record_duration"] * 1000)
-            if offset_ms + analysis_ms > record_ms:
-                QMessageBox.warning(
-                    self,
-                    "AI 配置错误",
-                    f"分析窗起始偏移({offset_ms}ms) + 分析时长({analysis_ms}ms) "
-                    f"不能超过录音时长({record_ms}ms)",
-                )
                 return
 
             from model.base_mode import db

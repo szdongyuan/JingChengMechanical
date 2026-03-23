@@ -50,8 +50,11 @@ class ConfigService:
             "config_name": cfg.config_name,
             "record_duration": cfg.record_duration,
             "analysis_duration": cfg.analysis_duration,
+            "analysis_window_offset_ms": cfg.analysis_window_offset_ms,
             "scan_triggers_test": bool(cfg.scan_triggers_test),
             "trigger_type": cfg.trigger_type,
+            "plc_device_key": cfg.plc_device_key,
+            "plc_device_label": cfg.plc_device_label,
             "input_device_name": cfg.input_device_name,
             "input_device_hostapi": cfg.input_device_hostapi,
             "input_device_samplerate": cfg.input_device_samplerate,
@@ -123,8 +126,17 @@ class ConfigService:
                     config_name=data["config_name"].strip(),
                     record_duration=data["record_duration"],
                     analysis_duration=data["analysis_duration"],
+                    analysis_window_offset_ms=int(
+                        data.get("analysis_window_offset_ms", 0)
+                    ),
                     scan_triggers_test=data["scan_triggers_test"],
                     trigger_type=data.get("trigger_type"),
+                    plc_device_key=self._clean_optional_text(
+                        data.get("plc_device_key")
+                    ),
+                    plc_device_label=self._clean_optional_text(
+                        data.get("plc_device_label")
+                    ),
                     input_device_name=data.get("input_device_name"),
                     input_device_hostapi=data.get("input_device_hostapi"),
                     input_device_samplerate=data.get("input_device_samplerate"),
@@ -203,6 +215,8 @@ class ConfigService:
         if not isinstance(data.get("scan_triggers_test"), bool):
             errors.append("扫码触发必须为布尔值")
 
+        errors.extend(self.validate_factory_runtime(data))
+
         input_dev = data.get("input_device_name")
         sel_ch = data.get("selected_channels", [])
         if input_dev and not sel_ch:
@@ -273,6 +287,32 @@ class ConfigService:
                         )
         return errors
 
+    def validate_factory_runtime(self, data: dict) -> list[str]:
+        errors = []
+        offset = data.get("analysis_window_offset_ms", 0)
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            errors.append("分析窗起始偏移必须为不小于 0 的整数")
+        else:
+            rd = data.get("record_duration", 0)
+            ad = data.get("analysis_duration", 0)
+            has_valid_rd = (
+                isinstance(rd, (int, float)) and not isinstance(rd, bool) and rd > 0
+            )
+            has_valid_ad = (
+                isinstance(ad, (int, float)) and not isinstance(ad, bool) and ad > 0
+            )
+            if has_valid_rd and has_valid_ad:
+                window_end = (offset / 1000.0) + ad
+                if window_end > rd:
+                    errors.append("分析窗起始偏移加分析时长不能超过录音时长")
+
+        if data.get("trigger_type") == "plc" and not self._clean_optional_text(
+            data.get("plc_device_key")
+        ):
+            errors.append("PLC 触发必须填写 PLC 设备标识")
+
+        return errors
+
     @staticmethod
     def _parse_json(text: str, default):
         try:
@@ -282,3 +322,10 @@ class ConfigService:
             return result
         except (json.JSONDecodeError, TypeError):
             return default
+
+    @staticmethod
+    def _clean_optional_text(value):
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
