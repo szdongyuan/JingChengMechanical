@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 
 from peewee import IntegrityError
 
 from model.base_mode import db
 from model.test_config_table import TestConfigTable
+from model.test_config_ai_binding_table import TestConfigAiBindingTable
 from model.channel_config_table import ChannelConfigTable
 from model.device_table import DeviceTable
 from consts.time_consts import now_str
@@ -119,6 +121,7 @@ class ConfigService:
         if not TestConfigTable.select().where(TestConfigTable.config_id == config_id).exists():
             raise ValueError("配置不存在或已被删除")
         channels = data.get("channels", [])
+        analysis_window_offset_ms = int(data.get("analysis_window_offset_ms", 0))
 
         try:
             with db.atomic():
@@ -126,9 +129,7 @@ class ConfigService:
                     config_name=data["config_name"].strip(),
                     record_duration=data["record_duration"],
                     analysis_duration=data["analysis_duration"],
-                    analysis_window_offset_ms=int(
-                        data.get("analysis_window_offset_ms", 0)
-                    ),
+                    analysis_window_offset_ms=analysis_window_offset_ms,
                     scan_triggers_test=data["scan_triggers_test"],
                     trigger_type=data.get("trigger_type"),
                     plc_device_key=self._clean_optional_text(
@@ -146,6 +147,10 @@ class ConfigService:
                     selected_channels=json.dumps(data.get("selected_channels", [])),
                     updated_time=now_str(),
                 ).where(TestConfigTable.config_id == config_id).execute()
+                TestConfigAiBindingTable.update(
+                    analysis_window_offset_ms=analysis_window_offset_ms,
+                    updated_time=now_str(),
+                ).where(TestConfigAiBindingTable.config == config_id).execute()
 
                 ChannelConfigTable.delete().where(
                     ChannelConfigTable.config == config_id
@@ -302,8 +307,9 @@ class ConfigService:
                 isinstance(ad, (int, float)) and not isinstance(ad, bool) and ad > 0
             )
             if has_valid_rd and has_valid_ad:
-                window_end = (offset / 1000.0) + ad
-                if window_end > rd:
+                window_end_ms = Decimal(offset) + (Decimal(str(ad)) * Decimal("1000"))
+                record_duration_ms = Decimal(str(rd)) * Decimal("1000")
+                if window_end_ms > record_duration_ms:
                     errors.append("分析窗起始偏移加分析时长不能超过录音时长")
 
         if data.get("trigger_type") == "plc" and not self._clean_optional_text(

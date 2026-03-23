@@ -5,6 +5,9 @@ from unittest.mock import MagicMock
 
 from app.service.config_service import ConfigService
 from model.channel_config_table import ChannelConfigTable
+from model.test_config_ai_binding_table import (
+    TestConfigAiBindingTable as AiBindingTable,
+)
 from model.test_config_table import TestConfigTable as ConfigTable
 
 
@@ -152,6 +155,43 @@ def test_save_config_persists_analysis_window_offset_ms_and_plc_fields():
     assert loaded["plc_device_label"] == "PLC A"
 
 
+def test_save_config_keeps_existing_ai_binding_analysis_window_offset_in_sync():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    binding = AiBindingTable.create(
+        config=config_id,
+        enabled=False,
+        analysis_window_offset_ms=100,
+    )
+
+    svc.save_config(
+        {
+            "config_id": config_id,
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "analysis_window_offset_ms": 500,
+            "scan_triggers_test": False,
+            "trigger_type": "plc",
+            "plc_device_key": "plc-a",
+            "plc_device_label": "PLC A",
+            "input_device_name": "Mic 1",
+            "input_device_hostapi": "ASIO",
+            "input_device_samplerate": 48000,
+            "output_device_name": "Speaker 1",
+            "output_device_hostapi": "WASAPI",
+            "output_device_samplerate": 44100,
+            "selected_channels": [0],
+            "channels": [_channel_payload(0)],
+        }
+    )
+
+    updated = AiBindingTable.get_by_id(binding.binding_id)
+
+    assert updated.binding_id == binding.binding_id
+    assert updated.analysis_window_offset_ms == 500
+
+
 def test_legacy_fallback_infers_selected_channels():
     svc = _service()
     cfg = ConfigTable.create(config_name="Cfg1", selected_channels="[]")
@@ -212,6 +252,21 @@ def test_validate_factory_runtime_rejects_analysis_window_offset_plus_duration_b
     )
 
     assert any("分析" in err for err in errors)
+
+
+def test_validate_factory_runtime_allows_exact_fit_analysis_window_boundary():
+    svc = _service()
+
+    errors = svc.validate_factory_runtime(
+        {
+            "record_duration": 0.3,
+            "analysis_duration": 0.1,
+            "analysis_window_offset_ms": 200,
+            "trigger_type": "manual",
+        }
+    )
+
+    assert errors == []
 
 
 def test_validate_factory_runtime_requires_plc_device_key_for_plc_trigger():
