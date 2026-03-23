@@ -1,4 +1,4 @@
-from peewee import AutoField, BooleanField, FloatField, TextField
+from peewee import AutoField, BooleanField, FloatField, IntegerField, TextField
 
 from consts.time_consts import now_str
 from model.base_mode import BaseModel
@@ -20,6 +20,9 @@ class TestConfigTable(BaseModel):
     output_device_hostapi = TextField(null=True)
     output_device_samplerate = FloatField(null=True)
     selected_channels = TextField(default='[]')
+    plc_device_key = TextField(null=True, default=None)
+    plc_device_label = TextField(null=True, default=None)
+    analysis_window_offset_ms = IntegerField(default=0)
 
     class Meta:
         table_name = "test_config_table"

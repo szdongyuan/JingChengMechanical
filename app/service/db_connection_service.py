@@ -20,6 +20,10 @@ class DbConnectionService:
     - 业务代码/CRUD 不需要每次手动 connect/close
     """
 
+    _ANALYSIS_OFFSET_BACKFILL_MARKER = (
+        "test_config_analysis_window_offset_backfill_v1"
+    )
+
     def connect(self):
         db.connect(reuse_if_open=True)
         db.create_tables(
@@ -44,6 +48,9 @@ class DbConnectionService:
             ("output_device_hostapi", "TEXT"),
             ("output_device_samplerate", "REAL"),
             ("selected_channels", "TEXT DEFAULT '[]'"),
+            ("plc_device_key", "TEXT DEFAULT NULL"),
+            ("plc_device_label", "TEXT DEFAULT NULL"),
+            ("analysis_window_offset_ms", "INTEGER NOT NULL DEFAULT 0"),
         ]
         for column_name, type_spec in columns:
             try:
@@ -64,6 +71,46 @@ class DbConnectionService:
                 )
             except OperationalError:
                 pass
+
+        self._backfill_analysis_window_offset_once()
+
+    def _backfill_analysis_window_offset_once(self):
+        db.execute_sql(
+            """
+            CREATE TABLE IF NOT EXISTS migration_marker_table (
+                marker_key TEXT PRIMARY KEY,
+                applied_time TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
+        )
+
+        marker_row = db.execute_sql(
+            "SELECT 1 FROM migration_marker_table WHERE marker_key = ?",
+            (self._ANALYSIS_OFFSET_BACKFILL_MARKER,),
+        ).fetchone()
+        if marker_row:
+            return
+
+        with db.atomic():
+            db.execute_sql(
+                """
+                UPDATE test_config_table
+                SET analysis_window_offset_ms = (
+                    SELECT binding.analysis_window_offset_ms
+                    FROM test_config_ai_binding_table AS binding
+                    WHERE binding.config_id = test_config_table.config_id
+                )
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM test_config_ai_binding_table AS binding
+                    WHERE binding.config_id = test_config_table.config_id
+                )
+                """
+            )
+            db.execute_sql(
+                "INSERT INTO migration_marker_table (marker_key) VALUES (?)",
+                (self._ANALYSIS_OFFSET_BACKFILL_MARKER,),
+            )
 
     def close(self):
         if not db.is_closed():
