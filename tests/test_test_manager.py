@@ -97,6 +97,19 @@ def _mock_services(bus):
     return services
 
 
+def _expected_no_result_payload(error_summary: str) -> dict:
+    return {
+        "no_result": True,
+        "has_result": False,
+        "display_status": "no_result",
+        "ai_status": "no_result",
+        "ai_label": None,
+        "ai_score": None,
+        "ai_summary": None,
+        "error_summary": error_summary,
+    }
+
+
 class TestTestManagerInit:
     def test_init(self):
         bus = _mock_bus()
@@ -519,10 +532,7 @@ class TestTestManagerRejudge:
 
         mgr.rejudge(config_id=1, start_sec=0.0, end_sec=2.0)
 
-        payload = {
-            "no_result": True,
-            "error_summary": "analysis window not fully captured",
-        }
+        payload = _expected_no_result_payload("analysis window not fully captured")
         bus.test_finished.emit.assert_called_once_with(1, payload)
         bus.result_changed.emit.assert_called_once_with(payload)
         assert mock_session.last_result is prior_result
@@ -545,10 +555,7 @@ class TestTestManagerRejudge:
 
         mgr.rejudge(config_id=1, start_sec=0.0, end_sec=2.0)
 
-        payload = {
-            "no_result": True,
-            "error_summary": "analysis result unavailable",
-        }
+        payload = _expected_no_result_payload("analysis result unavailable")
         bus.test_finished.emit.assert_called_once_with(1, payload)
         bus.result_changed.emit.assert_called_once_with(payload)
         assert mock_session.last_result is prior_result
@@ -1239,10 +1246,7 @@ class TestLateAttachBufferSlice:
 
         mgr._on_session_done(1)
 
-        payload = {
-            "no_result": True,
-            "error_summary": "analysis window not fully captured",
-        }
+        payload = _expected_no_result_payload("analysis window not fully captured")
         rec.get_buffer_from.assert_called_once_with(attach_snapshot)
         np.testing.assert_array_equal(session._buffer, post_attach)
         assert session._sample_rate == 100.0
@@ -1279,10 +1283,7 @@ class TestLateAttachBufferSlice:
 
         mgr._on_session_done(1)
 
-        payload = {
-            "no_result": True,
-            "error_summary": "analysis crashed",
-        }
+        payload = _expected_no_result_payload("analysis crashed")
         rec.get_buffer_from.assert_called_once_with(attach_snapshot)
         np.testing.assert_array_equal(session._buffer, post_attach)
         assert session._sample_rate == 100.0

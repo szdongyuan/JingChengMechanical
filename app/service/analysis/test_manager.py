@@ -258,6 +258,12 @@ class TestManager(QObject):
     def _make_no_result_payload(error: Exception | str) -> dict:
         return {
             "no_result": True,
+            "has_result": False,
+            "display_status": "no_result",
+            "ai_status": "no_result",
+            "ai_label": None,
+            "ai_score": None,
+            "ai_summary": None,
             "error_summary": str(error),
         }
 
