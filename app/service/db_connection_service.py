@@ -39,6 +39,7 @@ class DbConnectionService:
         self._migrate()
 
     def _migrate(self):
+        existing_config_columns = self._get_table_columns("test_config_table")
         columns = [
             ("trigger_type", "TEXT DEFAULT 'manual'"),
             ("input_device_name", "TEXT"),
@@ -72,9 +73,15 @@ class DbConnectionService:
             except OperationalError:
                 pass
 
-        self._backfill_analysis_window_offset_once()
+        self._backfill_analysis_window_offset_once(
+            should_backfill="analysis_window_offset_ms" not in existing_config_columns
+        )
 
-    def _backfill_analysis_window_offset_once(self):
+    def _get_table_columns(self, table_name: str) -> set[str]:
+        cursor = db.execute_sql(f"PRAGMA table_info({table_name})")
+        return {row[1] for row in cursor.fetchall()}
+
+    def _backfill_analysis_window_offset_once(self, should_backfill: bool):
         db.execute_sql(
             """
             CREATE TABLE IF NOT EXISTS migration_marker_table (
@@ -92,21 +99,22 @@ class DbConnectionService:
             return
 
         with db.atomic():
-            db.execute_sql(
-                """
-                UPDATE test_config_table
-                SET analysis_window_offset_ms = (
-                    SELECT binding.analysis_window_offset_ms
-                    FROM test_config_ai_binding_table AS binding
-                    WHERE binding.config_id = test_config_table.config_id
+            if should_backfill:
+                db.execute_sql(
+                    """
+                    UPDATE test_config_table
+                    SET analysis_window_offset_ms = (
+                        SELECT binding.analysis_window_offset_ms
+                        FROM test_config_ai_binding_table AS binding
+                        WHERE binding.config_id = test_config_table.config_id
+                    )
+                    WHERE EXISTS (
+                        SELECT 1
+                        FROM test_config_ai_binding_table AS binding
+                        WHERE binding.config_id = test_config_table.config_id
+                    )
+                    """
                 )
-                WHERE EXISTS (
-                    SELECT 1
-                    FROM test_config_ai_binding_table AS binding
-                    WHERE binding.config_id = test_config_table.config_id
-                )
-                """
-            )
             db.execute_sql(
                 "INSERT INTO migration_marker_table (marker_key) VALUES (?)",
                 (self._ANALYSIS_OFFSET_BACKFILL_MARKER,),
