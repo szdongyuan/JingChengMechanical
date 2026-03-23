@@ -63,6 +63,7 @@ class DbConnectionService:
         self._backfill_analysis_window_offset_once()
         self._rebuild_ai_binding_table_without_analysis_window_offset()
         self._ensure_ai_binding_columns()
+        self._ensure_ai_binding_indexes()
 
     def _get_table_columns(self, table_name: str) -> set[str]:
         cursor = db.execute_sql(f"PRAGMA table_info({table_name})")
@@ -79,6 +80,14 @@ class DbConnectionService:
                 )
             except OperationalError:
                 pass
+
+    def _ensure_ai_binding_indexes(self):
+        db.execute_sql(
+            """
+            CREATE INDEX IF NOT EXISTS testconfigaibindingtable_toolchain_id
+            ON test_config_ai_binding_table (toolchain_id)
+            """
+        )
 
     def _backfill_analysis_window_offset_once(self):
         db.execute_sql(

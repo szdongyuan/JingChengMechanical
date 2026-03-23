@@ -11,6 +11,15 @@ from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable as AiBindingTable
 
 
+def _index_definitions(tmp_db, table_name: str) -> list[tuple[tuple[str, ...], bool]]:
+    cursor = tmp_db.execute_sql(f"PRAGMA index_list({table_name})")
+    definitions = []
+    for _, index_name, unique, *_ in cursor.fetchall():
+        info = tmp_db.execute_sql(f"PRAGMA index_info({index_name})").fetchall()
+        definitions.append((tuple(row[2] for row in info), bool(unique)))
+    return definitions
+
+
 def _bind_all_models(tmp_db):
     from model.channel_config_table import ChannelConfigTable
     from model.test_config_table import TestConfigTable
@@ -65,6 +74,9 @@ def test_connect_creates_ai_tables(monkeypatch):
         column_names = {row[1] for row in cursor.fetchall()}
         assert "score_threshold" in column_names
         assert "analysis_window_offset_ms" not in column_names
+        assert (("toolchain_id",), False) in _index_definitions(
+            tmp_db, "test_config_ai_binding_table"
+        )
 
         svc.close()
         tmp_db.close()
@@ -235,6 +247,9 @@ def test_migrate_rebuilds_existing_binding_table_without_analysis_window_offset_
         assert "score_threshold" in columns
         assert "analysis_window_offset_ms" not in columns
         assert columns["score_threshold"][4] == "NULL"
+        assert (("toolchain_id",), False) in _index_definitions(
+            tmp_db, "test_config_ai_binding_table"
+        )
 
         cursor = tmp_db.execute_sql(
             """

@@ -155,13 +155,14 @@ def test_save_config_persists_analysis_window_offset_ms_and_plc_fields():
     assert loaded["plc_device_label"] == "PLC A"
 
 
-def test_save_config_keeps_existing_ai_binding_analysis_window_offset_in_sync():
+def test_save_config_keeps_existing_ai_binding_row_while_offset_stays_config_owned():
     svc = _service()
     config_id = ConfigTable.create(config_name="Cfg1").config_id
     binding = AiBindingTable.create(
         config=config_id,
-        enabled=False,
-        analysis_window_offset_ms=100,
+        enabled=True,
+        timeout_ms=1200,
+        params_json='{"legacy": true}',
     )
 
     svc.save_config(
@@ -187,9 +188,14 @@ def test_save_config_keeps_existing_ai_binding_analysis_window_offset_in_sync():
     )
 
     updated = AiBindingTable.get_by_id(binding.binding_id)
+    loaded = svc.load_config(config_id)
 
+    assert loaded["analysis_window_offset_ms"] == 500
     assert updated.binding_id == binding.binding_id
-    assert updated.analysis_window_offset_ms == 500
+    assert updated.enabled is True
+    assert updated.timeout_ms == 1200
+    assert updated.params_json == '{"legacy": true}'
+    assert not hasattr(updated, "analysis_window_offset_ms")
 
 
 def test_legacy_fallback_infers_selected_channels():

@@ -7,7 +7,6 @@ from peewee import IntegrityError
 
 from model.base_mode import db
 from model.test_config_table import TestConfigTable
-from model.test_config_ai_binding_table import TestConfigAiBindingTable
 from model.channel_config_table import ChannelConfigTable
 from model.device_table import DeviceTable
 from consts.time_consts import now_str
@@ -147,11 +146,6 @@ class ConfigService:
                     selected_channels=json.dumps(data.get("selected_channels", [])),
                     updated_time=now_str(),
                 ).where(TestConfigTable.config_id == config_id).execute()
-                TestConfigAiBindingTable.update(
-                    analysis_window_offset_ms=analysis_window_offset_ms,
-                    updated_time=now_str(),
-                ).where(TestConfigAiBindingTable.config == config_id).execute()
-
                 ChannelConfigTable.delete().where(
                     ChannelConfigTable.config == config_id
                 ).execute()
