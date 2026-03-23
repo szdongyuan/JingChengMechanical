@@ -180,7 +180,7 @@ class TestSession:
             return result
 
         analysis_start, analysis_end = result.analysis_window
-        default_window_offset_ms = int(binding.get("analysis_window_offset_ms", 0) or 0)
+        default_window_offset_ms = int(self._config.get("analysis_window_offset_ms", 0) or 0)
         default_window_duration_ms = int(self._analysis_duration * 1000)
         final_window_offset_ms = int(analysis_start * 1000)
         final_window_duration_ms = max(0, int((analysis_end - analysis_start) * 1000))

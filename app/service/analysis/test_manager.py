@@ -191,7 +191,14 @@ class TestManager(QObject):
         if session is None:
             self._bus.log.emit(f"[TestManager] no session for config {config_id}")
             return
-        result = session.rejudge(start_sec, end_sec)
+        try:
+            result = session.rejudge(start_sec, end_sec)
+        except ValueError as exc:
+            payload = self._make_no_result_payload(exc)
+            self._bus.test_finished.emit(config_id, payload)
+            self._bus.result_changed.emit(payload)
+            self._bus.log.emit(f"[TestManager] no-result rejudge for config={config_id}: {exc}")
+            return
         if result is not None and is_dataclass(result):
             result_dict = asdict(result)
             self._bus.test_finished.emit(config_id, result_dict)
@@ -220,13 +227,20 @@ class TestManager(QObject):
             session._sample_rate = rec._sample_rate
             self._disconnect_session_signals(session, rec, mon)
 
-        result = session._run_judgment()
-        result_dict = asdict(result)
-        self._bus.test_finished.emit(config_id, result_dict)
-        self._bus.result_changed.emit(result_dict)
-        self._bus.log.emit(
-            f"[TestManager] result: {result.overall} (limit={result.limit_pass})"
-        )
+        try:
+            result = session._run_judgment()
+        except ValueError as exc:
+            payload = self._make_no_result_payload(exc)
+            self._bus.test_finished.emit(config_id, payload)
+            self._bus.result_changed.emit(payload)
+            self._bus.log.emit(f"[TestManager] no-result analysis for config={config_id}: {exc}")
+        else:
+            result_dict = asdict(result)
+            self._bus.test_finished.emit(config_id, result_dict)
+            self._bus.result_changed.emit(result_dict)
+            self._bus.log.emit(
+                f"[TestManager] result: {result.overall} (limit={result.limit_pass})"
+            )
         self._bus.status.emit("Idle")
 
         session = self._sessions.pop(config_id, None)
@@ -245,6 +259,13 @@ class TestManager(QObject):
         self._bus.log.emit(f"[TestManager] ERROR config={config_id}: {message}")
         self._bus.status.emit(f"Error: {message}")
         self._stop_one(config_id, silent=True)
+
+    @staticmethod
+    def _make_no_result_payload(error: Exception) -> dict:
+        return {
+            "no_result": True,
+            "error_summary": str(error),
+        }
 
     @staticmethod
     def _disconnect(signal, callback):
