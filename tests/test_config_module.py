@@ -189,7 +189,7 @@ def test_collect_ai_binding_does_not_include_analysis_window_offset(qapp):
     assert "analysis_window_offset_ms" not in ai_data
 
 
-def test_on_save_preserves_main_config_analysis_offset_in_ai_binding_payload(
+def test_on_save_keeps_main_config_analysis_offset_out_of_ai_binding_payload(
     qapp, monkeypatch
 ):
     config_service = _ConfigServiceStub()
@@ -221,7 +221,6 @@ def test_on_save_preserves_main_config_analysis_offset_in_ai_binding_payload(
                 "toolchain_id": None,
                 "timeout_ms": None,
                 "params_json": "{}",
-                "analysis_window_offset_ms": 250,
             },
         )
     ]
