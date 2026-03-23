@@ -496,9 +496,11 @@ class TestTestSessionJudgment:
         assert session._audio_file_path == str(tmp_path / "existing.wav")
         assert session._audio_data_id == "audio-123"
 
-    def test_rejudge_passes_selected_window_to_ai_analysis(self, tmp_path):
+    def test_rejudge_passes_selected_window_to_ai_analysis_with_config_default_window_offset(self, tmp_path):
         bus = _make_mock_bus()
         ai = MagicMock()
+        config = _make_config()
+        config["analysis_window_offset_ms"] = 1500
         ai.resolve_binding.return_value = {
             "enabled": True,
             "analysis_window_offset_ms": 250,
@@ -510,7 +512,7 @@ class TestTestSessionJudgment:
             "error_summary": None,
         }
         session = TestSession(
-            config=_make_config(), bus=bus, ai_service=ai,
+            config=config, bus=bus, ai_service=ai,
             mic_cal={}, workorder={"sn": "test", "model": "M"},
             audio_dir=str(tmp_path),
         )
@@ -533,7 +535,7 @@ class TestTestSessionJudgment:
         assert kwargs["segments"][0]["duration_ms"] == 400
         assert kwargs["window_info"] == {
             "window_overridden": True,
-            "default_window_offset_ms": 250,
+            "default_window_offset_ms": 1500,
             "default_window_duration_ms": 1000,
             "final_window_offset_ms": 100,
             "final_window_duration_ms": 400,
