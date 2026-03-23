@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -27,13 +28,31 @@ class _SignalStub:
 
 
 class _ConfigServiceStub:
+    def __init__(self):
+        self.saved_configs = []
+
     def list_configs(self):
+        return [
+            {
+                "config_id": saved["config_id"],
+                "config_name": saved["config_name"],
+            }
+            for saved in self.saved_configs
+        ]
+
+    def validate(self, _data):
         return []
+
+    def save_config(self, data):
+        saved = dict(data)
+        self.saved_configs = [saved]
+        return saved["config_id"]
 
 
 class _AiServiceStub:
     def __init__(self, binding: dict | None = None):
         self._binding = binding
+        self.saved_bindings = []
 
     def list_enabled_toolchains(self):
         return [{"toolchain_id": "tc-1", "display_name": "Toolchain", "version": "1"}]
@@ -43,6 +62,10 @@ class _AiServiceStub:
 
     def get_toolchain(self, toolchain_id: str):
         return SimpleNamespace(display_name=toolchain_id, version="1")
+
+    def save_binding(self, config_id: int, data: dict):
+        self.saved_bindings.append((config_id, dict(data)))
+        return 1
 
 
 class _HardwareServiceStub:
@@ -76,10 +99,14 @@ def qapp():
     return app
 
 
-def _make_module(binding: dict | None = None) -> ConfigModule:
+def _make_module(
+    binding: dict | None = None,
+    config_service: _ConfigServiceStub | None = None,
+    ai_service: _AiServiceStub | None = None,
+) -> ConfigModule:
     services = SimpleNamespace(
-        config_service=_ConfigServiceStub(),
-        ai_service=_AiServiceStub(binding=binding),
+        config_service=config_service or _ConfigServiceStub(),
+        ai_service=ai_service or _AiServiceStub(binding=binding),
         hss_service=_HardwareServiceStub(),
         bus=SimpleNamespace(
             refresh_channels=_SignalStub(),
@@ -160,3 +187,41 @@ def test_collect_ai_binding_does_not_include_analysis_window_offset(qapp):
     ai_data = module._collect_ai_binding()
 
     assert "analysis_window_offset_ms" not in ai_data
+
+
+def test_on_save_preserves_main_config_analysis_offset_in_ai_binding_payload(
+    qapp, monkeypatch
+):
+    config_service = _ConfigServiceStub()
+    ai_service = _AiServiceStub()
+    module = _make_module(config_service=config_service, ai_service=ai_service)
+
+    module._current_config_id = 7
+    module.ed_name.setText("Cfg1")
+    module.spin_analysis_window_offset.setValue(250)
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module._on_save()
+
+    assert warnings == []
+    assert config_service.saved_configs[0]["analysis_window_offset_ms"] == 250
+    assert ai_service.saved_bindings == [
+        (
+            7,
+            {
+                "enabled": False,
+                "toolchain_id": None,
+                "timeout_ms": None,
+                "params_json": "{}",
+                "analysis_window_offset_ms": 250,
+            },
+        )
+    ]

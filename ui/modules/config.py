@@ -997,6 +997,7 @@ class ConfigModule(QWidget):
         try:
             # Validate AI binding before saving anything
             ai_data = self._collect_ai_binding()
+            ai_data["analysis_window_offset_ms"] = data["analysis_window_offset_ms"]
             params_text = ai_data.get("params_json", "{}")
             try:
                 import json as _json
