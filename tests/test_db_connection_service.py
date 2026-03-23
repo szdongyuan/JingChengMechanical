@@ -214,6 +214,20 @@ def test_migrate_rebuilds_existing_binding_table_without_analysis_window_offset_
         )
         tmp_db.execute_sql(
             """
+            INSERT INTO ai_toolchain_table (
+                toolchain_id,
+                display_name,
+                version,
+                entrypoint,
+                default_timeout_ms,
+                enabled,
+                created_time,
+                updated_time
+            ) VALUES ('legacy-toolchain', 'Legacy Toolchain', '1.0.0', 'legacy.entry', 30000, 1, '', '')
+            """
+        )
+        tmp_db.execute_sql(
+            """
             INSERT INTO test_config_table (
                 config_id,
                 config_name,
@@ -231,11 +245,12 @@ def test_migrate_rebuilds_existing_binding_table_without_analysis_window_offset_
                 binding_id,
                 config_id,
                 enabled,
+                toolchain_id,
                 timeout_ms,
                 analysis_window_offset_ms,
                 params_json,
                 updated_time
-            ) VALUES (1, 1, 1, 1200, 250, '{"legacy": true}', '')
+            ) VALUES (1, 1, 1, 'legacy-toolchain', 1200, 250, '{"legacy": true}', '')
             """
         )
         tmp_db.close()
@@ -253,12 +268,18 @@ def test_migrate_rebuilds_existing_binding_table_without_analysis_window_offset_
 
         cursor = tmp_db.execute_sql(
             """
-            SELECT enabled, timeout_ms, params_json, score_threshold
+            SELECT enabled, toolchain_id, timeout_ms, params_json, score_threshold
             FROM test_config_ai_binding_table
             WHERE config_id = 1
             """
         )
-        assert cursor.fetchone() == (1, 1200, '{"legacy": true}', None)
+        assert cursor.fetchone() == (
+            1,
+            "legacy-toolchain",
+            1200,
+            '{"legacy": true}',
+            None,
+        )
 
         svc.close()
         tmp_db.close()
@@ -542,10 +563,10 @@ def test_migrate_does_not_overwrite_existing_analysis_window_offset_when_marker_
             pass
 
 
-def test_migrate_recovers_binding_analysis_window_offset_when_marker_missing_and_config_value_is_default(
+def test_migrate_preserves_existing_zero_analysis_window_offset_when_marker_missing(
     monkeypatch,
 ):
-    """connect() must recover legacy binding offsets before recording the marker."""
+    """connect() must preserve config-owned zero offsets when the marker is missing."""
     fd, db_path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     try:
@@ -644,7 +665,7 @@ def test_migrate_recovers_binding_analysis_window_offset_when_marker_missing_and
         cursor = tmp_db.execute_sql(
             "SELECT analysis_window_offset_ms FROM test_config_table WHERE config_id = 1"
         )
-        assert cursor.fetchone()[0] == 250
+        assert cursor.fetchone()[0] == 0
         cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_ai_binding_table)")
         assert "analysis_window_offset_ms" not in {row[1] for row in cursor.fetchall()}
 

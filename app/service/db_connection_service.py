@@ -39,6 +39,7 @@ class DbConnectionService:
         self._migrate()
 
     def _migrate(self):
+        added_test_config_columns = set()
         columns = [
             ("trigger_type", "TEXT DEFAULT 'manual'"),
             ("input_device_name", "TEXT"),
@@ -59,8 +60,14 @@ class DbConnectionService:
                 )
             except OperationalError:
                 pass
+            else:
+                added_test_config_columns.add(column_name)
 
-        self._backfill_analysis_window_offset_once()
+        self._backfill_analysis_window_offset_once(
+            analysis_offset_added_this_run=(
+                "analysis_window_offset_ms" in added_test_config_columns
+            )
+        )
         self._rebuild_ai_binding_table_without_analysis_window_offset()
         self._ensure_ai_binding_columns()
         self._ensure_ai_binding_indexes()
@@ -89,7 +96,9 @@ class DbConnectionService:
             """
         )
 
-    def _backfill_analysis_window_offset_once(self):
+    def _backfill_analysis_window_offset_once(
+        self, analysis_offset_added_this_run: bool
+    ):
         db.execute_sql(
             """
             CREATE TABLE IF NOT EXISTS migration_marker_table (
@@ -109,6 +118,13 @@ class DbConnectionService:
         if "analysis_window_offset_ms" not in self._get_table_columns(
             "test_config_ai_binding_table"
         ):
+            db.execute_sql(
+                "INSERT OR IGNORE INTO migration_marker_table (marker_key) VALUES (?)",
+                (self._ANALYSIS_OFFSET_BACKFILL_MARKER,),
+            )
+            return
+
+        if not analysis_offset_added_this_run:
             db.execute_sql(
                 "INSERT OR IGNORE INTO migration_marker_table (marker_key) VALUES (?)",
                 (self._ANALYSIS_OFFSET_BACKFILL_MARKER,),
