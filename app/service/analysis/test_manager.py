@@ -193,16 +193,13 @@ class TestManager(QObject):
             return
         try:
             result = session.rejudge(start_sec, end_sec)
-        except ValueError as exc:
-            payload = self._make_no_result_payload(exc)
-            self._bus.test_finished.emit(config_id, payload)
-            self._bus.result_changed.emit(payload)
-            self._bus.log.emit(f"[TestManager] no-result rejudge for config={config_id}: {exc}")
+            result_dict = self._serialize_result(result)
+        except Exception as exc:
+            self._emit_no_result(config_id, exc, context="rejudge")
             return
-        if result is not None and is_dataclass(result):
-            result_dict = asdict(result)
-            self._bus.test_finished.emit(config_id, result_dict)
-            self._bus.result_changed.emit(result_dict)
+
+        self._bus.test_finished.emit(config_id, result_dict)
+        self._bus.result_changed.emit(result_dict)
 
     def _on_recording_done(self, config_id: int):
         """Called when a recorder fills its buffer."""
@@ -229,13 +226,10 @@ class TestManager(QObject):
 
         try:
             result = session._run_judgment()
-        except ValueError as exc:
-            payload = self._make_no_result_payload(exc)
-            self._bus.test_finished.emit(config_id, payload)
-            self._bus.result_changed.emit(payload)
-            self._bus.log.emit(f"[TestManager] no-result analysis for config={config_id}: {exc}")
+            result_dict = self._serialize_result(result)
+        except Exception as exc:
+            self._emit_no_result(config_id, exc, context="analysis")
         else:
-            result_dict = asdict(result)
             self._bus.test_finished.emit(config_id, result_dict)
             self._bus.result_changed.emit(result_dict)
             self._bus.log.emit(
@@ -261,11 +255,25 @@ class TestManager(QObject):
         self._stop_one(config_id, silent=True)
 
     @staticmethod
-    def _make_no_result_payload(error: Exception) -> dict:
+    def _make_no_result_payload(error: Exception | str) -> dict:
         return {
             "no_result": True,
             "error_summary": str(error),
         }
+
+    @staticmethod
+    def _serialize_result(result) -> dict:
+        if result is None or not is_dataclass(result):
+            raise RuntimeError("analysis result unavailable")
+        return asdict(result)
+
+    def _emit_no_result(self, config_id: int, error: Exception | str, *, context: str):
+        payload = self._make_no_result_payload(error)
+        self._bus.test_finished.emit(config_id, payload)
+        self._bus.result_changed.emit(payload)
+        self._bus.log.emit(
+            f"[TestManager] no-result {context} for config={config_id}: {payload['error_summary']}"
+        )
 
     @staticmethod
     def _disconnect(signal, callback):

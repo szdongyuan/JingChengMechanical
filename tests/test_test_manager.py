@@ -527,6 +527,32 @@ class TestTestManagerRejudge:
         bus.result_changed.emit.assert_called_once_with(payload)
         assert mock_session.last_result is prior_result
 
+    def test_rejudge_none_result_emits_no_result_payload_without_overwriting_trace(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        prior_result = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=True,
+            ai_score=0.88,
+        )
+        mock_session = MagicMock()
+        mock_session.config_id = 1
+        mock_session.last_result = prior_result
+        mock_session.rejudge.return_value = None
+        mgr._completed_sessions[1] = mock_session
+
+        mgr.rejudge(config_id=1, start_sec=0.0, end_sec=2.0)
+
+        payload = {
+            "no_result": True,
+            "error_summary": "analysis result unavailable",
+        }
+        bus.test_finished.emit.assert_called_once_with(1, payload)
+        bus.result_changed.emit.assert_called_once_with(payload)
+        assert mock_session.last_result is prior_result
+
 
 class TestSharedRecorderTeardown:
     def test_shared_recorder_not_stopped_while_other_session_uses_it(self):
@@ -1216,6 +1242,46 @@ class TestLateAttachBufferSlice:
         payload = {
             "no_result": True,
             "error_summary": "analysis window not fully captured",
+        }
+        rec.get_buffer_from.assert_called_once_with(attach_snapshot)
+        np.testing.assert_array_equal(session._buffer, post_attach)
+        assert session._sample_rate == 100.0
+        assert session._audio_file_path == "captured.wav"
+        assert session._audio_data_id == "audio-123"
+        bus.test_finished.emit.assert_called_once_with(1, payload)
+        bus.result_changed.emit.assert_called_once_with(payload)
+        assert mgr._completed_sessions[1] is session
+
+    def test_on_session_done_unexpected_analysis_failure_emits_no_result_payload_and_preserves_completed_session(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        post_attach = np.arange(10, 20, dtype=np.float32).reshape(10, 1)
+        attach_snapshot = object()
+        rec = MagicMock()
+        rec.get_buffer_from.return_value = post_attach
+        rec._sample_rate = 100.0
+        session = MagicMock()
+        session.config_id = 1
+        session._buffer = None
+        session._attach_snapshot = attach_snapshot
+        session._audio_file_path = None
+        session._audio_data_id = None
+
+        def raise_unexpected_failure():
+            session._audio_file_path = "captured.wav"
+            session._audio_data_id = "audio-123"
+            raise RuntimeError("analysis crashed")
+
+        session._run_judgment.side_effect = raise_unexpected_failure
+        mgr._sessions[1] = session
+        mgr._recorders[1] = rec
+
+        mgr._on_session_done(1)
+
+        payload = {
+            "no_result": True,
+            "error_summary": "analysis crashed",
         }
         rec.get_buffer_from.assert_called_once_with(attach_snapshot)
         np.testing.assert_array_equal(session._buffer, post_attach)
