@@ -444,6 +444,69 @@ def test_factory_mode_controller_accepted_starts_clear_stale_review_context(star
     assert controller.state.run_phase == "running"
 
 
+@pytest.mark.parametrize("start_kind", ["manual", "plc", "scan"])
+def test_factory_mode_controller_accepted_starts_preclear_review_context_before_test_manager_start(
+    start_kind,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    services = _make_services(
+        (
+            _make_config(101, trigger_type="plc", plc_device_key="plc-a", scan_triggers_test=True),
+            _make_config(202, trigger_type="plc", plc_device_key="plc-b", scan_triggers_test=True),
+        )
+    )
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    _enter_reviewing_state(controller, bus, config_id=202, trigger_source="plc")
+
+    start_snapshots: list[dict[str, object]] = []
+
+    def _capture_start(payload):
+        start_snapshots.append(
+            {
+                "payload": dict(payload),
+                "review_payload": controller.review_payload,
+                "state": controller.state,
+                "reset_reasons": list(reset_reasons),
+                "reviews": list(reviews),
+            }
+        )
+
+    services.test.start.side_effect = _capture_start
+    reset_reasons.clear()
+    reviews.clear()
+
+    if start_kind == "manual":
+        accepted = controller.start_manual()
+        expected_config_id = 101
+    elif start_kind == "plc":
+        accepted = controller.handle_plc_event(
+            services_mod.FactoryPlcIngressPayload(plc_device_key="plc-b")
+        )
+        expected_config_id = 202
+    else:
+        accepted = controller.handle_scan_event(
+            services_mod.FactoryScanIngressPayload(scan_text="SN-1")
+        )
+        expected_config_id = 101
+
+    assert accepted is True
+    assert len(start_snapshots) == 1
+    assert start_snapshots[0]["payload"]["config_id"] == expected_config_id
+    assert start_snapshots[0]["review_payload"] == services_mod.FactoryReviewPayload()
+    assert start_snapshots[0]["reset_reasons"] == ["next_run_accepted"]
+    assert start_snapshots[0]["reviews"] == [services_mod.FactoryReviewPayload()]
+    assert start_snapshots[0]["state"].active_config_id is None
+    assert start_snapshots[0]["state"].displayed_config_id is None
+    assert start_snapshots[0]["state"].run_phase == "armed"
+    assert start_snapshots[0]["state"].trigger_source is None
+
+
 @pytest.mark.parametrize("phase", ["running", "analyzing", "reanalyzing"])
 def test_factory_mode_controller_blocks_new_starts_during_active_or_reanalysis_phase(phase):
     controller_mod = _load_factory_mode_controller_module()
@@ -473,6 +536,57 @@ def test_factory_mode_controller_blocks_new_starts_during_active_or_reanalysis_p
         services_mod.FactoryScanIngressPayload(scan_text="SN-1")
     ) is False
     services.test.start.assert_not_called()
+
+
+@pytest.mark.parametrize("phase", ["running", "analyzing", "reanalyzing"])
+def test_factory_mode_controller_ignores_selection_changes_during_active_or_reanalysis_phase(
+    phase,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    states: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    bus.factory_state_changed.connect(states.append)
+    services = _make_services(
+        (
+            _make_config(101, trigger_type="plc", plc_device_key="plc-a"),
+            _make_config(202, trigger_type="plc", plc_device_key="plc-b"),
+            _make_config(303, trigger_type="button"),
+            _make_config(404, trigger_type="button"),
+        )
+    )
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.start_manual()
+
+    if phase == "analyzing":
+        controller.handle_runtime_analyzing(services_mod.FactoryRuntimeConfigPayload(config_id=101))
+    elif phase == "reanalyzing":
+        controller.handle_runtime_review_ready(_make_review_payload(displayed_config_id=101))
+        controller.begin_reanalysis(1.0, 3.0)
+
+    original_state = controller.state
+    original_review_payload = controller.review_payload
+    reset_reasons.clear()
+    reviews.clear()
+    states.clear()
+
+    next_state = controller.set_selection((303, 404), manual_primary_config_id=303)
+
+    assert next_state == original_state
+    assert controller.state == original_state
+    assert controller.review_payload == original_review_payload
+    assert controller.state.selected_config_ids == (101, 202)
+    assert controller.state.manual_primary_config_id == 101
+    assert controller.state.displayed_config_id == original_state.displayed_config_id
+    assert controller.state.run_phase == phase
+    assert controller.can_arm() is False
+    assert reset_reasons == []
+    assert reviews == []
+    assert states == []
 
 
 @pytest.mark.parametrize("phase", ["running", "analyzing"])

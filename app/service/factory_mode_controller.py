@@ -53,6 +53,9 @@ class FactoryModeController(QObject):
         selected_config_ids: tuple[int, ...] | list[int],
         manual_primary_config_id: int | None = None,
     ) -> FactoryControllerState:
+        if self._state.run_phase in self._BLOCKED_START_PHASES:
+            return self._state
+
         if self._has_review_context():
             self._reset_review_context("selection_changed")
 
@@ -249,6 +252,9 @@ class FactoryModeController(QObject):
     ) -> bool:
         if not self.can_arm():
             return False
+
+        if self._has_review_context():
+            self._reset_review_context("next_run_accepted")
 
         payload = dict(workorder or {})
         payload["config_id"] = config_id
