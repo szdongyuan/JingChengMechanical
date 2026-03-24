@@ -12,6 +12,9 @@ from app.service.analysis.test_manager import TestManager
 from app.services_container import EventBus
 
 
+_DEFAULT_JUDGMENT_PAYLOAD = object()
+
+
 def _load_factory_mode_controller_module():
     spec = importlib.util.find_spec("app.service.factory_mode_controller")
     assert spec is not None, "app.service.factory_mode_controller module is missing"
@@ -22,6 +25,9 @@ def _make_review_payload(
     *,
     displayed_config_id: int = 101,
     trigger_source: str = "manual",
+    no_result: bool = False,
+    error_message: str | None = None,
+    judgment_payload: dict | None | object = _DEFAULT_JUDGMENT_PAYLOAD,
 ):
     review_window_cls = getattr(services_mod, "FactoryReviewWindow", None)
     review_payload_cls = getattr(services_mod, "FactoryReviewPayload", None)
@@ -36,9 +42,13 @@ def _make_review_payload(
         default_window=review_window_cls(start_sec=1.0, end_sec=3.0),
         fallback_window=None,
         manual_reanalysis_allowed=True,
-        no_result=False,
-        error_message=None,
-        judgment_payload={"overall": "PASS"},
+        no_result=no_result,
+        error_message=error_message,
+        judgment_payload=(
+            {"overall": "PASS"}
+            if judgment_payload is _DEFAULT_JUDGMENT_PAYLOAD
+            else judgment_payload
+        ),
     )
 
 
@@ -923,6 +933,124 @@ def test_factory_mode_controller_ignores_mismatched_factory_runtime_review_paylo
     assert controller.state.displayed_config_id == 101
     assert controller.state.run_phase == "analyzing"
     assert controller.state.trigger_source == "manual"
+    assert reviews == []
+
+
+@pytest.mark.parametrize(
+    ("signal_name", "payload"),
+    [
+        (
+            "factory_runtime_auto_analysis_no_result",
+            _make_review_payload(no_result=True, judgment_payload=None),
+        ),
+        (
+            "factory_runtime_auto_analysis_error",
+            _make_review_payload(
+                no_result=True,
+                error_message="analysis window missing",
+                judgment_payload=None,
+            ),
+        ),
+    ],
+)
+def test_factory_mode_controller_ignores_out_of_band_auto_analysis_failure_payloads_while_armed(
+    signal_name,
+    payload,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reviews: list[object] = []
+    bus.factory_review_changed.connect(reviews.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    reviews.clear()
+
+    getattr(bus, signal_name).emit(payload)
+
+    assert controller.review_payload == services_mod.FactoryReviewPayload()
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.run_phase == "armed"
+    assert controller.state.trigger_source is None
+    assert reviews == []
+
+
+@pytest.mark.parametrize(
+    ("reset_kind", "signal_name", "payload"),
+    [
+        (
+            "stop",
+            "factory_runtime_auto_analysis_no_result",
+            _make_review_payload(no_result=True, judgment_payload=None),
+        ),
+        (
+            "stop",
+            "factory_runtime_auto_analysis_error",
+            _make_review_payload(
+                no_result=True,
+                error_message="analysis window missing",
+                judgment_payload=None,
+            ),
+        ),
+        (
+            "abort",
+            "factory_runtime_auto_analysis_no_result",
+            _make_review_payload(no_result=True, judgment_payload=None),
+        ),
+        (
+            "abort",
+            "factory_runtime_auto_analysis_error",
+            _make_review_payload(
+                no_result=True,
+                error_message="analysis window missing",
+                judgment_payload=None,
+            ),
+        ),
+    ],
+)
+def test_factory_mode_controller_ignores_out_of_band_auto_analysis_failure_payloads_after_stop_or_abort(
+    reset_kind,
+    signal_name,
+    payload,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    abort_payload_cls = getattr(services_mod, "FactoryRuntimeAbortPayload", None)
+
+    assert abort_payload_cls is not None, "FactoryRuntimeAbortPayload is missing"
+
+    bus = EventBus()
+    reviews: list[object] = []
+    bus.factory_review_changed.connect(reviews.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    _accept_start(services)
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.start_manual()
+
+    if reset_kind == "stop":
+        controller.handle_runtime_analyzing(services_mod.FactoryRuntimeConfigPayload(config_id=101))
+        reviews.clear()
+        assert controller.stop_active_run() is True
+    else:
+        reviews.clear()
+        bus.factory_runtime_aborted.emit(
+            abort_payload_cls(
+                config_id=101,
+                trigger_source="manual",
+                error_message="monitor disconnected",
+            )
+        )
+
+    reviews.clear()
+
+    getattr(bus, signal_name).emit(payload)
+
+    assert controller.review_payload == services_mod.FactoryReviewPayload()
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.run_phase == "armed"
+    assert controller.state.trigger_source is None
     assert reviews == []
 
 

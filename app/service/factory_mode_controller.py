@@ -167,6 +167,10 @@ class FactoryModeController(QObject):
         self.handle_runtime_review_ready(payload)
 
     def handle_runtime_no_result(self, payload: FactoryReviewPayload) -> None:
+        if not self._owns_active_review_payload(payload):
+            return
+
+        self._owned_runtime_config_id = None
         self._apply_review_payload(payload)
 
     def handle_runtime_auto_analysis_no_result(self, payload: FactoryReviewPayload) -> None:
