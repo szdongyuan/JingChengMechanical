@@ -774,6 +774,7 @@ class TestTestManagerStartStop:
             "input_device_samplerate": 100,
             "output_device_name": None,
         }
+        events: list[str] = []
 
         class FastRecorder:
             instances = []
@@ -833,6 +834,11 @@ class TestTestManagerStartStop:
         prior_session = MagicMock(name="prior_session")
         mgr = TestManager(bus, services)
         mgr._completed_sessions[1] = prior_session
+        bus.test_started.emit.side_effect = lambda config_id: events.append(
+            f"test_started:{config_id}"
+        )
+        bus.status.emit.side_effect = lambda message: events.append(f"status:{message}")
+        bus.log.emit.side_effect = lambda message: events.append(f"log:{message}")
 
         accepted = mgr.start({"config_id": 1, "sn": "SN1", "trigger_source": "manual"})
 
@@ -841,7 +847,109 @@ class TestTestManagerStartStop:
         assert mgr._completed_sessions[1] is not prior_session
         assert mgr._completed_sessions[1]._workorder["sn"] == "SN1"
         assert mgr._completed_sessions[1]._workorder["trigger_source"] == "manual"
+        assert "status:Analyzing..." in events
+        assert "status:Idle" in events
+        assert "test_started:1" not in events
+        assert "status:Recording..." not in events
+        assert not any(
+            event.startswith("log:[TestManager] started config=1")
+            for event in events
+        )
         bus.factory_runtime_auto_analysis_succeeded.emit.assert_called_once()
+
+    def test_start_does_not_emit_started_or_recording_status_after_reentrant_recorder_error(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        services.config_service.load_config.return_value = {
+            "config_id": 1,
+            "config_name": "Test",
+            "record_duration": 2.0,
+            "analysis_duration": 1.0,
+            "selected_channels": [0],
+            "channels": [{
+                "channel_index": 0,
+                "stft_nfft": 1024,
+                "stft_overlap": 0.5,
+                "spl_weighting": "Z",
+                "spl_time_constant": 0.125,
+                "spl_upper_limit": 85.0,
+                "spl_lower_limit": 40.0,
+                "fft_band_limits": [],
+                "oct_weighting": "Z",
+                "oct_band_limits": [],
+            }],
+            "input_device_name": "Mic",
+            "input_device_hostapi": "MME",
+            "input_device_samplerate": 100,
+            "output_device_name": None,
+        }
+
+        events: list[str] = []
+
+        class ErrorRecorder:
+            instances = []
+
+            def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+                self._sample_rate = float(sample_rate)
+                self._n_channels = n_channels
+                self._record_duration = float(record_duration)
+                self._buffer = np.ones(
+                    (int(self._sample_rate * self._record_duration), n_channels),
+                    dtype=np.float32,
+                )
+                self.chunk_ready = _DummySignal()
+                self.recording_done = _DummySignal()
+                self.error_occurred = _DummySignal()
+                self._running = False
+                ErrorRecorder.instances.append(self)
+
+            def isRunning(self):
+                return self._running
+
+            def start(self):
+                self._running = True
+                self.error_occurred.emit("device lost")
+
+            def stop(self):
+                self._running = False
+
+            def wait(self, timeout):
+                return True
+
+            def attach_session(self, *, record_duration):
+                return MagicMock(chunk_index=0, sample_index=0)
+
+            def get_buffer_from(self, snapshot):
+                return self._buffer
+
+        monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", ErrorRecorder)
+        monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
+
+        prior_session = MagicMock(name="prior_session")
+        mgr = TestManager(bus, services)
+        mgr._completed_sessions[1] = prior_session
+        bus.test_started.emit.side_effect = lambda config_id: events.append(
+            f"test_started:{config_id}"
+        )
+        bus.status.emit.side_effect = lambda message: events.append(f"status:{message}")
+        bus.log.emit.side_effect = lambda message: events.append(f"log:{message}")
+
+        accepted = mgr.start({"config_id": 1, "sn": "SN1", "trigger_source": "manual"})
+
+        assert accepted is True
+        assert mgr.is_running(config_id=1) is False
+        assert mgr._completed_sessions[1] is prior_session
+        assert "status:Error: device lost" in events
+        assert "test_started:1" not in events
+        assert "status:Recording..." not in events
+        assert not any(
+            event.startswith("log:[TestManager] started config=1")
+            for event in events
+        )
+        bus.factory_runtime_aborted.emit.assert_called_once()
 
     def test_stop_all(self):
         bus = _mock_bus()

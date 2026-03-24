@@ -193,6 +193,13 @@ class TestManager(QObject):
             self._clear_pending_factory_start(request_id)
             return False
 
+        active_session = self._sessions.get(config_id)
+        if active_session is not session:
+            if prior_completed_session is not None and config_id not in self._completed_sessions:
+                self._completed_sessions[config_id] = prior_completed_session
+            self._clear_pending_factory_start(request_id)
+            return True
+
         self._clear_pending_factory_start(request_id)
         self._bus.test_started.emit(config_id)
         self._bus.status.emit("Recording...")
