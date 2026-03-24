@@ -151,6 +151,20 @@ class TestManager(QObject):
             for cid in list(self._sessions.keys()):
                 self._stop_one(cid, silent)
 
+    def stop_active_run(self, config_id: int | None = None) -> bool:
+        """Factory-mode hook for stopping an active session."""
+        if config_id is None:
+            if not self._sessions:
+                return False
+            self.stop()
+            return True
+
+        if config_id not in self._sessions:
+            return False
+
+        self.stop(config_id=config_id)
+        return True
+
     def _stop_one(self, config_id: int, silent: bool = False):
         session = self._sessions.pop(config_id, None)
         rec = self._recorders.pop(config_id, None)

@@ -269,6 +269,29 @@ class TestTestManagerStartStop:
         mgr.stop(False)
         assert mgr.is_running() is False
 
+    def test_stop_active_run_returns_true_when_factory_run_is_stopped(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        session = MagicMock()
+        session.config_id = 1
+        mgr._sessions[1] = session
+        mgr._recorders[1] = MagicMock()
+
+        stopped = mgr.stop_active_run(config_id=1)
+
+        assert stopped is True
+        assert mgr.is_running(config_id=1) is False
+
+    def test_stop_active_run_returns_false_when_factory_run_is_missing(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+
+        stopped = mgr.stop_active_run(config_id=99)
+
+        assert stopped is False
+
     def test_start_resolves_config_name(self):
         """WorkOrderModule sends config name, not config_id. Should resolve."""
         bus = _mock_bus()
