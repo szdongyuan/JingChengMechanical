@@ -19,6 +19,14 @@ QWidget#ChangePasswordRoot {
   border: 1px solid #e5e7eb;
   border-radius: 10px;
 }
+QWidget#AddUserWindow {
+  background: white;
+}
+QWidget#AddUserRoot {
+  background: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+}
 QToolButton#TopTab {
   border: 1px solid transparent;
   background: transparent;

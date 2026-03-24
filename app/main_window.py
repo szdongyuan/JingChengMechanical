@@ -31,6 +31,7 @@ from ui.modules.config import ConfigModule
 from ui.modules.channel_select import ChannelSelectModule
 from ui.modules.login import LoginWindow
 from ui.modules.change_password import ChangePasswordWindow
+from ui.modules.add_user import AddUserWindow
 
 ROLE_PERMISSIONS = {
     "管理员": {
@@ -56,6 +57,7 @@ class MainWindow(QMainWindow):
         self.current_user_role = None
         self.login_window = None
         self.change_password_window = None
+        self.add_user_window = None
         self.login_shown = False
 
         self.setWindowTitle("精成电机")
@@ -122,6 +124,10 @@ class MainWindow(QMainWindow):
         self.change_password_window = ChangePasswordWindow(self.current_user_name)
         self.change_password_window.show()
 
+    def show_add_user_window(self):
+        self.add_user_window = AddUserWindow()
+        self.add_user_window.show()
+
     def build_topbar(self):
         topbar = QWidget()
         topbar.setObjectName("TopBar")
@@ -164,9 +170,7 @@ class MainWindow(QMainWindow):
         self.action_switch_user.triggered.connect(
             lambda: self.show_login_window(close_main_window=False, window_title="切换用户")
         )
-        self.action_add_user.triggered.connect(
-            lambda: self.services.bus.status.emit("添加用户功能暂未实现")
-        )
+        self.action_add_user.triggered.connect(self.show_add_user_window)
         self.action_change_pwd.triggered.connect(self.show_change_password_window)
 
         user_menu.addAction(self.action_switch_user)
