@@ -197,7 +197,8 @@ class TestTestManagerStartStop:
         bus = _mock_bus()
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
-        mgr.start({"sn": "123"})
+        accepted = mgr.start({"sn": "123"})
+        assert accepted is False
         bus.log.emit.assert_called()
         assert mgr.is_running() is False
 
@@ -228,9 +229,22 @@ class TestTestManagerStartStop:
             "output_device_name": None,
         }
         mgr = TestManager(bus, services)
-        mgr.start({"config_id": 1, "sn": "SN1"})
+        accepted = mgr.start({"config_id": 1, "sn": "SN1"})
+        assert accepted is True
         assert mgr.is_running(config_id=1) is True
         bus.test_started.emit.assert_called_with(1)
+
+    def test_start_returns_false_when_config_load_fails(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        services.config_service.load_config.side_effect = RuntimeError("missing config")
+        mgr = TestManager(bus, services)
+
+        accepted = mgr.start({"config_id": 1, "sn": "SN1"})
+
+        assert accepted is False
+        assert mgr.is_running(config_id=1) is False
+        bus.log.emit.assert_called()
 
     def test_stop_all(self):
         bus = _mock_bus()
@@ -323,7 +337,8 @@ class TestTestManagerStartStop:
             "output_device_name": None,
         }
         mgr = TestManager(bus, services)
-        mgr.start({"config": "MyConfig", "sn": "SN1", "model": "M1"})
+        accepted = mgr.start({"config": "MyConfig", "sn": "SN1", "model": "M1"})
+        assert accepted is True
         assert mgr.is_running(config_id=42) is True
 
     def test_start_passes_output_device_identity_to_monitor(self, monkeypatch):

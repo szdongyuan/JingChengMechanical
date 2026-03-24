@@ -220,7 +220,8 @@ class FactoryModeController(QObject):
             else:
                 stopped = False
 
-        self._reset_review_context("active_run_stopped")
+        if stopped:
+            self._reset_review_context("active_run_stopped")
         return stopped
 
     def clear_for_next_run(self, reason: str = "next_run_accepted") -> None:
@@ -258,9 +259,18 @@ class FactoryModeController(QObject):
 
         payload = dict(workorder or {})
         payload["config_id"] = config_id
+        start_accepted = True
         test_manager = getattr(self.services, "test", None)
         if test_manager is not None:
-            test_manager.start(payload)
+            start = getattr(test_manager, "start", None)
+            if callable(start):
+                start_accepted = bool(start(payload))
+            else:
+                start_accepted = False
+
+        if not start_accepted:
+            return False
+
         self.bus.factory_runtime_start_accepted.emit(
             FactoryRuntimeStartPayload(config_id=config_id, trigger_source=trigger_source)
         )

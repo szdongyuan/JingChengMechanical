@@ -33,7 +33,7 @@ class TestManager(QObject):
         self._monitors: dict[int, AudioMonitor] = {}
         self._shared_recorders: dict[str, AudioRecorder] = {}
 
-    def start(self, workorder: dict):
+    def start(self, workorder: dict) -> bool:
         """Start a test for the config_id in the workorder."""
         config_id = workorder.get("config_id")
         if config_id is None:
@@ -45,7 +45,7 @@ class TestManager(QObject):
                         break
         if config_id is None:
             self._bus.log.emit("[TestManager] ERROR: could not resolve config_id from workorder")
-            return
+            return False
 
         if config_id in self._sessions:
             self._bus.log.emit(f"[TestManager] config {config_id} already running, stopping first")
@@ -57,7 +57,7 @@ class TestManager(QObject):
             config = self._services.config_service.load_config(config_id)
         except Exception as exc:
             self._bus.log.emit(f"[TestManager] ERROR loading config {config_id}: {exc}")
-            return
+            return False
 
         device_info = self._services.hss_service.load_io_devices()
         mic_cal = device_info.get("mic_cal", {})
@@ -140,6 +140,7 @@ class TestManager(QObject):
         self._bus.log.emit(f"[TestManager] started config={config_id}, workorder={workorder}")
         if not recorder.isRunning():
             recorder.start()
+        return True
 
     def stop(self, config_id: int | None = None, silent: bool = False):
         """Stop test(s). If config_id is None, stop all."""

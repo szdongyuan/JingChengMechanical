@@ -292,6 +292,7 @@ def test_factory_mode_controller_manual_start_resolves_to_primary_only():
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()
     services = _make_services((_make_config(101), _make_config(202)))
+    services.test.start.return_value = True
     controller = controller_mod.FactoryModeController(bus, services)
     controller.set_selection((101, 202), manual_primary_config_id=202)
 
@@ -331,6 +332,7 @@ def test_factory_mode_controller_manual_start_resolves_to_primary_only():
 def test_factory_mode_controller_routes_plc_events(configs, manual_primary_config_id, plc_device_key, expected_config_id):
     controller_mod = _load_factory_mode_controller_module()
     services = _make_services(configs)
+    services.test.start.return_value = True
     controller = controller_mod.FactoryModeController(EventBus(), services)
     controller.set_selection((101, 202), manual_primary_config_id=manual_primary_config_id)
 
@@ -367,6 +369,7 @@ def test_factory_mode_controller_routes_plc_events(configs, manual_primary_confi
 def test_factory_mode_controller_routes_scan_events(configs, manual_primary_config_id, expected_config_id):
     controller_mod = _load_factory_mode_controller_module()
     services = _make_services(configs)
+    services.test.start.return_value = True
     controller = controller_mod.FactoryModeController(EventBus(), services)
     controller.set_selection((101, 202), manual_primary_config_id=manual_primary_config_id)
 
@@ -418,6 +421,7 @@ def test_factory_mode_controller_accepted_starts_clear_stale_review_context(star
 
     reset_reasons.clear()
     reviews.clear()
+    services.test.start.return_value = True
     services.test.start.reset_mock()
 
     if start_kind == "manual":
@@ -476,6 +480,7 @@ def test_factory_mode_controller_accepted_starts_preclear_review_context_before_
                 "reviews": list(reviews),
             }
         )
+        return True
 
     services.test.start.side_effect = _capture_start
     reset_reasons.clear()
@@ -505,6 +510,30 @@ def test_factory_mode_controller_accepted_starts_preclear_review_context_before_
     assert start_snapshots[0]["state"].displayed_config_id is None
     assert start_snapshots[0]["state"].run_phase == "armed"
     assert start_snapshots[0]["state"].trigger_source is None
+
+
+def test_factory_mode_controller_failed_start_keeps_controller_armed():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    states: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_state_changed.connect(states.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    services.test.start.return_value = False
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+
+    accepted = controller.start_manual({"sn": "SN-1"})
+
+    assert accepted is False
+    services.test.start.assert_called_once_with({"sn": "SN-1", "config_id": 101})
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.run_phase == "armed"
+    assert controller.state.trigger_source is None
+    assert reset_reasons == []
+    assert states[-1].run_phase == "armed"
 
 
 @pytest.mark.parametrize("phase", ["running", "analyzing", "reanalyzing"])
@@ -598,6 +627,7 @@ def test_factory_mode_controller_stop_clears_active_state_and_display_ownership(
     bus.factory_display_reset.connect(reset_reasons.append)
     bus.factory_review_changed.connect(reviews.append)
     services = _make_services((_make_config(101), _make_config(202)))
+    services.test.start.return_value = True
     controller = controller_mod.FactoryModeController(bus, services)
     controller.set_selection((101, 202), manual_primary_config_id=101)
     controller.start_manual()
@@ -617,6 +647,37 @@ def test_factory_mode_controller_stop_clears_active_state_and_display_ownership(
     assert controller.state.trigger_source is None
     assert reset_reasons == ["active_run_stopped"]
     assert reviews == [services_mod.FactoryReviewPayload()]
+
+
+@pytest.mark.parametrize("phase", ["running", "analyzing"])
+def test_factory_mode_controller_failed_stop_keeps_active_run_state(phase):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    services.test.start.return_value = True
+    services.test.stop_active_run.return_value = False
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.start_manual()
+    reviews.clear()
+
+    if phase == "analyzing":
+        controller.handle_runtime_analyzing(services_mod.FactoryRuntimeConfigPayload(config_id=101))
+
+    stopped = controller.stop_active_run()
+
+    assert stopped is False
+    services.test.stop_active_run.assert_called_once_with(config_id=101)
+    assert controller.state.active_config_id == 101
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == phase
+    assert controller.state.trigger_source == "manual"
+    assert reset_reasons == []
+    assert reviews == []
 
 
 def test_factory_mode_controller_reanalysis_failure_returns_to_reviewing_without_result():
