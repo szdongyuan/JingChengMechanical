@@ -280,14 +280,17 @@ class FactoryModeController(QObject):
         stopped = True
         test_manager = getattr(self.services, "test", None)
         stop_active_run = getattr(test_manager, "stop_active_run", None)
-        if callable(stop_active_run):
-            stopped = bool(stop_active_run(config_id=config_id))
-        elif test_manager is not None:
-            stop = getattr(test_manager, "stop", None)
-            if callable(stop):
-                stop(config_id=config_id)
-            else:
-                stopped = False
+        try:
+            if callable(stop_active_run):
+                stopped = bool(stop_active_run(config_id=config_id))
+            elif test_manager is not None:
+                stop = getattr(test_manager, "stop", None)
+                if callable(stop):
+                    stop(config_id=config_id)
+                else:
+                    stopped = False
+        except Exception:
+            stopped = False
 
         if stopped:
             self._reset_review_context("active_run_stopped")

@@ -1235,6 +1235,46 @@ def test_factory_mode_controller_failed_stop_keeps_active_run_state(phase):
     assert reviews == []
 
 
+@pytest.mark.parametrize("backend_stop_api", ["stop_active_run", "stop"])
+def test_factory_mode_controller_stop_backend_exception_is_contained_and_keeps_active_run_state(
+    backend_stop_api,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    _accept_start(services)
+    if backend_stop_api == "stop_active_run":
+        services.test.stop_active_run.side_effect = RuntimeError("stop exploded")
+    else:
+        services.test.stop_active_run = None
+        services.test.stop.side_effect = RuntimeError("stop exploded")
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.start_manual()
+    reviews.clear()
+
+    try:
+        stopped = controller.stop_active_run()
+    except RuntimeError as exc:
+        pytest.fail(f"stop backend exception escaped controller boundary: {exc}")
+
+    assert stopped is False
+    if backend_stop_api == "stop_active_run":
+        services.test.stop_active_run.assert_called_once_with(config_id=101)
+    else:
+        services.test.stop.assert_called_once_with(config_id=101)
+    assert controller.state.active_config_id == 101
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "running"
+    assert controller.state.trigger_source == "manual"
+    assert reset_reasons == []
+    assert reviews == []
+
+
 def test_factory_mode_controller_reanalysis_failure_returns_to_reviewing_without_result():
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()
