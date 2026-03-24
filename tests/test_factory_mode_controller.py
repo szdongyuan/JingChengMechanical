@@ -95,18 +95,22 @@ def _emit_owned_runtime_start(
     config_id: int,
     trigger_source: str,
     run_id: str | None = None,
+    request_id: str | None = None,
 ):
     runtime_start_cls = getattr(services_mod, "FactoryRuntimeStartPayload", None)
 
     assert runtime_start_cls is not None, "FactoryRuntimeStartPayload is missing"
 
     active_run_id = run_id or _run_id_for(config_id)
+    active_request_id = request_id or f"request-{config_id}"
     controller._pending_start = (config_id, trigger_source)
+    controller._pending_start_request_id = active_request_id
     bus.factory_runtime_start_accepted.emit(
         runtime_start_cls(
             config_id=config_id,
             run_id=active_run_id,
             trigger_source=trigger_source,
+            request_id=active_request_id,
         )
     )
 
@@ -847,6 +851,7 @@ def test_factory_mode_controller_selection_change_cancels_pending_start_acceptan
     bus = EventBus()
     states: list[object] = []
     callbacks: list[object] = []
+    start_payloads: list[dict[str, object]] = []
     bus.factory_state_changed.connect(states.append)
     services = _make_services(
         (
@@ -861,6 +866,7 @@ def test_factory_mode_controller_selection_change_cancels_pending_start_acceptan
         assert payload["config_id"] == 101
         assert payload["trigger_source"] == "manual"
         assert callable(on_start_accepted)
+        start_payloads.append(dict(payload))
         callbacks.append(on_start_accepted)
         return True
 
@@ -871,10 +877,17 @@ def test_factory_mode_controller_selection_change_cancels_pending_start_acceptan
 
     assert controller.start_manual({"sn": "first"}) is True
     assert len(callbacks) == 1
+    request_id = start_payloads[0].get("factory_start_request_id")
+    assert isinstance(request_id, str)
+    assert request_id
 
     next_state = controller.set_selection((303, 404), manual_primary_config_id=303)
 
     assert next_state == controller.state
+    services.test.cancel_pending_start.assert_called_once_with(
+        request_id=request_id,
+        config_id=101,
+    )
     assert controller.state.selected_config_ids == (303, 404)
     assert controller.state.manual_primary_config_id == 303
     assert controller.state.active_config_id is None
@@ -893,6 +906,78 @@ def test_factory_mode_controller_selection_change_cancels_pending_start_acceptan
     assert controller.state.run_phase == "armed"
     assert controller.state.trigger_source is None
     assert controller.can_arm() is True
+    assert states == [controller.state]
+
+
+def test_factory_mode_controller_ignores_stale_bus_start_acceptance_for_same_config_new_request():
+    controller_mod = _load_factory_mode_controller_module()
+    runtime_start_cls = getattr(services_mod, "FactoryRuntimeStartPayload", None)
+
+    assert runtime_start_cls is not None, "FactoryRuntimeStartPayload is missing"
+
+    bus = EventBus()
+    states: list[object] = []
+    callbacks: list[object] = []
+    start_payloads: list[dict[str, object]] = []
+    bus.factory_state_changed.connect(states.append)
+    services = _make_services(
+        (_make_config(101), _make_config(202), _make_config(303), _make_config(404))
+    )
+
+    def _capture_start(payload, *, on_start_accepted=None):
+        assert payload["config_id"] == 101
+        assert payload["trigger_source"] == "manual"
+        assert callable(on_start_accepted)
+        start_payloads.append(dict(payload))
+        callbacks.append(on_start_accepted)
+        return True
+
+    services.test.start.side_effect = _capture_start
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+
+    assert controller.start_manual({"sn": "first"}) is True
+    first_request_id = start_payloads[0].get("factory_start_request_id")
+    assert isinstance(first_request_id, str)
+    assert first_request_id
+
+    controller.set_selection((303, 404), manual_primary_config_id=303)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    assert controller.start_manual({"sn": "second"}) is True
+    second_request_id = start_payloads[1].get("factory_start_request_id")
+    assert isinstance(second_request_id, str)
+    assert second_request_id
+    assert second_request_id != first_request_id
+    states.clear()
+
+    controller.handle_runtime_start_accepted(
+        runtime_start_cls(
+            config_id=101,
+            run_id=_run_id_for(101, attempt=1),
+            trigger_source="manual",
+            request_id=first_request_id,
+        )
+    )
+
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.run_phase == "armed"
+    assert controller.state.trigger_source is None
+    assert states == []
+
+    controller.handle_runtime_start_accepted(
+        runtime_start_cls(
+            config_id=101,
+            run_id=_run_id_for(101, attempt=2),
+            trigger_source="manual",
+            request_id=second_request_id,
+        )
+    )
+
+    assert controller.state.active_config_id == 101
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "running"
+    assert controller.state.trigger_source == "manual"
     assert states == [controller.state]
 
 
@@ -963,7 +1048,7 @@ def test_factory_mode_controller_start_exception_preserves_review_context_and_cl
     assert accepted is False
     services.test.start.assert_called_once()
     assert controller._pending_start is None
-    assert controller._pending_start_request_token is None
+    assert controller._pending_start_request_id is None
     assert controller.can_arm() is True
     assert controller.state.active_config_id is None
     assert controller.state.displayed_config_id == 202

@@ -33,6 +33,8 @@ class TestManager(QObject):
         self._recorders: dict[int, AudioRecorder] = {}
         self._monitors: dict[int, AudioMonitor] = {}
         self._shared_recorders: dict[str, AudioRecorder] = {}
+        self._pending_factory_starts: dict[str, int] = {}
+        self._canceled_factory_start_requests: set[str] = set()
 
     def start(self, workorder: dict, *, on_start_accepted=None) -> bool:
         """Start a test for the config_id in the workorder."""
@@ -48,6 +50,10 @@ class TestManager(QObject):
             self._bus.log.emit("[TestManager] ERROR: could not resolve config_id from workorder")
             return False
 
+        request_id = self._get_factory_start_request_id(workorder)
+        if request_id is not None:
+            self._pending_factory_starts[request_id] = config_id
+
         if config_id in self._sessions:
             self._bus.log.emit(f"[TestManager] config {config_id} already running, stopping first")
             self.stop(config_id=config_id)
@@ -56,6 +62,7 @@ class TestManager(QObject):
             config = self._services.config_service.load_config(config_id)
         except Exception as exc:
             self._bus.log.emit(f"[TestManager] ERROR loading config {config_id}: {exc}")
+            self._clear_pending_factory_start(request_id)
             return False
 
         device_info = self._services.hss_service.load_io_devices()
@@ -141,6 +148,12 @@ class TestManager(QObject):
         except Exception as exc:
             self._bus.log.emit(f"[TestManager] ERROR starting config {config_id}: {exc}")
             self._stop_one(config_id, silent=True)
+            self._clear_pending_factory_start(request_id)
+            return False
+
+        if self._factory_start_canceled(request_id):
+            self._stop_one(config_id, silent=True)
+            self._clear_pending_factory_start(request_id)
             return False
 
         if callable(on_start_accepted):
@@ -151,7 +164,13 @@ class TestManager(QObject):
                     f"[TestManager] ERROR accepting start for config {config_id}: {exc}"
                 )
                 self._stop_one(config_id, silent=True)
+                self._clear_pending_factory_start(request_id)
                 return False
+
+        if self._factory_start_canceled(request_id):
+            self._stop_one(config_id, silent=True)
+            self._clear_pending_factory_start(request_id)
+            return False
 
         prior_completed_session = self._completed_sessions.pop(config_id, None)
 
@@ -171,13 +190,26 @@ class TestManager(QObject):
             self._stop_one(config_id, silent=True)
             if prior_completed_session is not None and config_id not in self._completed_sessions:
                 self._completed_sessions[config_id] = prior_completed_session
+            self._clear_pending_factory_start(request_id)
             return False
 
+        self._clear_pending_factory_start(request_id)
         self._bus.test_started.emit(config_id)
         self._bus.status.emit("Recording...")
         self._bus.log.emit(
             f"[TestManager] started config={config_id}, workorder={session_workorder}"
         )
+        return True
+
+    def cancel_pending_start(self, *, request_id: str, config_id: int | None = None) -> bool:
+        if not request_id:
+            return False
+
+        pending_config_id = self._pending_factory_starts.get(request_id)
+        if pending_config_id is not None and config_id is not None and pending_config_id != config_id:
+            return False
+
+        self._canceled_factory_start_requests.add(request_id)
         return True
 
     def stop(self, config_id: int | None = None, silent: bool = False):
@@ -232,6 +264,22 @@ class TestManager(QObject):
         if not silent:
             self._bus.log.emit(f"[TestManager] stopped config={config_id}")
             self._bus.status.emit("Stopped")
+
+    @staticmethod
+    def _get_factory_start_request_id(workorder: dict) -> str | None:
+        request_id = workorder.get("factory_start_request_id")
+        if not request_id:
+            return None
+        return str(request_id)
+
+    def _factory_start_canceled(self, request_id: str | None) -> bool:
+        return bool(request_id) and request_id in self._canceled_factory_start_requests
+
+    def _clear_pending_factory_start(self, request_id: str | None) -> None:
+        if not request_id:
+            return
+        self._pending_factory_starts.pop(request_id, None)
+        self._canceled_factory_start_requests.discard(request_id)
 
     def is_running(self, config_id: int | None = None) -> bool:
         if config_id is not None:

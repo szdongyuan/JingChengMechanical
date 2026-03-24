@@ -29,7 +29,7 @@ class FactoryModeController(QObject):
         self._state = FactoryControllerState()
         self._review_payload = FactoryReviewPayload()
         self._pending_start: tuple[int, str] | None = None
-        self._pending_start_request_token: object | None = None
+        self._pending_start_request_id: str | None = None
         self._owned_runtime_config_id: int | None = None
         self._owned_runtime_run_id: str | None = None
         self._owned_reanalysis_config_id: int | None = None
@@ -72,6 +72,10 @@ class FactoryModeController(QObject):
         if has_review_context and not selection_changed:
             return self._state
 
+        if selection_changed and self._pending_start is not None:
+            if not self._cancel_pending_start():
+                return self._state
+
         is_ready = False
         self._selected_configs = {}
         if len(selected) == 2 and len(set(selected)) == 2 and manual_primary_config_id in selected:
@@ -94,9 +98,6 @@ class FactoryModeController(QObject):
         if has_review_context:
             self._reset_review_context("selection_changed", state=next_state)
         else:
-            if selection_changed:
-                self._pending_start = None
-                self._pending_start_request_token = None
             self._state = next_state
             self._emit_state()
         return self._state
@@ -136,7 +137,7 @@ class FactoryModeController(QObject):
             return
 
         self._pending_start = None
-        self._pending_start_request_token = None
+        self._pending_start_request_id = None
         if self._has_review_context():
             self._reset_review_context("next_run_accepted")
 
@@ -332,15 +333,16 @@ class FactoryModeController(QObject):
         payload = dict(workorder or {})
         payload["config_id"] = config_id
         payload["trigger_source"] = trigger_source
+        request_id = f"factory-start-{uuid.uuid4().hex}"
+        payload["factory_start_request_id"] = request_id
         self._pending_start = (config_id, trigger_source)
-        request_token = object()
-        self._pending_start_request_token = request_token
+        self._pending_start_request_id = request_id
 
         def _on_start_accepted(run_id: str) -> None:
             if not self._matches_pending_start_request(
                 config_id=config_id,
                 trigger_source=trigger_source,
-                request_token=request_token,
+                request_id=request_id,
             ):
                 return
             self.bus.factory_runtime_start_accepted.emit(
@@ -348,6 +350,7 @@ class FactoryModeController(QObject):
                     config_id=config_id,
                     run_id=run_id,
                     trigger_source=trigger_source,
+                    request_id=request_id,
                 )
             )
 
@@ -362,7 +365,7 @@ class FactoryModeController(QObject):
                     )
                 except Exception:
                     self._pending_start = None
-                    self._pending_start_request_token = None
+                    self._pending_start_request_id = None
                     return False
             else:
                 start_accepted = False
@@ -371,7 +374,7 @@ class FactoryModeController(QObject):
 
         if not start_accepted:
             self._pending_start = None
-            self._pending_start_request_token = None
+            self._pending_start_request_id = None
             return False
 
         return True
@@ -461,7 +464,7 @@ class FactoryModeController(QObject):
         state: FactoryControllerState | None = None,
     ) -> None:
         self._pending_start = None
-        self._pending_start_request_token = None
+        self._pending_start_request_id = None
         self._owned_runtime_config_id = None
         self._owned_runtime_run_id = None
         self._owned_reanalysis_config_id = None
@@ -484,8 +487,10 @@ class FactoryModeController(QObject):
     def _matches_pending_start(self, payload: FactoryRuntimeStartPayload) -> bool:
         return (
             self._pending_start is not None
+            and self._pending_start_request_id is not None
             and payload.config_id == self._pending_start[0]
             and payload.trigger_source == self._pending_start[1]
+            and payload.request_id == self._pending_start_request_id
         )
 
     def _matches_pending_start_request(
@@ -493,14 +498,45 @@ class FactoryModeController(QObject):
         *,
         config_id: int,
         trigger_source: str,
-        request_token: object,
+        request_id: str,
     ) -> bool:
         return (
             self._pending_start is not None
+            and self._pending_start_request_id is not None
             and config_id == self._pending_start[0]
             and trigger_source == self._pending_start[1]
-            and self._pending_start_request_token is request_token
+            and self._pending_start_request_id == request_id
         )
+
+    def _cancel_pending_start(self) -> bool:
+        request_id = self._pending_start_request_id
+        if self._pending_start is None:
+            self._pending_start_request_id = None
+            return True
+        if not request_id:
+            return False
+
+        test_manager = getattr(self.services, "test", None)
+        cancel_pending_start = getattr(test_manager, "cancel_pending_start", None)
+        if not callable(cancel_pending_start):
+            return False
+
+        try:
+            canceled = bool(
+                cancel_pending_start(
+                    request_id=request_id,
+                    config_id=self._pending_start[0],
+                )
+            )
+        except Exception:
+            return False
+
+        if not canceled:
+            return False
+
+        self._pending_start = None
+        self._pending_start_request_id = None
+        return True
 
     def _owns_runtime_payload(
         self,
