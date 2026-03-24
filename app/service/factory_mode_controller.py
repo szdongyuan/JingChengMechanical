@@ -107,6 +107,7 @@ class FactoryModeController(QObject):
             self._state.is_ready
             and self._state.run_phase not in self._BLOCKED_START_PHASES
             and self._pending_start is None
+            and not self._backend_session_running()
         )
 
     def start_manual(self, workorder: dict | None = None) -> bool:
@@ -274,6 +275,9 @@ class FactoryModeController(QObject):
         self.finish_reanalysis_success(payload)
 
     def stop_active_run(self) -> bool:
+        if self._pending_start is not None:
+            return self._cancel_pending_start()
+
         config_id = self._state.active_config_id
         if config_id is None or self._state.run_phase not in self._ACTIVE_RUN_PHASES:
             return False
@@ -326,7 +330,7 @@ class FactoryModeController(QObject):
         trigger_source: str,
         workorder: dict | None = None,
     ) -> bool:
-        if not self.can_arm():
+        if not self.can_arm() or self._backend_session_running():
             return False
 
         payload = dict(workorder or {})
@@ -534,6 +538,17 @@ class FactoryModeController(QObject):
         self._pending_start = None
         self._pending_start_request_id = None
         return True
+
+    def _backend_session_running(self) -> bool:
+        test_manager = getattr(self.services, "test", None)
+        is_running = getattr(test_manager, "is_running", None)
+        if not callable(is_running):
+            return False
+
+        try:
+            return bool(is_running())
+        except Exception:
+            return False
 
     def _owns_runtime_payload(
         self,

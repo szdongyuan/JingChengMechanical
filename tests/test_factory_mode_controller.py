@@ -165,6 +165,7 @@ def _make_services(configs, *, validation_errors: dict[int, list[str]] | None = 
     config_map = {config["config_id"]: dict(config) for config in configs}
     services = MagicMock()
     services.test = MagicMock()
+    services.test.is_running.return_value = False
     services.config_service = MagicMock()
     services.config_service.load_config.side_effect = lambda config_id: dict(config_map[config_id])
     services.config_service.validate_factory_runtime.side_effect = (
@@ -490,6 +491,22 @@ def test_factory_mode_controller_arms_only_after_runtime_validation_succeeds():
     assert controller.state.run_phase == "armed"
     assert controller.state.is_ready is True
     assert controller.can_arm() is True
+
+
+def test_factory_mode_controller_rejects_start_when_backend_session_is_already_running():
+    controller_mod = _load_factory_mode_controller_module()
+    services = _make_services((_make_config(101), _make_config(202)))
+    services.test.is_running.return_value = True
+    controller = controller_mod.FactoryModeController(EventBus(), services)
+
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+
+    assert controller.state.run_phase == "armed"
+    assert controller.state.is_ready is True
+    assert controller.can_arm() is False
+    assert controller.start_manual({"sn": "SN-1"}) is False
+    services.test.is_running.assert_called()
+    services.test.start.assert_not_called()
 
 
 def test_factory_mode_controller_manual_start_resolves_to_primary_only():
@@ -904,6 +921,78 @@ def test_factory_mode_controller_selection_change_cancels_pending_start_acceptan
     assert controller.state.trigger_source is None
     assert controller.can_arm() is True
     assert states == [controller.state]
+
+
+def test_factory_mode_controller_stop_cancels_pending_start_and_preserves_review_state():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    states: list[object] = []
+    accepted_payloads: list[object] = []
+    callbacks: list[object] = []
+    start_payloads: list[dict[str, object]] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    bus.factory_state_changed.connect(states.append)
+    bus.factory_runtime_start_accepted.connect(accepted_payloads.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+
+    def _capture_start(payload, *, on_start_accepted=None):
+        assert payload["config_id"] == 101
+        assert payload["trigger_source"] == "manual"
+        assert callable(on_start_accepted)
+        start_payloads.append(dict(payload))
+        callbacks.append(on_start_accepted)
+        return True
+
+    services.test.start.side_effect = _capture_start
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    original_review_payload = _enter_reviewing_state(
+        controller,
+        bus,
+        config_id=202,
+        trigger_source="plc",
+    )
+    original_state = controller.state
+
+    reset_reasons.clear()
+    reviews.clear()
+    states.clear()
+    accepted_payloads.clear()
+
+    assert controller.start_manual({"sn": "SN-2"}) is True
+    assert len(callbacks) == 1
+    request_id = start_payloads[0].get("factory_start_request_id")
+    assert isinstance(request_id, str)
+    assert request_id
+
+    stopped = controller.stop_active_run()
+
+    assert stopped is True
+    services.test.cancel_pending_start.assert_called_once_with(
+        request_id=request_id,
+        config_id=101,
+    )
+    assert controller._pending_start is None
+    assert controller._pending_start_request_id is None
+    assert controller.state == original_state
+    assert controller.review_payload == original_review_payload
+    assert controller.can_arm() is True
+    assert reset_reasons == []
+    assert reviews == []
+    assert states == []
+    assert accepted_payloads == []
+
+    callbacks[0](_run_id_for(101))
+
+    assert controller.state == original_state
+    assert controller.review_payload == original_review_payload
+    assert reset_reasons == []
+    assert reviews == []
+    assert states == []
+    assert accepted_payloads == []
 
 
 def test_factory_mode_controller_ignores_stale_start_callback_for_same_config_new_request():
