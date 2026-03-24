@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from app.service.ai_service import AiService
@@ -9,6 +9,57 @@ from app.service.config_service import ConfigService
 from app.service.db_connection_service import DbConnectionService
 from app.service.hardwareselect_service import HardwareSelectService
 from app.service.input_calibration_service import InputCalibrationService
+
+
+@dataclass(frozen=True)
+class FactoryControllerState:
+    selected_config_ids: tuple[int, ...] = ()
+    manual_primary_config_id: int | None = None
+    active_config_id: int | None = None
+    displayed_config_id: int | None = None
+    run_phase: str = "not_ready"
+    trigger_source: str | None = None
+    is_ready: bool = False
+
+
+@dataclass(frozen=True)
+class FactoryReviewWindow:
+    start_sec: float
+    end_sec: float
+
+
+@dataclass(frozen=True)
+class FactoryReviewPayload:
+    displayed_config_id: int | None = None
+    trigger_source: str | None = None
+    captured_duration_sec: float | None = None
+    default_window: FactoryReviewWindow | None = None
+    fallback_window: FactoryReviewWindow | None = None
+    manual_reanalysis_allowed: bool = False
+    no_result: bool = False
+    error_message: str | None = None
+    judgment_payload: dict | None = None
+
+
+@dataclass(frozen=True)
+class FactoryPlcIngressPayload:
+    plc_device_key: str
+
+
+@dataclass(frozen=True)
+class FactoryScanIngressPayload:
+    scan_text: str
+
+
+@dataclass(frozen=True)
+class FactoryRuntimeStartPayload:
+    config_id: int
+    trigger_source: str
+
+
+@dataclass(frozen=True)
+class FactoryRuntimeConfigPayload:
+    config_id: int
 
 
 class EventBus(QObject):
@@ -48,13 +99,26 @@ class EventBus(QObject):
     test_started = pyqtSignal(int)                  # config_id
     test_finished = pyqtSignal(int, dict)           # config_id, JudgmentResult as dict
 
+    # ── Factory-mode ingress and controller contracts ──
+    factory_plc_event = pyqtSignal(object)                  # FactoryPlcIngressPayload
+    factory_scan_event = pyqtSignal(object)                 # FactoryScanIngressPayload
+    factory_runtime_start_accepted = pyqtSignal(object)     # FactoryRuntimeStartPayload
+    factory_runtime_analyzing_entered = pyqtSignal(object)  # FactoryRuntimeConfigPayload
+    factory_runtime_auto_analysis_succeeded = pyqtSignal(object)  # FactoryReviewPayload
+    factory_runtime_auto_analysis_no_result = pyqtSignal(object)  # FactoryReviewPayload
+    factory_runtime_auto_analysis_error = pyqtSignal(object)      # FactoryReviewPayload
+    factory_runtime_reanalysis_completed = pyqtSignal(object)     # FactoryReviewPayload
+    factory_state_changed = pyqtSignal(object)              # FactoryControllerState
+    factory_review_changed = pyqtSignal(object)             # FactoryReviewPayload
+    factory_display_reset = pyqtSignal(str)                 # reset reason
+
 
 @dataclass
 class ServiceContainer:
     """
     暂时不创建多个ServiceContainer
     """
-    bus = EventBus()
+    bus: EventBus = field(default_factory=EventBus)
 
     def __post_init__(self):
         self.test = TestManager(self.bus, self)
@@ -72,3 +136,7 @@ class ServiceContainer:
         self.config_service = ConfigService(self.bus)
 
         self.ai_service = AiService()
+
+        from app.service.factory_mode_controller import FactoryModeController
+
+        self.factory_mode = FactoryModeController(self.bus, self)
