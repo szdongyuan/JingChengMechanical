@@ -153,6 +153,8 @@ class TestManager(QObject):
                 self._stop_one(config_id, silent=True)
                 return False
 
+        prior_completed_session = self._completed_sessions.pop(config_id, None)
+
         try:
             if not recorder.isRunning():
                 recorder.start()
@@ -167,9 +169,9 @@ class TestManager(QObject):
                 ),
             )
             self._stop_one(config_id, silent=True)
+            if prior_completed_session is not None and config_id not in self._completed_sessions:
+                self._completed_sessions[config_id] = prior_completed_session
             return False
-
-        self._completed_sessions.pop(config_id, None)
 
         self._bus.test_started.emit(config_id)
         self._bus.status.emit("Recording...")

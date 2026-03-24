@@ -517,14 +517,24 @@ class FactoryModeController(QObject):
 
     def _owns_reanalysis_payload(self, payload: FactoryReviewPayload) -> bool:
         config_id = payload.displayed_config_id
+        if (
+            config_id is None
+            or config_id != self._owned_reanalysis_config_id
+            or self._state.displayed_config_id != config_id
+            or self._state.run_phase != "reanalyzing"
+        ):
+            return False
+
+        if payload.run_id is None:
+            return (
+                bool(payload.no_result or payload.error_message)
+                and self._owned_reanalysis_run_id is not None
+                and self._review_payload.run_id == self._owned_reanalysis_run_id
+            )
+
         return (
-            config_id is not None
-            and payload.run_id is not None
-            and config_id == self._owned_reanalysis_config_id
-            and payload.run_id == self._owned_reanalysis_run_id
-            and self._state.displayed_config_id == config_id
+            payload.run_id == self._owned_reanalysis_run_id
             and self._review_payload.run_id == payload.run_id
-            and self._state.run_phase == "reanalyzing"
         )
 
     @staticmethod

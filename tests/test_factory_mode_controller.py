@@ -1106,6 +1106,59 @@ def test_factory_mode_controller_reanalysis_failure_returns_to_reviewing_without
     assert controller.review_payload.judgment_payload is None
 
 
+def test_factory_mode_controller_reanalysis_missing_session_unwinds_to_reviewing_no_result():
+    controller_mod = _load_factory_mode_controller_module()
+    review_payload_cls = getattr(services_mod, "FactoryReviewPayload", None)
+
+    assert review_payload_cls is not None, "FactoryReviewPayload is missing"
+
+    bus = EventBus()
+    reviews: list[object] = []
+    states: list[object] = []
+    bus.factory_review_changed.connect(reviews.append)
+    bus.factory_state_changed.connect(states.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    original_review = _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
+    reviews.clear()
+    states.clear()
+
+    def _rejudge(config_id, start_sec, end_sec):
+        bus.factory_runtime_reanalysis_completed.emit(
+            review_payload_cls(
+                displayed_config_id=config_id,
+                run_id=None,
+                trigger_source="manual",
+                captured_duration_sec=None,
+                default_window=None,
+                fallback_window=None,
+                manual_reanalysis_allowed=False,
+                no_result=True,
+                error_message=f"no session for config {config_id}",
+                judgment_payload=None,
+            )
+        )
+
+    services.test.rejudge.side_effect = _rejudge
+
+    started = controller.begin_reanalysis(1.25, 3.25)
+
+    assert started is True
+    services.test.rejudge.assert_called_once_with(101, 1.25, 3.25)
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id == 101
+    assert controller.review_payload.run_id == original_review.run_id
+    assert controller.review_payload.default_window == original_review.default_window
+    assert controller.review_payload.manual_reanalysis_allowed is True
+    assert controller.review_payload.no_result is True
+    assert controller.review_payload.error_message == "no session for config 101"
+    assert controller.review_payload.judgment_payload is None
+    assert [state.run_phase for state in states] == ["reanalyzing", "reviewing"]
+    assert reviews[-1] == controller.review_payload
+
+
 def test_factory_mode_controller_ignores_mismatched_factory_runtime_review_payload():
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()

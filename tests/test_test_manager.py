@@ -636,6 +636,105 @@ class TestTestManagerStartStop:
         assert FakeRecorder.instances[0].stop_calls == 1
         bus.test_started.emit.assert_not_called()
 
+    def test_start_keeps_newly_completed_session_when_recorder_finishes_before_start_returns(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        services.config_service.load_config.return_value = {
+            "config_id": 1,
+            "config_name": "Test",
+            "record_duration": 2.0,
+            "analysis_duration": 1.0,
+            "analysis_window_offset_ms": 0,
+            "selected_channels": [0],
+            "channels": [{
+                "channel_index": 0,
+                "stft_nfft": 1024,
+                "stft_overlap": 0.5,
+                "spl_weighting": "Z",
+                "spl_time_constant": 0.125,
+                "spl_upper_limit": 85.0,
+                "spl_lower_limit": 40.0,
+                "fft_band_limits": [],
+                "oct_weighting": "Z",
+                "oct_band_limits": [],
+            }],
+            "input_device_name": "Mic",
+            "input_device_hostapi": "MME",
+            "input_device_samplerate": 100,
+            "output_device_name": None,
+        }
+
+        class FastRecorder:
+            instances = []
+
+            def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+                self._sample_rate = float(sample_rate)
+                self._n_channels = n_channels
+                self._record_duration = float(record_duration)
+                self._buffer = np.ones(
+                    (int(self._sample_rate * self._record_duration), n_channels),
+                    dtype=np.float32,
+                )
+                self.chunk_ready = _DummySignal()
+                self.recording_done = _DummySignal()
+                self.error_occurred = _DummySignal()
+                self._running = False
+                FastRecorder.instances.append(self)
+
+            def isRunning(self):
+                return self._running
+
+            def start(self):
+                self._running = True
+                self.recording_done.emit()
+
+            def stop(self):
+                self._running = False
+
+            def wait(self, timeout):
+                return True
+
+            def attach_session(self, *, record_duration):
+                return MagicMock(chunk_index=0, sample_index=0)
+
+            def get_buffer_from(self, snapshot):
+                return self._buffer
+
+        class FastSession(_FakeSession):
+            def __init__(self, config, bus, ai_service, mic_cal, workorder, audio_dir):
+                super().__init__(config, bus, ai_service, mic_cal, workorder, audio_dir)
+                self._config = dict(config)
+                self._audio_file_path = None
+
+            def _run_judgment(self):
+                self._audio_file_path = "captured.wav"
+                return JudgmentResult(
+                    overall="合格",
+                    limit_pass=True,
+                    ai_pass=True,
+                    ai_score=0.95,
+                    analysis_window=(0.0, 1.0),
+                )
+
+        monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FastRecorder)
+        monkeypatch.setattr("app.service.analysis.test_manager.TestSession", FastSession)
+
+        prior_session = MagicMock(name="prior_session")
+        mgr = TestManager(bus, services)
+        mgr._completed_sessions[1] = prior_session
+
+        accepted = mgr.start({"config_id": 1, "sn": "SN1", "trigger_source": "manual"})
+
+        assert accepted is True
+        assert mgr.is_running(config_id=1) is False
+        assert mgr._completed_sessions[1] is not prior_session
+        assert mgr._completed_sessions[1]._workorder["sn"] == "SN1"
+        assert mgr._completed_sessions[1]._workorder["trigger_source"] == "manual"
+        bus.factory_runtime_auto_analysis_succeeded.emit.assert_called_once()
+
     def test_stop_all(self):
         bus = _mock_bus()
         services = _mock_services(bus)
