@@ -30,6 +30,7 @@ class FactoryModeController(QObject):
         self._review_payload = FactoryReviewPayload()
         self._pending_start: tuple[int, str] | None = None
         self._pending_start_request_id: str | None = None
+        self._dispatching_runtime_start_accepted_payload: FactoryRuntimeStartPayload | None = None
         self._owned_runtime_config_id: int | None = None
         self._owned_runtime_run_id: str | None = None
         self._owned_reanalysis_config_id: int | None = None
@@ -154,6 +155,8 @@ class FactoryModeController(QObject):
         self._emit_state()
 
     def handle_runtime_start_accepted(self, payload: FactoryRuntimeStartPayload) -> None:
+        if payload is not self._dispatching_runtime_start_accepted_payload:
+            return
         self.handle_runtime_started(payload)
 
     def handle_runtime_analyzing(self, payload: FactoryRuntimeConfigPayload) -> None:
@@ -309,6 +312,7 @@ class FactoryModeController(QObject):
     def _connect_bus(self) -> None:
         self.bus.factory_plc_event.connect(self.handle_plc_event)
         self.bus.factory_scan_event.connect(self.handle_scan_event)
+        self.bus.factory_runtime_start_accepted.connect(self.handle_runtime_start_accepted)
         self.bus.factory_runtime_analyzing_entered.connect(self.handle_runtime_analyzing_entered)
         self.bus.factory_runtime_auto_analysis_succeeded.connect(
             self.handle_runtime_auto_analysis_succeeded
@@ -353,8 +357,12 @@ class FactoryModeController(QObject):
                 run_id=run_id,
                 trigger_source=trigger_source,
             )
-            self.handle_runtime_started(accepted_payload)
-            self.bus.factory_runtime_start_accepted.emit(accepted_payload)
+            self._dispatching_runtime_start_accepted_payload = accepted_payload
+            try:
+                self.bus.factory_runtime_start_accepted.emit(accepted_payload)
+            finally:
+                if self._dispatching_runtime_start_accepted_payload is accepted_payload:
+                    self._dispatching_runtime_start_accepted_payload = None
 
         start_accepted = True
         test_manager = getattr(self.services, "test", None)

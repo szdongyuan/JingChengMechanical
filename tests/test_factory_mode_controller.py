@@ -1058,6 +1058,62 @@ def test_factory_mode_controller_ignores_stale_start_callback_for_same_config_ne
     assert not hasattr(accepted_payloads[0], "request_id")
 
 
+def test_factory_mode_controller_consumes_validated_start_acceptance_via_event_bus_dispatch():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    callbacks: list[object] = []
+    accepted_snapshots: list[dict[str, object]] = []
+    states: list[object] = []
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = None
+
+    def _observe_accepted(payload):
+        accepted_snapshots.append(
+            {
+                "run_id": payload.run_id,
+                "active_config_id": controller.state.active_config_id,
+                "displayed_config_id": controller.state.displayed_config_id,
+                "run_phase": controller.state.run_phase,
+                "trigger_source": controller.state.trigger_source,
+            }
+        )
+
+    bus.factory_runtime_start_accepted.connect(_observe_accepted)
+
+    def _capture_start(payload, *, on_start_accepted=None):
+        assert payload["config_id"] == 101
+        assert payload["trigger_source"] == "manual"
+        assert callable(on_start_accepted)
+        callbacks.append(on_start_accepted)
+        return True
+
+    services.test.start.side_effect = _capture_start
+    controller = controller_mod.FactoryModeController(bus, services)
+    bus.factory_state_changed.connect(states.append)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    states.clear()
+
+    assert controller.start_manual({"sn": "SN-1"}) is True
+    assert len(callbacks) == 1
+
+    callbacks[0](_run_id_for(101))
+
+    assert accepted_snapshots == [
+        {
+            "run_id": _run_id_for(101),
+            "active_config_id": None,
+            "displayed_config_id": None,
+            "run_phase": "armed",
+            "trigger_source": None,
+        }
+    ]
+    assert controller.state.active_config_id == 101
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "running"
+    assert controller.state.trigger_source == "manual"
+    assert states == [controller.state]
+
+
 def test_factory_mode_controller_ignores_stale_public_start_accepted_emit_for_same_config_new_request():
     controller_mod = _load_factory_mode_controller_module()
     runtime_start_cls = getattr(services_mod, "FactoryRuntimeStartPayload", None)
