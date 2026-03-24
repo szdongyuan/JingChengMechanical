@@ -228,6 +228,79 @@ def test_set_selection_clears_review_payload_and_emits_cleared_review_contract()
     assert reset_reasons == ["selection_changed"]
 
 
+def test_set_selection_preserves_review_context_for_noop_resubmit():
+    controller_mod = _load_factory_mode_controller_module()
+
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    states: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    bus.factory_state_changed.connect(states.append)
+    controller = controller_mod.FactoryModeController(bus)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    original_review_payload = _enter_reviewing_state(
+        controller,
+        bus,
+        config_id=202,
+        trigger_source="plc",
+    )
+    original_state = controller.state
+
+    reset_reasons.clear()
+    reviews.clear()
+    states.clear()
+
+    next_state = controller.set_selection((101, 202), manual_primary_config_id=101)
+
+    assert next_state == original_state
+    assert controller.state == original_state
+    assert controller.review_payload == original_review_payload
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.displayed_config_id == 202
+    assert controller.state.trigger_source == "plc"
+    assert reset_reasons == []
+    assert reviews == []
+    assert states == []
+
+
+def test_set_selection_from_review_to_invalid_primary_goes_directly_to_not_ready():
+    controller_mod = _load_factory_mode_controller_module()
+    review_payload_cls = getattr(services_mod, "FactoryReviewPayload", None)
+
+    assert review_payload_cls is not None, "FactoryReviewPayload is missing"
+
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    states: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    bus.factory_state_changed.connect(states.append)
+    controller = controller_mod.FactoryModeController(bus)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    _enter_reviewing_state(controller, bus, config_id=202, trigger_source="plc")
+
+    reset_reasons.clear()
+    reviews.clear()
+    states.clear()
+
+    controller.set_selection((101, 202), manual_primary_config_id=None)
+
+    assert controller.review_payload == review_payload_cls()
+    assert controller.state.selected_config_ids == (101, 202)
+    assert controller.state.manual_primary_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.trigger_source is None
+    assert controller.state.run_phase == "not_ready"
+    assert controller.state.is_ready is False
+    assert reset_reasons == ["selection_changed"]
+    assert reviews == [review_payload_cls()]
+    assert states == [controller.state]
+    assert states[0].run_phase == "not_ready"
+
+
 def test_runtime_start_accepted_clears_review_context_before_running():
     controller_mod = _load_factory_mode_controller_module()
     review_payload_cls = getattr(services_mod, "FactoryReviewPayload", None)

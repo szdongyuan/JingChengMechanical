@@ -56,10 +56,15 @@ class FactoryModeController(QObject):
         if self._state.run_phase in self._BLOCKED_START_PHASES:
             return self._state
 
-        if self._has_review_context():
-            self._reset_review_context("selection_changed")
-
         selected = tuple(selected_config_ids)
+        has_review_context = self._has_review_context()
+        selection_changed = (
+            selected != self._state.selected_config_ids
+            or manual_primary_config_id != self._state.manual_primary_config_id
+        )
+        if has_review_context and not selection_changed:
+            return self._state
+
         is_ready = False
         self._selected_configs = {}
         if len(selected) == 2 and len(set(selected)) == 2 and manual_primary_config_id in selected:
@@ -69,7 +74,7 @@ class FactoryModeController(QObject):
                 and not self._selected_configs_have_runtime_errors()
             )
 
-        self._state = FactoryControllerState(
+        next_state = FactoryControllerState(
             selected_config_ids=selected,
             manual_primary_config_id=manual_primary_config_id,
             active_config_id=None,
@@ -78,7 +83,12 @@ class FactoryModeController(QObject):
             trigger_source=None,
             is_ready=is_ready,
         )
-        self._emit_state()
+
+        if has_review_context:
+            self._reset_review_context("selection_changed", state=next_state)
+        else:
+            self._state = next_state
+            self._emit_state()
         return self._state
 
     def can_arm(self) -> bool:
@@ -360,9 +370,14 @@ class FactoryModeController(QObject):
             or self._state.run_phase in {"reviewing", "reanalyzing"}
         )
 
-    def _reset_review_context(self, reason: str) -> None:
+    def _reset_review_context(
+        self,
+        reason: str,
+        *,
+        state: FactoryControllerState | None = None,
+    ) -> None:
         self._review_payload = FactoryReviewPayload()
-        self._state = replace(
+        self._state = state or replace(
             self._state,
             active_config_id=None,
             displayed_config_id=None,
