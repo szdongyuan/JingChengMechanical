@@ -4,8 +4,11 @@ import importlib
 import importlib.util
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import app.services_container as services_mod
+from app.service.analysis.frames import JudgmentResult
+from app.service.analysis.test_manager import TestManager
 from app.services_container import EventBus
 
 
@@ -89,6 +92,21 @@ def _make_services(configs, *, validation_errors: dict[int, list[str]] | None = 
         lambda config: list((validation_errors or {}).get(config["config_id"], ()))
     )
     return services
+
+
+class _DummySignal:
+    def __init__(self):
+        self._callbacks = []
+
+    def connect(self, callback):
+        self._callbacks.append(callback)
+
+    def disconnect(self, callback):
+        self._callbacks.remove(callback)
+
+    def emit(self, *args, **kwargs):
+        for callback in list(self._callbacks):
+            callback(*args, **kwargs)
 
 
 def _accept_start(services):
@@ -825,3 +843,148 @@ def test_factory_mode_controller_reanalysis_failure_returns_to_reviewing_without
     assert controller.review_payload.no_result is True
     assert controller.review_payload.error_message == "manual reanalysis failed"
     assert controller.review_payload.judgment_payload is None
+
+
+def test_factory_mode_controller_consumes_real_test_manager_lifecycle_signals(monkeypatch):
+    controller_mod = _load_factory_mode_controller_module()
+
+    class FakeRecorder:
+        def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+            self._sample_rate = float(sample_rate)
+            self._n_channels = n_channels
+            self._record_duration = float(record_duration)
+            self._buffer = np.zeros(
+                (int(self._sample_rate * self._record_duration), n_channels),
+                dtype=np.float32,
+            )
+            self._running = False
+            self.chunk_ready = _DummySignal()
+            self.recording_done = _DummySignal()
+            self.error_occurred = _DummySignal()
+
+        def isRunning(self):
+            return self._running
+
+        def start(self):
+            self._running = True
+
+        def stop(self):
+            self._running = False
+
+        def wait(self, timeout):
+            return True
+
+        def attach_session(self, *, record_duration):
+            return MagicMock(chunk_index=0, sample_index=0)
+
+        def get_buffer_from(self, snapshot):
+            return self._buffer
+
+    class FakeSession:
+        def __init__(self, config, bus, ai_service, mic_cal, workorder, audio_dir):
+            self.config_id = config["config_id"]
+            self._config = dict(config)
+            self._buffer = None
+            self._sample_rate = None
+            self._finished = False
+            self._attach_snapshot = None
+            self._audio_file_path = "captured.wav"
+            self._audio_data_id = "audio-123"
+
+        def _setup_pipelines(self):
+            return None
+
+        def prepare_for_attach(self):
+            return None
+
+        def attach_to_recorder(self, *, chunk_index, snapshot=None):
+            self._attach_snapshot = snapshot
+
+        def _on_chunk(self, *args, **kwargs):
+            return None
+
+        def _save_wav(self, *args, **kwargs):
+            return "captured.wav"
+
+        def _run_judgment(self):
+            self._audio_file_path = "captured.wav"
+            return JudgmentResult(
+                overall="合格",
+                limit_pass=True,
+                ai_pass=True,
+                ai_score=0.91,
+                analysis_window=(1.0, 3.0),
+            )
+
+        def rejudge(self, start_sec, end_sec):
+            return JudgmentResult(
+                overall="合格",
+                limit_pass=True,
+                ai_pass=True,
+                ai_score=0.97,
+                analysis_window=(start_sec, end_sec),
+            )
+
+    monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
+    monkeypatch.setattr("app.service.analysis.test_manager.TestSession", FakeSession)
+
+    config_map = {
+        101: _make_config(101),
+        202: _make_config(202),
+    }
+    bus = EventBus()
+    services = MagicMock()
+    services.bus = bus
+    services.config_service = MagicMock()
+    services.config_service.load_config.side_effect = lambda config_id: dict(config_map[config_id])
+    services.config_service.validate_factory_runtime.side_effect = lambda config: []
+    services.ai_service = MagicMock()
+    services.ai_service.resolve_binding.return_value = None
+    services.hss_service = MagicMock()
+    services.hss_service.load_io_devices.return_value = {
+        "input": {
+            "id": 0,
+            "name": "Mic",
+            "type": "MME",
+            "samplerate": "100",
+            "channel_count": "1",
+        },
+        "output": {
+            "id": 1,
+            "name": "Speaker",
+            "type": "MME",
+            "samplerate": "100",
+            "channel_count": "1",
+        },
+        "mic_cal": {},
+    }
+    services.test = TestManager(bus, services)
+    states: list[object] = []
+    bus.factory_state_changed.connect(states.append)
+    controller = controller_mod.FactoryModeController(bus, services)
+
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+
+    started = controller.start_manual({"sn": "SN-1"})
+
+    assert started is True
+    assert controller.state.run_phase == "running"
+    services.test._on_session_done(101)
+
+    assert controller.state.run_phase == "reviewing"
+    assert controller.review_payload.displayed_config_id == 101
+    assert controller.review_payload.judgment_payload["analysis_window"] == (1.0, 3.0)
+
+    reanalyzing_started = controller.begin_reanalysis(1.25, 3.25)
+
+    assert reanalyzing_started is True
+    assert controller.state.run_phase == "reviewing"
+    assert controller.review_payload.judgment_payload["analysis_window"] == (1.25, 3.25)
+    assert [state.run_phase for state in states] == [
+        "armed",
+        "running",
+        "analyzing",
+        "reviewing",
+        "reanalyzing",
+        "reviewing",
+    ]

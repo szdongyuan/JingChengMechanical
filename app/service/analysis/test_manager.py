@@ -216,17 +216,44 @@ class TestManager(QObject):
         """Re-run judgment on a user-selected window."""
         session = self._sessions.get(config_id) or self._completed_sessions.get(config_id)
         if session is None:
-            self._bus.log.emit(f"[TestManager] no session for config {config_id}")
+            error_message = f"no session for config {config_id}"
+            self._bus.log.emit(f"[TestManager] {error_message}")
+            self._emit_optional_signal(
+                "factory_runtime_reanalysis_completed",
+                self._make_factory_review_payload(
+                    config_id,
+                    None,
+                    no_result=True,
+                    error_message=error_message,
+                ),
+            )
             return
         try:
             result = session.rejudge(start_sec, end_sec)
             result_dict = self._serialize_result(result)
         except Exception as exc:
-            self._emit_no_result(config_id, exc, context="rejudge")
+            payload = self._emit_no_result(config_id, exc, context="rejudge")
+            self._emit_optional_signal(
+                "factory_runtime_reanalysis_completed",
+                self._make_factory_review_payload(
+                    config_id,
+                    session,
+                    no_result=True,
+                    error_message=payload["error_summary"],
+                ),
+            )
             return
 
         self._bus.test_finished.emit(config_id, result_dict)
         self._bus.result_changed.emit(result_dict)
+        self._emit_optional_signal(
+            "factory_runtime_reanalysis_completed",
+            self._make_factory_review_payload(
+                config_id,
+                session,
+                judgment_payload=result_dict,
+            ),
+        )
 
     def _on_recording_done(self, config_id: int):
         """Called when a recorder fills its buffer."""
@@ -243,6 +270,10 @@ class TestManager(QObject):
 
         self._bus.status.emit("Analyzing...")
         self._bus.log.emit(f"[TestManager] recording done for config={config_id}")
+        self._emit_optional_signal(
+            "factory_runtime_analyzing_entered",
+            self._make_factory_runtime_config_payload(config_id),
+        )
 
         rec = self._recorders.get(config_id)
         mon = self._monitors.get(config_id)
@@ -255,12 +286,34 @@ class TestManager(QObject):
             result = session._run_judgment()
             result_dict = self._serialize_result(result)
         except Exception as exc:
-            self._emit_no_result(config_id, exc, context="analysis")
+            payload = self._emit_no_result(config_id, exc, context="analysis")
+            signal_name = (
+                "factory_runtime_auto_analysis_no_result"
+                if self._is_factory_no_result_error(exc)
+                else "factory_runtime_auto_analysis_error"
+            )
+            self._emit_optional_signal(
+                signal_name,
+                self._make_factory_review_payload(
+                    config_id,
+                    session,
+                    no_result=True,
+                    error_message=payload["error_summary"],
+                ),
+            )
         else:
             self._bus.test_finished.emit(config_id, result_dict)
             self._bus.result_changed.emit(result_dict)
             self._bus.log.emit(
                 f"[TestManager] result: {result.overall} (limit={result.limit_pass})"
+            )
+            self._emit_optional_signal(
+                "factory_runtime_auto_analysis_succeeded",
+                self._make_factory_review_payload(
+                    config_id,
+                    session,
+                    judgment_payload=result_dict,
+                ),
             )
         self._bus.status.emit("Idle")
 
@@ -306,6 +359,125 @@ class TestManager(QObject):
         self._bus.result_changed.emit(payload)
         self._bus.log.emit(
             f"[TestManager] no-result {context} for config={config_id}: {payload['error_summary']}"
+        )
+        return payload
+
+    def _emit_optional_signal(self, signal_name: str, payload):
+        signal = getattr(self._bus, signal_name, None)
+        emit = getattr(signal, "emit", None)
+        if callable(emit):
+            emit(payload)
+
+    @staticmethod
+    def _make_factory_runtime_config_payload(config_id: int):
+        from app.services_container import FactoryRuntimeConfigPayload
+
+        return FactoryRuntimeConfigPayload(config_id=config_id)
+
+    @staticmethod
+    def _is_factory_no_result_error(error: Exception) -> bool:
+        if isinstance(error, ValueError):
+            return True
+        return isinstance(error, RuntimeError) and str(error) == "analysis result unavailable"
+
+    def _make_factory_review_payload(
+        self,
+        config_id: int,
+        session,
+        *,
+        judgment_payload: dict | None = None,
+        no_result: bool = False,
+        error_message: str | None = None,
+    ):
+        from app.services_container import FactoryReviewPayload, FactoryReviewWindow
+
+        config = getattr(session, "_config", {}) or {}
+        analysis_duration = self._analysis_duration_sec(config)
+        captured_duration_sec = self._captured_duration_sec(session)
+        default_window = self._window_from_payload(
+            judgment_payload,
+            review_window_cls=FactoryReviewWindow,
+        )
+        if default_window is None:
+            default_window = self._configured_review_window(
+                config,
+                review_window_cls=FactoryReviewWindow,
+            )
+
+        manual_reanalysis_allowed = (
+            session is not None
+            and captured_duration_sec is not None
+            and analysis_duration > 0
+            and captured_duration_sec >= analysis_duration
+            and getattr(session, "_audio_file_path", None) is not None
+        )
+        fallback_window = None
+        if manual_reanalysis_allowed and (
+            default_window is None
+            or default_window.start_sec < 0
+            or default_window.end_sec > captured_duration_sec
+        ):
+            fallback_window = FactoryReviewWindow(
+                start_sec=0.0,
+                end_sec=analysis_duration,
+            )
+
+        return FactoryReviewPayload(
+            displayed_config_id=config_id,
+            trigger_source=None,
+            captured_duration_sec=captured_duration_sec,
+            default_window=default_window,
+            fallback_window=fallback_window,
+            manual_reanalysis_allowed=manual_reanalysis_allowed,
+            no_result=no_result,
+            error_message=error_message,
+            judgment_payload=judgment_payload,
+        )
+
+    @staticmethod
+    def _analysis_duration_sec(config: dict) -> float:
+        try:
+            return float(config.get("analysis_duration", 0) or 0)
+        except (TypeError, ValueError, AttributeError):
+            return 0.0
+
+    @staticmethod
+    def _captured_duration_sec(session) -> float | None:
+        if session is None:
+            return None
+        buffer = getattr(session, "_buffer", None)
+        try:
+            sample_rate = float(getattr(session, "_sample_rate", 0) or 0)
+        except (TypeError, ValueError):
+            sample_rate = 0.0
+        if not isinstance(buffer, np.ndarray) or buffer.size <= 0 or sample_rate <= 0:
+            return None
+        return float(buffer.shape[0]) / sample_rate
+
+    @staticmethod
+    def _window_from_payload(judgment_payload: dict | None, *, review_window_cls):
+        if not isinstance(judgment_payload, dict):
+            return None
+        analysis_window = judgment_payload.get("analysis_window")
+        if not isinstance(analysis_window, (list, tuple)) or len(analysis_window) != 2:
+            return None
+        return review_window_cls(
+            start_sec=float(analysis_window[0]),
+            end_sec=float(analysis_window[1]),
+        )
+
+    @staticmethod
+    def _configured_review_window(config: dict, *, review_window_cls):
+        analysis_duration = TestManager._analysis_duration_sec(config)
+        if analysis_duration <= 0:
+            return None
+        try:
+            start_sec = float(config.get("analysis_window_offset_ms", 0) or 0) / 1000.0
+        except (TypeError, ValueError, AttributeError):
+            start_sec = 0.0
+        return review_window_cls(
+            start_sec=start_sec,
+            end_sec=start_sec + analysis_duration,
         )
 
     @staticmethod

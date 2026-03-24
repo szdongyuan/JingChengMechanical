@@ -64,6 +64,11 @@ def _mock_bus():
         "recording_progress",
         "test_started",
         "test_finished",
+        "factory_runtime_analyzing_entered",
+        "factory_runtime_auto_analysis_succeeded",
+        "factory_runtime_auto_analysis_no_result",
+        "factory_runtime_auto_analysis_error",
+        "factory_runtime_reanalysis_completed",
     ):
         setattr(bus, sig, MagicMock())
         getattr(bus, sig).emit = MagicMock()
@@ -679,6 +684,67 @@ class TestTestManagerRejudge:
         mgr.rejudge(config_id=1, start_sec=0.0, end_sec=2.0)
         mock_session.rejudge.assert_called_with(0.0, 2.0)
 
+    def test_rejudge_emits_factory_runtime_reanalysis_completed_on_success(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        mock_session = MagicMock()
+        mock_session.config_id = 1
+        mock_session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+        }
+        mock_session._buffer = np.zeros((500, 1), dtype=np.float32)
+        mock_session._sample_rate = 100.0
+        mock_session._audio_file_path = "captured.wav"
+        mock_session.rejudge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=True,
+            ai_score=0.88,
+            analysis_window=(1.0, 3.0),
+        )
+        mgr._completed_sessions[1] = mock_session
+
+        mgr.rejudge(config_id=1, start_sec=1.0, end_sec=3.0)
+
+        payload = bus.factory_runtime_reanalysis_completed.emit.call_args.args[0]
+        assert payload.displayed_config_id == 1
+        assert payload.captured_duration_sec == 5.0
+        assert payload.default_window.start_sec == 1.0
+        assert payload.default_window.end_sec == 3.0
+        assert payload.fallback_window is None
+        assert payload.manual_reanalysis_allowed is True
+        assert payload.no_result is False
+        assert payload.error_message is None
+        assert payload.judgment_payload == {
+            "overall": "合格",
+            "limit_pass": True,
+            "ai_pass": True,
+            "ai_score": 0.88,
+            "channel_results": [],
+            "analysis_window": (1.0, 3.0),
+        }
+
+    def test_rejudge_without_session_emits_factory_runtime_reanalysis_completed(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+
+        mgr.rejudge(config_id=99, start_sec=0.0, end_sec=2.0)
+
+        payload = bus.factory_runtime_reanalysis_completed.emit.call_args.args[0]
+        assert payload.displayed_config_id == 99
+        assert payload.captured_duration_sec is None
+        assert payload.default_window is None
+        assert payload.fallback_window is None
+        assert payload.manual_reanalysis_allowed is False
+        assert payload.no_result is True
+        assert payload.error_message == "no session for config 99"
+        assert payload.judgment_payload is None
+        bus.test_finished.emit.assert_not_called()
+        bus.result_changed.emit.assert_not_called()
+
     def test_rejudge_required_window_failure_emits_no_result_payload_without_overwriting_trace(self):
         bus = _mock_bus()
         services = _mock_services(bus)
@@ -691,6 +757,13 @@ class TestTestManagerRejudge:
         )
         mock_session = MagicMock()
         mock_session.config_id = 1
+        mock_session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 1500,
+        }
+        mock_session._buffer = np.zeros((500, 1), dtype=np.float32)
+        mock_session._sample_rate = 100.0
+        mock_session._audio_file_path = "captured.wav"
         mock_session.last_result = prior_result
         mock_session.rejudge.side_effect = ValueError("analysis window not fully captured")
         mgr._completed_sessions[1] = mock_session
@@ -700,6 +773,11 @@ class TestTestManagerRejudge:
         payload = _expected_no_result_payload("analysis window not fully captured")
         bus.test_finished.emit.assert_called_once_with(1, payload)
         bus.result_changed.emit.assert_called_once_with(payload)
+        factory_payload = bus.factory_runtime_reanalysis_completed.emit.call_args.args[0]
+        assert factory_payload.displayed_config_id == 1
+        assert factory_payload.no_result is True
+        assert factory_payload.error_message == "analysis window not fully captured"
+        assert factory_payload.judgment_payload is None
         assert mock_session.last_result is prior_result
 
     def test_rejudge_none_result_emits_no_result_payload_without_overwriting_trace(self):
@@ -714,6 +792,13 @@ class TestTestManagerRejudge:
         )
         mock_session = MagicMock()
         mock_session.config_id = 1
+        mock_session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+        }
+        mock_session._buffer = np.zeros((500, 1), dtype=np.float32)
+        mock_session._sample_rate = 100.0
+        mock_session._audio_file_path = "captured.wav"
         mock_session.last_result = prior_result
         mock_session.rejudge.return_value = None
         mgr._completed_sessions[1] = mock_session
@@ -723,6 +808,11 @@ class TestTestManagerRejudge:
         payload = _expected_no_result_payload("analysis result unavailable")
         bus.test_finished.emit.assert_called_once_with(1, payload)
         bus.result_changed.emit.assert_called_once_with(payload)
+        factory_payload = bus.factory_runtime_reanalysis_completed.emit.call_args.args[0]
+        assert factory_payload.displayed_config_id == 1
+        assert factory_payload.no_result is True
+        assert factory_payload.error_message == "analysis result unavailable"
+        assert factory_payload.judgment_payload is None
         assert mock_session.last_result is prior_result
 
 
@@ -1384,6 +1474,56 @@ class TestLateAttachBufferSlice:
         assert session._sample_rate == 100.0
         session._run_judgment.assert_called_once_with()
 
+    def test_on_session_done_emits_factory_runtime_auto_analysis_success(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        post_attach = np.arange(500, dtype=np.float32).reshape(500, 1)
+        attach_snapshot = object()
+        rec = MagicMock()
+        rec.get_buffer_from.return_value = post_attach
+        rec._sample_rate = 100.0
+        session = MagicMock()
+        session.config_id = 1
+        session._buffer = None
+        session._attach_snapshot = attach_snapshot
+        session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+        }
+        session._audio_file_path = "captured.wav"
+        session._run_judgment.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=True,
+            ai_score=0.93,
+            analysis_window=(1.0, 3.0),
+        )
+        mgr._sessions[1] = session
+        mgr._recorders[1] = rec
+
+        mgr._on_session_done(1)
+
+        phase_payload = bus.factory_runtime_analyzing_entered.emit.call_args.args[0]
+        review_payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
+        assert phase_payload.config_id == 1
+        assert review_payload.displayed_config_id == 1
+        assert review_payload.captured_duration_sec == 5.0
+        assert review_payload.default_window.start_sec == 1.0
+        assert review_payload.default_window.end_sec == 3.0
+        assert review_payload.fallback_window is None
+        assert review_payload.manual_reanalysis_allowed is True
+        assert review_payload.no_result is False
+        assert review_payload.error_message is None
+        assert review_payload.judgment_payload == {
+            "overall": "合格",
+            "limit_pass": True,
+            "ai_pass": True,
+            "ai_score": 0.93,
+            "channel_results": [],
+            "analysis_window": (1.0, 3.0),
+        }
+
     def test_on_session_done_required_window_failure_emits_no_result_payload_and_preserves_completed_session(self):
         bus = _mock_bus()
         services = _mock_services(bus)
@@ -1399,6 +1539,10 @@ class TestLateAttachBufferSlice:
         session._attach_snapshot = attach_snapshot
         session._audio_file_path = None
         session._audio_data_id = None
+        session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 1500,
+        }
 
         def raise_required_window_failure():
             session._audio_file_path = "captured.wav"
@@ -1419,6 +1563,12 @@ class TestLateAttachBufferSlice:
         assert session._audio_data_id == "audio-123"
         bus.test_finished.emit.assert_called_once_with(1, payload)
         bus.result_changed.emit.assert_called_once_with(payload)
+        bus.factory_runtime_analyzing_entered.emit.assert_called_once()
+        factory_payload = bus.factory_runtime_auto_analysis_no_result.emit.call_args.args[0]
+        assert factory_payload.displayed_config_id == 1
+        assert factory_payload.no_result is True
+        assert factory_payload.error_message == "analysis window not fully captured"
+        assert factory_payload.judgment_payload is None
         assert mgr._completed_sessions[1] is session
 
     def test_on_session_done_unexpected_analysis_failure_emits_no_result_payload_and_preserves_completed_session(self):
@@ -1436,6 +1586,10 @@ class TestLateAttachBufferSlice:
         session._attach_snapshot = attach_snapshot
         session._audio_file_path = None
         session._audio_data_id = None
+        session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 1500,
+        }
 
         def raise_unexpected_failure():
             session._audio_file_path = "captured.wav"
@@ -1456,6 +1610,12 @@ class TestLateAttachBufferSlice:
         assert session._audio_data_id == "audio-123"
         bus.test_finished.emit.assert_called_once_with(1, payload)
         bus.result_changed.emit.assert_called_once_with(payload)
+        bus.factory_runtime_analyzing_entered.emit.assert_called_once()
+        factory_payload = bus.factory_runtime_auto_analysis_error.emit.call_args.args[0]
+        assert factory_payload.displayed_config_id == 1
+        assert factory_payload.no_result is True
+        assert factory_payload.error_message == "analysis crashed"
+        assert factory_payload.judgment_payload is None
         assert mgr._completed_sessions[1] is session
 
     def test_late_attached_session_processes_attach_window_chunk_consistently_with_final_buffer(self, monkeypatch):
