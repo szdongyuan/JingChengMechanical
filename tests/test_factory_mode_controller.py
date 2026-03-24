@@ -754,13 +754,15 @@ def test_factory_mode_controller_accepted_starts_preserve_review_context_until_s
     assert start_snapshots[1]["state"].trigger_source == start_kind
 
 
-def test_factory_mode_controller_ignores_stale_same_config_start_acceptance_callbacks():
+def test_factory_mode_controller_ignores_stale_same_config_start_acceptance_callbacks_after_pending_reset():
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()
     states: list[object] = []
     callbacks: list[object] = []
     bus.factory_state_changed.connect(states.append)
-    services = _make_services((_make_config(101), _make_config(202)))
+    services = _make_services(
+        (_make_config(101), _make_config(202), _make_config(303), _make_config(404))
+    )
 
     def _capture_start(payload, *, on_start_accepted=None):
         assert payload["config_id"] == 101
@@ -775,8 +777,11 @@ def test_factory_mode_controller_ignores_stale_same_config_start_acceptance_call
     states.clear()
 
     assert controller.start_manual({"sn": "first"}) is True
+    controller.set_selection((303, 404), manual_primary_config_id=303)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
     assert controller.start_manual({"sn": "second"}) is True
     assert len(callbacks) == 2
+    states.clear()
 
     callbacks[0](_run_id_for(101, attempt=1))
 
@@ -794,6 +799,101 @@ def test_factory_mode_controller_ignores_stale_same_config_start_acceptance_call
     assert controller.state.trigger_source == "manual"
     assert len(states) == 1
     assert states[0] == controller.state
+
+
+def test_factory_mode_controller_treats_pending_start_as_busy_until_acceptance():
+    controller_mod = _load_factory_mode_controller_module()
+    services = _make_services(
+        (
+            _make_config(101, trigger_type="plc", plc_device_key="plc-a", scan_triggers_test=True),
+            _make_config(202, trigger_type="plc", plc_device_key="plc-b", scan_triggers_test=True),
+        )
+    )
+    callbacks: list[object] = []
+
+    def _capture_start(payload, *, on_start_accepted=None):
+        assert payload["config_id"] == 101
+        assert payload["trigger_source"] == "manual"
+        assert callable(on_start_accepted)
+        callbacks.append(on_start_accepted)
+        return True
+
+    services.test.start.side_effect = _capture_start
+    controller = controller_mod.FactoryModeController(EventBus(), services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+
+    assert controller.start_manual({"sn": "first"}) is True
+    assert controller.can_arm() is False
+    assert controller.start_manual({"sn": "second"}) is False
+    assert controller.handle_plc_event(
+        services_mod.FactoryPlcIngressPayload(plc_device_key="plc-b")
+    ) is False
+    assert controller.handle_scan_event(
+        services_mod.FactoryScanIngressPayload(scan_text="SN-1")
+    ) is False
+    assert len(callbacks) == 1
+    assert services.test.start.call_count == 1
+
+    callbacks[0](_run_id_for(101))
+
+    assert controller.state.active_config_id == 101
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "running"
+    assert controller.state.trigger_source == "manual"
+
+
+def test_factory_mode_controller_selection_change_cancels_pending_start_acceptance():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    states: list[object] = []
+    callbacks: list[object] = []
+    bus.factory_state_changed.connect(states.append)
+    services = _make_services(
+        (
+            _make_config(101),
+            _make_config(202),
+            _make_config(303),
+            _make_config(404),
+        )
+    )
+
+    def _capture_start(payload, *, on_start_accepted=None):
+        assert payload["config_id"] == 101
+        assert payload["trigger_source"] == "manual"
+        assert callable(on_start_accepted)
+        callbacks.append(on_start_accepted)
+        return True
+
+    services.test.start.side_effect = _capture_start
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    states.clear()
+
+    assert controller.start_manual({"sn": "first"}) is True
+    assert len(callbacks) == 1
+
+    next_state = controller.set_selection((303, 404), manual_primary_config_id=303)
+
+    assert next_state == controller.state
+    assert controller.state.selected_config_ids == (303, 404)
+    assert controller.state.manual_primary_config_id == 303
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.run_phase == "armed"
+    assert controller.state.trigger_source is None
+    assert controller.can_arm() is True
+    assert states == [controller.state]
+
+    callbacks[0](_run_id_for(101))
+
+    assert controller.state.selected_config_ids == (303, 404)
+    assert controller.state.manual_primary_config_id == 303
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.run_phase == "armed"
+    assert controller.state.trigger_source is None
+    assert controller.can_arm() is True
+    assert states == [controller.state]
 
 
 def test_factory_mode_controller_failed_start_preserves_review_context():

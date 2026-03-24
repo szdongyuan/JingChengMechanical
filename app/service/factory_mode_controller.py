@@ -94,12 +94,19 @@ class FactoryModeController(QObject):
         if has_review_context:
             self._reset_review_context("selection_changed", state=next_state)
         else:
+            if selection_changed:
+                self._pending_start = None
+                self._pending_start_request_token = None
             self._state = next_state
             self._emit_state()
         return self._state
 
     def can_arm(self) -> bool:
-        return self._state.is_ready and self._state.run_phase not in self._BLOCKED_START_PHASES
+        return (
+            self._state.is_ready
+            and self._state.run_phase not in self._BLOCKED_START_PHASES
+            and self._pending_start is None
+        )
 
     def start_manual(self, workorder: dict | None = None) -> bool:
         config_id = self._state.manual_primary_config_id
