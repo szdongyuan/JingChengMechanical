@@ -57,7 +57,6 @@ class FactoryRuntimeStartPayload:
     config_id: int
     run_id: str
     trigger_source: str
-    request_id: str | None = None
 
 
 @dataclass(frozen=True)

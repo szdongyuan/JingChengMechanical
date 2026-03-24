@@ -305,7 +305,6 @@ class FactoryModeController(QObject):
     def _connect_bus(self) -> None:
         self.bus.factory_plc_event.connect(self.handle_plc_event)
         self.bus.factory_scan_event.connect(self.handle_scan_event)
-        self.bus.factory_runtime_start_accepted.connect(self.handle_runtime_start_accepted)
         self.bus.factory_runtime_analyzing_entered.connect(self.handle_runtime_analyzing_entered)
         self.bus.factory_runtime_auto_analysis_succeeded.connect(
             self.handle_runtime_auto_analysis_succeeded
@@ -345,14 +344,13 @@ class FactoryModeController(QObject):
                 request_id=request_id,
             ):
                 return
-            self.bus.factory_runtime_start_accepted.emit(
-                FactoryRuntimeStartPayload(
-                    config_id=config_id,
-                    run_id=run_id,
-                    trigger_source=trigger_source,
-                    request_id=request_id,
-                )
+            accepted_payload = FactoryRuntimeStartPayload(
+                config_id=config_id,
+                run_id=run_id,
+                trigger_source=trigger_source,
             )
+            self.handle_runtime_started(accepted_payload)
+            self.bus.factory_runtime_start_accepted.emit(accepted_payload)
 
         start_accepted = True
         test_manager = getattr(self.services, "test", None)
@@ -490,7 +488,6 @@ class FactoryModeController(QObject):
             and self._pending_start_request_id is not None
             and payload.config_id == self._pending_start[0]
             and payload.trigger_source == self._pending_start[1]
-            and payload.request_id == self._pending_start_request_id
         )
 
     def _matches_pending_start_request(
