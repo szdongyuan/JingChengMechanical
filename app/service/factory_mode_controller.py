@@ -29,6 +29,7 @@ class FactoryModeController(QObject):
         self._state = FactoryControllerState()
         self._review_payload = FactoryReviewPayload()
         self._pending_start: tuple[int, str] | None = None
+        self._pending_start_request_token: object | None = None
         self._owned_runtime_config_id: int | None = None
         self._owned_runtime_run_id: str | None = None
         self._owned_reanalysis_config_id: int | None = None
@@ -128,6 +129,7 @@ class FactoryModeController(QObject):
             return
 
         self._pending_start = None
+        self._pending_start_request_token = None
         if self._has_review_context():
             self._reset_review_context("next_run_accepted")
 
@@ -315,8 +317,16 @@ class FactoryModeController(QObject):
         payload["config_id"] = config_id
         payload["trigger_source"] = trigger_source
         self._pending_start = (config_id, trigger_source)
+        request_token = object()
+        self._pending_start_request_token = request_token
 
         def _on_start_accepted(run_id: str) -> None:
+            if not self._matches_pending_start_request(
+                config_id=config_id,
+                trigger_source=trigger_source,
+                request_token=request_token,
+            ):
+                return
             self.bus.factory_runtime_start_accepted.emit(
                 FactoryRuntimeStartPayload(
                     config_id=config_id,
@@ -340,6 +350,7 @@ class FactoryModeController(QObject):
 
         if not start_accepted:
             self._pending_start = None
+            self._pending_start_request_token = None
             return False
 
         return True
@@ -429,6 +440,7 @@ class FactoryModeController(QObject):
         state: FactoryControllerState | None = None,
     ) -> None:
         self._pending_start = None
+        self._pending_start_request_token = None
         self._owned_runtime_config_id = None
         self._owned_runtime_run_id = None
         self._owned_reanalysis_config_id = None
@@ -453,6 +465,20 @@ class FactoryModeController(QObject):
             self._pending_start is not None
             and payload.config_id == self._pending_start[0]
             and payload.trigger_source == self._pending_start[1]
+        )
+
+    def _matches_pending_start_request(
+        self,
+        *,
+        config_id: int,
+        trigger_source: str,
+        request_token: object,
+    ) -> bool:
+        return (
+            self._pending_start is not None
+            and config_id == self._pending_start[0]
+            and trigger_source == self._pending_start[1]
+            and self._pending_start_request_token is request_token
         )
 
     def _owns_runtime_payload(

@@ -754,6 +754,48 @@ def test_factory_mode_controller_accepted_starts_preserve_review_context_until_s
     assert start_snapshots[1]["state"].trigger_source == start_kind
 
 
+def test_factory_mode_controller_ignores_stale_same_config_start_acceptance_callbacks():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    states: list[object] = []
+    callbacks: list[object] = []
+    bus.factory_state_changed.connect(states.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+
+    def _capture_start(payload, *, on_start_accepted=None):
+        assert payload["config_id"] == 101
+        assert payload["trigger_source"] == "manual"
+        assert callable(on_start_accepted)
+        callbacks.append(on_start_accepted)
+        return True
+
+    services.test.start.side_effect = _capture_start
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    states.clear()
+
+    assert controller.start_manual({"sn": "first"}) is True
+    assert controller.start_manual({"sn": "second"}) is True
+    assert len(callbacks) == 2
+
+    callbacks[0](_run_id_for(101, attempt=1))
+
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.run_phase == "armed"
+    assert controller.state.trigger_source is None
+    assert states == []
+
+    callbacks[1](_run_id_for(101, attempt=2))
+
+    assert controller.state.active_config_id == 101
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "running"
+    assert controller.state.trigger_source == "manual"
+    assert len(states) == 1
+    assert states[0] == controller.state
+
+
 def test_factory_mode_controller_failed_start_preserves_review_context():
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()
