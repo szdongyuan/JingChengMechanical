@@ -135,6 +135,17 @@ class TestManager(QObject):
             monitor.error_occurred.connect(session._monitor_error_lambda)
             self._monitors[config_id] = monitor
 
+        try:
+            if mon := self._monitors.get(config_id):
+                mon.start()
+
+            if not recorder.isRunning():
+                recorder.start()
+        except Exception as exc:
+            self._bus.log.emit(f"[TestManager] ERROR starting config {config_id}: {exc}")
+            self._stop_one(config_id, silent=True)
+            return False
+
         if callable(on_start_accepted):
             try:
                 on_start_accepted(session_workorder["factory_run_id"])
@@ -147,16 +158,11 @@ class TestManager(QObject):
 
         self._completed_sessions.pop(config_id, None)
 
-        if mon := self._monitors.get(config_id):
-            mon.start()
-
         self._bus.test_started.emit(config_id)
         self._bus.status.emit("Recording...")
         self._bus.log.emit(
             f"[TestManager] started config={config_id}, workorder={session_workorder}"
         )
-        if not recorder.isRunning():
-            recorder.start()
         return True
 
     def stop(self, config_id: int | None = None, silent: bool = False):
