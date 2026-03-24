@@ -19,7 +19,10 @@ class FactoryControllerState:
     displayed_config_id: int | None = None
     run_phase: str = "not_ready"
     trigger_source: str | None = None
-    is_ready: bool = False
+
+    @property
+    def is_ready(self) -> bool:
+        return self.run_phase != "not_ready"
 
 
 @dataclass(frozen=True)

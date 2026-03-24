@@ -104,6 +104,21 @@ def test_factory_runtime_payload_contract_includes_run_id():
     assert abort_payload.run_id == "run-101-1"
 
 
+def test_factory_controller_state_contract_exposes_only_spec_fields():
+    state_cls = getattr(mod, "FactoryControllerState", None)
+
+    assert state_cls is not None, "FactoryControllerState is missing"
+    assert is_dataclass(state_cls)
+    assert [field.name for field in fields(state_cls)] == [
+        "selected_config_ids",
+        "manual_primary_config_id",
+        "active_config_id",
+        "displayed_config_id",
+        "run_phase",
+        "trigger_source",
+    ]
+
+
 def test_factory_review_payload_contract_is_explicit():
     review_payload_cls = getattr(mod, "FactoryReviewPayload", None)
     review_window_cls = getattr(mod, "FactoryReviewWindow", None)

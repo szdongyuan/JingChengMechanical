@@ -93,7 +93,6 @@ class FactoryModeController(QObject):
             displayed_config_id=None,
             run_phase="armed" if is_ready else "not_ready",
             trigger_source=None,
-            is_ready=is_ready,
         )
 
         if has_review_context:
