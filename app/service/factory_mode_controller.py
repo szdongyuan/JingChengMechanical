@@ -236,7 +236,11 @@ class FactoryModeController(QObject):
         self._emit_state()
         test_manager = getattr(self.services, "test", None)
         if test_manager is not None:
-            test_manager.rejudge(config_id, start_sec, end_sec)
+            try:
+                test_manager.rejudge(config_id, start_sec, end_sec)
+            except Exception as exc:
+                self.finish_reanalysis_failure(str(exc))
+                return False
         return True
 
     def finish_reanalysis_success(self, payload: FactoryReviewPayload) -> None:
@@ -290,6 +294,8 @@ class FactoryModeController(QObject):
         return stopped
 
     def clear_for_next_run(self, reason: str = "next_run_accepted") -> None:
+        if self._pending_start is not None or self._state.run_phase in self._BLOCKED_START_PHASES:
+            return
         self._reset_review_context(reason)
 
     def _connect_bus(self) -> None:
@@ -347,9 +353,14 @@ class FactoryModeController(QObject):
         if test_manager is not None:
             start = getattr(test_manager, "start", None)
             if callable(start):
-                start_accepted = bool(
-                    start(payload, on_start_accepted=_on_start_accepted)
-                )
+                try:
+                    start_accepted = bool(
+                        start(payload, on_start_accepted=_on_start_accepted)
+                    )
+                except Exception:
+                    self._pending_start = None
+                    self._pending_start_request_token = None
+                    return False
             else:
                 start_accepted = False
         else:

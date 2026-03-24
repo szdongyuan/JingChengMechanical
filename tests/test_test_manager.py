@@ -2001,6 +2001,49 @@ class TestLateAttachBufferSlice:
         assert factory_payload.judgment_payload is None
         assert mgr._completed_sessions[1] is session
 
+    def test_stop_during_inflight_analysis_suppresses_completion_signals_and_discards_completed_session(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        post_attach = np.arange(10, 20, dtype=np.float32).reshape(10, 1)
+        attach_snapshot = object()
+        rec = MagicMock()
+        rec.get_buffer_from.return_value = post_attach
+        rec._sample_rate = 100.0
+        session = MagicMock()
+        session.config_id = 1
+        session._buffer = None
+        session._attach_snapshot = attach_snapshot
+        session._workorder = {"factory_run_id": "run-1"}
+        session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+        }
+
+        def stop_then_return_result():
+            mgr.stop(config_id=1)
+            return JudgmentResult(
+                overall="合格",
+                limit_pass=True,
+                ai_pass=True,
+                ai_score=0.93,
+            )
+
+        session._run_judgment.side_effect = stop_then_return_result
+        mgr._sessions[1] = session
+        mgr._recorders[1] = rec
+
+        mgr._on_session_done(1)
+
+        bus.factory_runtime_analyzing_entered.emit.assert_called_once()
+        bus.test_finished.emit.assert_not_called()
+        bus.result_changed.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_succeeded.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_no_result.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_error.emit.assert_not_called()
+        assert 1 not in mgr._completed_sessions
+        assert mgr.is_running(config_id=1) is False
+
     def test_on_error_emits_factory_runtime_aborted_for_active_factory_run(self):
         bus = _mock_bus()
         services = _mock_services(bus)

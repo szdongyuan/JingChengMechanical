@@ -311,14 +311,23 @@ class TestManager(QObject):
             session._sample_rate = rec._sample_rate
             self._disconnect_session_signals(session, rec, mon)
 
+        analysis_error = None
+        result = None
+        result_dict = None
         try:
             result = session._run_judgment()
             result_dict = self._serialize_result(result)
         except Exception as exc:
-            payload = self._emit_no_result(config_id, exc, context="analysis")
+            analysis_error = exc
+
+        if self._sessions.get(config_id) is not session:
+            return
+
+        if analysis_error is not None:
+            payload = self._emit_no_result(config_id, analysis_error, context="analysis")
             signal_name = (
                 "factory_runtime_auto_analysis_no_result"
-                if self._is_factory_no_result_error(exc)
+                if self._is_factory_no_result_error(analysis_error)
                 else "factory_runtime_auto_analysis_error"
             )
             self._emit_optional_signal(
