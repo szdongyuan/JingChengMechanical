@@ -91,6 +91,22 @@ def _make_services(configs, *, validation_errors: dict[int, list[str]] | None = 
     return services
 
 
+def _accept_start(services):
+    def _start(workorder, *, on_start_accepted=None):
+        if callable(on_start_accepted):
+            on_start_accepted()
+        return True
+
+    services.test.start.side_effect = _start
+
+
+def _assert_start_called_with(services, expected_workorder: dict):
+    services.test.start.assert_called_once()
+    args, kwargs = services.test.start.call_args
+    assert args == (expected_workorder,)
+    assert callable(kwargs["on_start_accepted"])
+
+
 def test_factory_mode_controller_starts_not_ready():
     controller_mod = _load_factory_mode_controller_module()
     state_cls = getattr(services_mod, "FactoryControllerState", None)
@@ -292,14 +308,14 @@ def test_factory_mode_controller_manual_start_resolves_to_primary_only():
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()
     services = _make_services((_make_config(101), _make_config(202)))
-    services.test.start.return_value = True
+    _accept_start(services)
     controller = controller_mod.FactoryModeController(bus, services)
     controller.set_selection((101, 202), manual_primary_config_id=202)
 
     accepted = controller.start_manual({"sn": "SN-1", "model": "M-1"})
 
     assert accepted is True
-    services.test.start.assert_called_once_with({"sn": "SN-1", "model": "M-1", "config_id": 202})
+    _assert_start_called_with(services, {"sn": "SN-1", "model": "M-1", "config_id": 202})
     assert controller.state.active_config_id == 202
     assert controller.state.displayed_config_id == 202
     assert controller.state.run_phase == "running"
@@ -332,14 +348,14 @@ def test_factory_mode_controller_manual_start_resolves_to_primary_only():
 def test_factory_mode_controller_routes_plc_events(configs, manual_primary_config_id, plc_device_key, expected_config_id):
     controller_mod = _load_factory_mode_controller_module()
     services = _make_services(configs)
-    services.test.start.return_value = True
+    _accept_start(services)
     controller = controller_mod.FactoryModeController(EventBus(), services)
     controller.set_selection((101, 202), manual_primary_config_id=manual_primary_config_id)
 
     accepted = controller.handle_plc_event(services_mod.FactoryPlcIngressPayload(plc_device_key=plc_device_key))
 
     assert accepted is True
-    services.test.start.assert_called_once_with({"config_id": expected_config_id})
+    _assert_start_called_with(services, {"config_id": expected_config_id})
     assert controller.state.active_config_id == expected_config_id
     assert controller.state.run_phase == "running"
     assert controller.state.trigger_source == "plc"
@@ -369,14 +385,14 @@ def test_factory_mode_controller_routes_plc_events(configs, manual_primary_confi
 def test_factory_mode_controller_routes_scan_events(configs, manual_primary_config_id, expected_config_id):
     controller_mod = _load_factory_mode_controller_module()
     services = _make_services(configs)
-    services.test.start.return_value = True
+    _accept_start(services)
     controller = controller_mod.FactoryModeController(EventBus(), services)
     controller.set_selection((101, 202), manual_primary_config_id=manual_primary_config_id)
 
     accepted = controller.handle_scan_event(services_mod.FactoryScanIngressPayload(scan_text="SN-1"))
 
     assert accepted is True
-    services.test.start.assert_called_once_with({"config_id": expected_config_id})
+    _assert_start_called_with(services, {"config_id": expected_config_id})
     assert controller.state.active_config_id == expected_config_id
     assert controller.state.run_phase == "running"
     assert controller.state.trigger_source == "scan"
@@ -421,7 +437,7 @@ def test_factory_mode_controller_accepted_starts_clear_stale_review_context(star
 
     reset_reasons.clear()
     reviews.clear()
-    services.test.start.return_value = True
+    _accept_start(services)
     services.test.start.reset_mock()
 
     if start_kind == "manual":
@@ -442,14 +458,14 @@ def test_factory_mode_controller_accepted_starts_clear_stale_review_context(star
     assert reset_reasons == ["next_run_accepted"]
     assert reviews == [services_mod.FactoryReviewPayload()]
     assert controller.review_payload == services_mod.FactoryReviewPayload()
-    services.test.start.assert_called_once_with({"config_id": expected_config_id})
+    _assert_start_called_with(services, {"config_id": expected_config_id})
     assert controller.state.active_config_id == expected_config_id
     assert controller.state.displayed_config_id == expected_config_id
     assert controller.state.run_phase == "running"
 
 
 @pytest.mark.parametrize("start_kind", ["manual", "plc", "scan"])
-def test_factory_mode_controller_accepted_starts_preclear_review_context_before_test_manager_start(
+def test_factory_mode_controller_accepted_starts_preserve_review_context_until_start_acceptance(
     start_kind,
 ):
     controller_mod = _load_factory_mode_controller_module()
@@ -470,9 +486,22 @@ def test_factory_mode_controller_accepted_starts_preclear_review_context_before_
 
     start_snapshots: list[dict[str, object]] = []
 
-    def _capture_start(payload):
+    def _capture_start(payload, *, on_start_accepted=None):
         start_snapshots.append(
             {
+                "stage": "before_acceptance",
+                "payload": dict(payload),
+                "review_payload": controller.review_payload,
+                "state": controller.state,
+                "reset_reasons": list(reset_reasons),
+                "reviews": list(reviews),
+            }
+        )
+        assert callable(on_start_accepted)
+        on_start_accepted()
+        start_snapshots.append(
+            {
+                "stage": "after_acceptance",
                 "payload": dict(payload),
                 "review_payload": controller.review_payload,
                 "state": controller.state,
@@ -501,39 +530,57 @@ def test_factory_mode_controller_accepted_starts_preclear_review_context_before_
         expected_config_id = 101
 
     assert accepted is True
-    assert len(start_snapshots) == 1
+    assert len(start_snapshots) == 2
     assert start_snapshots[0]["payload"]["config_id"] == expected_config_id
-    assert start_snapshots[0]["review_payload"] == services_mod.FactoryReviewPayload()
-    assert start_snapshots[0]["reset_reasons"] == ["next_run_accepted"]
-    assert start_snapshots[0]["reviews"] == [services_mod.FactoryReviewPayload()]
+    assert start_snapshots[0]["stage"] == "before_acceptance"
+    assert start_snapshots[0]["review_payload"].displayed_config_id == 202
+    assert start_snapshots[0]["reset_reasons"] == []
+    assert start_snapshots[0]["reviews"] == []
     assert start_snapshots[0]["state"].active_config_id is None
-    assert start_snapshots[0]["state"].displayed_config_id is None
-    assert start_snapshots[0]["state"].run_phase == "armed"
-    assert start_snapshots[0]["state"].trigger_source is None
+    assert start_snapshots[0]["state"].displayed_config_id == 202
+    assert start_snapshots[0]["state"].run_phase == "reviewing"
+    assert start_snapshots[0]["state"].trigger_source == "plc"
+    assert start_snapshots[1]["stage"] == "after_acceptance"
+    assert start_snapshots[1]["review_payload"] == services_mod.FactoryReviewPayload()
+    assert start_snapshots[1]["reset_reasons"] == ["next_run_accepted"]
+    assert start_snapshots[1]["reviews"] == [services_mod.FactoryReviewPayload()]
+    assert start_snapshots[1]["state"].active_config_id == expected_config_id
+    assert start_snapshots[1]["state"].displayed_config_id == expected_config_id
+    assert start_snapshots[1]["state"].run_phase == "running"
+    assert start_snapshots[1]["state"].trigger_source == start_kind
 
 
-def test_factory_mode_controller_failed_start_keeps_controller_armed():
+def test_factory_mode_controller_failed_start_preserves_review_context():
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()
     reset_reasons: list[str] = []
+    reviews: list[object] = []
     states: list[object] = []
     bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
     bus.factory_state_changed.connect(states.append)
     services = _make_services((_make_config(101), _make_config(202)))
-    services.test.start.return_value = False
+    services.test.start.side_effect = lambda workorder, *, on_start_accepted=None: False
     controller = controller_mod.FactoryModeController(bus, services)
     controller.set_selection((101, 202), manual_primary_config_id=101)
+    original_review_payload = _enter_reviewing_state(controller, bus, config_id=202, trigger_source="plc")
+
+    reset_reasons.clear()
+    reviews.clear()
+    states.clear()
 
     accepted = controller.start_manual({"sn": "SN-1"})
 
     assert accepted is False
-    services.test.start.assert_called_once_with({"sn": "SN-1", "config_id": 101})
+    _assert_start_called_with(services, {"sn": "SN-1", "config_id": 101})
     assert controller.state.active_config_id is None
-    assert controller.state.displayed_config_id is None
-    assert controller.state.run_phase == "armed"
-    assert controller.state.trigger_source is None
+    assert controller.state.displayed_config_id == 202
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.trigger_source == "plc"
+    assert controller.review_payload == original_review_payload
     assert reset_reasons == []
-    assert states[-1].run_phase == "armed"
+    assert reviews == []
+    assert states == []
 
 
 @pytest.mark.parametrize("phase", ["running", "analyzing", "reanalyzing"])
@@ -547,6 +594,7 @@ def test_factory_mode_controller_blocks_new_starts_during_active_or_reanalysis_p
     )
     controller = controller_mod.FactoryModeController(EventBus(), services)
     controller.set_selection((101, 202), manual_primary_config_id=101)
+    _accept_start(services)
     controller.start_manual()
     services.test.start.reset_mock()
 
@@ -589,6 +637,7 @@ def test_factory_mode_controller_ignores_selection_changes_during_active_or_rean
     )
     controller = controller_mod.FactoryModeController(bus, services)
     controller.set_selection((101, 202), manual_primary_config_id=101)
+    _accept_start(services)
     controller.start_manual()
 
     if phase == "analyzing":
@@ -627,7 +676,7 @@ def test_factory_mode_controller_stop_clears_active_state_and_display_ownership(
     bus.factory_display_reset.connect(reset_reasons.append)
     bus.factory_review_changed.connect(reviews.append)
     services = _make_services((_make_config(101), _make_config(202)))
-    services.test.start.return_value = True
+    _accept_start(services)
     controller = controller_mod.FactoryModeController(bus, services)
     controller.set_selection((101, 202), manual_primary_config_id=101)
     controller.start_manual()
@@ -658,7 +707,7 @@ def test_factory_mode_controller_failed_stop_keeps_active_run_state(phase):
     bus.factory_display_reset.connect(reset_reasons.append)
     bus.factory_review_changed.connect(reviews.append)
     services = _make_services((_make_config(101), _make_config(202)))
-    services.test.start.return_value = True
+    _accept_start(services)
     services.test.stop_active_run.return_value = False
     controller = controller_mod.FactoryModeController(bus, services)
     controller.set_selection((101, 202), manual_primary_config_id=101)

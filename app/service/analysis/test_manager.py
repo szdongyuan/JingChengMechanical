@@ -33,7 +33,7 @@ class TestManager(QObject):
         self._monitors: dict[int, AudioMonitor] = {}
         self._shared_recorders: dict[str, AudioRecorder] = {}
 
-    def start(self, workorder: dict) -> bool:
+    def start(self, workorder: dict, *, on_start_accepted=None) -> bool:
         """Start a test for the config_id in the workorder."""
         config_id = workorder.get("config_id")
         if config_id is None:
@@ -50,8 +50,6 @@ class TestManager(QObject):
         if config_id in self._sessions:
             self._bus.log.emit(f"[TestManager] config {config_id} already running, stopping first")
             self.stop(config_id=config_id)
-
-        self._completed_sessions.pop(config_id, None)
 
         try:
             config = self._services.config_service.load_config(config_id)
@@ -133,7 +131,21 @@ class TestManager(QObject):
             recorder.chunk_ready.connect(session._monitor_lambda)
             monitor.error_occurred.connect(session._monitor_error_lambda)
             self._monitors[config_id] = monitor
-            monitor.start()
+
+        if callable(on_start_accepted):
+            try:
+                on_start_accepted()
+            except Exception as exc:
+                self._bus.log.emit(
+                    f"[TestManager] ERROR accepting start for config {config_id}: {exc}"
+                )
+                self._stop_one(config_id, silent=True)
+                return False
+
+        self._completed_sessions.pop(config_id, None)
+
+        if mon := self._monitors.get(config_id):
+            mon.start()
 
         self._bus.test_started.emit(config_id)
         self._bus.status.emit("Recording...")

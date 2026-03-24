@@ -246,6 +246,133 @@ class TestTestManagerStartStop:
         assert mgr.is_running(config_id=1) is False
         bus.log.emit.assert_called()
 
+    def test_start_same_config_failed_restart_preserves_completed_session(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        services.config_service.load_config.side_effect = RuntimeError("missing config")
+        mgr = TestManager(bus, services)
+        prior_session = MagicMock()
+        mgr._completed_sessions[1] = prior_session
+
+        accepted = mgr.start({"config_id": 1, "sn": "SN1"})
+
+        assert accepted is False
+        assert mgr._completed_sessions[1] is prior_session
+
+    def test_start_calls_on_start_accepted_before_test_started_and_recorder_start(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        services.config_service.load_config.return_value = {
+            "config_id": 1,
+            "config_name": "Test",
+            "record_duration": 2.0,
+            "analysis_duration": 1.0,
+            "selected_channels": [0],
+            "channels": [{
+                "channel_index": 0,
+                "stft_nfft": 1024,
+                "stft_overlap": 0.5,
+                "spl_weighting": "Z",
+                "spl_time_constant": 0.125,
+                "spl_upper_limit": 85.0,
+                "spl_lower_limit": 40.0,
+                "fft_band_limits": [],
+                "oct_weighting": "Z",
+                "oct_band_limits": [],
+            }],
+            "input_device_name": "Mic",
+            "input_device_hostapi": "MME",
+            "input_device_samplerate": 44100,
+            "output_device_name": None,
+        }
+
+        events: list[str] = []
+
+        class FakeRecorder:
+            instances = []
+
+            def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+                self.device_name = device_name
+                self.hostapi = hostapi
+                self._sample_rate = sample_rate
+                self._n_channels = n_channels
+                self._record_duration = record_duration
+                self._buffer = np.zeros(
+                    (int(sample_rate * record_duration), n_channels),
+                    dtype=np.float32,
+                )
+                self.chunk_ready = _DummySignal()
+                self.recording_done = _DummySignal()
+                self.error_occurred = _DummySignal()
+                self._running = False
+                FakeRecorder.instances.append(self)
+
+            def isRunning(self):
+                return self._running
+
+            def start(self):
+                events.append("recorder.start")
+                self._running = True
+
+            def stop(self):
+                self._running = False
+
+            def wait(self, timeout):
+                return True
+
+            def attach_session(self, *, record_duration):
+                if record_duration > self._record_duration:
+                    self._record_duration = record_duration
+                    self._buffer = np.zeros(
+                        (int(self._sample_rate * record_duration), self._n_channels),
+                        dtype=np.float32,
+                    )
+                return MagicMock(chunk_index=0, sample_index=0)
+
+            def get_buffer_from(self, snapshot):
+                return self._buffer
+
+        monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
+        monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
+
+        prior_session = MagicMock()
+        mgr = TestManager(bus, services)
+        mgr._completed_sessions[1] = prior_session
+        bus.test_started.emit.side_effect = lambda config_id: events.append(
+            f"test_started:{config_id}"
+        )
+        accepted_snapshots: list[dict[str, object]] = []
+
+        def on_start_accepted():
+            accepted_snapshots.append(
+                {
+                    "completed_session": mgr._completed_sessions.get(1),
+                    "events": list(events),
+                    "recorder_running": FakeRecorder.instances[0]._running,
+                }
+            )
+            events.append("accepted")
+
+        accepted = mgr.start(
+            {"config_id": 1, "sn": "SN1"},
+            on_start_accepted=on_start_accepted,
+        )
+
+        assert accepted is True
+        assert accepted_snapshots == [
+            {
+                "completed_session": prior_session,
+                "events": [],
+                "recorder_running": False,
+            }
+        ]
+        assert events == ["accepted", "test_started:1", "recorder.start"]
+        assert 1 not in mgr._completed_sessions
+        assert FakeRecorder.instances[0]._running is True
+
     def test_stop_all(self):
         bus = _mock_bus()
         services = _mock_services(bus)

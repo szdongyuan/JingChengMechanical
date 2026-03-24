@@ -254,26 +254,32 @@ class FactoryModeController(QObject):
         if not self.can_arm():
             return False
 
-        if self._has_review_context():
-            self._reset_review_context("next_run_accepted")
-
         payload = dict(workorder or {})
         payload["config_id"] = config_id
+        start_payload = FactoryRuntimeStartPayload(
+            config_id=config_id,
+            trigger_source=trigger_source,
+        )
+
+        def _on_start_accepted() -> None:
+            self.bus.factory_runtime_start_accepted.emit(start_payload)
+
         start_accepted = True
         test_manager = getattr(self.services, "test", None)
         if test_manager is not None:
             start = getattr(test_manager, "start", None)
             if callable(start):
-                start_accepted = bool(start(payload))
+                start_accepted = bool(
+                    start(payload, on_start_accepted=_on_start_accepted)
+                )
             else:
                 start_accepted = False
+        else:
+            _on_start_accepted()
 
         if not start_accepted:
             return False
 
-        self.bus.factory_runtime_start_accepted.emit(
-            FactoryRuntimeStartPayload(config_id=config_id, trigger_source=trigger_source)
-        )
         return True
 
     def _apply_review_payload(self, payload: FactoryReviewPayload) -> None:
