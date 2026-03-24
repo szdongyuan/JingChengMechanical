@@ -62,6 +62,13 @@ class FactoryRuntimeConfigPayload:
     config_id: int
 
 
+@dataclass(frozen=True)
+class FactoryRuntimeAbortPayload:
+    config_id: int
+    trigger_source: str | None = None
+    error_message: str | None = None
+
+
 class EventBus(QObject):
     """
     模块间通信的“信号总线”。
@@ -107,6 +114,7 @@ class EventBus(QObject):
     factory_runtime_auto_analysis_succeeded = pyqtSignal(object)  # FactoryReviewPayload
     factory_runtime_auto_analysis_no_result = pyqtSignal(object)  # FactoryReviewPayload
     factory_runtime_auto_analysis_error = pyqtSignal(object)      # FactoryReviewPayload
+    factory_runtime_aborted = pyqtSignal(object)                  # FactoryRuntimeAbortPayload
     factory_runtime_reanalysis_completed = pyqtSignal(object)     # FactoryReviewPayload
     factory_state_changed = pyqtSignal(object)              # FactoryControllerState
     factory_review_changed = pyqtSignal(object)             # FactoryReviewPayload

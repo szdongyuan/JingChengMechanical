@@ -42,11 +42,29 @@ def _make_review_payload(
     )
 
 
-def _enter_reviewing_state(controller, bus, *, config_id: int = 101, trigger_source: str = "manual"):
+def _emit_owned_runtime_start(
+    controller,
+    bus,
+    *,
+    config_id: int,
+    trigger_source: str,
+):
     runtime_start_cls = getattr(services_mod, "FactoryRuntimeStartPayload", None)
-    runtime_phase_cls = getattr(services_mod, "FactoryRuntimeConfigPayload", None)
 
     assert runtime_start_cls is not None, "FactoryRuntimeStartPayload is missing"
+
+    controller._pending_start = runtime_start_cls(
+        config_id=config_id,
+        trigger_source=trigger_source,
+    )
+    bus.factory_runtime_start_accepted.emit(
+        runtime_start_cls(config_id=config_id, trigger_source=trigger_source)
+    )
+
+
+def _enter_reviewing_state(controller, bus, *, config_id: int = 101, trigger_source: str = "manual"):
+    runtime_phase_cls = getattr(services_mod, "FactoryRuntimeConfigPayload", None)
+
     assert runtime_phase_cls is not None, "FactoryRuntimeConfigPayload is missing"
 
     review_payload = _make_review_payload(
@@ -54,8 +72,11 @@ def _enter_reviewing_state(controller, bus, *, config_id: int = 101, trigger_sou
         trigger_source=trigger_source,
     )
 
-    bus.factory_runtime_start_accepted.emit(
-        runtime_start_cls(config_id=config_id, trigger_source=trigger_source)
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=config_id,
+        trigger_source=trigger_source,
     )
     bus.factory_runtime_analyzing_entered.emit(runtime_phase_cls(config_id=config_id))
     bus.factory_runtime_auto_analysis_succeeded.emit(review_payload)
@@ -118,10 +139,20 @@ def _accept_start(services):
     services.test.start.side_effect = _start
 
 
-def _assert_start_called_with(services, expected_workorder: dict):
+def _assert_start_called_with(
+    services,
+    expected_workorder: dict,
+    *,
+    expected_trigger_source: str | None = None,
+):
     services.test.start.assert_called_once()
     args, kwargs = services.test.start.call_args
-    assert args == (expected_workorder,)
+    assert len(args) == 1
+    actual_workorder = args[0]
+    for key, value in expected_workorder.items():
+        assert actual_workorder[key] == value
+    if expected_trigger_source is not None:
+        assert actual_workorder["trigger_source"] == expected_trigger_source
     assert callable(kwargs["on_start_accepted"])
 
 
@@ -162,11 +193,9 @@ def test_factory_mode_controller_owns_pair_selection_state():
 def test_factory_mode_controller_consumes_runtime_events_and_review_payload():
     controller_mod = _load_factory_mode_controller_module()
     review_payload_cls = getattr(services_mod, "FactoryReviewPayload", None)
-    runtime_start_cls = getattr(services_mod, "FactoryRuntimeStartPayload", None)
     runtime_phase_cls = getattr(services_mod, "FactoryRuntimeConfigPayload", None)
 
     assert review_payload_cls is not None, "FactoryReviewPayload is missing"
-    assert runtime_start_cls is not None, "FactoryRuntimeStartPayload is missing"
     assert runtime_phase_cls is not None, "FactoryRuntimeConfigPayload is missing"
 
     bus = EventBus()
@@ -175,28 +204,38 @@ def test_factory_mode_controller_consumes_runtime_events_and_review_payload():
     controller = controller_mod.FactoryModeController(bus)
     controller.set_selection((101, 202), manual_primary_config_id=101)
 
-    bus.factory_runtime_start_accepted.emit(
-        runtime_start_cls(config_id=101, trigger_source="manual")
-    )
-
-    assert controller.state.active_config_id == 101
-    assert controller.state.displayed_config_id == 101
-    assert controller.state.run_phase == "running"
-    assert controller.state.trigger_source == "manual"
-
-    bus.factory_runtime_analyzing_entered.emit(runtime_phase_cls(config_id=101))
-
-    assert controller.state.run_phase == "analyzing"
-
-    review_payload = _make_review_payload()
-
-    bus.factory_runtime_auto_analysis_succeeded.emit(review_payload)
+    _enter_reviewing_state(controller, bus)
 
     assert controller.state.active_config_id is None
     assert controller.state.displayed_config_id == 101
     assert controller.state.run_phase == "reviewing"
-    assert controller.review_payload == review_payload
-    assert reviews[-1] == review_payload
+    assert controller.review_payload == _make_review_payload()
+    assert reviews[-1] == _make_review_payload()
+
+
+def test_factory_mode_controller_ignores_out_of_band_factory_runtime_start_acceptance():
+    controller_mod = _load_factory_mode_controller_module()
+    runtime_start_cls = getattr(services_mod, "FactoryRuntimeStartPayload", None)
+
+    assert runtime_start_cls is not None, "FactoryRuntimeStartPayload is missing"
+
+    bus = EventBus()
+    states: list[object] = []
+    bus.factory_state_changed.connect(states.append)
+    controller = controller_mod.FactoryModeController(bus)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+
+    bus.factory_runtime_start_accepted.emit(
+        runtime_start_cls(config_id=202, trigger_source="plc")
+    )
+
+    assert controller.state.selected_config_ids == (101, 202)
+    assert controller.state.manual_primary_config_id == 101
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.run_phase == "armed"
+    assert controller.state.trigger_source is None
+    assert states == [controller.state]
 
 
 def test_factory_mode_controller_tracks_explicit_plc_ingress_and_display_reset():
@@ -322,10 +361,8 @@ def test_set_selection_from_review_to_invalid_primary_goes_directly_to_not_ready
 def test_runtime_start_accepted_clears_review_context_before_running():
     controller_mod = _load_factory_mode_controller_module()
     review_payload_cls = getattr(services_mod, "FactoryReviewPayload", None)
-    runtime_start_cls = getattr(services_mod, "FactoryRuntimeStartPayload", None)
 
     assert review_payload_cls is not None, "FactoryReviewPayload is missing"
-    assert runtime_start_cls is not None, "FactoryRuntimeStartPayload is missing"
 
     bus = EventBus()
     reviews: list[object] = []
@@ -342,9 +379,7 @@ def test_runtime_start_accepted_clears_review_context_before_running():
     reset_reasons.clear()
     states.clear()
 
-    bus.factory_runtime_start_accepted.emit(
-        runtime_start_cls(config_id=202, trigger_source="plc")
-    )
+    _emit_owned_runtime_start(controller, bus, config_id=202, trigger_source="plc")
 
     assert controller.review_payload == review_payload_cls()
     assert len(reset_reasons) == 1
@@ -406,7 +441,11 @@ def test_factory_mode_controller_manual_start_resolves_to_primary_only():
     accepted = controller.start_manual({"sn": "SN-1", "model": "M-1"})
 
     assert accepted is True
-    _assert_start_called_with(services, {"sn": "SN-1", "model": "M-1", "config_id": 202})
+    _assert_start_called_with(
+        services,
+        {"sn": "SN-1", "model": "M-1", "config_id": 202},
+        expected_trigger_source="manual",
+    )
     assert controller.state.active_config_id == 202
     assert controller.state.displayed_config_id == 202
     assert controller.state.run_phase == "running"
@@ -446,7 +485,11 @@ def test_factory_mode_controller_routes_plc_events(configs, manual_primary_confi
     accepted = controller.handle_plc_event(services_mod.FactoryPlcIngressPayload(plc_device_key=plc_device_key))
 
     assert accepted is True
-    _assert_start_called_with(services, {"config_id": expected_config_id})
+    _assert_start_called_with(
+        services,
+        {"config_id": expected_config_id},
+        expected_trigger_source="plc",
+    )
     assert controller.state.active_config_id == expected_config_id
     assert controller.state.run_phase == "running"
     assert controller.state.trigger_source == "plc"
@@ -483,7 +526,11 @@ def test_factory_mode_controller_routes_scan_events(configs, manual_primary_conf
     accepted = controller.handle_scan_event(services_mod.FactoryScanIngressPayload(scan_text="SN-1"))
 
     assert accepted is True
-    _assert_start_called_with(services, {"config_id": expected_config_id})
+    _assert_start_called_with(
+        services,
+        {"config_id": expected_config_id},
+        expected_trigger_source="scan",
+    )
     assert controller.state.active_config_id == expected_config_id
     assert controller.state.run_phase == "running"
     assert controller.state.trigger_source == "scan"
@@ -549,7 +596,11 @@ def test_factory_mode_controller_accepted_starts_clear_stale_review_context(star
     assert reset_reasons == ["next_run_accepted"]
     assert reviews == [services_mod.FactoryReviewPayload()]
     assert controller.review_payload == services_mod.FactoryReviewPayload()
-    _assert_start_called_with(services, {"config_id": expected_config_id})
+    _assert_start_called_with(
+        services,
+        {"config_id": expected_config_id},
+        expected_trigger_source=start_kind,
+    )
     assert controller.state.active_config_id == expected_config_id
     assert controller.state.displayed_config_id == expected_config_id
     assert controller.state.run_phase == "running"
@@ -623,6 +674,7 @@ def test_factory_mode_controller_accepted_starts_preserve_review_context_until_s
     assert accepted is True
     assert len(start_snapshots) == 2
     assert start_snapshots[0]["payload"]["config_id"] == expected_config_id
+    assert start_snapshots[0]["payload"]["trigger_source"] == start_kind
     assert start_snapshots[0]["stage"] == "before_acceptance"
     assert start_snapshots[0]["review_payload"].displayed_config_id == 202
     assert start_snapshots[0]["reset_reasons"] == []
@@ -663,7 +715,11 @@ def test_factory_mode_controller_failed_start_preserves_review_context():
     accepted = controller.start_manual({"sn": "SN-1"})
 
     assert accepted is False
-    _assert_start_called_with(services, {"sn": "SN-1", "config_id": 101})
+    _assert_start_called_with(
+        services,
+        {"sn": "SN-1", "config_id": 101},
+        expected_trigger_source="manual",
+    )
     assert controller.state.active_config_id is None
     assert controller.state.displayed_config_id == 202
     assert controller.state.run_phase == "reviewing"
@@ -826,7 +882,7 @@ def test_factory_mode_controller_reanalysis_failure_returns_to_reviewing_without
     services = _make_services((_make_config(101), _make_config(202)))
     controller = controller_mod.FactoryModeController(bus, services)
     controller.set_selection((101, 202), manual_primary_config_id=101)
-    controller.handle_runtime_review_ready(_make_review_payload(displayed_config_id=101))
+    _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
 
     started = controller.begin_reanalysis(1.25, 3.25)
 
@@ -843,6 +899,100 @@ def test_factory_mode_controller_reanalysis_failure_returns_to_reviewing_without
     assert controller.review_payload.no_result is True
     assert controller.review_payload.error_message == "manual reanalysis failed"
     assert controller.review_payload.judgment_payload is None
+
+
+def test_factory_mode_controller_ignores_mismatched_factory_runtime_review_payload():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reviews: list[object] = []
+    bus.factory_review_changed.connect(reviews.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    _accept_start(services)
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.start_manual()
+    reviews.clear()
+
+    controller.handle_runtime_analyzing(services_mod.FactoryRuntimeConfigPayload(config_id=101))
+    bus.factory_runtime_auto_analysis_succeeded.emit(
+        _make_review_payload(displayed_config_id=202, trigger_source="plc")
+    )
+
+    assert controller.review_payload == services_mod.FactoryReviewPayload()
+    assert controller.state.active_config_id == 101
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "analyzing"
+    assert controller.state.trigger_source == "manual"
+    assert reviews == []
+
+
+def test_factory_mode_controller_recovers_from_factory_runtime_abort_mid_run():
+    controller_mod = _load_factory_mode_controller_module()
+    abort_payload_cls = getattr(services_mod, "FactoryRuntimeAbortPayload", None)
+
+    assert abort_payload_cls is not None, "FactoryRuntimeAbortPayload is missing"
+
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    _accept_start(services)
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.start_manual()
+    reviews.clear()
+
+    bus.factory_runtime_aborted.emit(
+        abort_payload_cls(
+            config_id=101,
+            trigger_source="manual",
+            error_message="monitor disconnected",
+        )
+    )
+
+    assert controller.review_payload == services_mod.FactoryReviewPayload()
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.run_phase == "armed"
+    assert controller.state.trigger_source is None
+    assert reset_reasons == ["runtime_aborted"]
+    assert reviews == [services_mod.FactoryReviewPayload()]
+
+
+def test_factory_mode_controller_ignores_out_of_band_factory_runtime_abort():
+    controller_mod = _load_factory_mode_controller_module()
+    abort_payload_cls = getattr(services_mod, "FactoryRuntimeAbortPayload", None)
+
+    assert abort_payload_cls is not None, "FactoryRuntimeAbortPayload is missing"
+
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    _accept_start(services)
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.start_manual()
+    reviews.clear()
+
+    bus.factory_runtime_aborted.emit(
+        abort_payload_cls(
+            config_id=202,
+            trigger_source="plc",
+            error_message="recorder exploded",
+        )
+    )
+
+    assert controller.state.active_config_id == 101
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "running"
+    assert controller.state.trigger_source == "manual"
+    assert reset_reasons == []
+    assert reviews == []
 
 
 def test_factory_mode_controller_consumes_real_test_manager_lifecycle_signals(monkeypatch):
@@ -973,6 +1123,7 @@ def test_factory_mode_controller_consumes_real_test_manager_lifecycle_signals(mo
 
     assert controller.state.run_phase == "reviewing"
     assert controller.review_payload.displayed_config_id == 101
+    assert controller.review_payload.trigger_source == "manual"
     assert controller.review_payload.judgment_payload["analysis_window"] == (1.0, 3.0)
 
     reanalyzing_started = controller.begin_reanalysis(1.25, 3.25)

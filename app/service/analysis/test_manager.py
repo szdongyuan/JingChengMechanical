@@ -330,8 +330,18 @@ class TestManager(QObject):
             self._stop_recorder_if_unused(rec)
 
     def _on_error(self, config_id: int, message: str):
+        session = self._sessions.get(config_id)
         self._bus.log.emit(f"[TestManager] ERROR config={config_id}: {message}")
         self._bus.status.emit(f"Error: {message}")
+        if session is not None:
+            self._emit_optional_signal(
+                "factory_runtime_aborted",
+                self._make_factory_runtime_abort_payload(
+                    config_id,
+                    session,
+                    error_message=message,
+                ),
+            )
         self._stop_one(config_id, silent=True)
 
     @staticmethod
@@ -373,6 +383,31 @@ class TestManager(QObject):
         from app.services_container import FactoryRuntimeConfigPayload
 
         return FactoryRuntimeConfigPayload(config_id=config_id)
+
+    @staticmethod
+    def _factory_trigger_source(session) -> str | None:
+        workorder = getattr(session, "_workorder", None)
+        if not isinstance(workorder, dict):
+            return None
+        trigger_source = workorder.get("trigger_source")
+        if isinstance(trigger_source, str) and trigger_source:
+            return trigger_source
+        return None
+
+    def _make_factory_runtime_abort_payload(
+        self,
+        config_id: int,
+        session,
+        *,
+        error_message: str,
+    ):
+        from app.services_container import FactoryRuntimeAbortPayload
+
+        return FactoryRuntimeAbortPayload(
+            config_id=config_id,
+            trigger_source=self._factory_trigger_source(session),
+            error_message=error_message,
+        )
 
     @staticmethod
     def _is_factory_no_result_error(error: Exception) -> bool:
@@ -424,7 +459,7 @@ class TestManager(QObject):
 
         return FactoryReviewPayload(
             displayed_config_id=config_id,
-            trigger_source=None,
+            trigger_source=self._factory_trigger_source(session),
             captured_duration_sec=captured_duration_sec,
             default_window=default_window,
             fallback_window=fallback_window,

@@ -68,6 +68,7 @@ def _mock_bus():
         "factory_runtime_auto_analysis_succeeded",
         "factory_runtime_auto_analysis_no_result",
         "factory_runtime_auto_analysis_error",
+        "factory_runtime_aborted",
         "factory_runtime_reanalysis_completed",
     ):
         setattr(bus, sig, MagicMock())
@@ -690,6 +691,7 @@ class TestTestManagerRejudge:
         mgr = TestManager(bus, services)
         mock_session = MagicMock()
         mock_session.config_id = 1
+        mock_session._workorder = {"trigger_source": "manual"}
         mock_session._config = {
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 0,
@@ -710,6 +712,7 @@ class TestTestManagerRejudge:
 
         payload = bus.factory_runtime_reanalysis_completed.emit.call_args.args[0]
         assert payload.displayed_config_id == 1
+        assert payload.trigger_source == "manual"
         assert payload.captured_duration_sec == 5.0
         assert payload.default_window.start_sec == 1.0
         assert payload.default_window.end_sec == 3.0
@@ -1491,6 +1494,7 @@ class TestLateAttachBufferSlice:
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 0,
         }
+        session._workorder = {"trigger_source": "scan"}
         session._audio_file_path = "captured.wav"
         session._run_judgment.return_value = JudgmentResult(
             overall="合格",
@@ -1508,6 +1512,7 @@ class TestLateAttachBufferSlice:
         review_payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
         assert phase_payload.config_id == 1
         assert review_payload.displayed_config_id == 1
+        assert review_payload.trigger_source == "scan"
         assert review_payload.captured_duration_sec == 5.0
         assert review_payload.default_window.start_sec == 1.0
         assert review_payload.default_window.end_sec == 3.0
@@ -1617,6 +1622,25 @@ class TestLateAttachBufferSlice:
         assert factory_payload.error_message == "analysis crashed"
         assert factory_payload.judgment_payload is None
         assert mgr._completed_sessions[1] is session
+
+    def test_on_error_emits_factory_runtime_aborted_for_active_factory_run(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        rec = MagicMock()
+        session = MagicMock()
+        session.config_id = 1
+        session._workorder = {"trigger_source": "plc"}
+        mgr._sessions[1] = session
+        mgr._recorders[1] = rec
+
+        mgr._on_error(1, "monitor disconnected")
+
+        abort_payload = bus.factory_runtime_aborted.emit.call_args.args[0]
+        assert abort_payload.config_id == 1
+        assert abort_payload.trigger_source == "plc"
+        assert abort_payload.error_message == "monitor disconnected"
+        assert mgr.is_running(config_id=1) is False
 
     def test_late_attached_session_processes_attach_window_chunk_consistently_with_final_buffer(self, monkeypatch):
         bus = _mock_bus()

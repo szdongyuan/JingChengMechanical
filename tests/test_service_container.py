@@ -47,6 +47,7 @@ def test_factory_mode_signals_exist():
         "factory_runtime_auto_analysis_succeeded",
         "factory_runtime_auto_analysis_no_result",
         "factory_runtime_auto_analysis_error",
+        "factory_runtime_aborted",
         "factory_runtime_reanalysis_completed",
         "factory_state_changed",
         "factory_review_changed",
@@ -59,11 +60,14 @@ def test_factory_review_payload_contract_is_explicit():
     review_payload_cls = getattr(mod, "FactoryReviewPayload", None)
     review_window_cls = getattr(mod, "FactoryReviewWindow", None)
     plc_payload_cls = getattr(mod, "FactoryPlcIngressPayload", None)
+    abort_payload_cls = getattr(mod, "FactoryRuntimeAbortPayload", None)
 
     assert review_payload_cls is not None, "FactoryReviewPayload is missing"
     assert review_window_cls is not None, "FactoryReviewWindow is missing"
     assert plc_payload_cls is not None, "FactoryPlcIngressPayload is missing"
+    assert abort_payload_cls is not None, "FactoryRuntimeAbortPayload is missing"
     assert is_dataclass(review_payload_cls)
+    assert is_dataclass(abort_payload_cls)
     assert [field.name for field in fields(review_payload_cls)] == [
         "displayed_config_id",
         "trigger_source",
@@ -75,13 +79,26 @@ def test_factory_review_payload_contract_is_explicit():
         "error_message",
         "judgment_payload",
     ]
+    assert [field.name for field in fields(abort_payload_cls)] == [
+        "config_id",
+        "trigger_source",
+        "error_message",
+    ]
 
     review_window = review_window_cls(start_sec=1.0, end_sec=3.0)
     payload = review_payload_cls(default_window=review_window)
     plc_payload = plc_payload_cls(plc_device_key="plc-a")
+    abort_payload = abort_payload_cls(
+        config_id=101,
+        trigger_source="manual",
+        error_message="runtime exploded",
+    )
 
     assert payload.default_window == review_window
     assert plc_payload.plc_device_key == "plc-a"
+    assert abort_payload.config_id == 101
+    assert abort_payload.trigger_source == "manual"
+    assert abort_payload.error_message == "runtime exploded"
 
 
 def test_service_container_uses_test_manager(monkeypatch):
