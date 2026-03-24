@@ -29,7 +29,6 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from consts.style import combo_qss
 from ui.widgets.cards import Card
 from ui.widgets.collapsible_group_box import CollapsibleGroupBox
 
@@ -216,7 +215,6 @@ class ConfigModule(QWidget):
         hw_lay.setVerticalSpacing(8)
 
         self.combo_trigger = _NoWheelComboBox()
-        self.combo_trigger.setStyleSheet(combo_qss)
         self.combo_trigger.addItem("（未选择）", None)
         self.combo_trigger.addItem("PLC 设备关联 (待定)", "plc")
         model = self.combo_trigger.model()
@@ -225,11 +223,9 @@ class ConfigModule(QWidget):
         hw_lay.addRow("PLC 设备", self.combo_trigger)
 
         self.combo_input_dev = _NoWheelComboBox()
-        self.combo_input_dev.setStyleSheet(combo_qss)
         hw_lay.addRow("输入设备", self.combo_input_dev)
 
         self.combo_output_dev = _NoWheelComboBox()
-        self.combo_output_dev.setStyleSheet(combo_qss)
         hw_lay.addRow("输出设备", self.combo_output_dev)
 
         self._channel_check_container = QWidget()
@@ -252,7 +248,6 @@ class ConfigModule(QWidget):
         ab_lay.addRow("启用 AI", self.chk_ai_enabled)
 
         self.combo_ai_toolchain = _NoWheelComboBox()
-        self.combo_ai_toolchain.setStyleSheet(combo_qss)
         ab_lay.addRow("AI 工具链", self.combo_ai_toolchain)
 
         self.spin_ai_timeout = _NoWheelSpinBoxInt()
@@ -483,7 +478,6 @@ class ConfigModule(QWidget):
         sf_lay.setVerticalSpacing(6)
 
         combo_nfft = _NoWheelComboBox()
-        combo_nfft.setStyleSheet(combo_qss)
         for v in [256, 512, 1024, 2048, 4096, 8192]:
             combo_nfft.addItem(str(v), v)
         combo_nfft.setObjectName("stft_nfft")
@@ -493,7 +487,6 @@ class ConfigModule(QWidget):
         sf_lay.addRow("FFT 点数", combo_nfft)
 
         combo_overlap = _NoWheelComboBox()
-        combo_overlap.setStyleSheet(combo_qss)
         for v in [0.25, 0.5, 0.75]:
             combo_overlap.addItem(str(v), v)
         combo_overlap.setObjectName("stft_overlap")
@@ -514,7 +507,6 @@ class ConfigModule(QWidget):
         sp_lay.setVerticalSpacing(6)
 
         combo_spl_w = _NoWheelComboBox()
-        combo_spl_w.setStyleSheet(combo_qss)
         combo_spl_w.addItems(["A", "C", "Z"])
         combo_spl_w.setObjectName("spl_weighting")
         val = data.get("spl_weighting", "A") if data else "A"
@@ -576,7 +568,6 @@ class ConfigModule(QWidget):
         ow_lay = QFormLayout(oct_w_row)
         ow_lay.setContentsMargins(0, 0, 0, 0)
         combo_oct_w = _NoWheelComboBox()
-        combo_oct_w.setStyleSheet(combo_qss)
         combo_oct_w.addItems(["A", "C", "Z"])
         combo_oct_w.setObjectName("oct_weighting")
         val = data.get("oct_weighting", "A") if data else "A"
@@ -1014,7 +1005,7 @@ class ConfigModule(QWidget):
             self._refresh_list()
             self._select_config_by_id(saved_id)
             self._skip_reload = False
-            self.services.bus.status.emit("配置已保存")
+            self.services.bus.log.emit("配置已保存")
         except ValueError as e:
             self._skip_reload = False
             QMessageBox.warning(self, "保存失败", str(e))

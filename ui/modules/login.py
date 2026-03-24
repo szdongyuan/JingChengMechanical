@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
 
 from app.service.log_manager import LogManager
 from base.utils import get_mac_address
-from consts.style import APP_QSS, combo_qss
+from consts.style import APP_QSS
 from model.users_table import UsersTable
 
 
@@ -69,7 +69,6 @@ class LoginWindow(QWidget):
         role_row.addWidget(role_label)
         self.role_combo = QComboBox()
         self.role_combo.addItems(["管理员", "工程师", "操作员"])
-        self.role_combo.setStyleSheet(combo_qss)
         self.role_combo.setMinimumHeight(34)
         role_row.addWidget(self.role_combo, 1)
         root.addLayout(role_row)

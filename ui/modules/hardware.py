@@ -17,7 +17,6 @@ from PyQt6.QtWidgets import (
 )
 
 from app.service.log_manager import LogManager
-from consts.style import combo_qss
 
 
 class HardwareModule(QWidget):
@@ -72,8 +71,6 @@ class HardwareModule(QWidget):
         self.combobox_output = QComboBox()
         self.combobox_input.setMinimumWidth(520)
         self.combobox_output.setMinimumWidth(520)
-        self.combobox_input.setStyleSheet(combo_qss)
-        self.combobox_output.setStyleSheet(combo_qss)
         sel_lay.addRow("输入设备", self.combobox_input)
         sel_lay.addRow("输出设备", self.combobox_output)
         lay.addWidget(sel)

@@ -20,7 +20,6 @@ from PyQt6.QtWidgets import (
 
 from app.service.log_manager import LogManager
 from base.audio_thd_frequency_response_analysis import AudioThdFrequencyResponseAnalysis
-from consts.style import combo_qss
 
 
 class InputCalibrationModule(QWidget):
@@ -85,7 +84,6 @@ class InputCalibrationModule(QWidget):
         result_lay.setSpacing(10)
 
         self.combo_channel = QComboBox()
-        self.combo_channel.setStyleSheet(combo_qss)
         # 太窄会把 “In1” 截成 “In”
         self.combo_channel.setFixedWidth(70)
 

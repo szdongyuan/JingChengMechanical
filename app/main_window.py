@@ -32,11 +32,12 @@ from ui.modules.channel_select import ChannelSelectModule
 from ui.modules.login import LoginWindow
 from ui.modules.change_password import ChangePasswordWindow
 from ui.modules.add_user import AddUserWindow
+from ui.modules.delete_user import DeleteUserWindow
 
 ROLE_PERMISSIONS = {
     "管理员": {
         "tabs": {"测试", "数据管理", "配置", "硬件"},
-        "actions": {"切换用户", "添加用户", "修改密码"},
+        "actions": {"切换用户", "添加用户", "删除用户", "修改密码"},
     },
     "工程师": {
         "tabs": {"测试", "配置", "硬件"},
@@ -58,6 +59,7 @@ class MainWindow(QMainWindow):
         self.login_window = None
         self.change_password_window = None
         self.add_user_window = None
+        self.delete_user_window = None
         self.login_shown = False
 
         self.setWindowTitle("精成电机")
@@ -128,6 +130,10 @@ class MainWindow(QMainWindow):
         self.add_user_window = AddUserWindow()
         self.add_user_window.show()
 
+    def show_delete_user_window(self):
+        self.delete_user_window = DeleteUserWindow()
+        self.delete_user_window.show()
+
     def build_topbar(self):
         topbar = QWidget()
         topbar.setObjectName("TopBar")
@@ -165,16 +171,19 @@ class MainWindow(QMainWindow):
         user_menu = QMenu(self.user_btn)
         self.action_switch_user = QAction("切换用户", self)
         self.action_add_user = QAction("添加用户", self)
+        self.action_delete_user = QAction("删除用户", self)
         self.action_change_pwd = QAction("修改密码", self)
 
         self.action_switch_user.triggered.connect(
             lambda: self.show_login_window(close_main_window=False, window_title="切换用户")
         )
         self.action_add_user.triggered.connect(self.show_add_user_window)
+        self.action_delete_user.triggered.connect(self.show_delete_user_window)
         self.action_change_pwd.triggered.connect(self.show_change_password_window)
 
         user_menu.addAction(self.action_switch_user)
         user_menu.addAction(self.action_add_user)
+        user_menu.addAction(self.action_delete_user)
         user_menu.addAction(self.action_change_pwd)
         self.user_btn.setMenu(user_menu)
         lay.addWidget(self.user_btn)
@@ -193,6 +202,7 @@ class MainWindow(QMainWindow):
         if hasattr(self, "action_switch_user"):
             self.action_switch_user.setEnabled("切换用户" in allowed_actions)
             self.action_add_user.setEnabled("添加用户" in allowed_actions)
+            self.action_delete_user.setEnabled("删除用户" in allowed_actions)
             self.action_change_pwd.setEnabled("修改密码" in allowed_actions)
 
         # 禁用/启用按钮

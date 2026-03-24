@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from consts.style import APP_QSS, combo_qss
+from consts.style import APP_QSS
 from consts.time_consts import now_str
 from model.users_table import UsersTable
 from ui.modules.login import encrypt_password
@@ -60,7 +60,6 @@ class AddUserWindow(QWidget):
         role_row.addWidget(role_label)
         self.role_combo = QComboBox()
         self.role_combo.addItems(["管理员", "工程师", "操作员"])
-        self.role_combo.setStyleSheet(combo_qss)
         self.role_combo.setMinimumHeight(34)
         role_row.addWidget(self.role_combo, 1)
         root.addLayout(role_row)
