@@ -31,6 +31,7 @@ class FactoryReviewWindow:
 @dataclass(frozen=True)
 class FactoryReviewPayload:
     displayed_config_id: int | None = None
+    run_id: str | None = None
     trigger_source: str | None = None
     captured_duration_sec: float | None = None
     default_window: FactoryReviewWindow | None = None
@@ -54,17 +55,20 @@ class FactoryScanIngressPayload:
 @dataclass(frozen=True)
 class FactoryRuntimeStartPayload:
     config_id: int
+    run_id: str
     trigger_source: str
 
 
 @dataclass(frozen=True)
 class FactoryRuntimeConfigPayload:
     config_id: int
+    run_id: str
 
 
 @dataclass(frozen=True)
 class FactoryRuntimeAbortPayload:
     config_id: int
+    run_id: str
     trigger_source: str | None = None
     error_message: str | None = None
 

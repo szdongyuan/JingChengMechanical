@@ -56,6 +56,54 @@ def test_factory_mode_signals_exist():
         assert hasattr(EventBus, name), f"Missing factory signal: {name}"
 
 
+def test_factory_runtime_payload_contract_includes_run_id():
+    start_payload_cls = getattr(mod, "FactoryRuntimeStartPayload", None)
+    runtime_payload_cls = getattr(mod, "FactoryRuntimeConfigPayload", None)
+    abort_payload_cls = getattr(mod, "FactoryRuntimeAbortPayload", None)
+
+    assert start_payload_cls is not None, "FactoryRuntimeStartPayload is missing"
+    assert runtime_payload_cls is not None, "FactoryRuntimeConfigPayload is missing"
+    assert abort_payload_cls is not None, "FactoryRuntimeAbortPayload is missing"
+    assert is_dataclass(start_payload_cls)
+    assert is_dataclass(runtime_payload_cls)
+    assert is_dataclass(abort_payload_cls)
+    assert [field.name for field in fields(start_payload_cls)] == [
+        "config_id",
+        "run_id",
+        "trigger_source",
+    ]
+    assert [field.name for field in fields(runtime_payload_cls)] == [
+        "config_id",
+        "run_id",
+    ]
+    assert [field.name for field in fields(abort_payload_cls)] == [
+        "config_id",
+        "run_id",
+        "trigger_source",
+        "error_message",
+    ]
+
+    start_payload = start_payload_cls(
+        config_id=101,
+        run_id="run-101-1",
+        trigger_source="manual",
+    )
+    runtime_payload = runtime_payload_cls(
+        config_id=101,
+        run_id="run-101-1",
+    )
+    abort_payload = abort_payload_cls(
+        config_id=101,
+        run_id="run-101-1",
+        trigger_source="manual",
+        error_message="runtime exploded",
+    )
+
+    assert start_payload.run_id == "run-101-1"
+    assert runtime_payload.run_id == "run-101-1"
+    assert abort_payload.run_id == "run-101-1"
+
+
 def test_factory_review_payload_contract_is_explicit():
     review_payload_cls = getattr(mod, "FactoryReviewPayload", None)
     review_window_cls = getattr(mod, "FactoryReviewWindow", None)
@@ -70,6 +118,7 @@ def test_factory_review_payload_contract_is_explicit():
     assert is_dataclass(abort_payload_cls)
     assert [field.name for field in fields(review_payload_cls)] == [
         "displayed_config_id",
+        "run_id",
         "trigger_source",
         "captured_duration_sec",
         "default_window",
@@ -81,22 +130,26 @@ def test_factory_review_payload_contract_is_explicit():
     ]
     assert [field.name for field in fields(abort_payload_cls)] == [
         "config_id",
+        "run_id",
         "trigger_source",
         "error_message",
     ]
 
     review_window = review_window_cls(start_sec=1.0, end_sec=3.0)
-    payload = review_payload_cls(default_window=review_window)
+    payload = review_payload_cls(run_id="run-101-1", default_window=review_window)
     plc_payload = plc_payload_cls(plc_device_key="plc-a")
     abort_payload = abort_payload_cls(
         config_id=101,
+        run_id="run-101-1",
         trigger_source="manual",
         error_message="runtime exploded",
     )
 
     assert payload.default_window == review_window
+    assert payload.run_id == "run-101-1"
     assert plc_payload.plc_device_key == "plc-a"
     assert abort_payload.config_id == 101
+    assert abort_payload.run_id == "run-101-1"
     assert abort_payload.trigger_source == "manual"
     assert abort_payload.error_message == "runtime exploded"
 

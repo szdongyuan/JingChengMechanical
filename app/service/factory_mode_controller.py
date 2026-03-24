@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import uuid
 from dataclasses import replace
 
 from PyQt6.QtCore import QObject
@@ -27,9 +28,11 @@ class FactoryModeController(QObject):
         self.services = services
         self._state = FactoryControllerState()
         self._review_payload = FactoryReviewPayload()
-        self._pending_start: FactoryRuntimeStartPayload | None = None
+        self._pending_start: tuple[int, str] | None = None
         self._owned_runtime_config_id: int | None = None
+        self._owned_runtime_run_id: str | None = None
         self._owned_reanalysis_config_id: int | None = None
+        self._owned_reanalysis_run_id: str | None = None
         self._last_plc_ingress: FactoryPlcIngressPayload | None = None
         self._last_scan_ingress: FactoryScanIngressPayload | None = None
         self._selected_configs: dict[int, dict] = {}
@@ -129,6 +132,7 @@ class FactoryModeController(QObject):
             self._reset_review_context("next_run_accepted")
 
         self._owned_runtime_config_id = payload.config_id
+        self._owned_runtime_run_id = payload.run_id
         self._state = replace(
             self._state,
             active_config_id=payload.config_id,
@@ -142,7 +146,11 @@ class FactoryModeController(QObject):
         self.handle_runtime_started(payload)
 
     def handle_runtime_analyzing(self, payload: FactoryRuntimeConfigPayload) -> None:
-        if not self._owns_active_runtime_config(payload.config_id):
+        if not self._owns_runtime_payload(
+            config_id=payload.config_id,
+            run_id=payload.run_id,
+            allowed_phases=self._ACTIVE_RUN_PHASES,
+        ):
             return
 
         self._state = replace(
@@ -161,6 +169,7 @@ class FactoryModeController(QObject):
             return
 
         self._owned_runtime_config_id = None
+        self._owned_runtime_run_id = None
         self._apply_review_payload(payload)
 
     def handle_runtime_auto_analysis_succeeded(self, payload: FactoryReviewPayload) -> None:
@@ -171,6 +180,7 @@ class FactoryModeController(QObject):
             return
 
         self._owned_runtime_config_id = None
+        self._owned_runtime_run_id = None
         self._apply_review_payload(payload)
 
     def handle_runtime_auto_analysis_no_result(self, payload: FactoryReviewPayload) -> None:
@@ -180,7 +190,11 @@ class FactoryModeController(QObject):
         self.handle_runtime_no_result(payload)
 
     def handle_runtime_aborted(self, payload) -> None:
-        if not self._owns_active_runtime_config(payload.config_id):
+        if not self._owns_runtime_payload(
+            config_id=payload.config_id,
+            run_id=payload.run_id,
+            allowed_phases=self._ACTIVE_RUN_PHASES,
+        ):
             return
         self._reset_review_context("runtime_aborted")
 
@@ -194,6 +208,7 @@ class FactoryModeController(QObject):
 
         config_id = self._state.displayed_config_id
         self._owned_reanalysis_config_id = config_id
+        self._owned_reanalysis_run_id = self._review_payload.run_id
         self._review_payload = replace(
             self._review_payload,
             displayed_config_id=config_id,
@@ -217,10 +232,12 @@ class FactoryModeController(QObject):
 
     def finish_reanalysis_success(self, payload: FactoryReviewPayload) -> None:
         self._owned_reanalysis_config_id = None
+        self._owned_reanalysis_run_id = None
         self._apply_review_payload(payload)
 
     def finish_reanalysis_failure(self, error: Exception | str) -> None:
         self._owned_reanalysis_config_id = None
+        self._owned_reanalysis_run_id = None
         self._apply_review_payload(
             replace(
                 self._review_payload,
@@ -297,14 +314,16 @@ class FactoryModeController(QObject):
         payload = dict(workorder or {})
         payload["config_id"] = config_id
         payload["trigger_source"] = trigger_source
-        start_payload = FactoryRuntimeStartPayload(
-            config_id=config_id,
-            trigger_source=trigger_source,
-        )
-        self._pending_start = start_payload
+        self._pending_start = (config_id, trigger_source)
 
-        def _on_start_accepted() -> None:
-            self.bus.factory_runtime_start_accepted.emit(start_payload)
+        def _on_start_accepted(run_id: str) -> None:
+            self.bus.factory_runtime_start_accepted.emit(
+                FactoryRuntimeStartPayload(
+                    config_id=config_id,
+                    run_id=run_id,
+                    trigger_source=trigger_source,
+                )
+            )
 
         start_accepted = True
         test_manager = getattr(self.services, "test", None)
@@ -317,7 +336,7 @@ class FactoryModeController(QObject):
             else:
                 start_accepted = False
         else:
-            _on_start_accepted()
+            _on_start_accepted(self._make_fallback_run_id(config_id))
 
         if not start_accepted:
             self._pending_start = None
@@ -411,7 +430,9 @@ class FactoryModeController(QObject):
     ) -> None:
         self._pending_start = None
         self._owned_runtime_config_id = None
+        self._owned_runtime_run_id = None
         self._owned_reanalysis_config_id = None
+        self._owned_reanalysis_run_id = None
         self._review_payload = FactoryReviewPayload()
         self._state = state or replace(
             self._state,
@@ -430,26 +451,49 @@ class FactoryModeController(QObject):
     def _matches_pending_start(self, payload: FactoryRuntimeStartPayload) -> bool:
         return (
             self._pending_start is not None
-            and payload.config_id == self._pending_start.config_id
-            and payload.trigger_source == self._pending_start.trigger_source
+            and payload.config_id == self._pending_start[0]
+            and payload.trigger_source == self._pending_start[1]
         )
 
-    def _owns_active_runtime_config(self, config_id: int) -> bool:
+    def _owns_runtime_payload(
+        self,
+        *,
+        config_id: int,
+        run_id: str | None,
+        allowed_phases: frozenset[str],
+    ) -> bool:
         return (
+            run_id is not None
+            and
             self._owned_runtime_config_id == config_id
+            and self._owned_runtime_run_id == run_id
             and self._state.active_config_id == config_id
-            and self._state.run_phase in self._ACTIVE_RUN_PHASES
+            and self._state.run_phase in allowed_phases
         )
 
     def _owns_active_review_payload(self, payload: FactoryReviewPayload) -> bool:
         config_id = payload.displayed_config_id
-        return config_id is not None and self._owns_active_runtime_config(config_id)
+        return (
+            config_id is not None
+            and self._owns_runtime_payload(
+                config_id=config_id,
+                run_id=payload.run_id,
+                allowed_phases=frozenset({"analyzing"}),
+            )
+        )
 
     def _owns_reanalysis_payload(self, payload: FactoryReviewPayload) -> bool:
         config_id = payload.displayed_config_id
         return (
             config_id is not None
+            and payload.run_id is not None
             and config_id == self._owned_reanalysis_config_id
+            and payload.run_id == self._owned_reanalysis_run_id
             and self._state.displayed_config_id == config_id
+            and self._review_payload.run_id == payload.run_id
             and self._state.run_phase == "reanalyzing"
         )
+
+    @staticmethod
+    def _make_fallback_run_id(config_id: int) -> str:
+        return f"factory-run-{config_id}-{uuid.uuid4().hex}"

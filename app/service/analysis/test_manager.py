@@ -6,6 +6,7 @@ API so ControlModule needs zero changes.
 from __future__ import annotations
 
 import os
+import uuid
 from dataclasses import asdict, is_dataclass
 
 import numpy as np
@@ -73,13 +74,15 @@ class TestManager(QObject):
         sample_rate = device_sr
         n_channels = int(input_info.get("channel_count", 1))
         record_duration = config.get("record_duration", 5.0)
+        session_workorder = dict(workorder)
+        session_workorder["factory_run_id"] = self._new_factory_run_id()
 
         session = TestSession(
             config=config,
             bus=self._bus,
             ai_service=self._services.ai_service,
             mic_cal=mic_cal,
-            workorder=workorder,
+            workorder=session_workorder,
             audio_dir=audio_dir,
         )
         session._on_session_done_cb = self._on_session_done
@@ -134,7 +137,7 @@ class TestManager(QObject):
 
         if callable(on_start_accepted):
             try:
-                on_start_accepted()
+                on_start_accepted(session_workorder["factory_run_id"])
             except Exception as exc:
                 self._bus.log.emit(
                     f"[TestManager] ERROR accepting start for config {config_id}: {exc}"
@@ -149,7 +152,9 @@ class TestManager(QObject):
 
         self._bus.test_started.emit(config_id)
         self._bus.status.emit("Recording...")
-        self._bus.log.emit(f"[TestManager] started config={config_id}, workorder={workorder}")
+        self._bus.log.emit(
+            f"[TestManager] started config={config_id}, workorder={session_workorder}"
+        )
         if not recorder.isRunning():
             recorder.start()
         return True
@@ -272,7 +277,10 @@ class TestManager(QObject):
         self._bus.log.emit(f"[TestManager] recording done for config={config_id}")
         self._emit_optional_signal(
             "factory_runtime_analyzing_entered",
-            self._make_factory_runtime_config_payload(config_id),
+            self._make_factory_runtime_config_payload(
+                config_id,
+                self._factory_run_id(session),
+            ),
         )
 
         rec = self._recorders.get(config_id)
@@ -345,6 +353,10 @@ class TestManager(QObject):
         self._stop_one(config_id, silent=True)
 
     @staticmethod
+    def _new_factory_run_id() -> str:
+        return uuid.uuid4().hex
+
+    @staticmethod
     def _make_no_result_payload(error: Exception | str) -> dict:
         return {
             "no_result": True,
@@ -379,10 +391,20 @@ class TestManager(QObject):
             emit(payload)
 
     @staticmethod
-    def _make_factory_runtime_config_payload(config_id: int):
+    def _factory_run_id(session) -> str | None:
+        workorder = getattr(session, "_workorder", None)
+        if not isinstance(workorder, dict):
+            return None
+        run_id = workorder.get("factory_run_id")
+        if isinstance(run_id, str) and run_id:
+            return run_id
+        return None
+
+    @staticmethod
+    def _make_factory_runtime_config_payload(config_id: int, run_id: str):
         from app.services_container import FactoryRuntimeConfigPayload
 
-        return FactoryRuntimeConfigPayload(config_id=config_id)
+        return FactoryRuntimeConfigPayload(config_id=config_id, run_id=run_id)
 
     @staticmethod
     def _factory_trigger_source(session) -> str | None:
@@ -405,6 +427,7 @@ class TestManager(QObject):
 
         return FactoryRuntimeAbortPayload(
             config_id=config_id,
+            run_id=self._factory_run_id(session),
             trigger_source=self._factory_trigger_source(session),
             error_message=error_message,
         )
@@ -459,6 +482,7 @@ class TestManager(QObject):
 
         return FactoryReviewPayload(
             displayed_config_id=config_id,
+            run_id=self._factory_run_id(session),
             trigger_source=self._factory_trigger_source(session),
             captured_duration_sec=captured_duration_sec,
             default_window=default_window,

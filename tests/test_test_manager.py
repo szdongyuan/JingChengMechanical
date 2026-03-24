@@ -27,6 +27,8 @@ class _DummySignal:
 class _FakeSession:
     def __init__(self, config, bus, ai_service, mic_cal, workorder, audio_dir):
         self.config_id = config["config_id"]
+        self._config = config
+        self._workorder = dict(workorder)
         self._buffer = None
         self._sample_rate = None
         self._finished = False
@@ -265,7 +267,7 @@ class TestTestManagerStartStop:
         assert accepted is False
         assert mgr._completed_sessions[1] is prior_session
 
-    def test_start_calls_on_start_accepted_before_test_started_and_recorder_start(
+    def test_start_calls_on_start_accepted_with_factory_run_id_before_test_started_and_recorder_start(
         self,
         monkeypatch,
     ):
@@ -352,12 +354,14 @@ class TestTestManagerStartStop:
         )
         accepted_snapshots: list[dict[str, object]] = []
 
-        def on_start_accepted():
+        def on_start_accepted(run_id):
             accepted_snapshots.append(
                 {
                     "completed_session": mgr._completed_sessions.get(1),
                     "events": list(events),
                     "recorder_running": FakeRecorder.instances[0]._running,
+                    "run_id": run_id,
+                    "session_run_id": mgr._sessions[1]._workorder["factory_run_id"],
                 }
             )
             events.append("accepted")
@@ -373,8 +377,13 @@ class TestTestManagerStartStop:
                 "completed_session": prior_session,
                 "events": [],
                 "recorder_running": False,
+                "run_id": accepted_snapshots[0]["run_id"],
+                "session_run_id": accepted_snapshots[0]["session_run_id"],
             }
         ]
+        assert isinstance(accepted_snapshots[0]["run_id"], str)
+        assert accepted_snapshots[0]["run_id"]
+        assert accepted_snapshots[0]["run_id"] == accepted_snapshots[0]["session_run_id"]
         assert events == ["accepted", "test_started:1", "recorder.start"]
         assert 1 not in mgr._completed_sessions
         assert FakeRecorder.instances[0]._running is True
@@ -691,7 +700,10 @@ class TestTestManagerRejudge:
         mgr = TestManager(bus, services)
         mock_session = MagicMock()
         mock_session.config_id = 1
-        mock_session._workorder = {"trigger_source": "manual"}
+        mock_session._workorder = {
+            "trigger_source": "manual",
+            "factory_run_id": "run-1",
+        }
         mock_session._config = {
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 0,
@@ -712,6 +724,7 @@ class TestTestManagerRejudge:
 
         payload = bus.factory_runtime_reanalysis_completed.emit.call_args.args[0]
         assert payload.displayed_config_id == 1
+        assert payload.run_id == "run-1"
         assert payload.trigger_source == "manual"
         assert payload.captured_duration_sec == 5.0
         assert payload.default_window.start_sec == 1.0
@@ -738,6 +751,7 @@ class TestTestManagerRejudge:
 
         payload = bus.factory_runtime_reanalysis_completed.emit.call_args.args[0]
         assert payload.displayed_config_id == 99
+        assert payload.run_id is None
         assert payload.captured_duration_sec is None
         assert payload.default_window is None
         assert payload.fallback_window is None
@@ -760,6 +774,7 @@ class TestTestManagerRejudge:
         )
         mock_session = MagicMock()
         mock_session.config_id = 1
+        mock_session._workorder = {"factory_run_id": "run-1"}
         mock_session._config = {
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 1500,
@@ -778,6 +793,7 @@ class TestTestManagerRejudge:
         bus.result_changed.emit.assert_called_once_with(payload)
         factory_payload = bus.factory_runtime_reanalysis_completed.emit.call_args.args[0]
         assert factory_payload.displayed_config_id == 1
+        assert factory_payload.run_id == "run-1"
         assert factory_payload.no_result is True
         assert factory_payload.error_message == "analysis window not fully captured"
         assert factory_payload.judgment_payload is None
@@ -795,6 +811,7 @@ class TestTestManagerRejudge:
         )
         mock_session = MagicMock()
         mock_session.config_id = 1
+        mock_session._workorder = {"factory_run_id": "run-1"}
         mock_session._config = {
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 0,
@@ -813,6 +830,7 @@ class TestTestManagerRejudge:
         bus.result_changed.emit.assert_called_once_with(payload)
         factory_payload = bus.factory_runtime_reanalysis_completed.emit.call_args.args[0]
         assert factory_payload.displayed_config_id == 1
+        assert factory_payload.run_id == "run-1"
         assert factory_payload.no_result is True
         assert factory_payload.error_message == "analysis result unavailable"
         assert factory_payload.judgment_payload is None
@@ -1477,7 +1495,7 @@ class TestLateAttachBufferSlice:
         assert session._sample_rate == 100.0
         session._run_judgment.assert_called_once_with()
 
-    def test_on_session_done_emits_factory_runtime_auto_analysis_success(self):
+    def test_on_session_done_emits_factory_run_id_on_runtime_payloads(self):
         bus = _mock_bus()
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
@@ -1494,7 +1512,10 @@ class TestLateAttachBufferSlice:
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 0,
         }
-        session._workorder = {"trigger_source": "scan"}
+        session._workorder = {
+            "trigger_source": "scan",
+            "factory_run_id": "run-1",
+        }
         session._audio_file_path = "captured.wav"
         session._run_judgment.return_value = JudgmentResult(
             overall="合格",
@@ -1511,7 +1532,9 @@ class TestLateAttachBufferSlice:
         phase_payload = bus.factory_runtime_analyzing_entered.emit.call_args.args[0]
         review_payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
         assert phase_payload.config_id == 1
+        assert phase_payload.run_id == "run-1"
         assert review_payload.displayed_config_id == 1
+        assert review_payload.run_id == "run-1"
         assert review_payload.trigger_source == "scan"
         assert review_payload.captured_duration_sec == 5.0
         assert review_payload.default_window.start_sec == 1.0
@@ -1544,6 +1567,7 @@ class TestLateAttachBufferSlice:
         session._attach_snapshot = attach_snapshot
         session._audio_file_path = None
         session._audio_data_id = None
+        session._workorder = {"factory_run_id": "run-1"}
         session._config = {
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 1500,
@@ -1569,8 +1593,11 @@ class TestLateAttachBufferSlice:
         bus.test_finished.emit.assert_called_once_with(1, payload)
         bus.result_changed.emit.assert_called_once_with(payload)
         bus.factory_runtime_analyzing_entered.emit.assert_called_once()
+        phase_payload = bus.factory_runtime_analyzing_entered.emit.call_args.args[0]
         factory_payload = bus.factory_runtime_auto_analysis_no_result.emit.call_args.args[0]
+        assert phase_payload.run_id == "run-1"
         assert factory_payload.displayed_config_id == 1
+        assert factory_payload.run_id == "run-1"
         assert factory_payload.no_result is True
         assert factory_payload.error_message == "analysis window not fully captured"
         assert factory_payload.judgment_payload is None
@@ -1591,6 +1618,7 @@ class TestLateAttachBufferSlice:
         session._attach_snapshot = attach_snapshot
         session._audio_file_path = None
         session._audio_data_id = None
+        session._workorder = {"factory_run_id": "run-1"}
         session._config = {
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 1500,
@@ -1616,8 +1644,11 @@ class TestLateAttachBufferSlice:
         bus.test_finished.emit.assert_called_once_with(1, payload)
         bus.result_changed.emit.assert_called_once_with(payload)
         bus.factory_runtime_analyzing_entered.emit.assert_called_once()
+        phase_payload = bus.factory_runtime_analyzing_entered.emit.call_args.args[0]
         factory_payload = bus.factory_runtime_auto_analysis_error.emit.call_args.args[0]
+        assert phase_payload.run_id == "run-1"
         assert factory_payload.displayed_config_id == 1
+        assert factory_payload.run_id == "run-1"
         assert factory_payload.no_result is True
         assert factory_payload.error_message == "analysis crashed"
         assert factory_payload.judgment_payload is None
@@ -1630,7 +1661,10 @@ class TestLateAttachBufferSlice:
         rec = MagicMock()
         session = MagicMock()
         session.config_id = 1
-        session._workorder = {"trigger_source": "plc"}
+        session._workorder = {
+            "trigger_source": "plc",
+            "factory_run_id": "run-1",
+        }
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
@@ -1638,6 +1672,7 @@ class TestLateAttachBufferSlice:
 
         abort_payload = bus.factory_runtime_aborted.emit.call_args.args[0]
         assert abort_payload.config_id == 1
+        assert abort_payload.run_id == "run-1"
         assert abort_payload.trigger_source == "plc"
         assert abort_payload.error_message == "monitor disconnected"
         assert mgr.is_running(config_id=1) is False
