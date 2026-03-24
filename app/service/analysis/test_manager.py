@@ -138,9 +138,6 @@ class TestManager(QObject):
         try:
             if mon := self._monitors.get(config_id):
                 mon.start()
-
-            if not recorder.isRunning():
-                recorder.start()
         except Exception as exc:
             self._bus.log.emit(f"[TestManager] ERROR starting config {config_id}: {exc}")
             self._stop_one(config_id, silent=True)
@@ -155,6 +152,22 @@ class TestManager(QObject):
                 )
                 self._stop_one(config_id, silent=True)
                 return False
+
+        try:
+            if not recorder.isRunning():
+                recorder.start()
+        except Exception as exc:
+            self._bus.log.emit(f"[TestManager] ERROR starting config {config_id}: {exc}")
+            self._emit_optional_signal(
+                "factory_runtime_aborted",
+                self._make_factory_runtime_abort_payload(
+                    config_id,
+                    session,
+                    error_message=str(exc),
+                ),
+            )
+            self._stop_one(config_id, silent=True)
+            return False
 
         self._completed_sessions.pop(config_id, None)
 
