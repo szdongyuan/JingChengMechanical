@@ -3,6 +3,22 @@ QMainWindow { background: #f3f5f8; }
 QWidget { font-family: "Segoe UI", "Microsoft YaHei UI"; font-size: 12px; color: #111827; }
 
 QWidget#TopBar { background: transparent; }
+QWidget#LoginWindow {
+  background: white;
+}
+QWidget#LoginRoot {
+  background: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+}
+QWidget#ChangePasswordWindow {
+  background: white;
+}
+QWidget#ChangePasswordRoot {
+  background: white;
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+}
 QToolButton#TopTab {
   border: 1px solid transparent;
   background: transparent;
@@ -16,6 +32,22 @@ QToolButton#TopTab:checked {
 }
 QToolButton#TopTab:hover:!checked {
   background: rgba(37, 99, 235, 0.10);
+}
+QMenu {
+  background: white;
+  color: #111827;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 6px;
+}
+QMenu::item {
+  background: transparent;
+  padding: 6px 14px;
+  border-radius: 6px;
+}
+QMenu::item:selected {
+  background: rgba(37, 99, 235, 0.10);
+  color: #1d4ed8;
 }
 
 QFrame#Card {

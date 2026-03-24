@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from PyQt6.QtGui import QCloseEvent
+from PyQt6.QtGui import QAction, QCloseEvent
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
     QGridLayout,
     QLabel,
     QMainWindow,
+    QMenu,
     QStackedWidget,
     QToolButton,
     QVBoxLayout,
@@ -28,12 +29,34 @@ from ui.modules.hardware import HardwareModule
 from ui.modules.input_calibration import InputCalibrationModule
 from ui.modules.config import ConfigModule
 from ui.modules.channel_select import ChannelSelectModule
+from ui.modules.login import LoginWindow
+from ui.modules.change_password import ChangePasswordWindow
+
+ROLE_PERMISSIONS = {
+    "管理员": {
+        "tabs": {"测试", "数据管理", "配置", "硬件"},
+        "actions": {"切换用户", "添加用户", "修改密码"},
+    },
+    "工程师": {
+        "tabs": {"测试", "配置", "硬件"},
+        "actions": {"切换用户", "修改密码"},
+    },
+    "操作员": {
+        "tabs": {"测试", "硬件"},
+        "actions": {"切换用户", "修改密码"},
+    },
+}
 
 
 class MainWindow(QMainWindow):
     def __init__(self, services):
         super().__init__()
         self.services = services
+        self.current_user_name = None  # current_user_name作为是否已登录的唯一判断
+        self.current_user_role = None
+        self.login_window = None
+        self.change_password_window = None
+        self.login_shown = False
 
         self.setWindowTitle("精成电机")
         self.setStyleSheet(APP_QSS)
@@ -48,7 +71,7 @@ class MainWindow(QMainWindow):
 
         # tab
         self.tab = QStackedWidget()
-        outer.addWidget(self._build_topbar())
+        outer.addWidget(self.build_topbar())
         outer.addWidget(self.tab, 1)
 
         # 页面：测试/数据管理/配置/硬件
@@ -58,32 +81,60 @@ class MainWindow(QMainWindow):
         self.tab.addWidget(self.build_hardware_page())
 
         self.services.bus.status.connect(self.statusBar().showMessage)
-        self.statusBar().showMessage("Idle")
 
         self.services.bus.log.emit("[App] 启动程序")
+        self.set_role()
 
-    def closeEvent(self, event: QCloseEvent):
-        self.services.bus.log.emit("[App] 关闭程序")
-        try:
-            # 关闭 DB 长连接
-            self.services.db.close()
-            # 视频关闭
-            self.video.stop_camera()
-        except Exception:
-            pass
-        super().closeEvent(event)
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self.login_shown:
+            self.login_shown = True
+            self.show_login_window(close_main_window=True, window_title="登录")
 
-    def _build_topbar(self):
-        bar = QWidget()
-        bar.setObjectName("TopBar")
-        lay = QHBoxLayout(bar)
+    def show_login_window(self, close_main_window=False, window_title="登录"):
+        self.setEnabled(False) # 锁住主界面
+
+        def on_login_success(username: str, role: str):
+            self.current_user_name = username
+            self.current_user_role = role
+            self.setEnabled(True)
+            self.set_role()
+            self.raise_()
+            self.activateWindow()
+
+        def on_login_cancel():
+            self.setEnabled(True)
+            if close_main_window:
+                self.close()
+
+        self.login_window = LoginWindow(
+            on_login_success=on_login_success,
+            on_login_cancel=on_login_cancel,
+            window_title=window_title,
+        )
+        self.login_window.show()
+
+    def show_change_password_window(self):
+        if not self.current_user_name:
+            self.services.bus.status.emit("请先登录")
+            return
+
+        self.change_password_window = ChangePasswordWindow(self.current_user_name)
+        self.change_password_window.show()
+
+    def build_topbar(self):
+        topbar = QWidget()
+        topbar.setObjectName("TopBar")
+        lay = QHBoxLayout(topbar)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
 
         group = QButtonGroup(self)
         group.setExclusive(True)
+        self.top_button_dict = {}
 
-        def add_tab(text: str, checked: bool = False):
+        # 创建一个顶部 tab 按钮，并设置选中第0个tab_names
+        def add_tab(text, checked: bool = False):
             b = QToolButton()
             b.setText(text)
             b.setCheckable(True)
@@ -92,20 +143,70 @@ class MainWindow(QMainWindow):
             group.addButton(b)
             lay.addWidget(b)
             return b
-
-        tabs = [
-            add_tab("测试", True),
-            add_tab("数据管理"),
-            add_tab("配置"),
-            add_tab("硬件"),
-        ]
-        for i, b in enumerate(tabs):
+        self.tab_names = ["测试", "数据管理", "配置", "硬件"]
+        for i, name in enumerate(self.tab_names):
+            b = add_tab(name, checked=(i == 0))
+            self.top_button_dict[name] = b
             group.setId(b, i)
-
+        # 把group中的按钮一起绑定页面设置
         group.idClicked.connect(self.tab.setCurrentIndex)
 
+        self.user_btn = QToolButton()
+        self.user_btn.setText("用户")
+        self.user_btn.setObjectName("TopTab")
+        self.user_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+
+        user_menu = QMenu(self.user_btn)
+        self.action_switch_user = QAction("切换用户", self)
+        self.action_add_user = QAction("添加用户", self)
+        self.action_change_pwd = QAction("修改密码", self)
+
+        self.action_switch_user.triggered.connect(
+            lambda: self.show_login_window(close_main_window=False, window_title="切换用户")
+        )
+        self.action_add_user.triggered.connect(
+            lambda: self.services.bus.status.emit("添加用户功能暂未实现")
+        )
+        self.action_change_pwd.triggered.connect(self.show_change_password_window)
+
+        user_menu.addAction(self.action_switch_user)
+        user_menu.addAction(self.action_add_user)
+        user_menu.addAction(self.action_change_pwd)
+        self.user_btn.setMenu(user_menu)
+        lay.addWidget(self.user_btn)
+
         lay.addStretch(1)
-        return bar
+        return topbar
+
+    def set_role(self):
+        role = self.current_user_role
+        perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["操作员"])
+        allowed_tabs = perms["tabs"]
+        allowed_actions = perms["actions"]
+        for name, btn in getattr(self, "top_button_dict", {}).items():
+            btn.setEnabled(name in allowed_tabs)
+
+        if hasattr(self, "action_switch_user"):
+            self.action_switch_user.setEnabled("切换用户" in allowed_actions)
+            self.action_add_user.setEnabled("添加用户" in allowed_actions)
+            self.action_change_pwd.setEnabled("修改密码" in allowed_actions)
+
+        # 禁用/启用按钮
+        if hasattr(self, "control"):
+            self.control.btn_start.setEnabled(bool(self.current_user_name))
+            self.control.btn_stop.setEnabled(bool(self.current_user_name))
+
+        if hasattr(self, "tab") and "测试" in getattr(self, "top_button_dict", {}):
+            current_name = self.tab_names[self.tab.currentIndex()]
+            current_btn = self.top_button_dict.get(current_name)
+            if current_btn and not current_btn.isEnabled():
+                self.tab.setCurrentIndex(0)
+                self.top_button_dict["测试"].setChecked(True)
+
+        if self.current_user_name and self.current_user_role:
+            self.statusBar().showMessage(
+                f"当前用户：{self.current_user_name} | 权限：{self.current_user_role}"
+            )
 
     def build_test_page(self) -> QWidget:
         page = QWidget()
@@ -244,4 +345,13 @@ class MainWindow(QMainWindow):
         content_lay.addWidget(main, 1)
         return page
 
-
+    def closeEvent(self, event: QCloseEvent):
+        self.services.bus.log.emit("[App] 关闭程序")
+        try:
+            # 关闭 DB 长连接
+            self.services.db.close()
+            # 视频关闭
+            self.video.stop_camera()
+        except Exception:
+            pass
+        super().closeEvent(event)

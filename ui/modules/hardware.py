@@ -258,11 +258,9 @@ class HardwareModule(QWidget):
                 f"[Hardware] 已保存输入/输出: IN {in_dev.get('id')} | {in_dev.get('name')} ; "
                 f"OUT {out_dev.get('id')} | {out_dev.get('name')}"
             )
-            self.services.bus.status.emit("硬件设备已保存")
             QMessageBox.information(self, "保存成功", "输入/输出设备保存成功！")
             self.services.bus.refresh_channels.emit()
         except Exception as e:
             self.services.bus.log.emit(f"[Hardware] 保存失败: {e}")
-            self.services.bus.status.emit("硬件设备保存失败")
             QMessageBox.warning(self, "保存失败", "硬件设备保存失败，请重试！")
 
