@@ -50,6 +50,9 @@ class FactoryModeController(QObject):
         selected_config_ids: tuple[int, ...] | list[int],
         manual_primary_config_id: int | None = None,
     ) -> FactoryControllerState:
+        if self._has_review_context():
+            self._reset_review_context("selection_changed")
+
         selected = tuple(selected_config_ids)
         is_ready = (
             len(selected) == 2
@@ -69,11 +72,7 @@ class FactoryModeController(QObject):
         return self._state
 
     def clear_display_state(self, reason: str) -> None:
-        self._review_payload = FactoryReviewPayload()
-        self._state = replace(self._state, displayed_config_id=None)
-        self.bus.factory_display_reset.emit(reason)
-        self.bus.factory_review_changed.emit(self._review_payload)
-        self._emit_state()
+        self._reset_review_context(reason)
 
     def handle_plc_event(self, payload: FactoryPlcIngressPayload) -> None:
         self._last_plc_ingress = payload
@@ -82,6 +81,9 @@ class FactoryModeController(QObject):
         self._last_scan_ingress = payload
 
     def handle_runtime_start_accepted(self, payload: FactoryRuntimeStartPayload) -> None:
+        if self._has_review_context():
+            self._reset_review_context("next_run_accepted")
+
         self._state = replace(
             self._state,
             active_config_id=payload.config_id,
@@ -144,6 +146,26 @@ class FactoryModeController(QObject):
             trigger_source=trigger_source,
         )
         self.bus.factory_review_changed.emit(payload)
+        self._emit_state()
+
+    def _has_review_context(self) -> bool:
+        return (
+            self._review_payload != FactoryReviewPayload()
+            or self._state.displayed_config_id is not None
+            or self._state.run_phase in {"reviewing", "reanalyzing"}
+        )
+
+    def _reset_review_context(self, reason: str) -> None:
+        self._review_payload = FactoryReviewPayload()
+        self._state = replace(
+            self._state,
+            active_config_id=None,
+            displayed_config_id=None,
+            run_phase="armed" if self._state.is_ready else "not_ready",
+            trigger_source=None,
+        )
+        self.bus.factory_display_reset.emit(reason)
+        self.bus.factory_review_changed.emit(self._review_payload)
         self._emit_state()
 
     def _emit_state(self) -> None:
