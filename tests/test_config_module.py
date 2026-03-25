@@ -1,25 +1,75 @@
+from __future__ import annotations
+
 import os
+from contextlib import nullcontext
+from types import SimpleNamespace
+
+import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtWidgets import QApplication
 
 from ui.modules.config import ConfigModule
 
 
-class _FakeBus(QObject):
-    refresh_channels = pyqtSignal()
-    status = pyqtSignal(str)
+class _SignalStub:
+    def __init__(self):
+        self._callbacks = []
+        self.emissions = []
+
+    def connect(self, callback):
+        self._callbacks.append(callback)
+
+    def emit(self, *args, **kwargs):
+        self.emissions.append((args, kwargs))
+        for callback in self._callbacks:
+            callback(*args, **kwargs)
 
 
-class _FakeConfigService:
+class _ConfigServiceStub:
+    def __init__(self):
+        self.saved_configs = []
+
     def list_configs(self):
+        return [
+            {
+                "config_id": saved["config_id"],
+                "config_name": saved["config_name"],
+            }
+            for saved in self.saved_configs
+        ]
+
+    def validate(self, _data):
         return []
 
+    def save_config(self, data):
+        saved = dict(data)
+        self.saved_configs = [saved]
+        return saved["config_id"]
 
-class _FakeHardwareService:
-    def query_devices_and_hostapis(self, refresh=False):
+
+class _AiServiceStub:
+    def __init__(self, binding: dict | None = None):
+        self._binding = binding
+        self.saved_bindings = []
+
+    def list_enabled_toolchains(self):
+        return [{"toolchain_id": "tc-1", "display_name": "Toolchain", "version": "1"}]
+
+    def resolve_binding(self, _config_id: int):
+        return self._binding
+
+    def get_toolchain(self, toolchain_id: str):
+        return SimpleNamespace(display_name=toolchain_id, version="1")
+
+    def save_binding(self, config_id: int, data: dict):
+        self.saved_bindings.append((config_id, dict(data)))
+        return 1
+
+
+class _HardwareServiceStub:
+    def query_devices_and_hostapis(self, refresh: bool = False):
         return (
             [
                 {
@@ -31,56 +81,110 @@ class _FakeHardwareService:
                 },
                 {
                     "name": "Speaker 1",
-                    "hostapi": 0,
+                    "hostapi": 1,
                     "default_samplerate": 44100,
                     "max_input_channels": 0,
                     "max_output_channels": 2,
                 },
             ],
-            [{"name": "ASIO"}],
+            [{"name": "ASIO"}, {"name": "WASAPI"}],
         )
 
 
-class _FakeAiService:
-    def list_enabled_toolchains(self):
-        return []
-
-    def get_toolchain(self, toolchain_id):
-        return None
-
-    def resolve_binding(self, config_id):
-        return None
+@pytest.fixture(scope="session")
+def qapp():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    return app
 
 
-class _FakeServices:
-    def __init__(self):
-        self.bus = _FakeBus()
-        self.config_service = _FakeConfigService()
-        self.hss_service = _FakeHardwareService()
-        self.ai_service = _FakeAiService()
+def _make_module(
+    binding: dict | None = None,
+    config_service: _ConfigServiceStub | None = None,
+    ai_service: _AiServiceStub | None = None,
+) -> ConfigModule:
+    services = SimpleNamespace(
+        config_service=config_service or _ConfigServiceStub(),
+        ai_service=ai_service or _AiServiceStub(binding=binding),
+        hss_service=_HardwareServiceStub(),
+        bus=SimpleNamespace(
+            refresh_channels=_SignalStub(),
+            status=_SignalStub(),
+        ),
+    )
+    return ConfigModule(services)
 
 
-def _make_module():
-    app = QApplication.instance() or QApplication([])
-    services = _FakeServices()
-    module = ConfigModule(services)
-    return app, module
+def test_populate_detail_uses_main_config_analysis_offset_and_plc_fields(qapp):
+    module = _make_module(
+        binding={
+            "enabled": True,
+            "toolchain_id": "tc-1",
+            "timeout_ms": 1000,
+            "analysis_window_offset_ms": 900,
+            "params_json": '{"legacy": true}',
+        }
+    )
+
+    assert hasattr(module, "spin_analysis_window_offset")
+    assert hasattr(module, "ed_plc_device_key")
+    assert hasattr(module, "ed_plc_device_label")
+    assert not hasattr(module, "combo_trigger")
+
+    module._populate_detail(
+        {
+            "config_id": 7,
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "analysis_window_offset_ms": 250,
+            "scan_triggers_test": False,
+            "plc_device_key": "plc-a",
+            "plc_device_label": "PLC A",
+            "input_device_name": "Mic 1",
+            "input_device_hostapi": "ASIO",
+            "input_device_samplerate": 48000,
+            "output_device_name": "Speaker 1",
+            "output_device_hostapi": "WASAPI",
+            "output_device_samplerate": 44100,
+            "selected_channels": [0],
+            "channels": [],
+        }
+    )
+
+    assert module.spin_analysis_window_offset.value() == 250
+    assert module.ed_plc_device_key.text() == "plc-a"
+    assert module.ed_plc_device_label.text() == "PLC A"
 
 
-def test_collect_data_includes_plc_metadata_fields():
-    _, module = _make_module()
+def test_collect_data_returns_main_config_analysis_offset_and_plc_fields(qapp):
+    module = _make_module()
+
+    assert hasattr(module, "spin_analysis_window_offset")
+    assert hasattr(module, "ed_plc_device_key")
+    assert hasattr(module, "ed_plc_device_label")
+    assert not hasattr(module, "combo_trigger")
+
     module._current_config_id = 7
     module.ed_name.setText("Cfg1")
-    module.txt_plc_device_key.setText("  PLC-A  ")
-    module.txt_plc_device_label.setText("  Line 1  ")
+    module.spin_record.setValue(5.0)
+    module.spin_analysis.setValue(3.0)
+    module.spin_analysis_window_offset.setValue(500)
+    module.ed_plc_device_key.setText("plc-a")
+    module.ed_plc_device_label.setText("PLC A")
 
     data = module._collect_data()
 
-    assert set(data.keys()) == {
+    assert data["analysis_window_offset_ms"] == 500
+    assert data["plc_device_key"] == "plc-a"
+    assert data["plc_device_label"] == "PLC A"
+    assert set(data) == {
         "config_id",
         "config_name",
         "record_duration",
         "analysis_duration",
+        "analysis_window_offset_ms",
         "scan_triggers_test",
         "plc_device_key",
         "plc_device_label",
@@ -93,113 +197,48 @@ def test_collect_data_includes_plc_metadata_fields():
         "selected_channels",
         "channels",
     }
-    assert data["plc_device_key"] == "  PLC-A  "
-    assert data["plc_device_label"] == "  Line 1  "
 
 
-def test_populate_hardware_card_loads_plc_metadata_fields():
-    _, module = _make_module()
+def test_collect_ai_binding_does_not_include_analysis_window_offset(qapp):
+    module = _make_module()
 
-    module._populate_hardware_card(
-        {
-            "plc_device_key": "PLC-A",
-            "plc_device_label": "Line 1",
-            "input_device_name": None,
-            "input_device_hostapi": None,
-            "input_device_samplerate": None,
-            "output_device_name": None,
-            "output_device_hostapi": None,
-            "output_device_samplerate": None,
-            "selected_channels": [],
-        }
-    )
+    ai_data = module._collect_ai_binding()
 
-    assert module.txt_plc_device_key.text() == "PLC-A"
-    assert module.txt_plc_device_label.text() == "Line 1"
-    assert module.chk_scan is not None
-    assert not hasattr(module, "combo_trigger")
+    assert "analysis_window_offset_ms" not in ai_data
 
 
-def test_populate_hardware_card_handles_unbound_plc_metadata():
-    _, module = _make_module()
-    module.txt_plc_device_key.setText("stale")
-    module.txt_plc_device_label.setText("stale")
+def test_on_save_keeps_main_config_analysis_offset_out_of_ai_binding_payload(
+    qapp, monkeypatch
+):
+    config_service = _ConfigServiceStub()
+    ai_service = _AiServiceStub()
+    module = _make_module(config_service=config_service, ai_service=ai_service)
 
-    module._populate_hardware_card(
-        {
-            "plc_device_key": None,
-            "plc_device_label": None,
-            "input_device_name": None,
-            "input_device_hostapi": None,
-            "input_device_samplerate": None,
-            "output_device_name": None,
-            "output_device_hostapi": None,
-            "output_device_samplerate": None,
-            "selected_channels": [],
-        }
-    )
-
-    assert module.txt_plc_device_key.text() == ""
-    assert module.txt_plc_device_label.text() == ""
-
-
-def test_scan_checkbox_behavior_is_preserved_in_collect_and_populate():
-    _, module = _make_module()
     module._current_config_id = 7
-    module.chk_scan.setChecked(True)
+    module.ed_name.setText("Cfg1")
+    module.spin_analysis_window_offset.setValue(250)
 
-    data = module._collect_data()
+    import model.base_mode as base_mod
 
-    assert data["scan_triggers_test"] is True
-
-    module.chk_scan.setChecked(False)
-    module._populate_detail(
-        {
-            "config_id": 7,
-            "config_name": "Cfg1",
-            "record_duration": 5.0,
-            "analysis_duration": 3.0,
-            "scan_triggers_test": True,
-            "plc_device_key": None,
-            "plc_device_label": None,
-            "input_device_name": None,
-            "input_device_hostapi": None,
-            "input_device_samplerate": None,
-            "output_device_name": None,
-            "output_device_hostapi": None,
-            "output_device_samplerate": None,
-            "selected_channels": [],
-            "channels": [],
-        }
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
     )
 
-    assert module.chk_scan.isChecked() is True
+    module._on_save()
 
-
-def test_hardware_card_still_round_trips_devices_and_selected_channels():
-    _, module = _make_module()
-
-    module._populate_hardware_card(
-        {
-            "plc_device_key": "PLC-A",
-            "plc_device_label": "Line 1",
-            "input_device_name": "Mic 1",
-            "input_device_hostapi": "ASIO",
-            "input_device_samplerate": 48000,
-            "output_device_name": "Speaker 1",
-            "output_device_hostapi": "ASIO",
-            "output_device_samplerate": 44100,
-            "selected_channels": [0, 1],
-        }
-    )
-
-    data = module._collect_data()
-
-    assert data["input_device_name"] == "Mic 1"
-    assert data["input_device_hostapi"] == "ASIO"
-    assert data["input_device_samplerate"] == 48000
-    assert data["output_device_name"] == "Speaker 1"
-    assert data["output_device_hostapi"] == "ASIO"
-    assert data["output_device_samplerate"] == 44100
-    assert data["selected_channels"] == [0, 1]
-    assert data["plc_device_key"] == "PLC-A"
+    assert warnings == []
+    assert config_service.saved_configs[0]["analysis_window_offset_ms"] == 250
+    assert ai_service.saved_bindings == [
+        (
+            7,
+            {
+                "enabled": False,
+                "toolchain_id": None,
+                "timeout_ms": None,
+                "params_json": "{}",
+            },
+        )
+    ]

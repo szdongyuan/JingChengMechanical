@@ -16,6 +16,7 @@ def _make_config(channels=None, **overrides) -> dict:
         "config_name": "Test",
         "record_duration": 5.0,
         "analysis_duration": 3.0,
+        "analysis_window_offset_ms": 0,
         "selected_channels": [0],
         "channels": channels or [_make_channel_config(0)],
     }
@@ -204,18 +205,35 @@ class TestLimitChecks:
                               audio_file_path="/tmp/test.wav")
         assert result.limit_pass is False
 
-    def test_analysis_window_extraction(self):
-        """Should analyze only the last analysis_duration seconds."""
+    def test_judge_uses_analysis_window_offset_and_duration(self):
+        """Automatic judgment should use the configured offset-based window."""
         engine = self._make_engine()
         sr = 44100.0
-        config = _make_config(record_duration=5.0, analysis_duration=3.0)
+        config = _make_config(
+            record_duration=5.0,
+            analysis_duration=2.0,
+            analysis_window_offset_ms=1000,
+        )
         # 5 seconds of audio, single channel
         buf = np.random.randn(int(sr * 5), 1) * 0.001
         result = engine.judge(config, buf, sr, mic_cal={},
                               audio_file_path="/tmp/test.wav")
-        # Window should be (2.0, 5.0)
-        assert result.analysis_window[0] == pytest.approx(2.0, abs=0.1)
-        assert result.analysis_window[1] == pytest.approx(5.0, abs=0.1)
+        assert result.analysis_window == pytest.approx((1.0, 3.0), abs=0.01)
+
+    def test_judge_raises_required_window_error_when_buffer_too_short(self):
+        """Automatic judgment should fail when the required window was not captured."""
+        engine = self._make_engine()
+        sr = 44100.0
+        config = _make_config(
+            record_duration=5.0,
+            analysis_duration=3.0,
+            analysis_window_offset_ms=3000,
+        )
+        buf = np.random.randn(int(sr * 4), 1) * 0.001
+
+        with pytest.raises(ValueError, match="analysis window"):
+            engine.judge(config, buf, sr, mic_cal={},
+                         audio_file_path="/tmp/test.wav")
 
     def test_multi_channel(self):
         engine = self._make_engine()
@@ -306,7 +324,7 @@ class TestRunAiDeferral:
         mock_ai = MagicMock()
         engine = JudgmentEngine(mock_ai)
         config = _make_config(config_id=None)
-        result = engine.judge(config, np.zeros((44100, 1)), 44100.0,
+        result = engine.judge(config, np.zeros((44100 * 3, 1)), 44100.0,
                               mic_cal={}, audio_file_path="/tmp/test.wav")
         assert result.ai_pass is None
         assert result.ai_score is None

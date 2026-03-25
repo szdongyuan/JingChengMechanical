@@ -115,6 +115,7 @@ class TestSession:
             return
 
         elapsed = max(0, chunk_index - self._attach_chunk_index + 1) * 0.05
+        frame_run_id = self._runtime_frame_run_id()
 
         for pipeline in self._pipelines:
             ch_idx = pipeline.channel_index
@@ -128,13 +129,13 @@ class TestSession:
             result = pipeline.process_chunk(mono, elapsed)
 
             if result["stft"] is not None:
-                self._bus.stft_updated.emit(self.config_id, ch_idx, result["stft"])
+                self._bus.stft_updated.emit(self.config_id, frame_run_id, ch_idx, result["stft"])
             if result["spl"] is not None:
-                self._bus.spl_updated.emit(self.config_id, ch_idx, result["spl"])
+                self._bus.spl_updated.emit(self.config_id, frame_run_id, ch_idx, result["spl"])
             if result["octave"] is not None:
-                self._bus.octave_updated.emit(self.config_id, ch_idx, result["octave"])
+                self._bus.octave_updated.emit(self.config_id, frame_run_id, ch_idx, result["octave"])
             if result["fft"] is not None:
-                self._bus.fft_updated.emit(self.config_id, ch_idx, result["fft"])
+                self._bus.fft_updated.emit(self.config_id, frame_run_id, ch_idx, result["fft"])
 
         self._bus.recording_progress.emit(self.config_id, elapsed)
 
@@ -180,7 +181,7 @@ class TestSession:
             return result
 
         analysis_start, analysis_end = result.analysis_window
-        default_window_offset_ms = int(binding.get("analysis_window_offset_ms", 0) or 0)
+        default_window_offset_ms = int(self._config.get("analysis_window_offset_ms", 0) or 0)
         default_window_duration_ms = int(self._analysis_duration * 1000)
         final_window_offset_ms = int(analysis_start * 1000)
         final_window_duration_ms = max(0, int((analysis_end - analysis_start) * 1000))
@@ -306,6 +307,14 @@ class TestSession:
             timestamp_ms = int(datetime.now(_TZ8).timestamp() * 1000)
             self._test_run_id = f"run_{self.config_id}_{timestamp_ms}"
         return self._test_run_id
+
+    def _runtime_frame_run_id(self) -> str:
+        workorder = self._workorder
+        if isinstance(workorder, dict):
+            factory_run_id = workorder.get("factory_run_id")
+            if isinstance(factory_run_id, str) and factory_run_id:
+                return factory_run_id
+        return self._get_or_create_test_run_id()
 
     def _get_sensitivity(self, channel_index: int) -> float:
         """Get mic sensitivity (Pa/V) for a channel from mic_cal."""

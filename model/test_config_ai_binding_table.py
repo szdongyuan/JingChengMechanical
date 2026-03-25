@@ -25,7 +25,6 @@ class TestConfigAiBindingTable(BaseModel):
         AiToolchainTable, backref="bindings", on_delete="SET NULL", null=True
     )
     timeout_ms = IntegerField(null=True, default=None)
-    analysis_window_offset_ms = IntegerField(default=0)
     params_json = TextField(default="{}")
     score_threshold = FloatField(null=True, default=None)
     updated_time = TextField(default=now_str)

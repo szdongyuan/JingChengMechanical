@@ -1,6 +1,7 @@
 """Tests for TestSession lifecycle."""
 from __future__ import annotations
 
+import pytest
 import os
 import re
 import math
@@ -113,6 +114,27 @@ class TestTestSessionProcessing:
         session._on_chunk(chunk, 0)
         bus.spl_updated.emit.assert_called()
 
+    def test_on_chunk_emits_analysis_signals_with_factory_run_id(self):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        session = TestSession(
+            config=_make_config(),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"factory_run_id": "factory-run-1"},
+            audio_dir="/tmp/audio",
+        )
+        session._setup_pipelines()
+
+        chunk = np.random.randn(2048, 1).astype(np.float32)
+
+        session._on_chunk(chunk, 0)
+
+        assert bus.spl_updated.emit.call_args.args[0] == 1
+        assert bus.spl_updated.emit.call_args.args[1] == "factory-run-1"
+        assert bus.spl_updated.emit.call_args.args[2] == 0
+
     def test_on_chunk_notifies_when_session_duration_expires(self):
         bus = _make_mock_bus()
         ai = MagicMock()
@@ -180,9 +202,34 @@ class TestTestSessionJudgment:
         assert isinstance(result, JudgmentResult)
         assert result.overall in ("合格", "不合格")
 
-    def test_run_judgment_runs_ai_analysis_when_binding_enabled(self, tmp_path):
+    def test_run_judgment_required_window_failure_preserves_no_result_session_state(self, tmp_path):
         bus = _make_mock_bus()
         ai = MagicMock()
+        ai.resolve_binding.return_value = None
+        session = TestSession(
+            config=_make_config(), bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+        session._judgment = MagicMock()
+        session._judgment.judge.side_effect = ValueError("analysis window not fully captured")
+
+        with pytest.raises(ValueError, match="analysis window not fully captured"):
+            session._run_judgment()
+
+        assert session.buffer is not None
+        assert session._audio_file_path is not None
+        assert os.path.isfile(session._audio_file_path)
+        assert session._audio_data_id is not None
+        assert session.last_result is None
+
+    def test_run_judgment_default_window_offset_ms_uses_config_analysis_window_offset(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        config = _make_config()
+        config["analysis_window_offset_ms"] = 1500
         ai.resolve_binding.return_value = {
             "enabled": True,
             "analysis_window_offset_ms": 250,
@@ -194,7 +241,7 @@ class TestTestSessionJudgment:
             "error_summary": None,
         }
         session = TestSession(
-            config=_make_config(), bus=bus, ai_service=ai,
+            config=config, bus=bus, ai_service=ai,
             mic_cal={}, workorder={"sn": "test", "model": "M"},
             audio_dir=str(tmp_path),
         )
@@ -206,7 +253,7 @@ class TestTestSessionJudgment:
             limit_pass=True,
             ai_pass=None,
             ai_score=None,
-            analysis_window=(0.25, 1.25),
+            analysis_window=(1.5, 2.5),
         )
 
         result = session._run_judgment()
@@ -227,9 +274,9 @@ class TestTestSessionJudgment:
         assert segment["sample_rate"] == 44100
         assert kwargs["window_info"] == {
             "window_overridden": False,
-            "default_window_offset_ms": 250,
+            "default_window_offset_ms": 1500,
             "default_window_duration_ms": 1000,
-            "final_window_offset_ms": 250,
+            "final_window_offset_ms": 1500,
             "final_window_duration_ms": 1000,
         }
         assert result.ai_pass is True
@@ -440,9 +487,41 @@ class TestTestSessionJudgment:
         assert result.ai_score == 0.88
         assert result.overall == "合格"
 
-    def test_rejudge_passes_selected_window_to_ai_analysis(self, tmp_path):
+    def test_rejudge_required_window_failure_preserves_prior_no_result_trace(self, tmp_path):
         bus = _make_mock_bus()
         ai = MagicMock()
+        ai.resolve_binding.return_value = None
+        session = TestSession(
+            config=_make_config(), bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+        session._audio_file_path = str(tmp_path / "existing.wav")
+        session._audio_data_id = "audio-123"
+        prior_result = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=True,
+            ai_score=0.88,
+        )
+        session._last_result = prior_result
+        session._judgment = MagicMock()
+        session._judgment.rejudge.side_effect = ValueError("analysis window not fully captured")
+
+        with pytest.raises(ValueError, match="analysis window not fully captured"):
+            session.rejudge(0.1, 0.5)
+
+        assert session.last_result is prior_result
+        assert session._audio_file_path == str(tmp_path / "existing.wav")
+        assert session._audio_data_id == "audio-123"
+
+    def test_rejudge_passes_selected_window_to_ai_analysis_with_config_default_window_offset(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        config = _make_config()
+        config["analysis_window_offset_ms"] = 1500
         ai.resolve_binding.return_value = {
             "enabled": True,
             "analysis_window_offset_ms": 250,
@@ -454,7 +533,7 @@ class TestTestSessionJudgment:
             "error_summary": None,
         }
         session = TestSession(
-            config=_make_config(), bus=bus, ai_service=ai,
+            config=config, bus=bus, ai_service=ai,
             mic_cal={}, workorder={"sn": "test", "model": "M"},
             audio_dir=str(tmp_path),
         )
@@ -477,7 +556,7 @@ class TestTestSessionJudgment:
         assert kwargs["segments"][0]["duration_ms"] == 400
         assert kwargs["window_info"] == {
             "window_overridden": True,
-            "default_window_offset_ms": 250,
+            "default_window_offset_ms": 1500,
             "default_window_duration_ms": 1000,
             "final_window_offset_ms": 100,
             "final_window_duration_ms": 400,

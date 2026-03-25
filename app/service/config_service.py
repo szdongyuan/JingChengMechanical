@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 
 from peewee import IntegrityError
 
@@ -49,6 +50,7 @@ class ConfigService:
             "config_name": cfg.config_name,
             "record_duration": cfg.record_duration,
             "analysis_duration": cfg.analysis_duration,
+            "analysis_window_offset_ms": cfg.analysis_window_offset_ms,
             "scan_triggers_test": bool(cfg.scan_triggers_test),
             "plc_device_key": self._normalize_optional_text(cfg.plc_device_key),
             "plc_device_label": self._normalize_optional_text(cfg.plc_device_label),
@@ -116,6 +118,7 @@ class ConfigService:
         if not TestConfigTable.select().where(TestConfigTable.config_id == config_id).exists():
             raise ValueError("配置不存在或已被删除")
         channels = data.get("channels", [])
+        analysis_window_offset_ms = int(data.get("analysis_window_offset_ms", 0))
 
         try:
             with TestConfigTable._meta.database.atomic():
@@ -123,9 +126,14 @@ class ConfigService:
                     config_name=data["config_name"].strip(),
                     record_duration=data["record_duration"],
                     analysis_duration=data["analysis_duration"],
+                    analysis_window_offset_ms=analysis_window_offset_ms,
                     scan_triggers_test=data["scan_triggers_test"],
-                    plc_device_key=self._normalize_optional_text(data.get("plc_device_key")),
-                    plc_device_label=self._normalize_optional_text(data.get("plc_device_label")),
+                    plc_device_key=self._normalize_optional_text(
+                        data.get("plc_device_key")
+                    ),
+                    plc_device_label=self._normalize_optional_text(
+                        data.get("plc_device_label")
+                    ),
                     input_device_name=data.get("input_device_name"),
                     input_device_hostapi=data.get("input_device_hostapi"),
                     input_device_samplerate=data.get("input_device_samplerate"),
@@ -135,7 +143,6 @@ class ConfigService:
                     selected_channels=json.dumps(data.get("selected_channels", [])),
                     updated_time=now_str(),
                 ).where(TestConfigTable.config_id == config_id).execute()
-
                 ChannelConfigTable.delete().where(
                     ChannelConfigTable.config == config_id
                 ).execute()
@@ -203,6 +210,8 @@ class ConfigService:
 
         if not isinstance(data.get("scan_triggers_test"), bool):
             errors.append("扫码触发必须为布尔值")
+
+        errors.extend(self.validate_factory_runtime(data))
 
         input_dev = data.get("input_device_name")
         sel_ch = data.get("selected_channels", [])
@@ -272,6 +281,28 @@ class ConfigService:
                         errors.append(
                             f"{prefix}: {label} 第 {j+1} 行下限必须小于上限"
                         )
+        return errors
+
+    def validate_factory_runtime(self, data: dict) -> list[str]:
+        errors = []
+        offset = data.get("analysis_window_offset_ms", 0)
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            errors.append("分析窗起始偏移必须为不小于 0 的整数")
+        else:
+            rd = data.get("record_duration", 0)
+            ad = data.get("analysis_duration", 0)
+            has_valid_rd = (
+                isinstance(rd, (int, float)) and not isinstance(rd, bool) and rd > 0
+            )
+            has_valid_ad = (
+                isinstance(ad, (int, float)) and not isinstance(ad, bool) and ad > 0
+            )
+            if has_valid_rd and has_valid_ad:
+                window_end_ms = Decimal(offset) + (Decimal(str(ad)) * Decimal("1000"))
+                record_duration_ms = Decimal(str(rd)) * Decimal("1000")
+                if window_end_ms > record_duration_ms:
+                    errors.append("分析窗起始偏移加分析时长不能超过录音时长")
+
         return errors
 
     @staticmethod

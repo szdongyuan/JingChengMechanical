@@ -50,7 +50,7 @@ class JudgmentEngine:
         mic_cal: dict,
         audio_file_path: str,
     ) -> JudgmentResult:
-        """Run judgment on the default analysis window (last N seconds).
+        """Run judgment on the configured automatic analysis window.
 
         Parameters
         ----------
@@ -61,12 +61,17 @@ class JudgmentEngine:
         audio_file_path : path to saved WAV for AI
         """
         analysis_dur = config.get("analysis_duration", 3.0)
+        offset_ms = config.get("analysis_window_offset_ms", 0)
         total_samples = buffer.shape[0]
         total_sec = total_samples / sample_rate
 
-        # Default window: last analysis_duration seconds
-        end_sec = total_sec
-        start_sec = max(0.0, end_sec - analysis_dur)
+        start_sec = float(offset_ms) / 1000.0
+        end_sec = start_sec + analysis_dur
+        if total_sec < end_sec:
+            raise ValueError(
+                "Captured audio does not fully cover the required analysis window "
+                f"({start_sec:.3f}s to {end_sec:.3f}s)"
+            )
         return self._run(config, buffer, sample_rate, mic_cal,
                          audio_file_path, start_sec, end_sec)
 

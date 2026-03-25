@@ -11,6 +11,30 @@ from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable as AiBindingTable
 
 
+def _index_definitions(tmp_db, table_name: str) -> list[tuple[tuple[str, ...], bool]]:
+    cursor = tmp_db.execute_sql(f"PRAGMA index_list({table_name})")
+    definitions = []
+    for _, index_name, unique, *_ in cursor.fetchall():
+        info = tmp_db.execute_sql(f"PRAGMA index_info({index_name})").fetchall()
+        definitions.append((tuple(row[2] for row in info), bool(unique)))
+    return definitions
+
+
+def _bind_all_models(tmp_db):
+    from model.channel_config_table import ChannelConfigTable
+    from model.test_config_table import TestConfigTable
+
+    all_models = [
+        TestConfigTable,
+        ChannelConfigTable,
+        AiToolchainTable,
+        AiBindingTable,
+        AiExecutionTable,
+    ]
+    tmp_db.bind(all_models)
+    return all_models
+
+
 def test_connect_creates_ai_tables(monkeypatch):
     """DbConnectionService.connect() must create all 3 AI tables in a fresh DB."""
     # Use a temp file DB so we can inspect it independently
@@ -33,17 +57,7 @@ def test_connect_creates_ai_tables(monkeypatch):
         monkeypatch.setattr(svc_mod, "db", tmp_db)
 
         # Rebind all model classes to the temp DB
-        from model.channel_config_table import ChannelConfigTable
-        from model.test_config_table import TestConfigTable
-
-        all_models = [
-            TestConfigTable,
-            ChannelConfigTable,
-            AiToolchainTable,
-            AiBindingTable,
-            AiExecutionTable,
-        ]
-        tmp_db.bind(all_models)
+        _bind_all_models(tmp_db)
 
         svc.connect()
 
@@ -55,10 +69,15 @@ def test_connect_creates_ai_tables(monkeypatch):
         assert "ai_toolchain_table" in table_names
         assert "test_config_ai_binding_table" in table_names
         assert "ai_execution_table" in table_names
+        assert "migration_marker_table" not in table_names
 
         cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_ai_binding_table)")
         column_names = {row[1] for row in cursor.fetchall()}
         assert "score_threshold" in column_names
+        assert "analysis_window_offset_ms" not in column_names
+        assert (("toolchain_id",), False) in _index_definitions(
+            tmp_db, "test_config_ai_binding_table"
+        )
 
         svc.close()
         tmp_db.close()
@@ -70,7 +89,7 @@ def test_connect_creates_ai_tables(monkeypatch):
 
 
 def test_connect_creates_test_config_table_with_exact_fresh_schema_columns(monkeypatch):
-    """DbConnectionService.connect() must create the exact fresh config schema."""
+    """DbConnectionService.connect() must create the trigger-cleanup config schema."""
     fd, db_path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     try:
@@ -84,31 +103,19 @@ def test_connect_creates_test_config_table_with_exact_fresh_schema_columns(monke
 
         monkeypatch.setattr(svc_mod, "db", tmp_db)
 
-        from model.channel_config_table import ChannelConfigTable
-        from model.test_config_table import TestConfigTable
-
-        all_models = [
-            TestConfigTable,
-            ChannelConfigTable,
-            AiToolchainTable,
-            AiBindingTable,
-            AiExecutionTable,
-        ]
-        tmp_db.bind(all_models)
+        _bind_all_models(tmp_db)
 
         DbConnectionService().connect()
 
         cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_table)")
         column_names = {row[1] for row in cursor.fetchall()}
 
-        expected_columns = {
+        assert column_names == {
             "config_id",
             "config_name",
             "record_duration",
             "analysis_duration",
             "scan_triggers_test",
-            "plc_device_key",
-            "plc_device_label",
             "created_time",
             "updated_time",
             "input_device_name",
@@ -118,9 +125,10 @@ def test_connect_creates_test_config_table_with_exact_fresh_schema_columns(monke
             "output_device_hostapi",
             "output_device_samplerate",
             "selected_channels",
+            "plc_device_key",
+            "plc_device_label",
+            "analysis_window_offset_ms",
         }
-
-        assert column_names == expected_columns
 
         tmp_db.close()
     finally:
@@ -130,8 +138,8 @@ def test_connect_creates_test_config_table_with_exact_fresh_schema_columns(monke
             pass
 
 
-def test_migrate_adds_only_expected_columns_to_existing_db(monkeypatch):
-    """DbConnectionService.connect() must add only the supported compatibility columns."""
+def test_migrate_adds_only_supported_columns_to_existing_db(monkeypatch):
+    """DbConnectionService.connect() must not restore removed trigger columns."""
     fd, db_path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     try:
@@ -147,17 +155,7 @@ def test_migrate_adds_only_expected_columns_to_existing_db(monkeypatch):
 
         monkeypatch.setattr(svc_mod, "db", tmp_db)
 
-        from model.channel_config_table import ChannelConfigTable
-        from model.test_config_table import TestConfigTable
-
-        all_models = [
-            TestConfigTable,
-            ChannelConfigTable,
-            AiToolchainTable,
-            AiBindingTable,
-            AiExecutionTable,
-        ]
-        tmp_db.bind(all_models)
+        _bind_all_models(tmp_db)
 
         tmp_db.connect()
         tmp_db.execute_sql(
@@ -180,7 +178,7 @@ def test_migrate_adds_only_expected_columns_to_existing_db(monkeypatch):
         cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_table)")
         column_names = {row[1] for row in cursor.fetchall()}
 
-        expected_columns = {
+        assert column_names == {
             "config_id",
             "config_name",
             "record_duration",
@@ -195,9 +193,10 @@ def test_migrate_adds_only_expected_columns_to_existing_db(monkeypatch):
             "output_device_hostapi",
             "output_device_samplerate",
             "selected_channels",
+            "analysis_window_offset_ms",
         }
-
-        assert column_names == expected_columns
+        assert "plc_device_key" not in column_names
+        assert "plc_device_label" not in column_names
 
         svc.close()
         tmp_db.close()
@@ -208,8 +207,10 @@ def test_migrate_adds_only_expected_columns_to_existing_db(monkeypatch):
             pass  # Windows may still hold the file briefly
 
 
-def test_migrate_adds_score_threshold_to_existing_binding_table(monkeypatch):
-    """connect() must add score_threshold to an existing binding table that lacks it."""
+def test_migrate_existing_binding_table_keeps_legacy_offset_column_untouched(
+    monkeypatch,
+):
+    """connect() should not run legacy binding-table rebuild logic for old offset columns."""
     fd, db_path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     try:
@@ -225,17 +226,7 @@ def test_migrate_adds_score_threshold_to_existing_binding_table(monkeypatch):
 
         monkeypatch.setattr(svc_mod, "db", tmp_db)
 
-        from model.channel_config_table import ChannelConfigTable
-        from model.test_config_table import TestConfigTable
-
-        all_models = [
-            TestConfigTable,
-            ChannelConfigTable,
-            AiToolchainTable,
-            AiBindingTable,
-            AiExecutionTable,
-        ]
-        tmp_db.bind(all_models)
+        _bind_all_models(tmp_db)
 
         # Create a binding table WITHOUT score_threshold (simulating old schema)
         tmp_db.connect()
@@ -280,6 +271,47 @@ def test_migrate_adds_score_threshold_to_existing_binding_table(monkeypatch):
             )
             """
         )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO ai_toolchain_table (
+                toolchain_id,
+                display_name,
+                version,
+                entrypoint,
+                default_timeout_ms,
+                enabled,
+                created_time,
+                updated_time
+            ) VALUES ('legacy-toolchain', 'Legacy Toolchain', '1.0.0', 'legacy.entry', 30000, 1, '', '')
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO test_config_table (
+                config_id,
+                config_name,
+                record_duration,
+                analysis_duration,
+                scan_triggers_test,
+                created_time,
+                updated_time
+            ) VALUES (1, 'Legacy Config', 5.0, 3.0, 0, '', '')
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO test_config_ai_binding_table (
+                binding_id,
+                config_id,
+                enabled,
+                toolchain_id,
+                timeout_ms,
+                analysis_window_offset_ms,
+                params_json,
+                updated_time
+            ) VALUES (1, 1, 1, 'legacy-toolchain', 1200, 250, '{"legacy": true}', '')
+            """
+        )
         tmp_db.close()
 
         svc.connect()
@@ -287,7 +319,33 @@ def test_migrate_adds_score_threshold_to_existing_binding_table(monkeypatch):
         cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_ai_binding_table)")
         columns = {row[1]: row for row in cursor.fetchall()}
         assert "score_threshold" in columns
+        assert "analysis_window_offset_ms" in columns
         assert columns["score_threshold"][4] == "NULL"
+        assert (("toolchain_id",), False) in _index_definitions(
+            tmp_db, "test_config_ai_binding_table"
+        )
+
+        cursor = tmp_db.execute_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+        table_names = {row[0] for row in cursor.fetchall()}
+        assert "migration_marker_table" not in table_names
+
+        cursor = tmp_db.execute_sql(
+            """
+            SELECT enabled, toolchain_id, timeout_ms, analysis_window_offset_ms, params_json, score_threshold
+            FROM test_config_ai_binding_table
+            WHERE config_id = 1
+            """
+        )
+        assert cursor.fetchone() == (
+            1,
+            "legacy-toolchain",
+            1200,
+            250,
+            '{"legacy": true}',
+            None,
+        )
 
         svc.close()
         tmp_db.close()
@@ -296,3 +354,4 @@ def test_migrate_adds_score_threshold_to_existing_binding_table(monkeypatch):
             os.unlink(db_path)
         except OSError:
             pass
+

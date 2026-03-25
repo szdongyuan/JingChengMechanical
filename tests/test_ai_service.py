@@ -69,6 +69,17 @@ class TestBindingResolver:
         assert binding["toolchain_id"] == "motor-ai"
         assert binding["timeout_ms"] == 5000
 
+    def test_resolve_binding_excludes_analysis_window_offset_ms(
+        self, ai_service, config, toolchain
+    ):
+        AiBindingTable.create(
+            config=config, toolchain=toolchain, enabled=True, timeout_ms=5000
+        )
+
+        binding = ai_service.resolve_binding(config.config_id)
+
+        assert "analysis_window_offset_ms" not in binding
+
     def test_resolve_binding_not_found(self, ai_service, config):
         assert ai_service.resolve_binding(config.config_id) is None
 
@@ -110,14 +121,32 @@ class TestBindingCrud:
             "enabled": True,
             "toolchain_id": "motor-ai",
             "timeout_ms": 5000,
-            "analysis_window_offset_ms": 500,
             "params_json": '{"k": "v"}',
         })
         assert bid > 0
         binding = ai_service.resolve_binding(config.config_id)
         assert binding["enabled"] is True
         assert binding["timeout_ms"] == 5000
-        assert binding["analysis_window_offset_ms"] == 500
+        assert binding["params_json"] == '{"k": "v"}'
+
+    def test_save_binding_ignores_analysis_window_offset_ms(
+        self, ai_service, config, toolchain
+    ):
+        bid = ai_service.save_binding(config.config_id, {
+            "enabled": True,
+            "toolchain_id": "motor-ai",
+            "timeout_ms": 5000,
+            "analysis_window_offset_ms": 500,
+            "params_json": '{"k": "v"}',
+        })
+
+        assert bid > 0
+
+        binding = ai_service.resolve_binding(config.config_id)
+        row = AiBindingTable.get(AiBindingTable.config == config.config_id)
+
+        assert "analysis_window_offset_ms" not in binding
+        assert not hasattr(row, "analysis_window_offset_ms")
 
     def test_save_updates_existing_binding(self, ai_service, config, toolchain):
         ai_service.save_binding(config.config_id, {
