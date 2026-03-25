@@ -53,7 +53,7 @@ After this cleanup, trigger behavior is defined by explicit fields and page stat
 
 - Manual start: always starts the selected `manual_primary_config_id`
 - Scan eligibility: only depends on `scan_triggers_test == True`
-- PLC eligibility: only depends on the config having a non-empty `plc_device_key`
+- PLC eligibility: only depends on the config having a non-empty `plc_device_key` after trimming surrounding whitespace
 
 `plc_device_label` is display-only metadata and does not affect eligibility.
 
@@ -66,7 +66,7 @@ This cleanup separates config eligibility from runtime routing.
 Config fields determine whether a config is eligible for a given non-manual trigger source:
 
 - `scan_triggers_test` determines scan eligibility
-- `plc_device_key` determines PLC eligibility
+- `plc_device_key.strip()` determines PLC eligibility
 
 Runtime routing remains a controller concern. Future factory-mode routing must still evaluate:
 
@@ -107,6 +107,12 @@ Do not replace it with another enum. The explicit scan field and PLC binding fie
 - scan eligibility derived from `scan_triggers_test`
 - PLC eligibility derived from `plc_device_key`
 - any per-config validation that does not depend on selected-pair page state or live event payloads
+
+Contract:
+
+- input: one loaded config dict
+- output: `list[str]`
+- meaning: empty list means the config is runtime-eligible; non-empty list contains operator-facing validation errors
 
 The future factory-mode controller remains the owner of:
 
@@ -162,6 +168,8 @@ Specifically, those earlier docs should no longer be treated as authoritative wh
 
 A new focused implementation plan should be written for this cleanup instead of revising those larger historical documents in place.
 
+The new March 25 cleanup plan becomes the authoritative plan for trigger-model work. Until that plan exists, `docs/superpowers/plans/2026-03-20-factory-mode-analysis-ui.md` must be treated as superseded on trigger-related logic and must not be used as the implementation authority for `trigger_type`.
+
 ## Success Criteria
 
 This cleanup is complete when:
@@ -176,5 +184,6 @@ This cleanup is complete when:
 
 - search the repo for remaining production references to `trigger_type`
 - confirm the active March 25 plan contains no trigger-type-based routing rules
+- confirm `docs/superpowers/plans/2026-03-20-factory-mode-analysis-ui.md` is no longer treated as authoritative for trigger logic once the March 25 cleanup plan is written
 - confirm the config UI exposes scan and PLC metadata without a trigger selector
 - run targeted tests for model, config service, config UI, and any factory-routing logic touched by the cleanup
