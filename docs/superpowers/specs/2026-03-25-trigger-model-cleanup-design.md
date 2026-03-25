@@ -32,7 +32,7 @@ This spec covers only trigger-model cleanup for the current branch.
 
 In scope:
 
-- remove `trigger_type` from config schema, persistence, UI, tests, and active planning assumptions
+- remove `trigger_type` from config schema, persistence, UI, tests, and active non-historical planning assumptions
 - keep `scan_triggers_test` as the only scan-trigger eligibility field
 - add or preserve `plc_device_key` and `plc_device_label` as saved PLC metadata
 - define PLC eligibility by `plc_device_key` presence only
@@ -118,26 +118,12 @@ Capability checks use the normalized stored `plc_device_key`.
 - saving `trigger_type`
 - validating `trigger_type`
 
-This cleanup also requires `ConfigService` to load and save:
+This cleanup also requires `ConfigService` to load and save normalized PLC metadata:
 
 - `plc_device_key`
 - `plc_device_label`
 
-This cleanup plan includes implementing `ConfigService.validate_factory_runtime()` now. It is not deferred guidance for a later factory-mode plan.
-
-`ConfigService.validate_factory_runtime()` is limited to hard-blocking per-config runtime validation shared by all start paths, including:
-
-- any per-config validation that does not depend on selected-pair page state or live event payloads
-
-Contract:
-
-- input: one loaded config dict
-- output: `list[str]`
-- meaning: empty list means there is no hard-blocking config error for starting this config manually; non-empty list contains operator-facing validation errors
-
-Non-eligibility for scan or PLC is not an error. A manual-only config with `scan_triggers_test == False` and blank `plc_device_key` is still valid and should return no errors from `validate_factory_runtime()` unless some separate hard-blocking config problem exists.
-
-Capability checks are separate and explicit:
+Capability checks are explicit field reads, not validation errors:
 
 - scan capability is `scan_triggers_test == True`
 - PLC capability is `plc_device_key.strip() != ""`
@@ -150,7 +136,7 @@ The future factory-mode controller remains the owner of:
 - scan/PLC tie-break rules
 - blocking starts during active run or reanalysis states
 
-If helper methods are introduced for clarity, they should expose capability questions directly rather than encoding capability as validation errors.
+This cleanup does not introduce a new runtime-validation API. It only establishes the persisted fields and capability rules that later factory-mode work must use.
 
 ### Config UI
 
@@ -193,6 +179,7 @@ Because this is a new project, this cleanup does not require compatibility work 
 That means:
 
 - no SQLite drop-column or table-rebuild work is required just to erase a stale `trigger_type` column from an old local DB
+- no additive migration support is required for pre-cleanup local DBs that are missing the new PLC metadata fields
 - no compatibility logic is required to preserve historical `trigger_type` values
 - if a developer still has an old local DB file that does not match the new supported schema, recreating that DB is an acceptable path
 
@@ -230,5 +217,7 @@ This cleanup is complete when:
 - confirm `docs/superpowers/plans/2026-03-20-factory-mode-analysis-ui.md` is no longer treated as authoritative for trigger logic once the March 25 cleanup plan is written
 - confirm the config UI exposes scan and PLC metadata without a trigger selector
 - confirm PLC metadata is persisted on the config record and round-trips through the config UI/service
-- run targeted tests for model, config service, config UI, and any factory-routing logic touched by the cleanup
-- search docs and tests for stale `trigger_type` references and either remove them or make any historical exceptions explicit
+- confirm whitespace-only `plc_device_key` and `plc_device_label` values persist as `NULL`, while trimmed non-empty values round-trip unchanged
+- run targeted tests for model, config service, and config UI touched by the cleanup
+- confirm tests contain zero remaining `trigger_type` references
+- if any docs still mention `trigger_type`, they must be limited to the explicitly superseded March 17 and March 20 historical design/plan files
