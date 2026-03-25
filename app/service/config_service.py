@@ -5,7 +5,6 @@ from decimal import Decimal
 
 from peewee import IntegrityError
 
-from model.base_mode import db
 from model.test_config_table import TestConfigTable
 from model.channel_config_table import ChannelConfigTable
 from model.device_table import DeviceTable
@@ -53,9 +52,8 @@ class ConfigService:
             "analysis_duration": cfg.analysis_duration,
             "analysis_window_offset_ms": cfg.analysis_window_offset_ms,
             "scan_triggers_test": bool(cfg.scan_triggers_test),
-            "trigger_type": cfg.trigger_type,
-            "plc_device_key": cfg.plc_device_key,
-            "plc_device_label": cfg.plc_device_label,
+            "plc_device_key": self._normalize_optional_text(cfg.plc_device_key),
+            "plc_device_label": self._normalize_optional_text(cfg.plc_device_label),
             "input_device_name": cfg.input_device_name,
             "input_device_hostapi": cfg.input_device_hostapi,
             "input_device_samplerate": cfg.input_device_samplerate,
@@ -100,7 +98,7 @@ class ConfigService:
         if TestConfigTable.select().where(TestConfigTable.config_name == name).exists():
             raise ValueError(f"配置名称「{name}」已存在")
         try:
-            with db.atomic():
+            with TestConfigTable._meta.database.atomic():
                 cfg = TestConfigTable.create(
                     config_name=name,
                     created_time=now_str(),
@@ -123,18 +121,17 @@ class ConfigService:
         analysis_window_offset_ms = int(data.get("analysis_window_offset_ms", 0))
 
         try:
-            with db.atomic():
+            with TestConfigTable._meta.database.atomic():
                 TestConfigTable.update(
                     config_name=data["config_name"].strip(),
                     record_duration=data["record_duration"],
                     analysis_duration=data["analysis_duration"],
                     analysis_window_offset_ms=analysis_window_offset_ms,
                     scan_triggers_test=data["scan_triggers_test"],
-                    trigger_type=data.get("trigger_type"),
-                    plc_device_key=self._clean_optional_text(
+                    plc_device_key=self._normalize_optional_text(
                         data.get("plc_device_key")
                     ),
-                    plc_device_label=self._clean_optional_text(
+                    plc_device_label=self._normalize_optional_text(
                         data.get("plc_device_label")
                     ),
                     input_device_name=data.get("input_device_name"),
@@ -171,7 +168,7 @@ class ConfigService:
         return config_id
 
     def delete_config(self, config_id: int) -> bool:
-        with db.atomic():
+        with TestConfigTable._meta.database.atomic():
             count = (
                 TestConfigTable.delete()
                 .where(TestConfigTable.config_id == config_id)
@@ -306,11 +303,6 @@ class ConfigService:
                 if window_end_ms > record_duration_ms:
                     errors.append("分析窗起始偏移加分析时长不能超过录音时长")
 
-        if data.get("trigger_type") == "plc" and not self._clean_optional_text(
-            data.get("plc_device_key")
-        ):
-            errors.append("PLC 触发必须填写 PLC 设备标识")
-
         return errors
 
     @staticmethod
@@ -324,8 +316,10 @@ class ConfigService:
             return default
 
     @staticmethod
-    def _clean_optional_text(value):
+    def _normalize_optional_text(value):
         if value is None:
             return None
-        text = str(value).strip()
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
         return text or None

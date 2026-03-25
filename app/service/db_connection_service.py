@@ -36,7 +36,6 @@ class DbConnectionService:
 
     def _migrate(self):
         columns = [
-            ("trigger_type", "TEXT DEFAULT 'manual'"),
             ("input_device_name", "TEXT"),
             ("input_device_hostapi", "TEXT"),
             ("input_device_samplerate", "REAL"),
@@ -44,8 +43,6 @@ class DbConnectionService:
             ("output_device_hostapi", "TEXT"),
             ("output_device_samplerate", "REAL"),
             ("selected_channels", "TEXT DEFAULT '[]'"),
-            ("plc_device_key", "TEXT DEFAULT NULL"),
-            ("plc_device_label", "TEXT DEFAULT NULL"),
             ("analysis_window_offset_ms", "INTEGER NOT NULL DEFAULT 0"),
         ]
         for column_name, type_spec in columns:

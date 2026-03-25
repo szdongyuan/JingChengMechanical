@@ -643,12 +643,14 @@ class FactoryModeController(QObject):
         )
 
     def _resolve_plc_config_id(self, plc_device_key: str) -> int | None:
+        normalized_plc_key = self._normalize_optional_text(plc_device_key)
+        if normalized_plc_key is None:
+            return None
         matches = [
             config_id
             for config_id, config in self._selected_configs.items()
-            if config.get("trigger_type") == "plc"
-            and config.get("plc_device_key")
-            and config.get("plc_device_key") == plc_device_key
+            if self._normalize_optional_text(config.get("plc_device_key"))
+            == normalized_plc_key
         ]
         if len(matches) == 1:
             return matches[0]
@@ -674,6 +676,13 @@ class FactoryModeController(QObject):
             or self._state.displayed_config_id is not None
             or self._state.run_phase in {"reviewing", "reanalyzing"}
         )
+
+    @staticmethod
+    def _normalize_optional_text(value: object) -> str | None:
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        return text or None
 
     def _reset_review_context(
         self,

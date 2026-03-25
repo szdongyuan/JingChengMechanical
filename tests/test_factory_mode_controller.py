@@ -145,7 +145,6 @@ def _enter_reviewing_state(
 def _make_config(
     config_id: int,
     *,
-    trigger_type: str = "button",
     plc_device_key: str | None = None,
     scan_triggers_test: bool = False,
 ):
@@ -155,7 +154,6 @@ def _make_config(
         "record_duration": 5.0,
         "analysis_duration": 2.0,
         "analysis_window_offset_ms": 0,
-        "trigger_type": trigger_type,
         "plc_device_key": plc_device_key,
         "scan_triggers_test": scan_triggers_test,
     }
@@ -722,8 +720,8 @@ def test_factory_mode_controller_manual_start_resolves_to_primary_only():
     [
         (
             (
-                _make_config(101, trigger_type="plc", plc_device_key="plc-a"),
-                _make_config(202, trigger_type="plc", plc_device_key="plc-b"),
+                _make_config(101, plc_device_key="plc-a"),
+                _make_config(202, plc_device_key="plc-b"),
             ),
             101,
             "plc-b",
@@ -731,8 +729,8 @@ def test_factory_mode_controller_manual_start_resolves_to_primary_only():
         ),
         (
             (
-                _make_config(101, trigger_type="plc", plc_device_key="plc-a"),
-                _make_config(202, trigger_type="plc", plc_device_key="plc-a"),
+                _make_config(101, plc_device_key="plc-a"),
+                _make_config(202, plc_device_key="plc-a"),
             ),
             101,
             "plc-a",
@@ -820,7 +818,6 @@ def test_factory_mode_controller_applies_deferred_same_id_plc_refresh_after_acti
     if phase == "analyzing":
         controller.handle_runtime_analyzing(_make_runtime_config_payload(config_id=101))
 
-    config_map[202]["trigger_type"] = "plc"
     config_map[202]["plc_device_key"] = "plc-b"
     bus.config_changed.emit()
 
@@ -899,8 +896,8 @@ def test_factory_mode_controller_ignores_plc_and_scan_before_armed():
     controller_mod = _load_factory_mode_controller_module()
     services = _make_services(
         (
-            _make_config(101, trigger_type="plc", plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, trigger_type="plc", plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
+            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
         )
     )
     controller = controller_mod.FactoryModeController(EventBus(), services)
@@ -921,8 +918,8 @@ def test_factory_mode_controller_logs_ignored_plc_and_scan_before_armed():
     bus.log.connect(log_messages.append)
     services = _make_services(
         (
-            _make_config(101, trigger_type="plc", plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, trigger_type="plc", plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
+            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
         )
     )
     controller = controller_mod.FactoryModeController(bus, services)
@@ -949,8 +946,8 @@ def test_factory_mode_controller_logs_and_drops_plc_and_scan_during_active_phase
     bus.log.connect(log_messages.append)
     services = _make_services(
         (
-            _make_config(101, trigger_type="plc", plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, trigger_type="plc", plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
+            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
         )
     )
     _accept_start(services)
@@ -1015,15 +1012,15 @@ def test_factory_mode_controller_logs_and_drops_plc_and_scan_during_active_phase
     [
         (
             (
-                _make_config(101, trigger_type="plc", plc_device_key="plc-a"),
-                _make_config(202, trigger_type="plc", plc_device_key="plc-b"),
+                _make_config(101, plc_device_key="plc-a"),
+                _make_config(202, plc_device_key="plc-b"),
             ),
             "plc-missing",
         ),
         (
             (
-                _make_config(101, trigger_type="button", plc_device_key="plc-a"),
-                _make_config(202, trigger_type="plc", plc_device_key=""),
+                _make_config(101),
+                _make_config(202, plc_device_key=""),
             ),
             "plc-a",
         ),
@@ -1088,8 +1085,8 @@ def test_factory_mode_controller_accepted_starts_clear_stale_review_context(star
     bus.factory_review_changed.connect(reviews.append)
     services = _make_services(
         (
-            _make_config(101, trigger_type="plc", plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, trigger_type="plc", plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
+            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
         )
     )
     controller = controller_mod.FactoryModeController(bus, services)
@@ -1141,8 +1138,8 @@ def test_factory_mode_controller_accepted_starts_preserve_review_context_until_s
     bus.factory_review_changed.connect(reviews.append)
     services = _make_services(
         (
-            _make_config(101, trigger_type="plc", plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, trigger_type="plc", plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
+            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
         )
     )
     controller = controller_mod.FactoryModeController(bus, services)
@@ -1269,8 +1266,8 @@ def test_factory_mode_controller_treats_pending_start_as_busy_until_acceptance()
     states: list[object] = []
     services = _make_services(
         (
-            _make_config(101, trigger_type="plc", plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, trigger_type="plc", plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
+            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
         )
     )
     callbacks: list[object] = []
@@ -1892,8 +1889,8 @@ def test_factory_mode_controller_blocks_new_starts_during_active_or_reanalysis_p
     controller_mod = _load_factory_mode_controller_module()
     services = _make_services(
         (
-            _make_config(101, trigger_type="plc", plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, trigger_type="plc", plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
+            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
         )
     )
     controller = controller_mod.FactoryModeController(EventBus(), services)
@@ -1934,10 +1931,10 @@ def test_factory_mode_controller_ignores_selection_changes_during_active_or_rean
     bus.factory_state_changed.connect(states.append)
     services = _make_services(
         (
-            _make_config(101, trigger_type="plc", plc_device_key="plc-a"),
-            _make_config(202, trigger_type="plc", plc_device_key="plc-b"),
-            _make_config(303, trigger_type="button"),
-            _make_config(404, trigger_type="button"),
+            _make_config(101, plc_device_key="plc-a"),
+            _make_config(202, plc_device_key="plc-b"),
+            _make_config(303),
+            _make_config(404),
         )
     )
     controller = controller_mod.FactoryModeController(bus, services)

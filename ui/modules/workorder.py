@@ -424,7 +424,7 @@ class WorkOrderModule(QWidget):
             lines.append(
                 (
                     f"Config {slot}: {self._config_name(config_id)} | "
-                    f"Trigger: {config.get('trigger_type') or '-'} | "
+                    f"Scan: {self._scan_summary(config)} | "
                     f"PLC: {self._plc_summary(config)} | "
                     f"Channels: {self._channels_summary(config)} | "
                     f"Record: {self._duration_text(config.get('record_duration'))} | "
@@ -472,6 +472,10 @@ class WorkOrderModule(QWidget):
     @staticmethod
     def _plc_summary(config: dict) -> str:
         return config.get("plc_device_label") or config.get("plc_device_key") or "-"
+
+    @staticmethod
+    def _scan_summary(config: dict) -> str:
+        return "enabled" if bool(config.get("scan_triggers_test")) else "disabled"
 
     @staticmethod
     def _channels_summary(config: dict) -> str:

@@ -130,6 +130,7 @@ def test_populate_detail_uses_main_config_analysis_offset_and_plc_fields(qapp):
     assert hasattr(module, "spin_analysis_window_offset")
     assert hasattr(module, "ed_plc_device_key")
     assert hasattr(module, "ed_plc_device_label")
+    assert not hasattr(module, "combo_trigger")
 
     module._populate_detail(
         {
@@ -139,7 +140,6 @@ def test_populate_detail_uses_main_config_analysis_offset_and_plc_fields(qapp):
             "analysis_duration": 3.0,
             "analysis_window_offset_ms": 250,
             "scan_triggers_test": False,
-            "trigger_type": "plc",
             "plc_device_key": "plc-a",
             "plc_device_label": "PLC A",
             "input_device_name": "Mic 1",
@@ -164,6 +164,7 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_fields(qapp):
     assert hasattr(module, "spin_analysis_window_offset")
     assert hasattr(module, "ed_plc_device_key")
     assert hasattr(module, "ed_plc_device_label")
+    assert not hasattr(module, "combo_trigger")
 
     module._current_config_id = 7
     module.ed_name.setText("Cfg1")
@@ -172,13 +173,30 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_fields(qapp):
     module.spin_analysis_window_offset.setValue(500)
     module.ed_plc_device_key.setText("plc-a")
     module.ed_plc_device_label.setText("PLC A")
-    module.combo_trigger.setCurrentIndex(module.combo_trigger.findData("plc"))
 
     data = module._collect_data()
 
     assert data["analysis_window_offset_ms"] == 500
     assert data["plc_device_key"] == "plc-a"
     assert data["plc_device_label"] == "PLC A"
+    assert set(data) == {
+        "config_id",
+        "config_name",
+        "record_duration",
+        "analysis_duration",
+        "analysis_window_offset_ms",
+        "scan_triggers_test",
+        "plc_device_key",
+        "plc_device_label",
+        "input_device_name",
+        "input_device_hostapi",
+        "input_device_samplerate",
+        "output_device_name",
+        "output_device_hostapi",
+        "output_device_samplerate",
+        "selected_channels",
+        "channels",
+    }
 
 
 def test_collect_ai_binding_does_not_include_analysis_window_offset(qapp):

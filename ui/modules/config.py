@@ -215,14 +215,6 @@ class ConfigModule(QWidget):
         hw_lay.setHorizontalSpacing(10)
         hw_lay.setVerticalSpacing(8)
 
-        self.combo_trigger = _NoWheelComboBox()
-        self.combo_trigger.setStyleSheet(combo_qss)
-        self.combo_trigger.addItem("（未选择）", None)
-        self.combo_trigger.addItem("手动触发", "manual")
-        self.combo_trigger.addItem("硬件触发", "hardware")
-        self.combo_trigger.addItem("PLC 触发", "plc")
-        hw_lay.addRow("触发类型", self.combo_trigger)
-
         self.ed_plc_device_key = QLineEdit()
         self.ed_plc_device_key.setPlaceholderText("例如: plc-a")
         hw_lay.addRow("PLC 设备标识", self.ed_plc_device_key)
@@ -716,13 +708,8 @@ class ConfigModule(QWidget):
         self.combo_input_dev.blockSignals(True)
 
         self._populate_devices()
-
-        trigger = data.get("trigger_type")
-        idx = self.combo_trigger.findData(trigger)
-        if idx >= 0:
-            self.combo_trigger.setCurrentIndex(idx)
-        else:
-            self.combo_trigger.setCurrentIndex(0)
+        self.ed_plc_device_key.setText(data.get("plc_device_key") or "")
+        self.ed_plc_device_label.setText(data.get("plc_device_label") or "")
 
         saved_input = data.get("input_device_name")
         saved_input_api = data.get("input_device_hostapi")
@@ -795,8 +782,6 @@ class ConfigModule(QWidget):
     # ── Data collection ─────────────────────────────────────
 
     def _collect_data(self) -> dict:
-        trigger_data = self.combo_trigger.currentData()
-
         input_dev = self.combo_input_dev.currentData()
         output_dev = self.combo_output_dev.currentData()
 
@@ -811,7 +796,6 @@ class ConfigModule(QWidget):
             "analysis_duration": self.spin_analysis.value(),
             "analysis_window_offset_ms": self.spin_analysis_window_offset.value(),
             "scan_triggers_test": self.chk_scan.isChecked(),
-            "trigger_type": trigger_data if trigger_data else None,
             "plc_device_key": self.ed_plc_device_key.text(),
             "plc_device_label": self.ed_plc_device_label.text(),
             "input_device_name": input_dev.get("name") if isinstance(input_dev, dict) else None,
@@ -896,8 +880,6 @@ class ConfigModule(QWidget):
             data.get("analysis_window_offset_ms", 0)
         )
         self.chk_scan.setChecked(data["scan_triggers_test"])
-        self.ed_plc_device_key.setText(data.get("plc_device_key") or "")
-        self.ed_plc_device_label.setText(data.get("plc_device_label") or "")
 
         self._populate_hardware_card(data)
 

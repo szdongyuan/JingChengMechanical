@@ -44,11 +44,10 @@ def test_create_config_no_channel_rows():
     assert ChannelConfigTable.select().where(ChannelConfigTable.config == config_id).count() == 0
 
 
-def test_load_config_returns_hardware_fields():
+def test_load_config_returns_hardware_fields_with_cleaned_trigger_model():
     svc = _service()
     cfg = ConfigTable.create(
         config_name="Cfg1",
-        trigger_type="hardware",
         input_device_name="Mic 1",
         input_device_hostapi="ASIO",
         input_device_samplerate=48000,
@@ -60,7 +59,24 @@ def test_load_config_returns_hardware_fields():
 
     result = svc.load_config(cfg.config_id)
 
-    assert result["trigger_type"] == "hardware"
+    assert set(result) == {
+        "config_id",
+        "config_name",
+        "record_duration",
+        "analysis_duration",
+        "analysis_window_offset_ms",
+        "scan_triggers_test",
+        "plc_device_key",
+        "plc_device_label",
+        "input_device_name",
+        "input_device_hostapi",
+        "input_device_samplerate",
+        "output_device_name",
+        "output_device_hostapi",
+        "output_device_samplerate",
+        "selected_channels",
+        "channels",
+    }
     assert result["input_device_name"] == "Mic 1"
     assert result["input_device_hostapi"] == "ASIO"
     assert result["input_device_samplerate"] == 48000
@@ -74,14 +90,31 @@ def test_load_config_returns_plc_binding_and_analysis_offset_fields():
     svc = _service()
     cfg = ConfigTable.create(
         config_name="Cfg1",
-        trigger_type="plc",
-        plc_device_key="plc-a",
-        plc_device_label="PLC A",
+        plc_device_key="  plc-a  ",
+        plc_device_label="  PLC A  ",
         analysis_window_offset_ms=250,
     )
 
     result = svc.load_config(cfg.config_id)
 
+    assert set(result) == {
+        "config_id",
+        "config_name",
+        "record_duration",
+        "analysis_duration",
+        "analysis_window_offset_ms",
+        "scan_triggers_test",
+        "plc_device_key",
+        "plc_device_label",
+        "input_device_name",
+        "input_device_hostapi",
+        "input_device_samplerate",
+        "output_device_name",
+        "output_device_hostapi",
+        "output_device_samplerate",
+        "selected_channels",
+        "channels",
+    }
     assert result["plc_device_key"] == "plc-a"
     assert result["plc_device_label"] == "PLC A"
     assert result["analysis_window_offset_ms"] == 250
@@ -98,7 +131,6 @@ def test_save_config_persists_hardware_fields():
             "record_duration": 5.0,
             "analysis_duration": 3.0,
             "scan_triggers_test": False,
-            "trigger_type": "hardware",
             "input_device_name": "Mic 1",
             "input_device_hostapi": "ASIO",
             "input_device_samplerate": 48000,
@@ -112,7 +144,24 @@ def test_save_config_persists_hardware_fields():
 
     loaded = svc.load_config(config_id)
 
-    assert loaded["trigger_type"] == "hardware"
+    assert set(loaded) == {
+        "config_id",
+        "config_name",
+        "record_duration",
+        "analysis_duration",
+        "analysis_window_offset_ms",
+        "scan_triggers_test",
+        "plc_device_key",
+        "plc_device_label",
+        "input_device_name",
+        "input_device_hostapi",
+        "input_device_samplerate",
+        "output_device_name",
+        "output_device_hostapi",
+        "output_device_samplerate",
+        "selected_channels",
+        "channels",
+    }
     assert loaded["input_device_name"] == "Mic 1"
     assert loaded["input_device_hostapi"] == "ASIO"
     assert loaded["input_device_samplerate"] == 48000
@@ -134,9 +183,8 @@ def test_save_config_persists_analysis_window_offset_ms_and_plc_fields():
             "analysis_duration": 3.0,
             "analysis_window_offset_ms": 500,
             "scan_triggers_test": False,
-            "trigger_type": "plc",
-            "plc_device_key": "plc-a",
-            "plc_device_label": "PLC A",
+            "plc_device_key": "  plc-a  ",
+            "plc_device_label": "  PLC A  ",
             "input_device_name": "Mic 1",
             "input_device_hostapi": "ASIO",
             "input_device_samplerate": 48000,
@@ -149,10 +197,41 @@ def test_save_config_persists_analysis_window_offset_ms_and_plc_fields():
     )
 
     loaded = svc.load_config(config_id)
+    saved_row = ConfigTable.get_by_id(config_id)
 
     assert loaded["analysis_window_offset_ms"] == 500
     assert loaded["plc_device_key"] == "plc-a"
     assert loaded["plc_device_label"] == "PLC A"
+    assert saved_row.plc_device_key == "plc-a"
+    assert saved_row.plc_device_label == "PLC A"
+
+
+def test_save_config_blank_plc_metadata_persists_none():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+
+    svc.save_config(
+        {
+            "config_id": config_id,
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "analysis_window_offset_ms": 500,
+            "scan_triggers_test": False,
+            "plc_device_key": "   ",
+            "plc_device_label": "\t",
+            "selected_channels": [0],
+            "channels": [_channel_payload(0)],
+        }
+    )
+
+    loaded = svc.load_config(config_id)
+    saved_row = ConfigTable.get_by_id(config_id)
+
+    assert loaded["plc_device_key"] is None
+    assert loaded["plc_device_label"] is None
+    assert saved_row.plc_device_key is None
+    assert saved_row.plc_device_label is None
 
 
 def test_save_config_keeps_existing_ai_binding_row_while_offset_stays_config_owned():
@@ -173,7 +252,6 @@ def test_save_config_keeps_existing_ai_binding_row_while_offset_stays_config_own
             "analysis_duration": 3.0,
             "analysis_window_offset_ms": 500,
             "scan_triggers_test": False,
-            "trigger_type": "plc",
             "plc_device_key": "plc-a",
             "plc_device_label": "PLC A",
             "input_device_name": "Mic 1",
@@ -253,7 +331,6 @@ def test_validate_factory_runtime_rejects_analysis_window_offset_plus_duration_b
             "record_duration": 5.0,
             "analysis_duration": 3.0,
             "analysis_window_offset_ms": 2500,
-            "trigger_type": "manual",
         }
     )
 
@@ -268,14 +345,13 @@ def test_validate_factory_runtime_allows_exact_fit_analysis_window_boundary():
             "record_duration": 0.3,
             "analysis_duration": 0.1,
             "analysis_window_offset_ms": 200,
-            "trigger_type": "manual",
         }
     )
 
     assert errors == []
 
 
-def test_validate_factory_runtime_requires_plc_device_key_for_plc_trigger():
+def test_validate_factory_runtime_does_not_require_plc_device_key_when_unbound():
     svc = _service()
 
     errors = svc.validate_factory_runtime(
@@ -283,9 +359,8 @@ def test_validate_factory_runtime_requires_plc_device_key_for_plc_trigger():
             "record_duration": 5.0,
             "analysis_duration": 3.0,
             "analysis_window_offset_ms": 0,
-            "trigger_type": "plc",
             "plc_device_key": "",
         }
     )
 
-    assert any("PLC" in err for err in errors)
+    assert errors == []

@@ -132,11 +132,12 @@ def _make_config(
     config_id: int,
     config_name: str,
     *,
-    trigger_type: str,
     plc_device_label: str | None,
     selected_channels: list[int],
     record_duration: float,
     analysis_duration: float,
+    plc_device_key: str | None = None,
+    scan_triggers_test: bool = False,
 ):
     return {
         "config_id": config_id,
@@ -144,9 +145,10 @@ def _make_config(
         "record_duration": record_duration,
         "analysis_duration": analysis_duration,
         "analysis_window_offset_ms": 0,
-        "scan_triggers_test": False,
-        "trigger_type": trigger_type,
-        "plc_device_key": f"plc-{config_id}" if plc_device_label else None,
+        "scan_triggers_test": scan_triggers_test,
+        "plc_device_key": plc_device_key if plc_device_key is not None else (
+            f"plc-{config_id}" if plc_device_label else None
+        ),
         "plc_device_label": plc_device_label,
         "selected_channels": selected_channels,
         "channels": [],
@@ -168,7 +170,6 @@ def _make_module(
                 _make_config(
                     101,
                     "Config Alpha",
-                    trigger_type="plc",
                     plc_device_label="PLC A",
                     selected_channels=[0, 1],
                     record_duration=5.0,
@@ -177,7 +178,6 @@ def _make_module(
                 _make_config(
                     202,
                     "Config Beta",
-                    trigger_type="button",
                     plc_device_label=None,
                     selected_channels=[1],
                     record_duration=6.0,
@@ -186,11 +186,11 @@ def _make_module(
                 _make_config(
                     303,
                     "Config Gamma",
-                    trigger_type="scan",
                     plc_device_label=None,
                     selected_channels=[0],
                     record_duration=7.0,
                     analysis_duration=3.0,
+                    scan_triggers_test=True,
                 ),
             ],
             runtime_errors_by_id=runtime_errors_by_id,
@@ -212,7 +212,6 @@ def _make_module_with_real_factory_controller(
             _make_config(
                 101,
                 "Config Alpha",
-                trigger_type="plc",
                 plc_device_label="PLC A",
                 selected_channels=[0, 1],
                 record_duration=5.0,
@@ -221,7 +220,6 @@ def _make_module_with_real_factory_controller(
             _make_config(
                 202,
                 "Config Beta",
-                trigger_type="button",
                 plc_device_label=None,
                 selected_channels=[1],
                 record_duration=6.0,
@@ -340,6 +338,8 @@ def test_phase_trigger_summary_text_is_visible(qapp):
     assert "plc" in module.lbl_trigger_summary.text().lower()
     assert "Config Alpha" in module.lbl_factory_summary.text()
     assert "PLC A" in module.lbl_factory_summary.text()
+    assert "Trigger:" not in module.lbl_factory_summary.text()
+    assert "Scan:" in module.lbl_factory_summary.text()
     assert "5.0s" in module.lbl_factory_summary.text()
 
 
@@ -538,7 +538,6 @@ def test_same_id_config_refresh_reloads_controller_plc_metadata_in_reviewing(qap
 
     services.config_service.update_config(
         202,
-        trigger_type="plc",
         plc_device_key="plc-b",
         plc_device_label="PLC B",
     )
