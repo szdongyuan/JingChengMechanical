@@ -14,6 +14,7 @@ from PyQt6.QtCore import QObject
 
 from app.service.analysis.audio_monitor import AudioMonitor
 from app.service.analysis.audio_recorder import AudioRecorder
+from app.service.analysis.review_payloads import build_chart_payload, build_summary_payload
 from app.service.analysis.test_session import TestSession
 from consts.running_consts import base_dir
 
@@ -347,6 +348,10 @@ class TestManager(QObject):
             result_dict = self._serialize_result(result)
         except Exception as exc:
             payload = self._emit_no_result(config_id, exc, context="rejudge")
+            summary_payload = self._build_summary_payload_for_error(
+                session,
+                error_message=payload["error_summary"],
+            )
             self._emit_optional_signal(
                 "factory_runtime_reanalysis_completed",
                 self._make_factory_review_payload(
@@ -354,10 +359,19 @@ class TestManager(QObject):
                     session,
                     no_result=True,
                     error_message=payload["error_summary"],
+                    summary_payload=summary_payload,
                 ),
             )
             return
 
+        summary_payload = self._build_summary_payload(
+            session,
+            judgment_payload=result_dict,
+        )
+        chart_payload = self._build_chart_payload(
+            session,
+            analysis_window=result_dict.get("analysis_window"),
+        )
         self._bus.test_finished.emit(config_id, result_dict)
         self._bus.result_changed.emit(result_dict)
         self._emit_optional_signal(
@@ -366,6 +380,8 @@ class TestManager(QObject):
                 config_id,
                 session,
                 judgment_payload=result_dict,
+                summary_payload=summary_payload,
+                chart_payload=chart_payload,
             ),
         )
 
@@ -418,6 +434,10 @@ class TestManager(QObject):
                 if self._is_factory_no_result_error(analysis_error)
                 else "factory_runtime_auto_analysis_error"
             )
+            summary_payload = self._build_summary_payload_for_error(
+                session,
+                error_message=payload["error_summary"],
+            )
             self._emit_optional_signal(
                 signal_name,
                 self._make_factory_review_payload(
@@ -425,9 +445,18 @@ class TestManager(QObject):
                     session,
                     no_result=True,
                     error_message=payload["error_summary"],
+                    summary_payload=summary_payload,
                 ),
             )
         else:
+            summary_payload = self._build_summary_payload(
+                session,
+                judgment_payload=result_dict,
+            )
+            chart_payload = self._build_chart_payload(
+                session,
+                analysis_window=result_dict.get("analysis_window"),
+            )
             self._bus.test_finished.emit(config_id, result_dict)
             self._bus.result_changed.emit(result_dict)
             self._bus.log.emit(
@@ -439,6 +468,8 @@ class TestManager(QObject):
                     config_id,
                     session,
                     judgment_payload=result_dict,
+                    summary_payload=summary_payload,
+                    chart_payload=chart_payload,
                 ),
             )
         self._bus.status.emit("Idle")
@@ -562,6 +593,8 @@ class TestManager(QObject):
         session,
         *,
         judgment_payload: dict | None = None,
+        summary_payload: dict | None = None,
+        chart_payload: dict | None = None,
         no_result: bool = False,
         error_message: str | None = None,
     ):
@@ -609,6 +642,44 @@ class TestManager(QObject):
             no_result=no_result,
             error_message=error_message,
             judgment_payload=judgment_payload,
+            summary_payload=summary_payload,
+            chart_payload=chart_payload,
+        )
+
+    @staticmethod
+    def _session_config(session) -> dict:
+        config = getattr(session, "_config", None)
+        if isinstance(config, dict):
+            return config
+        return {}
+
+    def _build_summary_payload(self, session, *, judgment_payload: dict) -> dict:
+        return build_summary_payload(
+            config=self._session_config(session),
+            judgment_payload=judgment_payload,
+            ai_review=getattr(session, "last_ai_review", None),
+            error_message=None,
+        )
+
+    def _build_summary_payload_for_error(self, session, *, error_message: str) -> dict:
+        return build_summary_payload(
+            config=self._session_config(session),
+            judgment_payload=None,
+            ai_review=None,
+            error_message=error_message,
+        )
+
+    @staticmethod
+    def _build_chart_payload(session, *, analysis_window) -> dict | None:
+        mic_cal = getattr(session, "_mic_cal", None)
+        if not isinstance(mic_cal, dict):
+            mic_cal = {}
+        return build_chart_payload(
+            buffer=getattr(session, "_buffer", None),
+            config=TestManager._session_config(session),
+            sample_rate=float(getattr(session, "_sample_rate", 0) or 0),
+            mic_cal=mic_cal,
+            analysis_window=analysis_window,
         )
 
     @staticmethod

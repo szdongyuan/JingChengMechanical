@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
+
+from app.service.analysis import dsp
+from app.service.analysis.judgment import _runtime_channel_defaults
+
 _SUMMARY_ROW_DEFS = (
     ("spl", "SPL"),
     ("fft", "FFT"),
@@ -10,6 +15,8 @@ _SUMMARY_ROW_DEFS = (
 )
 _NO_RESULT_FALLBACK_MESSAGE = "分析结果不可用"
 _NO_RESULT_STATUS = "无结果"
+_REF_PRESSURE = 20e-6
+_SPL_CHUNK_DURATION_SEC = 0.05
 
 
 def canonical_channel_label(channel_index: int | None) -> str:
@@ -77,6 +84,47 @@ def build_summary_payload(
         ),
         "rows": rows,
     }
+
+
+def build_chart_payload(
+    *,
+    buffer: np.ndarray | None,
+    config: dict,
+    sample_rate: float,
+    mic_cal: dict,
+    analysis_window: tuple[float, float] | list[float] | None,
+) -> dict[int, dict]:
+    if not isinstance(buffer, np.ndarray) or buffer.size <= 0:
+        return {}
+
+    try:
+        sample_rate = float(sample_rate)
+    except (TypeError, ValueError):
+        return {}
+    if sample_rate <= 0:
+        return {}
+
+    window = _slice_analysis_window(buffer, sample_rate, analysis_window)
+    if window.size <= 0:
+        return {}
+
+    payload: dict[int, dict] = {}
+    for channel_index in _selected_chart_channels(config, buffer):
+        signal = _extract_channel(window, channel_index)
+        if signal is None or signal.size <= 0:
+            continue
+        channel_config = _runtime_channel_config(config, channel_index)
+        calibrated = _apply_mic_calibration(signal, mic_cal, channel_index)
+        payload[channel_index] = {
+            "spl": _build_spl_chart(signal=calibrated, sample_rate=sample_rate, channel_config=channel_config),
+            "fft": _build_fft_chart(signal=calibrated, sample_rate=sample_rate, channel_config=channel_config),
+            "octave": _build_octave_chart(
+                signal=calibrated,
+                sample_rate=sample_rate,
+                channel_config=channel_config,
+            ),
+        }
+    return payload
 
 
 def _selected_channels(config: dict, judgment_payload: dict) -> tuple[int, ...]:
@@ -392,7 +440,7 @@ def _normalize_ai_channel_index(
 def _coerce_number(value) -> float | None:
     if isinstance(value, bool):
         return None
-    if isinstance(value, (int, float)):
+    if isinstance(value, (int, float, np.integer, np.floating)):
         if math.isfinite(value):
             return float(value)
         return None
@@ -423,4 +471,201 @@ def _normalize_error_message(*messages) -> str:
     return _NO_RESULT_FALLBACK_MESSAGE
 
 
-__all__ = ["build_summary_payload", "canonical_channel_label"]
+def _slice_analysis_window(
+    buffer: np.ndarray,
+    sample_rate: float,
+    analysis_window: tuple[float, float] | list[float] | None,
+) -> np.ndarray:
+    total_samples = int(buffer.shape[0])
+    if (
+        not isinstance(analysis_window, (list, tuple))
+        or len(analysis_window) != 2
+    ):
+        return buffer
+    try:
+        start_sec = float(analysis_window[0])
+        end_sec = float(analysis_window[1])
+    except (TypeError, ValueError):
+        return buffer
+    start_idx = max(0, min(total_samples, int(start_sec * sample_rate)))
+    end_idx = max(start_idx, min(total_samples, int(end_sec * sample_rate)))
+    return buffer[start_idx:end_idx]
+
+
+def _selected_chart_channels(config: dict, buffer: np.ndarray) -> tuple[int, ...]:
+    selected = tuple(
+        channel_index
+        for channel_index in config.get("selected_channels", [])
+        if isinstance(channel_index, int)
+        and not isinstance(channel_index, bool)
+        and channel_index >= 0
+    )
+    if selected:
+        return selected
+    if buffer.ndim == 1:
+        return (0,)
+    return tuple(range(int(buffer.shape[1])))
+
+
+def _runtime_channel_config(config: dict, channel_index: int) -> dict:
+    channel_configs = _channel_config_by_index(config)
+    if channel_index in channel_configs:
+        return channel_configs[channel_index]
+    return _runtime_channel_defaults(channel_index)
+
+
+def _extract_channel(buffer: np.ndarray, channel_index: int) -> np.ndarray | None:
+    if buffer.ndim == 1:
+        return np.asarray(buffer, dtype=np.float64)
+    if channel_index < 0 or channel_index >= buffer.shape[1]:
+        return None
+    return np.asarray(buffer[:, channel_index], dtype=np.float64)
+
+
+def _apply_mic_calibration(signal: np.ndarray, mic_cal: dict, channel_index: int) -> np.ndarray:
+    if not isinstance(mic_cal, dict):
+        return dsp.apply_mic_calibration(signal, 0.0)
+    entry = mic_cal.get(f"In{channel_index + 1}", {})
+    raw = entry.get("deviation_value", "0")
+    try:
+        sensitivity = float(raw)
+    except (TypeError, ValueError):
+        sensitivity = 0.0
+    return dsp.apply_mic_calibration(signal, sensitivity)
+
+
+def _build_spl_chart(*, signal: np.ndarray, sample_rate: float, channel_config: dict) -> dict:
+    chunk_samples = max(1, int(round(sample_rate * _SPL_CHUNK_DURATION_SEC)))
+    times_sec: list[float] = []
+    values_db: list[float] = []
+    weighting = str(channel_config.get("spl_weighting", "Z") or "Z")
+    try:
+        time_constant = float(channel_config.get("spl_time_constant", 0.125) or 0.125)
+    except (TypeError, ValueError):
+        time_constant = 0.125
+
+    for start in range(0, int(signal.size), chunk_samples):
+        chunk = signal[start : start + chunk_samples]
+        if chunk.size <= 0:
+            continue
+        value = _normalize_chart_number(
+            dsp.compute_spl(chunk, sample_rate, weighting, time_constant)
+        )
+        if value is None:
+            continue
+        end_time = _normalize_chart_number((start + chunk.size) / sample_rate)
+        if end_time is None:
+            continue
+        times_sec.append(end_time)
+        values_db.append(value)
+
+    return {
+        "times_sec": times_sec,
+        "values_db": values_db,
+        "lower_limit_db": _normalize_chart_number(channel_config.get("spl_lower_limit")),
+        "upper_limit_db": _normalize_chart_number(channel_config.get("spl_upper_limit")),
+    }
+
+
+def _build_fft_chart(*, signal: np.ndarray, sample_rate: float, channel_config: dict) -> dict:
+    try:
+        nfft = int(channel_config.get("stft_nfft", 1024) or 1024)
+    except (TypeError, ValueError):
+        nfft = 1024
+    frequencies_hz, magnitudes_db = dsp.compute_fft_spectrum(signal, sample_rate, nfft)
+    levels_db = _absolute_levels_db(magnitudes_db)
+    return {
+        "frequencies_hz": _normalize_chart_list(frequencies_hz),
+        "levels_db": _normalize_chart_list(levels_db),
+        "limit_bands": _build_limit_band_payloads(
+            frequencies=frequencies_hz,
+            levels_db=levels_db,
+            configured_bands=channel_config.get("fft_band_limits", []),
+        ),
+    }
+
+
+def _build_octave_chart(*, signal: np.ndarray, sample_rate: float, channel_config: dict) -> dict:
+    weighting = str(channel_config.get("oct_weighting", "Z") or "Z")
+    center_freqs_hz, levels_db = dsp.compute_octave_bands(signal, sample_rate, weighting)
+    absolute_levels_db = _absolute_levels_db(levels_db)
+    return {
+        "center_freqs_hz": _normalize_chart_list(center_freqs_hz),
+        "levels_db": _normalize_chart_list(absolute_levels_db),
+        "limit_bands": _build_limit_band_payloads(
+            frequencies=center_freqs_hz,
+            levels_db=absolute_levels_db,
+            configured_bands=channel_config.get("oct_band_limits", []),
+        ),
+    }
+
+
+def _absolute_levels_db(levels_db: np.ndarray | list[float]) -> np.ndarray:
+    levels = np.asarray(levels_db, dtype=np.float64)
+    return levels - 20.0 * math.log10(_REF_PRESSURE)
+
+
+def _build_limit_band_payloads(
+    *,
+    frequencies: np.ndarray | list[float],
+    levels_db: np.ndarray | list[float],
+    configured_bands,
+) -> list[dict]:
+    frequency_axis = np.asarray(frequencies, dtype=np.float64)
+    level_axis = np.asarray(levels_db, dtype=np.float64)
+    if frequency_axis.size == 0 or level_axis.size == 0:
+        return []
+
+    payload: list[dict] = []
+    for band in configured_bands or []:
+        if not isinstance(band, dict):
+            continue
+        target_freq = _coerce_number(band.get("freq"))
+        if target_freq is None:
+            continue
+        idx = int(np.argmin(np.abs(frequency_axis - target_freq)))
+        actual_db = _normalize_chart_number(level_axis[idx])
+        lower_db = _normalize_chart_number(band.get("lower"))
+        upper_db = _normalize_chart_number(band.get("upper"))
+        if actual_db is None:
+            continue
+        payload.append(
+            {
+                "freq_hz": _normalize_chart_number(frequency_axis[idx]),
+                "lower_db": lower_db,
+                "upper_db": upper_db,
+                "actual_db": actual_db,
+                "passed": _passes_limit(actual_db, lower_db, upper_db),
+            }
+        )
+    return payload
+
+
+def _passes_limit(actual_db: float, lower_db: float | None, upper_db: float | None) -> bool:
+    if lower_db is not None and actual_db < lower_db:
+        return False
+    if upper_db is not None and actual_db > upper_db:
+        return False
+    return True
+
+
+def _normalize_chart_list(values: np.ndarray | list[float]) -> list[float]:
+    normalized: list[float] = []
+    for value in values:
+        normalized_value = _normalize_chart_number(value)
+        if normalized_value is not None:
+            normalized.append(normalized_value)
+    return normalized
+
+
+def _normalize_chart_number(value) -> float | None:
+    normalized = _coerce_number(value)
+    if normalized is None:
+        return None
+    normalized = round(normalized, 6)
+    if abs(normalized) < 1e-9:
+        return 0.0
+    return normalized
+
+
+__all__ = ["build_chart_payload", "build_summary_payload", "canonical_channel_label"]

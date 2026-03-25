@@ -52,6 +52,7 @@ class TestSession:
         self._buffer: np.ndarray | None = None
         self._judgment: JudgmentEngine = JudgmentEngine(ai_service)
         self._last_result: JudgmentResult | None = None
+        self._last_ai_review: dict[str, Any] | None = None
         self._audio_file_path: str | None = None
         self._audio_data_id: str | None = None
         self._test_run_id: str | None = None
@@ -146,6 +147,7 @@ class TestSession:
 
     def _run_judgment(self) -> JudgmentResult:
         """Run judgment on the recorded buffer."""
+        self._last_ai_review = None
         if self._buffer is None:
             return JudgmentResult(
                 overall="不合格",
@@ -172,12 +174,36 @@ class TestSession:
         try:
             binding = self._ai_service.resolve_binding(self.config_id)
         except Exception as exc:
+            self._last_ai_review = self._make_ai_review(
+                status="binding_error",
+                threshold=None,
+                score=None,
+                channel_index=None,
+                error_message=str(exc),
+            )
             self._bus.log.emit(
                 f"[TestSession] WARNING: failed to resolve AI binding for config={self.config_id}: {exc}"
             )
             return result
 
-        if not binding or not binding.get("enabled"):
+        if not binding:
+            self._last_ai_review = self._make_ai_review(
+                status="not_configured",
+                threshold=None,
+                score=None,
+                channel_index=None,
+                error_message=None,
+            )
+            return result
+
+        if not binding.get("enabled"):
+            self._last_ai_review = self._make_ai_review(
+                status="disabled",
+                threshold=self._coerce_ai_score(binding.get("score_threshold")),
+                score=None,
+                channel_index=None,
+                error_message=None,
+            )
             return result
 
         analysis_start, analysis_end = result.analysis_window
@@ -200,6 +226,7 @@ class TestSession:
         }
         ai_runs_dir = os.path.abspath(os.path.join(self._audio_dir, "..", "ai_runs"))
         test_run_id = self._get_or_create_test_run_id()
+        score_threshold = self._coerce_ai_score(binding.get("score_threshold"))
         effective_final_window_duration_ms = final_window_duration_ms or default_window_duration_ms
         window_info = {
             "window_overridden": (
@@ -222,13 +249,31 @@ class TestSession:
                 window_info=window_info,
             )
         except Exception as exc:
+            self._last_ai_review = self._make_ai_review(
+                status="error",
+                threshold=score_threshold,
+                score=None,
+                channel_index=None,
+                error_message=str(exc),
+            )
             self._bus.log.emit(
                 f"[TestSession] WARNING: AI analysis failed for config={self.config_id}: {exc}"
             )
             return result
 
-        module_status = envelope.get("module_status")
+        module_status = str(envelope.get("module_status") or "").strip().lower()
+        channel_index = self._coerce_ai_channel_index(envelope.get("channel_index"))
         if module_status != "success":
+            self._last_ai_review = self._make_ai_review(
+                status=module_status or "error",
+                threshold=score_threshold,
+                score=self._coerce_ai_score(envelope.get("score")),
+                channel_index=channel_index,
+                error_message=self._normalize_ai_error(
+                    envelope.get("error_summary"),
+                    fallback="AI analysis failed",
+                ),
+            )
             self._bus.log.emit(
                 f"[TestSession] WARNING: AI analysis did not succeed for config={self.config_id}: "
                 f"module_status={module_status} ai_label={envelope.get('ai_label')} "
@@ -236,13 +281,8 @@ class TestSession:
             )
             return result
 
-        score = envelope.get("score")
+        score = self._coerce_ai_score(envelope.get("score"))
         ai_label = envelope.get("ai_label")
-        score_threshold = binding.get("score_threshold")
-
-        # Guard: treat NaN/inf score as "no score"
-        if score is not None and (math.isnan(score) or math.isinf(score)):
-            score = None
 
         # Primary: score + threshold
         ai_pass = None
@@ -255,6 +295,23 @@ class TestSession:
                 ai_pass = True
             elif label == "FAIL":
                 ai_pass = False
+
+        ai_review_status = "success"
+        ai_review_error = None
+        if score is None and (score_threshold is not None or ai_pass is None):
+            ai_review_status = "missing_score"
+            ai_review_error = self._normalize_ai_error(
+                envelope.get("error_summary"),
+                fallback="AI score unavailable",
+            )
+
+        self._last_ai_review = self._make_ai_review(
+            status=ai_review_status,
+            threshold=score_threshold,
+            score=score,
+            channel_index=channel_index,
+            error_message=ai_review_error,
+        )
 
         result.ai_pass = ai_pass
         result.ai_score = score
@@ -288,6 +345,7 @@ class TestSession:
         """Re-run judgment on a user-selected window."""
         if self._buffer is None or self._audio_file_path is None:
             return None
+        self._last_ai_review = None
         result = self._judgment.rejudge(
             self._config,
             self._buffer,
@@ -331,5 +389,50 @@ class TestSession:
         return self._last_result
 
     @property
+    def last_ai_review(self) -> dict[str, Any] | None:
+        return self._last_ai_review
+
+    @property
     def buffer(self) -> np.ndarray | None:
         return self._buffer
+
+    @staticmethod
+    def _coerce_ai_score(value) -> float | None:
+        if isinstance(value, bool):
+            return None
+        if isinstance(value, (int, float)):
+            if math.isfinite(value):
+                return float(value)
+            return None
+        return None
+
+    @staticmethod
+    def _coerce_ai_channel_index(value) -> int | None:
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        return None
+
+    @staticmethod
+    def _normalize_ai_error(message, *, fallback: str | None = None) -> str | None:
+        if isinstance(message, str):
+            normalized = message.strip()
+            if normalized:
+                return normalized
+        return fallback
+
+    @staticmethod
+    def _make_ai_review(
+        *,
+        status: str,
+        threshold: float | None,
+        score: float | None,
+        channel_index: int | None,
+        error_message: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "status": status,
+            "threshold": threshold,
+            "score": score,
+            "channel_index": channel_index,
+            "error_message": error_message,
+        }

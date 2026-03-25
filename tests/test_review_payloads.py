@@ -1,6 +1,9 @@
+import math
+
+import numpy as np
 import pytest
 
-from app.service.analysis.review_payloads import build_summary_payload
+from app.service.analysis.review_payloads import build_chart_payload, build_summary_payload
 
 
 def _make_config(*, fft_limits=True, octave_limits=True):
@@ -249,3 +252,78 @@ def test_build_summary_payload_renders_four_no_result_rows_for_full_no_result():
     assert all(row["status"] == "无结果" for row in summary["rows"])
     assert all(row["deviation_display"] == "--" for row in summary["rows"])
     assert all(row["channel_label"] == "--" for row in summary["rows"])
+
+
+def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch):
+    ref_db = 20.0 * math.log10(20e-6)
+
+    def fake_compute_spl(signal, sample_rate, weighting, time_constant):
+        return float(np.mean(signal) * 10.0)
+
+    def fake_compute_fft_spectrum(signal, sample_rate, nfft):
+        if float(signal[0]) < 0.15:
+            levels_db = np.array([67.0, 45.0], dtype=np.float64) + ref_db
+        else:
+            levels_db = np.array([58.0, 49.0], dtype=np.float64) + ref_db
+        return np.array([1000.0, 2000.0], dtype=np.float64), levels_db
+
+    def fake_compute_octave_bands(signal, sample_rate, weighting):
+        if float(signal[0]) < 0.15:
+            levels_db = np.array([57.0, 43.0], dtype=np.float64) + ref_db
+        else:
+            levels_db = np.array([53.0, 50.0], dtype=np.float64) + ref_db
+        return np.array([500.0, 1000.0], dtype=np.float64), levels_db
+
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_spl",
+        fake_compute_spl,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
+        fake_compute_fft_spectrum,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_octave_bands",
+        fake_compute_octave_bands,
+    )
+
+    buffer = np.column_stack(
+        [
+            np.full(200, 0.1, dtype=np.float32),
+            np.full(200, 0.2, dtype=np.float32),
+        ]
+    )
+
+    payload = build_chart_payload(
+        buffer=buffer,
+        config=_make_config(),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.5, 1.5),
+    )
+
+    assert sorted(payload) == [0, 1]
+    assert set(payload[0]) == {"spl", "fft", "octave"}
+    assert "stft" not in payload[0]
+    assert payload[0]["spl"]["times_sec"]
+    assert payload[0]["spl"]["values_db"]
+    assert payload[0]["spl"]["lower_limit_db"] == 40.0
+    assert payload[0]["spl"]["upper_limit_db"] == 80.0
+    assert payload[0]["fft"]["frequencies_hz"] == [1000.0, 2000.0]
+    assert payload[0]["fft"]["levels_db"] == [67.0, 45.0]
+    assert payload[0]["fft"]["limit_bands"][0] == {
+        "freq_hz": 1000.0,
+        "lower_db": 40.0,
+        "upper_db": 60.0,
+        "actual_db": 67.0,
+        "passed": False,
+    }
+    assert payload[0]["octave"]["center_freqs_hz"] == [500.0, 1000.0]
+    assert payload[0]["octave"]["levels_db"] == [57.0, 43.0]
+    assert payload[0]["octave"]["limit_bands"][0] == {
+        "freq_hz": 500.0,
+        "lower_db": 35.0,
+        "upper_db": 55.0,
+        "actual_db": 57.0,
+        "passed": False,
+    }
