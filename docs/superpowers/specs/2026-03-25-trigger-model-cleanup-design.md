@@ -53,7 +53,7 @@ After this cleanup, trigger behavior is defined by explicit fields and page stat
 
 - Manual start: always starts the selected `manual_primary_config_id`
 - Scan eligibility: only depends on `scan_triggers_test == True`
-- PLC eligibility: only depends on the config having a non-empty `plc_device_key` after trimming surrounding whitespace
+- PLC eligibility: only depends on the stored normalized `plc_device_key` being non-`NULL`
 
 `plc_device_label` is display-only metadata and does not affect eligibility.
 
@@ -66,7 +66,7 @@ This cleanup separates config eligibility from runtime routing.
 Config fields determine whether a config is eligible for a given non-manual trigger source:
 
 - `scan_triggers_test` determines scan eligibility
-- `plc_device_key.strip()` determines PLC eligibility
+- stored normalized `plc_device_key` determines PLC eligibility
 
 Runtime routing remains a controller concern. Future factory-mode routing must still evaluate:
 
@@ -126,7 +126,7 @@ This cleanup also requires `ConfigService` to load and save normalized PLC metad
 Capability checks are explicit field reads, not validation errors:
 
 - scan capability is `scan_triggers_test == True`
-- PLC capability is `plc_device_key.strip() != ""`
+- PLC capability is `plc_device_key is not None`
 
 The future factory-mode controller remains the owner of:
 
@@ -174,7 +174,7 @@ For this cleanup, "remove `trigger_type` from schema" means:
 - stop adding it in startup migration code
 - stop reading and writing it anywhere in application code
 
-Because this is a new project, this cleanup does not require compatibility work for pre-cleanup local databases. The supported schema after this change is defined by the updated model code and the minimal startup schema setup needed for the new PLC metadata fields. No backfill logic is required.
+Because this is a new project, this cleanup does not require compatibility work for pre-cleanup local databases. The supported schema after this change is defined by the updated model code on a fresh database. No backfill logic is required.
 
 That means:
 
@@ -218,6 +218,7 @@ This cleanup is complete when:
 - confirm the config UI exposes scan and PLC metadata without a trigger selector
 - confirm PLC metadata is persisted on the config record and round-trips through the config UI/service
 - confirm whitespace-only `plc_device_key` and `plc_device_label` values persist as `NULL`, while trimmed non-empty values round-trip unchanged
+- confirm fresh startup schema creation includes the PLC metadata fields without relying on compatibility migration for old local DBs
 - run targeted tests for model, config service, and config UI touched by the cleanup
 - confirm tests contain zero remaining `trigger_type` references
-- if any docs still mention `trigger_type`, they must be limited to the explicitly superseded March 17 and March 20 historical design/plan files
+- outside the superseded March 17/March 20 historical docs and the active March 25 cleanup spec/plan, docs must not mention `trigger_type`
