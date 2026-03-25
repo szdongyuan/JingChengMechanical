@@ -209,7 +209,9 @@ def _build_ai_row(
         selected_channels=selected_channels,
     )
 
-    if status in {"", "disabled", "not_enabled", "not_configured", "skipped"} and threshold is None:
+    if status in {"disabled", "not_enabled", "not_configured", "skipped"}:
+        return _build_unconstrained_row("ai", "AI分析"), None
+    if status == "" and threshold is None:
         return _build_unconstrained_row("ai", "AI分析"), None
     if status == "success" and threshold is None:
         return _build_unconstrained_row("ai", "AI分析"), None

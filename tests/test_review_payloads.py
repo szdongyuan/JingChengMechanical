@@ -1,3 +1,5 @@
+import pytest
+
 from app.service.analysis.review_payloads import build_summary_payload
 
 
@@ -167,6 +169,32 @@ def test_build_summary_payload_renders_unconstrained_rows_and_ai_channel_fallbac
     assert summary["rows"][3]["channel_label"] == "--"
     assert summary["rows"][3]["status"] == "OK"
     assert summary["rows"][3]["constrained"] is False
+
+
+@pytest.mark.parametrize("status", ["not_enabled", "not_configured", "disabled", "skipped"])
+def test_build_summary_payload_treats_not_enabled_ai_statuses_as_unconstrained_even_with_threshold(status):
+    summary = build_summary_payload(
+        config=_make_config(),
+        judgment_payload=_make_judgment_payload(),
+        ai_review={
+            "status": status,
+            "threshold": 0.8,
+            "score": None,
+            "channel_index": 1,
+            "error_message": "should be ignored",
+        },
+    )
+
+    assert summary["overall_status"] == "fail"
+    assert summary["overall_label"] == "FAIL"
+    assert summary["error_message"] is None
+    assert summary["rows"][-1]["label"] == "AI分析"
+    assert summary["rows"][-1]["deviation_value"] is None
+    assert summary["rows"][-1]["deviation_display"] == "--"
+    assert summary["rows"][-1]["channel_index"] is None
+    assert summary["rows"][-1]["channel_label"] == "--"
+    assert summary["rows"][-1]["status"] == "OK"
+    assert summary["rows"][-1]["constrained"] is False
 
 
 def test_build_summary_payload_marks_enabled_ai_failure_as_partial_no_result():
