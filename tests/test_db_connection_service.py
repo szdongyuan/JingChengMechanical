@@ -10,8 +10,6 @@ from model.ai_execution_table import AiExecutionTable
 from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable as AiBindingTable
 
-REMOVED_TRIGGER_COLUMN = "trigger" + "_type"
-
 
 def test_connect_creates_ai_tables(monkeypatch):
     """DbConnectionService.connect() must create all 3 AI tables in a fresh DB."""
@@ -103,7 +101,6 @@ def test_connect_creates_test_config_table_with_plc_metadata_fields(monkeypatch)
         cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_table)")
         column_names = {row[1] for row in cursor.fetchall()}
 
-        assert REMOVED_TRIGGER_COLUMN not in column_names
         assert "plc_device_key" in column_names
         assert "plc_device_label" in column_names
 
@@ -172,7 +169,6 @@ def test_migrate_adds_new_columns_to_existing_db(monkeypatch):
         assert "output_device_hostapi" in column_names
         assert "output_device_samplerate" in column_names
         assert "selected_channels" in column_names
-        assert REMOVED_TRIGGER_COLUMN not in column_names
         assert "plc_device_key" not in column_names
         assert "plc_device_label" not in column_names
 
