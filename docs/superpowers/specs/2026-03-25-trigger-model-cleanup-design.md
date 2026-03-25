@@ -34,7 +34,7 @@ In scope:
 
 - remove `trigger_type` from config schema, persistence, UI, tests, and active planning assumptions
 - keep `scan_triggers_test` as the only scan-trigger eligibility field
-- keep `plc_device_key` and `plc_device_label` as saved PLC metadata
+- add or preserve `plc_device_key` and `plc_device_label` as saved PLC metadata
 - define PLC eligibility by `plc_device_key` presence only
 - define the authoritative trigger rules that future factory-mode implementation must follow
 
@@ -94,6 +94,13 @@ Delete `trigger_type` from `TestConfigTable`.
 
 Do not replace it with another enum. The explicit scan field and PLC binding fields already model the actual behavior required by this branch.
 
+This cleanup also owns the minimal PLC metadata path required after `trigger_type` removal:
+
+- `plc_device_key`
+- `plc_device_label`
+
+Those fields belong on `TestConfigTable` and are the saved config-level source of PLC binding metadata for future factory-mode routing.
+
 ### Config Persistence
 
 `ConfigService` must stop:
@@ -102,17 +109,27 @@ Do not replace it with another enum. The explicit scan field and PLC binding fie
 - saving `trigger_type`
 - validating `trigger_type`
 
-`ConfigService.validate_factory_runtime()` is the owner of per-config runtime eligibility checks, including:
+This cleanup also requires `ConfigService` to load and save:
 
-- scan eligibility derived from `scan_triggers_test`
-- PLC eligibility derived from `plc_device_key`
+- `plc_device_key`
+- `plc_device_label`
+
+`ConfigService.validate_factory_runtime()` is limited to hard-blocking per-config runtime validation shared by all start paths, including:
+
 - any per-config validation that does not depend on selected-pair page state or live event payloads
 
 Contract:
 
 - input: one loaded config dict
 - output: `list[str]`
-- meaning: empty list means the config is runtime-eligible; non-empty list contains operator-facing validation errors
+- meaning: empty list means there is no hard-blocking config error for starting this config manually; non-empty list contains operator-facing validation errors
+
+Non-eligibility for scan or PLC is not an error. A manual-only config with `scan_triggers_test == False` and blank `plc_device_key` is still valid and should return no errors from `validate_factory_runtime()` unless some separate hard-blocking config problem exists.
+
+Capability checks are separate and explicit:
+
+- scan capability is `scan_triggers_test == True`
+- PLC capability is `plc_device_key.strip() != ""`
 
 The future factory-mode controller remains the owner of:
 
@@ -122,6 +139,8 @@ The future factory-mode controller remains the owner of:
 - scan/PLC tie-break rules
 - blocking starts during active run or reanalysis states
 
+If helper methods are introduced for clarity, they should expose capability questions directly rather than encoding capability as validation errors.
+
 ### Config UI
 
 Remove the trigger selector from the config UI.
@@ -130,6 +149,13 @@ Keep:
 
 - the existing scan-trigger checkbox because it represents a real independent behavior
 - PLC binding inputs because PLC metadata is still part of the branch design
+
+This cleanup owns the minimal PLC metadata editing path needed after removing `trigger_type`:
+
+- plain config inputs for `plc_device_key`
+- plain config inputs for `plc_device_label`
+
+No PLC discovery workflow is required here. Simple persisted metadata inputs are enough.
 
 The UI should no longer imply that the operator must choose one trigger mode for a config.
 
@@ -186,4 +212,6 @@ This cleanup is complete when:
 - confirm the active March 25 plan contains no trigger-type-based routing rules
 - confirm `docs/superpowers/plans/2026-03-20-factory-mode-analysis-ui.md` is no longer treated as authoritative for trigger logic once the March 25 cleanup plan is written
 - confirm the config UI exposes scan and PLC metadata without a trigger selector
+- confirm PLC metadata is persisted on the config record and round-trips through the config UI/service
 - run targeted tests for model, config service, config UI, and any factory-routing logic touched by the cleanup
+- search docs and tests for stale `trigger_type` references and either remove them or make any historical exceptions explicit
