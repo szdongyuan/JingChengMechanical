@@ -117,6 +117,8 @@ class FactoryReviewPayload:
     no_result: bool = False
     error_message: str | None = None
     judgment_payload: dict | None = None
+    summary_payload: dict | None = None
+    chart_payload: dict | None = None
 
 
 @dataclass(frozen=True)
