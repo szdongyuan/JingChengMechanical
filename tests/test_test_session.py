@@ -114,6 +114,27 @@ class TestTestSessionProcessing:
         session._on_chunk(chunk, 0)
         bus.spl_updated.emit.assert_called()
 
+    def test_on_chunk_emits_analysis_signals_with_factory_run_id(self):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        session = TestSession(
+            config=_make_config(),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"factory_run_id": "factory-run-1"},
+            audio_dir="/tmp/audio",
+        )
+        session._setup_pipelines()
+
+        chunk = np.random.randn(2048, 1).astype(np.float32)
+
+        session._on_chunk(chunk, 0)
+
+        assert bus.spl_updated.emit.call_args.args[0] == 1
+        assert bus.spl_updated.emit.call_args.args[1] == "factory-run-1"
+        assert bus.spl_updated.emit.call_args.args[2] == 0
+
     def test_on_chunk_notifies_when_session_duration_expires(self):
         bus = _make_mock_bus()
         ai = MagicMock()

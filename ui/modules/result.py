@@ -14,6 +14,21 @@ from PyQt6.QtWidgets import (
 
 class ResultModule(QWidget):
     module_id = "result"
+    _EMPTY_TEXT = "No data"
+    _NO_RESULT_STATUS_TEXT = "无结果"
+    _AI_STATUS_DISPLAY = {
+        "success": "分析完成",
+        "not_enabled": "AI 未启用",
+        "not_configured": "AI 未配置",
+        "preflight_error": "前置校验失败",
+        "timeout": "超时",
+        "process_error": "执行错误",
+        "protocol_error": "协议错误",
+        "invalid_output": "输出无效",
+        "cancelled": "已取消",
+        "no_result": _NO_RESULT_STATUS_TEXT,
+        "window_invalidated": "窗口已变更，结果已失效，请确认后重新分析",
+    }
 
     def __init__(self, services):
         super().__init__()
@@ -86,7 +101,7 @@ class ResultModule(QWidget):
         self.lb_empty_icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_lay.addWidget(self.lb_empty_icon)
 
-        self.lb_empty_text = QLabel("No data")
+        self.lb_empty_text = QLabel(self._EMPTY_TEXT)
         self.lb_empty_text.setObjectName("EmptyText")
         self.lb_empty_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         empty_lay.addWidget(self.lb_empty_text)
@@ -97,9 +112,12 @@ class ResultModule(QWidget):
         lay.addWidget(self.empty_state, 0, Qt.AlignmentFlag.AlignHCenter)
         lay.addStretch(1)
 
-        self.services.bus.result_changed.connect(self._on_result)
+        if hasattr(self.services.bus, "factory_review_changed"):
+            self.services.bus.factory_review_changed.connect(self._on_factory_review_changed)
+        if hasattr(self.services.bus, "factory_display_reset"):
+            self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
 
-        self._set_empty_visible(True)
+        self._clear_result()
 
     def _set_row(self, row: int, name: str, value: str):
         it_name = QTableWidgetItem(name)
@@ -113,7 +131,63 @@ class ResultModule(QWidget):
     def _set_empty_visible(self, visible: bool):
         self.empty_state.setVisible(bool(visible))
 
-    def _on_result(self, r: dict):
+    def _reset_badge(self):
+        self.lb_overall.setText("-")
+        self.lb_overall.setProperty("resultLevel", "unknown")
+        self.lb_overall.style().unpolish(self.lb_overall)
+        self.lb_overall.style().polish(self.lb_overall)
+
+    def _clear_result(self):
+        self._reset_badge()
+        self.lb_empty_icon.setText("?")
+        self.lb_empty_text.setText(self._EMPTY_TEXT)
+        self._set_row(0, "AI 标签", "-")
+        self._set_row(1, "AI 评分", "-")
+        self._set_row(2, "AI 简述", "-")
+        self._set_row(3, "工具链", "-")
+        self._set_row(4, "AI 状态", "-")
+        self._set_row(5, "错误信息", "-")
+        self._set_row(6, "详情/产物", "-")
+        self._set_row(7, "声压级", "-")
+        self._set_empty_visible(True)
+
+    def _show_no_result(self, error_message: str | None):
+        self._reset_badge()
+        message = str(error_message) if error_message else "-"
+        self.lb_empty_icon.setText("!")
+        self.lb_empty_text.setText(error_message or self._NO_RESULT_STATUS_TEXT)
+        self._set_row(0, "AI 标签", "-")
+        self._set_row(1, "AI 评分", "-")
+        self._set_row(2, "AI 简述", "-")
+        self._set_row(3, "工具链", "-")
+        self._set_row(4, "AI 状态", self._NO_RESULT_STATUS_TEXT)
+        self._set_row(5, "错误信息", message)
+        self._set_row(6, "详情/产物", "-")
+        self._set_row(7, "声压级", "-")
+        self._set_empty_visible(True)
+
+    def _on_factory_display_reset(self, _reason: str):
+        self._clear_result()
+
+    def _on_factory_review_changed(self, review):
+        judgment_payload = getattr(review, "judgment_payload", None)
+        no_result = bool(getattr(review, "no_result", False))
+        error_message = getattr(review, "error_message", None)
+
+        if isinstance(judgment_payload, dict):
+            payload = dict(judgment_payload)
+            if error_message and not payload.get("error_summary"):
+                payload["error_summary"] = error_message
+            self._render_result(payload)
+            return
+
+        if no_result or error_message:
+            self._show_no_result(error_message)
+            return
+
+        self._clear_result()
+
+    def _render_result(self, r: dict):
         overall = r.get("overall", None)
         if overall == "不合格":
             self.lb_overall.setText("FAIL")
@@ -138,20 +212,7 @@ class ResultModule(QWidget):
         except (TypeError, ValueError):
             ai_score_text = str(ai_score) if ai_score not in (None, "") else "-"
 
-        _AI_STATUS_DISPLAY = {
-            "success": "分析完成",
-            "not_enabled": "AI 未启用",
-            "not_configured": "AI 未配置",
-            "preflight_error": "前置校验失败",
-            "timeout": "超时",
-            "process_error": "执行错误",
-            "protocol_error": "协议错误",
-            "invalid_output": "输出无效",
-            "cancelled": "已取消",
-            "no_result": "-",
-            "window_invalidated": "窗口已变更，结果已失效，请确认后重新分析",
-        }
-        ai_status_text = _AI_STATUS_DISPLAY.get(ai_status, ai_status)
+        ai_status_text = self._AI_STATUS_DISPLAY.get(ai_status, ai_status)
 
         # Toolchain info
         tc_name = r.get("toolchain_name", "")

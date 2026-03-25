@@ -224,26 +224,33 @@ class TestManager(QObject):
         if isinstance(config_id, bool):
             config_id = None
         if config_id is not None:
-            self._stop_one(config_id, silent)
+            self._stop_one(config_id, silent, notify_factory_runtime_abort=True)
         else:
             for cid in list(self._sessions.keys()):
-                self._stop_one(cid, silent)
+                self._stop_one(cid, silent, notify_factory_runtime_abort=True)
 
     def stop_active_run(self, config_id: int | None = None) -> bool:
         """Factory-mode hook for stopping an active session."""
         if config_id is None:
             if not self._sessions:
                 return False
-            self.stop()
+            for cid in list(self._sessions.keys()):
+                self._stop_one(cid, notify_factory_runtime_abort=False)
             return True
 
         if config_id not in self._sessions:
             return False
 
-        self.stop(config_id=config_id)
+        self._stop_one(config_id, notify_factory_runtime_abort=False)
         return True
 
-    def _stop_one(self, config_id: int, silent: bool = False):
+    def _stop_one(
+        self,
+        config_id: int,
+        silent: bool = False,
+        *,
+        notify_factory_runtime_abort: bool = False,
+    ):
         session = self._sessions.pop(config_id, None)
         rec = self._recorders.pop(config_id, None)
         mon = self._monitors.pop(config_id, None)
@@ -251,26 +258,52 @@ class TestManager(QObject):
         if session is not None and rec is not None:
             self._disconnect_session_signals(session, rec, mon)
 
-        if session is not None and rec is not None and not silent:
-            partial_buf = rec.get_buffer_from(getattr(session, "_attach_snapshot", None))
-            if isinstance(partial_buf, np.ndarray) and partial_buf.size > 0:
-                session._buffer = partial_buf
-                session._sample_rate = rec._sample_rate
-                session._save_wav(partial_buf, rec._sample_rate)
-                self._bus.log.emit(
-                    f"[TestManager] saved partial recording for config={config_id}"
+        factory_abort_payload = None
+        if (
+            notify_factory_runtime_abort
+            and session is not None
+            and self._factory_run_id(session) is not None
+        ):
+            factory_abort_payload = self._make_factory_runtime_abort_payload(
+                config_id,
+                session,
+                error_message=None,
+            )
+
+        try:
+            if session is not None and rec is not None and not silent:
+                partial_buf = rec.get_buffer_from(getattr(session, "_attach_snapshot", None))
+                if isinstance(partial_buf, np.ndarray) and partial_buf.size > 0:
+                    session._buffer = partial_buf
+                    session._sample_rate = rec._sample_rate
+                    try:
+                        session._save_wav(partial_buf, rec._sample_rate)
+                    except Exception as exc:
+                        self._bus.log.emit(
+                            f"[TestManager] ERROR saving partial recording for "
+                            f"config={config_id}: {exc}"
+                        )
+                    else:
+                        self._bus.log.emit(
+                            f"[TestManager] saved partial recording for config={config_id}"
+                        )
+        finally:
+            if mon is not None:
+                mon.stop()
+                mon.wait(1000)
+
+            if rec is not None:
+                self._stop_recorder_if_unused(rec)
+
+            if factory_abort_payload is not None:
+                self._emit_optional_signal(
+                    "factory_runtime_aborted",
+                    factory_abort_payload,
                 )
 
-        if mon is not None:
-            mon.stop()
-            mon.wait(1000)
-
-        if rec is not None:
-            self._stop_recorder_if_unused(rec)
-
-        if not silent:
-            self._bus.log.emit(f"[TestManager] stopped config={config_id}")
-            self._bus.status.emit("Stopped")
+            if not silent:
+                self._bus.log.emit(f"[TestManager] stopped config={config_id}")
+                self._bus.status.emit("Stopped")
 
     @staticmethod
     def _get_factory_start_request_id(workorder: dict) -> str | None:
@@ -506,7 +539,7 @@ class TestManager(QObject):
         config_id: int,
         session,
         *,
-        error_message: str,
+        error_message: str | None,
     ):
         from app.services_container import FactoryRuntimeAbortPayload
 

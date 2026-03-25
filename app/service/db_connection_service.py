@@ -20,10 +20,6 @@ class DbConnectionService:
     - 业务代码/CRUD 不需要每次手动 connect/close
     """
 
-    _ANALYSIS_OFFSET_BACKFILL_MARKER = (
-        "test_config_analysis_window_offset_backfill_v1"
-    )
-
     def connect(self):
         db.connect(reuse_if_open=True)
         db.create_tables(
@@ -39,7 +35,6 @@ class DbConnectionService:
         self._migrate()
 
     def _migrate(self):
-        added_test_config_columns = set()
         columns = [
             ("trigger_type", "TEXT DEFAULT 'manual'"),
             ("input_device_name", "TEXT"),
@@ -60,15 +55,6 @@ class DbConnectionService:
                 )
             except OperationalError:
                 pass
-            else:
-                added_test_config_columns.add(column_name)
-
-        self._backfill_analysis_window_offset_once(
-            analysis_offset_added_this_run=(
-                "analysis_window_offset_ms" in added_test_config_columns
-            )
-        )
-        self._rebuild_ai_binding_table_without_analysis_window_offset()
         self._ensure_ai_binding_columns()
         self._ensure_ai_binding_indexes()
 
@@ -95,116 +81,6 @@ class DbConnectionService:
             ON test_config_ai_binding_table (toolchain_id)
             """
         )
-
-    def _backfill_analysis_window_offset_once(
-        self, analysis_offset_added_this_run: bool
-    ):
-        db.execute_sql(
-            """
-            CREATE TABLE IF NOT EXISTS migration_marker_table (
-                marker_key TEXT PRIMARY KEY,
-                applied_time TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            )
-            """
-        )
-
-        marker_row = db.execute_sql(
-            "SELECT 1 FROM migration_marker_table WHERE marker_key = ?",
-            (self._ANALYSIS_OFFSET_BACKFILL_MARKER,),
-        ).fetchone()
-        if marker_row:
-            return
-
-        if "analysis_window_offset_ms" not in self._get_table_columns(
-            "test_config_ai_binding_table"
-        ):
-            db.execute_sql(
-                "INSERT OR IGNORE INTO migration_marker_table (marker_key) VALUES (?)",
-                (self._ANALYSIS_OFFSET_BACKFILL_MARKER,),
-            )
-            return
-
-        if not analysis_offset_added_this_run:
-            db.execute_sql(
-                "INSERT OR IGNORE INTO migration_marker_table (marker_key) VALUES (?)",
-                (self._ANALYSIS_OFFSET_BACKFILL_MARKER,),
-            )
-            return
-
-        with db.atomic():
-            db.execute_sql(
-                """
-                UPDATE test_config_table
-                SET analysis_window_offset_ms = (
-                    SELECT binding.analysis_window_offset_ms
-                    FROM test_config_ai_binding_table AS binding
-                    WHERE binding.config_id = test_config_table.config_id
-                )
-                WHERE test_config_table.analysis_window_offset_ms = 0
-                  AND EXISTS (
-                      SELECT 1
-                      FROM test_config_ai_binding_table AS binding
-                      WHERE binding.config_id = test_config_table.config_id
-                        AND binding.analysis_window_offset_ms != 0
-                  )
-                """
-            )
-            db.execute_sql(
-                "INSERT INTO migration_marker_table (marker_key) VALUES (?)",
-                (self._ANALYSIS_OFFSET_BACKFILL_MARKER,),
-            )
-
-    def _rebuild_ai_binding_table_without_analysis_window_offset(self):
-        columns = self._get_table_columns("test_config_ai_binding_table")
-        if "analysis_window_offset_ms" not in columns:
-            return
-
-        score_threshold_select = "score_threshold" if "score_threshold" in columns else "NULL"
-
-        with db.atomic():
-            db.execute_sql("DROP TABLE IF EXISTS test_config_ai_binding_table__new")
-            db.execute_sql(
-                """
-                CREATE TABLE test_config_ai_binding_table__new (
-                    binding_id INTEGER PRIMARY KEY,
-                    config_id INTEGER NOT NULL UNIQUE REFERENCES test_config_table(config_id) ON DELETE CASCADE,
-                    enabled INTEGER NOT NULL DEFAULT 0,
-                    toolchain_id TEXT REFERENCES ai_toolchain_table(toolchain_id) ON DELETE SET NULL,
-                    timeout_ms INTEGER,
-                    params_json TEXT NOT NULL DEFAULT '{}',
-                    score_threshold REAL DEFAULT NULL,
-                    updated_time TEXT NOT NULL DEFAULT ''
-                )
-                """
-            )
-            db.execute_sql(
-                f"""
-                INSERT INTO test_config_ai_binding_table__new (
-                    binding_id,
-                    config_id,
-                    enabled,
-                    toolchain_id,
-                    timeout_ms,
-                    params_json,
-                    score_threshold,
-                    updated_time
-                )
-                SELECT
-                    binding_id,
-                    config_id,
-                    enabled,
-                    toolchain_id,
-                    timeout_ms,
-                    params_json,
-                    {score_threshold_select},
-                    updated_time
-                FROM test_config_ai_binding_table
-                """
-            )
-            db.execute_sql("DROP TABLE test_config_ai_binding_table")
-            db.execute_sql(
-                "ALTER TABLE test_config_ai_binding_table__new RENAME TO test_config_ai_binding_table"
-            )
 
     def close(self):
         if not db.is_closed():

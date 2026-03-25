@@ -14,6 +14,8 @@ from app.services_container import (
     FactoryScanIngressPayload,
 )
 
+_UNSET = object()
+
 
 class FactoryModeController(QObject):
     """Owns the factory-mode page state and the UI-facing review contract."""
@@ -21,6 +23,11 @@ class FactoryModeController(QObject):
     __test__ = False
     _BLOCKED_START_PHASES = frozenset({"running", "analyzing", "reanalyzing"})
     _ACTIVE_RUN_PHASES = frozenset({"running", "analyzing"})
+    _BLOCKED_START_PHASE_REASONS = {
+        "running": "当前测试运行中",
+        "analyzing": "当前测试分析中",
+        "reanalyzing": "当前正在重新分析",
+    }
 
     def __init__(self, bus, services=None):
         super().__init__()
@@ -38,6 +45,7 @@ class FactoryModeController(QObject):
         self._last_plc_ingress: FactoryPlcIngressPayload | None = None
         self._last_scan_ingress: FactoryScanIngressPayload | None = None
         self._selected_configs: dict[int, dict] = {}
+        self._selection_refresh_deferred = False
         self._connect_bus()
 
     @property
@@ -74,25 +82,23 @@ class FactoryModeController(QObject):
             return self._state
 
         if selection_changed and self._pending_start is not None:
-            if not self._cancel_pending_start():
+            if not self._cancel_pending_start(emit_state=False):
                 return self._state
 
-        is_ready = False
-        self._selected_configs = {}
-        if len(selected) == 2 and len(set(selected)) == 2 and manual_primary_config_id in selected:
-            self._selected_configs = self._load_selected_configs(selected)
-            is_ready = (
-                len(self._selected_configs) == len(selected)
-                and not self._selected_configs_have_runtime_errors()
-            )
-
-        next_state = FactoryControllerState(
+        is_ready = self._reload_selected_configs(
             selected_config_ids=selected,
             manual_primary_config_id=manual_primary_config_id,
-            active_config_id=None,
-            displayed_config_id=None,
-            run_phase="armed" if is_ready else "not_ready",
-            trigger_source=None,
+        )
+
+        next_state = self._state_with_readiness(
+            FactoryControllerState(
+                selected_config_ids=selected,
+                manual_primary_config_id=manual_primary_config_id,
+                active_config_id=None,
+                displayed_config_id=None,
+                run_phase="armed" if is_ready else "not_ready",
+                trigger_source=None,
+            )
         )
 
         if has_review_context:
@@ -102,13 +108,57 @@ class FactoryModeController(QObject):
             self._emit_state()
         return self._state
 
-    def can_arm(self) -> bool:
-        return (
-            self._state.is_ready
-            and self._state.run_phase not in self._BLOCKED_START_PHASES
-            and self._pending_start is None
-            and not self._backend_session_running()
+    def refresh_selection(self) -> FactoryControllerState:
+        if self._state.run_phase in self._BLOCKED_START_PHASES:
+            self._selection_refresh_deferred = True
+            return self._state
+
+        return self._refresh_selection_now()
+
+    def _refresh_selection_now(self, *, emit_state: bool = True) -> FactoryControllerState:
+        self._selection_refresh_deferred = False
+
+        selected = tuple(self._state.selected_config_ids)
+        manual_primary_config_id = self._state.manual_primary_config_id
+        if not selected and manual_primary_config_id is None:
+            return self._state
+
+        is_ready = self._reload_selected_configs(
+            selected_config_ids=selected,
+            manual_primary_config_id=manual_primary_config_id,
         )
+        if self._pending_start is not None and not is_ready:
+            self._stale_pending_start()
+        if self._has_review_context():
+            self._state = self._state_with_readiness(self._state)
+            if emit_state:
+                self._emit_state()
+            return self._state
+
+        self._state = self._state_with_readiness(
+            FactoryControllerState(
+                selected_config_ids=selected,
+                manual_primary_config_id=manual_primary_config_id,
+                active_config_id=None,
+                displayed_config_id=None,
+                run_phase="armed" if is_ready else "not_ready",
+                trigger_source=None,
+            )
+        )
+        if emit_state:
+            self._emit_state()
+        return self._state
+
+    def _apply_deferred_selection_refresh(self, *, emit_state: bool = False) -> None:
+        if not self._selection_refresh_deferred:
+            return
+        self._refresh_selection_now(emit_state=emit_state)
+
+    def can_arm(self) -> bool:
+        if self._state.run_phase not in self._BLOCKED_START_PHASES:
+            self._apply_deferred_selection_refresh()
+        self._state = self._state_with_readiness(self._state)
+        return self._state.start_ready
 
     def start_manual(self, workorder: dict | None = None) -> bool:
         config_id = self._state.manual_primary_config_id
@@ -121,15 +171,53 @@ class FactoryModeController(QObject):
 
     def handle_plc_event(self, payload: FactoryPlcIngressPayload) -> bool:
         self._last_plc_ingress = payload
+        if self._state.run_phase in self._BLOCKED_START_PHASES:
+            self._log_ingress_ignored(
+                event_type="PLC",
+                reason=self._state.run_phase,
+                plc_device_key=payload.plc_device_key,
+            )
+            return False
+        if not self.can_arm():
+            self._log_ingress_ignored(
+                event_type="PLC",
+                reason="not armed",
+                plc_device_key=payload.plc_device_key,
+            )
+            return False
         config_id = self._resolve_plc_config_id(payload.plc_device_key)
         if config_id is None:
+            self._log_ingress_ignored(
+                event_type="PLC",
+                reason="no match",
+                plc_device_key=payload.plc_device_key,
+            )
             return False
         return self._accept_start(config_id, "plc")
 
     def handle_scan_event(self, payload: FactoryScanIngressPayload) -> bool:
         self._last_scan_ingress = payload
+        if self._state.run_phase in self._BLOCKED_START_PHASES:
+            self._log_ingress_ignored(
+                event_type="scan",
+                reason=self._state.run_phase,
+                scan_text=payload.scan_text,
+            )
+            return False
+        if not self.can_arm():
+            self._log_ingress_ignored(
+                event_type="scan",
+                reason="not armed",
+                scan_text=payload.scan_text,
+            )
+            return False
         config_id = self._resolve_scan_config_id()
         if config_id is None:
+            self._log_ingress_ignored(
+                event_type="scan",
+                reason="no match",
+                scan_text=payload.scan_text,
+            )
             return False
         return self._accept_start(config_id, "scan")
 
@@ -144,12 +232,14 @@ class FactoryModeController(QObject):
 
         self._owned_runtime_config_id = payload.config_id
         self._owned_runtime_run_id = payload.run_id
-        self._state = replace(
-            self._state,
-            active_config_id=payload.config_id,
-            displayed_config_id=payload.config_id,
-            run_phase="running",
-            trigger_source=payload.trigger_source,
+        self._state = self._state_with_readiness(
+            replace(
+                self._state,
+                active_config_id=payload.config_id,
+                displayed_config_id=payload.config_id,
+                run_phase="running",
+                trigger_source=payload.trigger_source,
+            )
         )
         self._emit_state()
 
@@ -166,11 +256,13 @@ class FactoryModeController(QObject):
         ):
             return
 
-        self._state = replace(
-            self._state,
-            active_config_id=payload.config_id,
-            displayed_config_id=payload.config_id,
-            run_phase="analyzing",
+        self._state = self._state_with_readiness(
+            replace(
+                self._state,
+                active_config_id=payload.config_id,
+                displayed_config_id=payload.config_id,
+                run_phase="analyzing",
+            )
         )
         self._emit_state()
 
@@ -230,11 +322,13 @@ class FactoryModeController(QObject):
             error_message=None,
             judgment_payload=None,
         )
-        self._state = replace(
-            self._state,
-            active_config_id=None,
-            displayed_config_id=config_id,
-            run_phase="reanalyzing",
+        self._state = self._state_with_readiness(
+            replace(
+                self._state,
+                active_config_id=None,
+                displayed_config_id=config_id,
+                run_phase="reanalyzing",
+            )
         )
         self.bus.factory_review_changed.emit(self._review_payload)
         self._emit_state()
@@ -309,6 +403,8 @@ class FactoryModeController(QObject):
         self._reset_review_context(reason)
 
     def _connect_bus(self) -> None:
+        if hasattr(self.bus, "config_changed"):
+            self.bus.config_changed.connect(self.refresh_selection)
         self.bus.factory_plc_event.connect(self.handle_plc_event)
         self.bus.factory_scan_event.connect(self.handle_scan_event)
         self.bus.factory_runtime_start_accepted.connect(self.handle_runtime_start_accepted)
@@ -386,20 +482,26 @@ class FactoryModeController(QObject):
             self._pending_start_request_id = None
             return False
 
+        if self._pending_start is not None:
+            self._state = self._state_with_readiness(self._state)
+            self._emit_state()
         return True
 
     def _apply_review_payload(self, payload: FactoryReviewPayload) -> None:
+        self._apply_deferred_selection_refresh()
         trigger_source = payload.trigger_source
         if trigger_source is None:
             trigger_source = self._state.trigger_source
 
         self._review_payload = replace(payload, trigger_source=trigger_source)
-        self._state = replace(
-            self._state,
-            active_config_id=None,
-            displayed_config_id=self._review_payload.displayed_config_id,
-            run_phase="reviewing",
-            trigger_source=trigger_source,
+        self._state = self._state_with_readiness(
+            replace(
+                self._state,
+                active_config_id=None,
+                displayed_config_id=self._review_payload.displayed_config_id,
+                run_phase="reviewing",
+                trigger_source=trigger_source,
+            )
         )
         self.bus.factory_review_changed.emit(self._review_payload)
         self._emit_state()
@@ -420,17 +522,127 @@ class FactoryModeController(QObject):
                 return {}
         return configs
 
+    def _reload_selected_configs(
+        self,
+        *,
+        selected_config_ids: tuple[int, ...],
+        manual_primary_config_id: int | None,
+    ) -> bool:
+        self._selected_configs = {}
+        if (
+            len(selected_config_ids) == 2
+            and len(set(selected_config_ids)) == 2
+            and manual_primary_config_id in selected_config_ids
+        ):
+            self._selected_configs = self._load_selected_configs(selected_config_ids)
+        return self._selection_is_start_ready(
+            selected_config_ids=selected_config_ids,
+            manual_primary_config_id=manual_primary_config_id,
+        )
+
     def _selected_configs_have_runtime_errors(self) -> bool:
+        return bool(self._selected_config_runtime_errors())
+
+    def _selected_config_runtime_errors(self) -> list[str]:
         config_service = getattr(self.services, "config_service", None)
         validate = getattr(config_service, "validate_factory_runtime", None)
         if not callable(validate):
-            return False
-        return any(validate(config) for config in self._selected_configs.values())
+            return []
+        errors: list[str] = []
+        for config in self._selected_configs.values():
+            errors.extend(validate(config))
+        return errors
+
+    def _selection_is_start_ready(
+        self,
+        *,
+        selected_config_ids: tuple[int, ...] | object = _UNSET,
+        manual_primary_config_id: int | None | object = _UNSET,
+    ) -> bool:
+        selected = (
+            tuple(selected_config_ids)
+            if selected_config_ids is not _UNSET
+            else tuple(self._state.selected_config_ids)
+        )
+        primary_config_id = (
+            manual_primary_config_id
+            if manual_primary_config_id is not _UNSET
+            else self._state.manual_primary_config_id
+        )
+        return (
+            len(selected) == 2
+            and len(set(selected)) == 2
+            and primary_config_id in selected
+            and len(self._selected_configs) == len(selected)
+            and not self._selected_config_runtime_errors()
+        )
+
+    def _selection_readiness(
+        self,
+        *,
+        selected_config_ids: tuple[int, ...] | object = _UNSET,
+        manual_primary_config_id: int | None | object = _UNSET,
+    ) -> tuple[bool, str | None]:
+        selected = (
+            tuple(selected_config_ids)
+            if selected_config_ids is not _UNSET
+            else tuple(self._state.selected_config_ids)
+        )
+        primary_config_id = (
+            manual_primary_config_id
+            if manual_primary_config_id is not _UNSET
+            else self._state.manual_primary_config_id
+        )
+        if len(selected) != 2 or len(set(selected)) != 2:
+            return False, "请选择两个不同配置"
+        if primary_config_id not in selected:
+            return False, "请先选择手动主配置"
+        if len(self._selected_configs) != len(selected):
+            return False, "工厂模式未就绪"
+        runtime_errors = self._selected_config_runtime_errors()
+        if runtime_errors:
+            return False, runtime_errors[0]
+        return True, None
+
+    def _start_readiness(
+        self,
+        *,
+        state: FactoryControllerState,
+        selection_ready: bool,
+        selection_ready_reason: str | None,
+    ) -> tuple[bool, str | None]:
+        blocked_phase_reason = self._BLOCKED_START_PHASE_REASONS.get(state.run_phase)
+        if blocked_phase_reason is not None:
+            return False, blocked_phase_reason
+        if not selection_ready:
+            return False, selection_ready_reason
+        if self._pending_start is not None:
+            return False, "启动请求处理中"
+        if self._backend_session_running():
+            return False, "当前测试运行中"
+        if state.run_phase not in {"armed", "reviewing"}:
+            return False, "工厂模式未就绪"
+        return True, None
+
+    def _state_with_readiness(self, state: FactoryControllerState) -> FactoryControllerState:
+        selection_ready, selection_ready_reason = self._selection_readiness(
+            selected_config_ids=state.selected_config_ids,
+            manual_primary_config_id=state.manual_primary_config_id,
+        )
+        start_ready, start_ready_reason = self._start_readiness(
+            state=state,
+            selection_ready=selection_ready,
+            selection_ready_reason=selection_ready_reason,
+        )
+        return replace(
+            state,
+            selection_ready=selection_ready,
+            selection_ready_reason=selection_ready_reason,
+            start_ready=start_ready,
+            start_ready_reason=start_ready_reason,
+        )
 
     def _resolve_plc_config_id(self, plc_device_key: str) -> int | None:
-        if not self.can_arm():
-            return None
-
         matches = [
             config_id
             for config_id, config in self._selected_configs.items()
@@ -445,9 +657,6 @@ class FactoryModeController(QObject):
         return None
 
     def _resolve_scan_config_id(self) -> int | None:
-        if not self.can_arm():
-            return None
-
         matches = [
             config_id
             for config_id, config in self._selected_configs.items()
@@ -478,13 +687,17 @@ class FactoryModeController(QObject):
         self._owned_runtime_run_id = None
         self._owned_reanalysis_config_id = None
         self._owned_reanalysis_run_id = None
+        self._apply_deferred_selection_refresh()
         self._review_payload = FactoryReviewPayload()
-        self._state = state or replace(
-            self._state,
-            active_config_id=None,
-            displayed_config_id=None,
-            run_phase="armed" if self._state.is_ready else "not_ready",
-            trigger_source=None,
+        self._state = self._state_with_readiness(
+            state
+            or replace(
+                self._state,
+                active_config_id=None,
+                displayed_config_id=None,
+                run_phase="armed" if self._selection_is_start_ready() else "not_ready",
+                trigger_source=None,
+            )
         )
         self.bus.factory_display_reset.emit(reason)
         self.bus.factory_review_changed.emit(self._review_payload)
@@ -516,7 +729,7 @@ class FactoryModeController(QObject):
             and self._pending_start_request_id == request_id
         )
 
-    def _cancel_pending_start(self) -> bool:
+    def _cancel_pending_start(self, *, emit_state: bool = True) -> bool:
         request_id = self._pending_start_request_id
         if self._pending_start is None:
             self._pending_start_request_id = None
@@ -544,7 +757,19 @@ class FactoryModeController(QObject):
 
         self._pending_start = None
         self._pending_start_request_id = None
+        if emit_state:
+            self._state = self._state_with_readiness(self._state)
+            self._emit_state()
         return True
+
+    def _stale_pending_start(self) -> None:
+        if self._pending_start is None:
+            self._pending_start_request_id = None
+            return
+        if self._cancel_pending_start(emit_state=False):
+            return
+        self._pending_start = None
+        self._pending_start_request_id = None
 
     def _backend_session_running(self) -> bool:
         test_manager = getattr(self.services, "test", None)
@@ -556,6 +781,22 @@ class FactoryModeController(QObject):
             return bool(is_running())
         except Exception:
             return False
+
+    def _log_ingress_ignored(self, *, event_type: str, reason: str, **details) -> None:
+        log_signal = getattr(self.bus, "log", None)
+        emit = getattr(log_signal, "emit", None)
+        if not callable(emit):
+            return
+
+        detail_parts = [
+            f"{key}={value}"
+            for key, value in details.items()
+            if value is not None and value != ""
+        ]
+        detail_suffix = ""
+        if detail_parts:
+            detail_suffix = f" ({', '.join(detail_parts)})"
+        emit(f"[FactoryModeController] {event_type} event ignored: {reason}{detail_suffix}")
 
     def _owns_runtime_payload(
         self,

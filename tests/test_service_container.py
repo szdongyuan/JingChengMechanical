@@ -18,6 +18,17 @@ def _load_factory_mode_controller_module():
     return importlib.import_module("app.service.factory_mode_controller")
 
 
+def _normalized_signal_argument_types(signal) -> tuple[str, ...]:
+    signatures = tuple(signal.signatures)
+    assert len(signatures) == 1
+
+    signature = signatures[0]
+    if "(" in signature:
+        signature = signature.split("(", 1)[1]
+    signature = signature.removesuffix(")")
+    return tuple(part.strip() for part in signature.split(","))
+
+
 def test_service_container_has_ai_service():
     source = inspect.getsource(mod.ServiceContainer.__post_init__)
     assert "ai_service" in source
@@ -36,6 +47,22 @@ def test_analysis_signals_exist():
         "test_finished",
     ):
         assert hasattr(EventBus, name), f"Missing signal: {name}"
+
+
+def test_analysis_frame_signals_include_run_id_contract():
+    expected_argument_types = ("int", "QString", "int", "PyQt_PyObject")
+
+    assert _normalized_signal_argument_types(EventBus.stft_updated) == expected_argument_types
+    assert _normalized_signal_argument_types(EventBus.spl_updated) == expected_argument_types
+    assert _normalized_signal_argument_types(EventBus.octave_updated) == expected_argument_types
+    assert _normalized_signal_argument_types(EventBus.fft_updated) == expected_argument_types
+
+    EventBus()
+
+    assert _normalized_signal_argument_types(EventBus.stft_updated) == expected_argument_types
+    assert _normalized_signal_argument_types(EventBus.spl_updated) == expected_argument_types
+    assert _normalized_signal_argument_types(EventBus.octave_updated) == expected_argument_types
+    assert _normalized_signal_argument_types(EventBus.fft_updated) == expected_argument_types
 
 
 def test_factory_mode_signals_exist():
@@ -116,6 +143,10 @@ def test_factory_controller_state_contract_exposes_only_spec_fields():
         "displayed_config_id",
         "run_phase",
         "trigger_source",
+        "selection_ready",
+        "selection_ready_reason",
+        "start_ready",
+        "start_ready_reason",
     ]
 
 

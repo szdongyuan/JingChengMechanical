@@ -69,6 +69,7 @@ def test_connect_creates_ai_tables(monkeypatch):
         assert "ai_toolchain_table" in table_names
         assert "test_config_ai_binding_table" in table_names
         assert "ai_execution_table" in table_names
+        assert "migration_marker_table" not in table_names
 
         cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_ai_binding_table)")
         column_names = {row[1] for row in cursor.fetchall()}
@@ -148,10 +149,10 @@ def test_migrate_adds_plc_and_analysis_window_offset_columns_to_existing_db(monk
             pass  # Windows may still hold the file briefly
 
 
-def test_migrate_rebuilds_existing_binding_table_without_analysis_window_offset_ms(
+def test_migrate_existing_binding_table_keeps_legacy_offset_column_untouched(
     monkeypatch,
 ):
-    """connect() must rebuild legacy binding tables without the binding-side offset column."""
+    """connect() should not run legacy binding-table rebuild logic for old offset columns."""
     fd, db_path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     try:
@@ -260,15 +261,21 @@ def test_migrate_rebuilds_existing_binding_table_without_analysis_window_offset_
         cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_ai_binding_table)")
         columns = {row[1]: row for row in cursor.fetchall()}
         assert "score_threshold" in columns
-        assert "analysis_window_offset_ms" not in columns
+        assert "analysis_window_offset_ms" in columns
         assert columns["score_threshold"][4] == "NULL"
         assert (("toolchain_id",), False) in _index_definitions(
             tmp_db, "test_config_ai_binding_table"
         )
 
         cursor = tmp_db.execute_sql(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+        table_names = {row[0] for row in cursor.fetchall()}
+        assert "migration_marker_table" not in table_names
+
+        cursor = tmp_db.execute_sql(
             """
-            SELECT enabled, toolchain_id, timeout_ms, params_json, score_threshold
+            SELECT enabled, toolchain_id, timeout_ms, analysis_window_offset_ms, params_json, score_threshold
             FROM test_config_ai_binding_table
             WHERE config_id = 1
             """
@@ -277,6 +284,7 @@ def test_migrate_rebuilds_existing_binding_table_without_analysis_window_offset_
             1,
             "legacy-toolchain",
             1200,
+            250,
             '{"legacy": true}',
             None,
         )
@@ -289,396 +297,3 @@ def test_migrate_rebuilds_existing_binding_table_without_analysis_window_offset_
         except OSError:
             pass
 
-
-def test_migrate_backfills_analysis_window_offset_once_from_binding_table(monkeypatch):
-    """connect() must move legacy binding offsets once before dropping the old binding column."""
-    fd, db_path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    try:
-        tmp_db = SqliteDatabase(db_path, pragmas={"foreign_keys": 1})
-        import model.base_mode as base_mod
-
-        monkeypatch.setattr(base_mod, "db", tmp_db)
-
-        from app.service.db_connection_service import DbConnectionService
-
-        svc = DbConnectionService()
-        import app.service.db_connection_service as svc_mod
-
-        monkeypatch.setattr(svc_mod, "db", tmp_db)
-
-        _bind_all_models(tmp_db)
-
-        tmp_db.connect()
-        tmp_db.execute_sql(
-            """
-            CREATE TABLE test_config_table (
-                config_id INTEGER PRIMARY KEY,
-                config_name TEXT NOT NULL UNIQUE,
-                record_duration REAL NOT NULL DEFAULT 5.0,
-                analysis_duration REAL NOT NULL DEFAULT 3.0,
-                scan_triggers_test INTEGER NOT NULL DEFAULT 0,
-                created_time TEXT NOT NULL DEFAULT '',
-                updated_time TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            CREATE TABLE ai_toolchain_table (
-                toolchain_id TEXT PRIMARY KEY,
-                display_name TEXT NOT NULL,
-                version TEXT NOT NULL DEFAULT '',
-                entrypoint TEXT NOT NULL,
-                default_timeout_ms INTEGER NOT NULL DEFAULT 30000,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                created_time TEXT NOT NULL DEFAULT '',
-                updated_time TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            CREATE TABLE test_config_ai_binding_table (
-                binding_id INTEGER PRIMARY KEY,
-                config_id INTEGER NOT NULL UNIQUE REFERENCES test_config_table(config_id) ON DELETE CASCADE,
-                enabled INTEGER NOT NULL DEFAULT 0,
-                toolchain_id TEXT REFERENCES ai_toolchain_table(toolchain_id) ON DELETE SET NULL,
-                timeout_ms INTEGER,
-                analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0,
-                params_json TEXT NOT NULL DEFAULT '{}',
-                updated_time TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            CREATE TABLE ai_execution_table (
-                execution_id INTEGER PRIMARY KEY,
-                config_id INTEGER NOT NULL,
-                toolchain_id TEXT,
-                status TEXT NOT NULL DEFAULT 'pending',
-                started_at TEXT,
-                finished_at TEXT,
-                latency_ms INTEGER,
-                score REAL,
-                error_message TEXT,
-                result_json TEXT NOT NULL DEFAULT '{}',
-                input_hash TEXT,
-                created_time TEXT NOT NULL DEFAULT '',
-                updated_time TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            CREATE TABLE channel_config_table (
-                channel_id INTEGER PRIMARY KEY,
-                config_id INTEGER NOT NULL,
-                channel_index INTEGER NOT NULL DEFAULT 0,
-                channel_name TEXT NOT NULL DEFAULT '',
-                ai_enabled INTEGER NOT NULL DEFAULT 0,
-                limit_enabled INTEGER NOT NULL DEFAULT 0,
-                created_time TEXT NOT NULL DEFAULT '',
-                updated_time TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            INSERT INTO test_config_table (
-                config_id,
-                config_name,
-                record_duration,
-                analysis_duration,
-                scan_triggers_test,
-                created_time,
-                updated_time
-            ) VALUES (1, 'Legacy Config', 5.0, 3.0, 0, '', '')
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            INSERT INTO test_config_ai_binding_table (
-                binding_id,
-                config_id,
-                enabled,
-                timeout_ms,
-                analysis_window_offset_ms,
-                params_json,
-                updated_time
-            ) VALUES (1, 1, 1, NULL, 250, '{}', '')
-            """
-        )
-        tmp_db.close()
-
-        svc.connect()
-
-        cursor = tmp_db.execute_sql(
-            "SELECT analysis_window_offset_ms FROM test_config_table WHERE config_id = 1"
-        )
-        assert cursor.fetchone()[0] == 250
-        cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_ai_binding_table)")
-        assert "analysis_window_offset_ms" not in {row[1] for row in cursor.fetchall()}
-
-        tmp_db.execute_sql(
-            "UPDATE test_config_table SET analysis_window_offset_ms = 0 WHERE config_id = 1"
-        )
-
-        svc.close()
-        svc.connect()
-
-        cursor = tmp_db.execute_sql(
-            "SELECT analysis_window_offset_ms FROM test_config_table WHERE config_id = 1"
-        )
-        assert cursor.fetchone()[0] == 0
-
-        svc.close()
-        tmp_db.close()
-    finally:
-        try:
-            os.unlink(db_path)
-        except OSError:
-            pass
-
-
-def test_migrate_does_not_overwrite_existing_analysis_window_offset_when_marker_missing(
-    monkeypatch,
-):
-    """connect() must preserve config-owned offsets when the config column already exists."""
-    fd, db_path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    try:
-        tmp_db = SqliteDatabase(db_path, pragmas={"foreign_keys": 1})
-        import model.base_mode as base_mod
-
-        monkeypatch.setattr(base_mod, "db", tmp_db)
-
-        from app.service.db_connection_service import DbConnectionService
-
-        svc = DbConnectionService()
-        import app.service.db_connection_service as svc_mod
-
-        monkeypatch.setattr(svc_mod, "db", tmp_db)
-
-        _bind_all_models(tmp_db)
-
-        tmp_db.connect()
-        tmp_db.execute_sql(
-            """
-            CREATE TABLE test_config_table (
-                config_id INTEGER PRIMARY KEY,
-                config_name TEXT NOT NULL UNIQUE,
-                record_duration REAL NOT NULL DEFAULT 5.0,
-                analysis_duration REAL NOT NULL DEFAULT 3.0,
-                scan_triggers_test INTEGER NOT NULL DEFAULT 0,
-                plc_device_key TEXT DEFAULT NULL,
-                plc_device_label TEXT DEFAULT NULL,
-                analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0,
-                created_time TEXT NOT NULL DEFAULT '',
-                updated_time TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            CREATE TABLE ai_toolchain_table (
-                toolchain_id TEXT PRIMARY KEY,
-                display_name TEXT NOT NULL,
-                version TEXT NOT NULL DEFAULT '',
-                entrypoint TEXT NOT NULL,
-                default_timeout_ms INTEGER NOT NULL DEFAULT 30000,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                created_time TEXT NOT NULL DEFAULT '',
-                updated_time TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            CREATE TABLE test_config_ai_binding_table (
-                binding_id INTEGER PRIMARY KEY,
-                config_id INTEGER NOT NULL UNIQUE REFERENCES test_config_table(config_id) ON DELETE CASCADE,
-                enabled INTEGER NOT NULL DEFAULT 0,
-                toolchain_id TEXT REFERENCES ai_toolchain_table(toolchain_id) ON DELETE SET NULL,
-                timeout_ms INTEGER,
-                analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0,
-                params_json TEXT NOT NULL DEFAULT '{}',
-                updated_time TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            INSERT INTO test_config_table (
-                config_id,
-                config_name,
-                record_duration,
-                analysis_duration,
-                scan_triggers_test,
-                plc_device_key,
-                plc_device_label,
-                analysis_window_offset_ms,
-                created_time,
-                updated_time
-            ) VALUES (1, 'Config-Owned Offset', 5.0, 3.0, 0, 'plc-a', 'PLC A', 500, '', '')
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            INSERT INTO test_config_ai_binding_table (
-                binding_id,
-                config_id,
-                enabled,
-                timeout_ms,
-                analysis_window_offset_ms,
-                params_json,
-                updated_time
-            ) VALUES (1, 1, 1, NULL, 250, '{}', '')
-            """
-        )
-        tmp_db.close()
-
-        svc.connect()
-
-        cursor = tmp_db.execute_sql(
-            "SELECT analysis_window_offset_ms FROM test_config_table WHERE config_id = 1"
-        )
-        assert cursor.fetchone()[0] == 500
-        cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_ai_binding_table)")
-        assert "analysis_window_offset_ms" not in {row[1] for row in cursor.fetchall()}
-
-        marker_row = tmp_db.execute_sql(
-            "SELECT 1 FROM migration_marker_table WHERE marker_key = ?",
-            (svc._ANALYSIS_OFFSET_BACKFILL_MARKER,),
-        ).fetchone()
-        assert marker_row == (1,)
-
-        svc.close()
-        tmp_db.close()
-    finally:
-        try:
-            os.unlink(db_path)
-        except OSError:
-            pass
-
-
-def test_migrate_preserves_existing_zero_analysis_window_offset_when_marker_missing(
-    monkeypatch,
-):
-    """connect() must preserve config-owned zero offsets when the marker is missing."""
-    fd, db_path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    try:
-        tmp_db = SqliteDatabase(db_path, pragmas={"foreign_keys": 1})
-        import model.base_mode as base_mod
-
-        monkeypatch.setattr(base_mod, "db", tmp_db)
-
-        from app.service.db_connection_service import DbConnectionService
-
-        svc = DbConnectionService()
-        import app.service.db_connection_service as svc_mod
-
-        monkeypatch.setattr(svc_mod, "db", tmp_db)
-
-        _bind_all_models(tmp_db)
-
-        tmp_db.connect()
-        tmp_db.execute_sql(
-            """
-            CREATE TABLE test_config_table (
-                config_id INTEGER PRIMARY KEY,
-                config_name TEXT NOT NULL UNIQUE,
-                record_duration REAL NOT NULL DEFAULT 5.0,
-                analysis_duration REAL NOT NULL DEFAULT 3.0,
-                scan_triggers_test INTEGER NOT NULL DEFAULT 0,
-                plc_device_key TEXT DEFAULT NULL,
-                plc_device_label TEXT DEFAULT NULL,
-                analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0,
-                created_time TEXT NOT NULL DEFAULT '',
-                updated_time TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            CREATE TABLE ai_toolchain_table (
-                toolchain_id TEXT PRIMARY KEY,
-                display_name TEXT NOT NULL,
-                version TEXT NOT NULL DEFAULT '',
-                entrypoint TEXT NOT NULL,
-                default_timeout_ms INTEGER NOT NULL DEFAULT 30000,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                created_time TEXT NOT NULL DEFAULT '',
-                updated_time TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            CREATE TABLE test_config_ai_binding_table (
-                binding_id INTEGER PRIMARY KEY,
-                config_id INTEGER NOT NULL UNIQUE REFERENCES test_config_table(config_id) ON DELETE CASCADE,
-                enabled INTEGER NOT NULL DEFAULT 0,
-                toolchain_id TEXT REFERENCES ai_toolchain_table(toolchain_id) ON DELETE SET NULL,
-                timeout_ms INTEGER,
-                analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0,
-                params_json TEXT NOT NULL DEFAULT '{}',
-                updated_time TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            INSERT INTO test_config_table (
-                config_id,
-                config_name,
-                record_duration,
-                analysis_duration,
-                scan_triggers_test,
-                plc_device_key,
-                plc_device_label,
-                analysis_window_offset_ms,
-                created_time,
-                updated_time
-            ) VALUES (1, 'Partial Migration', 5.0, 3.0, 0, 'plc-a', 'PLC A', 0, '', '')
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            INSERT INTO test_config_ai_binding_table (
-                binding_id,
-                config_id,
-                enabled,
-                timeout_ms,
-                analysis_window_offset_ms,
-                params_json,
-                updated_time
-            ) VALUES (1, 1, 1, NULL, 250, '{}', '')
-            """
-        )
-        tmp_db.close()
-
-        svc.connect()
-
-        cursor = tmp_db.execute_sql(
-            "SELECT analysis_window_offset_ms FROM test_config_table WHERE config_id = 1"
-        )
-        assert cursor.fetchone()[0] == 0
-        cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_ai_binding_table)")
-        assert "analysis_window_offset_ms" not in {row[1] for row in cursor.fetchall()}
-
-        marker_row = tmp_db.execute_sql(
-            "SELECT 1 FROM migration_marker_table WHERE marker_key = ?",
-            (svc._ANALYSIS_OFFSET_BACKFILL_MARKER,),
-        ).fetchone()
-        assert marker_row == (1,)
-
-        svc.close()
-        tmp_db.close()
-    finally:
-        try:
-            os.unlink(db_path)
-        except OSError:
-            pass

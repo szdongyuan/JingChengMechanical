@@ -174,6 +174,20 @@ def _make_services(configs, *, validation_errors: dict[int, list[str]] | None = 
     return services
 
 
+def _make_dynamic_services(config_map, *, validate_factory_runtime=None):
+    services = MagicMock()
+    services.test = MagicMock()
+    services.test.is_running.return_value = False
+    services.config_service = MagicMock()
+    services.config_service.load_config.side_effect = lambda config_id: dict(config_map[config_id])
+    services.config_service.validate_factory_runtime.side_effect = (
+        validate_factory_runtime
+        if validate_factory_runtime is not None
+        else (lambda config: [])
+    )
+    return services
+
+
 class _DummySignal:
     def __init__(self):
         self._callbacks = []
@@ -215,6 +229,170 @@ def _assert_start_called_with(
     assert callable(kwargs["on_start_accepted"])
 
 
+def _assert_log_contains(messages: list[str], *substrings: str) -> None:
+    assert any(
+        all(substring in message for substring in substrings)
+        for message in messages
+    ), messages
+
+
+def _finish_active_run_to_reviewing(
+    controller,
+    bus,
+    *,
+    config_id: int,
+    trigger_source: str,
+    run_id: str | None = None,
+):
+    active_run_id = run_id or _run_id_for(config_id)
+    controller.handle_runtime_analyzing(
+        _make_runtime_config_payload(config_id=config_id, run_id=active_run_id)
+    )
+    bus.factory_runtime_auto_analysis_succeeded.emit(
+        _make_review_payload(
+            displayed_config_id=config_id,
+            run_id=active_run_id,
+            trigger_source=trigger_source,
+        )
+    )
+
+
+def _make_real_manager_factory_context(monkeypatch, *, save_wav_error: Exception | None = None):
+    controller_mod = _load_factory_mode_controller_module()
+
+    class FakeRecorder:
+        instances = []
+
+        def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+            self._sample_rate = float(sample_rate)
+            self._n_channels = n_channels
+            self._record_duration = float(record_duration)
+            self._buffer = np.zeros(
+                (int(self._sample_rate * self._record_duration), n_channels),
+                dtype=np.float32,
+            )
+            self._running = False
+            self.stop_calls = 0
+            self.wait_calls: list[int] = []
+            self.chunk_ready = _DummySignal()
+            self.recording_done = _DummySignal()
+            self.error_occurred = _DummySignal()
+            FakeRecorder.instances.append(self)
+
+        def isRunning(self):
+            return self._running
+
+        def start(self):
+            self._running = True
+
+        def stop(self):
+            self.stop_calls += 1
+            self._running = False
+
+        def wait(self, timeout):
+            self.wait_calls.append(timeout)
+            return True
+
+        def attach_session(self, *, record_duration):
+            return MagicMock(chunk_index=0, sample_index=0)
+
+        def get_buffer_from(self, snapshot):
+            return self._buffer
+
+    class FakeSession:
+        def __init__(self, config, bus, ai_service, mic_cal, workorder, audio_dir):
+            self.config_id = config["config_id"]
+            self._config = dict(config)
+            self._workorder = dict(workorder)
+            self._buffer = None
+            self._sample_rate = None
+            self._finished = False
+            self._attach_snapshot = None
+            self._audio_file_path = None
+            self._audio_data_id = "audio-123"
+
+        def _setup_pipelines(self):
+            return None
+
+        def prepare_for_attach(self):
+            return None
+
+        def attach_to_recorder(self, *, chunk_index, snapshot=None):
+            self._attach_snapshot = snapshot
+
+        def _on_chunk(self, *args, **kwargs):
+            return None
+
+        def _save_wav(self, *args, **kwargs):
+            if save_wav_error is not None:
+                raise save_wav_error
+            self._audio_file_path = "captured.wav"
+            return self._audio_file_path
+
+        def _run_judgment(self):
+            self._audio_file_path = "captured.wav"
+            return JudgmentResult(
+                overall="合格",
+                limit_pass=True,
+                ai_pass=True,
+                ai_score=0.91,
+                analysis_window=(1.0, 3.0),
+            )
+
+        def rejudge(self, start_sec, end_sec):
+            return JudgmentResult(
+                overall="合格",
+                limit_pass=True,
+                ai_pass=True,
+                ai_score=0.97,
+                analysis_window=(start_sec, end_sec),
+            )
+
+    monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
+    monkeypatch.setattr("app.service.analysis.test_manager.TestSession", FakeSession)
+
+    config_map = {
+        101: _make_config(101),
+        202: _make_config(202),
+    }
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    states: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    bus.factory_state_changed.connect(states.append)
+    services = MagicMock()
+    services.bus = bus
+    services.config_service = MagicMock()
+    services.config_service.load_config.side_effect = lambda config_id: dict(config_map[config_id])
+    services.config_service.validate_factory_runtime.side_effect = lambda config: []
+    services.ai_service = MagicMock()
+    services.ai_service.resolve_binding.return_value = None
+    services.hss_service = MagicMock()
+    services.hss_service.load_io_devices.return_value = {
+        "input": {
+            "id": 0,
+            "name": "Mic",
+            "type": "MME",
+            "samplerate": "100",
+            "channel_count": "1",
+        },
+        "output": {
+            "id": 1,
+            "name": "Speaker",
+            "type": "MME",
+            "samplerate": "100",
+            "channel_count": "1",
+        },
+        "mic_cal": {},
+    }
+    services.test = TestManager(bus, services)
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    return controller, services, reset_reasons, reviews, states, FakeRecorder
+
+
 def test_factory_mode_controller_starts_not_ready():
     controller_mod = _load_factory_mode_controller_module()
     state_cls = getattr(services_mod, "FactoryControllerState", None)
@@ -230,6 +408,10 @@ def test_factory_mode_controller_starts_not_ready():
     assert controller.state.displayed_config_id is None
     assert controller.state.run_phase == "not_ready"
     assert controller.state.trigger_source is None
+    assert controller.state.selection_ready is False
+    assert controller.state.selection_ready_reason == "请选择两个不同配置"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "请选择两个不同配置"
     assert controller.state.is_ready is False
 
 
@@ -245,6 +427,10 @@ def test_factory_mode_controller_owns_pair_selection_state():
     assert controller.state.selected_config_ids == (101, 202)
     assert controller.state.manual_primary_config_id == 101
     assert controller.state.run_phase == "armed"
+    assert controller.state.selection_ready is True
+    assert controller.state.selection_ready_reason is None
+    assert controller.state.start_ready is True
+    assert controller.state.start_ready_reason is None
     assert controller.state.is_ready is True
     assert states[-1] == controller.state
 
@@ -615,6 +801,100 @@ def test_factory_mode_controller_routes_scan_events(configs, manual_primary_conf
     assert controller.state.trigger_source == "scan"
 
 
+@pytest.mark.parametrize("phase", ["running", "analyzing"])
+def test_factory_mode_controller_applies_deferred_same_id_plc_refresh_after_active_phase(phase):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    config_map = {
+        101: _make_config(101),
+        202: _make_config(202),
+    }
+    services = _make_dynamic_services(config_map)
+    _accept_start(services)
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+
+    assert controller.start_manual() is True
+    services.test.start.reset_mock()
+
+    if phase == "analyzing":
+        controller.handle_runtime_analyzing(_make_runtime_config_payload(config_id=101))
+
+    config_map[202]["trigger_type"] = "plc"
+    config_map[202]["plc_device_key"] = "plc-b"
+    bus.config_changed.emit()
+
+    _finish_active_run_to_reviewing(
+        controller,
+        bus,
+        config_id=101,
+        trigger_source="manual",
+    )
+
+    accepted = controller.handle_plc_event(
+        services_mod.FactoryPlcIngressPayload(plc_device_key="plc-b")
+    )
+
+    assert accepted is True
+    _assert_start_called_with(
+        services,
+        {"config_id": 202},
+        expected_trigger_source="plc",
+    )
+    assert controller.state.active_config_id == 202
+    assert controller.state.displayed_config_id == 202
+    assert controller.state.run_phase == "running"
+    assert controller.state.trigger_source == "plc"
+
+
+@pytest.mark.parametrize("phase", ["running", "analyzing"])
+def test_factory_mode_controller_applies_deferred_runtime_revalidation_after_active_phase(
+    phase,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    config_map = {
+        101: _make_config(101),
+        202: _make_config(202),
+    }
+    services = _make_dynamic_services(
+        config_map,
+        validate_factory_runtime=lambda config: (
+            ["analysis window invalid"]
+            if config["analysis_window_offset_ms"] > 0
+            else []
+        ),
+    )
+    _accept_start(services)
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+
+    assert controller.start_manual() is True
+    services.test.start.reset_mock()
+
+    if phase == "analyzing":
+        controller.handle_runtime_analyzing(_make_runtime_config_payload(config_id=101))
+
+    config_map[202]["analysis_window_offset_ms"] = 4000
+    bus.config_changed.emit()
+
+    _finish_active_run_to_reviewing(
+        controller,
+        bus,
+        config_id=101,
+        trigger_source="manual",
+    )
+
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.selection_ready is False
+    assert controller.state.selection_ready_reason == "analysis window invalid"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "analysis window invalid"
+    assert controller.can_arm() is False
+    assert controller.start_manual() is False
+    services.test.start.assert_not_called()
+
+
 def test_factory_mode_controller_ignores_plc_and_scan_before_armed():
     controller_mod = _load_factory_mode_controller_module()
     services = _make_services(
@@ -632,6 +912,170 @@ def test_factory_mode_controller_ignores_plc_and_scan_before_armed():
     assert scan_accepted is False
     services.test.start.assert_not_called()
     assert controller.state.run_phase == "not_ready"
+
+
+def test_factory_mode_controller_logs_ignored_plc_and_scan_before_armed():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    log_messages: list[str] = []
+    bus.log.connect(log_messages.append)
+    services = _make_services(
+        (
+            _make_config(101, trigger_type="plc", plc_device_key="plc-a", scan_triggers_test=True),
+            _make_config(202, trigger_type="plc", plc_device_key="plc-b", scan_triggers_test=True),
+        )
+    )
+    controller = controller_mod.FactoryModeController(bus, services)
+
+    plc_accepted = controller.handle_plc_event(
+        services_mod.FactoryPlcIngressPayload(plc_device_key="plc-a")
+    )
+    scan_accepted = controller.handle_scan_event(
+        services_mod.FactoryScanIngressPayload(scan_text="SN-1")
+    )
+
+    assert plc_accepted is False
+    assert scan_accepted is False
+    services.test.start.assert_not_called()
+    _assert_log_contains(log_messages, "PLC", "ignored", "not armed")
+    _assert_log_contains(log_messages, "scan", "ignored", "not armed")
+
+
+@pytest.mark.parametrize("phase", ["running", "analyzing", "reanalyzing"])
+def test_factory_mode_controller_logs_and_drops_plc_and_scan_during_active_phase(phase):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    log_messages: list[str] = []
+    bus.log.connect(log_messages.append)
+    services = _make_services(
+        (
+            _make_config(101, trigger_type="plc", plc_device_key="plc-a", scan_triggers_test=True),
+            _make_config(202, trigger_type="plc", plc_device_key="plc-b", scan_triggers_test=True),
+        )
+    )
+    _accept_start(services)
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+
+    assert controller.start_manual({"sn": "SN-1"}) is True
+    active_run_id = _run_id_for(101)
+    if phase == "analyzing":
+        controller.handle_runtime_analyzing(
+            _make_runtime_config_payload(config_id=101, run_id=active_run_id)
+        )
+    elif phase == "reanalyzing":
+        _finish_active_run_to_reviewing(
+            controller,
+            bus,
+            config_id=101,
+            trigger_source="manual",
+            run_id=active_run_id,
+        )
+        assert controller.begin_reanalysis(1.0, 3.0) is True
+
+    services.test.start.reset_mock()
+    log_messages.clear()
+
+    plc_accepted = controller.handle_plc_event(
+        services_mod.FactoryPlcIngressPayload(plc_device_key="plc-b")
+    )
+    scan_accepted = controller.handle_scan_event(
+        services_mod.FactoryScanIngressPayload(scan_text="SN-2")
+    )
+
+    assert plc_accepted is False
+    assert scan_accepted is False
+    services.test.start.assert_not_called()
+    _assert_log_contains(log_messages, "PLC", "ignored", phase)
+    _assert_log_contains(log_messages, "scan", "ignored", phase)
+
+    if phase == "reanalyzing":
+        controller.finish_reanalysis_success(
+            _make_review_payload(
+                displayed_config_id=101,
+                run_id=active_run_id,
+                trigger_source="manual",
+            )
+        )
+    elif phase == "analyzing":
+        _finish_active_run_to_reviewing(
+            controller,
+            bus,
+            config_id=101,
+            trigger_source="manual",
+            run_id=active_run_id,
+        )
+
+    assert controller.state.run_phase == "reviewing" if phase != "running" else controller.state.run_phase == "running"
+    services.test.start.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("configs", "plc_device_key"),
+    [
+        (
+            (
+                _make_config(101, trigger_type="plc", plc_device_key="plc-a"),
+                _make_config(202, trigger_type="plc", plc_device_key="plc-b"),
+            ),
+            "plc-missing",
+        ),
+        (
+            (
+                _make_config(101, trigger_type="button", plc_device_key="plc-a"),
+                _make_config(202, trigger_type="plc", plc_device_key=""),
+            ),
+            "plc-a",
+        ),
+    ],
+)
+def test_factory_mode_controller_logs_ignored_plc_no_match_for_current_pair(
+    configs,
+    plc_device_key,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    log_messages: list[str] = []
+    bus.log.connect(log_messages.append)
+    services = _make_dynamic_services(
+        {config["config_id"]: dict(config) for config in configs},
+        validate_factory_runtime=lambda config: [],
+    )
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+
+    accepted = controller.handle_plc_event(
+        services_mod.FactoryPlcIngressPayload(plc_device_key=plc_device_key)
+    )
+
+    assert controller.state.run_phase == "armed"
+    assert accepted is False
+    services.test.start.assert_not_called()
+    _assert_log_contains(log_messages, "PLC", "ignored", "no match")
+
+
+def test_factory_mode_controller_logs_ignored_scan_no_match_for_current_pair():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    log_messages: list[str] = []
+    bus.log.connect(log_messages.append)
+    services = _make_services(
+        (
+            _make_config(101, scan_triggers_test=False),
+            _make_config(202, scan_triggers_test=False),
+        )
+    )
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+
+    accepted = controller.handle_scan_event(
+        services_mod.FactoryScanIngressPayload(scan_text="SN-404")
+    )
+
+    assert controller.state.run_phase == "armed"
+    assert accepted is False
+    services.test.start.assert_not_called()
+    _assert_log_contains(log_messages, "scan", "ignored", "no match")
 
 
 @pytest.mark.parametrize("start_kind", ["manual", "plc", "scan"])
@@ -821,6 +1265,8 @@ def test_factory_mode_controller_ignores_stale_same_config_start_acceptance_call
 
 def test_factory_mode_controller_treats_pending_start_as_busy_until_acceptance():
     controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    states: list[object] = []
     services = _make_services(
         (
             _make_config(101, trigger_type="plc", plc_device_key="plc-a", scan_triggers_test=True),
@@ -837,10 +1283,20 @@ def test_factory_mode_controller_treats_pending_start_as_busy_until_acceptance()
         return True
 
     services.test.start.side_effect = _capture_start
-    controller = controller_mod.FactoryModeController(EventBus(), services)
+    bus.factory_state_changed.connect(states.append)
+    controller = controller_mod.FactoryModeController(bus, services)
     controller.set_selection((101, 202), manual_primary_config_id=101)
+    states.clear()
 
     assert controller.start_manual({"sn": "first"}) is True
+    assert len(states) == 1
+    assert states[0] == controller.state
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.run_phase == "armed"
+    assert controller.state.trigger_source is None
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "启动请求处理中"
     assert controller.can_arm() is False
     assert controller.start_manual({"sn": "second"}) is False
     assert controller.handle_plc_event(
@@ -854,10 +1310,157 @@ def test_factory_mode_controller_treats_pending_start_as_busy_until_acceptance()
 
     callbacks[0](_run_id_for(101))
 
+    assert len(states) == 2
+    assert states[-1] == controller.state
     assert controller.state.active_config_id == 101
     assert controller.state.displayed_config_id == 101
     assert controller.state.run_phase == "running"
     assert controller.state.trigger_source == "manual"
+
+
+def test_factory_mode_controller_same_id_invalidating_refresh_stales_pending_manual_start():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    states: list[object] = []
+    callbacks: list[object] = []
+    accepted_payloads: list[object] = []
+    config_map = {
+        101: _make_config(101),
+        202: _make_config(202),
+    }
+    services = _make_dynamic_services(
+        config_map,
+        validate_factory_runtime=lambda config: (
+            ["analysis window invalid"]
+            if config["analysis_window_offset_ms"] > 0
+            else []
+        ),
+    )
+
+    def _capture_start(payload, *, on_start_accepted=None):
+        assert payload["config_id"] == 101
+        assert payload["trigger_source"] == "manual"
+        assert callable(on_start_accepted)
+        callbacks.append(on_start_accepted)
+        return True
+
+    services.test.start.side_effect = _capture_start
+    bus.factory_state_changed.connect(states.append)
+    bus.factory_runtime_start_accepted.connect(accepted_payloads.append)
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    states.clear()
+
+    assert controller.start_manual({"sn": "SN-1"}) is True
+    assert controller._pending_start == (101, "manual")
+    assert controller._pending_start_request_id
+
+    config_map[202]["analysis_window_offset_ms"] = 4000
+    bus.config_changed.emit()
+
+    assert controller.state.selected_config_ids == (101, 202)
+    assert controller.state.manual_primary_config_id == 101
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.run_phase == "not_ready"
+    assert controller.state.trigger_source is None
+    assert controller._pending_start is None
+    assert controller._pending_start_request_id is None
+    assert controller.can_arm() is False
+    assert len(states) == 2
+    assert states[0].selected_config_ids == (101, 202)
+    assert states[0].manual_primary_config_id == 101
+    assert states[0].active_config_id is None
+    assert states[0].displayed_config_id is None
+    assert states[0].run_phase == "armed"
+    assert states[0].trigger_source is None
+    assert states[0].start_ready is False
+    assert states[0].start_ready_reason == "启动请求处理中"
+    assert states[1] == controller.state
+    assert accepted_payloads == []
+
+    callbacks[0](_run_id_for(101))
+
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.run_phase == "not_ready"
+    assert controller.state.trigger_source is None
+    assert controller._pending_start is None
+    assert controller._pending_start_request_id is None
+    assert len(states) == 2
+    assert states[1] == controller.state
+    assert accepted_payloads == []
+
+
+def test_factory_mode_controller_same_id_valid_refresh_keeps_pending_manual_start():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    states: list[object] = []
+    callbacks: list[object] = []
+    accepted_payloads: list[object] = []
+    config_map = {
+        101: _make_config(101),
+        202: _make_config(202),
+    }
+    services = _make_dynamic_services(config_map)
+
+    def _capture_start(payload, *, on_start_accepted=None):
+        assert payload["config_id"] == 101
+        assert payload["trigger_source"] == "manual"
+        assert callable(on_start_accepted)
+        callbacks.append(on_start_accepted)
+        return True
+
+    services.test.start.side_effect = _capture_start
+    bus.factory_state_changed.connect(states.append)
+    bus.factory_runtime_start_accepted.connect(accepted_payloads.append)
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    states.clear()
+
+    assert controller.start_manual({"sn": "SN-1"}) is True
+    pending_request_id = controller._pending_start_request_id
+    assert pending_request_id
+
+    config_map[202]["config_name"] = "Config 202 Updated"
+    bus.config_changed.emit()
+
+    assert controller.state.selected_config_ids == (101, 202)
+    assert controller.state.manual_primary_config_id == 101
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.run_phase == "armed"
+    assert controller.state.trigger_source is None
+    assert controller._pending_start == (101, "manual")
+    assert controller._pending_start_request_id == pending_request_id
+    assert controller.can_arm() is False
+    assert len(states) == 2
+    assert states[0].selected_config_ids == (101, 202)
+    assert states[0].manual_primary_config_id == 101
+    assert states[0].active_config_id is None
+    assert states[0].displayed_config_id is None
+    assert states[0].run_phase == "armed"
+    assert states[0].trigger_source is None
+    assert states[0].start_ready is False
+    assert states[0].start_ready_reason == "启动请求处理中"
+    assert states[1] == controller.state
+    assert accepted_payloads == []
+    services.test.cancel_pending_start.assert_not_called()
+
+    callbacks[0](_run_id_for(101))
+
+    assert controller.state.active_config_id == 101
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "running"
+    assert controller.state.trigger_source == "manual"
+    assert controller._pending_start is None
+    assert controller._pending_start_request_id is None
+    assert len(states) == 3
+    assert states[2] == controller.state
+    assert len(accepted_payloads) == 1
+    assert accepted_payloads[0].config_id == 101
+    assert accepted_payloads[0].run_id == _run_id_for(101)
+    assert accepted_payloads[0].trigger_source == "manual"
 
 
 def test_factory_mode_controller_selection_change_cancels_pending_start_acceptance():
@@ -909,7 +1512,16 @@ def test_factory_mode_controller_selection_change_cancels_pending_start_acceptan
     assert controller.state.run_phase == "armed"
     assert controller.state.trigger_source is None
     assert controller.can_arm() is True
-    assert states == [controller.state]
+    assert len(states) == 2
+    assert states[0].selected_config_ids == (101, 202)
+    assert states[0].manual_primary_config_id == 101
+    assert states[0].active_config_id is None
+    assert states[0].displayed_config_id is None
+    assert states[0].run_phase == "armed"
+    assert states[0].trigger_source is None
+    assert states[0].start_ready is False
+    assert states[0].start_ready_reason == "启动请求处理中"
+    assert states[1] == controller.state
 
     callbacks[0](_run_id_for(101))
 
@@ -920,7 +1532,8 @@ def test_factory_mode_controller_selection_change_cancels_pending_start_acceptan
     assert controller.state.run_phase == "armed"
     assert controller.state.trigger_source is None
     assert controller.can_arm() is True
-    assert states == [controller.state]
+    assert len(states) == 2
+    assert states[1] == controller.state
 
 
 def test_factory_mode_controller_stop_cancels_pending_start_and_preserves_review_state():
@@ -982,7 +1595,16 @@ def test_factory_mode_controller_stop_cancels_pending_start_and_preserves_review
     assert controller.can_arm() is True
     assert reset_reasons == []
     assert reviews == []
-    assert states == []
+    assert len(states) == 2
+    assert states[0].selected_config_ids == original_state.selected_config_ids
+    assert states[0].manual_primary_config_id == original_state.manual_primary_config_id
+    assert states[0].active_config_id == original_state.active_config_id
+    assert states[0].displayed_config_id == original_state.displayed_config_id
+    assert states[0].run_phase == original_state.run_phase
+    assert states[0].trigger_source == original_state.trigger_source
+    assert states[0].start_ready is False
+    assert states[0].start_ready_reason == "启动请求处理中"
+    assert states[1] == original_state
     assert accepted_payloads == []
 
     callbacks[0](_run_id_for(101))
@@ -991,7 +1613,8 @@ def test_factory_mode_controller_stop_cancels_pending_start_and_preserves_review
     assert controller.review_payload == original_review_payload
     assert reset_reasons == []
     assert reviews == []
-    assert states == []
+    assert len(states) == 2
+    assert states[1] == original_state
     assert accepted_payloads == []
 
 
@@ -1111,7 +1734,16 @@ def test_factory_mode_controller_consumes_validated_start_acceptance_via_event_b
     assert controller.state.displayed_config_id == 101
     assert controller.state.run_phase == "running"
     assert controller.state.trigger_source == "manual"
-    assert states == [controller.state]
+    assert len(states) == 2
+    assert states[0].selected_config_ids == (101, 202)
+    assert states[0].manual_primary_config_id == 101
+    assert states[0].active_config_id is None
+    assert states[0].displayed_config_id is None
+    assert states[0].run_phase == "armed"
+    assert states[0].trigger_source is None
+    assert states[0].start_ready is False
+    assert states[0].start_ready_reason == "启动请求处理中"
+    assert states[1] == controller.state
 
 
 def test_factory_mode_controller_ignores_stale_public_start_accepted_emit_for_same_config_new_request():
@@ -2134,3 +2766,59 @@ def test_factory_mode_controller_consumes_real_test_manager_lifecycle_signals(mo
         "reanalyzing",
         "reviewing",
     ]
+
+
+def test_factory_mode_controller_direct_backend_stop_unwinds_real_manager_run(monkeypatch):
+    controller, services, reset_reasons, reviews, _, recorder_cls = _make_real_manager_factory_context(
+        monkeypatch
+    )
+
+    started = controller.start_manual({"sn": "SN-1"})
+
+    assert started is True
+    assert controller.state.run_phase == "running"
+
+    reset_reasons.clear()
+    reviews.clear()
+
+    services.test.stop(config_id=101)
+
+    assert services.test.is_running(config_id=101) is False
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.run_phase == "armed"
+    assert controller.state.trigger_source is None
+    assert reset_reasons == ["runtime_aborted"]
+    assert reviews == [services_mod.FactoryReviewPayload()]
+    assert recorder_cls.instances[0].stop_calls == 1
+    assert recorder_cls.instances[0].wait_calls == [3000]
+
+
+def test_factory_mode_controller_stop_active_run_remains_clean_when_partial_save_fails(
+    monkeypatch,
+):
+    controller, services, reset_reasons, reviews, _, recorder_cls = _make_real_manager_factory_context(
+        monkeypatch,
+        save_wav_error=RuntimeError("disk full"),
+    )
+
+    started = controller.start_manual({"sn": "SN-1"})
+
+    assert started is True
+    assert controller.state.run_phase == "running"
+
+    reset_reasons.clear()
+    reviews.clear()
+
+    stopped = controller.stop_active_run()
+
+    assert stopped is True
+    assert services.test.is_running(config_id=101) is False
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.run_phase == "armed"
+    assert controller.state.trigger_source is None
+    assert reset_reasons == ["active_run_stopped"]
+    assert reviews == [services_mod.FactoryReviewPayload()]
+    assert recorder_cls.instances[0].stop_calls == 1
+    assert recorder_cls.instances[0].wait_calls == [3000]

@@ -1,6 +1,7 @@
 """Tests for TestManager (replaces fake TestService)."""
 from __future__ import annotations
 
+from typing import get_type_hints
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -51,6 +52,149 @@ class _FakeSession:
 
     def _save_wav(self, *args, **kwargs):
         return None
+
+
+def _factory_runtime_config(config_id: int = 1) -> dict:
+    return {
+        "config_id": config_id,
+        "config_name": "Test",
+        "record_duration": 2.0,
+        "analysis_duration": 1.0,
+        "analysis_window_offset_ms": 0,
+        "selected_channels": [0],
+        "channels": [{
+            "channel_index": 0,
+            "stft_nfft": 1024,
+            "stft_overlap": 0.5,
+            "spl_weighting": "Z",
+            "spl_time_constant": 0.125,
+            "spl_upper_limit": 85.0,
+            "spl_lower_limit": 40.0,
+            "fft_band_limits": [],
+            "oct_weighting": "Z",
+            "oct_band_limits": [],
+        }],
+        "input_device_name": "InputMic",
+        "input_device_hostapi": "InputAPI",
+        "input_device_samplerate": 44100,
+        "output_device_name": "OutputSpeaker",
+        "output_device_hostapi": "OutputAPI",
+        "output_device_samplerate": 48000,
+    }
+
+
+def _make_running_factory_manager(monkeypatch, *, save_wav_error: Exception | None = None):
+    bus = _mock_bus()
+    services = _mock_services(bus)
+    services.config_service.load_config.return_value = _factory_runtime_config()
+
+    partial_buf = np.arange(20, dtype=np.float32).reshape(20, 1)
+
+    class FakeRecorder:
+        instances = []
+
+        def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+            self.device_name = device_name
+            self.hostapi = hostapi
+            self._sample_rate = sample_rate
+            self._n_channels = n_channels
+            self._record_duration = record_duration
+            self._buffer = partial_buf
+            self.chunk_ready = _DummySignal()
+            self.recording_done = _DummySignal()
+            self.error_occurred = _DummySignal()
+            self._running = False
+            self.stop_calls = 0
+            self.wait_calls = []
+            self.attach_calls = []
+            self.get_buffer_from_calls = []
+            FakeRecorder.instances.append(self)
+
+        def isRunning(self):
+            return self._running
+
+        def start(self):
+            self._running = True
+
+        def stop(self):
+            self.stop_calls += 1
+            self._running = False
+
+        def wait(self, timeout):
+            self.wait_calls.append(timeout)
+            return True
+
+        def attach_session(self, *, record_duration):
+            self.attach_calls.append(record_duration)
+            return MagicMock(chunk_index=0, sample_index=0)
+
+        def get_buffer_from(self, snapshot):
+            self.get_buffer_from_calls.append(snapshot)
+            return self._buffer
+
+    class FakeMonitor:
+        instances = []
+
+        def __init__(self, *, device_name, hostapi, sample_rate, monitor_channel):
+            self.device_name = device_name
+            self.hostapi = hostapi
+            self.sample_rate = sample_rate
+            self.monitor_channel = monitor_channel
+            self.error_occurred = _DummySignal()
+            self.stop_calls = 0
+            self.wait_calls = []
+            self.start_calls = 0
+            FakeMonitor.instances.append(self)
+
+        def feed(self, chunk):
+            return None
+
+        def start(self):
+            self.start_calls += 1
+
+        def stop(self):
+            self.stop_calls += 1
+
+        def wait(self, timeout):
+            self.wait_calls.append(timeout)
+            return True
+
+    class FakeSession(_FakeSession):
+        instances = []
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.saved_wavs = []
+            FakeSession.instances.append(self)
+
+        def _save_wav(self, buf, sample_rate):
+            self.saved_wavs.append((buf.copy(), sample_rate))
+            if save_wav_error is not None:
+                raise save_wav_error
+
+    monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
+    monkeypatch.setattr("app.service.analysis.test_manager.AudioMonitor", FakeMonitor)
+    monkeypatch.setattr("app.service.analysis.test_manager.TestSession", FakeSession)
+
+    mgr = TestManager(bus, services)
+
+    started = mgr.start({"config_id": 1, "sn": "SN1", "trigger_source": "manual"})
+
+    assert started is True
+    assert mgr.is_running(config_id=1) is True
+    assert len(FakeSession.instances) == 1
+    assert len(FakeRecorder.instances) == 1
+    assert len(FakeMonitor.instances) == 1
+
+    return (
+        bus,
+        services,
+        mgr,
+        FakeSession.instances[0],
+        FakeRecorder.instances[0],
+        FakeMonitor.instances[0],
+        partial_buf,
+    )
 
 
 def _mock_bus():
@@ -127,6 +271,11 @@ class TestTestManagerInit:
 
 
 class TestTestManagerStartStop:
+    def test_factory_runtime_abort_payload_helper_accepts_optional_error_message(self):
+        hints = get_type_hints(TestManager._make_factory_runtime_abort_payload)
+
+        assert hints["error_message"] == str | None
+
     def test_start_passes_input_device_identity_to_recorder(self, monkeypatch):
         bus = _mock_bus()
         services = _mock_services(bus)
@@ -962,19 +1111,33 @@ class TestTestManagerStartStop:
         mgr.stop()
         assert mgr.is_running() is False
 
-    def test_stop_by_config_id(self):
-        bus = _mock_bus()
-        services = _mock_services(bus)
-        mgr = TestManager(bus, services)
-        mock_session1 = MagicMock()
-        mock_session1.config_id = 1
-        mock_session2 = MagicMock()
-        mock_session2.config_id = 2
-        mgr._sessions = {1: mock_session1, 2: mock_session2}
-        mgr._recorders = {1: MagicMock(), 2: MagicMock()}
+    def test_stop_by_config_id_emits_factory_abort_payload_and_clears_active_runtime(self, monkeypatch):
+        bus, _, mgr, session, recorder, monitor, partial_buf = _make_running_factory_manager(
+            monkeypatch
+        )
+
+        factory_run_id = session._workorder["factory_run_id"]
+
         mgr.stop(config_id=1)
-        assert 1 not in mgr._sessions
-        assert 2 in mgr._sessions
+
+        abort_payload = bus.factory_runtime_aborted.emit.call_args.args[0]
+        assert abort_payload.config_id == 1
+        assert abort_payload.run_id == factory_run_id
+        assert abort_payload.trigger_source == "manual"
+        assert abort_payload.error_message is None
+        assert mgr.is_running(config_id=1) is False
+        assert mgr._sessions == {}
+        assert mgr._recorders == {}
+        assert mgr._monitors == {}
+        assert mgr._shared_recorders == {}
+        assert mgr._completed_sessions == {}
+        assert recorder.get_buffer_from_calls == [session._attach_snapshot]
+        np.testing.assert_array_equal(session._buffer, partial_buf)
+        assert session._sample_rate == recorder._sample_rate
+        assert recorder.stop_calls == 1
+        assert recorder.wait_calls == [3000]
+        assert monitor.stop_calls == 1
+        assert monitor.wait_calls == [1000]
 
     def test_stop_with_bool_from_clicked_stops_all(self):
         """QPushButton.clicked emits bool. stop() should treat it as stop-all."""
@@ -988,19 +1151,38 @@ class TestTestManagerStartStop:
         mgr.stop(False)
         assert mgr.is_running() is False
 
-    def test_stop_active_run_returns_true_when_factory_run_is_stopped(self):
-        bus = _mock_bus()
-        services = _mock_services(bus)
-        mgr = TestManager(bus, services)
-        session = MagicMock()
-        session.config_id = 1
-        mgr._sessions[1] = session
-        mgr._recorders[1] = MagicMock()
+    def test_stop_active_run_remains_cleanup_safe_when_partial_save_wav_fails(self, monkeypatch):
+        save_error = RuntimeError("disk full")
+        bus, _, mgr, session, recorder, monitor, partial_buf = _make_running_factory_manager(
+            monkeypatch,
+            save_wav_error=save_error,
+        )
 
         stopped = mgr.stop_active_run(config_id=1)
 
         assert stopped is True
         assert mgr.is_running(config_id=1) is False
+        assert mgr._sessions == {}
+        assert mgr._recorders == {}
+        assert mgr._monitors == {}
+        assert mgr._shared_recorders == {}
+        assert recorder.get_buffer_from_calls == [session._attach_snapshot]
+        np.testing.assert_array_equal(session._buffer, partial_buf)
+        assert session._sample_rate == recorder._sample_rate
+        assert len(session.saved_wavs) == 1
+        saved_buf, saved_sample_rate = session.saved_wavs[0]
+        np.testing.assert_array_equal(saved_buf, partial_buf)
+        assert saved_sample_rate == recorder._sample_rate
+        assert recorder.stop_calls == 1
+        assert recorder.wait_calls == [3000]
+        assert monitor.stop_calls == 1
+        assert monitor.wait_calls == [1000]
+        bus.factory_runtime_aborted.emit.assert_not_called()
+        assert any(
+            "ERROR saving partial recording for config=1: disk full" in call.args[0]
+            for call in bus.log.emit.call_args_list
+        )
+        bus.status.emit.assert_any_call("Stopped")
 
     def test_stop_active_run_returns_false_when_factory_run_is_missing(self):
         bus = _mock_bus()

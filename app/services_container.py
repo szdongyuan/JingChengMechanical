@@ -19,10 +19,84 @@ class FactoryControllerState:
     displayed_config_id: int | None = None
     run_phase: str = "not_ready"
     trigger_source: str | None = None
+    selection_ready: bool | None = None
+    selection_ready_reason: str | None = None
+    start_ready: bool | None = None
+    start_ready_reason: str | None = None
+
+    _BLOCKED_START_PHASE_REASONS = {
+        "running": "当前测试运行中",
+        "analyzing": "当前测试分析中",
+        "reanalyzing": "当前正在重新分析",
+    }
+
+    def __post_init__(self):
+        selection_ready = self.selection_ready
+        selection_ready_reason = self.selection_ready_reason
+        start_ready = self.start_ready
+        start_ready_reason = self.start_ready_reason
+
+        if selection_ready is None:
+            selection_ready, derived_reason = self._derive_selection_readiness()
+            if selection_ready_reason is None:
+                selection_ready_reason = derived_reason
+        elif not selection_ready and selection_ready_reason is None:
+            _, selection_ready_reason = self._derive_selection_readiness()
+
+        if start_ready is None:
+            start_ready, derived_reason = self._derive_start_readiness(
+                selection_ready=bool(selection_ready),
+                selection_ready_reason=selection_ready_reason,
+            )
+            if start_ready_reason is None:
+                start_ready_reason = derived_reason
+        elif not start_ready and start_ready_reason is None:
+            _, start_ready_reason = self._derive_start_readiness(
+                selection_ready=bool(selection_ready),
+                selection_ready_reason=selection_ready_reason,
+            )
+
+        object.__setattr__(self, "selection_ready", bool(selection_ready))
+        object.__setattr__(
+            self,
+            "selection_ready_reason",
+            None if selection_ready else selection_ready_reason,
+        )
+        object.__setattr__(self, "start_ready", bool(start_ready))
+        object.__setattr__(
+            self,
+            "start_ready_reason",
+            None if start_ready else start_ready_reason,
+        )
+
+    def _derive_selection_readiness(self) -> tuple[bool, str | None]:
+        selected = tuple(self.selected_config_ids)
+        if len(selected) < 2 or len(set(selected)) < 2:
+            return False, "请选择两个不同配置"
+        if self.manual_primary_config_id not in selected:
+            return False, "请先选择手动主配置"
+        if self.run_phase == "not_ready":
+            return False, "工厂模式未就绪"
+        return True, None
+
+    def _derive_start_readiness(
+        self,
+        *,
+        selection_ready: bool,
+        selection_ready_reason: str | None,
+    ) -> tuple[bool, str | None]:
+        blocked_phase_reason = self._BLOCKED_START_PHASE_REASONS.get(self.run_phase)
+        if blocked_phase_reason is not None:
+            return False, blocked_phase_reason
+        if not selection_ready:
+            return False, selection_ready_reason
+        if self.run_phase not in {"armed", "reviewing"}:
+            return False, "工厂模式未就绪"
+        return True, None
 
     @property
     def is_ready(self) -> bool:
-        return self.run_phase != "not_ready"
+        return self.selection_ready
 
 
 @dataclass(frozen=True)
@@ -103,10 +177,10 @@ class EventBus(QObject):
 
     # ── Analysis kernel real-time signals ──
     # Real-time analysis frames (~20 Hz per channel)
-    stft_updated = pyqtSignal(int, int, object)     # config_id, channel_idx, StftFrame
-    spl_updated = pyqtSignal(int, int, object)      # config_id, channel_idx, SplFrame
-    octave_updated = pyqtSignal(int, int, object)   # config_id, channel_idx, OctaveFrame
-    fft_updated = pyqtSignal(int, int, object)      # config_id, channel_idx, FftFrame
+    stft_updated = pyqtSignal(int, str, int, object)     # config_id, run_id, channel_idx, StftFrame
+    spl_updated = pyqtSignal(int, str, int, object)      # config_id, run_id, channel_idx, SplFrame
+    octave_updated = pyqtSignal(int, str, int, object)   # config_id, run_id, channel_idx, OctaveFrame
+    fft_updated = pyqtSignal(int, str, int, object)      # config_id, run_id, channel_idx, FftFrame
 
     # Session lifecycle
     recording_progress = pyqtSignal(int, float)     # config_id, elapsed_sec
