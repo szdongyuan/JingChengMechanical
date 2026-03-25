@@ -153,6 +153,20 @@ def test_save_config_blank_plc_metadata_persists_none():
     assert row.plc_device_label is None
 
 
+def test_load_config_normalizes_direct_row_plc_metadata():
+    svc = _service()
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        plc_device_key="  PLC-A  ",
+        plc_device_label="   ",
+    )
+
+    loaded = svc.load_config(cfg.config_id)
+
+    assert loaded["plc_device_key"] == "PLC-A"
+    assert loaded["plc_device_label"] is None
+
+
 def test_legacy_fallback_infers_selected_channels():
     svc = _service()
     cfg = ConfigTable.create(config_name="Cfg1", selected_channels="[]")
