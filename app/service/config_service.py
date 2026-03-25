@@ -4,7 +4,6 @@ import json
 
 from peewee import IntegrityError
 
-from model.base_mode import db
 from model.test_config_table import TestConfigTable
 from model.channel_config_table import ChannelConfigTable
 from model.device_table import DeviceTable
@@ -51,7 +50,8 @@ class ConfigService:
             "record_duration": cfg.record_duration,
             "analysis_duration": cfg.analysis_duration,
             "scan_triggers_test": bool(cfg.scan_triggers_test),
-            "trigger_type": cfg.trigger_type,
+            "plc_device_key": cfg.plc_device_key,
+            "plc_device_label": cfg.plc_device_label,
             "input_device_name": cfg.input_device_name,
             "input_device_hostapi": cfg.input_device_hostapi,
             "input_device_samplerate": cfg.input_device_samplerate,
@@ -96,7 +96,7 @@ class ConfigService:
         if TestConfigTable.select().where(TestConfigTable.config_name == name).exists():
             raise ValueError(f"配置名称「{name}」已存在")
         try:
-            with db.atomic():
+            with TestConfigTable._meta.database.atomic():
                 cfg = TestConfigTable.create(
                     config_name=name,
                     created_time=now_str(),
@@ -118,13 +118,14 @@ class ConfigService:
         channels = data.get("channels", [])
 
         try:
-            with db.atomic():
+            with TestConfigTable._meta.database.atomic():
                 TestConfigTable.update(
                     config_name=data["config_name"].strip(),
                     record_duration=data["record_duration"],
                     analysis_duration=data["analysis_duration"],
                     scan_triggers_test=data["scan_triggers_test"],
-                    trigger_type=data.get("trigger_type"),
+                    plc_device_key=self._normalize_optional_text(data.get("plc_device_key")),
+                    plc_device_label=self._normalize_optional_text(data.get("plc_device_label")),
                     input_device_name=data.get("input_device_name"),
                     input_device_hostapi=data.get("input_device_hostapi"),
                     input_device_samplerate=data.get("input_device_samplerate"),
@@ -160,7 +161,7 @@ class ConfigService:
         return config_id
 
     def delete_config(self, config_id: int) -> bool:
-        with db.atomic():
+        with TestConfigTable._meta.database.atomic():
             count = (
                 TestConfigTable.delete()
                 .where(TestConfigTable.config_id == config_id)
@@ -282,3 +283,12 @@ class ConfigService:
             return result
         except (json.JSONDecodeError, TypeError):
             return default
+
+    @staticmethod
+    def _normalize_optional_text(value):
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            return None
+        text = value.strip()
+        return text or None

@@ -41,11 +41,12 @@ def test_create_config_no_channel_rows():
     assert ChannelConfigTable.select().where(ChannelConfigTable.config == config_id).count() == 0
 
 
-def test_load_config_returns_hardware_fields():
+def test_load_config_returns_plc_metadata_and_hardware_fields():
     svc = _service()
     cfg = ConfigTable.create(
         config_name="Cfg1",
-        trigger_type="hardware",
+        plc_device_key="PLC-A",
+        plc_device_label="Line 1",
         input_device_name="Mic 1",
         input_device_hostapi="ASIO",
         input_device_samplerate=48000,
@@ -57,7 +58,25 @@ def test_load_config_returns_hardware_fields():
 
     result = svc.load_config(cfg.config_id)
 
-    assert result["trigger_type"] == "hardware"
+    assert set(result.keys()) == {
+        "config_id",
+        "config_name",
+        "record_duration",
+        "analysis_duration",
+        "scan_triggers_test",
+        "plc_device_key",
+        "plc_device_label",
+        "input_device_name",
+        "input_device_hostapi",
+        "input_device_samplerate",
+        "output_device_name",
+        "output_device_hostapi",
+        "output_device_samplerate",
+        "selected_channels",
+        "channels",
+    }
+    assert result["plc_device_key"] == "PLC-A"
+    assert result["plc_device_label"] == "Line 1"
     assert result["input_device_name"] == "Mic 1"
     assert result["input_device_hostapi"] == "ASIO"
     assert result["input_device_samplerate"] == 48000
@@ -67,7 +86,7 @@ def test_load_config_returns_hardware_fields():
     assert result["selected_channels"] == [0, 2]
 
 
-def test_save_config_persists_hardware_fields():
+def test_save_config_normalizes_plc_metadata():
     svc = _service()
     config_id = ConfigTable.create(config_name="Cfg1").config_id
 
@@ -78,7 +97,8 @@ def test_save_config_persists_hardware_fields():
             "record_duration": 5.0,
             "analysis_duration": 3.0,
             "scan_triggers_test": False,
-            "trigger_type": "hardware",
+            "plc_device_key": "  PLC-A  ",
+            "plc_device_label": "  Line 1  ",
             "input_device_name": "Mic 1",
             "input_device_hostapi": "ASIO",
             "input_device_samplerate": 48000,
@@ -91,8 +111,10 @@ def test_save_config_persists_hardware_fields():
     )
 
     loaded = svc.load_config(config_id)
+    row = ConfigTable.get_by_id(config_id)
 
-    assert loaded["trigger_type"] == "hardware"
+    assert loaded["plc_device_key"] == "PLC-A"
+    assert loaded["plc_device_label"] == "Line 1"
     assert loaded["input_device_name"] == "Mic 1"
     assert loaded["input_device_hostapi"] == "ASIO"
     assert loaded["input_device_samplerate"] == 48000
@@ -100,6 +122,35 @@ def test_save_config_persists_hardware_fields():
     assert loaded["output_device_hostapi"] == "WASAPI"
     assert loaded["output_device_samplerate"] == 44100
     assert loaded["selected_channels"] == [0, 2]
+    assert row.plc_device_key == "PLC-A"
+    assert row.plc_device_label == "Line 1"
+
+
+def test_save_config_blank_plc_metadata_persists_none():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+
+    svc.save_config(
+        {
+            "config_id": config_id,
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "scan_triggers_test": False,
+            "plc_device_key": "   ",
+            "plc_device_label": "   ",
+            "selected_channels": [],
+            "channels": [],
+        }
+    )
+
+    loaded = svc.load_config(config_id)
+    row = ConfigTable.get_by_id(config_id)
+
+    assert loaded["plc_device_key"] is None
+    assert loaded["plc_device_label"] is None
+    assert row.plc_device_key is None
+    assert row.plc_device_label is None
 
 
 def test_legacy_fallback_infers_selected_channels():
