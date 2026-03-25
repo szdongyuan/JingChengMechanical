@@ -215,14 +215,11 @@ class ConfigModule(QWidget):
         hw_lay.setHorizontalSpacing(10)
         hw_lay.setVerticalSpacing(8)
 
-        self.combo_trigger = _NoWheelComboBox()
-        self.combo_trigger.setStyleSheet(combo_qss)
-        self.combo_trigger.addItem("（未选择）", None)
-        self.combo_trigger.addItem("PLC 设备关联 (待定)", "plc")
-        model = self.combo_trigger.model()
-        plc_item = model.item(1)
-        plc_item.setEnabled(False)
-        hw_lay.addRow("PLC 设备", self.combo_trigger)
+        self.txt_plc_device_key = QLineEdit()
+        hw_lay.addRow("PLC Key", self.txt_plc_device_key)
+
+        self.txt_plc_device_label = QLineEdit()
+        hw_lay.addRow("PLC 显示名", self.txt_plc_device_label)
 
         self.combo_input_dev = _NoWheelComboBox()
         self.combo_input_dev.setStyleSheet(combo_qss)
@@ -712,12 +709,8 @@ class ConfigModule(QWidget):
 
         self._populate_devices()
 
-        trigger = data.get("trigger_type")
-        idx = self.combo_trigger.findData(trigger)
-        if idx >= 0:
-            self.combo_trigger.setCurrentIndex(idx)
-        else:
-            self.combo_trigger.setCurrentIndex(0)
+        self.txt_plc_device_key.setText(data.get("plc_device_key") or "")
+        self.txt_plc_device_label.setText(data.get("plc_device_label") or "")
 
         saved_input = data.get("input_device_name")
         saved_input_api = data.get("input_device_hostapi")
@@ -790,8 +783,6 @@ class ConfigModule(QWidget):
     # ── Data collection ─────────────────────────────────────
 
     def _collect_data(self) -> dict:
-        trigger_data = self.combo_trigger.currentData()
-
         input_dev = self.combo_input_dev.currentData()
         output_dev = self.combo_output_dev.currentData()
 
@@ -805,7 +796,8 @@ class ConfigModule(QWidget):
             "record_duration": self.spin_record.value(),
             "analysis_duration": self.spin_analysis.value(),
             "scan_triggers_test": self.chk_scan.isChecked(),
-            "trigger_type": trigger_data if trigger_data else None,
+            "plc_device_key": self.txt_plc_device_key.text(),
+            "plc_device_label": self.txt_plc_device_label.text(),
             "input_device_name": input_dev.get("name") if isinstance(input_dev, dict) else None,
             "input_device_hostapi": input_dev.get("hostapi") if isinstance(input_dev, dict) else None,
             "input_device_samplerate": input_dev.get("default_samplerate") if isinstance(input_dev, dict) else None,
