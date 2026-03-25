@@ -36,7 +36,6 @@ class DbConnectionService:
 
     def _migrate(self):
         columns = [
-            ("trigger_type", "TEXT DEFAULT 'manual'"),
             ("input_device_name", "TEXT"),
             ("input_device_hostapi", "TEXT"),
             ("input_device_samplerate", "REAL"),

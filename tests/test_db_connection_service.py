@@ -69,6 +69,50 @@ def test_connect_creates_ai_tables(monkeypatch):
             pass  # Windows may still hold the file briefly
 
 
+def test_connect_creates_test_config_table_with_plc_metadata_fields(monkeypatch):
+    """DbConnectionService.connect() must create PLC metadata fields on a fresh DB."""
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        tmp_db = SqliteDatabase(db_path, pragmas={"foreign_keys": 1})
+        import model.base_mode as base_mod
+
+        monkeypatch.setattr(base_mod, "db", tmp_db)
+
+        from app.service.db_connection_service import DbConnectionService
+        import app.service.db_connection_service as svc_mod
+
+        monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+        from model.channel_config_table import ChannelConfigTable
+        from model.test_config_table import TestConfigTable
+
+        all_models = [
+            TestConfigTable,
+            ChannelConfigTable,
+            AiToolchainTable,
+            AiBindingTable,
+            AiExecutionTable,
+        ]
+        tmp_db.bind(all_models)
+
+        DbConnectionService().connect()
+
+        cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_table)")
+        column_names = {row[1] for row in cursor.fetchall()}
+
+        assert "trigger_type" not in column_names
+        assert "plc_device_key" in column_names
+        assert "plc_device_label" in column_names
+
+        tmp_db.close()
+    finally:
+        try:
+            os.unlink(db_path)
+        except OSError:
+            pass
+
+
 def test_migrate_adds_new_columns_to_existing_db(monkeypatch):
     """DbConnectionService.connect() must add missing config columns to existing DBs."""
     fd, db_path = tempfile.mkstemp(suffix=".db")
@@ -119,7 +163,6 @@ def test_migrate_adds_new_columns_to_existing_db(monkeypatch):
         cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_table)")
         column_names = {row[1] for row in cursor.fetchall()}
 
-        assert "trigger_type" in column_names
         assert "input_device_name" in column_names
         assert "input_device_hostapi" in column_names
         assert "input_device_samplerate" in column_names
@@ -127,6 +170,9 @@ def test_migrate_adds_new_columns_to_existing_db(monkeypatch):
         assert "output_device_hostapi" in column_names
         assert "output_device_samplerate" in column_names
         assert "selected_channels" in column_names
+        assert "trigger_type" not in column_names
+        assert "plc_device_key" not in column_names
+        assert "plc_device_label" not in column_names
 
         svc.close()
         tmp_db.close()
