@@ -101,6 +101,15 @@ This cleanup also owns the minimal PLC metadata path required after `trigger_typ
 
 Those fields belong on `TestConfigTable` and are the saved config-level source of PLC binding metadata for future factory-mode routing.
 
+Field contract:
+
+| Field | Type | Null/default | Save normalization | Load behavior |
+|------|------|--------------|--------------------|---------------|
+| `plc_device_key` | `TEXT` | `NULL`, default `NULL` | trim surrounding whitespace; if the trimmed value is empty, persist `NULL` | return stored normalized value (`None` or trimmed string) |
+| `plc_device_label` | `TEXT` | `NULL`, default `NULL` | trim surrounding whitespace; if the trimmed value is empty, persist `NULL` | return stored normalized value (`None` or trimmed string) |
+
+Capability checks use the normalized stored `plc_device_key`.
+
 ### Config Persistence
 
 `ConfigService` must stop:
@@ -113,6 +122,8 @@ This cleanup also requires `ConfigService` to load and save:
 
 - `plc_device_key`
 - `plc_device_label`
+
+This cleanup plan includes implementing `ConfigService.validate_factory_runtime()` now. It is not deferred guidance for a later factory-mode plan.
 
 `ConfigService.validate_factory_runtime()` is limited to hard-blocking per-config runtime validation shared by all start paths, including:
 
@@ -177,7 +188,13 @@ For this cleanup, "remove `trigger_type` from schema" means:
 - stop adding it in startup migration code
 - stop reading and writing it anywhere in application code
 
-This cleanup does not require SQLite drop-column or table-rebuild work just to erase a stale local column from an already-created developer database. If such a column exists in an old local DB file, it is ignored and no longer authoritative.
+Because this is a new project, this cleanup does not require compatibility work for pre-cleanup local databases. The supported schema after this change is defined by the updated model code and the minimal startup schema setup needed for the new PLC metadata fields. No backfill logic is required.
+
+That means:
+
+- no SQLite drop-column or table-rebuild work is required just to erase a stale `trigger_type` column from an old local DB
+- no compatibility logic is required to preserve historical `trigger_type` values
+- if a developer still has an old local DB file that does not match the new supported schema, recreating that DB is an acceptable path
 
 ## Planning Impact
 
