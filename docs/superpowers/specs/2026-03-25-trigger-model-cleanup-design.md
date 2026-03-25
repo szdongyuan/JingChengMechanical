@@ -52,12 +52,31 @@ Out of scope:
 After this cleanup, trigger behavior is defined by explicit fields and page state:
 
 - Manual start: always starts the selected `manual_primary_config_id`
-- Scan start: only depends on `scan_triggers_test == True`
-- PLC start: only depends on the config having a non-empty `plc_device_key`
+- Scan eligibility: only depends on `scan_triggers_test == True`
+- PLC eligibility: only depends on the config having a non-empty `plc_device_key`
 
 `plc_device_label` is display-only metadata and does not affect eligibility.
 
 There is no config-owned field that means "the one true trigger type" for a config.
+
+### Eligibility vs Routing
+
+This cleanup separates config eligibility from runtime routing.
+
+Config fields determine whether a config is eligible for a given non-manual trigger source:
+
+- `scan_triggers_test` determines scan eligibility
+- `plc_device_key` determines PLC eligibility
+
+Runtime routing remains a controller concern. Future factory-mode routing must still evaluate:
+
+- selected pair state
+- primary selection
+- active/review/reanalysis lock state
+- incoming PLC event identity
+- tie-break rules between the selected configs
+
+This spec does not move routing authority into config fields. It only removes the redundant `trigger_type` gate from that routing model.
 
 ### Source of Truth
 
@@ -83,7 +102,19 @@ Do not replace it with another enum. The explicit scan field and PLC binding fie
 - saving `trigger_type`
 - validating `trigger_type`
 
-Factory-runtime validation must treat PLC eligibility as `plc_device_key` presence only.
+`ConfigService.validate_factory_runtime()` is the owner of per-config runtime eligibility checks, including:
+
+- scan eligibility derived from `scan_triggers_test`
+- PLC eligibility derived from `plc_device_key`
+- any per-config validation that does not depend on selected-pair page state or live event payloads
+
+The future factory-mode controller remains the owner of:
+
+- pair validation
+- primary selection requirements
+- PLC event matching against the selected pair
+- scan/PLC tie-break rules
+- blocking starts during active run or reanalysis states
 
 ### Config UI
 
@@ -105,6 +136,16 @@ Because this is a new project, this cleanup intentionally rejects:
 - fallback routing that consults both `trigger_type` and PLC binding
 
 The branch should move to one clean trigger model instead of carrying dead state forward.
+
+### Database Handling
+
+For this cleanup, "remove `trigger_type` from schema" means:
+
+- remove it from the model definition
+- stop adding it in startup migration code
+- stop reading and writing it anywhere in application code
+
+This cleanup does not require SQLite drop-column or table-rebuild work just to erase a stale local column from an already-created developer database. If such a column exists in an old local DB file, it is ignored and no longer authoritative.
 
 ## Planning Impact
 
