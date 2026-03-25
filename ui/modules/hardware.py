@@ -25,6 +25,9 @@ class HardwareModule(QWidget):
     def __init__(self, services):
         super().__init__()
         self.services = services
+        self._devices = []
+        self._hostapis = []
+        self.device_info = {}
         self.logger = LogManager.set_log_handler("硬件选择")
 
         self._init_ui()
@@ -33,10 +36,6 @@ class HardwareModule(QWidget):
         self.combobox_input.currentIndexChanged.connect(self._update_save_enabled)
         self.combobox_output.currentIndexChanged.connect(self._update_save_enabled)
 
-        self._devices: list[dict] = []
-        self._hostapis: list[dict] = []
-
-        self._load_saved()
         self.refresh_devices()
 
     def _init_ui(self):
@@ -88,18 +87,21 @@ class HardwareModule(QWidget):
         # self.table.setSortingEnabled(True)
         lay.addWidget(self.table, 1)
 
-    def _load_saved(self):
+    def load_saved(self):
         # 从“硬件服务”（DB）读取上次保存的输入/输出设备信息，并显示在顶部“当前保存”标签里
         try:
-            device_info = self.services.hss_service.load_io_devices()
+            self.device_info = self.services.hss_service.load_io_devices()
         except Exception as e:
             # 读取失败时不阻塞页面，其它功能仍可用；给用户一个提示，同时写日志方便排查
             self.lb_current.setText("当前保存：—（数据库未就绪）")
             self.services.bus.log.emit(f"[Hardware] 读取已保存设备失败: {e}")
             return
 
-        in_dev = device_info.get("input")
-        out_dev = device_info.get("output")
+        self._update_current_label()
+
+    def _update_current_label(self):
+        in_dev = self.device_info.get("input")
+        out_dev = self.device_info.get("output")
         if not (in_dev or out_dev):
             # DB 里没有保存过任何选择
             self.lb_current.setText("当前保存：—")
@@ -108,8 +110,33 @@ class HardwareModule(QWidget):
         def fmt(dev: dict) -> str:
             return f"({dev.get('id','-')})：{dev.get('name','-')}"
 
+        def is_detected(saved_dev):
+            if not saved_dev:
+                return False
+
+            for dev in self._devices:
+                dev_name = dev["name"]
+                dev_type = self._hostapis[dev["hostapi"]]["name"]
+
+                dev_rate = str(int(dev["default_samplerate"]))
+
+                # 名称、驱动、采样率 三者完全相等即为同一个设备
+                if (dev_name == saved_dev["name"] and
+                        dev_type == saved_dev["type"] and
+                        dev_rate == saved_dev["samplerate"]):
+                    return True
+
+            return False
+
+        if not self._devices:
+            self.lb_current.setText(
+                f"当前设备：麦克{fmt(in_dev)} | 扬声器{fmt(out_dev)}"
+            )
+            return
+        input_status = "" if is_detected(in_dev) else "（未检测到）"
+        output_status = "" if is_detected(out_dev) else "（未检测到）"
         self.lb_current.setText(
-            f"当前设备：麦克{fmt(in_dev)} | 扬声器{fmt(out_dev)}"
+            f"当前设备：麦克{fmt(in_dev)}{input_status} | 扬声器{fmt(out_dev)}{output_status}"
         )
 
     def refresh_devices(self):
@@ -129,17 +156,6 @@ class HardwareModule(QWidget):
             self.services.bus.log.emit(f"[Hardware] 读取设备失败: {e}")
             self.table.setRowCount(0)
             return
-
-        def set_combo(cb: QComboBox, target):
-            if target is None:
-                cb.setCurrentIndex(0)
-                return False
-            for i in range(1, cb.count()):
-                if cb.itemData(i) == target:
-                    cb.setCurrentIndex(i)
-                    return True
-            cb.setCurrentIndex(0)
-            return False
 
         default_in, default_out = self.services.hss_service.get_default_device_ids()
         self.services.bus.log.emit(f"[Hardware] 默认设备：out{default_out}, in{default_in}")
@@ -202,6 +218,7 @@ class HardwareModule(QWidget):
         self.combobox_input.setCurrentIndex(0)
         self.combobox_output.setCurrentIndex(0)
 
+        self.load_saved()
         self._update_save_enabled()
 
     def _apply_table_sizing(self):
@@ -250,7 +267,7 @@ class HardwareModule(QWidget):
                 sync_sounddevice_default=True,
             )
 
-            self._load_saved()
+            self.load_saved()
             self.services.bus.log.emit(
                 f"[Hardware] 已保存输入/输出: IN {in_dev.get('id')} | {in_dev.get('name')} ; "
                 f"OUT {out_dev.get('id')} | {out_dev.get('name')}"

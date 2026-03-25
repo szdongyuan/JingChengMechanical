@@ -319,7 +319,7 @@ class MainWindow(QMainWindow):
 
         # 左侧栏
         left = QWidget()
-        left.setFixedWidth(900)
+        left.setFixedWidth(1200)
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
         left_lay.setSpacing(12)
