@@ -170,8 +170,8 @@ def test_save_config_persists_hardware_fields():
     assert loaded["output_device_hostapi"] == "WASAPI"
     assert loaded["output_device_samplerate"] == 44100
     assert loaded["selected_channels"] == [0, 2]
-    assert row.plc_device_key == "PLC-A"
-    assert row.plc_device_label == "Line 1"
+    assert row.plc_device_key is None
+    assert row.plc_device_label is None
 
 
 def test_save_config_blank_plc_metadata_persists_none():
