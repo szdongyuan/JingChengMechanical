@@ -69,8 +69,8 @@ def test_connect_creates_ai_tables(monkeypatch):
             pass  # Windows may still hold the file briefly
 
 
-def test_connect_creates_test_config_table_with_plc_metadata_fields(monkeypatch):
-    """DbConnectionService.connect() must create PLC metadata fields on a fresh DB."""
+def test_connect_creates_test_config_table_with_exact_fresh_schema_columns(monkeypatch):
+    """DbConnectionService.connect() must create the exact fresh config schema."""
     fd, db_path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     try:
@@ -101,8 +101,26 @@ def test_connect_creates_test_config_table_with_plc_metadata_fields(monkeypatch)
         cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_table)")
         column_names = {row[1] for row in cursor.fetchall()}
 
-        assert "plc_device_key" in column_names
-        assert "plc_device_label" in column_names
+        expected_columns = {
+            "config_id",
+            "config_name",
+            "record_duration",
+            "analysis_duration",
+            "scan_triggers_test",
+            "plc_device_key",
+            "plc_device_label",
+            "created_time",
+            "updated_time",
+            "input_device_name",
+            "input_device_hostapi",
+            "input_device_samplerate",
+            "output_device_name",
+            "output_device_hostapi",
+            "output_device_samplerate",
+            "selected_channels",
+        }
+
+        assert column_names == expected_columns
 
         tmp_db.close()
     finally:
@@ -112,8 +130,8 @@ def test_connect_creates_test_config_table_with_plc_metadata_fields(monkeypatch)
             pass
 
 
-def test_migrate_adds_new_columns_to_existing_db(monkeypatch):
-    """DbConnectionService.connect() must add missing config columns to existing DBs."""
+def test_migrate_adds_only_expected_columns_to_existing_db(monkeypatch):
+    """DbConnectionService.connect() must add only the supported compatibility columns."""
     fd, db_path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
     try:
@@ -162,15 +180,24 @@ def test_migrate_adds_new_columns_to_existing_db(monkeypatch):
         cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_table)")
         column_names = {row[1] for row in cursor.fetchall()}
 
-        assert "input_device_name" in column_names
-        assert "input_device_hostapi" in column_names
-        assert "input_device_samplerate" in column_names
-        assert "output_device_name" in column_names
-        assert "output_device_hostapi" in column_names
-        assert "output_device_samplerate" in column_names
-        assert "selected_channels" in column_names
-        assert "plc_device_key" not in column_names
-        assert "plc_device_label" not in column_names
+        expected_columns = {
+            "config_id",
+            "config_name",
+            "record_duration",
+            "analysis_duration",
+            "scan_triggers_test",
+            "created_time",
+            "updated_time",
+            "input_device_name",
+            "input_device_hostapi",
+            "input_device_samplerate",
+            "output_device_name",
+            "output_device_hostapi",
+            "output_device_samplerate",
+            "selected_channels",
+        }
+
+        assert column_names == expected_columns
 
         svc.close()
         tmp_db.close()
