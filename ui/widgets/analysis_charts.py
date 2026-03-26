@@ -317,7 +317,7 @@ class FftLineChartWidget(LineChartWidget):
             y=centers,
             top=spans,
             bottom=spans,
-            beam=np.zeros(len(limit_bands), dtype=float),
+            beam=0.0,
         )
         self._band_marker_item.setData(
             [
@@ -432,7 +432,7 @@ class OctaveBarChartWidget(_BasePlotChart):
             y=centers,
             top=spans,
             bottom=spans,
-            beam=np.full(len(limit_bands), 0.3, dtype=float),
+            beam=0.3,
         )
         self._band_marker_item.setData(
             [

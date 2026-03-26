@@ -261,6 +261,42 @@ def test_fft_line_chart_widget_empty_limit_bands_allow_autorange_after_show(qapp
         widget.close()
 
 
+def test_fft_line_chart_widget_multi_band_limit_markers_allow_bounds_queries(qapp):
+    widget = FftLineChartWidget()
+
+    try:
+        widget.set_spectrum(
+            frequencies_hz=[125.0, 250.0, 500.0, 1000.0, 2000.0],
+            levels_db=[42.0, 45.0, 51.0, 67.0, 63.0],
+            limit_bands=[
+                {
+                    "freq_hz": 250.0,
+                    "lower_db": 40.0,
+                    "upper_db": 50.0,
+                    "actual_db": 45.0,
+                    "passed": True,
+                },
+                {
+                    "freq_hz": 1000.0,
+                    "lower_db": 55.0,
+                    "upper_db": 65.0,
+                    "actual_db": 67.0,
+                    "passed": False,
+                },
+            ],
+        )
+
+        widget.show()
+        qapp.processEvents()
+
+        rect = widget._band_range_item.boundingRect()
+
+        assert rect.width() >= 0.0
+        assert rect.height() >= 0.0
+    finally:
+        widget.close()
+
+
 def test_octave_bar_chart_widget_accepts_limit_band_markers(qapp):
     widget = OctaveBarChartWidget()
     limit_bands = [
@@ -293,6 +329,42 @@ def test_octave_bar_chart_widget_empty_limit_bands_allow_bounds_queries(qapp):
             center_freqs_hz=[125.0, 250.0, 500.0],
             levels_db=[33.0, 41.0, 57.0],
             limit_bands=[],
+        )
+
+        widget.show()
+        qapp.processEvents()
+
+        rect = widget._band_range_item.boundingRect()
+
+        assert rect.width() >= 0.0
+        assert rect.height() >= 0.0
+    finally:
+        widget.close()
+
+
+def test_octave_bar_chart_widget_multi_band_limit_markers_allow_bounds_queries(qapp):
+    widget = OctaveBarChartWidget()
+
+    try:
+        widget.set_bands(
+            center_freqs_hz=[125.0, 250.0, 500.0, 1000.0],
+            levels_db=[33.0, 41.0, 57.0, 49.0],
+            limit_bands=[
+                {
+                    "freq_hz": 250.0,
+                    "lower_db": 30.0,
+                    "upper_db": 45.0,
+                    "actual_db": 41.0,
+                    "passed": True,
+                },
+                {
+                    "freq_hz": 500.0,
+                    "lower_db": 35.0,
+                    "upper_db": 55.0,
+                    "actual_db": 57.0,
+                    "passed": False,
+                },
+            ],
         )
 
         widget.show()
