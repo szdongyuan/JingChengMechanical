@@ -173,6 +173,8 @@ def test_factory_review_payload_contract_is_explicit():
         "no_result",
         "error_message",
         "judgment_payload",
+        "summary_payload",
+        "chart_payload",
     ]
     assert [field.name for field in fields(abort_payload_cls)] == [
         "config_id",
@@ -198,6 +200,15 @@ def test_factory_review_payload_contract_is_explicit():
     assert abort_payload.run_id == "run-101-1"
     assert abort_payload.trigger_source == "manual"
     assert abort_payload.error_message == "runtime exploded"
+
+
+def test_factory_review_payload_exposes_summary_and_chart_payload_fields():
+    payload = mod.FactoryReviewPayload()
+
+    assert hasattr(payload, "summary_payload")
+    assert hasattr(payload, "chart_payload")
+    assert payload.summary_payload is None
+    assert payload.chart_payload is None
 
 
 def test_service_container_uses_test_manager(monkeypatch):

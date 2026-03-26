@@ -1,10 +1,53 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+
+import numpy as np
 from PyQt6.QtCore import QPoint, QRect, Qt
 from PyQt6.QtWidgets import QFrame, QPushButton, QVBoxLayout, QWidget
 
+from app.service.analysis.frames import StftFrame
 from app.services_container import FactoryControllerState, FactoryReviewPayload
-from ui.widgets.fake_plots import FakeHeatmap
+from ui.widgets.analysis_charts import StftImageChartWidget
+
+
+@dataclass
+class _StftCacheEntry:
+    frequencies_hz: list[float] = field(default_factory=list)
+    times_sec: list[float] = field(default_factory=list)
+    magnitude_columns: list[np.ndarray] = field(default_factory=list)
+
+    def append_frame(self, frame: StftFrame) -> bool:
+        frequencies = np.asarray(getattr(frame, "frequencies", ()), dtype=float)
+        magnitudes = np.asarray(getattr(frame, "magnitudes", ()), dtype=float)
+        if frequencies.ndim != 1 or magnitudes.ndim != 1:
+            return False
+        if frequencies.shape != magnitudes.shape or frequencies.size == 0:
+            return False
+
+        if (
+            self.frequencies_hz
+            and not np.allclose(frequencies, np.asarray(self.frequencies_hz, dtype=float))
+        ):
+            self.times_sec.clear()
+            self.magnitude_columns.clear()
+
+        self.frequencies_hz = frequencies.tolist()
+        self.times_sec.append(float(getattr(frame, "time", 0.0)))
+        self.magnitude_columns.append(magnitudes.copy())
+        return True
+
+    def has_data(self) -> bool:
+        return bool(self.frequencies_hz and self.times_sec and self.magnitude_columns)
+
+    def image_payload(self) -> dict | None:
+        if not self.has_data():
+            return None
+        return {
+            "times_sec": list(self.times_sec),
+            "frequencies_hz": list(self.frequencies_hz),
+            "magnitude_db": np.column_stack(self.magnitude_columns),
+        }
 
 
 class _AnalysisSelectionBox(QFrame):
@@ -38,7 +81,11 @@ class _AnalysisSelectionBox(QFrame):
     def mouseMoveEvent(self, event):
         if self._owner._drag_offset_px is not None:
             canvas_origin = self._owner.canvas.mapToGlobal(QPoint(0, 0))
-            left_px = float(event.globalPosition().x()) - canvas_origin.x() - self._owner._drag_offset_px
+            left_px = (
+                float(event.globalPosition().x())
+                - canvas_origin.x()
+                - self._owner._drag_offset_px
+            )
             self._owner.move_selection_to_track_x(left_px)
             event.accept()
             return
@@ -57,7 +104,7 @@ class _HeatmapCanvas(QWidget):
     def __init__(self, owner: "StftModule"):
         super().__init__(owner)
         self._owner = owner
-        self.heatmap = FakeHeatmap(self)
+        self.heatmap = StftImageChartWidget(self)
 
     def resizeEvent(self, event):
         self.heatmap.setGeometry(self.rect())
@@ -67,16 +114,25 @@ class _HeatmapCanvas(QWidget):
 
 class StftModule(QWidget):
     module_id = "stft"
+    _DISPLAY_PHASES = frozenset({"running", "analyzing", "reviewing", "reanalyzing"})
     _REVIEW_PHASES = frozenset({"reviewing", "reanalyzing"})
     _SELECTION_MARGIN_PX = 12
 
     def __init__(self, services):
         super().__init__()
         self.services = services
-        self._factory_state = getattr(services.factory_mode, "state", FactoryControllerState())
-        self._review_payload = getattr(services.factory_mode, "review_payload", FactoryReviewPayload())
+        self.selected_display_channel_provider = None
+        self._factory_state = getattr(
+            services.factory_mode, "state", FactoryControllerState()
+        )
+        self._review_payload = getattr(
+            services.factory_mode, "review_payload", FactoryReviewPayload()
+        )
         self._selected_window: tuple[float, float] | None = None
         self._drag_offset_px: float | None = None
+        self._display_run_id = getattr(self._review_payload, "run_id", None)
+        self._render_cache_key: tuple[int, str, int] | None = None
+        self._stft_cache: dict[tuple[int, str, int], _StftCacheEntry] = {}
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -90,11 +146,25 @@ class StftModule(QWidget):
         self.analyze_button.hide()
 
         if hasattr(self.services.bus, "factory_state_changed"):
-            self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
+            self.services.bus.factory_state_changed.connect(
+                self._on_factory_state_changed
+            )
         if hasattr(self.services.bus, "factory_review_changed"):
-            self.services.bus.factory_review_changed.connect(self._on_factory_review_changed)
+            self.services.bus.factory_review_changed.connect(
+                self._on_factory_review_changed
+            )
         if hasattr(self.services.bus, "factory_display_reset"):
             self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
+        if hasattr(self.services.bus, "factory_runtime_start_accepted"):
+            self.services.bus.factory_runtime_start_accepted.connect(
+                self._on_factory_runtime_context
+            )
+        if hasattr(self.services.bus, "factory_runtime_analyzing_entered"):
+            self.services.bus.factory_runtime_analyzing_entered.connect(
+                self._on_factory_runtime_context
+            )
+        if hasattr(self.services.bus, "stft_updated"):
+            self.services.bus.stft_updated.connect(self._on_stft_updated)
 
         self._on_factory_review_changed(self._review_payload)
         self._on_factory_state_changed(self._factory_state)
@@ -102,6 +172,30 @@ class StftModule(QWidget):
     @property
     def selected_window(self) -> tuple[float, float] | None:
         return self._selected_window
+
+    def has_cached_run_data(
+        self,
+        run_id: str,
+        *,
+        channel_index: int,
+        config_id: int | None = None,
+    ) -> bool:
+        for cache_key, cache_entry in self._stft_cache.items():
+            cache_config_id, cache_run_id, cache_channel_index = cache_key
+            if config_id is not None and cache_config_id != config_id:
+                continue
+            if cache_run_id == run_id and cache_channel_index == channel_index:
+                return cache_entry.has_data()
+        return False
+
+    def current_render_cache_key(self) -> tuple[int, str, int] | None:
+        return self._render_cache_key
+
+    def current_image_payload(self) -> dict | None:
+        return self.canvas.heatmap.image_payload()
+
+    def refresh_selected_display_channel(self) -> None:
+        self._refresh_cached_rendering()
 
     def move_selection_to_start(self, start_sec: float) -> bool:
         if not self.is_selection_movable() or self._selected_window is None:
@@ -140,14 +234,26 @@ class StftModule(QWidget):
         )
 
     def _on_factory_state_changed(self, state):
+        previous_config_id = self._factory_state.displayed_config_id
         if isinstance(state, FactoryControllerState):
             self._factory_state = state
-            self._update_overlay_geometry()
+        else:
+            self._factory_state = FactoryControllerState()
+
+        if not self._has_display_context():
+            self._display_run_id = None
+        elif self._factory_state.displayed_config_id != previous_config_id:
+            self._display_run_id = self._review_run_id_for_displayed_config()
+
+        self._refresh_cached_rendering()
+        self._update_overlay_geometry()
 
     def _on_factory_review_changed(self, review):
         if isinstance(review, FactoryReviewPayload):
             if self._should_preserve_selection(review):
                 self._review_payload = review
+                self._sync_display_run_id_from_review(review)
+                self._refresh_cached_rendering()
                 self._update_overlay_geometry()
                 return
             self._review_payload = review
@@ -155,13 +261,64 @@ class StftModule(QWidget):
             self._review_payload = FactoryReviewPayload()
 
         self._selected_window = self._selection_from_review(self._review_payload)
+        self._sync_display_run_id_from_review(self._review_payload)
+        self._refresh_cached_rendering()
         self._update_overlay_geometry()
 
     def _on_factory_display_reset(self, _reason: str):
         self._review_payload = FactoryReviewPayload()
         self._selected_window = None
         self._drag_offset_px = None
+        self._display_run_id = None
+        self._render_cache_key = None
+        self._stft_cache.clear()
+        self.canvas.heatmap.clear_data()
         self._update_overlay_geometry()
+
+    def _on_factory_runtime_context(self, payload) -> None:
+        config_id = getattr(payload, "config_id", None)
+        run_id = getattr(payload, "run_id", None)
+        if (
+            config_id == self._factory_state.displayed_config_id
+            and isinstance(run_id, str)
+            and run_id
+        ):
+            self._display_run_id = run_id
+            self._refresh_cached_rendering()
+
+    def _on_stft_updated(
+        self,
+        config_id: int,
+        run_id: str,
+        channel_idx: int,
+        frame,
+    ) -> None:
+        if not isinstance(run_id, str) or not run_id:
+            return
+        try:
+            normalized_config_id = int(config_id)
+            normalized_channel_idx = int(channel_idx)
+        except (TypeError, ValueError):
+            return
+
+        cache_entry = self._stft_cache.setdefault(
+            (normalized_config_id, run_id, normalized_channel_idx),
+            _StftCacheEntry(),
+        )
+        if not cache_entry.append_frame(frame):
+            return
+
+        if (
+            not self._has_display_context()
+            or normalized_config_id != self._factory_state.displayed_config_id
+        ):
+            return
+
+        if self._display_run_id is None:
+            self._display_run_id = run_id
+        if run_id != self._display_run_id:
+            return
+        self._refresh_cached_rendering()
 
     def _begin_reanalysis(self):
         if self._selected_window is None or not self.is_selection_movable():
@@ -342,3 +499,91 @@ class StftModule(QWidget):
             -self._SELECTION_MARGIN_PX,
             -self._SELECTION_MARGIN_PX,
         )
+
+    def _has_display_context(self) -> bool:
+        return (
+            self._factory_state.displayed_config_id is not None
+            and self._factory_state.run_phase in self._DISPLAY_PHASES
+        )
+
+    def _review_run_id_for_displayed_config(self) -> str | None:
+        if (
+            self._review_payload.displayed_config_id == self._factory_state.displayed_config_id
+            and isinstance(self._review_payload.run_id, str)
+            and self._review_payload.run_id
+        ):
+            return self._review_payload.run_id
+        return None
+
+    def _sync_display_run_id_from_review(self, review: FactoryReviewPayload) -> None:
+        if (
+            review.displayed_config_id == self._factory_state.displayed_config_id
+            and isinstance(review.run_id, str)
+            and review.run_id
+        ):
+            self._display_run_id = review.run_id
+        elif self._factory_state.run_phase in self._REVIEW_PHASES:
+            self._display_run_id = None
+
+    def _refresh_cached_rendering(self) -> None:
+        if not self._has_display_context():
+            self._render_cache_key = None
+            self.canvas.heatmap.clear_data()
+            return
+
+        config_id = self._factory_state.displayed_config_id
+        run_id = self._display_run_id or self._review_run_id_for_displayed_config()
+        if config_id is None or run_id is None:
+            self._render_cache_key = None
+            self.canvas.heatmap.clear_data()
+            return
+
+        channel_index = self._resolve_render_channel(config_id, run_id)
+        if channel_index is None:
+            self._render_cache_key = None
+            self.canvas.heatmap.clear_data()
+            return
+
+        cache_key = (config_id, run_id, channel_index)
+        cache_entry = self._stft_cache.get(cache_key)
+        payload = None if cache_entry is None else cache_entry.image_payload()
+        if payload is None:
+            self._render_cache_key = None
+            self.canvas.heatmap.clear_data()
+            return
+
+        self._render_cache_key = cache_key
+        self.canvas.heatmap.set_image(
+            times_sec=payload["times_sec"],
+            frequencies_hz=payload["frequencies_hz"],
+            magnitude_db=payload["magnitude_db"],
+        )
+
+    def _resolve_render_channel(self, config_id: int, run_id: str) -> int | None:
+        selected_channel = None
+        provider = self.selected_display_channel_provider
+        if callable(provider):
+            provided_channel = provider()
+            if isinstance(provided_channel, int):
+                selected_channel = provided_channel
+
+        if selected_channel is not None:
+            return selected_channel
+
+        available_channels = self._available_cached_channels(config_id, run_id)
+        if available_channels:
+            return available_channels[0]
+        return None
+
+    def _available_cached_channels(self, config_id: int, run_id: str) -> list[int]:
+        channels: list[int] = []
+        for cache_key, cache_entry in self._stft_cache.items():
+            cache_config_id, cache_run_id, channel_index = cache_key
+            if (
+                cache_config_id == config_id
+                and cache_run_id == run_id
+                and cache_entry.has_data()
+                and channel_index not in channels
+            ):
+                channels.append(channel_index)
+        return channels

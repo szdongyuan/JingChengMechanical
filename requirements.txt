@@ -1,0 +1,12 @@
+# Runtime dependencies
+concurrent-log-handler
+numpy
+peewee
+PyQt6
+pyqtgraph==0.13.7
+scipy
+sounddevice
+
+# Test dependencies
+pytest
+pytest-qt

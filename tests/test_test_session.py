@@ -225,6 +225,23 @@ class TestTestSessionJudgment:
         assert session._audio_data_id is not None
         assert session.last_result is None
 
+    def test_run_judgment_missing_buffer_returns_none_for_manager_no_result_path(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        session = TestSession(
+            config=_make_config(), bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+
+        result = session._run_judgment()
+
+        assert result is None
+        assert session.last_result is None
+        assert session.last_ai_review is None
+        assert session._audio_file_path is None
+        assert session._audio_data_id is None
+
     def test_run_judgment_default_window_offset_ms_uses_config_analysis_window_offset(self, tmp_path):
         bus = _make_mock_bus()
         ai = MagicMock()
@@ -349,6 +366,47 @@ class TestTestSessionJudgment:
             "[TestSession] WARNING: AI analysis did not succeed for config=1: "
             "module_status=timeout ai_label=None error=Process timed out"
         )
+
+    def test_run_judgment_preserves_ai_review_details_separately_from_judgment_result_on_timeout(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = {
+            "enabled": True,
+            "score_threshold": 0.8,
+        }
+        ai.run_ai_analysis.return_value = {
+            "module_status": "timeout",
+            "ai_label": None,
+            "score": None,
+            "error_summary": "Process timed out",
+            "channel_index": 0,
+        }
+        session = TestSession(
+            config=_make_config(), bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+        )
+
+        result = session._run_judgment()
+
+        assert result.limit_pass is True
+        assert result.ai_pass is None
+        assert result.ai_score is None
+        assert result.overall == "合格"
+        assert session.last_ai_review["status"] == "timeout"
+        assert session.last_ai_review["threshold"] == 0.8
+        assert session.last_ai_review["score"] is None
+        assert session.last_ai_review["channel_index"] == 0
+        assert session.last_ai_review["error_message"] == "Process timed out"
 
     def test_run_judgment_keeps_limit_result_when_ai_analysis_fails(self, tmp_path):
         bus = _make_mock_bus()
@@ -773,6 +831,46 @@ class TestScoreThresholdDecision:
         result = session._run_ai(self._make_base_result())
         assert result.ai_pass is True
         assert result.ai_score is None
+
+    def test_nan_score_preserves_missing_score_ai_review_even_when_label_fallback_passes(self, tmp_path):
+        ai = MagicMock()
+        ai.run_ai_analysis.return_value = {
+            "module_status": "success",
+            "ai_label": "PASS",
+            "score": float("nan"),
+            "error_summary": None,
+        }
+        session = self._make_session(tmp_path, ai, {
+            "enabled": True,
+            "score_threshold": 0.8,
+        })
+
+        result = session._run_ai(self._make_base_result())
+
+        assert result.ai_pass is True
+        assert result.ai_score is None
+        assert session.last_ai_review["status"] == "missing_score"
+        assert session.last_ai_review["threshold"] == 0.8
+        assert session.last_ai_review["score"] is None
+
+    def test_run_ai_malformed_output_none_marks_invalid_output_and_preserves_limit_result(self, tmp_path):
+        ai = MagicMock()
+        ai.run_ai_analysis.return_value = None
+        session = self._make_session(tmp_path, ai, {
+            "enabled": True,
+            "score_threshold": 0.8,
+        })
+
+        result = session._run_ai(self._make_base_result())
+
+        assert result.ai_pass is None
+        assert result.ai_score is None
+        assert result.overall == "合格"
+        assert session.last_ai_review["status"] == "invalid_output"
+        assert session.last_ai_review["threshold"] == 0.8
+        assert session.last_ai_review["score"] is None
+        assert session.last_ai_review["channel_index"] is None
+        assert session.last_ai_review["error_message"] == "AI analysis returned invalid output"
 
     def test_inf_score_falls_back_to_label(self, tmp_path):
         ai = MagicMock()

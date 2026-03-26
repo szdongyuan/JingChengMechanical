@@ -4,12 +4,14 @@ import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
+from app.service.analysis.frames import StftFrame
 from app.services_container import (
     FactoryControllerState,
     FactoryReviewPayload,
@@ -84,7 +86,7 @@ def _emit_phase(
     payload: FactoryReviewPayload,
     *,
     run_phase: str,
-) -> None:
+    ) -> None:
     services.bus.factory_state_changed.emit(
         FactoryControllerState(
             displayed_config_id=payload.displayed_config_id,
@@ -94,9 +96,23 @@ def _emit_phase(
     )
 
 
+def _make_stft_frame(
+    *,
+    time: float,
+    magnitudes: tuple[float, ...],
+    frequencies: tuple[float, ...] = (100.0, 200.0),
+) -> StftFrame:
+    return StftFrame(
+        time=time,
+        frequencies=np.asarray(frequencies, dtype=float),
+        magnitudes=np.asarray(magnitudes, dtype=float),
+    )
+
+
 def _make_review_payload(
     *,
     displayed_config_id: int = 101,
+    run_id: str | None = None,
     captured_duration_sec: float = 5.0,
     default_window: FactoryReviewWindow | None = None,
     fallback_window: FactoryReviewWindow | None = None,
@@ -104,12 +120,14 @@ def _make_review_payload(
     no_result: bool = False,
     error_message: str | None = None,
     judgment_payload: dict | None = None,
+    summary_payload: dict | None = None,
+    chart_payload: dict | None = None,
 ) -> FactoryReviewPayload:
     if default_window is None:
         default_window = FactoryReviewWindow(start_sec=1.0, end_sec=3.0)
     return FactoryReviewPayload(
         displayed_config_id=displayed_config_id,
-        run_id=f"run-{displayed_config_id}",
+        run_id=run_id or f"run-{displayed_config_id}",
         trigger_source="manual",
         captured_duration_sec=captured_duration_sec,
         default_window=default_window,
@@ -118,7 +136,118 @@ def _make_review_payload(
         no_result=no_result,
         error_message=error_message,
         judgment_payload=judgment_payload,
+        summary_payload=summary_payload,
+        chart_payload=chart_payload,
     )
+
+
+def test_stft_module_keeps_live_frames_visible_in_review_without_chart_payload(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 1
+    _show(module, qapp)
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="running",
+            trigger_source="manual",
+        )
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        1,
+        _make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)),
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        1,
+        _make_stft_frame(time=0.5, magnitudes=(3.0, 4.0)),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            run_id="run-101",
+            judgment_payload={"overall": "合格"},
+            summary_payload={"overall_status": "pass", "rows": []},
+            chart_payload=None,
+        ),
+    )
+
+    assert module.has_cached_run_data("run-101", channel_index=1) is True
+    assert module.current_render_cache_key() == (101, "run-101", 1)
+    payload = module.current_image_payload()
+    assert payload is not None
+    assert payload["times_sec"] == [0.0, 0.5]
+    assert payload["frequencies_hz"] == [100.0, 200.0]
+    assert np.array_equal(
+        payload["magnitude_db"],
+        np.array([[1.0, 3.0], [2.0, 4.0]]),
+    )
+
+
+def test_stft_module_keeps_selected_cached_channel_visible_during_analyzing_without_committed_chart_payload(
+    qapp,
+):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 1
+    _show(module, qapp)
+
+    payload = _make_review_payload(
+        run_id="run-101",
+        judgment_payload=None,
+        summary_payload=None,
+        chart_payload=None,
+    )
+
+    _emit_phase(services, payload, run_phase="running")
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        1,
+        _make_stft_frame(time=0.25, magnitudes=(6.0, 7.0)),
+    )
+
+    _emit_phase(services, payload, run_phase="analyzing")
+
+    assert module.current_render_cache_key() == (101, "run-101", 1)
+    payload = module.current_image_payload()
+    assert payload is not None
+    assert payload["times_sec"] == [0.25]
+    assert np.array_equal(payload["magnitude_db"], np.array([[6.0], [7.0]]))
+
+
+def test_stft_module_clears_when_selected_channel_has_no_cached_frames_yet(qapp):
+    module, services = _make_module()
+    selected_channel = 0
+    module.selected_display_channel_provider = lambda: selected_channel
+    _show(module, qapp)
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="running",
+            trigger_source="manual",
+        )
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        0,
+        _make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)),
+    )
+
+    assert module.current_render_cache_key() == (101, "run-101", 0)
+    assert module.current_image_payload() is not None
+
+    selected_channel = 1
+    module.refresh_selected_display_channel()
+
+    assert module.current_render_cache_key() is None
+    assert module.current_image_payload() is None
 
 
 def test_review_success_shows_analysis_box_from_automatic_window_with_fixed_duration(qapp):
