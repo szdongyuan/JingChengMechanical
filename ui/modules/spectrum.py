@@ -3,24 +3,31 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QLabel, QStackedLayout, QVBoxLayout, QWidget
 
-from app.services_container import FactoryControllerState
-from ui.widgets.fake_plots import FakeLinePlot
+from app.services_container import FactoryControllerState, FactoryReviewPayload
+from ui.widgets.analysis_charts import FftLineChartWidget
 
 
 class SpectrumModule(QWidget):
     module_id = "spectrum"
-    _DISPLAY_PHASES = frozenset({"running", "analyzing", "reviewing", "reanalyzing"})
+    _RENDER_PHASES = frozenset({"reviewing"})
 
     def __init__(self, services):
         super().__init__()
         self.services = services
-        self._factory_state = getattr(services.factory_mode, "state", FactoryControllerState())
-        self._has_plot_data = False
-        self._display_run_id = getattr(
-            getattr(services.factory_mode, "review_payload", None),
-            "run_id",
-            None,
+        self.selected_display_channel_provider = None
+        self.selected_display_channel_sync = None
+        self._factory_state = getattr(
+            services.factory_mode,
+            "state",
+            FactoryControllerState(),
         )
+        self._review_payload = getattr(
+            services.factory_mode,
+            "review_payload",
+            FactoryReviewPayload(),
+        )
+        self._has_plot_data = False
+        self._rendered_channel_index: int | None = None
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -34,71 +41,148 @@ class SpectrumModule(QWidget):
         self.empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.stack.addWidget(self.empty_state)
 
-        self.plot = FakeLinePlot()
+        self.plot = FftLineChartWidget()
         self.stack.addWidget(self.plot)
 
         if hasattr(self.services.bus, "factory_state_changed"):
             self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
         if hasattr(self.services.bus, "factory_display_reset"):
             self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
-        if hasattr(self.services.bus, "factory_runtime_start_accepted"):
-            self.services.bus.factory_runtime_start_accepted.connect(self._on_factory_runtime_context)
-        if hasattr(self.services.bus, "factory_runtime_analyzing_entered"):
-            self.services.bus.factory_runtime_analyzing_entered.connect(self._on_factory_runtime_context)
         if hasattr(self.services.bus, "factory_review_changed"):
             self.services.bus.factory_review_changed.connect(self._on_factory_review_changed)
-        if hasattr(self.services.bus, "fft_updated"):
-            self.services.bus.fft_updated.connect(self._on_fft_updated)
 
-        self._update_visible_state()
+        self._refresh_committed_rendering()
 
-    def _on_factory_state_changed(self, state):
-        previous_config_id = self._factory_state.displayed_config_id
+    def has_committed_plot_data(self) -> bool:
+        return self._has_plot_data
+
+    def current_plot_payload(self) -> dict | None:
+        if not self._has_plot_data:
+            return None
+        return self.plot.spectrum_payload()
+
+    def current_render_channel(self) -> int | None:
+        return self._rendered_channel_index
+
+    def refresh_selected_display_channel(self) -> None:
+        self._refresh_committed_rendering()
+
+    def _on_factory_state_changed(self, state) -> None:
         if isinstance(state, FactoryControllerState):
             self._factory_state = state
         else:
             self._factory_state = FactoryControllerState()
+        self._refresh_committed_rendering()
 
-        if (
-            self._factory_state.displayed_config_id != previous_config_id
-            or not self._has_display_context()
-        ):
-            self._has_plot_data = False
-        if not self._has_display_context():
-            self._display_run_id = None
-        self._update_visible_state()
-
-    def _on_factory_display_reset(self, _reason: str):
-        self._display_run_id = None
-        self._has_plot_data = False
-        self._update_visible_state()
-
-    def _on_factory_runtime_context(self, payload) -> None:
-        run_id = getattr(payload, "run_id", None)
-        if isinstance(run_id, str) and run_id:
-            self._display_run_id = run_id
+    def _on_factory_display_reset(self, _reason: str) -> None:
+        self._review_payload = FactoryReviewPayload()
+        self._clear_plot()
 
     def _on_factory_review_changed(self, review) -> None:
-        run_id = getattr(review, "run_id", None)
-        if isinstance(run_id, str) and run_id:
-            self._display_run_id = run_id
+        if isinstance(review, FactoryReviewPayload):
+            self._review_payload = review
+        else:
+            self._review_payload = FactoryReviewPayload()
+        self._refresh_committed_rendering()
 
-    def _on_fft_updated(self, config_id: int, run_id: str, _channel_idx: int, _frame) -> None:
-        if (
-            config_id != self._factory_state.displayed_config_id
-            or run_id != self._display_run_id
-            or not self._has_display_context()
-        ):
+    def _refresh_committed_rendering(self) -> None:
+        if not self._can_render_committed_chart():
+            self._clear_plot()
             return
-        self._has_plot_data = True
-        self._update_visible_state()
 
-    def _has_display_context(self) -> bool:
+        chart_payload = self._chart_payload_for_displayed_config()
+        if not chart_payload:
+            self._clear_plot()
+            return
+
+        channel_index, channel_payload = self._resolve_channel_payload(chart_payload)
+        fft_payload = (
+            channel_payload.get("fft")
+            if isinstance(channel_payload, dict)
+            else None
+        )
+        if not isinstance(fft_payload, dict):
+            self._clear_plot()
+            return
+
+        frequencies_hz = fft_payload.get("frequencies_hz") or []
+        levels_db = fft_payload.get("levels_db") or []
+        if not frequencies_hz or not levels_db:
+            self._clear_plot()
+            return
+
+        try:
+            self.plot.set_spectrum(
+                frequencies_hz=frequencies_hz,
+                levels_db=levels_db,
+                limit_bands=fft_payload.get("limit_bands"),
+            )
+        except (TypeError, ValueError):
+            self._clear_plot()
+            return
+
+        self._has_plot_data = True
+        self._rendered_channel_index = channel_index
+        self.stack.setCurrentWidget(self.plot)
+
+    def _clear_plot(self) -> None:
+        self._has_plot_data = False
+        self._rendered_channel_index = None
+        self.stack.setCurrentWidget(self.empty_state)
+
+    def _can_render_committed_chart(self) -> bool:
         return (
             self._factory_state.displayed_config_id is not None
-            and self._factory_state.run_phase in self._DISPLAY_PHASES
+            and self._factory_state.run_phase in self._RENDER_PHASES
         )
 
-    def _update_visible_state(self) -> None:
-        self.stack.setCurrentWidget(self.plot if self._has_plot_data else self.empty_state)
+    def _chart_payload_for_displayed_config(self) -> dict[int, dict]:
+        if self._review_payload.displayed_config_id != self._factory_state.displayed_config_id:
+            return {}
 
+        raw_chart_payload = getattr(self._review_payload, "chart_payload", None)
+        if not isinstance(raw_chart_payload, dict):
+            return {}
+
+        normalized: dict[int, dict] = {}
+        for channel_key, channel_payload in raw_chart_payload.items():
+            try:
+                channel_index = int(channel_key)
+            except (TypeError, ValueError):
+                continue
+            if channel_index in normalized or not isinstance(channel_payload, dict):
+                continue
+            normalized[channel_index] = channel_payload
+        return normalized
+
+    def _resolve_channel_payload(
+        self,
+        chart_payload: dict[int, dict],
+    ) -> tuple[int | None, dict | None]:
+        selected_channel = self._selected_channel_index()
+        if selected_channel is not None and selected_channel in chart_payload:
+            return selected_channel, chart_payload[selected_channel]
+
+        for channel_index, channel_payload in chart_payload.items():
+            self._sync_selected_channel(selected_channel, channel_index)
+            return channel_index, channel_payload
+        return None, None
+
+    def _selected_channel_index(self) -> int | None:
+        provider = self.selected_display_channel_provider
+        if not callable(provider):
+            return None
+        provided_channel = provider()
+        return provided_channel if isinstance(provided_channel, int) else None
+
+    def _sync_selected_channel(
+        self,
+        selected_channel: int | None,
+        fallback_channel: int,
+    ) -> None:
+        if selected_channel == fallback_channel:
+            return
+
+        sync_callback = self.selected_display_channel_sync
+        if callable(sync_callback):
+            sync_callback(fallback_channel)

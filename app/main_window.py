@@ -280,6 +280,8 @@ class MainWindow(QMainWindow):
     def _attach_analysis_channel_providers(self) -> None:
         for module in (self.stft, self.spl, self.spectrum, self.octave):
             module.selected_display_channel_provider = self.current_display_channel_index
+        for module in (self.spl, self.spectrum, self.octave):
+            module.selected_display_channel_sync = self._sync_selected_display_channel
 
     def _on_factory_state_changed(self, state) -> None:
         if isinstance(state, FactoryControllerState):
@@ -300,16 +302,33 @@ class MainWindow(QMainWindow):
         self._sync_analysis_toolbar()
 
     def _on_analysis_channel_changed(self, channel_index: int) -> None:
+        self._sync_selected_display_channel(channel_index, refresh_modules=False)
+        self._refresh_analysis_display_modules()
+
+    def _sync_selected_display_channel(
+        self,
+        channel_index: int,
+        *,
+        refresh_modules: bool = True,
+    ) -> None:
         config_id = self._factory_state.displayed_config_id
         if config_id is None:
             return
+
         self.display_channel_by_config_id[config_id] = channel_index
-        refresh_stft = getattr(self.stft, "refresh_selected_display_channel", None)
-        if callable(refresh_stft):
-            refresh_stft()
+        self.analysis_toolbar.set_current_channel(channel_index)
         self.analysis_toolbar.set_context_label_text(
             self._build_analysis_toolbar_context(config_id, channel_index)
         )
+
+        if refresh_modules:
+            self._refresh_analysis_display_modules()
+
+    def _refresh_analysis_display_modules(self) -> None:
+        for module in (self.stft, self.spl, self.spectrum, self.octave):
+            refresh = getattr(module, "refresh_selected_display_channel", None)
+            if callable(refresh):
+                refresh()
 
     def _sync_analysis_toolbar(self) -> None:
         if not hasattr(self, "analysis_toolbar"):

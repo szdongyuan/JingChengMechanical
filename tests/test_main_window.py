@@ -211,6 +211,46 @@ def _review_payload(config_id: int, *, run_id: str | None = None) -> FactoryRevi
     )
 
 
+def _chart_payload_for_channels(channels: tuple[int, ...]) -> dict:
+    payload: dict[int, dict] = {}
+    for channel_index in channels:
+        payload[channel_index] = {
+            "spl": {
+                "times_sec": [0.0, 1.0],
+                "values_db": [70.0 + channel_index, 71.0 + channel_index],
+                "lower_limit_db": 60.0,
+                "upper_limit_db": 80.0,
+            },
+            "fft": {
+                "frequencies_hz": [125.0, 250.0],
+                "levels_db": [40.0 + channel_index, 42.0 + channel_index],
+                "limit_bands": [
+                    {
+                        "freq_hz": 250.0,
+                        "lower_db": 35.0,
+                        "upper_db": 45.0,
+                        "actual_db": 42.0 + channel_index,
+                        "passed": True,
+                    }
+                ],
+            },
+            "octave": {
+                "center_freqs_hz": [125.0, 250.0],
+                "levels_db": [32.0 + channel_index, 34.0 + channel_index],
+                "limit_bands": [
+                    {
+                        "freq_hz": 250.0,
+                        "lower_db": 30.0,
+                        "upper_db": 40.0,
+                        "actual_db": 34.0 + channel_index,
+                        "passed": True,
+                    }
+                ],
+            },
+        }
+    return payload
+
+
 def _review_payload_with_chart_payload(
     config_id: int,
     *,
@@ -228,14 +268,7 @@ def _review_payload_with_chart_payload(
         no_result=False,
         error_message=None,
         summary_payload={"overall_status": "pass", "rows": []},
-        chart_payload={
-            channel_index: {
-                "spl": {},
-                "fft": {},
-                "octave": {},
-            }
-            for channel_index in channels
-        },
+        chart_payload=_chart_payload_for_channels(channels),
     )
 
 
@@ -265,6 +298,9 @@ def _assert_chart_cards_visible(window) -> None:
     assert window.spectrum.empty_state.isHidden() is True
     assert window.spl.empty_state.isHidden() is True
     assert window.octave.empty_state.isHidden() is True
+    assert window.spectrum.has_committed_plot_data() is True
+    assert window.spl.has_committed_plot_data() is True
+    assert window.octave.has_committed_plot_data() is True
 
 
 def _emit_runtime_started(services, *, config_id: int, run_id: str) -> None:
@@ -284,6 +320,41 @@ def _emit_chart_frames(services, *, config_id: int, run_id: str) -> None:
     services.bus.octave_updated.emit(config_id, run_id, 0, object())
 
 
+def _emit_review_ready(
+    services,
+    *,
+    config_id: int,
+    run_id: str,
+    channels: tuple[int, ...] = (0, 1),
+) -> None:
+    services.bus.factory_state_changed.emit(_reviewing_state(config_id))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(
+            config_id,
+            run_id=run_id,
+            channels=channels,
+        )
+    )
+
+
+def _assert_committed_chart_channel(window, *, channel_index: int) -> None:
+    assert window.spl.current_render_channel() == channel_index
+    assert window.spl.current_plot_payload()["y_values"] == [
+        70.0 + channel_index,
+        71.0 + channel_index,
+    ]
+    assert window.spectrum.current_render_channel() == channel_index
+    assert window.spectrum.current_plot_payload()["levels_db"] == [
+        40.0 + channel_index,
+        42.0 + channel_index,
+    ]
+    assert window.octave.current_render_channel() == channel_index
+    assert window.octave.current_plot_payload()["levels_db"] == [
+        32.0 + channel_index,
+        34.0 + channel_index,
+    ]
+
+
 def _make_stft_frame(
     *,
     time: float,
@@ -297,7 +368,10 @@ def _make_stft_frame(
     )
 
 
-def test_armed_page_hides_run_specific_cards_until_new_run_data_arrives(qapp, monkeypatch):
+def test_armed_page_keeps_chart_cards_empty_until_committed_review_payload_arrives(
+    qapp,
+    monkeypatch,
+):
     window, services = _make_window(
         monkeypatch,
         initial_state=_armed_state(),
@@ -314,10 +388,15 @@ def test_armed_page_hides_run_specific_cards_until_new_run_data_arrives(qapp, mo
     _emit_chart_frames(services, config_id=101, run_id="run-101-1")
     qapp.processEvents()
 
+    _assert_run_specific_cards_cleared(window, result_badge="分析中")
+
+    _emit_review_ready(services, config_id=101, run_id="run-101-1")
+    qapp.processEvents()
+
     _assert_chart_cards_visible(window)
 
 
-def test_next_run_reset_clears_result_stft_and_chart_cards_before_new_data_renders(
+def test_next_run_reset_clears_result_stft_and_chart_cards_before_next_review_payload_renders(
     qapp,
     monkeypatch,
 ):
@@ -325,9 +404,7 @@ def test_next_run_reset_clears_result_stft_and_chart_cards_before_new_data_rende
     _show(window, qapp)
 
     _emit_runtime_started(services, config_id=101, run_id="run-101-1")
-    _emit_chart_frames(services, config_id=101, run_id="run-101-1")
-    services.bus.factory_state_changed.emit(_reviewing_state(101))
-    services.bus.factory_review_changed.emit(_review_payload(101, run_id="run-101-1"))
+    _emit_review_ready(services, config_id=101, run_id="run-101-1")
     qapp.processEvents()
 
     assert window.result.empty_state.isHidden() is True
@@ -349,15 +426,23 @@ def test_next_run_reset_clears_result_stft_and_chart_cards_before_new_data_rende
     _emit_chart_frames(services, config_id=202, run_id="run-202-1")
     qapp.processEvents()
 
+    _assert_run_specific_cards_cleared(window, result_badge="分析中")
+
+    _emit_review_ready(services, config_id=202, run_id="run-202-1")
+    qapp.processEvents()
+
     _assert_chart_cards_visible(window)
 
 
-def test_same_config_rerun_ignores_late_old_chart_frames_after_reset(qapp, monkeypatch):
+def test_same_config_rerun_keeps_chart_cards_empty_until_new_review_payload_arrives(
+    qapp,
+    monkeypatch,
+):
     window, services = _make_window(monkeypatch, initial_state=_armed_state())
     _show(window, qapp)
 
     _emit_runtime_started(services, config_id=101, run_id="run-101-1")
-    _emit_chart_frames(services, config_id=101, run_id="run-101-1")
+    _emit_review_ready(services, config_id=101, run_id="run-101-1")
     qapp.processEvents()
 
     _assert_chart_cards_visible(window)
@@ -379,7 +464,14 @@ def test_same_config_rerun_ignores_late_old_chart_frames_after_reset(qapp, monke
 
     _assert_run_specific_cards_cleared(window, result_badge="分析中")
 
-    _emit_chart_frames(services, config_id=101, run_id="run-101-2")
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, run_id="run-101-1")
+    )
+    qapp.processEvents()
+
+    _assert_run_specific_cards_cleared(window)
+
+    _emit_review_ready(services, config_id=101, run_id="run-101-2")
     qapp.processEvents()
 
     _assert_chart_cards_visible(window)
@@ -390,9 +482,7 @@ def test_selection_changed_reset_clears_result_stft_and_chart_cards(qapp, monkey
     _show(window, qapp)
 
     _emit_runtime_started(services, config_id=101, run_id="run-101-1")
-    _emit_chart_frames(services, config_id=101, run_id="run-101-1")
-    services.bus.factory_state_changed.emit(_reviewing_state(101))
-    services.bus.factory_review_changed.emit(_review_payload(101, run_id="run-101-1"))
+    _emit_review_ready(services, config_id=101, run_id="run-101-1")
     qapp.processEvents()
 
     assert window.result.empty_state.isHidden() is True
@@ -487,6 +577,34 @@ def test_main_window_toolbar_selection_immediately_refreshes_stft_cached_channel
         window.stft.current_image_payload()["magnitude_db"],
         np.array([[9.0], [10.0]]),
     )
+
+
+def test_main_window_toolbar_selection_immediately_refreshes_committed_chart_modules(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0, 1)),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0, 1))
+    )
+    qapp.processEvents()
+
+    _assert_committed_chart_channel(window, channel_index=0)
+
+    _select_toolbar_channel(window, qapp, 1)
+
+    _assert_committed_chart_channel(window, channel_index=1)
 
 
 def test_main_window_resolves_display_channel_before_analysis_modules_handle_factory_signals(
@@ -640,6 +758,38 @@ def test_main_window_review_time_selected_channel_fallback_picks_first_committed
     assert window.analysis_toolbar.current_channel_index() == 0
     assert window.display_channel_by_config_id[101] == 0
     assert window.octave.selected_display_channel_provider() == 0
+
+
+def test_main_window_toolbar_selection_missing_committed_channel_resynchronizes_to_fallback(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0, 2)),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0, 2))
+    )
+    qapp.processEvents()
+
+    assert window.analysis_toolbar.current_channel_index() == 0
+    _assert_committed_chart_channel(window, channel_index=0)
+
+    _select_toolbar_channel(window, qapp, 1)
+    qapp.processEvents()
+
+    assert window.analysis_toolbar.current_channel_index() == 0
+    assert window.display_channel_by_config_id[101] == 0
+    _assert_committed_chart_channel(window, channel_index=0)
 
 
 def test_main_window_channel_toolbar_hides_when_returning_to_armed_without_displayed_config(
