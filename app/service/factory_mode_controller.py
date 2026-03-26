@@ -5,6 +5,7 @@ from dataclasses import replace
 
 from PyQt6.QtCore import QObject
 
+from app.service.analysis.review_payloads import build_summary_payload
 from app.services_container import (
     FactoryControllerState,
     FactoryPlcIngressPayload,
@@ -21,12 +22,6 @@ class FactoryModeController(QObject):
     """Owns the factory-mode page state and the UI-facing review contract."""
 
     __test__ = False
-    _NO_RESULT_SUMMARY_ROWS = (
-        ("spl", "SPL"),
-        ("fft", "FFT"),
-        ("octave", "倍频程"),
-        ("ai", "AI分析"),
-    )
     _BLOCKED_START_PHASES = frozenset({"running", "analyzing", "reanalyzing"})
     _ACTIVE_RUN_PHASES = frozenset({"running", "analyzing"})
     _BLOCKED_START_PHASE_REASONS = {
@@ -363,6 +358,10 @@ class FactoryModeController(QObject):
         self._owned_reanalysis_config_id = None
         self._owned_reanalysis_run_id = None
         error_message = str(error)
+        summary_payload = self._normalize_no_result_summary(
+            error_message=error_message,
+            summary_payload=summary_payload,
+        )
         self._apply_review_payload(
             replace(
                 self._review_payload,
@@ -371,13 +370,12 @@ class FactoryModeController(QObject):
                 ),
                 trigger_source=self._state.trigger_source,
                 no_result=True,
-                error_message=error_message,
-                judgment_payload=None,
-                summary_payload=(
-                    summary_payload
-                    if isinstance(summary_payload, dict)
-                    else self._build_full_no_result_summary(error_message)
+                error_message=self._summary_error_message(
+                    error_message=error_message,
+                    summary_payload=summary_payload,
                 ),
+                judgment_payload=None,
+                summary_payload=summary_payload,
                 chart_payload=None,
             )
         )
@@ -385,13 +383,16 @@ class FactoryModeController(QObject):
     def handle_runtime_reanalysis_completed(self, payload: FactoryReviewPayload) -> None:
         if not self._owns_reanalysis_payload(payload):
             return
+        if isinstance(payload.summary_payload, dict):
+            self.finish_reanalysis_success(self._merge_reanalysis_review_payload(payload))
+            return
         if payload.no_result or payload.error_message:
             self.finish_reanalysis_failure(
                 payload.error_message or "manual reanalysis failed",
                 summary_payload=payload.summary_payload,
             )
             return
-        self.finish_reanalysis_success(payload)
+        self.finish_reanalysis_success(self._merge_reanalysis_review_payload(payload))
 
     def stop_active_run(self) -> bool:
         if self._pending_start is not None:
@@ -883,23 +884,67 @@ class FactoryModeController(QObject):
     def _make_fallback_run_id(config_id: int) -> str:
         return f"factory-run-{config_id}-{uuid.uuid4().hex}"
 
+    @staticmethod
+    def _normalize_no_result_summary(
+        *,
+        error_message: str | None,
+        summary_payload: dict | None,
+    ) -> dict:
+        if isinstance(summary_payload, dict):
+            return summary_payload
+        return build_summary_payload(
+            config={},
+            judgment_payload=None,
+            error_message=error_message,
+        )
+
     @classmethod
-    def _build_full_no_result_summary(cls, error_message: str) -> dict:
-        return {
-            "overall_status": "no_result",
-            "overall_label": "无结果",
-            "error_message": error_message,
-            "rows": [
-                {
-                    "item_key": item_key,
-                    "label": label,
-                    "deviation_value": None,
-                    "deviation_display": "--",
-                    "channel_index": None,
-                    "channel_label": "--",
-                    "status": "无结果",
-                    "constrained": True,
-                }
-                for item_key, label in cls._NO_RESULT_SUMMARY_ROWS
-            ],
-        }
+    def _summary_error_message(
+        cls,
+        *,
+        error_message: str | None,
+        summary_payload: dict | None,
+    ) -> str | None:
+        if isinstance(summary_payload, dict):
+            summary_error_message = cls._normalize_optional_text(
+                summary_payload.get("error_message")
+            )
+            if summary_error_message is not None:
+                return summary_error_message
+        normalized_error_message = cls._normalize_optional_text(error_message)
+        if normalized_error_message is not None:
+            return normalized_error_message
+        return normalized_error_message
+
+    def _merge_reanalysis_review_payload(
+        self,
+        payload: FactoryReviewPayload,
+    ) -> FactoryReviewPayload:
+        return replace(
+            payload,
+            displayed_config_id=(
+                payload.displayed_config_id
+                or self._state.displayed_config_id
+                or self._review_payload.displayed_config_id
+            ),
+            run_id=payload.run_id or self._review_payload.run_id,
+            trigger_source=(
+                payload.trigger_source
+                or self._state.trigger_source
+                or self._review_payload.trigger_source
+            ),
+            captured_duration_sec=(
+                payload.captured_duration_sec
+                if payload.captured_duration_sec is not None
+                else self._review_payload.captured_duration_sec
+            ),
+            default_window=payload.default_window or self._review_payload.default_window,
+            fallback_window=payload.fallback_window or self._review_payload.fallback_window,
+            manual_reanalysis_allowed=(
+                payload.manual_reanalysis_allowed or self._review_payload.manual_reanalysis_allowed
+            ),
+            error_message=self._summary_error_message(
+                error_message=payload.error_message,
+                summary_payload=payload.summary_payload,
+            ),
+        )

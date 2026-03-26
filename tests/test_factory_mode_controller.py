@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import app.services_container as services_mod
 from app.service.analysis.frames import JudgmentResult
+from app.service.analysis.review_payloads import build_summary_payload
 from app.service.analysis.test_manager import TestManager
 from app.services_container import EventBus
 
@@ -73,54 +74,12 @@ def _make_runtime_config_payload(*, config_id: int = 101, run_id: str | None = N
     )
 
 
-def _full_no_result_summary(error_message: str) -> dict:
-    return {
-        "overall_status": "no_result",
-        "overall_label": "无结果",
-        "error_message": error_message,
-        "rows": [
-            {
-                "item_key": "spl",
-                "label": "SPL",
-                "deviation_value": None,
-                "deviation_display": "--",
-                "channel_index": None,
-                "channel_label": "--",
-                "status": "无结果",
-                "constrained": True,
-            },
-            {
-                "item_key": "fft",
-                "label": "FFT",
-                "deviation_value": None,
-                "deviation_display": "--",
-                "channel_index": None,
-                "channel_label": "--",
-                "status": "无结果",
-                "constrained": True,
-            },
-            {
-                "item_key": "octave",
-                "label": "倍频程",
-                "deviation_value": None,
-                "deviation_display": "--",
-                "channel_index": None,
-                "channel_label": "--",
-                "status": "无结果",
-                "constrained": True,
-            },
-            {
-                "item_key": "ai",
-                "label": "AI分析",
-                "deviation_value": None,
-                "deviation_display": "--",
-                "channel_index": None,
-                "channel_label": "--",
-                "status": "无结果",
-                "constrained": True,
-            },
-        ],
-    }
+def _full_no_result_summary(error_message: str | None) -> dict:
+    return build_summary_payload(
+        config={},
+        judgment_payload=None,
+        error_message=error_message,
+    )
 
 
 def _make_abort_payload(
@@ -2322,6 +2281,109 @@ def test_begin_reanalysis_clears_summary_payload_and_chart_payload_without_reset
     assert [state.run_phase for state in states] == ["reanalyzing"]
 
 
+def test_factory_mode_controller_preserves_committed_partial_no_result_reanalysis_payload():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reviews: list[object] = []
+    states: list[object] = []
+    bus.factory_review_changed.connect(reviews.append)
+    bus.factory_state_changed.connect(states.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    original_review = _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
+    reviews.clear()
+    states.clear()
+
+    started = controller.begin_reanalysis(1.25, 3.25)
+    partial_summary_payload = {
+        "overall_status": "no_result",
+        "overall_label": "无结果",
+        "error_message": "AI timeout",
+        "rows": [
+            {
+                "item_key": "spl",
+                "label": "SPL",
+                "deviation_value": -1.0,
+                "deviation_display": "-1 dB",
+                "channel_index": 0,
+                "channel_label": "CH1",
+                "status": "OK",
+                "constrained": True,
+            },
+            {
+                "item_key": "fft",
+                "label": "FFT",
+                "deviation_value": -2.0,
+                "deviation_display": "-2 dB",
+                "channel_index": 0,
+                "channel_label": "CH1",
+                "status": "OK",
+                "constrained": True,
+            },
+            {
+                "item_key": "octave",
+                "label": "倍频程",
+                "deviation_value": -3.0,
+                "deviation_display": "-3 dB",
+                "channel_index": 0,
+                "channel_label": "CH1",
+                "status": "OK",
+                "constrained": True,
+            },
+            {
+                "item_key": "ai",
+                "label": "AI分析",
+                "deviation_value": None,
+                "deviation_display": "--",
+                "channel_index": None,
+                "channel_label": "--",
+                "status": "无结果",
+                "constrained": True,
+            },
+        ],
+    }
+    partial_chart_payload = {
+        0: {
+            "spl": {"series": [70.0, 71.0]},
+            "fft": {"series": [55.0, 48.0]},
+            "octave": {"series": [57.0, 50.0]},
+        }
+    }
+    committed_payload = _make_review_payload(
+        displayed_config_id=101,
+        run_id=original_review.run_id,
+        trigger_source="manual",
+        no_result=True,
+        error_message="AI timeout",
+        judgment_payload={"overall": "合格", "analysis_window": (1.25, 3.25)},
+        summary_payload=partial_summary_payload,
+        chart_payload=partial_chart_payload,
+    )
+
+    assert started is True
+    services.test.rejudge.assert_called_once_with(101, 1.25, 3.25)
+
+    controller.handle_runtime_reanalysis_completed(committed_payload)
+
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id == 101
+    assert controller.review_payload.run_id == original_review.run_id
+    assert controller.review_payload.default_window == original_review.default_window
+    assert controller.review_payload.manual_reanalysis_allowed is True
+    assert controller.review_payload.no_result is True
+    assert controller.review_payload.error_message == "AI timeout"
+    assert controller.review_payload.summary_payload is partial_summary_payload
+    assert controller.review_payload.chart_payload is partial_chart_payload
+    assert controller.review_payload.judgment_payload == {
+        "overall": "合格",
+        "analysis_window": (1.25, 3.25),
+    }
+    assert [state.run_phase for state in states] == ["reanalyzing", "reviewing"]
+    assert reviews[-1] == controller.review_payload
+
+
 def test_factory_mode_controller_reanalysis_missing_session_unwinds_to_reviewing_no_result():
     controller_mod = _load_factory_mode_controller_module()
     review_payload_cls = getattr(services_mod, "FactoryReviewPayload", None)
@@ -2339,6 +2401,7 @@ def test_factory_mode_controller_reanalysis_missing_session_unwinds_to_reviewing
     original_review = _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
     reviews.clear()
     states.clear()
+    summary_payload = _full_no_result_summary("no session for config 101")
 
     def _rejudge(config_id, start_sec, end_sec):
         error_message = f"no session for config {config_id}"
@@ -2354,7 +2417,7 @@ def test_factory_mode_controller_reanalysis_missing_session_unwinds_to_reviewing
                 no_result=True,
                 error_message=error_message,
                 judgment_payload=None,
-                summary_payload=_full_no_result_summary(error_message),
+                summary_payload=summary_payload,
             )
         )
 
@@ -2372,16 +2435,14 @@ def test_factory_mode_controller_reanalysis_missing_session_unwinds_to_reviewing
     assert controller.review_payload.manual_reanalysis_allowed is True
     assert controller.review_payload.no_result is True
     assert controller.review_payload.error_message == "no session for config 101"
-    assert controller.review_payload.summary_payload == _full_no_result_summary(
-        "no session for config 101"
-    )
+    assert controller.review_payload.summary_payload is summary_payload
     assert controller.review_payload.chart_payload is None
     assert controller.review_payload.judgment_payload is None
     assert [state.run_phase for state in states] == ["reanalyzing", "reviewing"]
     assert reviews[-1] == controller.review_payload
 
 
-def test_factory_mode_controller_rejudge_exception_unwinds_to_reviewing_no_result():
+def test_factory_mode_controller_reanalysis_empty_exception_message_unwinds_to_reviewing_no_result():
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()
     reviews: list[object] = []
@@ -2389,7 +2450,7 @@ def test_factory_mode_controller_rejudge_exception_unwinds_to_reviewing_no_resul
     bus.factory_review_changed.connect(reviews.append)
     bus.factory_state_changed.connect(states.append)
     services = _make_services((_make_config(101), _make_config(202)))
-    services.test.rejudge.side_effect = RuntimeError("rejudge exploded")
+    services.test.rejudge.side_effect = RuntimeError("")
     controller = controller_mod.FactoryModeController(bus, services)
     controller.set_selection((101, 202), manual_primary_config_id=101)
     original_review = _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
@@ -2410,10 +2471,8 @@ def test_factory_mode_controller_rejudge_exception_unwinds_to_reviewing_no_resul
     assert controller.review_payload.default_window == original_review.default_window
     assert controller.review_payload.manual_reanalysis_allowed is True
     assert controller.review_payload.no_result is True
-    assert controller.review_payload.error_message == "rejudge exploded"
-    assert controller.review_payload.summary_payload == _full_no_result_summary(
-        "rejudge exploded"
-    )
+    assert controller.review_payload.error_message == "分析结果不可用"
+    assert controller.review_payload.summary_payload == _full_no_result_summary("")
     assert controller.review_payload.chart_payload is None
     assert controller.review_payload.judgment_payload is None
     assert [state.run_phase for state in states] == ["reanalyzing", "reviewing"]
