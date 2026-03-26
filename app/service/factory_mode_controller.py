@@ -862,6 +862,9 @@ class FactoryModeController(QObject):
         if self._state.run_phase != "reanalyzing":
             return False
 
+        if payload.displayed_config_id is None and payload.run_id is None:
+            return False
+
         config_id = (
             payload.displayed_config_id
             if payload.displayed_config_id is not None
