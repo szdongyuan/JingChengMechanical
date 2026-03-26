@@ -567,11 +567,7 @@ class StftModule(QWidget):
             if isinstance(provided_channel, int):
                 selected_channel = provided_channel
 
-        if selected_channel is not None and self.has_cached_run_data(
-            run_id,
-            channel_index=selected_channel,
-            config_id=config_id,
-        ):
+        if selected_channel is not None:
             return selected_channel
 
         available_channels = self._available_cached_channels(config_id, run_id)

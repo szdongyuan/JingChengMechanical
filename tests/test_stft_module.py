@@ -220,6 +220,36 @@ def test_stft_module_keeps_selected_cached_channel_visible_during_analyzing_with
     assert np.array_equal(payload["magnitude_db"], np.array([[6.0], [7.0]]))
 
 
+def test_stft_module_clears_when_selected_channel_has_no_cached_frames_yet(qapp):
+    module, services = _make_module()
+    selected_channel = 0
+    module.selected_display_channel_provider = lambda: selected_channel
+    _show(module, qapp)
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="running",
+            trigger_source="manual",
+        )
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        0,
+        _make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)),
+    )
+
+    assert module.current_render_cache_key() == (101, "run-101", 0)
+    assert module.current_image_payload() is not None
+
+    selected_channel = 1
+    module.refresh_selected_display_channel()
+
+    assert module.current_render_cache_key() is None
+    assert module.current_image_payload() is None
+
+
 def test_review_success_shows_analysis_box_from_automatic_window_with_fixed_duration(qapp):
     module, services = _make_module()
     _show(module, qapp)
