@@ -89,6 +89,46 @@ def _make_judgment_payload():
     }
 
 
+def _build_single_channel_band_summary(*, config_key, result_key, band_results):
+    configured_bands = [
+        {"freq": 500.0, "lower": 35.0, "upper": 55.0},
+        {"freq": 1000.0, "lower": 35.0, "upper": 55.0},
+    ]
+
+    return build_summary_payload(
+        config={
+            "config_id": 101,
+            "selected_channels": [0],
+            "channels": [
+                {
+                    "channel_index": 0,
+                    "spl_lower_limit": 40.0,
+                    "spl_upper_limit": 80.0,
+                    "fft_band_limits": configured_bands if config_key == "fft_band_limits" else [],
+                    "oct_band_limits": configured_bands if config_key == "oct_band_limits" else [],
+                }
+            ],
+        },
+        judgment_payload={
+            "overall": "不合格",
+            "limit_pass": False,
+            "ai_pass": None,
+            "ai_score": None,
+            "analysis_window": (1.0, 3.0),
+            "channel_results": [
+                {
+                    "channel_index": 0,
+                    "spl_db": 70.0,
+                    "spl_pass": True,
+                    "fft_band_results": band_results if result_key == "fft_band_results" else [],
+                    "oct_band_results": band_results if result_key == "oct_band_results" else [],
+                }
+            ],
+        },
+        ai_review={"status": "not_enabled"},
+    )
+
+
 def test_build_summary_payload_uses_worst_case_deviation_across_channels():
     summary = build_summary_payload(
         config=_make_config(),
@@ -289,6 +329,91 @@ def test_build_summary_payload_marks_configured_octave_with_non_finite_actual_as
     assert summary["rows"][2]["channel_label"] == "--"
     assert summary["rows"][2]["status"] == "无结果"
     assert summary["rows"][2]["constrained"] is True
+
+
+@pytest.mark.parametrize(
+    ("config_key", "result_key", "row_index", "label"),
+    [
+        ("fft_band_limits", "fft_band_results", 1, "FFT"),
+        ("oct_band_limits", "oct_band_results", 2, "倍频程"),
+    ],
+)
+def test_build_summary_payload_marks_mixed_usable_and_non_finite_band_rows_as_no_result(
+    config_key,
+    result_key,
+    row_index,
+    label,
+):
+    summary = _build_single_channel_band_summary(
+        config_key=config_key,
+        result_key=result_key,
+        band_results=[
+            {
+                "freq": 500.0,
+                "level": 45.0,
+                "lower": 35.0,
+                "upper": 55.0,
+                "passed": True,
+            },
+            {
+                "freq": 1000.0,
+                "level": math.nan,
+                "lower": 35.0,
+                "upper": 55.0,
+                "passed": False,
+            },
+        ],
+    )
+
+    assert summary["overall_status"] == "no_result"
+    assert summary["overall_label"] == "无结果"
+    assert summary["error_message"] == "分析结果不可用"
+    assert summary["rows"][row_index]["label"] == label
+    assert summary["rows"][row_index]["deviation_value"] is None
+    assert summary["rows"][row_index]["deviation_display"] == "--"
+    assert summary["rows"][row_index]["channel_index"] is None
+    assert summary["rows"][row_index]["channel_label"] == "--"
+    assert summary["rows"][row_index]["status"] == "无结果"
+    assert summary["rows"][row_index]["constrained"] is True
+
+
+@pytest.mark.parametrize(
+    ("config_key", "result_key", "row_index", "label"),
+    [
+        ("fft_band_limits", "fft_band_results", 1, "FFT"),
+        ("oct_band_limits", "oct_band_results", 2, "倍频程"),
+    ],
+)
+def test_build_summary_payload_marks_mixed_usable_and_missing_band_rows_as_no_result(
+    config_key,
+    result_key,
+    row_index,
+    label,
+):
+    summary = _build_single_channel_band_summary(
+        config_key=config_key,
+        result_key=result_key,
+        band_results=[
+            {
+                "freq": 500.0,
+                "level": 45.0,
+                "lower": 35.0,
+                "upper": 55.0,
+                "passed": True,
+            }
+        ],
+    )
+
+    assert summary["overall_status"] == "no_result"
+    assert summary["overall_label"] == "无结果"
+    assert summary["error_message"] == "分析结果不可用"
+    assert summary["rows"][row_index]["label"] == label
+    assert summary["rows"][row_index]["deviation_value"] is None
+    assert summary["rows"][row_index]["deviation_display"] == "--"
+    assert summary["rows"][row_index]["channel_index"] is None
+    assert summary["rows"][row_index]["channel_label"] == "--"
+    assert summary["rows"][row_index]["status"] == "无结果"
+    assert summary["rows"][row_index]["constrained"] is True
 
 
 def test_build_summary_payload_renders_four_no_result_rows_for_full_no_result():

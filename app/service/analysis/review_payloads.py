@@ -212,22 +212,17 @@ def _build_band_row(
         configured_bands = channel_config.get(config_key, [])
         if isinstance(configured_bands, list) and configured_bands:
             configured_any = True
-        channel_result = channel_results.get(channel_index, {})
-        for band_result in channel_result.get(result_key, []):
-            if not isinstance(band_result, dict):
-                continue
-            actual = _coerce_number(band_result.get("level"))
-            lower = _coerce_bound(band_result.get("lower"))
-            upper = _coerce_bound(band_result.get("upper"))
-            deviation = _compute_deviation(actual=actual, lower=lower, upper=upper)
-            if deviation is None:
-                continue
-            candidates.append(
-                {
-                    "deviation_value": deviation,
-                    "channel_index": channel_index,
-                }
-            )
+        if not isinstance(configured_bands, list) or not configured_bands:
+            continue
+        channel_result = channel_results.get(channel_index)
+        channel_candidates = _build_configured_band_candidates(
+            configured_bands=configured_bands,
+            band_results=channel_result.get(result_key) if isinstance(channel_result, dict) else None,
+            channel_index=channel_index,
+        )
+        if channel_candidates is None:
+            return _build_constrained_no_result_row(item_key, label)
+        candidates.extend(channel_candidates)
     if not configured_any:
         return _build_unconstrained_row(item_key, label)
     if not candidates:
@@ -239,6 +234,53 @@ def _build_band_row(
         unit="dB",
         constrained=True,
     )
+
+
+def _build_configured_band_candidates(
+    *,
+    configured_bands,
+    band_results,
+    channel_index: int,
+) -> list[dict] | None:
+    if not isinstance(band_results, list):
+        return None
+
+    candidates = []
+    for configured_band in configured_bands:
+        band_result = _find_matching_band_result(configured_band, band_results)
+        if not isinstance(band_result, dict):
+            return None
+        actual = _coerce_number(band_result.get("level"))
+        lower = _coerce_bound(band_result.get("lower"))
+        upper = _coerce_bound(band_result.get("upper"))
+        deviation = _compute_deviation(actual=actual, lower=lower, upper=upper)
+        if deviation is None:
+            return None
+        candidates.append(
+            {
+                "deviation_value": deviation,
+                "channel_index": channel_index,
+            }
+        )
+    return candidates
+
+
+def _find_matching_band_result(configured_band, band_results) -> dict | None:
+    if not isinstance(configured_band, dict):
+        return None
+    target_freq = _coerce_number(configured_band.get("freq"))
+    if target_freq is None:
+        return None
+
+    for band_result in band_results:
+        if not isinstance(band_result, dict):
+            continue
+        result_freq = _coerce_number(band_result.get("freq"))
+        if result_freq is None:
+            continue
+        if math.isclose(result_freq, target_freq, rel_tol=0.0, abs_tol=1e-6):
+            return band_result
+    return None
 
 
 def _build_ai_row(
