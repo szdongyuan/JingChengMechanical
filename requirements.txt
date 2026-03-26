@@ -1,1 +1,1 @@
-pyqtgraph==0.12.4
+pyqtgraph==0.13.7
