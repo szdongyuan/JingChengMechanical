@@ -145,16 +145,11 @@ class TestSession:
             if self._on_session_done_cb is not None:
                 self._on_session_done_cb(self.config_id)
 
-    def _run_judgment(self) -> JudgmentResult:
+    def _run_judgment(self) -> JudgmentResult | None:
         """Run judgment on the recorded buffer."""
         self._last_ai_review = None
         if self._buffer is None:
-            return JudgmentResult(
-                overall="不合格",
-                limit_pass=False,
-                ai_pass=None,
-                ai_score=None,
-            )
+            return None
 
         self._audio_file_path = self._save_wav(self._buffer, self._sample_rate)
 
@@ -258,6 +253,21 @@ class TestSession:
             )
             self._bus.log.emit(
                 f"[TestSession] WARNING: AI analysis failed for config={self.config_id}: {exc}"
+            )
+            return result
+
+        if not isinstance(envelope, dict):
+            error_message = "AI analysis returned invalid output"
+            self._last_ai_review = self._make_ai_review(
+                status="invalid_output",
+                threshold=score_threshold,
+                score=None,
+                channel_index=None,
+                error_message=error_message,
+            )
+            self._bus.log.emit(
+                f"[TestSession] WARNING: AI analysis returned invalid output for config="
+                f"{self.config_id}: {envelope!r}"
             )
             return result
 

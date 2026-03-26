@@ -589,6 +589,7 @@ def _build_octave_chart(*, signal: np.ndarray, sample_rate: float, channel_confi
     weighting = str(channel_config.get("oct_weighting", "Z") or "Z")
     center_freqs_hz, levels_db = dsp.compute_octave_bands(signal, sample_rate, weighting)
     absolute_levels_db = _absolute_levels_db(levels_db)
+    center_freqs_hz, absolute_levels_db = _normalize_chart_pairs(center_freqs_hz, absolute_levels_db)
     return {
         "center_freqs_hz": _normalize_chart_list(center_freqs_hz),
         "levels_db": _normalize_chart_list(absolute_levels_db),
@@ -656,6 +657,22 @@ def _normalize_chart_list(values: np.ndarray | list[float]) -> list[float]:
         if normalized_value is not None:
             normalized.append(normalized_value)
     return normalized
+
+
+def _normalize_chart_pairs(
+    x_values: np.ndarray | list[float],
+    y_values: np.ndarray | list[float],
+) -> tuple[np.ndarray, np.ndarray]:
+    x_axis = np.asarray(x_values, dtype=np.float64)
+    y_axis = np.asarray(y_values, dtype=np.float64)
+    if x_axis.size <= 0 or y_axis.size <= 0:
+        return np.asarray([], dtype=np.float64), np.asarray([], dtype=np.float64)
+
+    length = min(int(x_axis.size), int(y_axis.size))
+    x_axis = x_axis[:length]
+    y_axis = y_axis[:length]
+    finite_mask = np.isfinite(x_axis) & np.isfinite(y_axis)
+    return x_axis[finite_mask], y_axis[finite_mask]
 
 
 def _normalize_chart_number(value) -> float | None:

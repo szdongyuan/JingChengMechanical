@@ -333,6 +333,12 @@ class TestManager(QObject):
         if session is None:
             error_message = f"no session for config {config_id}"
             self._bus.log.emit(f"[TestManager] {error_message}")
+            summary_payload = build_summary_payload(
+                config={},
+                judgment_payload=None,
+                ai_review=None,
+                error_message=error_message,
+            )
             self._emit_optional_signal(
                 "factory_runtime_reanalysis_completed",
                 self._make_factory_review_payload(
@@ -340,6 +346,7 @@ class TestManager(QObject):
                     None,
                     no_result=True,
                     error_message=error_message,
+                    summary_payload=summary_payload,
                 ),
             )
             return
