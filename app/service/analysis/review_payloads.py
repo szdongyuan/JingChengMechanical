@@ -589,14 +589,15 @@ def _build_octave_chart(*, signal: np.ndarray, sample_rate: float, channel_confi
     weighting = str(channel_config.get("oct_weighting", "Z") or "Z")
     center_freqs_hz, levels_db = dsp.compute_octave_bands(signal, sample_rate, weighting)
     absolute_levels_db = _absolute_levels_db(levels_db)
-    center_freqs_hz, absolute_levels_db = _normalize_chart_pairs(center_freqs_hz, absolute_levels_db)
+    chart_center_freqs_hz, chart_levels_db = _normalize_chart_pairs(center_freqs_hz, absolute_levels_db)
     return {
-        "center_freqs_hz": _normalize_chart_list(center_freqs_hz),
-        "levels_db": _normalize_chart_list(absolute_levels_db),
+        "center_freqs_hz": _normalize_chart_list(chart_center_freqs_hz),
+        "levels_db": _normalize_chart_list(chart_levels_db),
         "limit_bands": _build_limit_band_payloads(
             frequencies=center_freqs_hz,
             levels_db=absolute_levels_db,
             configured_bands=channel_config.get("oct_band_limits", []),
+            require_exact_frequency=True,
         ),
     }
 
@@ -611,6 +612,7 @@ def _build_limit_band_payloads(
     frequencies: np.ndarray | list[float],
     levels_db: np.ndarray | list[float],
     configured_bands,
+    require_exact_frequency: bool = False,
 ) -> list[dict]:
     frequency_axis = np.asarray(frequencies, dtype=np.float64)
     level_axis = np.asarray(levels_db, dtype=np.float64)
@@ -624,7 +626,13 @@ def _build_limit_band_payloads(
         target_freq = _coerce_number(band.get("freq"))
         if target_freq is None:
             continue
-        idx = int(np.argmin(np.abs(frequency_axis - target_freq)))
+        if require_exact_frequency:
+            matches = np.flatnonzero(np.isclose(frequency_axis, target_freq))
+            if matches.size == 0:
+                continue
+            idx = int(matches[0])
+        else:
+            idx = int(np.argmin(np.abs(frequency_axis - target_freq)))
         actual_db = _normalize_chart_number(level_axis[idx])
         lower_db = _normalize_chart_number(band.get("lower"))
         upper_db = _normalize_chart_number(band.get("upper"))

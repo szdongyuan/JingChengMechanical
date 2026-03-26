@@ -485,6 +485,7 @@ class TestTestManagerStartStop:
         assert accepted is True
         assert mgr.is_running(config_id=1) is True
         bus.test_started.emit.assert_called_with(1)
+        mgr.stop(config_id=1)
 
     def test_start_returns_false_when_config_load_fails(self):
         bus = _mock_bus()
@@ -1322,6 +1323,7 @@ class TestTestManagerStartStop:
         accepted = mgr.start({"config": "MyConfig", "sn": "SN1", "model": "M1"})
         assert accepted is True
         assert mgr.is_running(config_id=42) is True
+        mgr.stop(config_id=42)
 
     def test_start_passes_output_device_identity_to_monitor(self, monkeypatch):
         bus = _mock_bus()
@@ -1754,6 +1756,7 @@ class TestSampleRateMismatch:
         rec = mgr._recorders.get(1)
         assert rec is not None
         assert rec._sample_rate == 48000.0
+        mgr.stop(config_id=1)
 
     def test_start_builds_pipelines_with_resolved_device_sample_rate(self, monkeypatch):
         bus = _mock_bus()
@@ -3289,6 +3292,85 @@ class TestReviewPayloadEmission:
         payload = bus.factory_runtime_auto_analysis_no_result.emit.call_args.args[0]
         assert payload.summary_payload["overall_status"] == "no_result"
         assert payload.summary_payload["error_message"] == "analysis window not fully captured"
+        assert len(payload.summary_payload["rows"]) == 4
+        assert all(row["status"] == "无结果" for row in payload.summary_payload["rows"])
+        assert payload.chart_payload is None
+        assert payload.no_result is True
+
+    def test_on_session_done_none_result_emits_no_chart_payload_and_no_result_summary(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        post_attach = np.arange(10, 20, dtype=np.float32).reshape(10, 1)
+        attach_snapshot = object()
+        rec = MagicMock()
+        rec.get_buffer_from.return_value = post_attach
+        rec._sample_rate = 100.0
+        session = MagicMock()
+        session.config_id = 1
+        session._buffer = None
+        session._attach_snapshot = attach_snapshot
+        session._audio_file_path = "captured.wav"
+        session._audio_data_id = "audio-123"
+        session._workorder = {"factory_run_id": "run-1"}
+        session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+            "selected_channels": [0],
+            "channels": [{"channel_index": 0}],
+        }
+
+        expected_summary = _expected_summary_payload(
+            overall_status="no_result",
+            error_message="analysis result unavailable",
+        )
+        for row in expected_summary["rows"]:
+            row["deviation_value"] = None
+            row["deviation_display"] = "--"
+            row["channel_index"] = None
+            row["channel_label"] = "--"
+            row["status"] = "无结果"
+            row["constrained"] = False
+
+        build_summary_calls = []
+
+        def fake_build_summary_payload(**kwargs):
+            build_summary_calls.append(kwargs)
+            return expected_summary
+
+        def fail_build_chart_payload(**kwargs):
+            raise AssertionError("chart payload should not be built for full no-result")
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_summary_payload",
+            fake_build_summary_payload,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_chart_payload",
+            fail_build_chart_payload,
+            raising=False,
+        )
+        session._run_judgment.return_value = None
+        mgr._sessions[1] = session
+        mgr._recorders[1] = rec
+
+        mgr._on_session_done(1)
+
+        assert build_summary_calls == [
+            {
+                "config": session._config,
+                "judgment_payload": None,
+                "ai_review": None,
+                "error_message": "analysis result unavailable",
+            }
+        ]
+        payload = bus.factory_runtime_auto_analysis_no_result.emit.call_args.args[0]
+        assert payload.summary_payload["overall_status"] == "no_result"
+        assert payload.summary_payload["error_message"] == "analysis result unavailable"
         assert len(payload.summary_payload["rows"]) == 4
         assert all(row["status"] == "无结果" for row in payload.summary_payload["rows"])
         assert payload.chart_payload is None

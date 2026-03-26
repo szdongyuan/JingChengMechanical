@@ -392,3 +392,51 @@ def test_build_chart_payload_octave_filters_non_finite_levels_without_axis_misma
             "passed": True,
         },
     ]
+
+
+def test_build_chart_payload_octave_omits_limit_band_when_configured_bin_level_is_non_finite(monkeypatch):
+    ref_db = 20.0 * math.log10(20e-6)
+
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_spl",
+        lambda signal, sample_rate, weighting, time_constant: 70.0,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
+        lambda signal, sample_rate, nfft: (
+            np.array([1000.0], dtype=np.float64),
+            np.array([67.0], dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_octave_bands",
+        lambda signal, sample_rate, weighting: (
+            np.array([500.0, 1000.0, 2000.0], dtype=np.float64),
+            np.array([57.0, np.nan, 44.0], dtype=np.float64) + ref_db,
+        ),
+    )
+
+    config = _make_config()
+    config["selected_channels"] = [0]
+    config["channels"] = [{
+        "channel_index": 0,
+        "spl_lower_limit": 40.0,
+        "spl_upper_limit": 80.0,
+        "fft_band_limits": [],
+        "oct_band_limits": [
+            {"freq": 1000.0, "lower": 35.0, "upper": 55.0},
+        ],
+    }]
+
+    payload = build_chart_payload(
+        buffer=np.full((200, 1), 0.1, dtype=np.float32),
+        config=config,
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.0, 2.0),
+    )
+
+    octave = payload[0]["octave"]
+    assert octave["center_freqs_hz"] == [500.0, 2000.0]
+    assert octave["levels_db"] == [57.0, 44.0]
+    assert octave["limit_bands"] == []
