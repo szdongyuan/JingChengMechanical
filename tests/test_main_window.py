@@ -4,12 +4,14 @@ import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication, QWidget
 
+from app.service.analysis.frames import StftFrame
 from app.services_container import (
     FactoryControllerState,
     FactoryReviewPayload,
@@ -37,6 +39,7 @@ class _BusStub:
         self.status = _SignalStub()
         self.log = _SignalStub()
         self.result_changed = _SignalStub()
+        self.stft_updated = _SignalStub()
         self.fft_updated = _SignalStub()
         self.spl_updated = _SignalStub()
         self.octave_updated = _SignalStub()
@@ -281,6 +284,19 @@ def _emit_chart_frames(services, *, config_id: int, run_id: str) -> None:
     services.bus.octave_updated.emit(config_id, run_id, 0, object())
 
 
+def _make_stft_frame(
+    *,
+    time: float,
+    magnitudes: tuple[float, ...],
+    frequencies: tuple[float, ...] = (100.0, 200.0),
+) -> StftFrame:
+    return StftFrame(
+        time=time,
+        frequencies=np.asarray(frequencies, dtype=float),
+        magnitudes=np.asarray(magnitudes, dtype=float),
+    )
+
+
 def test_armed_page_hides_run_specific_cards_until_new_run_data_arrives(qapp, monkeypatch):
     window, services = _make_window(
         monkeypatch,
@@ -420,6 +436,57 @@ def test_main_window_channel_toolbar_shows_for_multi_channel_running_config(qapp
     assert callable(window.spectrum.selected_display_channel_provider)
     assert callable(window.octave.selected_display_channel_provider)
     assert window.stft.selected_display_channel_provider() == 0
+
+
+def test_main_window_toolbar_selection_immediately_refreshes_stft_cached_channel(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(
+            config_id=101,
+            run_id="run-101",
+            trigger_source="manual",
+        )
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        0,
+        _make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)),
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        1,
+        _make_stft_frame(time=0.0, magnitudes=(9.0, 10.0)),
+    )
+    qapp.processEvents()
+
+    assert window.stft.current_render_cache_key() == (101, "run-101", 0)
+    assert np.array_equal(
+        window.stft.current_image_payload()["magnitude_db"],
+        np.array([[1.0], [2.0]]),
+    )
+
+    _select_toolbar_channel(window, qapp, 1)
+
+    assert window.stft.current_render_cache_key() == (101, "run-101", 1)
+    assert np.array_equal(
+        window.stft.current_image_payload()["magnitude_db"],
+        np.array([[9.0], [10.0]]),
+    )
 
 
 def test_main_window_resolves_display_channel_before_analysis_modules_handle_factory_signals(

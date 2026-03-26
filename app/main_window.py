@@ -304,6 +304,9 @@ class MainWindow(QMainWindow):
         if config_id is None:
             return
         self.display_channel_by_config_id[config_id] = channel_index
+        refresh_stft = getattr(self.stft, "refresh_selected_display_channel", None)
+        if callable(refresh_stft):
+            refresh_stft()
         self.analysis_toolbar.set_context_label_text(
             self._build_analysis_toolbar_context(config_id, channel_index)
         )
