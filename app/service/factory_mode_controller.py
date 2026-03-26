@@ -321,6 +321,8 @@ class FactoryModeController(QObject):
             no_result=False,
             error_message=None,
             judgment_payload=None,
+            summary_payload=None,
+            chart_payload=None,
         )
         self._state = self._state_with_readiness(
             replace(
