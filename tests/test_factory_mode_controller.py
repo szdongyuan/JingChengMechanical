@@ -73,6 +73,56 @@ def _make_runtime_config_payload(*, config_id: int = 101, run_id: str | None = N
     )
 
 
+def _full_no_result_summary(error_message: str) -> dict:
+    return {
+        "overall_status": "no_result",
+        "overall_label": "无结果",
+        "error_message": error_message,
+        "rows": [
+            {
+                "item_key": "spl",
+                "label": "SPL",
+                "deviation_value": None,
+                "deviation_display": "--",
+                "channel_index": None,
+                "channel_label": "--",
+                "status": "无结果",
+                "constrained": True,
+            },
+            {
+                "item_key": "fft",
+                "label": "FFT",
+                "deviation_value": None,
+                "deviation_display": "--",
+                "channel_index": None,
+                "channel_label": "--",
+                "status": "无结果",
+                "constrained": True,
+            },
+            {
+                "item_key": "octave",
+                "label": "倍频程",
+                "deviation_value": None,
+                "deviation_display": "--",
+                "channel_index": None,
+                "channel_label": "--",
+                "status": "无结果",
+                "constrained": True,
+            },
+            {
+                "item_key": "ai",
+                "label": "AI分析",
+                "deviation_value": None,
+                "deviation_display": "--",
+                "channel_index": None,
+                "channel_label": "--",
+                "status": "无结果",
+                "constrained": True,
+            },
+        ],
+    }
+
+
 def _make_abort_payload(
     *,
     config_id: int = 101,
@@ -2210,6 +2260,10 @@ def test_factory_mode_controller_reanalysis_failure_returns_to_reviewing_without
     assert controller.state.displayed_config_id == 101
     assert controller.review_payload.no_result is True
     assert controller.review_payload.error_message == "manual reanalysis failed"
+    assert controller.review_payload.summary_payload == _full_no_result_summary(
+        "manual reanalysis failed"
+    )
+    assert controller.review_payload.chart_payload is None
     assert controller.review_payload.judgment_payload is None
 
 
@@ -2287,6 +2341,7 @@ def test_factory_mode_controller_reanalysis_missing_session_unwinds_to_reviewing
     states.clear()
 
     def _rejudge(config_id, start_sec, end_sec):
+        error_message = f"no session for config {config_id}"
         bus.factory_runtime_reanalysis_completed.emit(
             review_payload_cls(
                 displayed_config_id=config_id,
@@ -2297,8 +2352,9 @@ def test_factory_mode_controller_reanalysis_missing_session_unwinds_to_reviewing
                 fallback_window=None,
                 manual_reanalysis_allowed=False,
                 no_result=True,
-                error_message=f"no session for config {config_id}",
+                error_message=error_message,
                 judgment_payload=None,
+                summary_payload=_full_no_result_summary(error_message),
             )
         )
 
@@ -2316,6 +2372,10 @@ def test_factory_mode_controller_reanalysis_missing_session_unwinds_to_reviewing
     assert controller.review_payload.manual_reanalysis_allowed is True
     assert controller.review_payload.no_result is True
     assert controller.review_payload.error_message == "no session for config 101"
+    assert controller.review_payload.summary_payload == _full_no_result_summary(
+        "no session for config 101"
+    )
+    assert controller.review_payload.chart_payload is None
     assert controller.review_payload.judgment_payload is None
     assert [state.run_phase for state in states] == ["reanalyzing", "reviewing"]
     assert reviews[-1] == controller.review_payload
@@ -2351,6 +2411,10 @@ def test_factory_mode_controller_rejudge_exception_unwinds_to_reviewing_no_resul
     assert controller.review_payload.manual_reanalysis_allowed is True
     assert controller.review_payload.no_result is True
     assert controller.review_payload.error_message == "rejudge exploded"
+    assert controller.review_payload.summary_payload == _full_no_result_summary(
+        "rejudge exploded"
+    )
+    assert controller.review_payload.chart_payload is None
     assert controller.review_payload.judgment_payload is None
     assert [state.run_phase for state in states] == ["reanalyzing", "reviewing"]
     assert reviews[-1] == controller.review_payload

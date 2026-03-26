@@ -21,6 +21,12 @@ class FactoryModeController(QObject):
     """Owns the factory-mode page state and the UI-facing review contract."""
 
     __test__ = False
+    _NO_RESULT_SUMMARY_ROWS = (
+        ("spl", "SPL"),
+        ("fft", "FFT"),
+        ("octave", "倍频程"),
+        ("ai", "AI分析"),
+    )
     _BLOCKED_START_PHASES = frozenset({"running", "analyzing", "reanalyzing"})
     _ACTIVE_RUN_PHASES = frozenset({"running", "analyzing"})
     _BLOCKED_START_PHASE_REASONS = {
@@ -348,9 +354,15 @@ class FactoryModeController(QObject):
         self._owned_reanalysis_run_id = None
         self._apply_review_payload(payload)
 
-    def finish_reanalysis_failure(self, error: Exception | str) -> None:
+    def finish_reanalysis_failure(
+        self,
+        error: Exception | str,
+        *,
+        summary_payload: dict | None = None,
+    ) -> None:
         self._owned_reanalysis_config_id = None
         self._owned_reanalysis_run_id = None
+        error_message = str(error)
         self._apply_review_payload(
             replace(
                 self._review_payload,
@@ -359,8 +371,14 @@ class FactoryModeController(QObject):
                 ),
                 trigger_source=self._state.trigger_source,
                 no_result=True,
-                error_message=str(error),
+                error_message=error_message,
                 judgment_payload=None,
+                summary_payload=(
+                    summary_payload
+                    if isinstance(summary_payload, dict)
+                    else self._build_full_no_result_summary(error_message)
+                ),
+                chart_payload=None,
             )
         )
 
@@ -368,7 +386,10 @@ class FactoryModeController(QObject):
         if not self._owns_reanalysis_payload(payload):
             return
         if payload.no_result or payload.error_message:
-            self.finish_reanalysis_failure(payload.error_message or "manual reanalysis failed")
+            self.finish_reanalysis_failure(
+                payload.error_message or "manual reanalysis failed",
+                summary_payload=payload.summary_payload,
+            )
             return
         self.finish_reanalysis_success(payload)
 
@@ -861,3 +882,24 @@ class FactoryModeController(QObject):
     @staticmethod
     def _make_fallback_run_id(config_id: int) -> str:
         return f"factory-run-{config_id}-{uuid.uuid4().hex}"
+
+    @classmethod
+    def _build_full_no_result_summary(cls, error_message: str) -> dict:
+        return {
+            "overall_status": "no_result",
+            "overall_label": "无结果",
+            "error_message": error_message,
+            "rows": [
+                {
+                    "item_key": item_key,
+                    "label": label,
+                    "deviation_value": None,
+                    "deviation_display": "--",
+                    "channel_index": None,
+                    "channel_label": "--",
+                    "status": "无结果",
+                    "constrained": True,
+                }
+                for item_key, label in cls._NO_RESULT_SUMMARY_ROWS
+            ],
+        }
