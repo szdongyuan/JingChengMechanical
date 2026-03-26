@@ -11,6 +11,15 @@ from PyQt6.QtWidgets import QVBoxLayout, QWidget
 pg.setConfigOptions(antialias=True, background="w", foreground="#334155")
 
 
+def _empty_plot_array() -> np.ndarray:
+    return np.array([], dtype=float)
+
+
+def _clear_error_bar_item(error_bar_item: pg.ErrorBarItem) -> None:
+    empty = _empty_plot_array()
+    error_bar_item.setData(x=empty, y=empty, top=empty, bottom=empty, beam=0.0)
+
+
 def _normalize_vector(values: Iterable[float], *, name: str) -> list[float]:
     normalized: list[float] = []
     for value in values:
@@ -271,7 +280,7 @@ class FftLineChartWidget(LineChartWidget):
     def clear_data(self) -> None:
         super().clear_data()
         self._spectrum_payload = None
-        self._band_range_item.setData(x=[], y=[], top=[], bottom=[])
+        _clear_error_bar_item(self._band_range_item)
         self._band_marker_item.setData([])
 
     def spectrum_payload(self) -> dict | None:
@@ -284,7 +293,7 @@ class FftLineChartWidget(LineChartWidget):
         limit_bands: list[dict],
     ) -> None:
         if not limit_bands:
-            self._band_range_item.setData(x=[], y=[], top=[], bottom=[])
+            _clear_error_bar_item(self._band_range_item)
             self._band_marker_item.setData([])
             return
 
@@ -370,7 +379,7 @@ class OctaveBarChartWidget(_BasePlotChart):
     def clear_data(self) -> None:
         self._band_payload = None
         self._replace_bar_item(x=np.array([], dtype=float), heights=np.array([], dtype=float))
-        self._band_range_item.setData(x=[], y=[], top=[], bottom=[])
+        _clear_error_bar_item(self._band_range_item)
         self._band_marker_item.setData([])
         self.plot_item.getAxis("bottom").setTicks([])
 
@@ -399,7 +408,7 @@ class OctaveBarChartWidget(_BasePlotChart):
         limit_bands: list[dict],
     ) -> None:
         if not limit_bands:
-            self._band_range_item.setData(x=[], y=[], top=[], bottom=[])
+            _clear_error_bar_item(self._band_range_item)
             self._band_marker_item.setData([])
             return
 

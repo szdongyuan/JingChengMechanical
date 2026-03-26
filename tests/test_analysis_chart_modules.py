@@ -237,6 +237,30 @@ def test_fft_line_chart_widget_accepts_limit_band_markers(qapp):
     assert widget.spectrum_payload()["limit_bands"] == limit_bands
 
 
+def test_fft_line_chart_widget_empty_limit_bands_allow_autorange_after_show(qapp):
+    widget = FftLineChartWidget()
+
+    try:
+        widget.set_spectrum(
+            frequencies_hz=[125.0, 250.0, 500.0],
+            levels_db=[42.0, 45.0, 51.0],
+            limit_bands=[],
+        )
+
+        widget.show()
+        qapp.processEvents()
+
+        rect = widget._band_range_item.boundingRect()
+        x_range, _y_range = widget.plot_item.vb.viewRange()
+
+        assert rect.width() >= 0.0
+        assert rect.height() >= 0.0
+        assert x_range[1] > 100.0
+        assert (x_range[1] - x_range[0]) > 100.0
+    finally:
+        widget.close()
+
+
 def test_octave_bar_chart_widget_accepts_limit_band_markers(qapp):
     widget = OctaveBarChartWidget()
     limit_bands = [
@@ -259,6 +283,71 @@ def test_octave_bar_chart_widget_accepts_limit_band_markers(qapp):
     assert widget.band_payload()["center_freqs_hz"] == [125.0, 250.0, 500.0, 1000.0]
     assert widget.band_payload()["levels_db"] == [33.0, 41.0, 57.0, 49.0]
     assert widget.band_payload()["limit_bands"] == limit_bands
+
+
+def test_octave_bar_chart_widget_empty_limit_bands_allow_bounds_queries(qapp):
+    widget = OctaveBarChartWidget()
+
+    try:
+        widget.set_bands(
+            center_freqs_hz=[125.0, 250.0, 500.0],
+            levels_db=[33.0, 41.0, 57.0],
+            limit_bands=[],
+        )
+
+        widget.show()
+        qapp.processEvents()
+
+        rect = widget._band_range_item.boundingRect()
+
+        assert rect.width() >= 0.0
+        assert rect.height() >= 0.0
+    finally:
+        widget.close()
+
+
+@pytest.mark.parametrize("widget_cls", (FftLineChartWidget, OctaveBarChartWidget))
+def test_chart_widgets_clear_data_keeps_error_bar_bounds_query_safe(qapp, widget_cls):
+    widget = widget_cls()
+
+    try:
+        if widget_cls is FftLineChartWidget:
+            widget.set_spectrum(
+                frequencies_hz=[125.0, 250.0, 500.0],
+                levels_db=[42.0, 45.0, 51.0],
+                limit_bands=[
+                    {
+                        "freq_hz": 250.0,
+                        "lower_db": 40.0,
+                        "upper_db": 50.0,
+                        "actual_db": 45.0,
+                        "passed": True,
+                    }
+                ],
+            )
+        else:
+            widget.set_bands(
+                center_freqs_hz=[125.0, 250.0, 500.0],
+                levels_db=[33.0, 41.0, 57.0],
+                limit_bands=[
+                    {
+                        "freq_hz": 250.0,
+                        "lower_db": 30.0,
+                        "upper_db": 45.0,
+                        "actual_db": 41.0,
+                        "passed": True,
+                    }
+                ],
+            )
+
+        widget.clear_data()
+
+        rect = widget._band_range_item.boundingRect()
+
+        assert rect.width() >= 0.0
+        assert rect.height() >= 0.0
+    finally:
+        widget.close()
 
 
 def test_spl_module_renders_committed_chart_for_selected_channel(qapp):
