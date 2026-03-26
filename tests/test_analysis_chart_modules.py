@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -16,6 +17,18 @@ from ui.widgets.analysis_charts import (
     StftImageChartWidget,
 )
 
+EXPECTED_BASELINE_REQUIREMENTS = {
+    "concurrent-log-handler",
+    "numpy",
+    "peewee",
+    "pyqt6",
+    "pyqtgraph==0.13.7",
+    "pytest",
+    "pytest-qt",
+    "scipy",
+    "sounddevice",
+}
+
 
 @pytest.fixture(scope="session")
 def qapp():
@@ -23,6 +36,17 @@ def qapp():
     if app is None:
         app = QApplication([])
     return app
+
+
+def test_requirements_txt_lists_runtime_and_test_baseline_dependencies():
+    requirements_path = Path(__file__).resolve().parents[1] / "requirements.txt"
+    entries = {
+        line.split("#", 1)[0].strip().casefold()
+        for line in requirements_path.read_text(encoding="utf-8").splitlines()
+        if line.split("#", 1)[0].strip()
+    }
+
+    assert entries == EXPECTED_BASELINE_REQUIREMENTS
 
 
 def test_stft_image_chart_widget_accepts_render_payload(qapp):
@@ -38,6 +62,30 @@ def test_stft_image_chart_widget_accepts_render_payload(qapp):
     assert widget.image_payload()["times_sec"] == [0.0, 0.5, 1.0]
     assert widget.image_payload()["frequencies_hz"] == [100.0, 200.0]
     assert widget.image_payload()["magnitude_db"].shape == (2, 3)
+
+
+def test_stft_image_chart_widget_image_payload_returns_defensive_copies(qapp):
+    widget = StftImageChartWidget()
+    widget.set_image(
+        times_sec=[0.0, 0.5, 1.0],
+        frequencies_hz=[100.0, 200.0],
+        magnitude_db=np.array([[1.0, 2.0, 3.0], [3.5, 4.5, 5.5]]),
+    )
+
+    payload = widget.image_payload()
+    assert payload is not None
+
+    payload["times_sec"].append(9.5)
+    payload["frequencies_hz"][0] = -1.0
+    payload["magnitude_db"][0, 0] = 99.0
+
+    fresh_payload = widget.image_payload()
+    assert fresh_payload["times_sec"] == [0.0, 0.5, 1.0]
+    assert fresh_payload["frequencies_hz"] == [100.0, 200.0]
+    assert np.array_equal(
+        fresh_payload["magnitude_db"],
+        np.array([[1.0, 2.0, 3.0], [3.5, 4.5, 5.5]]),
+    )
 
 
 def test_line_chart_widget_accepts_limit_lines(qapp):

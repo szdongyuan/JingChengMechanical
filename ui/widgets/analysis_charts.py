@@ -145,6 +145,8 @@ class StftImageChartWidget(_BasePlotChart):
         if self._image_payload is None:
             return None
         payload = dict(self._image_payload)
+        payload["times_sec"] = list(self._image_payload["times_sec"])
+        payload["frequencies_hz"] = list(self._image_payload["frequencies_hz"])
         payload["magnitude_db"] = self._image_payload["magnitude_db"].copy()
         return payload
 
