@@ -364,7 +364,11 @@ class MainWindow(QMainWindow):
 
         remembered_channel = self.display_channel_by_config_id.get(config_id)
         review_channels = self._chart_payload_channels_for_config(config_id)
-        if review_channels and remembered_channel not in review_channels:
+        if (
+            remembered_channel is not None
+            and review_channels
+            and remembered_channel not in review_channels
+        ):
             for review_channel in review_channels:
                 if review_channel in channels:
                     return review_channel
