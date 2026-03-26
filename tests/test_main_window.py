@@ -53,6 +53,29 @@ class _StubModule(QWidget):
         self.services = services
 
 
+class _ChannelProbeModule(_StubModule):
+    def __init__(self, services=None):
+        super().__init__(services)
+        self.selected_display_channel_provider = None
+        self.state_seen_channels = []
+        self.review_seen_channels = []
+
+        if hasattr(self.services.bus, "factory_state_changed"):
+            self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
+        if hasattr(self.services.bus, "factory_review_changed"):
+            self.services.bus.factory_review_changed.connect(self._on_factory_review_changed)
+
+    def _record_current_channel(self, bucket: list[int | None]) -> None:
+        provider = self.selected_display_channel_provider
+        bucket.append(provider() if callable(provider) else None)
+
+    def _on_factory_state_changed(self, _state) -> None:
+        self._record_current_channel(self.state_seen_channels)
+
+    def _on_factory_review_changed(self, _review) -> None:
+        self._record_current_channel(self.review_seen_channels)
+
+
 @pytest.fixture(scope="session")
 def qapp():
     app = QApplication.instance()
@@ -217,6 +240,11 @@ def _select_toolbar_channel(window, qapp, channel_index: int) -> None:
     combo = window.analysis_toolbar.channel_combo
     combo.setCurrentIndex(combo.findData(channel_index))
     qapp.processEvents()
+
+
+def _toolbar_channel_options(window) -> list[int]:
+    combo = window.analysis_toolbar.channel_combo
+    return [combo.itemData(index) for index in range(combo.count())]
 
 
 def _assert_run_specific_cards_cleared(window, *, result_badge: str = "-") -> None:
@@ -394,6 +422,43 @@ def test_main_window_channel_toolbar_shows_for_multi_channel_running_config(qapp
     assert window.stft.selected_display_channel_provider() == 0
 
 
+def test_main_window_resolves_display_channel_before_analysis_modules_handle_factory_signals(
+    qapp,
+    monkeypatch,
+):
+    for name in ("ResultModule",):
+        monkeypatch.setattr(main_window_mod, name, _StubModule)
+    for name in ("SpectrumModule", "StftModule", "SplModule", "OctaveModule"):
+        monkeypatch.setattr(main_window_mod, name, _ChannelProbeModule)
+
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_armed_state(),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+
+    assert window.stft.state_seen_channels[-1] == 0
+    assert window.spl.state_seen_channels[-1] == 0
+
+    _select_toolbar_channel(window, qapp, 1)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0, 2))
+    )
+    qapp.processEvents()
+
+    assert window.stft.review_seen_channels[-1] == 0
+    assert window.octave.review_seen_channels[-1] == 0
+
+
 def test_main_window_channel_toolbar_hides_or_disables_selector_for_single_channel_displayed_config(
     qapp,
     monkeypatch,
@@ -481,6 +546,7 @@ def test_main_window_review_time_selected_channel_fallback_picks_first_committed
     )
     qapp.processEvents()
 
+    assert _toolbar_channel_options(window) == [0, 1]
     assert window.analysis_toolbar.current_channel_index() == 0
     assert window.display_channel_by_config_id[101] == 0
     assert window.octave.selected_display_channel_provider() == 0

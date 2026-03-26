@@ -61,19 +61,14 @@ class MainWindow(QMainWindow):
         outer.addWidget(self._build_topbar())
         outer.addWidget(self.tab, 1)
 
+        self._connect_bus_signals()
+
         # 页面：测试/数据管理/配置/硬件
         self.tab.addWidget(self.build_test_page())
         self.tab.addWidget(self.build_placeholder_page("数据管理"))
         self.tab.addWidget(self.build_config_page())
         self.tab.addWidget(self.build_hardware_page())
 
-        self.services.bus.status.connect(self.statusBar().showMessage)
-        if hasattr(self.services.bus, "factory_state_changed"):
-            self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
-        if hasattr(self.services.bus, "factory_review_changed"):
-            self.services.bus.factory_review_changed.connect(self._on_factory_review_changed)
-        if hasattr(self.services.bus, "factory_display_reset"):
-            self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
         self.statusBar().showMessage("Idle")
 
         self.services.bus.log.emit("[App] 启动程序")
@@ -267,6 +262,15 @@ class MainWindow(QMainWindow):
         content_lay.addWidget(main, 1)
         return page
 
+    def _connect_bus_signals(self) -> None:
+        self.services.bus.status.connect(self.statusBar().showMessage)
+        if hasattr(self.services.bus, "factory_state_changed"):
+            self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
+        if hasattr(self.services.bus, "factory_review_changed"):
+            self.services.bus.factory_review_changed.connect(self._on_factory_review_changed)
+        if hasattr(self.services.bus, "factory_display_reset"):
+            self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
+
     def current_display_channel_index(self) -> int | None:
         config_id = self._factory_state.displayed_config_id
         if config_id is None:
@@ -305,6 +309,9 @@ class MainWindow(QMainWindow):
         )
 
     def _sync_analysis_toolbar(self) -> None:
+        if not hasattr(self, "analysis_toolbar"):
+            return
+
         config_id = self._factory_state.displayed_config_id
         if (
             config_id is None
@@ -338,14 +345,14 @@ class MainWindow(QMainWindow):
         self.analysis_toolbar.show()
 
     def _resolve_display_channels(self, config_id: int) -> list[int]:
-        if self._factory_state.run_phase in {"running", "analyzing"}:
-            return self._selected_channels_for_config(config_id)
+        selected_channels = self._selected_channels_for_config(config_id)
+        if selected_channels:
+            return selected_channels
 
-        review_channels = self._chart_payload_channels_for_config(config_id)
-        if review_channels:
-            return review_channels
+        if self._factory_state.run_phase in {"reviewing", "reanalyzing"}:
+            return self._chart_payload_channels_for_config(config_id)
 
-        return self._selected_channels_for_config(config_id)
+        return []
 
     def _resolve_current_display_channel(
         self,
@@ -358,7 +365,9 @@ class MainWindow(QMainWindow):
         remembered_channel = self.display_channel_by_config_id.get(config_id)
         review_channels = self._chart_payload_channels_for_config(config_id)
         if review_channels and remembered_channel not in review_channels:
-            return review_channels[0]
+            for review_channel in review_channels:
+                if review_channel in channels:
+                    return review_channel
 
         if remembered_channel in channels:
             return remembered_channel
