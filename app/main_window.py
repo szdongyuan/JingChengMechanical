@@ -73,6 +73,7 @@ class MainWindow(QMainWindow):
 
         self.services.bus.log.emit("[App] 启动程序")
         self._sync_analysis_toolbar()
+        self._refresh_analysis_display_modules()
 
     def closeEvent(self, event: QCloseEvent):
         self.services.bus.log.emit("[App] 关闭程序")

@@ -730,6 +730,27 @@ def test_main_window_startup_in_review_prefers_first_selected_config_channel_whe
     assert window.stft.selected_display_channel_provider() == 1
 
 
+def test_main_window_startup_in_review_renders_committed_chart_modules_on_resolved_shared_channel(
+    qapp,
+    monkeypatch,
+):
+    _patch_non_target_modules(monkeypatch)
+    services = _make_services(
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0, 1)),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [1, 0],
+    }
+
+    window = main_window_mod.MainWindow(services)
+    _show(window, qapp)
+
+    assert window.analysis_toolbar.current_channel_index() == 1
+    _assert_committed_chart_channel(window, channel_index=1)
+
+
 def test_main_window_review_time_selected_channel_fallback_picks_first_committed_chart_payload_channel(
     qapp,
     monkeypatch,
