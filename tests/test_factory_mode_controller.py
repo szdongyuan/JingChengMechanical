@@ -2384,6 +2384,177 @@ def test_factory_mode_controller_preserves_committed_partial_no_result_reanalysi
     assert reviews[-1] == controller.review_payload
 
 
+def test_factory_mode_controller_accepts_successful_reanalysis_payload_without_run_id():
+    controller_mod = _load_factory_mode_controller_module()
+    review_window_cls = getattr(services_mod, "FactoryReviewWindow", None)
+    review_payload_cls = getattr(services_mod, "FactoryReviewPayload", None)
+
+    assert review_window_cls is not None, "FactoryReviewWindow is missing"
+    assert review_payload_cls is not None, "FactoryReviewPayload is missing"
+
+    bus = EventBus()
+    reviews: list[object] = []
+    states: list[object] = []
+    bus.factory_review_changed.connect(reviews.append)
+    bus.factory_state_changed.connect(states.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    original_review = _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
+    reviews.clear()
+    states.clear()
+
+    started = controller.begin_reanalysis(1.25, 3.25)
+
+    assert started is True
+
+    controller.handle_runtime_reanalysis_completed(
+        review_payload_cls(
+            displayed_config_id=101,
+            run_id=None,
+            trigger_source="manual",
+            captured_duration_sec=6.5,
+            default_window=review_window_cls(start_sec=1.25, end_sec=3.25),
+            fallback_window=None,
+            manual_reanalysis_allowed=False,
+            no_result=False,
+            error_message=None,
+            judgment_payload={"overall": "PASS", "source": "reanalysis"},
+            summary_payload=None,
+            chart_payload={"series": [1.0, 2.0, 3.0]},
+        )
+    )
+
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.displayed_config_id == 101
+    assert controller.review_payload.displayed_config_id == 101
+    assert controller.review_payload.run_id == original_review.run_id
+    assert controller.review_payload.captured_duration_sec == 6.5
+    assert controller.review_payload.judgment_payload == {
+        "overall": "PASS",
+        "source": "reanalysis",
+    }
+    assert controller.review_payload.chart_payload == {"series": [1.0, 2.0, 3.0]}
+    assert [state.run_phase for state in states] == ["reanalyzing", "reviewing"]
+    assert reviews[-1] == controller.review_payload
+
+
+def test_factory_mode_controller_accepts_reanalysis_payload_without_displayed_config_id():
+    controller_mod = _load_factory_mode_controller_module()
+    review_window_cls = getattr(services_mod, "FactoryReviewWindow", None)
+    review_payload_cls = getattr(services_mod, "FactoryReviewPayload", None)
+
+    assert review_window_cls is not None, "FactoryReviewWindow is missing"
+    assert review_payload_cls is not None, "FactoryReviewPayload is missing"
+
+    bus = EventBus()
+    reviews: list[object] = []
+    states: list[object] = []
+    bus.factory_review_changed.connect(reviews.append)
+    bus.factory_state_changed.connect(states.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    original_review = _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
+    reviews.clear()
+    states.clear()
+
+    started = controller.begin_reanalysis(1.25, 3.25)
+
+    assert started is True
+
+    controller.handle_runtime_reanalysis_completed(
+        review_payload_cls(
+            displayed_config_id=None,
+            run_id=original_review.run_id,
+            trigger_source="manual",
+            captured_duration_sec=6.5,
+            default_window=review_window_cls(start_sec=1.25, end_sec=3.25),
+            fallback_window=None,
+            manual_reanalysis_allowed=False,
+            no_result=False,
+            error_message=None,
+            judgment_payload={"overall": "PASS", "source": "reanalysis"},
+            summary_payload=None,
+            chart_payload={"series": [1.0, 2.0, 3.0]},
+        )
+    )
+
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.displayed_config_id == 101
+    assert controller.review_payload.displayed_config_id == 101
+    assert controller.review_payload.run_id == original_review.run_id
+    assert controller.review_payload.captured_duration_sec == 6.5
+    assert controller.review_payload.judgment_payload == {
+        "overall": "PASS",
+        "source": "reanalysis",
+    }
+    assert controller.review_payload.chart_payload == {"series": [1.0, 2.0, 3.0]}
+    assert [state.run_phase for state in states] == ["reanalyzing", "reviewing"]
+    assert reviews[-1] == controller.review_payload
+
+
+@pytest.mark.parametrize(
+    ("displayed_config_id", "run_id"),
+    [
+        (None, _run_id_for(202)),
+        (202, None),
+    ],
+)
+def test_factory_mode_controller_rejects_mismatched_sparse_reanalysis_payloads(
+    displayed_config_id,
+    run_id,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    review_window_cls = getattr(services_mod, "FactoryReviewWindow", None)
+    review_payload_cls = getattr(services_mod, "FactoryReviewPayload", None)
+
+    assert review_window_cls is not None, "FactoryReviewWindow is missing"
+    assert review_payload_cls is not None, "FactoryReviewPayload is missing"
+
+    bus = EventBus()
+    reviews: list[object] = []
+    states: list[object] = []
+    bus.factory_review_changed.connect(reviews.append)
+    bus.factory_state_changed.connect(states.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    original_review = _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
+    reviews.clear()
+    states.clear()
+
+    started = controller.begin_reanalysis(1.25, 3.25)
+
+    assert started is True
+
+    pending_review = controller.review_payload
+    pending_state = controller.state
+
+    controller.handle_runtime_reanalysis_completed(
+        review_payload_cls(
+            displayed_config_id=displayed_config_id,
+            run_id=run_id,
+            trigger_source="manual",
+            captured_duration_sec=6.5,
+            default_window=review_window_cls(start_sec=1.25, end_sec=3.25),
+            fallback_window=None,
+            manual_reanalysis_allowed=False,
+            no_result=False,
+            error_message=None,
+            judgment_payload={"overall": "PASS", "source": "wrong"},
+            summary_payload=None,
+            chart_payload={"series": [9.0]},
+        )
+    )
+
+    assert controller.state == pending_state
+    assert controller.review_payload == pending_review
+    assert controller.review_payload.run_id == original_review.run_id
+    assert [state.run_phase for state in states] == ["reanalyzing"]
+    assert reviews == [pending_review]
+
+
 def test_factory_mode_controller_reanalysis_missing_session_unwinds_to_reviewing_no_result():
     controller_mod = _load_factory_mode_controller_module()
     review_payload_cls = getattr(services_mod, "FactoryReviewPayload", None)
