@@ -272,6 +272,91 @@ def _review_payload_with_chart_payload(
     )
 
 
+def _summary_payload(
+    *,
+    overall_status: str,
+    error_message: str | None = None,
+    rows: list[dict] | None = None,
+) -> dict:
+    overall_label = {
+        "pass": "PASS",
+        "fail": "FAIL",
+        "no_result": "无结果",
+    }[overall_status]
+    return {
+        "overall_status": overall_status,
+        "overall_label": overall_label,
+        "error_message": error_message,
+        "rows": rows or [],
+    }
+
+
+def _partial_no_result_review_payload(
+    config_id: int,
+    *,
+    run_id: str | None = None,
+    channels: tuple[int, ...] = (0, 1),
+) -> FactoryReviewPayload:
+    return FactoryReviewPayload(
+        displayed_config_id=config_id,
+        run_id=run_id or f"run-{config_id}",
+        trigger_source="manual",
+        captured_duration_sec=5.0,
+        default_window=FactoryReviewWindow(start_sec=1.0, end_sec=3.0),
+        fallback_window=None,
+        manual_reanalysis_allowed=True,
+        no_result=True,
+        error_message="AI timeout",
+        summary_payload=_summary_payload(
+            overall_status="no_result",
+            error_message="AI timeout",
+            rows=[
+                {
+                    "item_key": "spl",
+                    "label": "SPL",
+                    "deviation_value": -1.0,
+                    "deviation_display": "-1 dB",
+                    "channel_index": 1,
+                    "channel_label": "CH2",
+                    "status": "OK",
+                    "constrained": True,
+                },
+                {
+                    "item_key": "fft",
+                    "label": "FFT",
+                    "deviation_value": 2.0,
+                    "deviation_display": "2 dB",
+                    "channel_index": 0,
+                    "channel_label": "CH1",
+                    "status": "NG",
+                    "constrained": True,
+                },
+                {
+                    "item_key": "octave",
+                    "label": "倍频程",
+                    "deviation_value": -3.0,
+                    "deviation_display": "-3 dB",
+                    "channel_index": 1,
+                    "channel_label": "CH2",
+                    "status": "OK",
+                    "constrained": True,
+                },
+                {
+                    "item_key": "ai",
+                    "label": "AI分析",
+                    "deviation_value": None,
+                    "deviation_display": "--",
+                    "channel_index": None,
+                    "channel_label": "--",
+                    "status": "无结果",
+                    "constrained": True,
+                },
+            ],
+        ),
+        chart_payload=_chart_payload_for_channels(channels),
+    )
+
+
 def _select_toolbar_channel(window, qapp, channel_index: int) -> None:
     combo = window.analysis_toolbar.channel_combo
     combo.setCurrentIndex(combo.findData(channel_index))
@@ -353,6 +438,12 @@ def _assert_committed_chart_channel(window, *, channel_index: int) -> None:
         32.0 + channel_index,
         34.0 + channel_index,
     ]
+
+
+def _result_table_value(window, row: int, column: int) -> str:
+    item = window.result.table.item(row, column)
+    assert item is not None
+    return item.text()
 
 
 def _make_stft_frame(
@@ -607,6 +698,48 @@ def test_main_window_toolbar_selection_immediately_refreshes_committed_chart_mod
     _assert_committed_chart_channel(window, channel_index=1)
 
 
+def test_main_window_ai_partial_no_result_keeps_rule_rows_and_committed_charts_visible(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 1)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _partial_no_result_review_payload(101, channels=(0, 1))
+    )
+    qapp.processEvents()
+
+    assert window.result.lb_overall.text() == "无结果"
+    assert window.result.error_label.isHidden() is False
+    assert window.result.error_label.text() == "AI timeout"
+    assert _result_table_value(window, 0, 0) == "SPL"
+    assert _result_table_value(window, 0, 1) == "-1 dB"
+    assert _result_table_value(window, 0, 2) == "CH2"
+    assert _result_table_value(window, 0, 3) == "OK"
+    assert _result_table_value(window, 1, 0) == "FFT"
+    assert _result_table_value(window, 1, 1) == "2 dB"
+    assert _result_table_value(window, 1, 2) == "CH1"
+    assert _result_table_value(window, 1, 3) == "NG"
+    assert _result_table_value(window, 3, 0) == "AI分析"
+    assert _result_table_value(window, 3, 2) == "--"
+    assert _result_table_value(window, 3, 3) == "无结果"
+    _assert_chart_cards_visible(window)
+    _assert_committed_chart_channel(window, channel_index=1)
+
+
 def test_main_window_resolves_display_channel_before_analysis_modules_handle_factory_signals(
     qapp,
     monkeypatch,
@@ -705,6 +838,58 @@ def test_main_window_remembers_selected_channel_per_config_when_switching_displa
     assert window.analysis_toolbar.current_channel_index() == 2
     assert window.display_channel_by_config_id[202] == 2
     assert window.spectrum.selected_display_channel_provider() == 2
+
+
+def test_main_window_review_switching_displayed_configs_restores_last_selected_channel_for_charts(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0, 1)),
+    )
+    services.config_service.load_config.side_effect = lambda config_id: {
+        101: {"config_id": 101, "selected_channels": [0, 1]},
+        202: {"config_id": 202, "selected_channels": [0, 2]},
+    }[config_id]
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0, 1))
+    )
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 1)
+    _assert_committed_chart_channel(window, channel_index=1)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(202))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(202, channels=(0, 2))
+    )
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 2)
+    _assert_committed_chart_channel(window, channel_index=2)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0, 1))
+    )
+    qapp.processEvents()
+
+    assert window.analysis_toolbar.current_channel_index() == 1
+    assert window.display_channel_by_config_id[101] == 1
+    _assert_committed_chart_channel(window, channel_index=1)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(202))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(202, channels=(0, 2))
+    )
+    qapp.processEvents()
+
+    assert window.analysis_toolbar.current_channel_index() == 2
+    assert window.display_channel_by_config_id[202] == 2
+    _assert_committed_chart_channel(window, channel_index=2)
 
 
 def test_main_window_startup_in_review_prefers_first_selected_config_channel_when_none_is_remembered(
