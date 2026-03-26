@@ -231,7 +231,7 @@ def _build_band_row(
     if not configured_any:
         return _build_unconstrained_row(item_key, label)
     if not candidates:
-        return _build_unconstrained_row(item_key, label)
+        return _build_constrained_no_result_row(item_key, label)
     return _build_row_from_candidate(
         item_key=item_key,
         label=label,
@@ -323,13 +323,21 @@ def _build_unconstrained_row(item_key: str, label: str) -> dict:
 
 
 def _build_full_no_result_row(item_key: str, label: str) -> dict:
+    return _build_no_result_row(item_key, label, constrained=False)
+
+
+def _build_constrained_no_result_row(item_key: str, label: str) -> dict:
+    return _build_no_result_row(item_key, label, constrained=True)
+
+
+def _build_no_result_row(item_key: str, label: str, *, constrained: bool) -> dict:
     return _build_row(
         item_key=item_key,
         label=label,
         deviation_value=None,
         channel_index=None,
         status=_NO_RESULT_STATUS,
-        constrained=False,
+        constrained=constrained,
         unit=None,
     )
 

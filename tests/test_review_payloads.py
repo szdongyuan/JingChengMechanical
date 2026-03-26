@@ -237,6 +237,60 @@ def test_build_summary_payload_preserves_ai_channel_label_on_ai_failure():
     assert summary["rows"][-1]["status"] == "无结果"
 
 
+def test_build_summary_payload_marks_configured_octave_with_non_finite_actual_as_no_result():
+    summary = build_summary_payload(
+        config={
+            "config_id": 101,
+            "selected_channels": [0],
+            "channels": [
+                {
+                    "channel_index": 0,
+                    "spl_lower_limit": 40.0,
+                    "spl_upper_limit": 80.0,
+                    "fft_band_limits": [],
+                    "oct_band_limits": [{"freq": 1000.0, "lower": 35.0, "upper": 55.0}],
+                }
+            ],
+        },
+        judgment_payload={
+            "overall": "合格",
+            "limit_pass": True,
+            "ai_pass": None,
+            "ai_score": None,
+            "analysis_window": (1.0, 3.0),
+            "channel_results": [
+                {
+                    "channel_index": 0,
+                    "spl_db": 70.0,
+                    "spl_pass": True,
+                    "fft_band_results": [],
+                    "oct_band_results": [
+                        {
+                            "freq": 1000.0,
+                            "level": math.nan,
+                            "lower": 35.0,
+                            "upper": 55.0,
+                            "passed": False,
+                        }
+                    ],
+                }
+            ],
+        },
+        ai_review={"status": "not_enabled"},
+    )
+
+    assert summary["overall_status"] == "no_result"
+    assert summary["overall_label"] == "无结果"
+    assert summary["error_message"] == "分析结果不可用"
+    assert summary["rows"][2]["label"] == "倍频程"
+    assert summary["rows"][2]["deviation_value"] is None
+    assert summary["rows"][2]["deviation_display"] == "--"
+    assert summary["rows"][2]["channel_index"] is None
+    assert summary["rows"][2]["channel_label"] == "--"
+    assert summary["rows"][2]["status"] == "无结果"
+    assert summary["rows"][2]["constrained"] is True
+
+
 def test_build_summary_payload_renders_four_no_result_rows_for_full_no_result():
     summary = build_summary_payload(
         config=_make_config(),
