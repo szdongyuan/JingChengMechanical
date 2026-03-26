@@ -416,6 +416,40 @@ def test_build_summary_payload_marks_mixed_usable_and_missing_band_rows_as_no_re
     assert summary["rows"][row_index]["constrained"] is True
 
 
+def test_build_summary_payload_keeps_nearest_bin_fft_band_results_as_normal_row():
+    summary = _build_single_channel_band_summary(
+        config_key="fft_band_limits",
+        result_key="fft_band_results",
+        band_results=[
+            {
+                "freq": 492.1875,
+                "level": 45.0,
+                "lower": 35.0,
+                "upper": 55.0,
+                "passed": True,
+            },
+            {
+                "freq": 984.375,
+                "level": 54.0,
+                "lower": 35.0,
+                "upper": 55.0,
+                "passed": True,
+            },
+        ],
+    )
+
+    assert summary["overall_status"] == "pass"
+    assert summary["overall_label"] == "PASS"
+    assert summary["error_message"] is None
+    assert summary["rows"][1]["label"] == "FFT"
+    assert summary["rows"][1]["deviation_value"] == -1.0
+    assert summary["rows"][1]["deviation_display"] == "-1 dB"
+    assert summary["rows"][1]["channel_index"] == 0
+    assert summary["rows"][1]["channel_label"] == "CH1"
+    assert summary["rows"][1]["status"] == "OK"
+    assert summary["rows"][1]["constrained"] is True
+
+
 def test_build_summary_payload_renders_four_no_result_rows_for_full_no_result():
     summary = build_summary_payload(
         config=_make_config(),

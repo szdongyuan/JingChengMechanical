@@ -246,8 +246,12 @@ def _build_configured_band_candidates(
         return None
 
     candidates = []
-    for configured_band in configured_bands:
-        band_result = _find_matching_band_result(configured_band, band_results)
+    for band_index, configured_band in enumerate(configured_bands):
+        if not isinstance(configured_band, dict):
+            return None
+        if band_index >= len(band_results):
+            return None
+        band_result = band_results[band_index]
         if not isinstance(band_result, dict):
             return None
         actual = _coerce_number(band_result.get("level"))
@@ -263,24 +267,6 @@ def _build_configured_band_candidates(
             }
         )
     return candidates
-
-
-def _find_matching_band_result(configured_band, band_results) -> dict | None:
-    if not isinstance(configured_band, dict):
-        return None
-    target_freq = _coerce_number(configured_band.get("freq"))
-    if target_freq is None:
-        return None
-
-    for band_result in band_results:
-        if not isinstance(band_result, dict):
-            continue
-        result_freq = _coerce_number(band_result.get("freq"))
-        if result_freq is None:
-            continue
-        if math.isclose(result_freq, target_freq, rel_tol=0.0, abs_tol=1e-6):
-            return band_result
-    return None
 
 
 def _build_ai_row(
