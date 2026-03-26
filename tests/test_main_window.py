@@ -89,6 +89,9 @@ def _make_services(
     return SimpleNamespace(
         bus=bus,
         db=SimpleNamespace(close=MagicMock()),
+        config_service=SimpleNamespace(
+            load_config=MagicMock(return_value={"selected_channels": []})
+        ),
         factory_mode=factory_mode,
     )
 
@@ -182,9 +185,44 @@ def _review_payload(config_id: int, *, run_id: str | None = None) -> FactoryRevi
     )
 
 
-def _assert_run_specific_cards_cleared(window) -> None:
-    assert window.result.empty_state.isHidden() is False
-    assert window.result.lb_empty_text.text() == "No data"
+def _review_payload_with_chart_payload(
+    config_id: int,
+    *,
+    run_id: str | None = None,
+    channels: tuple[int, ...] = (0, 1),
+) -> FactoryReviewPayload:
+    return FactoryReviewPayload(
+        displayed_config_id=config_id,
+        run_id=run_id or f"run-{config_id}",
+        trigger_source="manual",
+        captured_duration_sec=5.0,
+        default_window=FactoryReviewWindow(start_sec=1.0, end_sec=3.0),
+        fallback_window=None,
+        manual_reanalysis_allowed=True,
+        no_result=False,
+        error_message=None,
+        summary_payload={"overall_status": "pass", "rows": []},
+        chart_payload={
+            channel_index: {
+                "spl": {},
+                "fft": {},
+                "octave": {},
+            }
+            for channel_index in channels
+        },
+    )
+
+
+def _select_toolbar_channel(window, qapp, channel_index: int) -> None:
+    combo = window.analysis_toolbar.channel_combo
+    combo.setCurrentIndex(combo.findData(channel_index))
+    qapp.processEvents()
+
+
+def _assert_run_specific_cards_cleared(window, *, result_badge: str = "-") -> None:
+    assert window.result.lb_overall.text() == result_badge
+    assert window.result.empty_state.isHidden() is True
+    assert window.result.lb_empty_text.text() == ""
     assert window.stft.selection_box.isVisible() is False
     assert window.stft.analyze_button.isVisible() is False
     assert window.spectrum.empty_state.isHidden() is False
@@ -227,7 +265,7 @@ def test_armed_page_hides_run_specific_cards_until_new_run_data_arrives(qapp, mo
     _emit_runtime_started(services, config_id=101, run_id="run-101-1")
     qapp.processEvents()
 
-    _assert_run_specific_cards_cleared(window)
+    _assert_run_specific_cards_cleared(window, result_badge="分析中")
 
     _emit_chart_frames(services, config_id=101, run_id="run-101-1")
     qapp.processEvents()
@@ -262,7 +300,7 @@ def test_next_run_reset_clears_result_stft_and_chart_cards_before_new_data_rende
     _emit_runtime_started(services, config_id=202, run_id="run-202-1")
     qapp.processEvents()
 
-    _assert_run_specific_cards_cleared(window)
+    _assert_run_specific_cards_cleared(window, result_badge="分析中")
 
     _emit_chart_frames(services, config_id=202, run_id="run-202-1")
     qapp.processEvents()
@@ -290,12 +328,12 @@ def test_same_config_rerun_ignores_late_old_chart_frames_after_reset(qapp, monke
     _emit_runtime_started(services, config_id=101, run_id="run-101-2")
     qapp.processEvents()
 
-    _assert_run_specific_cards_cleared(window)
+    _assert_run_specific_cards_cleared(window, result_badge="分析中")
 
     _emit_chart_frames(services, config_id=101, run_id="run-101-1")
     qapp.processEvents()
 
-    _assert_run_specific_cards_cleared(window)
+    _assert_run_specific_cards_cleared(window, result_badge="分析中")
 
     _emit_chart_frames(services, config_id=101, run_id="run-101-2")
     qapp.processEvents()
@@ -328,3 +366,146 @@ def test_selection_changed_reset_clears_result_stft_and_chart_cards(qapp, monkey
     qapp.processEvents()
 
     _assert_run_specific_cards_cleared(window)
+
+
+def test_main_window_channel_toolbar_shows_for_multi_channel_running_config(qapp, monkeypatch):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+
+    assert window.analysis_toolbar.isVisible() is True
+    assert window.analysis_toolbar.channel_combo.isVisible() is True
+    assert window.analysis_toolbar.channel_combo.isEnabled() is True
+    assert window.analysis_toolbar.current_channel_index() == 0
+    assert window.display_channel_by_config_id == {101: 0}
+    assert callable(window.stft.selected_display_channel_provider)
+    assert callable(window.spl.selected_display_channel_provider)
+    assert callable(window.spectrum.selected_display_channel_provider)
+    assert callable(window.octave.selected_display_channel_provider)
+    assert window.stft.selected_display_channel_provider() == 0
+
+
+def test_main_window_channel_toolbar_hides_or_disables_selector_for_single_channel_displayed_config(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+
+    assert window.analysis_toolbar.isVisible() is True
+    assert window.analysis_toolbar.current_channel_index() == 0
+    assert (
+        window.analysis_toolbar.channel_combo.isHidden()
+        or not window.analysis_toolbar.channel_combo.isEnabled()
+    )
+    assert window.display_channel_by_config_id == {101: 0}
+
+
+def test_main_window_remembers_selected_channel_per_config_when_switching_displayed_configs(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.side_effect = lambda config_id: {
+        101: {"config_id": 101, "selected_channels": [0, 1]},
+        202: {"config_id": 202, "selected_channels": [0, 2]},
+    }[config_id]
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 1)
+
+    services.bus.factory_state_changed.emit(_running_state(202))
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 2)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+
+    assert window.analysis_toolbar.current_channel_index() == 1
+    assert window.display_channel_by_config_id[101] == 1
+    assert window.spl.selected_display_channel_provider() == 1
+
+    services.bus.factory_state_changed.emit(_running_state(202))
+    qapp.processEvents()
+
+    assert window.analysis_toolbar.current_channel_index() == 2
+    assert window.display_channel_by_config_id[202] == 2
+    assert window.spectrum.selected_display_channel_provider() == 2
+
+
+def test_main_window_review_time_selected_channel_fallback_picks_first_committed_chart_payload_channel(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 1)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0, 2))
+    )
+    qapp.processEvents()
+
+    assert window.analysis_toolbar.current_channel_index() == 0
+    assert window.display_channel_by_config_id[101] == 0
+    assert window.octave.selected_display_channel_provider() == 0
+
+
+def test_main_window_channel_toolbar_hides_when_returning_to_armed_without_displayed_config(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+    assert window.analysis_toolbar.isVisible() is True
+
+    services.bus.factory_review_changed.emit(FactoryReviewPayload())
+    services.bus.factory_state_changed.emit(_armed_state())
+    qapp.processEvents()
+
+    assert window.analysis_toolbar.isHidden() is True
