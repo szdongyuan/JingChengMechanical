@@ -581,6 +581,38 @@ def test_octave_module_keeps_two_committed_limit_band_markers_renderable(qapp):
     module.plot._band_range_item.boundingRect()
 
 
+@pytest.mark.parametrize("module_cls", (SpectrumModule, OctaveModule))
+def test_committed_chart_modules_stay_empty_in_reviewing_when_chart_payload_is_missing(
+    qapp,
+    module_cls,
+):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = module_cls(services)
+    module.selected_display_channel_provider = lambda: 0
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(
+        FactoryReviewPayload(
+            displayed_config_id=101,
+            run_id="run-101",
+            trigger_source="manual",
+            summary_payload={
+                "overall_status": "no_result",
+                "overall_label": "无结果",
+                "error_message": "analysis unavailable",
+                "rows": [],
+            },
+            chart_payload=None,
+        )
+    )
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is False
+    assert module.current_plot_payload() is None
+    assert module.current_render_channel() is None
+    assert module.empty_state.isHidden() is False
+
+
 @pytest.mark.parametrize(
     ("module_cls", "live_signal_name"),
     (
