@@ -518,6 +518,9 @@ class FactoryModeController(QObject):
             trigger_source = self._state.trigger_source
 
         self._review_payload = replace(payload, trigger_source=trigger_source)
+        ignore_backend_session_running = self._should_ignore_backend_session_running_for_review(
+            payload=self._review_payload
+        )
         self._state = self._state_with_readiness(
             replace(
                 self._state,
@@ -525,7 +528,8 @@ class FactoryModeController(QObject):
                 displayed_config_id=self._review_payload.displayed_config_id,
                 run_phase="reviewing",
                 trigger_source=trigger_source,
-            )
+            ),
+            ignore_backend_session_running=ignore_backend_session_running,
         )
         self.bus.factory_review_changed.emit(self._review_payload)
         self._emit_state()
@@ -634,6 +638,7 @@ class FactoryModeController(QObject):
         state: FactoryControllerState,
         selection_ready: bool,
         selection_ready_reason: str | None,
+        ignore_backend_session_running: bool = False,
     ) -> tuple[bool, str | None]:
         blocked_phase_reason = self._BLOCKED_START_PHASE_REASONS.get(state.run_phase)
         if blocked_phase_reason is not None:
@@ -642,13 +647,18 @@ class FactoryModeController(QObject):
             return False, selection_ready_reason
         if self._pending_start is not None:
             return False, "启动请求处理中"
-        if self._backend_session_running():
+        if not ignore_backend_session_running and self._backend_session_running():
             return False, "当前测试运行中"
         if state.run_phase not in {"armed", "reviewing"}:
             return False, "工厂模式未就绪"
         return True, None
 
-    def _state_with_readiness(self, state: FactoryControllerState) -> FactoryControllerState:
+    def _state_with_readiness(
+        self,
+        state: FactoryControllerState,
+        *,
+        ignore_backend_session_running: bool = False,
+    ) -> FactoryControllerState:
         selection_ready, selection_ready_reason = self._selection_readiness(
             selected_config_ids=state.selected_config_ids,
             manual_primary_config_id=state.manual_primary_config_id,
@@ -657,6 +667,7 @@ class FactoryModeController(QObject):
             state=state,
             selection_ready=selection_ready,
             selection_ready_reason=selection_ready_reason,
+            ignore_backend_session_running=ignore_backend_session_running,
         )
         return replace(
             state,
@@ -814,6 +825,30 @@ class FactoryModeController(QObject):
             return bool(is_running())
         except Exception:
             return False
+
+    def _should_ignore_backend_session_running_for_review(
+        self,
+        *,
+        payload: FactoryReviewPayload,
+    ) -> bool:
+        if self._state.run_phase != "analyzing":
+            return False
+
+        config_id = payload.displayed_config_id
+        run_id = payload.run_id
+        if config_id is None or run_id is None:
+            return False
+
+        test_manager = getattr(self.services, "test", None)
+        sessions = getattr(test_manager, "_sessions", None)
+        if not isinstance(sessions, dict) or tuple(sessions) != (config_id,):
+            return False
+
+        session = sessions.get(config_id)
+        workorder = getattr(session, "_workorder", None)
+        if not isinstance(workorder, dict):
+            return False
+        return workorder.get("factory_run_id") == run_id
 
     def _log_ingress_ignored(self, *, event_type: str, reason: str, **details) -> None:
         log_signal = getattr(self.bus, "log", None)

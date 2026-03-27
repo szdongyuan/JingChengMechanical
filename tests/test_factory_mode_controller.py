@@ -3023,6 +3023,26 @@ def test_factory_mode_controller_ignores_out_of_band_factory_runtime_abort():
     assert reviews == []
 
 
+def test_factory_mode_controller_marks_start_ready_immediately_after_auto_analysis_completion(
+    monkeypatch,
+):
+    controller, services, _, _, _, _ = _make_real_manager_factory_context(monkeypatch)
+
+    started = controller.start_manual({"sn": "SN-1"})
+
+    assert started is True
+    assert controller.state.run_phase == "running"
+
+    services.test._on_session_done(101)
+
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.start_ready is True
+    assert controller.state.start_ready_reason is None
+    assert services.test.is_running() is False
+    assert services.test._sessions == {}
+    assert 101 in services.test._completed_sessions
+
+
 def test_factory_mode_controller_consumes_real_test_manager_lifecycle_signals(monkeypatch):
     controller_mod = _load_factory_mode_controller_module()
 
