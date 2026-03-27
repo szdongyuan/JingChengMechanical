@@ -65,6 +65,10 @@ def _nearest_positions(base_values: list[float], band_freqs: Iterable[float]) ->
     return positions
 
 
+def _clear_error_bar_item(item: pg.ErrorBarItem) -> None:
+    item.setData(x=None, y=None, top=None, bottom=None, beam=None)
+
+
 class _BasePlotChart(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -269,9 +273,9 @@ class FftLineChartWidget(LineChartWidget):
         )
 
     def clear_data(self) -> None:
+        _clear_error_bar_item(self._band_range_item)
         super().clear_data()
         self._spectrum_payload = None
-        self._band_range_item.setData(x=[], y=[], top=[], bottom=[])
         self._band_marker_item.setData([])
 
     def spectrum_payload(self) -> dict | None:
@@ -284,7 +288,7 @@ class FftLineChartWidget(LineChartWidget):
         limit_bands: list[dict],
     ) -> None:
         if not limit_bands:
-            self._band_range_item.setData(x=[], y=[], top=[], bottom=[])
+            _clear_error_bar_item(self._band_range_item)
             self._band_marker_item.setData([])
             return
 
@@ -308,7 +312,7 @@ class FftLineChartWidget(LineChartWidget):
             y=centers,
             top=spans,
             bottom=spans,
-            beam=np.zeros(len(limit_bands), dtype=float),
+            beam=0.0,
         )
         self._band_marker_item.setData(
             [
@@ -369,9 +373,9 @@ class OctaveBarChartWidget(_BasePlotChart):
 
     def clear_data(self) -> None:
         self._band_payload = None
-        self._replace_bar_item(x=np.array([], dtype=float), heights=np.array([], dtype=float))
-        self._band_range_item.setData(x=[], y=[], top=[], bottom=[])
+        _clear_error_bar_item(self._band_range_item)
         self._band_marker_item.setData([])
+        self._replace_bar_item(x=np.array([], dtype=float), heights=np.array([], dtype=float))
         self.plot_item.getAxis("bottom").setTicks([])
 
     def has_bars(self) -> bool:
@@ -399,7 +403,7 @@ class OctaveBarChartWidget(_BasePlotChart):
         limit_bands: list[dict],
     ) -> None:
         if not limit_bands:
-            self._band_range_item.setData(x=[], y=[], top=[], bottom=[])
+            _clear_error_bar_item(self._band_range_item)
             self._band_marker_item.setData([])
             return
 
@@ -423,7 +427,7 @@ class OctaveBarChartWidget(_BasePlotChart):
             y=centers,
             top=spans,
             bottom=spans,
-            beam=np.full(len(limit_bands), 0.3, dtype=float),
+            beam=0.3,
         )
         self._band_marker_item.setData(
             [
