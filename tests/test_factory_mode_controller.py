@@ -2217,6 +2217,8 @@ def test_factory_mode_controller_reanalysis_failure_returns_to_reviewing_without
     assert controller.state.run_phase == "reviewing"
     assert controller.state.active_config_id is None
     assert controller.state.displayed_config_id == 101
+    assert controller.state.start_ready is True
+    assert controller.state.start_ready_reason is None
     assert controller.review_payload.no_result is True
     assert controller.review_payload.error_message == "manual reanalysis failed"
     assert controller.review_payload.summary_payload == _full_no_result_summary(
@@ -2369,6 +2371,8 @@ def test_factory_mode_controller_preserves_committed_partial_no_result_reanalysi
     assert controller.state.run_phase == "reviewing"
     assert controller.state.active_config_id is None
     assert controller.state.displayed_config_id == 101
+    assert controller.state.start_ready is True
+    assert controller.state.start_ready_reason is None
     assert controller.review_payload.run_id == original_review.run_id
     assert controller.review_payload.default_window == original_review.default_window
     assert controller.review_payload.manual_reanalysis_allowed is True
@@ -2427,6 +2431,8 @@ def test_factory_mode_controller_accepts_successful_reanalysis_payload_without_r
 
     assert controller.state.run_phase == "reviewing"
     assert controller.state.displayed_config_id == 101
+    assert controller.state.start_ready is True
+    assert controller.state.start_ready_reason is None
     assert controller.review_payload.displayed_config_id == 101
     assert controller.review_payload.run_id == original_review.run_id
     assert controller.review_payload.captured_duration_sec == 6.5
@@ -2653,6 +2659,8 @@ def test_factory_mode_controller_reanalysis_missing_session_unwinds_to_reviewing
     assert controller.state.run_phase == "reviewing"
     assert controller.state.active_config_id is None
     assert controller.state.displayed_config_id == 101
+    assert controller.state.start_ready is True
+    assert controller.state.start_ready_reason is None
     assert controller.review_payload.run_id == original_review.run_id
     assert controller.review_payload.default_window == original_review.default_window
     assert controller.review_payload.manual_reanalysis_allowed is True
@@ -2690,6 +2698,8 @@ def test_factory_mode_controller_reanalysis_empty_exception_message_unwinds_to_r
     assert controller.state.run_phase == "reviewing"
     assert controller.state.active_config_id is None
     assert controller.state.displayed_config_id == 101
+    assert controller.state.start_ready is True
+    assert controller.state.start_ready_reason is None
     assert controller.review_payload.run_id == original_review.run_id
     assert controller.review_payload.default_window == original_review.default_window
     assert controller.review_payload.manual_reanalysis_allowed is True
@@ -3041,6 +3051,61 @@ def test_factory_mode_controller_marks_start_ready_immediately_after_auto_analys
     assert services.test.is_running() is False
     assert services.test._sessions == {}
     assert 101 in services.test._completed_sessions
+
+
+@pytest.mark.parametrize(
+    ("signal_name", "review_kwargs"),
+    [
+        (
+            "factory_runtime_auto_analysis_no_result",
+            {"no_result": True, "judgment_payload": None},
+        ),
+        (
+            "factory_runtime_auto_analysis_error",
+            {
+                "no_result": True,
+                "error_message": "analysis window missing",
+                "judgment_payload": None,
+            },
+        ),
+    ],
+)
+def test_factory_mode_controller_marks_start_ready_after_terminal_auto_analysis_failures(
+    signal_name,
+    review_kwargs,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202), manual_primary_config_id=101)
+    run_id = _run_id_for(101)
+
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        run_id=run_id,
+        trigger_source="manual",
+    )
+    bus.factory_runtime_analyzing_entered.emit(
+        _make_runtime_config_payload(config_id=101, run_id=run_id)
+    )
+
+    getattr(bus, signal_name).emit(
+        _make_review_payload(
+            displayed_config_id=101,
+            run_id=run_id,
+            trigger_source="manual",
+            **review_kwargs,
+        )
+    )
+
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.start_ready is True
+    assert controller.state.start_ready_reason is None
 
 
 def test_factory_mode_controller_consumes_real_test_manager_lifecycle_signals(monkeypatch):
