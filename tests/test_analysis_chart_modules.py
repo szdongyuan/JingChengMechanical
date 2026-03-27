@@ -581,7 +581,7 @@ def test_octave_module_keeps_two_committed_limit_band_markers_renderable(qapp):
     module.plot._band_range_item.boundingRect()
 
 
-@pytest.mark.parametrize("module_cls", (SpectrumModule, OctaveModule))
+@pytest.mark.parametrize("module_cls", (SplModule, SpectrumModule, OctaveModule))
 def test_committed_chart_modules_stay_empty_in_reviewing_when_chart_payload_is_missing(
     qapp,
     module_cls,
