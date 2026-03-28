@@ -180,10 +180,18 @@ def _make_services(configs, *, validation_errors: dict[int, list[str]] | None = 
     services.test = MagicMock()
     services.test.is_running.return_value = False
     services.config_service = MagicMock()
+    services.config_service.list_configs.side_effect = lambda: [
+        {"config_id": config_id, "config_name": config["config_name"]}
+        for config_id, config in sorted(config_map.items())
+    ]
     services.config_service.load_config.side_effect = lambda config_id: dict(config_map[config_id])
     services.config_service.validate_factory_runtime.side_effect = (
         lambda config: list((validation_errors or {}).get(config["config_id"], ()))
     )
+    services.config_service.delete_config.side_effect = lambda config_id: (
+        config_map.pop(config_id, None) is not None
+    )
+    services.factory_selection_settings = _SelectionSettingsStub(saved_selected_ids=tuple(config_map))
     return services
 
 
@@ -192,12 +200,20 @@ def _make_dynamic_services(config_map, *, validate_factory_runtime=None):
     services.test = MagicMock()
     services.test.is_running.return_value = False
     services.config_service = MagicMock()
+    services.config_service.list_configs.side_effect = lambda: [
+        {"config_id": config_id, "config_name": config["config_name"]}
+        for config_id, config in sorted(config_map.items())
+    ]
     services.config_service.load_config.side_effect = lambda config_id: dict(config_map[config_id])
     services.config_service.validate_factory_runtime.side_effect = (
         validate_factory_runtime
         if validate_factory_runtime is not None
         else (lambda config: [])
     )
+    services.config_service.delete_config.side_effect = lambda config_id: (
+        config_map.pop(config_id, None) is not None
+    )
+    services.factory_selection_settings = _SelectionSettingsStub(saved_selected_ids=tuple(config_map))
     return services
 
 
@@ -214,6 +230,31 @@ class _DummySignal:
     def emit(self, *args, **kwargs):
         for callback in list(self._callbacks):
             callback(*args, **kwargs)
+
+
+class _SelectionSettingsStub:
+    def __init__(
+        self,
+        *,
+        saved_selected_ids: tuple[int, ...] = (),
+        save_results: list[str | None] | None = None,
+    ):
+        self._saved_selected_ids = tuple(saved_selected_ids)
+        self._save_results = list(save_results or [])
+        self.save_selected_config_ids = MagicMock(side_effect=self._save)
+        self.load_selected_config_ids = MagicMock(side_effect=self._load)
+
+    def _load(self) -> tuple[int, ...]:
+        return self._saved_selected_ids
+
+    def _save(self, config_ids: tuple[int, ...]) -> str | None:
+        if self._save_results:
+            result = self._save_results.pop(0)
+        else:
+            result = None
+        if result is None:
+            self._saved_selected_ids = tuple(config_ids)
+        return result
 
 
 def _accept_start(services):
@@ -825,14 +866,13 @@ def test_factory_mode_controller_manual_start_resolves_to_first_enabled_config()
 
 
 @pytest.mark.parametrize(
-    ("configs", "manual_primary_config_id", "plc_device_key", "expected_config_id"),
+    ("configs", "plc_device_key", "expected_config_id"),
     [
         (
             (
                 _make_config(101, plc_device_key="plc-a"),
                 _make_config(202, plc_device_key="plc-b"),
             ),
-            101,
             "plc-b",
             202,
         ),
@@ -841,13 +881,12 @@ def test_factory_mode_controller_manual_start_resolves_to_first_enabled_config()
                 _make_config(101, plc_device_key="plc-a"),
                 _make_config(202, plc_device_key="plc-a"),
             ),
-            101,
             "plc-a",
             101,
         ),
     ],
 )
-def test_factory_mode_controller_routes_plc_events(configs, manual_primary_config_id, plc_device_key, expected_config_id):
+def test_factory_mode_controller_routes_plc_events(configs, plc_device_key, expected_config_id):
     controller_mod = _load_factory_mode_controller_module()
     services = _make_services(configs)
     _accept_start(services)
@@ -868,14 +907,13 @@ def test_factory_mode_controller_routes_plc_events(configs, manual_primary_confi
 
 
 @pytest.mark.parametrize(
-    ("configs", "manual_primary_config_id", "expected_config_id"),
+    ("configs", "expected_config_id"),
     [
         (
             (
                 _make_config(101, scan_triggers_test=False),
                 _make_config(202, scan_triggers_test=True),
             ),
-            101,
             202,
         ),
         (
@@ -884,11 +922,10 @@ def test_factory_mode_controller_routes_plc_events(configs, manual_primary_confi
                 _make_config(202, scan_triggers_test=True),
             ),
             101,
-            101,
         ),
     ],
 )
-def test_factory_mode_controller_routes_scan_events(configs, manual_primary_config_id, expected_config_id):
+def test_factory_mode_controller_routes_scan_events(configs, expected_config_id):
     controller_mod = _load_factory_mode_controller_module()
     services = _make_services(configs)
     _accept_start(services)
@@ -906,6 +943,128 @@ def test_factory_mode_controller_routes_scan_events(configs, manual_primary_conf
     assert controller.state.active_config_id == expected_config_id
     assert controller.state.run_phase == "running"
     assert controller.state.trigger_source == "scan"
+
+
+def test_blocked_manual_start_emits_factory_start_blocked_reason():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    blocked_payloads: list[object] = []
+    bus.factory_start_blocked.connect(blocked_payloads.append)
+    services = _make_services((_make_config(101),))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection(())
+
+    assert controller.start_manual({"sn": "SN-1"}) is False
+
+    assert len(blocked_payloads) == 1
+    assert blocked_payloads[0].reason == "请至少启用一个配置"
+    assert blocked_payloads[0].trigger_source == "manual"
+
+
+def test_blocked_plc_and_scan_start_emit_factory_start_blocked_while_idle():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    blocked_payloads: list[object] = []
+    bus.factory_start_blocked.connect(blocked_payloads.append)
+    services = _make_services(
+        (
+            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
+            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
+        )
+    )
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection(())
+
+    assert controller.handle_plc_event(
+        services_mod.FactoryPlcIngressPayload(plc_device_key="plc-a")
+    ) is False
+    assert controller.handle_scan_event(
+        services_mod.FactoryScanIngressPayload(scan_text="SN-1")
+    ) is False
+
+    assert [payload.reason for payload in blocked_payloads] == [
+        "请至少启用一个配置",
+        "请至少启用一个配置",
+    ]
+    assert [payload.trigger_source for payload in blocked_payloads] == ["plc", "scan"]
+
+
+def test_busy_external_triggers_do_not_emit_factory_start_blocked():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    blocked_payloads: list[object] = []
+    bus.factory_start_blocked.connect(blocked_payloads.append)
+    services = _make_services(
+        (
+            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
+            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
+        )
+    )
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.restore_selection((101,), had_missing_configs=False)
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        trigger_source="manual",
+    )
+
+    assert controller.handle_plc_event(
+        services_mod.FactoryPlcIngressPayload(plc_device_key="plc-a")
+    ) is False
+    assert controller.handle_scan_event(
+        services_mod.FactoryScanIngressPayload(scan_text="SN-1")
+    ) is False
+
+    assert blocked_payloads == []
+
+
+def test_plc_trigger_uses_highest_priority_matching_config():
+    controller_mod = _load_factory_mode_controller_module()
+    services = _make_services(
+        (
+            _make_config(101, plc_device_key="plc-a"),
+            _make_config(202, plc_device_key="plc-a"),
+            _make_config(303, plc_device_key="plc-b"),
+        )
+    )
+    _accept_start(services)
+    controller = controller_mod.FactoryModeController(EventBus(), services)
+    controller.set_selection((303, 202, 101))
+
+    assert controller.handle_plc_event(
+        services_mod.FactoryPlcIngressPayload(plc_device_key="plc-a")
+    ) is True
+
+    _assert_start_called_with(
+        services,
+        {"config_id": 202},
+        expected_trigger_source="plc",
+    )
+
+
+def test_scan_trigger_uses_first_enabled_scan_triggers_test_config():
+    controller_mod = _load_factory_mode_controller_module()
+    services = _make_services(
+        (
+            _make_config(101, scan_triggers_test=True),
+            _make_config(202, scan_triggers_test=False),
+            _make_config(303, scan_triggers_test=True),
+        )
+    )
+    _accept_start(services)
+    controller = controller_mod.FactoryModeController(EventBus(), services)
+    controller.set_selection((303, 202, 101))
+
+    assert controller.handle_scan_event(
+        services_mod.FactoryScanIngressPayload(scan_text="SN-1")
+    ) is True
+
+    _assert_start_called_with(
+        services,
+        {"config_id": 303},
+        expected_trigger_source="scan",
+    )
 
 
 @pytest.mark.parametrize("phase", ["running", "analyzing"])
@@ -1424,7 +1583,7 @@ def test_factory_mode_controller_treats_pending_start_as_busy_until_acceptance()
     assert controller.state.trigger_source == "manual"
 
 
-def test_factory_mode_controller_same_id_invalidating_refresh_stales_pending_manual_start():
+def test_factory_mode_controller_same_id_invalidating_refresh_keeps_pending_reason_until_idle():
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()
     states: list[object] = []
@@ -1467,10 +1626,12 @@ def test_factory_mode_controller_same_id_invalidating_refresh_stales_pending_man
     assert controller.state.selected_config_ids == (101, 202)
     assert controller.state.active_config_id is None
     assert controller.state.displayed_config_id is None
-    assert controller.state.run_phase == "not_ready"
+    assert controller.state.run_phase == "armed"
     assert controller.state.trigger_source is None
-    assert controller._pending_start is None
-    assert controller._pending_start_request_id is None
+    assert controller.state.selection_ready is False
+    assert controller.state.selection_ready_reason == "analysis window invalid"
+    assert controller._pending_start == (101, "manual")
+    assert controller._pending_start_request_id
     assert controller.can_arm() is False
     assert len(states) == 2
     assert states[0].selected_config_ids == (101, 202)
@@ -1485,15 +1646,34 @@ def test_factory_mode_controller_same_id_invalidating_refresh_stales_pending_man
 
     callbacks[0](_run_id_for(101))
 
-    assert controller.state.active_config_id is None
-    assert controller.state.displayed_config_id is None
-    assert controller.state.run_phase == "not_ready"
-    assert controller.state.trigger_source is None
+    assert controller.state.active_config_id == 101
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "running"
+    assert controller.state.trigger_source == "manual"
     assert controller._pending_start is None
     assert controller._pending_start_request_id is None
-    assert len(states) == 2
-    assert states[1] == controller.state
-    assert accepted_payloads == []
+    assert len(states) == 3
+    assert states[2] == controller.state
+    assert len(accepted_payloads) == 1
+    assert accepted_payloads[0].config_id == 101
+    assert accepted_payloads[0].run_id == _run_id_for(101)
+    assert accepted_payloads[0].trigger_source == "manual"
+
+    _finish_active_run_to_reviewing(
+        controller,
+        bus,
+        config_id=101,
+        trigger_source="manual",
+    )
+
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.trigger_source == "manual"
+    assert controller.state.selection_ready is False
+    assert controller.state.selection_ready_reason == "analysis window invalid"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "analysis window invalid"
 
 
 def test_factory_mode_controller_same_id_valid_refresh_keeps_pending_manual_start():
@@ -1563,6 +1743,209 @@ def test_factory_mode_controller_same_id_valid_refresh_keeps_pending_manual_star
     assert accepted_payloads[0].config_id == 101
     assert accepted_payloads[0].run_id == _run_id_for(101)
     assert accepted_payloads[0].trigger_source == "manual"
+
+
+def test_restore_selection_with_missing_configs_blocks_without_persisting_until_user_edit():
+    controller_mod = _load_factory_mode_controller_module()
+    services = _make_services(
+        (
+            _make_config(101),
+            _make_config(202),
+            _make_config(303),
+        )
+    )
+    controller = controller_mod.FactoryModeController(EventBus(), services)
+
+    controller.restore_selection((101, 303), had_missing_configs=True)
+
+    assert controller.state.selected_config_ids == (101, 303)
+    assert controller.state.selection_ready is False
+    assert controller.state.selection_ready_reason == "配置已失效"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "配置已失效"
+    services.factory_selection_settings.save_selected_config_ids.assert_not_called()
+
+
+def test_config_changed_prunes_deleted_selected_config_persists_and_blocks_until_user_edit():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    services = _make_services(
+        (
+            _make_config(101),
+            _make_config(202),
+            _make_config(303),
+        )
+    )
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.restore_selection((101, 202, 303), had_missing_configs=False)
+    services.factory_selection_settings.save_selected_config_ids.reset_mock()
+
+    assert services.config_service.delete_config(202) is True
+    bus.config_changed.emit()
+
+    assert controller.state.selected_config_ids == (101, 303)
+    assert controller.state.selection_ready is False
+    assert controller.state.selection_ready_reason == "配置已失效"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "配置已失效"
+    services.factory_selection_settings.save_selected_config_ids.assert_called_once_with((101, 303))
+
+
+def test_runtime_prune_invalid_selection_stays_blocking_until_later_user_edit():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    services = _make_services(
+        (
+            _make_config(101),
+            _make_config(202),
+            _make_config(303),
+        )
+    )
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.restore_selection((101, 202, 303), had_missing_configs=False)
+
+    assert services.config_service.delete_config(202) is True
+    bus.config_changed.emit()
+    assert controller.state.start_ready_reason == "配置已失效"
+
+    controller.set_selection((303, 101))
+
+    assert controller.state.selected_config_ids == (303, 101)
+    assert controller.state.selection_ready is True
+    assert controller.state.selection_ready_reason is None
+    assert controller.state.start_ready is True
+    assert controller.state.start_ready_reason is None
+
+
+def test_busy_config_changed_prune_persists_now_but_defers_invalid_reason_until_idle():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    services = _make_services(
+        (
+            _make_config(101),
+            _make_config(202),
+            _make_config(303),
+        )
+    )
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.restore_selection((101, 202, 303), had_missing_configs=False)
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        trigger_source="manual",
+    )
+    services.factory_selection_settings.save_selected_config_ids.reset_mock()
+
+    assert services.config_service.delete_config(202) is True
+    bus.config_changed.emit()
+
+    assert controller.state.selected_config_ids == (101, 303)
+    assert controller.state.run_phase == "running"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "当前测试运行中"
+    services.factory_selection_settings.save_selected_config_ids.assert_called_once_with((101, 303))
+
+    bus.factory_runtime_aborted.emit(
+        _make_abort_payload(
+            config_id=101,
+            trigger_source="manual",
+        )
+    )
+
+    assert controller.state.run_phase == "not_ready"
+    assert controller.state.selection_ready is False
+    assert controller.state.selection_ready_reason == "配置已失效"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "配置已失效"
+
+
+def test_runtime_prune_save_failure_keeps_live_selection_preserves_restart_selection_and_emits_notice():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    notices: list[str] = []
+    bus.factory_selection_notice.connect(notices.append)
+    services = _make_services(
+        (
+            _make_config(101),
+            _make_config(202),
+            _make_config(303),
+        )
+    )
+    services.factory_selection_settings = _SelectionSettingsStub(
+        saved_selected_ids=(101, 202, 303),
+        save_results=["配置保存失败"],
+    )
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.restore_selection((101, 202, 303), had_missing_configs=False)
+
+    assert services.config_service.delete_config(202) is True
+    bus.config_changed.emit()
+
+    assert controller.state.selected_config_ids == (101, 303)
+    assert services.factory_selection_settings.load_selected_config_ids() == (101, 202, 303)
+    assert notices == ["配置保存失败"]
+
+
+def test_successful_later_controller_persist_clears_runtime_prune_notice():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    notices: list[str] = []
+    bus.factory_selection_notice.connect(notices.append)
+    services = _make_services(
+        (
+            _make_config(101),
+            _make_config(202),
+            _make_config(303),
+        )
+    )
+    services.factory_selection_settings = _SelectionSettingsStub(
+        saved_selected_ids=(101, 202, 303),
+        save_results=["配置保存失败", None],
+    )
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.restore_selection((101, 202, 303), had_missing_configs=False)
+
+    assert services.config_service.delete_config(202) is True
+    bus.config_changed.emit()
+    assert services.config_service.delete_config(303) is True
+    bus.config_changed.emit()
+
+    assert notices == ["配置保存失败", ""]
+    assert services.factory_selection_settings.load_selected_config_ids() == (101,)
+
+
+def test_config_changed_clears_config_load_failed_when_loading_recovers():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    config_map = {
+        101: _make_config(101),
+        202: _make_config(202),
+    }
+    broken = {"enabled": True}
+    services = _make_dynamic_services(config_map)
+
+    def _load_config(config_id: int):
+        if config_id == 202 and broken["enabled"]:
+            raise RuntimeError("boom")
+        return dict(config_map[config_id])
+
+    services.config_service.load_config.side_effect = _load_config
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((202, 101))
+
+    assert controller.state.selection_ready is False
+    assert controller.state.selection_ready_reason == "配置加载失败"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "配置加载失败"
+
+    broken["enabled"] = False
+    bus.config_changed.emit()
+
+    assert controller.state.selection_ready is True
+    assert controller.state.selection_ready_reason is None
+    assert controller.state.start_ready is True
+    assert controller.state.start_ready_reason is None
 
 
 def test_factory_mode_controller_selection_change_cancels_pending_start_acceptance():
