@@ -9,10 +9,16 @@ class FactorySelectionSettings:
     SETTINGS_KEY = "factory/selected_config_ids"
 
     def __init__(self, settings: QSettings | None = None):
-        self._settings = settings or QSettings("JingChen", "JingChenMechanical")
+        self._settings = settings
+
+    def _open_settings(self) -> QSettings:
+        if self._settings is not None:
+            return self._settings
+        return QSettings("JingChen", "JingChenMechanical")
 
     def load_selected_config_ids(self) -> tuple[int, ...]:
-        raw_value = self._settings.value(self.SETTINGS_KEY, "")
+        settings = self._open_settings()
+        raw_value = settings.value(self.SETTINGS_KEY, "")
         if raw_value in (None, ""):
             return ()
 
@@ -30,12 +36,13 @@ class FactorySelectionSettings:
             return ()
 
     def save_selected_config_ids(self, config_ids: tuple[int, ...]) -> str | None:
+        settings = self._open_settings()
         try:
-            self._settings.setValue(self.SETTINGS_KEY, json.dumps(list(config_ids)))
-            self._settings.sync()
+            settings.setValue(self.SETTINGS_KEY, json.dumps(list(config_ids)))
+            settings.sync()
         except Exception:
             return "配置保存失败"
-        status = getattr(self._settings, "status", None)
+        status = getattr(settings, "status", None)
         if callable(status) and status() != QSettings.Status.NoError:
             return "配置保存失败"
         return None
