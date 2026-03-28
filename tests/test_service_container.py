@@ -74,6 +74,7 @@ def test_factory_mode_signals_exist():
         "factory_runtime_auto_analysis_succeeded",
         "factory_runtime_auto_analysis_no_result",
         "factory_runtime_auto_analysis_error",
+        "factory_runtime_auto_analysis_cleanup_settled",
         "factory_runtime_aborted",
         "factory_runtime_reanalysis_completed",
         "factory_state_changed",

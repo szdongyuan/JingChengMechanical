@@ -405,6 +405,14 @@ class TestManager(QObject):
         if session is None:
             return
 
+        cleanup_settled_payload = None
+        factory_run_id = self._factory_run_id(session)
+        if factory_run_id is not None:
+            cleanup_settled_payload = self._make_factory_runtime_config_payload(
+                config_id,
+                factory_run_id,
+            )
+
         self._bus.status.emit("Analyzing...")
         self._bus.log.emit(f"[TestManager] recording done for config={config_id}")
         self._emit_optional_signal(
@@ -492,6 +500,11 @@ class TestManager(QObject):
             mon.wait(1000)
         if rec is not None:
             self._stop_recorder_if_unused(rec)
+        if cleanup_settled_payload is not None:
+            self._emit_optional_signal(
+                "factory_runtime_auto_analysis_cleanup_settled",
+                cleanup_settled_payload,
+            )
 
     def _on_error(self, config_id: int, message: str):
         session = self._sessions.get(config_id)

@@ -442,6 +442,10 @@ class FactoryModeController(QObject):
         self.bus.factory_runtime_auto_analysis_error.connect(
             self.handle_runtime_auto_analysis_error
         )
+        if hasattr(self.bus, "factory_runtime_auto_analysis_cleanup_settled"):
+            self.bus.factory_runtime_auto_analysis_cleanup_settled.connect(
+                self.handle_runtime_auto_analysis_cleanup_settled
+            )
         self.bus.factory_runtime_aborted.connect(self.handle_runtime_aborted)
         self.bus.factory_runtime_reanalysis_completed.connect(
             self.handle_runtime_reanalysis_completed
@@ -518,9 +522,6 @@ class FactoryModeController(QObject):
             trigger_source = self._state.trigger_source
 
         self._review_payload = replace(payload, trigger_source=trigger_source)
-        ignore_backend_session_running = self._should_ignore_backend_session_running_for_review(
-            payload=self._review_payload
-        )
         self._state = self._state_with_readiness(
             replace(
                 self._state,
@@ -529,7 +530,6 @@ class FactoryModeController(QObject):
                 run_phase="reviewing",
                 trigger_source=trigger_source,
             ),
-            ignore_backend_session_running=ignore_backend_session_running,
         )
         self.bus.factory_review_changed.emit(self._review_payload)
         self._emit_state()
@@ -750,6 +750,23 @@ class FactoryModeController(QObject):
     def _emit_state(self) -> None:
         self.bus.factory_state_changed.emit(self._state)
 
+    def handle_runtime_auto_analysis_cleanup_settled(
+        self,
+        payload: FactoryRuntimeConfigPayload,
+    ) -> None:
+        if self._state.run_phase != "reviewing":
+            return
+        if self._state.displayed_config_id != payload.config_id:
+            return
+        if self._review_payload.run_id != payload.run_id:
+            return
+
+        next_state = self._state_with_readiness(self._state)
+        if next_state == self._state:
+            return
+        self._state = next_state
+        self._emit_state()
+
     def _matches_pending_start(self, payload: FactoryRuntimeStartPayload) -> bool:
         return (
             self._pending_start is not None
@@ -825,30 +842,6 @@ class FactoryModeController(QObject):
             return bool(is_running())
         except Exception:
             return False
-
-    def _should_ignore_backend_session_running_for_review(
-        self,
-        *,
-        payload: FactoryReviewPayload,
-    ) -> bool:
-        if self._state.run_phase != "analyzing":
-            return False
-
-        config_id = payload.displayed_config_id
-        run_id = payload.run_id
-        if config_id is None or run_id is None:
-            return False
-
-        test_manager = getattr(self.services, "test", None)
-        sessions = getattr(test_manager, "_sessions", None)
-        if not isinstance(sessions, dict) or tuple(sessions) != (config_id,):
-            return False
-
-        session = sessions.get(config_id)
-        workorder = getattr(session, "_workorder", None)
-        if not isinstance(workorder, dict):
-            return False
-        return workorder.get("factory_run_id") == run_id
 
     def _log_ingress_ignored(self, *, event_type: str, reason: str, **details) -> None:
         log_signal = getattr(self.bus, "log", None)

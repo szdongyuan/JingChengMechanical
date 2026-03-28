@@ -5,6 +5,7 @@ from typing import get_type_hints
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.test_manager import TestManager
@@ -214,6 +215,7 @@ def _mock_bus():
         "factory_runtime_auto_analysis_succeeded",
         "factory_runtime_auto_analysis_no_result",
         "factory_runtime_auto_analysis_error",
+        "factory_runtime_auto_analysis_cleanup_settled",
         "factory_runtime_aborted",
         "factory_runtime_reanalysis_completed",
     ):
@@ -2399,6 +2401,79 @@ class TestLateAttachBufferSlice:
             "channel_results": [],
             "analysis_window": (1.0, 3.0),
         }
+
+    @pytest.mark.parametrize(
+        ("judgment_outcome", "review_signal_name"),
+        [
+            ("success", "factory_runtime_auto_analysis_succeeded"),
+            ("no_result", "factory_runtime_auto_analysis_no_result"),
+            ("error", "factory_runtime_auto_analysis_error"),
+        ],
+    )
+    def test_on_session_done_emits_cleanup_settled_after_auto_analysis_review_signal(
+        self,
+        judgment_outcome,
+        review_signal_name,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        post_attach = np.arange(500, dtype=np.float32).reshape(500, 1)
+        attach_snapshot = object()
+        rec = MagicMock()
+        rec.get_buffer_from.return_value = post_attach
+        rec._sample_rate = 100.0
+        session = MagicMock()
+        session.config_id = 1
+        session._buffer = None
+        session._attach_snapshot = attach_snapshot
+        session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+            "selected_channels": [0],
+            "channels": [{"channel_index": 0}],
+        }
+        session._workorder = {
+            "trigger_source": "manual",
+            "factory_run_id": "run-1",
+        }
+        session._audio_file_path = "captured.wav"
+        if judgment_outcome == "success":
+            session._run_judgment.return_value = JudgmentResult(
+                overall="合格",
+                limit_pass=True,
+                ai_pass=True,
+                ai_score=0.93,
+                analysis_window=(1.0, 3.0),
+            )
+        elif judgment_outcome == "no_result":
+            session._run_judgment.side_effect = ValueError("analysis window not fully captured")
+        else:
+            session._run_judgment.side_effect = RuntimeError("analysis crashed")
+        mgr._sessions[1] = session
+        mgr._recorders[1] = rec
+
+        emission_order: list[tuple[str, bool, bool, object]] = []
+
+        def _capture_emission(label, payload):
+            emission_order.append((label, bool(mgr._sessions), mgr.is_running(), payload))
+
+        getattr(bus, review_signal_name).emit.side_effect = (
+            lambda payload: _capture_emission("review", payload)
+        )
+        bus.factory_runtime_auto_analysis_cleanup_settled.emit.side_effect = (
+            lambda payload: _capture_emission("cleanup", payload)
+        )
+
+        mgr._on_session_done(1)
+
+        assert [entry[0] for entry in emission_order] == ["review", "cleanup"]
+        assert emission_order[0][1:3] == (True, True)
+        assert emission_order[1][1:3] == (False, False)
+        cleanup_payload = emission_order[1][3]
+        assert cleanup_payload.config_id == 1
+        assert cleanup_payload.run_id == "run-1"
+        assert mgr._completed_sessions[1] is session
 
     def test_on_session_done_required_window_failure_emits_no_result_payload_and_preserves_completed_session(self):
         bus = _mock_bus()
