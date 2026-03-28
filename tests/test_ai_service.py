@@ -11,6 +11,25 @@ from model.test_config_ai_binding_table import TestConfigAiBindingTable as AiBin
 from app.service.ai_service import AiService
 
 
+def _recreate_legacy_ai_binding_table(db):
+    db.execute_sql("DROP TABLE test_config_ai_binding_table")
+    db.execute_sql(
+        """
+        CREATE TABLE test_config_ai_binding_table (
+            binding_id INTEGER PRIMARY KEY,
+            config_id INTEGER NOT NULL UNIQUE REFERENCES test_config_table(config_id) ON DELETE CASCADE,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            toolchain_id TEXT REFERENCES ai_toolchain_table(toolchain_id) ON DELETE SET NULL,
+            timeout_ms INTEGER,
+            analysis_window_offset_ms INTEGER NOT NULL,
+            params_json TEXT NOT NULL DEFAULT '{}',
+            score_threshold REAL DEFAULT NULL,
+            updated_time TEXT NOT NULL DEFAULT ''
+        )
+        """
+    )
+
+
 @pytest.fixture
 def ai_service():
     return AiService()
@@ -129,6 +148,29 @@ class TestBindingCrud:
         assert binding["timeout_ms"] == 5000
         assert binding["params_json"] == '{"k": "v"}'
 
+    def test_save_binding_creates_row_when_legacy_binding_offset_column_is_not_null(
+        self, ai_service, config, toolchain
+    ):
+        db = AiBindingTable._meta.database
+        _recreate_legacy_ai_binding_table(db)
+
+        binding_id = ai_service.save_binding(config.config_id, {
+            "enabled": True,
+            "toolchain_id": "motor-ai",
+            "params_json": '{"k": "v"}',
+        })
+
+        row = db.execute_sql(
+            """
+            SELECT enabled, toolchain_id, analysis_window_offset_ms, params_json
+            FROM test_config_ai_binding_table
+            WHERE binding_id = ?
+            """,
+            (binding_id,),
+        ).fetchone()
+
+        assert row == (1, "motor-ai", 0, '{"k": "v"}')
+
     def test_save_binding_ignores_analysis_window_offset_ms(
         self, ai_service, config, toolchain
     ):
@@ -147,6 +189,49 @@ class TestBindingCrud:
 
         assert "analysis_window_offset_ms" not in binding
         assert not hasattr(row, "analysis_window_offset_ms")
+
+    def test_save_binding_updates_existing_row_when_legacy_binding_offset_column_is_not_null(
+        self, ai_service, config, toolchain
+    ):
+        db = AiBindingTable._meta.database
+        _recreate_legacy_ai_binding_table(db)
+        db.execute_sql(
+            """
+            INSERT INTO test_config_ai_binding_table (
+                binding_id,
+                config_id,
+                enabled,
+                toolchain_id,
+                timeout_ms,
+                analysis_window_offset_ms,
+                params_json,
+                score_threshold,
+                updated_time
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (1, config.config_id, 0, None, None, 250, "{}", None, ""),
+        )
+
+        ai_service.save_binding(config.config_id, {
+            "enabled": True,
+            "toolchain_id": "motor-ai",
+            "timeout_ms": 5000,
+        })
+
+        binding = ai_service.resolve_binding(config.config_id)
+        legacy_offset = db.execute_sql(
+            """
+            SELECT analysis_window_offset_ms
+            FROM test_config_ai_binding_table
+            WHERE config_id = ?
+            """,
+            (config.config_id,),
+        ).fetchone()
+
+        assert binding["enabled"] is True
+        assert binding["timeout_ms"] == 5000
+        assert "analysis_window_offset_ms" not in binding
+        assert legacy_offset == (250,)
 
     def test_save_updates_existing_binding(self, ai_service, config, toolchain):
         ai_service.save_binding(config.config_id, {
@@ -177,6 +262,27 @@ class TestBindingCrud:
     def test_clear_nonexistent_binding_is_noop(self, ai_service, config):
         """Clearing when no binding exists does nothing and doesn't error."""
         ai_service.clear_binding(config.config_id)  # should not raise
+
+    def test_save_binding_legacy_compatibility_does_not_mask_unrelated_insert_failures(
+        self, ai_service, config, toolchain, monkeypatch
+    ):
+        db = AiBindingTable._meta.database
+        _recreate_legacy_ai_binding_table(db)
+        original_execute_sql = db.execute_sql
+
+        def _raising_execute_sql(sql, params=None):
+            normalized_sql = str(sql).replace('"', "").replace("'", "").lower()
+            if "insert into test_config_ai_binding_table" in normalized_sql:
+                raise RuntimeError("different failure")
+            return original_execute_sql(sql, params)
+
+        monkeypatch.setattr(db, "execute_sql", _raising_execute_sql)
+
+        with pytest.raises(RuntimeError, match="different failure"):
+            ai_service.save_binding(config.config_id, {
+                "enabled": True,
+                "toolchain_id": "motor-ai",
+            })
 
 
 class TestScoreThresholdCrud:
