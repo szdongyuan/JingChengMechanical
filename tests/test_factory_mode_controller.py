@@ -2048,6 +2048,72 @@ def test_factory_mode_controller_selection_change_cancels_pending_start_acceptan
     assert states[1] == controller.state
 
 
+def test_factory_mode_controller_selection_change_cancels_pending_start_rejection_keeps_invalid_selection_warning():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    callbacks: list[object] = []
+    start_payloads: list[dict[str, object]] = []
+    services = _make_services(
+        (
+            _make_config(101),
+            _make_config(202),
+            _make_config(303),
+        )
+    )
+
+    def _capture_start(payload, *, on_start_accepted=None):
+        assert payload["config_id"] == 101
+        assert payload["trigger_source"] == "manual"
+        assert callable(on_start_accepted)
+        start_payloads.append(dict(payload))
+        callbacks.append(on_start_accepted)
+        return True
+
+    services.test.start.side_effect = _capture_start
+    services.test.cancel_pending_start.return_value = False
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202, 303))
+
+    assert controller.start_manual({"sn": "first"}) is True
+    assert len(callbacks) == 1
+    request_id = start_payloads[0].get("factory_start_request_id")
+    assert isinstance(request_id, str)
+    assert request_id
+
+    assert services.config_service.delete_config(202) is True
+    bus.config_changed.emit()
+
+    assert controller.state.selected_config_ids == (101, 303)
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "启动请求处理中"
+
+    next_state = controller.set_selection((303, 101))
+
+    assert next_state == controller.state
+    services.test.cancel_pending_start.assert_called_once_with(
+        request_id=request_id,
+        config_id=101,
+    )
+    assert controller.state.selected_config_ids == (101, 303)
+    assert controller._invalid_selection_warning_active is True
+    assert controller._pending_start == (101, "manual")
+
+    callbacks[0](_run_id_for(101))
+    bus.factory_runtime_aborted.emit(
+        _make_abort_payload(
+            config_id=101,
+            trigger_source="manual",
+        )
+    )
+
+    assert controller.state.selected_config_ids == (101, 303)
+    assert controller.state.run_phase == "not_ready"
+    assert controller.state.selection_ready is False
+    assert controller.state.selection_ready_reason == "配置已失效"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "配置已失效"
+
+
 def test_factory_mode_controller_stop_cancels_pending_start_and_preserves_review_state():
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()
