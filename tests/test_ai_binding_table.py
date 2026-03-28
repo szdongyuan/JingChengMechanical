@@ -19,6 +19,9 @@ def config_and_toolchain():
 
 
 class TestAiBindingTable:
+    def test_analysis_window_offset_ms_not_in_schema(self):
+        assert "analysis_window_offset_ms" not in AiBindingTable._meta.fields
+
     def test_create_and_read(self, config_and_toolchain):
         cfg, tc = config_and_toolchain
         binding = AiBindingTable.create(
@@ -26,7 +29,6 @@ class TestAiBindingTable:
             enabled=True,
             toolchain=tc,
             timeout_ms=60000,
-            analysis_window_offset_ms=1000,
             params_json='{"threshold": 0.5}',
         )
         fetched = AiBindingTable.get_by_id(binding.binding_id)
@@ -34,7 +36,6 @@ class TestAiBindingTable:
         assert fetched.enabled is True
         assert fetched.toolchain_id == tc.toolchain_id
         assert fetched.timeout_ms == 60000
-        assert fetched.analysis_window_offset_ms == 1000
         assert fetched.params_json == '{"threshold": 0.5}'
 
     def test_defaults(self, config_and_toolchain):
@@ -42,7 +43,6 @@ class TestAiBindingTable:
         binding = AiBindingTable.create(config=cfg, toolchain=tc)
         assert binding.enabled is False
         assert binding.timeout_ms is None
-        assert binding.analysis_window_offset_ms == 0
         assert binding.params_json == "{}"
         assert binding.updated_time is not None
         assert len(binding.updated_time) > 0

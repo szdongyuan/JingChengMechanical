@@ -7,6 +7,7 @@ and UI ViewModel adaptation.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -17,7 +18,6 @@ from datetime import datetime, timedelta, timezone
 
 from peewee import DoesNotExist
 
-from model.base_mode import db
 from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable
 from model.ai_execution_table import AiExecutionTable
@@ -78,22 +78,25 @@ class AiService:
             "toolchain_id": tc_id,
             "timeout_ms": binding.timeout_ms,
             "effective_timeout_ms": effective_timeout,
-            "analysis_window_offset_ms": binding.analysis_window_offset_ms,
             "params_json": binding.params_json,
+            "score_threshold": binding.score_threshold,
         }
 
     # ── Binding CRUD (for config UI) ────────────────────────
 
     def save_binding(self, config_id: int, data: dict) -> int:
         """Create or update the AI binding for a test config.
-
-        Validates analysis_window_offset_ms >= 0.
         """
-        offset = data.get("analysis_window_offset_ms", 0)
-        if not isinstance(offset, int) or offset < 0:
-            raise ValueError("analysis_window_offset_ms must be a non-negative integer")
+        if "score_threshold" in data:
+            st = data["score_threshold"]
+            if st is not None:
+                if isinstance(st, bool) or not isinstance(st, (int, float)):
+                    raise ValueError("score_threshold must be numeric (int or float, not bool)")
+                if math.isnan(st) or math.isinf(st):
+                    raise ValueError("score_threshold must be finite (not NaN or inf)")
 
-        with db.atomic():
+        database = TestConfigAiBindingTable._meta.database
+        with database.atomic():
             try:
                 existing = TestConfigAiBindingTable.get(
                     TestConfigAiBindingTable.config == config_id
@@ -101,10 +104,9 @@ class AiService:
                 existing.enabled = data.get("enabled", False)
                 existing.toolchain_id = data.get("toolchain_id")
                 existing.timeout_ms = data.get("timeout_ms")
-                existing.analysis_window_offset_ms = data.get(
-                    "analysis_window_offset_ms", 0
-                )
                 existing.params_json = data.get("params_json", "{}")
+                if "score_threshold" in data:
+                    existing.score_threshold = data["score_threshold"]
                 from consts.time_consts import now_str
                 existing.updated_time = now_str()
                 existing.save()
@@ -115,10 +117,8 @@ class AiService:
                     enabled=data.get("enabled", False),
                     toolchain=data.get("toolchain_id"),
                     timeout_ms=data.get("timeout_ms"),
-                    analysis_window_offset_ms=data.get(
-                        "analysis_window_offset_ms", 0
-                    ),
                     params_json=data.get("params_json", "{}"),
+                    score_threshold=data.get("score_threshold"),
                 )
                 return row.binding_id
 
@@ -202,6 +202,7 @@ class AiService:
         segments: list[dict],
         context: dict,
         params: dict,
+        window_info: dict | None = None,
     ) -> dict:
         return {
             "protocol_version": 1,
@@ -211,6 +212,7 @@ class AiService:
             "segments": segments,
             "context": context,
             "params": params,
+            "window_info": window_info or {},
         }
 
     # ── Executor (oneshot process) ──────────────────────────
@@ -453,6 +455,7 @@ class AiService:
             segments=segments,
             context=context,
             params=params,
+            window_info=window_info,
         )
         with open(request_json_path, "w", encoding="utf-8") as f:
             json.dump(request_data, f, ensure_ascii=False, indent=2)

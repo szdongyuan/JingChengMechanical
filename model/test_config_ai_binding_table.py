@@ -7,7 +7,7 @@ sets the FK to NULL rather than cascade-deleting bindings.
 """
 from __future__ import annotations
 
-from peewee import AutoField, BooleanField, ForeignKeyField, IntegerField, TextField
+from peewee import AutoField, BooleanField, FloatField, ForeignKeyField, IntegerField, TextField
 
 from consts.time_consts import now_str
 from model.ai_toolchain_table import AiToolchainTable
@@ -25,8 +25,8 @@ class TestConfigAiBindingTable(BaseModel):
         AiToolchainTable, backref="bindings", on_delete="SET NULL", null=True
     )
     timeout_ms = IntegerField(null=True, default=None)
-    analysis_window_offset_ms = IntegerField(default=0)
     params_json = TextField(default="{}")
+    score_threshold = FloatField(null=True, default=None)
     updated_time = TextField(default=now_str)
 
     class Meta:
