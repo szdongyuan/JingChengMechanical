@@ -76,10 +76,11 @@ class FactoryModeController(QObject):
             return self._state
 
         selected = tuple(selected_config_ids)
-        warning_cleared = self._invalid_selection_warning_active
-        self._invalid_selection_warning_active = False
-        has_review_context = self._has_review_context()
         selection_changed = selected != self._state.selected_config_ids
+        warning_cleared = selection_changed and self._invalid_selection_warning_active
+        if selection_changed:
+            self._invalid_selection_warning_active = False
+        has_review_context = self._has_review_context()
         if has_review_context and not selection_changed and not warning_cleared:
             return self._state
 

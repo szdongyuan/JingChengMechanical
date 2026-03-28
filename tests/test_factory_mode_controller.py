@@ -1766,6 +1766,36 @@ def test_restore_selection_with_missing_configs_blocks_without_persisting_until_
     services.factory_selection_settings.save_selected_config_ids.assert_not_called()
 
 
+def test_restore_selection_with_missing_configs_stays_blocking_until_later_user_edit():
+    controller_mod = _load_factory_mode_controller_module()
+    services = _make_services(
+        (
+            _make_config(101),
+            _make_config(202),
+            _make_config(303),
+        )
+    )
+    controller = controller_mod.FactoryModeController(EventBus(), services)
+
+    controller.restore_selection((101, 303), had_missing_configs=True)
+
+    controller.set_selection((101, 303))
+
+    assert controller.state.selected_config_ids == (101, 303)
+    assert controller.state.selection_ready is False
+    assert controller.state.selection_ready_reason == "配置已失效"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "配置已失效"
+
+    controller.set_selection((303, 101))
+
+    assert controller.state.selected_config_ids == (303, 101)
+    assert controller.state.selection_ready is True
+    assert controller.state.selection_ready_reason is None
+    assert controller.state.start_ready is True
+    assert controller.state.start_ready_reason is None
+
+
 def test_config_changed_prunes_deleted_selected_config_persists_and_blocks_until_user_edit():
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()
