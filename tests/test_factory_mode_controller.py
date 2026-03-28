@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
+from dataclasses import replace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 import app.services_container as services_mod
+from PyQt6.QtWidgets import QApplication
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.review_payloads import build_summary_payload
 from app.service.analysis.test_manager import TestManager
@@ -223,6 +225,14 @@ def _accept_start(services):
     services.test.start.side_effect = _start
 
 
+@pytest.fixture
+def qapp():
+    app = QApplication.instance()
+    if app is None:
+        app = QApplication([])
+    return app
+
+
 def _assert_start_called_with(
     services,
     expected_workorder: dict,
@@ -400,7 +410,7 @@ def _make_real_manager_factory_context(monkeypatch, *, save_wav_error: Exception
     }
     services.test = TestManager(bus, services)
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     return controller, services, reset_reasons, reviews, states, FakeRecorder
 
 
@@ -414,16 +424,104 @@ def test_factory_mode_controller_starts_not_ready():
 
     assert isinstance(controller.state, state_cls)
     assert controller.state.selected_config_ids == ()
-    assert controller.state.manual_primary_config_id is None
     assert controller.state.active_config_id is None
     assert controller.state.displayed_config_id is None
     assert controller.state.run_phase == "not_ready"
     assert controller.state.trigger_source is None
     assert controller.state.selection_ready is False
-    assert controller.state.selection_ready_reason == "请选择两个不同配置"
+    assert controller.state.selection_ready_reason == "请至少启用一个配置"
     assert controller.state.start_ready is False
-    assert controller.state.start_ready_reason == "请选择两个不同配置"
+    assert controller.state.start_ready_reason == "请至少启用一个配置"
     assert controller.state.is_ready is False
+
+
+def test_one_enabled_config_is_selection_ready_and_becomes_manual_start_target():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    services = _make_services((_make_config(202),))
+    controller = controller_mod.FactoryModeController(bus, services)
+
+    controller.set_selection((202,))
+
+    assert controller.state.selected_config_ids == (202,)
+    assert controller.state.run_phase == "armed"
+    assert controller.state.selection_ready is True
+    assert controller.state.selection_ready_reason is None
+    assert controller.state.start_ready is True
+    assert controller.state.start_ready_reason is None
+
+
+def test_zero_enabled_configs_block_with_explicit_reason():
+    controller_mod = _load_factory_mode_controller_module()
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(EventBus(), services)
+
+    controller.set_selection(())
+
+    assert controller.state.selected_config_ids == ()
+    assert controller.state.run_phase == "not_ready"
+    assert controller.state.selection_ready is False
+    assert controller.state.selection_ready_reason == "请至少启用一个配置"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "请至少启用一个配置"
+
+
+def test_runtime_validation_uses_first_error_from_highest_priority_enabled_config():
+    controller_mod = _load_factory_mode_controller_module()
+    services = _make_services(
+        (_make_config(101), _make_config(202), _make_config(303)),
+        validation_errors={
+            202: ["priority-202-error", "priority-202-second-error"],
+            101: ["priority-101-error"],
+        },
+    )
+    controller = controller_mod.FactoryModeController(EventBus(), services)
+
+    controller.set_selection((202, 101, 303))
+
+    assert controller.state.selection_ready is False
+    assert controller.state.selection_ready_reason == "priority-202-error"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "priority-202-error"
+
+
+def test_initial_load_failure_blocks_with_config_load_failed_reason():
+    controller_mod = _load_factory_mode_controller_module()
+    services = _make_services((_make_config(101), _make_config(202)))
+    services.config_service.load_config.side_effect = lambda config_id: (
+        (_make_config(config_id)) if config_id == 101 else (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    controller = controller_mod.FactoryModeController(EventBus(), services)
+
+    controller.set_selection((202, 101))
+
+    assert controller.state.selected_config_ids == (202, 101)
+    assert controller.state.run_phase == "not_ready"
+    assert controller.state.selection_ready is False
+    assert controller.state.selection_ready_reason == "配置加载失败"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "配置加载失败"
+
+
+def test_manual_start_uses_first_enabled_config_id():
+    controller_mod = _load_factory_mode_controller_module()
+    services = _make_services((_make_config(101), _make_config(202), _make_config(303)))
+    _accept_start(services)
+    controller = controller_mod.FactoryModeController(EventBus(), services)
+    controller.set_selection((303, 202, 101))
+
+    accepted = controller.start_manual({"sn": "SN-1", "model": "MODEL-1"})
+
+    assert accepted is True
+    _assert_start_called_with(
+        services,
+        {"sn": "SN-1", "model": "MODEL-1", "config_id": 303},
+        expected_trigger_source="manual",
+    )
+    assert controller.state.active_config_id == 303
+    assert controller.state.displayed_config_id == 303
+    assert controller.state.run_phase == "running"
+    assert controller.state.trigger_source == "manual"
 
 
 def test_factory_mode_controller_owns_pair_selection_state():
@@ -433,10 +531,9 @@ def test_factory_mode_controller_owns_pair_selection_state():
     bus.factory_state_changed.connect(states.append)
     controller = controller_mod.FactoryModeController(bus)
 
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
 
     assert controller.state.selected_config_ids == (101, 202)
-    assert controller.state.manual_primary_config_id == 101
     assert controller.state.run_phase == "armed"
     assert controller.state.selection_ready is True
     assert controller.state.selection_ready_reason is None
@@ -458,7 +555,7 @@ def test_factory_mode_controller_consumes_runtime_events_and_review_payload():
     reviews: list[object] = []
     bus.factory_review_changed.connect(reviews.append)
     controller = controller_mod.FactoryModeController(bus)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
 
     _enter_reviewing_state(controller, bus)
 
@@ -479,7 +576,7 @@ def test_factory_mode_controller_ignores_out_of_band_factory_runtime_start_accep
     states: list[object] = []
     bus.factory_state_changed.connect(states.append)
     controller = controller_mod.FactoryModeController(bus)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
 
     bus.factory_runtime_start_accepted.emit(
         runtime_start_cls(
@@ -490,7 +587,6 @@ def test_factory_mode_controller_ignores_out_of_band_factory_runtime_start_accep
     )
 
     assert controller.state.selected_config_ids == (101, 202)
-    assert controller.state.manual_primary_config_id == 101
     assert controller.state.active_config_id is None
     assert controller.state.displayed_config_id is None
     assert controller.state.run_phase == "armed"
@@ -528,17 +624,16 @@ def test_set_selection_clears_review_payload_and_emits_cleared_review_contract()
     bus.factory_review_changed.connect(reviews.append)
     bus.factory_display_reset.connect(reset_reasons.append)
     controller = controller_mod.FactoryModeController(bus)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     _enter_reviewing_state(controller, bus)
 
     reviews.clear()
     reset_reasons.clear()
 
-    controller.set_selection((303, 404), manual_primary_config_id=303)
+    controller.set_selection((303, 404))
 
     assert controller.review_payload == review_payload_cls()
     assert controller.state.selected_config_ids == (303, 404)
-    assert controller.state.manual_primary_config_id == 303
     assert controller.state.displayed_config_id is None
     assert controller.state.trigger_source is None
     assert reviews == [review_payload_cls()]
@@ -556,7 +651,7 @@ def test_set_selection_preserves_review_context_for_noop_resubmit():
     bus.factory_review_changed.connect(reviews.append)
     bus.factory_state_changed.connect(states.append)
     controller = controller_mod.FactoryModeController(bus)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     original_review_payload = _enter_reviewing_state(
         controller,
         bus,
@@ -569,7 +664,7 @@ def test_set_selection_preserves_review_context_for_noop_resubmit():
     reviews.clear()
     states.clear()
 
-    next_state = controller.set_selection((101, 202), manual_primary_config_id=101)
+    next_state = controller.set_selection((101, 202))
 
     assert next_state == original_state
     assert controller.state == original_state
@@ -582,7 +677,7 @@ def test_set_selection_preserves_review_context_for_noop_resubmit():
     assert states == []
 
 
-def test_set_selection_from_review_to_invalid_primary_goes_directly_to_not_ready():
+def test_set_selection_from_review_to_zero_enabled_configs_goes_directly_to_not_ready():
     controller_mod = _load_factory_mode_controller_module()
     review_payload_cls = getattr(services_mod, "FactoryReviewPayload", None)
 
@@ -596,22 +691,23 @@ def test_set_selection_from_review_to_invalid_primary_goes_directly_to_not_ready
     bus.factory_review_changed.connect(reviews.append)
     bus.factory_state_changed.connect(states.append)
     controller = controller_mod.FactoryModeController(bus)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     _enter_reviewing_state(controller, bus, config_id=202, trigger_source="plc")
 
     reset_reasons.clear()
     reviews.clear()
     states.clear()
 
-    controller.set_selection((101, 202), manual_primary_config_id=None)
+    controller.set_selection(())
 
     assert controller.review_payload == review_payload_cls()
-    assert controller.state.selected_config_ids == (101, 202)
-    assert controller.state.manual_primary_config_id is None
+    assert controller.state.selected_config_ids == ()
     assert controller.state.displayed_config_id is None
     assert controller.state.trigger_source is None
     assert controller.state.run_phase == "not_ready"
     assert controller.state.is_ready is False
+    assert controller.state.selection_ready_reason == "请至少启用一个配置"
+    assert controller.state.start_ready_reason == "请至少启用一个配置"
     assert reset_reasons == ["selection_changed"]
     assert reviews == [review_payload_cls()]
     assert states == [controller.state]
@@ -632,7 +728,7 @@ def test_runtime_start_accepted_clears_review_context_before_running():
     bus.factory_display_reset.connect(reset_reasons.append)
     bus.factory_state_changed.connect(states.append)
     controller = controller_mod.FactoryModeController(bus)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     _enter_reviewing_state(controller, bus)
 
     reviews.clear()
@@ -655,16 +751,16 @@ def test_runtime_start_accepted_clears_review_context_before_running():
     assert states[1].trigger_source == "plc"
 
 
-def test_factory_mode_controller_stays_not_ready_without_manual_primary():
+def test_factory_mode_controller_allows_ordered_selection_without_manual_primary():
     controller_mod = _load_factory_mode_controller_module()
     services = _make_services((_make_config(101), _make_config(202)))
     controller = controller_mod.FactoryModeController(EventBus(), services)
 
     controller.set_selection((101, 202))
 
-    assert controller.state.run_phase == "not_ready"
-    assert controller.state.is_ready is False
-    assert controller.can_arm() is False
+    assert controller.state.run_phase == "armed"
+    assert controller.state.is_ready is True
+    assert controller.can_arm() is True
 
 
 def test_factory_mode_controller_arms_only_after_runtime_validation_succeeds():
@@ -675,7 +771,7 @@ def test_factory_mode_controller_arms_only_after_runtime_validation_succeeds():
     )
     controller = controller_mod.FactoryModeController(EventBus(), services)
 
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
 
     assert controller.state.run_phase == "not_ready"
     assert controller.state.is_ready is False
@@ -683,7 +779,7 @@ def test_factory_mode_controller_arms_only_after_runtime_validation_succeeds():
     services = _make_services((_make_config(101), _make_config(202)))
     controller = controller_mod.FactoryModeController(EventBus(), services)
 
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
 
     assert controller.state.run_phase == "armed"
     assert controller.state.is_ready is True
@@ -696,7 +792,7 @@ def test_factory_mode_controller_rejects_start_when_backend_session_is_already_r
     services.test.is_running.return_value = True
     controller = controller_mod.FactoryModeController(EventBus(), services)
 
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
 
     assert controller.state.run_phase == "armed"
     assert controller.state.is_ready is True
@@ -706,13 +802,13 @@ def test_factory_mode_controller_rejects_start_when_backend_session_is_already_r
     services.test.start.assert_not_called()
 
 
-def test_factory_mode_controller_manual_start_resolves_to_primary_only():
+def test_factory_mode_controller_manual_start_resolves_to_first_enabled_config():
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()
     services = _make_services((_make_config(101), _make_config(202)))
     _accept_start(services)
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=202)
+    controller.set_selection((202, 101))
 
     accepted = controller.start_manual({"sn": "SN-1", "model": "M-1"})
 
@@ -756,7 +852,7 @@ def test_factory_mode_controller_routes_plc_events(configs, manual_primary_confi
     services = _make_services(configs)
     _accept_start(services)
     controller = controller_mod.FactoryModeController(EventBus(), services)
-    controller.set_selection((101, 202), manual_primary_config_id=manual_primary_config_id)
+    controller.set_selection((101, 202))
 
     accepted = controller.handle_plc_event(services_mod.FactoryPlcIngressPayload(plc_device_key=plc_device_key))
 
@@ -797,7 +893,7 @@ def test_factory_mode_controller_routes_scan_events(configs, manual_primary_conf
     services = _make_services(configs)
     _accept_start(services)
     controller = controller_mod.FactoryModeController(EventBus(), services)
-    controller.set_selection((101, 202), manual_primary_config_id=manual_primary_config_id)
+    controller.set_selection((101, 202))
 
     accepted = controller.handle_scan_event(services_mod.FactoryScanIngressPayload(scan_text="SN-1"))
 
@@ -823,7 +919,7 @@ def test_factory_mode_controller_applies_deferred_same_id_plc_refresh_after_acti
     services = _make_dynamic_services(config_map)
     _accept_start(services)
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
 
     assert controller.start_manual() is True
     services.test.start.reset_mock()
@@ -877,7 +973,7 @@ def test_factory_mode_controller_applies_deferred_runtime_revalidation_after_act
     )
     _accept_start(services)
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
 
     assert controller.start_manual() is True
     services.test.start.reset_mock()
@@ -965,7 +1061,7 @@ def test_factory_mode_controller_logs_and_drops_plc_and_scan_during_active_phase
     )
     _accept_start(services)
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
 
     assert controller.start_manual({"sn": "SN-1"}) is True
     active_run_id = _run_id_for(101)
@@ -1052,7 +1148,7 @@ def test_factory_mode_controller_logs_ignored_plc_no_match_for_current_pair(
         validate_factory_runtime=lambda config: [],
     )
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
 
     accepted = controller.handle_plc_event(
         services_mod.FactoryPlcIngressPayload(plc_device_key=plc_device_key)
@@ -1076,7 +1172,7 @@ def test_factory_mode_controller_logs_ignored_scan_no_match_for_current_pair():
         )
     )
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
 
     accepted = controller.handle_scan_event(
         services_mod.FactoryScanIngressPayload(scan_text="SN-404")
@@ -1103,7 +1199,7 @@ def test_factory_mode_controller_accepted_starts_clear_stale_review_context(star
         )
     )
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     _enter_reviewing_state(controller, bus, config_id=202, trigger_source="plc")
 
     reset_reasons.clear()
@@ -1156,7 +1252,7 @@ def test_factory_mode_controller_accepted_starts_preserve_review_context_until_s
         )
     )
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     _enter_reviewing_state(controller, bus, config_id=202, trigger_source="plc")
 
     start_snapshots: list[dict[str, object]] = []
@@ -1245,12 +1341,12 @@ def test_factory_mode_controller_ignores_stale_same_config_start_acceptance_call
 
     services.test.start.side_effect = _capture_start
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     states.clear()
 
     assert controller.start_manual({"sn": "first"}) is True
-    controller.set_selection((303, 404), manual_primary_config_id=303)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((303, 404))
+    controller.set_selection((101, 202))
     assert controller.start_manual({"sn": "second"}) is True
     assert len(callbacks) == 2
     states.clear()
@@ -1295,7 +1391,7 @@ def test_factory_mode_controller_treats_pending_start_as_busy_until_acceptance()
     services.test.start.side_effect = _capture_start
     bus.factory_state_changed.connect(states.append)
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     states.clear()
 
     assert controller.start_manual({"sn": "first"}) is True
@@ -1358,7 +1454,7 @@ def test_factory_mode_controller_same_id_invalidating_refresh_stales_pending_man
     bus.factory_state_changed.connect(states.append)
     bus.factory_runtime_start_accepted.connect(accepted_payloads.append)
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     states.clear()
 
     assert controller.start_manual({"sn": "SN-1"}) is True
@@ -1369,7 +1465,6 @@ def test_factory_mode_controller_same_id_invalidating_refresh_stales_pending_man
     bus.config_changed.emit()
 
     assert controller.state.selected_config_ids == (101, 202)
-    assert controller.state.manual_primary_config_id == 101
     assert controller.state.active_config_id is None
     assert controller.state.displayed_config_id is None
     assert controller.state.run_phase == "not_ready"
@@ -1379,7 +1474,6 @@ def test_factory_mode_controller_same_id_invalidating_refresh_stales_pending_man
     assert controller.can_arm() is False
     assert len(states) == 2
     assert states[0].selected_config_ids == (101, 202)
-    assert states[0].manual_primary_config_id == 101
     assert states[0].active_config_id is None
     assert states[0].displayed_config_id is None
     assert states[0].run_phase == "armed"
@@ -1425,7 +1519,7 @@ def test_factory_mode_controller_same_id_valid_refresh_keeps_pending_manual_star
     bus.factory_state_changed.connect(states.append)
     bus.factory_runtime_start_accepted.connect(accepted_payloads.append)
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     states.clear()
 
     assert controller.start_manual({"sn": "SN-1"}) is True
@@ -1436,7 +1530,6 @@ def test_factory_mode_controller_same_id_valid_refresh_keeps_pending_manual_star
     bus.config_changed.emit()
 
     assert controller.state.selected_config_ids == (101, 202)
-    assert controller.state.manual_primary_config_id == 101
     assert controller.state.active_config_id is None
     assert controller.state.displayed_config_id is None
     assert controller.state.run_phase == "armed"
@@ -1446,7 +1539,6 @@ def test_factory_mode_controller_same_id_valid_refresh_keeps_pending_manual_star
     assert controller.can_arm() is False
     assert len(states) == 2
     assert states[0].selected_config_ids == (101, 202)
-    assert states[0].manual_primary_config_id == 101
     assert states[0].active_config_id is None
     assert states[0].displayed_config_id is None
     assert states[0].run_phase == "armed"
@@ -1499,7 +1591,7 @@ def test_factory_mode_controller_selection_change_cancels_pending_start_acceptan
 
     services.test.start.side_effect = _capture_start
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     states.clear()
 
     assert controller.start_manual({"sn": "first"}) is True
@@ -1508,7 +1600,7 @@ def test_factory_mode_controller_selection_change_cancels_pending_start_acceptan
     assert isinstance(request_id, str)
     assert request_id
 
-    next_state = controller.set_selection((303, 404), manual_primary_config_id=303)
+    next_state = controller.set_selection((303, 404))
 
     assert next_state == controller.state
     services.test.cancel_pending_start.assert_called_once_with(
@@ -1516,7 +1608,6 @@ def test_factory_mode_controller_selection_change_cancels_pending_start_acceptan
         config_id=101,
     )
     assert controller.state.selected_config_ids == (303, 404)
-    assert controller.state.manual_primary_config_id == 303
     assert controller.state.active_config_id is None
     assert controller.state.displayed_config_id is None
     assert controller.state.run_phase == "armed"
@@ -1524,7 +1615,6 @@ def test_factory_mode_controller_selection_change_cancels_pending_start_acceptan
     assert controller.can_arm() is True
     assert len(states) == 2
     assert states[0].selected_config_ids == (101, 202)
-    assert states[0].manual_primary_config_id == 101
     assert states[0].active_config_id is None
     assert states[0].displayed_config_id is None
     assert states[0].run_phase == "armed"
@@ -1536,7 +1626,6 @@ def test_factory_mode_controller_selection_change_cancels_pending_start_acceptan
     callbacks[0](_run_id_for(101))
 
     assert controller.state.selected_config_ids == (303, 404)
-    assert controller.state.manual_primary_config_id == 303
     assert controller.state.active_config_id is None
     assert controller.state.displayed_config_id is None
     assert controller.state.run_phase == "armed"
@@ -1571,7 +1660,7 @@ def test_factory_mode_controller_stop_cancels_pending_start_and_preserves_review
 
     services.test.start.side_effect = _capture_start
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     original_review_payload = _enter_reviewing_state(
         controller,
         bus,
@@ -1607,7 +1696,6 @@ def test_factory_mode_controller_stop_cancels_pending_start_and_preserves_review
     assert reviews == []
     assert len(states) == 2
     assert states[0].selected_config_ids == original_state.selected_config_ids
-    assert states[0].manual_primary_config_id == original_state.manual_primary_config_id
     assert states[0].active_config_id == original_state.active_config_id
     assert states[0].displayed_config_id == original_state.displayed_config_id
     assert states[0].run_phase == original_state.run_phase
@@ -1651,15 +1739,15 @@ def test_factory_mode_controller_ignores_stale_start_callback_for_same_config_ne
 
     services.test.start.side_effect = _capture_start
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
 
     assert controller.start_manual({"sn": "first"}) is True
     first_request_id = start_payloads[0].get("factory_start_request_id")
     assert isinstance(first_request_id, str)
     assert first_request_id
 
-    controller.set_selection((303, 404), manual_primary_config_id=303)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((303, 404))
+    controller.set_selection((101, 202))
     assert controller.start_manual({"sn": "second"}) is True
     second_request_id = start_payloads[1].get("factory_start_request_id")
     assert isinstance(second_request_id, str)
@@ -1723,7 +1811,7 @@ def test_factory_mode_controller_consumes_validated_start_acceptance_via_event_b
     services.test.start.side_effect = _capture_start
     controller = controller_mod.FactoryModeController(bus, services)
     bus.factory_state_changed.connect(states.append)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     states.clear()
 
     assert controller.start_manual({"sn": "SN-1"}) is True
@@ -1746,7 +1834,6 @@ def test_factory_mode_controller_consumes_validated_start_acceptance_via_event_b
     assert controller.state.trigger_source == "manual"
     assert len(states) == 2
     assert states[0].selected_config_ids == (101, 202)
-    assert states[0].manual_primary_config_id == 101
     assert states[0].active_config_id is None
     assert states[0].displayed_config_id is None
     assert states[0].run_phase == "armed"
@@ -1781,11 +1868,11 @@ def test_factory_mode_controller_ignores_stale_public_start_accepted_emit_for_sa
 
     services.test.start.side_effect = _capture_start
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
 
     assert controller.start_manual({"sn": "first"}) is True
-    controller.set_selection((303, 404), manual_primary_config_id=303)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((303, 404))
+    controller.set_selection((101, 202))
     assert controller.start_manual({"sn": "second"}) is True
     assert len(callbacks) == 2
     states.clear()
@@ -1830,7 +1917,7 @@ def test_factory_mode_controller_failed_start_preserves_review_context():
     services = _make_services((_make_config(101), _make_config(202)))
     services.test.start.side_effect = lambda workorder, *, on_start_accepted=None: False
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     original_review_payload = _enter_reviewing_state(controller, bus, config_id=202, trigger_source="plc")
 
     reset_reasons.clear()
@@ -1870,7 +1957,7 @@ def test_factory_mode_controller_start_exception_preserves_review_context_and_cl
     services = _make_services((_make_config(101), _make_config(202)))
     services.test.start.side_effect = RuntimeError("start exploded")
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     original_review_payload = _enter_reviewing_state(controller, bus, config_id=202, trigger_source="plc")
 
     reset_reasons.clear()
@@ -1907,7 +1994,7 @@ def test_factory_mode_controller_blocks_new_starts_during_active_or_reanalysis_p
         )
     )
     controller = controller_mod.FactoryModeController(EventBus(), services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     _accept_start(services)
     controller.start_manual()
     services.test.start.reset_mock()
@@ -1928,6 +2015,41 @@ def test_factory_mode_controller_blocks_new_starts_during_active_or_reanalysis_p
         services_mod.FactoryScanIngressPayload(scan_text="SN-1")
     ) is False
     services.test.start.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("phase", "expected_reason"),
+    [
+        ("running", "当前测试运行中"),
+        ("analyzing", "当前测试分析中"),
+        ("reanalyzing", "当前正在重新分析"),
+    ],
+)
+def test_factory_mode_controller_keeps_start_ready_false_during_blocking_analysis_phases(
+    phase,
+    expected_reason,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(EventBus(), services)
+    controller.set_selection((202, 101))
+    _emit_owned_runtime_start(
+        controller,
+        controller.bus,
+        config_id=101,
+        trigger_source="manual",
+    )
+
+    if phase == "analyzing":
+        controller.handle_runtime_analyzing(_make_runtime_config_payload(config_id=101))
+    elif phase == "reanalyzing":
+        controller.handle_runtime_analyzing(_make_runtime_config_payload(config_id=101))
+        controller.handle_runtime_review_ready(_make_review_payload(displayed_config_id=101))
+        controller.begin_reanalysis(1.0, 3.0)
+
+    assert controller.state.run_phase == phase
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == expected_reason
 
 
 @pytest.mark.parametrize("phase", ["running", "analyzing", "reanalyzing"])
@@ -1951,7 +2073,7 @@ def test_factory_mode_controller_ignores_selection_changes_during_active_or_rean
         )
     )
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     _accept_start(services)
     controller.start_manual()
 
@@ -1968,13 +2090,12 @@ def test_factory_mode_controller_ignores_selection_changes_during_active_or_rean
     reviews.clear()
     states.clear()
 
-    next_state = controller.set_selection((303, 404), manual_primary_config_id=303)
+    next_state = controller.set_selection((303, 404))
 
     assert next_state == original_state
     assert controller.state == original_state
     assert controller.review_payload == original_review_payload
     assert controller.state.selected_config_ids == (101, 202)
-    assert controller.state.manual_primary_config_id == 101
     assert controller.state.displayed_config_id == original_state.displayed_config_id
     assert controller.state.run_phase == phase
     assert controller.can_arm() is False
@@ -2012,7 +2133,7 @@ def test_factory_mode_controller_clear_calls_ignore_pending_start_and_allow_acce
 
     services.test.start.side_effect = _capture_start
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     states.clear()
 
     assert controller.start_manual({"sn": "pending"}) is True
@@ -2062,7 +2183,7 @@ def test_factory_mode_controller_clear_calls_ignore_active_analysis_and_preserve
     services = _make_services((_make_config(101), _make_config(202)))
     _accept_start(services)
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     controller.start_manual()
     run_id = _run_id_for(101)
     controller.handle_runtime_analyzing(
@@ -2106,7 +2227,7 @@ def test_factory_mode_controller_stop_clears_active_state_and_display_ownership(
     services = _make_services((_make_config(101), _make_config(202)))
     _accept_start(services)
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     controller.start_manual()
     reviews.clear()
 
@@ -2138,7 +2259,7 @@ def test_factory_mode_controller_failed_stop_keeps_active_run_state(phase):
     _accept_start(services)
     services.test.stop_active_run.return_value = False
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     controller.start_manual()
     reviews.clear()
 
@@ -2175,7 +2296,7 @@ def test_factory_mode_controller_stop_backend_exception_is_contained_and_keeps_a
         services.test.stop_active_run = None
         services.test.stop.side_effect = RuntimeError("stop exploded")
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     controller.start_manual()
     reviews.clear()
 
@@ -2202,7 +2323,7 @@ def test_factory_mode_controller_reanalysis_failure_returns_to_reviewing_without
     bus = EventBus()
     services = _make_services((_make_config(101), _make_config(202)))
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
 
     started = controller.begin_reanalysis(1.25, 3.25)
@@ -2237,7 +2358,7 @@ def test_begin_reanalysis_clears_summary_payload_and_chart_payload_without_reset
     bus.factory_state_changed.connect(states.append)
     services = _make_services((_make_config(101), _make_config(202)))
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     run_id = _run_id_for(101)
     review_payload = _make_review_payload(
         displayed_config_id=101,
@@ -2292,7 +2413,7 @@ def test_factory_mode_controller_preserves_committed_partial_no_result_reanalysi
     bus.factory_state_changed.connect(states.append)
     services = _make_services((_make_config(101), _make_config(202)))
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     original_review = _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
     reviews.clear()
     states.clear()
@@ -2388,6 +2509,70 @@ def test_factory_mode_controller_preserves_committed_partial_no_result_reanalysi
     assert reviews[-1] == controller.review_payload
 
 
+@pytest.mark.parametrize(
+    ("payload_kwargs", "expected_error_message"),
+    [
+        (
+            {"no_result": True, "judgment_payload": None},
+            "manual reanalysis failed",
+        ),
+        (
+            {"error_message": "AI timeout", "judgment_payload": None},
+            "AI timeout",
+        ),
+    ],
+)
+def test_factory_mode_controller_reanalysis_completed_terminal_no_result_payload_restores_start_ready(
+    payload_kwargs,
+    expected_error_message,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reviews: list[object] = []
+    states: list[object] = []
+    bus.factory_review_changed.connect(reviews.append)
+    bus.factory_state_changed.connect(states.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((202, 101))
+    original_review = _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
+    reviews.clear()
+    states.clear()
+
+    started = controller.begin_reanalysis(1.25, 3.25)
+
+    assert started is True
+    services.test.rejudge.assert_called_once_with(101, 1.25, 3.25)
+
+    controller.handle_runtime_reanalysis_completed(
+        _make_review_payload(
+            displayed_config_id=101,
+            run_id=original_review.run_id,
+            trigger_source="manual",
+            summary_payload=None,
+            **payload_kwargs,
+        )
+    )
+
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.start_ready is True
+    assert controller.state.start_ready_reason is None
+    assert controller.review_payload.run_id == original_review.run_id
+    assert controller.review_payload.default_window == original_review.default_window
+    assert controller.review_payload.manual_reanalysis_allowed is True
+    assert controller.review_payload.no_result is True
+    assert controller.review_payload.error_message == expected_error_message
+    assert controller.review_payload.summary_payload == _full_no_result_summary(
+        expected_error_message
+    )
+    assert controller.review_payload.chart_payload is None
+    assert controller.review_payload.judgment_payload is None
+    assert [state.run_phase for state in states] == ["reanalyzing", "reviewing"]
+    assert reviews[-1] == controller.review_payload
+
+
 def test_factory_mode_controller_accepts_successful_reanalysis_payload_without_run_id():
     controller_mod = _load_factory_mode_controller_module()
     review_window_cls = getattr(services_mod, "FactoryReviewWindow", None)
@@ -2403,7 +2588,7 @@ def test_factory_mode_controller_accepts_successful_reanalysis_payload_without_r
     bus.factory_state_changed.connect(states.append)
     services = _make_services((_make_config(101), _make_config(202)))
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     original_review = _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
     reviews.clear()
     states.clear()
@@ -2460,7 +2645,7 @@ def test_factory_mode_controller_accepts_reanalysis_payload_without_displayed_co
     bus.factory_state_changed.connect(states.append)
     services = _make_services((_make_config(101), _make_config(202)))
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     original_review = _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
     reviews.clear()
     states.clear()
@@ -2515,7 +2700,7 @@ def test_factory_mode_controller_rejects_fully_sparse_reanalysis_payload():
     bus.factory_state_changed.connect(states.append)
     services = _make_services((_make_config(101), _make_config(202)))
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
     reviews.clear()
     states.clear()
@@ -2577,7 +2762,7 @@ def test_factory_mode_controller_rejects_mismatched_sparse_reanalysis_payloads(
     bus.factory_state_changed.connect(states.append)
     services = _make_services((_make_config(101), _make_config(202)))
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     original_review = _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
     reviews.clear()
     states.clear()
@@ -2626,7 +2811,7 @@ def test_factory_mode_controller_reanalysis_missing_session_unwinds_to_reviewing
     bus.factory_state_changed.connect(states.append)
     services = _make_services((_make_config(101), _make_config(202)))
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     original_review = _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
     reviews.clear()
     states.clear()
@@ -2683,7 +2868,7 @@ def test_factory_mode_controller_reanalysis_empty_exception_message_unwinds_to_r
     services = _make_services((_make_config(101), _make_config(202)))
     services.test.rejudge.side_effect = RuntimeError("")
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     original_review = _enter_reviewing_state(controller, bus, config_id=101, trigger_source="manual")
     reviews.clear()
     states.clear()
@@ -2720,7 +2905,7 @@ def test_factory_mode_controller_ignores_mismatched_factory_runtime_review_paylo
     services = _make_services((_make_config(101), _make_config(202)))
     _accept_start(services)
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     controller.start_manual()
     reviews.clear()
 
@@ -2765,7 +2950,7 @@ def test_factory_mode_controller_requires_analyzing_before_reviewing_for_auto_co
     bus.factory_review_changed.connect(reviews.append)
     services = _make_services((_make_config(101), _make_config(202)))
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     run_id = _run_id_for(101)
 
     _emit_owned_runtime_start(
@@ -2821,7 +3006,7 @@ def test_factory_mode_controller_ignores_out_of_band_auto_analysis_failure_paylo
     bus.factory_review_changed.connect(reviews.append)
     services = _make_services((_make_config(101), _make_config(202)))
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     reviews.clear()
 
     getattr(bus, signal_name).emit(_make_review_payload(**payload_kwargs))
@@ -2883,7 +3068,7 @@ def test_factory_mode_controller_ignores_out_of_band_auto_analysis_failure_paylo
     services = _make_services((_make_config(101), _make_config(202)))
     _accept_start(services)
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     controller.start_manual()
 
     if reset_kind == "stop":
@@ -2919,7 +3104,7 @@ def test_factory_mode_controller_ignores_late_same_config_run_id_events_after_st
     bus.factory_review_changed.connect(reviews.append)
     services = _make_services((_make_config(101), _make_config(202)))
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     first_run_id = _run_id_for(101, attempt=1)
     second_run_id = _run_id_for(101, attempt=2)
 
@@ -2978,7 +3163,7 @@ def test_factory_mode_controller_recovers_from_factory_runtime_abort_mid_run():
     services = _make_services((_make_config(101), _make_config(202)))
     _accept_start(services)
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     controller.start_manual()
     reviews.clear()
 
@@ -3013,7 +3198,7 @@ def test_factory_mode_controller_ignores_out_of_band_factory_runtime_abort():
     services = _make_services((_make_config(101), _make_config(202)))
     _accept_start(services)
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     controller.start_manual()
     reviews.clear()
 
@@ -3033,24 +3218,202 @@ def test_factory_mode_controller_ignores_out_of_band_factory_runtime_abort():
     assert reviews == []
 
 
-def test_factory_mode_controller_marks_start_ready_immediately_after_auto_analysis_completion(
+def test_factory_mode_controller_real_manager_auto_completion_gates_start_readiness_until_cleanup_settles(
     monkeypatch,
 ):
-    controller, services, _, _, _, _ = _make_real_manager_factory_context(monkeypatch)
+    controller, services, _, _, states, _ = _make_real_manager_factory_context(monkeypatch)
+    review_signal_snapshots: list[tuple[object, bool]] = []
+
+    bus = services.bus
+    bus.factory_review_changed.connect(
+        lambda *_: review_signal_snapshots.append((controller.state, services.test.is_running()))
+    )
 
     started = controller.start_manual({"sn": "SN-1"})
 
     assert started is True
     assert controller.state.run_phase == "running"
 
+    state_count_before_completion = len(states)
+
     services.test._on_session_done(101)
 
+    completion_states = states[state_count_before_completion:]
+    assert [state.run_phase for state in completion_states] == [
+        "analyzing",
+        "reviewing",
+        "reviewing",
+    ]
+    assert review_signal_snapshots[-1][0].run_phase == "reviewing"
+    assert review_signal_snapshots[-1][0].start_ready is False
+    assert review_signal_snapshots[-1][0].start_ready_reason == "当前测试运行中"
+    assert review_signal_snapshots[-1][1] is True
+    assert completion_states[-1].run_phase == "reviewing"
+    assert completion_states[-1].start_ready is True
+    assert completion_states[-1].start_ready_reason is None
     assert controller.state.run_phase == "reviewing"
     assert controller.state.start_ready is True
     assert controller.state.start_ready_reason is None
     assert services.test.is_running() is False
     assert services.test._sessions == {}
     assert 101 in services.test._completed_sessions
+
+
+@pytest.mark.parametrize(
+    ("signal_name", "review_kwargs"),
+    [
+        ("factory_runtime_auto_analysis_succeeded", {}),
+        (
+            "factory_runtime_auto_analysis_no_result",
+            {"no_result": True, "judgment_payload": None},
+        ),
+        (
+            "factory_runtime_auto_analysis_error",
+            {
+                "no_result": True,
+                "error_message": "analysis window missing",
+                "judgment_payload": None,
+            },
+        ),
+    ],
+)
+def test_factory_mode_controller_rechecks_start_readiness_after_cleanup_settled_signal(
+    qapp,
+    signal_name,
+    review_kwargs,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((202, 101))
+    run_id = _run_id_for(101)
+    backend_running = False
+
+    def _is_running(config_id=None):
+        return backend_running
+
+    services.test.is_running.side_effect = _is_running
+
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        run_id=run_id,
+        trigger_source="manual",
+    )
+    bus.factory_runtime_analyzing_entered.emit(
+        _make_runtime_config_payload(config_id=101, run_id=run_id)
+    )
+    backend_running = True
+
+    review_signal = getattr(bus, signal_name)
+    review_signal.emit(
+        _make_review_payload(
+            displayed_config_id=101,
+            run_id=run_id,
+            trigger_source="manual",
+            **review_kwargs,
+        )
+    )
+
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "当前测试运行中"
+
+    for _ in range(5):
+        qapp.processEvents()
+
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "当前测试运行中"
+
+    backend_running = False
+    bus.factory_runtime_auto_analysis_cleanup_settled.emit(
+        _make_runtime_config_payload(config_id=101, run_id=run_id)
+    )
+
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.start_ready is True
+    assert controller.state.start_ready_reason is None
+
+
+def test_factory_mode_controller_cleanup_settled_recomputes_review_readiness_instead_of_trusting_stale_reason_text(
+):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+    services.test.is_running.return_value = False
+    run_id = _run_id_for(101)
+    controller._review_payload = _make_review_payload(
+        displayed_config_id=101,
+        run_id=run_id,
+        trigger_source="manual",
+    )
+
+    controller._state = replace(
+        controller.state,
+        selected_config_ids=(),
+        active_config_id=None,
+        displayed_config_id=101,
+        run_phase="reviewing",
+        trigger_source="manual",
+        selection_ready=False,
+        selection_ready_reason="请至少启用一个配置",
+        start_ready=False,
+        start_ready_reason="当前测试运行中",
+    )
+
+    bus.factory_runtime_auto_analysis_cleanup_settled.emit(
+        _make_runtime_config_payload(config_id=101, run_id=run_id)
+    )
+
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "请至少启用一个配置"
+
+
+def test_factory_mode_controller_cleanup_settled_does_not_enable_start_while_backend_still_running():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+    run_id = _run_id_for(101)
+
+    services.test.is_running.return_value = True
+
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        run_id=run_id,
+        trigger_source="manual",
+    )
+    bus.factory_runtime_analyzing_entered.emit(
+        _make_runtime_config_payload(config_id=101, run_id=run_id)
+    )
+    bus.factory_runtime_auto_analysis_succeeded.emit(
+        _make_review_payload(
+            displayed_config_id=101,
+            run_id=run_id,
+            trigger_source="manual",
+        )
+    )
+
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "当前测试运行中"
+
+    bus.factory_runtime_auto_analysis_cleanup_settled.emit(
+        _make_runtime_config_payload(config_id=101, run_id=run_id)
+    )
+
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "当前测试运行中"
 
 
 @pytest.mark.parametrize(
@@ -3078,7 +3441,7 @@ def test_factory_mode_controller_marks_start_ready_after_terminal_auto_analysis_
     bus = EventBus()
     services = _make_services((_make_config(101), _make_config(202)))
     controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
     run_id = _run_id_for(101)
 
     _emit_owned_runtime_start(
@@ -3227,7 +3590,7 @@ def test_factory_mode_controller_consumes_real_test_manager_lifecycle_signals(mo
     bus.factory_state_changed.connect(states.append)
     controller = controller_mod.FactoryModeController(bus, services)
 
-    controller.set_selection((101, 202), manual_primary_config_id=101)
+    controller.set_selection((101, 202))
 
     started = controller.start_manual({"sn": "SN-1"})
 
@@ -3249,6 +3612,7 @@ def test_factory_mode_controller_consumes_real_test_manager_lifecycle_signals(mo
         "armed",
         "running",
         "analyzing",
+        "reviewing",
         "reviewing",
         "reanalyzing",
         "reviewing",
@@ -3309,3 +3673,4 @@ def test_factory_mode_controller_stop_active_run_remains_clean_when_partial_save
     assert reviews == [services_mod.FactoryReviewPayload()]
     assert recorder_cls.instances[0].stop_calls == 1
     assert recorder_cls.instances[0].wait_calls == [3000]
+

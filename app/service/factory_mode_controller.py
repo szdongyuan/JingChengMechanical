@@ -68,17 +68,13 @@ class FactoryModeController(QObject):
     def set_selection(
         self,
         selected_config_ids: tuple[int, ...] | list[int],
-        manual_primary_config_id: int | None = None,
     ) -> FactoryControllerState:
         if self._state.run_phase in self._BLOCKED_START_PHASES:
             return self._state
 
         selected = tuple(selected_config_ids)
         has_review_context = self._has_review_context()
-        selection_changed = (
-            selected != self._state.selected_config_ids
-            or manual_primary_config_id != self._state.manual_primary_config_id
-        )
+        selection_changed = selected != self._state.selected_config_ids
         if has_review_context and not selection_changed:
             return self._state
 
@@ -86,15 +82,11 @@ class FactoryModeController(QObject):
             if not self._cancel_pending_start(emit_state=False):
                 return self._state
 
-        is_ready = self._reload_selected_configs(
-            selected_config_ids=selected,
-            manual_primary_config_id=manual_primary_config_id,
-        )
+        is_ready = self._reload_selected_configs(selected_config_ids=selected)
 
         next_state = self._state_with_readiness(
             FactoryControllerState(
                 selected_config_ids=selected,
-                manual_primary_config_id=manual_primary_config_id,
                 active_config_id=None,
                 displayed_config_id=None,
                 run_phase="armed" if is_ready else "not_ready",
@@ -120,14 +112,10 @@ class FactoryModeController(QObject):
         self._selection_refresh_deferred = False
 
         selected = tuple(self._state.selected_config_ids)
-        manual_primary_config_id = self._state.manual_primary_config_id
-        if not selected and manual_primary_config_id is None:
+        if not selected:
             return self._state
 
-        is_ready = self._reload_selected_configs(
-            selected_config_ids=selected,
-            manual_primary_config_id=manual_primary_config_id,
-        )
+        is_ready = self._reload_selected_configs(selected_config_ids=selected)
         if self._pending_start is not None and not is_ready:
             self._stale_pending_start()
         if self._has_review_context():
@@ -139,7 +127,6 @@ class FactoryModeController(QObject):
         self._state = self._state_with_readiness(
             FactoryControllerState(
                 selected_config_ids=selected,
-                manual_primary_config_id=manual_primary_config_id,
                 active_config_id=None,
                 displayed_config_id=None,
                 run_phase="armed" if is_ready else "not_ready",
@@ -162,9 +149,10 @@ class FactoryModeController(QObject):
         return self._state.start_ready
 
     def start_manual(self, workorder: dict | None = None) -> bool:
-        config_id = self._state.manual_primary_config_id
-        if config_id is None:
+        selected = tuple(self._state.selected_config_ids)
+        if not selected:
             return False
+        config_id = selected[0]
         return self._accept_start(config_id, "manual", workorder)
 
     def clear_display_state(self, reason: str) -> None:
@@ -554,19 +542,11 @@ class FactoryModeController(QObject):
         self,
         *,
         selected_config_ids: tuple[int, ...],
-        manual_primary_config_id: int | None,
     ) -> bool:
         self._selected_configs = {}
-        if (
-            len(selected_config_ids) == 2
-            and len(set(selected_config_ids)) == 2
-            and manual_primary_config_id in selected_config_ids
-        ):
+        if selected_config_ids:
             self._selected_configs = self._load_selected_configs(selected_config_ids)
-        return self._selection_is_start_ready(
-            selected_config_ids=selected_config_ids,
-            manual_primary_config_id=manual_primary_config_id,
-        )
+        return self._selection_is_start_ready(selected_config_ids=selected_config_ids)
 
     def _selected_configs_have_runtime_errors(self) -> bool:
         return bool(self._selected_config_runtime_errors())
@@ -585,22 +565,14 @@ class FactoryModeController(QObject):
         self,
         *,
         selected_config_ids: tuple[int, ...] | object = _UNSET,
-        manual_primary_config_id: int | None | object = _UNSET,
     ) -> bool:
         selected = (
             tuple(selected_config_ids)
             if selected_config_ids is not _UNSET
             else tuple(self._state.selected_config_ids)
         )
-        primary_config_id = (
-            manual_primary_config_id
-            if manual_primary_config_id is not _UNSET
-            else self._state.manual_primary_config_id
-        )
         return (
-            len(selected) == 2
-            and len(set(selected)) == 2
-            and primary_config_id in selected
+            bool(selected)
             and len(self._selected_configs) == len(selected)
             and not self._selected_config_runtime_errors()
         )
@@ -609,24 +581,16 @@ class FactoryModeController(QObject):
         self,
         *,
         selected_config_ids: tuple[int, ...] | object = _UNSET,
-        manual_primary_config_id: int | None | object = _UNSET,
     ) -> tuple[bool, str | None]:
         selected = (
             tuple(selected_config_ids)
             if selected_config_ids is not _UNSET
             else tuple(self._state.selected_config_ids)
         )
-        primary_config_id = (
-            manual_primary_config_id
-            if manual_primary_config_id is not _UNSET
-            else self._state.manual_primary_config_id
-        )
-        if len(selected) != 2 or len(set(selected)) != 2:
-            return False, "请选择两个不同配置"
-        if primary_config_id not in selected:
-            return False, "请先选择手动主配置"
+        if not selected:
+            return False, "请至少启用一个配置"
         if len(self._selected_configs) != len(selected):
-            return False, "工厂模式未就绪"
+            return False, "配置加载失败"
         runtime_errors = self._selected_config_runtime_errors()
         if runtime_errors:
             return False, runtime_errors[0]
@@ -661,7 +625,6 @@ class FactoryModeController(QObject):
     ) -> FactoryControllerState:
         selection_ready, selection_ready_reason = self._selection_readiness(
             selected_config_ids=state.selected_config_ids,
-            manual_primary_config_id=state.manual_primary_config_id,
         )
         start_ready, start_ready_reason = self._start_readiness(
             state=state,
@@ -687,10 +650,8 @@ class FactoryModeController(QObject):
             if self._normalize_optional_text(config.get("plc_device_key"))
             == normalized_plc_key
         ]
-        if len(matches) == 1:
+        if matches:
             return matches[0]
-        if len(matches) == 2:
-            return self._state.manual_primary_config_id
         return None
 
     def _resolve_scan_config_id(self) -> int | None:
@@ -699,10 +660,8 @@ class FactoryModeController(QObject):
             for config_id, config in self._selected_configs.items()
             if bool(config.get("scan_triggers_test"))
         ]
-        if len(matches) == 1:
+        if matches:
             return matches[0]
-        if len(matches) == 2:
-            return self._state.manual_primary_config_id
         return None
 
     def _has_review_context(self) -> bool:

@@ -29,7 +29,7 @@ class FactoryControllerState:
         "analyzing": "当前测试分析中",
         "reanalyzing": "当前正在重新分析",
     }
-    _START_READY_SELECTION_PHASES = frozenset({"idle", "not_ready", "armed", "reviewing"})
+    _START_READY_SELECTION_PHASES = frozenset({"idle", "armed", "reviewing"})
 
     def __post_init__(self):
         selection_ready = self.selection_ready

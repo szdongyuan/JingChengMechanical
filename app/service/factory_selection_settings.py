@@ -35,4 +35,7 @@ class FactorySelectionSettings:
             self._settings.sync()
         except Exception:
             return "配置保存失败"
+        status = getattr(self._settings, "status", None)
+        if callable(status) and status() != QSettings.Status.NoError:
+            return "配置保存失败"
         return None

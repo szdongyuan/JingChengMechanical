@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from app.service.factory_selection_settings import FactorySelectionSettings
+from PyQt6.QtCore import QSettings
 
 
 class _FakeSettings:
@@ -28,6 +29,18 @@ class _ExplodingSettings:
         raise AssertionError("sync should not run after a failed set")
 
 
+class _StatusFailingSettings(_FakeSettings):
+    def __init__(self):
+        super().__init__()
+        self._status = QSettings.Status.NoError
+
+    def sync(self) -> None:
+        self._status = QSettings.Status.AccessError
+
+    def status(self):
+        return self._status
+
+
 def test_factory_selection_settings_round_trips_ordered_ids():
     store = FactorySelectionSettings(settings=_FakeSettings())
 
@@ -38,6 +51,14 @@ def test_factory_selection_settings_round_trips_ordered_ids():
 
 def test_factory_selection_settings_returns_error_when_save_fails():
     store = FactorySelectionSettings(settings=_ExplodingSettings())
+
+    error = store.save_selected_config_ids((101, 202))
+
+    assert error == "配置保存失败"
+
+
+def test_factory_selection_settings_returns_error_when_sync_status_is_not_no_error():
+    store = FactorySelectionSettings(settings=_StatusFailingSettings())
 
     error = store.save_selected_config_ids((101, 202))
 

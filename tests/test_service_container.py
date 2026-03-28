@@ -156,6 +156,10 @@ def test_factory_controller_state_contract_exposes_only_spec_fields():
 def test_factory_controller_state_derives_readiness_from_ordered_selection_without_manual_primary():
     ready_state = mod.FactoryControllerState(selected_config_ids=(101,), run_phase="armed")
     blocked_state = mod.FactoryControllerState(selected_config_ids=(), run_phase="not_ready")
+    not_ready_selected_state = mod.FactoryControllerState(
+        selected_config_ids=(101,),
+        run_phase="not_ready",
+    )
     reviewing_state = mod.FactoryControllerState(selected_config_ids=(101, 202), run_phase="reviewing")
     busy_state = mod.FactoryControllerState(selected_config_ids=(101,), run_phase="running")
 
@@ -168,6 +172,11 @@ def test_factory_controller_state_derives_readiness_from_ordered_selection_witho
     assert blocked_state.selection_ready_reason == "请至少启用一个配置"
     assert blocked_state.start_ready is False
     assert blocked_state.start_ready_reason == "请至少启用一个配置"
+
+    assert not_ready_selected_state.selection_ready is True
+    assert not_ready_selected_state.selection_ready_reason is None
+    assert not_ready_selected_state.start_ready is False
+    assert not_ready_selected_state.start_ready_reason == "工厂模式未就绪"
 
     assert reviewing_state.selection_ready is True
     assert reviewing_state.start_ready is True
