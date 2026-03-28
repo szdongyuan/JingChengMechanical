@@ -7,7 +7,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QPointF
-from PyQt6.QtWidgets import QApplication, QListWidget
+from PyQt6.QtWidgets import QApplication
 
 from ui.widgets.factory_config_list import FactoryConfigListWidget
 
@@ -48,6 +48,23 @@ class _DropEventStub:
 
     def ignore(self) -> None:
         self.ignored = True
+
+
+def _show_widget(widget: FactoryConfigListWidget, qapp) -> None:
+    widget.resize(320, 200)
+    widget.show()
+    qapp.processEvents()
+
+
+def _drop_event_on_row(
+    widget: FactoryConfigListWidget,
+    row_index: int,
+    *,
+    x_offset: int = 4,
+    y_offset: int = 4,
+) -> _DropEventStub:
+    row_rect = widget.visualItemRect(widget.item(row_index))
+    return _DropEventStub(QPointF(row_rect.left() + x_offset, row_rect.top() + y_offset))
 
 
 def test_factory_config_list_keeps_checked_rows_first_and_appends_new_checks_to_end(qapp):
@@ -112,7 +129,6 @@ def test_factory_config_list_visually_marks_top_checked_row_as_primary(qapp):
 
 def test_factory_config_list_drop_event_preserves_all_checked_configs_when_moving_to_top(
     qapp,
-    monkeypatch,
 ):
     widget = FactoryConfigListWidget()
     emissions: list[tuple[int, ...]] = []
@@ -121,22 +137,9 @@ def test_factory_config_list_drop_event_preserves_all_checked_configs_when_movin
         rows=[_row(101, "Config A"), _row(202, "Config B"), _row(303, "Config C")],
         enabled_config_ids=(101, 202, 303),
     )
-    widget.resize(320, 200)
-    widget.show()
-    qapp.processEvents()
+    _show_widget(widget, qapp)
     widget.setCurrentItem(widget.item(2))
-
-    def _fake_drop_event(self, event):
-        model = self.model()
-        mime = model.mimeData([model.index(2, 0)])
-        model.dropMimeData(mime, self.defaultDropAction(), 0, 0, self.rootIndex())
-
-    monkeypatch.setattr(QListWidget, "dropEvent", _fake_drop_event)
-
-    first_row_rect = widget.visualItemRect(widget.item(0))
-    drop_event = _DropEventStub(
-        QPointF(first_row_rect.left() + 4, first_row_rect.top() + 4)
-    )
+    drop_event = _drop_event_on_row(widget, 0)
 
     widget.dropEvent(drop_event)
 
@@ -145,5 +148,63 @@ def test_factory_config_list_drop_event_preserves_all_checked_configs_when_movin
     assert widget.primary_config_id() == 303
     assert widget.primary_row_badge_text() == "Primary"
     assert emissions[-1] == (303, 101, 202)
+    assert drop_event.accepted is True
+    assert drop_event.ignored is False
+
+
+def test_factory_config_list_drop_event_reorders_checked_config_downward_within_checked_block(
+    qapp,
+):
+    widget = FactoryConfigListWidget()
+    emissions: list[tuple[int, ...]] = []
+    widget.enabled_order_changed.connect(lambda config_ids: emissions.append(config_ids))
+    widget.set_rows(
+        rows=[
+            _row(101, "Config A"),
+            _row(202, "Config B"),
+            _row(303, "Config C"),
+            _row(404, "Config D"),
+        ],
+        enabled_config_ids=(101, 202, 303),
+    )
+    _show_widget(widget, qapp)
+    widget.setCurrentItem(widget.item(0))
+    drop_event = _drop_event_on_row(widget, 2)
+
+    widget.dropEvent(drop_event)
+
+    assert widget.enabled_config_ids() == (202, 101, 303)
+    assert widget.visual_config_order() == (202, 101, 303, 404)
+    assert widget.primary_config_id() == 202
+    assert emissions[-1] == (202, 101, 303)
+    assert drop_event.accepted is True
+    assert drop_event.ignored is False
+
+
+def test_factory_config_list_drop_event_into_unchecked_region_keeps_checked_block_contiguous(
+    qapp,
+):
+    widget = FactoryConfigListWidget()
+    emissions: list[tuple[int, ...]] = []
+    widget.enabled_order_changed.connect(lambda config_ids: emissions.append(config_ids))
+    widget.set_rows(
+        rows=[
+            _row(101, "Config A"),
+            _row(202, "Config B"),
+            _row(303, "Config C"),
+            _row(404, "Config D"),
+        ],
+        enabled_config_ids=(101, 202),
+    )
+    _show_widget(widget, qapp)
+    widget.setCurrentItem(widget.item(0))
+    drop_event = _drop_event_on_row(widget, 2)
+
+    widget.dropEvent(drop_event)
+
+    assert widget.enabled_config_ids() == (202, 101)
+    assert widget.visual_config_order() == (202, 101, 303, 404)
+    assert widget.primary_config_id() == 202
+    assert emissions[-1] == (202, 101)
     assert drop_event.accepted is True
     assert drop_event.ignored is False
