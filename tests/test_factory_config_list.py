@@ -6,9 +6,10 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QPointF
+from PyQt6.QtCore import QPointF, Qt
 from PyQt6.QtWidgets import QApplication
 
+import ui.widgets.factory_config_list as factory_config_list
 from ui.widgets.factory_config_list import FactoryConfigListWidget
 
 
@@ -48,6 +49,28 @@ class _DropEventStub:
 
     def ignore(self) -> None:
         self.ignored = True
+
+
+class _DragSpy:
+    def __init__(self, source):
+        self.source = source
+        self.mime_data = None
+        self.pixmap = None
+        self.hot_spot = None
+        self.exec_calls: list[tuple[Qt.DropAction, Qt.DropAction | None]] = []
+
+    def setMimeData(self, mime_data) -> None:
+        self.mime_data = mime_data
+
+    def setPixmap(self, pixmap) -> None:
+        self.pixmap = pixmap
+
+    def setHotSpot(self, hot_spot) -> None:
+        self.hot_spot = hot_spot
+
+    def exec(self, supported_actions, default_action=None):
+        self.exec_calls.append((supported_actions, default_action))
+        return default_action or supported_actions
 
 
 def _show_widget(widget: FactoryConfigListWidget, qapp) -> None:
@@ -141,6 +164,56 @@ def test_factory_config_list_drag_preview_matches_current_row_widget_size(qapp):
 
     assert preview.width() == row_widget.size().width()
     assert preview.height() == row_widget.size().height()
+
+
+def test_factory_config_list_start_drag_executes_move_only_with_row_preview(
+    qapp, monkeypatch
+):
+    widget = FactoryConfigListWidget()
+    widget.set_rows(
+        rows=[_row(101, "Config A"), _row(202, "Config B")],
+        enabled_config_ids=(101, 202),
+    )
+    _show_widget(widget, qapp)
+    dragged_item = widget.item(0)
+    dragged_item.setSelected(True)
+    widget.setCurrentItem(dragged_item)
+
+    drag_spy = _DragSpy(widget)
+    monkeypatch.setattr(factory_config_list, "QDrag", lambda source: drag_spy)
+
+    widget.startDrag(Qt.DropAction.CopyAction | Qt.DropAction.MoveAction)
+
+    row_widget = widget.itemWidget(dragged_item)
+    assert drag_spy.pixmap is not None
+    assert drag_spy.pixmap.size() == row_widget.size()
+    assert drag_spy.exec_calls == [
+        (Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
+    ]
+
+
+def test_factory_config_list_start_drag_ignores_current_unchecked_item_without_selection(
+    qapp, monkeypatch
+):
+    widget = FactoryConfigListWidget()
+    widget.set_rows(
+        rows=[_row(101, "Config A"), _row(202, "Config B")],
+        enabled_config_ids=(101,),
+    )
+    _show_widget(widget, qapp)
+    widget.setCurrentItem(widget.item(1))
+    widget.clearSelection()
+
+    drag_calls: list[object] = []
+    monkeypatch.setattr(
+        factory_config_list,
+        "QDrag",
+        lambda source: drag_calls.append(_DragSpy(source)) or drag_calls[-1],
+    )
+
+    widget.startDrag(Qt.DropAction.MoveAction)
+
+    assert drag_calls == []
 
 
 def test_factory_config_list_drop_event_preserves_all_checked_configs_when_moving_to_top(

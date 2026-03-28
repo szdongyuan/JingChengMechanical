@@ -255,16 +255,11 @@ class FactoryConfigListWidget(QListWidget):
         event.accept()
 
     def startDrag(self, supported_actions: Qt.DropAction) -> None:
-        dragged_item = self._dragged_item()
-        if dragged_item is None:
+        indexes = self._selected_draggable_indexes()
+        if not indexes:
             return
-
-        indexes = self.selectedIndexes()
-        if not indexes:
-            current_index = self.indexFromItem(dragged_item)
-            if current_index.isValid():
-                indexes = [current_index]
-        if not indexes:
+        dragged_item = self.itemFromIndex(indexes[0])
+        if dragged_item is None:
             return
 
         mime_data = self.model().mimeData(indexes)
@@ -281,11 +276,9 @@ class FactoryConfigListWidget(QListWidget):
             if not row_rect.isNull():
                 drag.setHotSpot(self.viewport().mapFromGlobal(QCursor.pos()) - row_rect.topLeft())
 
-        default_action = self.defaultDropAction()
-        if default_action == Qt.DropAction.IgnoreAction:
-            drag.exec(supported_actions)
+        if not supported_actions & Qt.DropAction.MoveAction:
             return
-        drag.exec(supported_actions, default_action)
+        drag.exec(Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
 
     def _normalize_enabled_order(
         self,
@@ -346,6 +339,17 @@ class FactoryConfigListWidget(QListWidget):
             if isinstance(widget, _FactoryConfigRowWidget):
                 return widget
         return None
+
+    def _selected_draggable_indexes(self) -> list:
+        indexes = []
+        for index in self.selectedIndexes():
+            if not index.isValid():
+                continue
+            item = self.itemFromIndex(index)
+            if item is None or not item.flags() & Qt.ItemFlag.ItemIsDragEnabled:
+                continue
+            indexes.append(index)
+        return indexes
 
     def _drag_preview_pixmap(
         self,
