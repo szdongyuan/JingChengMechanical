@@ -349,7 +349,15 @@ class FactoryConfigListWidget(QListWidget):
             if item is None or not item.flags() & Qt.ItemFlag.ItemIsDragEnabled:
                 continue
             indexes.append(index)
-        return indexes
+        if indexes:
+            return indexes
+
+        current_item = self.currentItem()
+        if current_item is None or not current_item.flags() & Qt.ItemFlag.ItemIsDragEnabled:
+            return []
+
+        current_index = self.indexFromItem(current_item)
+        return [current_index] if current_index.isValid() else []
 
     def _drag_preview_pixmap(
         self,

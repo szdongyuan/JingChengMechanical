@@ -192,6 +192,37 @@ def test_factory_config_list_start_drag_executes_move_only_with_row_preview(
     ]
 
 
+def test_factory_config_list_start_drag_uses_checked_current_item_without_selection(
+    qapp, monkeypatch
+):
+    widget = FactoryConfigListWidget()
+    widget.set_rows(
+        rows=[_row(101, "Config A"), _row(202, "Config B")],
+        enabled_config_ids=(101, 202),
+    )
+    _show_widget(widget, qapp)
+    dragged_item = widget.item(0)
+    widget.setCurrentItem(dragged_item)
+    widget.clearSelection()
+
+    drag_calls: list[_DragSpy] = []
+    monkeypatch.setattr(
+        factory_config_list,
+        "QDrag",
+        lambda source: drag_calls.append(_DragSpy(source)) or drag_calls[-1],
+    )
+
+    widget.startDrag(Qt.DropAction.CopyAction | Qt.DropAction.MoveAction)
+
+    row_widget = widget.itemWidget(dragged_item)
+    assert len(drag_calls) == 1
+    assert drag_calls[0].pixmap is not None
+    assert drag_calls[0].pixmap.size() == row_widget.size()
+    assert drag_calls[0].exec_calls == [
+        (Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
+    ]
+
+
 def test_factory_config_list_start_drag_ignores_current_unchecked_item_without_selection(
     qapp, monkeypatch
 ):
