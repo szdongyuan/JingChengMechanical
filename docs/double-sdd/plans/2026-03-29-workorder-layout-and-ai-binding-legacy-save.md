@@ -265,7 +265,8 @@ def test_save_binding_legacy_compatibility_does_not_mask_unrelated_insert_failur
     original_execute_sql = db.execute_sql
 
     def _raising_execute_sql(sql, params=None):
-        if "INSERT INTO test_config_ai_binding_table" in sql:
+        normalized_sql = str(sql).replace('"', "").replace("'", "").lower()
+        if "insert into test_config_ai_binding_table" in normalized_sql:
             raise RuntimeError("different failure")
         return original_execute_sql(sql, params)
 
