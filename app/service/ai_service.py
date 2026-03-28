@@ -84,6 +84,40 @@ class AiService:
 
     # ── Binding CRUD (for config UI) ────────────────────────
 
+    def _binding_table_has_legacy_offset_column(self, database) -> bool:
+        cursor = database.execute_sql("PRAGMA table_info(test_config_ai_binding_table)")
+        return any(row[1] == "analysis_window_offset_ms" for row in cursor.fetchall())
+
+    def _create_binding_with_legacy_offset(self, config_id: int, data: dict) -> int:
+        from consts.time_consts import now_str
+
+        database = TestConfigAiBindingTable._meta.database
+        cursor = database.execute_sql(
+            """
+            INSERT INTO test_config_ai_binding_table (
+                config_id,
+                enabled,
+                toolchain_id,
+                timeout_ms,
+                analysis_window_offset_ms,
+                params_json,
+                score_threshold,
+                updated_time
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                config_id,
+                data.get("enabled", False),
+                data.get("toolchain_id"),
+                data.get("timeout_ms"),
+                0,
+                data.get("params_json", "{}"),
+                data.get("score_threshold"),
+                now_str(),
+            ),
+        )
+        return cursor.lastrowid
+
     def save_binding(self, config_id: int, data: dict) -> int:
         """Create or update the AI binding for a test config.
         """
@@ -112,6 +146,8 @@ class AiService:
                 existing.save()
                 return existing.binding_id
             except DoesNotExist:
+                if self._binding_table_has_legacy_offset_column(database):
+                    return self._create_binding_with_legacy_offset(config_id, data)
                 row = TestConfigAiBindingTable.create(
                     config=config_id,
                     enabled=data.get("enabled", False),

@@ -262,15 +262,32 @@ def _make_real_controller_module(
 
 
 def _workorder_rendered_text(module: WorkOrderModule) -> str:
+    summary_label = getattr(module, "lbl_factory_summary", None)
     return "\n".join(
         (
             module.lbl_persistence_notice.text(),
             module.lbl_selection_status.text(),
             module.lbl_phase_summary.text(),
             module.lbl_trigger_summary.text(),
-            module.lbl_factory_summary.text(),
+            summary_label.text() if summary_label is not None else "",
         )
     )
+
+
+def test_workorder_module_uses_full_width_factory_config_section(qapp):
+    module, _ = _make_module()
+
+    assert module.lbl_factory_configs.text() == "工厂配置 Factory Configs"
+    assert hasattr(module, "ed_cfg") is False
+    assert module.form_layout.labelForField(module.config_selector) is None
+    assert module.factory_config_section.layout().indexOf(module.config_selector) >= 0
+
+
+def test_workorder_module_does_not_render_factory_summary_block(qapp):
+    module, _ = _make_module(saved_selected_ids=(303, 101))
+
+    assert hasattr(module, "lbl_factory_summary") is False
+    assert "Factory summary:" not in _workorder_rendered_text(module)
 
 
 def test_workorder_module_restores_saved_ids_prunes_missing_and_marks_invalid_selection(qapp):
@@ -293,7 +310,6 @@ def test_workorder_module_deduplicates_restored_saved_ids_before_syncing_control
 def test_workorder_module_only_renders_list_local_persistence_notice_not_controller_blockers(qapp):
     module, services = _make_module()
 
-    assert module.lbl_factory_summary.text() == "Factory summary: 未启用工厂配置。"
     assert "请至少启用一个配置" not in _workorder_rendered_text(module)
 
     services.bus.factory_state_changed.emit(
@@ -307,7 +323,6 @@ def test_workorder_module_only_renders_list_local_persistence_notice_not_control
         )
     )
 
-    assert module.lbl_factory_summary.text() == "Factory summary: 未启用工厂配置。"
     assert "请至少启用一个配置" not in _workorder_rendered_text(module)
 
     module, services = _make_module(saved_selected_ids=(303, 999, 101))

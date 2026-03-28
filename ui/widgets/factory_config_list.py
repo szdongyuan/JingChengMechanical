@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QDropEvent
+from PyQt6.QtGui import QCursor, QDrag, QDropEvent, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -254,6 +254,29 @@ class FactoryConfigListWidget(QListWidget):
         event.setDropAction(Qt.DropAction.MoveAction)
         event.accept()
 
+    def startDrag(self, supported_actions: Qt.DropAction) -> None:
+        indexes, dragged_item = self._drag_source()
+        if dragged_item is None:
+            return
+
+        mime_data = self.model().mimeData(indexes)
+        if mime_data is None:
+            return
+
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+
+        preview = self._drag_preview_pixmap(dragged_item)
+        if not preview.isNull():
+            drag.setPixmap(preview)
+            row_rect = self.visualItemRect(dragged_item)
+            if not row_rect.isNull():
+                drag.setHotSpot(self.viewport().mapFromGlobal(QCursor.pos()) - row_rect.topLeft())
+
+        if not supported_actions & Qt.DropAction.MoveAction:
+            return
+        drag.exec(Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
+
     def _normalize_enabled_order(
         self,
         enabled_config_ids: tuple[int, ...] | list[int],
@@ -314,15 +337,48 @@ class FactoryConfigListWidget(QListWidget):
                 return widget
         return None
 
+    def _selected_draggable_indexes(self) -> list:
+        indexes = []
+        for index in self.selectedIndexes():
+            if not index.isValid():
+                continue
+            item = self.itemFromIndex(index)
+            if item is None or not item.flags() & Qt.ItemFlag.ItemIsDragEnabled:
+                continue
+            indexes.append(index)
+        if indexes:
+            return indexes
+
+        current_item = self.currentItem()
+        if current_item is None or not current_item.flags() & Qt.ItemFlag.ItemIsDragEnabled:
+            return []
+
+        current_index = self.indexFromItem(current_item)
+        return [current_index] if current_index.isValid() else []
+
+    def _drag_preview_pixmap(
+        self,
+        item: QListWidgetItem | None = None,
+    ) -> QPixmap:
+        dragged_item = item or self._drag_source()[1]
+        if dragged_item is None:
+            return QPixmap()
+        row_widget = self.itemWidget(dragged_item)
+        if row_widget is None:
+            return QPixmap()
+        return row_widget.grab(row_widget.rect())
+
+    def _drag_source(self) -> tuple[list, QListWidgetItem | None]:
+        indexes = self._selected_draggable_indexes()
+        if not indexes:
+            return [], None
+        return indexes, self.itemFromIndex(indexes[0])
+
     def _dragged_config_id(self) -> int | None:
-        selected_items = self.selectedItems()
-        if not selected_items:
-            current_item = self.currentItem()
-            if current_item is not None:
-                selected_items = [current_item]
-        if not selected_items:
+        _, dragged_item = self._drag_source()
+        if dragged_item is None:
             return None
-        config_id = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        config_id = dragged_item.data(Qt.ItemDataRole.UserRole)
         return config_id if isinstance(config_id, int) else None
 
     def _drop_insertion_row(self, event: QDropEvent) -> int | None:
