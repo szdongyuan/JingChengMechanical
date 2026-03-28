@@ -127,6 +127,22 @@ def test_factory_config_list_visually_marks_top_checked_row_as_primary(qapp):
     assert "Primary" in widget.primary_row_badge_text()
 
 
+def test_factory_config_list_drag_preview_matches_current_row_widget_size(qapp):
+    widget = FactoryConfigListWidget()
+    widget.set_rows(
+        rows=[_row(101, "Config A"), _row(202, "Config B")],
+        enabled_config_ids=(101, 202),
+    )
+    _show_widget(widget, qapp)
+    widget.setCurrentItem(widget.item(0))
+
+    preview = widget._drag_preview_pixmap()
+    row_widget = widget.itemWidget(widget.item(0))
+
+    assert preview.width() == row_widget.size().width()
+    assert preview.height() == row_widget.size().height()
+
+
 def test_factory_config_list_drop_event_preserves_all_checked_configs_when_moving_to_top(
     qapp,
 ):
