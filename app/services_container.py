@@ -7,6 +7,7 @@ from app.service.ai_service import AiService
 from app.service.analysis.test_manager import TestManager
 from app.service.config_service import ConfigService
 from app.service.db_connection_service import DbConnectionService
+from app.service.factory_selection_settings import FactorySelectionSettings
 from app.service.hardwareselect_service import HardwareSelectService
 from app.service.input_calibration_service import InputCalibrationService
 
@@ -14,7 +15,6 @@ from app.service.input_calibration_service import InputCalibrationService
 @dataclass(frozen=True)
 class FactoryControllerState:
     selected_config_ids: tuple[int, ...] = ()
-    manual_primary_config_id: int | None = None
     active_config_id: int | None = None
     displayed_config_id: int | None = None
     run_phase: str = "not_ready"
@@ -29,6 +29,7 @@ class FactoryControllerState:
         "analyzing": "当前测试分析中",
         "reanalyzing": "当前正在重新分析",
     }
+    _START_READY_SELECTION_PHASES = frozenset({"idle", "not_ready", "armed", "reviewing"})
 
     def __post_init__(self):
         selection_ready = self.selection_ready
@@ -71,12 +72,8 @@ class FactoryControllerState:
 
     def _derive_selection_readiness(self) -> tuple[bool, str | None]:
         selected = tuple(self.selected_config_ids)
-        if len(selected) < 2 or len(set(selected)) < 2:
-            return False, "请选择两个不同配置"
-        if self.manual_primary_config_id not in selected:
-            return False, "请先选择手动主配置"
-        if self.run_phase == "not_ready":
-            return False, "工厂模式未就绪"
+        if not selected:
+            return False, "请至少启用一个配置"
         return True, None
 
     def _derive_start_readiness(
@@ -90,6 +87,8 @@ class FactoryControllerState:
             return False, blocked_phase_reason
         if not selection_ready:
             return False, selection_ready_reason
+        if self.run_phase in self._START_READY_SELECTION_PHASES:
+            return True, None
         if self.run_phase not in {"armed", "reviewing"}:
             return False, "工厂模式未就绪"
         return True, None
@@ -129,6 +128,12 @@ class FactoryPlcIngressPayload:
 @dataclass(frozen=True)
 class FactoryScanIngressPayload:
     scan_text: str
+
+
+@dataclass(frozen=True)
+class FactoryStartBlockedPayload:
+    reason: str
+    trigger_source: str
 
 
 @dataclass(frozen=True)
@@ -192,11 +197,14 @@ class EventBus(QObject):
     # ── Factory-mode ingress and controller contracts ──
     factory_plc_event = pyqtSignal(object)                  # FactoryPlcIngressPayload
     factory_scan_event = pyqtSignal(object)                 # FactoryScanIngressPayload
+    factory_start_blocked = pyqtSignal(object)              # FactoryStartBlockedPayload
+    factory_selection_notice = pyqtSignal(str)
     factory_runtime_start_accepted = pyqtSignal(object)     # FactoryRuntimeStartPayload
     factory_runtime_analyzing_entered = pyqtSignal(object)  # FactoryRuntimeConfigPayload
     factory_runtime_auto_analysis_succeeded = pyqtSignal(object)  # FactoryReviewPayload
     factory_runtime_auto_analysis_no_result = pyqtSignal(object)  # FactoryReviewPayload
     factory_runtime_auto_analysis_error = pyqtSignal(object)      # FactoryReviewPayload
+    factory_runtime_auto_analysis_cleanup_settled = pyqtSignal(object)  # FactoryRuntimeConfigPayload
     factory_runtime_aborted = pyqtSignal(object)                  # FactoryRuntimeAbortPayload
     factory_runtime_reanalysis_completed = pyqtSignal(object)     # FactoryReviewPayload
     factory_state_changed = pyqtSignal(object)              # FactoryControllerState
@@ -217,7 +225,7 @@ class ServiceContainer:
         self.db = DbConnectionService()
         self.db.connect()
 
-        # 设备服务（刷新/枚举/保存输入输出设备）
+        # 设备服务（刷新/枚举/保存输入监听设备）
         self.hss_service = HardwareSelectService()
 
         # 输入校准服务（后续扩展）
@@ -227,6 +235,7 @@ class ServiceContainer:
         self.config_service = ConfigService(self.bus)
 
         self.ai_service = AiService()
+        self.factory_selection_settings = FactorySelectionSettings()
 
         from app.service.factory_mode_controller import FactoryModeController
 

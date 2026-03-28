@@ -8,6 +8,7 @@ import inspect
 from unittest.mock import MagicMock
 
 import app.services_container as mod
+from app.service.factory_selection_settings import FactorySelectionSettings
 from app.service.analysis.test_manager import TestManager
 from app.services_container import EventBus
 
@@ -69,6 +70,8 @@ def test_factory_mode_signals_exist():
     for name in (
         "factory_plc_event",
         "factory_scan_event",
+        "factory_start_blocked",
+        "factory_selection_notice",
         "factory_runtime_start_accepted",
         "factory_runtime_analyzing_entered",
         "factory_runtime_auto_analysis_succeeded",
@@ -139,7 +142,6 @@ def test_factory_controller_state_contract_exposes_only_spec_fields():
     assert is_dataclass(state_cls)
     assert [field.name for field in fields(state_cls)] == [
         "selected_config_ids",
-        "manual_primary_config_id",
         "active_config_id",
         "displayed_config_id",
         "run_phase",
@@ -149,6 +151,47 @@ def test_factory_controller_state_contract_exposes_only_spec_fields():
         "start_ready",
         "start_ready_reason",
     ]
+
+
+def test_factory_controller_state_derives_readiness_from_ordered_selection_without_manual_primary():
+    ready_state = mod.FactoryControllerState(selected_config_ids=(101,), run_phase="armed")
+    blocked_state = mod.FactoryControllerState(selected_config_ids=(), run_phase="not_ready")
+    reviewing_state = mod.FactoryControllerState(selected_config_ids=(101, 202), run_phase="reviewing")
+    busy_state = mod.FactoryControllerState(selected_config_ids=(101,), run_phase="running")
+
+    assert ready_state.selection_ready is True
+    assert ready_state.selection_ready_reason is None
+    assert ready_state.start_ready is True
+    assert ready_state.start_ready_reason is None
+
+    assert blocked_state.selection_ready is False
+    assert blocked_state.selection_ready_reason == "请至少启用一个配置"
+    assert blocked_state.start_ready is False
+    assert blocked_state.start_ready_reason == "请至少启用一个配置"
+
+    assert reviewing_state.selection_ready is True
+    assert reviewing_state.start_ready is True
+    assert reviewing_state.start_ready_reason is None
+
+    assert busy_state.selection_ready is True
+    assert busy_state.start_ready is False
+    assert busy_state.start_ready_reason == "当前测试运行中"
+
+
+def test_factory_start_blocked_payload_contract_is_explicit():
+    payload_cls = getattr(mod, "FactoryStartBlockedPayload", None)
+
+    assert payload_cls is not None, "FactoryStartBlockedPayload is missing"
+    assert is_dataclass(payload_cls)
+    assert [field.name for field in fields(payload_cls)] == [
+        "reason",
+        "trigger_source",
+    ]
+
+    payload = payload_cls(reason="请至少启用一个配置", trigger_source="manual")
+
+    assert payload.reason == "请至少启用一个配置"
+    assert payload.trigger_source == "manual"
 
 
 def test_factory_review_payload_contract_is_explicit():
@@ -241,3 +284,15 @@ def test_service_container_owns_factory_mode_controller(monkeypatch):
     assert isinstance(services.factory_mode, controller_cls)
     assert services.factory_mode.bus is services.bus
     assert services.factory_mode.services is services
+
+
+def test_service_container_exposes_factory_selection_settings(monkeypatch):
+    monkeypatch.setattr(mod.DbConnectionService, "connect", lambda self: None)
+    monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "InputCalibrationService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "ConfigService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "AiService", MagicMock(return_value=MagicMock()))
+
+    services = mod.ServiceContainer()
+
+    assert isinstance(services.factory_selection_settings, FactorySelectionSettings)
