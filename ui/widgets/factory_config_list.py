@@ -229,29 +229,30 @@ class FactoryConfigListWidget(QListWidget):
             event.ignore()
             return
 
-        selected_items = self.selectedItems()
-        dragged_config_id = (
-            selected_items[0].data(Qt.ItemDataRole.UserRole) if selected_items else None
-        )
-        previous_enabled = tuple(self._enabled_order)
-        super().dropEvent(event)
-
-        if dragged_config_id not in previous_enabled:
-            self._rebuild()
+        dragged_config_id = self._dragged_config_id()
+        if dragged_config_id not in self._enabled_order:
+            event.ignore()
             return
 
-        current_visual_order = [
-            self.item(row_index).data(Qt.ItemDataRole.UserRole)
-            for row_index in range(self.count())
-        ]
-        enabled_ids = set(previous_enabled)
-        next_enabled = tuple(
-            config_id for config_id in current_visual_order if config_id in enabled_ids
+        insertion_row = self._drop_insertion_row(event)
+        if insertion_row is None:
+            event.ignore()
+            return
+
+        before_config_id = self._before_config_id_for_insertion_row(
+            dragged_config_id,
+            insertion_row,
         )
-        self._enabled_order = list(next_enabled)
-        self._rebuild()
-        if next_enabled != previous_enabled:
+        previous_enabled = tuple(self._enabled_order)
+        self.move_checked_config(
+            dragged_config_id,
+            before_config_id=before_config_id,
+            emit_signal=False,
+        )
+        if tuple(self._enabled_order) != previous_enabled:
             self.enabled_order_changed.emit(tuple(self._enabled_order))
+        event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
 
     def _normalize_enabled_order(
         self,
@@ -311,4 +312,59 @@ class FactoryConfigListWidget(QListWidget):
             widget = self.itemWidget(item)
             if isinstance(widget, _FactoryConfigRowWidget):
                 return widget
+        return None
+
+    def _dragged_config_id(self) -> int | None:
+        selected_items = self.selectedItems()
+        if not selected_items:
+            current_item = self.currentItem()
+            if current_item is not None:
+                selected_items = [current_item]
+        if not selected_items:
+            return None
+        config_id = selected_items[0].data(Qt.ItemDataRole.UserRole)
+        return config_id if isinstance(config_id, int) else None
+
+    def _drop_insertion_row(self, event: QDropEvent) -> int | None:
+        position = self._drop_position(event)
+        if position is None:
+            return None
+        for row_index in range(self.count()):
+            item = self.item(row_index)
+            if position.y() < self.visualItemRect(item).center().y():
+                return row_index
+        return self.count()
+
+    def _drop_position(self, event: QDropEvent):
+        position = getattr(event, "position", None)
+        if callable(position):
+            point = position()
+            to_point = getattr(point, "toPoint", None)
+            return to_point() if callable(to_point) else point
+        pos = getattr(event, "pos", None)
+        if callable(pos):
+            return pos()
+        return None
+
+    def _before_config_id_for_insertion_row(
+        self,
+        dragged_config_id: int,
+        insertion_row: int,
+    ) -> int | None:
+        visual_order = list(self.visual_config_order())
+        if dragged_config_id not in visual_order:
+            return None
+        dragged_row = visual_order.index(dragged_config_id)
+        visual_without_dragged = [
+            config_id for config_id in visual_order if config_id != dragged_config_id
+        ]
+        if insertion_row > dragged_row:
+            insertion_row -= 1
+        insertion_row = max(0, min(insertion_row, len(visual_without_dragged)))
+
+        enabled_without_dragged = set(self._enabled_order)
+        enabled_without_dragged.discard(dragged_config_id)
+        for config_id in visual_without_dragged[insertion_row:]:
+            if config_id in enabled_without_dragged:
+                return config_id
         return None
