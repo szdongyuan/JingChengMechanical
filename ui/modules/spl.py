@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QLabel, QStackedLayout, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 from app.services_container import FactoryControllerState, FactoryReviewPayload
 from ui.widgets.analysis_charts import LineChartWidget
@@ -32,17 +31,8 @@ class SplModule(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
 
-        self.stack = QStackedLayout()
-        self.stack.setContentsMargins(0, 0, 0, 0)
-        lay.addLayout(self.stack, 1)
-
-        self.empty_state = QLabel("No data")
-        self.empty_state.setObjectName("ChartEmptyState")
-        self.empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.stack.addWidget(self.empty_state)
-
         self.plot = LineChartWidget()
-        self.stack.addWidget(self.plot)
+        lay.addWidget(self.plot, 1)
 
         if hasattr(self.services.bus, "factory_state_changed"):
             self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
@@ -124,12 +114,11 @@ class SplModule(QWidget):
 
         self._has_plot_data = True
         self._rendered_channel_index = channel_index
-        self.stack.setCurrentWidget(self.plot)
 
     def _clear_plot(self) -> None:
         self._has_plot_data = False
         self._rendered_channel_index = None
-        self.stack.setCurrentWidget(self.empty_state)
+        self.plot.clear_data()
 
     def _can_render_committed_chart(self) -> bool:
         return (

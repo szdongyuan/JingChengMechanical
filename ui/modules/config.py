@@ -229,7 +229,7 @@ class ConfigModule(QWidget):
 
         self.combo_output_dev = _NoWheelComboBox()
         self.combo_output_dev.setStyleSheet(combo_qss)
-        hw_lay.addRow("输出设备", self.combo_output_dev)
+        hw_lay.addRow("监听设备", self.combo_output_dev)
 
         self._channel_check_container = QWidget()
         self._channel_check_layout = QGridLayout(self._channel_check_container)

@@ -75,7 +75,7 @@ class HardwareModule(QWidget):
         self.combobox_input.setStyleSheet(combo_qss)
         self.combobox_output.setStyleSheet(combo_qss)
         sel_lay.addRow("输入设备", self.combobox_input)
-        sel_lay.addRow("输出设备", self.combobox_output)
+        sel_lay.addRow("监听设备", self.combobox_output)
         lay.addWidget(sel)
 
         self.table = QTableWidget()
@@ -92,7 +92,7 @@ class HardwareModule(QWidget):
         lay.addWidget(self.table, 1)
 
     def _load_saved(self):
-        # 从“硬件服务”（DB）读取上次保存的输入/输出设备信息，并显示在顶部“当前保存”标签里
+        # 从“硬件服务”（DB）读取上次保存的输入/监听设备信息，并显示在顶部“当前保存”标签里
         try:
             device_info = self.services.hss_service.load_io_devices()
         except Exception as e:
@@ -149,7 +149,7 @@ class HardwareModule(QWidget):
 
         self.combobox_output.clear()
         self.combobox_input.clear()
-        self.combobox_output.addItem("请选择输出设备", None)
+        self.combobox_output.addItem("请选择监听设备", None)
         self.combobox_input.addItem("请选择输入设备", None)
         self.combobox_output.model().item(0).setEnabled(False)
         self.combobox_input.model().item(0).setEnabled(False)
@@ -235,13 +235,13 @@ class HardwareModule(QWidget):
             or self.combobox_output.currentData() is None
         )
         self.btn_save.setEnabled(True)
-        self.btn_save.setToolTip("请先选择输入设备和输出设备。") if missing else self.btn_save.setToolTip("")
+        self.btn_save.setToolTip("请先选择输入设备和监听设备。") if missing else self.btn_save.setToolTip("")
 
     def save_selected(self):
         in_id = self.combobox_input.currentData()
         out_id = self.combobox_output.currentData()
         if in_id is None or out_id is None:
-            QMessageBox.warning(self, "提示", "请先选择输入设备和输出设备。")
+            QMessageBox.warning(self, "提示", "请先选择输入设备和监听设备。")
             return
 
         try:
@@ -259,7 +259,7 @@ class HardwareModule(QWidget):
                 f"OUT {out_dev.get('id')} | {out_dev.get('name')}"
             )
             self.services.bus.status.emit("硬件设备已保存")
-            QMessageBox.information(self, "保存成功", "输入/输出设备保存成功！")
+            QMessageBox.information(self, "保存成功", "输入/监听设备保存成功！")
             self.services.bus.refresh_channels.emit()
         except Exception as e:
             self.services.bus.log.emit(f"[Hardware] 保存失败: {e}")

@@ -191,9 +191,14 @@ class FactoryModeController(QObject):
         self._refresh_selection_now(emit_state=emit_state)
 
     def can_arm(self) -> bool:
+        previous_state = self._state
         if self._state.run_phase not in self._BLOCKED_START_PHASES and not self._start_feedback_is_busy():
             self._apply_deferred_selection_refresh()
-        self._state = self._state_with_readiness(self._state)
+        next_state = self._state_with_readiness(self._state)
+        if next_state != self._state:
+            self._state = next_state
+        if self._state != previous_state:
+            self._emit_state()
         return self._state.start_ready
 
     def start_manual(self, workorder: dict | None = None) -> bool:

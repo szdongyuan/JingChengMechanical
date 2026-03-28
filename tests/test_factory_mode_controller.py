@@ -961,6 +961,34 @@ def test_blocked_manual_start_emits_factory_start_blocked_reason():
     assert blocked_payloads[0].trigger_source == "manual"
 
 
+def test_blocked_manual_start_emits_updated_state_before_blocked_feedback_when_readiness_changes():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    events: list[tuple[str, str | None]] = []
+    services = _make_services((_make_config(101),))
+    controller = controller_mod.FactoryModeController(bus, services)
+    bus.factory_state_changed.connect(
+        lambda state: events.append(("state", state.start_ready_reason))
+    )
+    bus.factory_start_blocked.connect(
+        lambda payload: events.append(("blocked", payload.reason))
+    )
+    controller.set_selection((101,))
+    events.clear()
+    services.config_service.validate_factory_runtime.side_effect = (
+        lambda config: ["analysis window invalid"]
+    )
+
+    assert controller.start_manual({"sn": "SN-1"}) is False
+
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "analysis window invalid"
+    assert events == [
+        ("state", "analysis window invalid"),
+        ("blocked", "analysis window invalid"),
+    ]
+
+
 def test_blocked_plc_and_scan_start_emit_factory_start_blocked_while_idle():
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()

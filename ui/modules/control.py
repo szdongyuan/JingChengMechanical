@@ -1,18 +1,29 @@
 from __future__ import annotations
 
-from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.services_container import FactoryControllerState
 
 
 class ControlModule(QWidget):
     module_id = "control"
+    _BUSY_RUN_PHASES = frozenset({"running", "analyzing", "reanalyzing"})
+    _REVIEW_CLEANUP_BUSY_REASON = "当前测试运行中"
+    _PENDING_START_REASON = "启动请求处理中"
 
     def __init__(self, services):
         super().__init__()
         self.services = services
         self._workorder = dict(getattr(self.services.bus, "current_workorder_payload", {}) or {})
         self._factory_state = getattr(services.factory_mode, "state", FactoryControllerState())
+        self._blocked_start_dialog = None
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -43,6 +54,8 @@ class ControlModule(QWidget):
         self.services.bus.workorder_changed.connect(self._on_workorder)
         if hasattr(self.services.bus, "factory_state_changed"):
             self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
+        if hasattr(self.services.bus, "factory_start_blocked"):
+            self.services.bus.factory_start_blocked.connect(self._on_factory_start_blocked)
         self.btn_start.clicked.connect(self._start)
         self.btn_stop.clicked.connect(self._stop)
         self.btn_pass.clicked.connect(lambda: self.services.bus.log.emit("Manual judgment: PASS"))
@@ -57,6 +70,16 @@ class ControlModule(QWidget):
         if isinstance(state, FactoryControllerState):
             self._factory_state = state
             self._sync_start_state()
+            self._sync_blocked_start_dialog()
+
+    def _on_factory_start_blocked(self, payload) -> None:
+        reason = getattr(payload, "reason", None)
+        if not isinstance(reason, str):
+            return
+        reason = reason.strip()
+        if not reason:
+            return
+        self._show_or_update_blocked_start_dialog(reason)
 
     def _start(self):
         if not self.btn_start.isEnabled():
@@ -73,11 +96,100 @@ class ControlModule(QWidget):
             stop_active_run()
 
     def _sync_start_state(self) -> None:
-        can_start = bool(self._factory_state.start_ready)
-        reason = self._factory_state.start_ready_reason or "工厂模式未就绪"
-        self.btn_start.setEnabled(can_start)
-        self.lbl_start_reason.setText("" if can_start else f"Start blocked: {reason}")
+        reason = self._effective_start_reason()
+        self.btn_start.setEnabled(not self._start_click_disabled())
+        self.lbl_start_reason.setText(reason)
 
     def _start_disabled_reason(self) -> str | None:
+        if not self._start_click_disabled():
+            return None
         return self._factory_state.start_ready_reason
+
+    def _start_click_disabled(self) -> bool:
+        return (
+            self._factory_state.run_phase in self._BUSY_RUN_PHASES
+            or self._factory_state.start_ready_reason == self._REVIEW_CLEANUP_BUSY_REASON
+            or self._factory_state.start_ready_reason == self._PENDING_START_REASON
+        )
+
+    def _current_idle_blocking_reason(self) -> str | None:
+        if self._start_click_disabled():
+            return None
+        if self._factory_state.start_ready:
+            return None
+        return self._factory_state.start_ready_reason
+
+    def _effective_start_reason(self) -> str:
+        idle_blocking_reason = self._current_idle_blocking_reason()
+        if idle_blocking_reason:
+            return idle_blocking_reason
+        return self._factory_state.start_ready_reason or ""
+
+    def _sync_blocked_start_dialog(self) -> None:
+        if self._blocked_start_dialog is None:
+            return
+        reason = self._current_idle_blocking_reason()
+        if not reason:
+            self._close_blocked_start_dialog()
+            return
+        self._update_blocked_start_dialog(reason)
+
+    def _show_or_update_blocked_start_dialog(self, reason: str) -> None:
+        if self._blocked_start_dialog is None:
+            dialog = self._create_blocked_start_dialog()
+            self._configure_blocked_start_dialog(dialog)
+            self._blocked_start_dialog = dialog
+            self._connect_blocked_start_dialog(dialog)
+            self._update_blocked_start_dialog(reason)
+            open_dialog = getattr(dialog, "open", None)
+            if callable(open_dialog):
+                open_dialog()
+            return
+        self._update_blocked_start_dialog(reason)
+
+    def _create_blocked_start_dialog(self):
+        return QMessageBox(self)
+
+    def _configure_blocked_start_dialog(self, dialog) -> None:
+        set_window_title = getattr(dialog, "setWindowTitle", None)
+        if callable(set_window_title):
+            set_window_title("自动开始已阻止")
+        set_icon = getattr(dialog, "setIcon", None)
+        if callable(set_icon):
+            set_icon(QMessageBox.Icon.Warning)
+        set_standard_buttons = getattr(dialog, "setStandardButtons", None)
+        if callable(set_standard_buttons):
+            set_standard_buttons(QMessageBox.StandardButton.Ok)
+
+    def _connect_blocked_start_dialog(self, dialog) -> None:
+        finished_signal = getattr(dialog, "finished", None)
+        connect = getattr(finished_signal, "connect", None)
+        if callable(connect):
+            connect(self._on_blocked_start_dialog_finished)
+
+    def _update_blocked_start_dialog(self, reason: str) -> None:
+        dialog = self._blocked_start_dialog
+        if dialog is None:
+            return
+        set_text = getattr(dialog, "setText", None)
+        if callable(set_text):
+            set_text(reason)
+        raise_dialog = getattr(dialog, "raise_", None)
+        if callable(raise_dialog):
+            raise_dialog()
+        activate_window = getattr(dialog, "activateWindow", None)
+        if callable(activate_window):
+            activate_window()
+
+    def _close_blocked_start_dialog(self) -> None:
+        dialog = self._blocked_start_dialog
+        self._blocked_start_dialog = None
+        if dialog is None:
+            return
+        close_dialog = getattr(dialog, "close", None)
+        if callable(close_dialog):
+            close_dialog()
+
+    def _on_blocked_start_dialog_finished(self, *_args) -> None:
+        self._blocked_start_dialog = None
 

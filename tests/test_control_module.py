@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import os
-from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -11,8 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
-from app.services_container import FactoryControllerState
-from app.service.factory_mode_controller import FactoryModeController
+from app.services_container import FactoryControllerState, FactoryStartBlockedPayload
 from ui.modules.control import ControlModule
 from ui.modules.workorder import WorkOrderModule
 
@@ -35,36 +33,28 @@ class _BusStub:
     def __init__(self):
         self.workorder_changed = _SignalStub()
         self.config_changed = _SignalStub()
-        self.factory_plc_event = _SignalStub()
-        self.factory_scan_event = _SignalStub()
-        self.factory_runtime_start_accepted = _SignalStub()
-        self.factory_runtime_analyzing_entered = _SignalStub()
-        self.factory_runtime_auto_analysis_succeeded = _SignalStub()
-        self.factory_runtime_auto_analysis_no_result = _SignalStub()
-        self.factory_runtime_auto_analysis_error = _SignalStub()
-        self.factory_runtime_aborted = _SignalStub()
-        self.factory_runtime_reanalysis_completed = _SignalStub()
         self.factory_state_changed = _SignalStub()
-        self.factory_review_changed = _SignalStub()
-        self.factory_display_reset = _SignalStub()
+        self.factory_start_blocked = _SignalStub()
+        self.factory_selection_notice = _SignalStub()
         self.log = _SignalStub()
+        self.current_workorder_payload = {}
 
 
 class _ConfigServiceStub:
-    def __init__(self, runtime_errors_by_id: dict[int, list[str]] | None = None):
-        self._runtime_errors_by_id = runtime_errors_by_id or {}
-        self._configs = {
-            101: {
+    def __init__(self):
+        self._configs = [
+            {
                 "config_id": 101,
                 "config_name": "Config Alpha",
                 "analysis_window_offset_ms": 0,
                 "analysis_duration": 2.0,
                 "record_duration": 5.0,
-                "plc_device_key": None,
-                "plc_device_label": None,
-                "selected_channels": [0],
+                "plc_device_key": "plc-a",
+                "plc_device_label": "PLC A",
+                "scan_triggers_test": False,
+                "selected_channels": [0, 1],
             },
-            202: {
+            {
                 "config_id": 202,
                 "config_name": "Config Beta",
                 "analysis_window_offset_ms": 0,
@@ -72,8 +62,13 @@ class _ConfigServiceStub:
                 "record_duration": 5.0,
                 "plc_device_key": None,
                 "plc_device_label": None,
+                "scan_triggers_test": True,
                 "selected_channels": [1],
             },
+        ]
+        self._details = {
+            config["config_id"]: dict(config)
+            for config in self._configs
         }
 
     def list_configs(self):
@@ -82,17 +77,23 @@ class _ConfigServiceStub:
                 "config_id": config["config_id"],
                 "config_name": config["config_name"],
             }
-            for config in self._configs.values()
+            for config in self._configs
         ]
 
     def load_config(self, config_id: int):
-        return dict(self._configs[config_id])
+        return dict(self._details[config_id])
 
-    def validate_factory_runtime(self, config: dict) -> list[str]:
-        return list(self._runtime_errors_by_id.get(config["config_id"], []))
 
-    def set_runtime_errors(self, config_id: int, errors: list[str]) -> None:
-        self._runtime_errors_by_id[config_id] = list(errors)
+class _FactorySelectionSettingsStub:
+    def __init__(self, saved_selected_ids: tuple[int, ...] = ()):
+        self._saved_selected_ids = tuple(saved_selected_ids)
+
+    def load_selected_config_ids(self) -> tuple[int, ...]:
+        return self._saved_selected_ids
+
+    def save_selected_config_ids(self, config_ids: tuple[int, ...]) -> str | None:
+        self._saved_selected_ids = tuple(config_ids)
+        return None
 
 
 class _FactoryModeStub:
@@ -102,28 +103,73 @@ class _FactoryModeStub:
         self.start_manual = MagicMock(return_value=True)
         self.stop_active_run = MagicMock(return_value=True)
 
-    def can_arm(self) -> bool:
-        return self.state.is_ready
-
-    def set_selection(
+    def restore_selection(
         self,
         selected_config_ids: tuple[int, ...] | list[int],
-        manual_primary_config_id: int | None = None,
+        *,
+        had_missing_configs: bool,
     ):
+        selected = tuple(selected_config_ids)
+        reason = "配置已失效" if had_missing_configs else None
+        self.state = FactoryControllerState(
+            selected_config_ids=selected,
+            run_phase="armed" if selected and reason is None else "not_ready",
+            selection_ready=(reason is None and bool(selected)),
+            selection_ready_reason=reason,
+            start_ready=(reason is None and bool(selected)),
+            start_ready_reason=reason,
+        )
+        return self.state
+
+    def set_selection(self, selected_config_ids: tuple[int, ...] | list[int]):
         selected = tuple(selected_config_ids)
         self.state = FactoryControllerState(
             selected_config_ids=selected,
-            manual_primary_config_id=manual_primary_config_id,
-            run_phase=(
-                "armed"
-                if len(selected) == 2
-                and len(set(selected)) == 2
-                and manual_primary_config_id in selected
-                else "not_ready"
-            ),
+            run_phase="armed" if selected else "not_ready",
         )
-        self._bus.factory_state_changed.emit(self.state)
         return self.state
+
+
+class _MessageBoxSpy:
+    def __init__(self):
+        self.open_count = 0
+        self.close_count = 0
+        self.latest_text = ""
+        self.latest_title = ""
+        self.was_closed = False
+        self.dialog = _FakeMessageBox(self)
+
+
+class _FakeMessageBox:
+    def __init__(self, recorder: _MessageBoxSpy):
+        self._recorder = recorder
+        self.finished = _SignalStub()
+
+    def setWindowTitle(self, title: str) -> None:
+        self._recorder.latest_title = title
+
+    def setText(self, text: str) -> None:
+        self._recorder.latest_text = text
+
+    def setIcon(self, _icon) -> None:
+        return None
+
+    def setStandardButtons(self, _buttons) -> None:
+        return None
+
+    def open(self) -> None:
+        self._recorder.open_count += 1
+
+    def close(self) -> None:
+        self._recorder.close_count += 1
+        self._recorder.was_closed = True
+        self.finished.emit(0)
+
+    def raise_(self) -> None:
+        return None
+
+    def activateWindow(self) -> None:
+        return None
 
 
 @pytest.fixture(scope="session")
@@ -134,102 +180,65 @@ def qapp():
     return app
 
 
+def _idle_blocked_state(
+    reason: str,
+    *,
+    selected_config_ids: tuple[int, ...] = (101,),
+) -> FactoryControllerState:
+    return FactoryControllerState(
+        selected_config_ids=selected_config_ids,
+        run_phase="not_ready",
+        selection_ready=False,
+        selection_ready_reason=reason,
+        start_ready=False,
+        start_ready_reason=reason,
+    )
+
+
 def _make_module(
     *,
     initial_state: FactoryControllerState | None = None,
-    runtime_errors_by_id: dict[int, list[str]] | None = None,
 ):
     bus = _BusStub()
-    factory_mode = _FactoryModeStub(bus, initial_state)
     services = SimpleNamespace(
         bus=bus,
-        factory_mode=factory_mode,
-        config_service=_ConfigServiceStub(runtime_errors_by_id),
-        test=SimpleNamespace(
-            start=MagicMock(return_value=True),
-            stop=MagicMock(return_value=True),
-        ),
+        config_service=_ConfigServiceStub(),
+        factory_selection_settings=_FactorySelectionSettingsStub(),
+        factory_mode=_FactoryModeStub(bus, initial_state),
     )
     return ControlModule(services), services
 
 
-def _make_shared_modules(*, initial_state: FactoryControllerState | None = None):
+def _make_shared_modules(
+    *,
+    initial_state: FactoryControllerState | None = None,
+):
     bus = _BusStub()
-    factory_mode = _FactoryModeStub(bus, initial_state)
     services = SimpleNamespace(
         bus=bus,
-        factory_mode=factory_mode,
         config_service=_ConfigServiceStub(),
-        test=SimpleNamespace(
-            start=MagicMock(return_value=True),
-            stop=MagicMock(return_value=True),
-        ),
+        factory_selection_settings=_FactorySelectionSettingsStub(),
+        factory_mode=_FactoryModeStub(bus, initial_state),
     )
     return WorkOrderModule(services), ControlModule(services), services
 
 
-def _make_real_factory_modules():
-    bus = _BusStub()
-    config_service = _ConfigServiceStub()
-    services = SimpleNamespace(
-        bus=bus,
-        config_service=config_service,
-        test=SimpleNamespace(
-            start=MagicMock(return_value=True),
-            stop=MagicMock(return_value=True),
-            is_running=MagicMock(return_value=False),
-            cancel_pending_start=MagicMock(return_value=True),
-        ),
-    )
-    services.factory_mode = FactoryModeController(bus, services)
-    return WorkOrderModule(services), ControlModule(services), services
+def _make_module_with_message_box_spy(
+    monkeypatch,
+    *,
+    initial_state: FactoryControllerState | None = None,
+):
+    module, services = _make_module(initial_state=initial_state)
+    recorder = _MessageBoxSpy()
+    monkeypatch.setattr(module, "_create_blocked_start_dialog", lambda: recorder.dialog)
+    return module, services, recorder
 
 
-def _promote_controller_to_reviewing(services, *, displayed_config_id: int, trigger_source: str):
-    controller = services.factory_mode
-    controller._state = replace(
-        controller.state,
-        displayed_config_id=displayed_config_id,
-        run_phase="reviewing",
-        trigger_source=trigger_source,
-    )
-    services.bus.factory_state_changed.emit(controller.state)
-
-
-def _set_combo_to_data(combo, data):
-    index = combo.findData(data)
-    assert index != -1
-    combo.setCurrentIndex(index)
-
-
-def test_start_delegates_to_factory_mode_controller_not_test_manager(qapp):
-    module, services = _make_module(
-        initial_state=FactoryControllerState(
-            selected_config_ids=(101, 202),
-            manual_primary_config_id=101,
-            run_phase="armed",
-        )
-    )
-    workorder = {
-        "sn": "SN-42",
-        "model": "MODEL-X",
-        "selected_config_ids": (101, 202),
-        "manual_primary_config_id": 101,
-    }
-    services.bus.workorder_changed.emit(workorder)
-
-    module.btn_start.click()
-
-    services.factory_mode.start_manual.assert_called_once_with(workorder)
-    services.test.start.assert_not_called()
-
-
-def test_start_uses_live_workorder_metadata_without_prior_apply(qapp):
+def test_start_uses_live_workorder_payload_from_current_workorder_module(qapp):
     workorder_module, control_module, services = _make_shared_modules()
 
-    _set_combo_to_data(workorder_module.combo_config_a, 101)
-    _set_combo_to_data(workorder_module.combo_config_b, 202)
-    _set_combo_to_data(workorder_module.combo_primary, 101)
+    workorder_module.config_selector.set_checked(101, True)
+    workorder_module.config_selector.set_checked(202, True)
     workorder_module.ed_sn.setText("SN-LIVE")
     workorder_module.ed_model.setText("MODEL-LIVE")
 
@@ -240,177 +249,178 @@ def test_start_uses_live_workorder_metadata_without_prior_apply(qapp):
             "sn": "SN-LIVE",
             "model": "MODEL-LIVE",
             "selected_config_ids": (101, 202),
-            "manual_primary_config_id": 101,
         }
     )
-
-
-def test_prearmed_page_construction_seeds_structured_workorder_before_first_start(qapp):
-    _, control_module, services = _make_shared_modules(
-        initial_state=FactoryControllerState(
-            selected_config_ids=(101, 202),
-            manual_primary_config_id=202,
-            run_phase="armed",
-        )
-    )
-
-    assert control_module.btn_start.isEnabled() is True
-
-    control_module.btn_start.click()
-
-    services.factory_mode.start_manual.assert_called_once_with(
-        {
-            "sn": "",
-            "model": "",
-            "selected_config_ids": (101, 202),
-            "manual_primary_config_id": 202,
-        }
-    )
-
-
-def test_start_uses_latest_workorder_metadata_after_editing_post_apply(qapp):
-    workorder_module, control_module, services = _make_shared_modules()
-
-    _set_combo_to_data(workorder_module.combo_config_a, 101)
-    _set_combo_to_data(workorder_module.combo_config_b, 202)
-    _set_combo_to_data(workorder_module.combo_primary, 101)
-    workorder_module.ed_sn.setText("SN-OLD")
-    workorder_module.ed_model.setText("MODEL-OLD")
-    workorder_module.apply()
-    workorder_module.ed_sn.setText("SN-NEW")
-    workorder_module.ed_model.setText("MODEL-NEW")
-
-    control_module.btn_start.click()
-
-    services.factory_mode.start_manual.assert_called_once_with(
-        {
-            "sn": "SN-NEW",
-            "model": "MODEL-NEW",
-            "selected_config_ids": (101, 202),
-            "manual_primary_config_id": 101,
-        }
-    )
-
-
-def test_pending_start_disables_start_button_until_runtime_acceptance(qapp):
-    workorder_module, control_module, services = _make_real_factory_modules()
-
-    _set_combo_to_data(workorder_module.combo_config_a, 101)
-    _set_combo_to_data(workorder_module.combo_config_b, 202)
-    _set_combo_to_data(workorder_module.combo_primary, 101)
-    workorder_module.ed_sn.setText("SN-PENDING")
-
-    assert control_module.btn_start.isEnabled() is True
-
-    control_module.btn_start.click()
-
-    services.test.start.assert_called_once()
-    assert control_module.btn_start.isEnabled() is False
-    assert "启动请求处理中" in control_module.lbl_start_reason.text()
-
-
-def test_stop_delegates_to_factory_mode_controller_stop_flow(qapp):
-    module, services = _make_module(
-        initial_state=FactoryControllerState(
-            selected_config_ids=(101, 202),
-            manual_primary_config_id=101,
-            active_config_id=101,
-            displayed_config_id=101,
-            run_phase="running",
-            trigger_source="manual",
-        )
-    )
-
-    module.btn_stop.click()
-
-    services.factory_mode.stop_active_run.assert_called_once_with()
-    services.test.stop.assert_not_called()
-
-
-def test_start_is_disabled_when_factory_mode_is_not_ready(qapp):
-    module, _ = _make_module(initial_state=FactoryControllerState())
-
-    assert module.btn_start.isEnabled() is False
-    assert "请选择两个不同配置" in module.lbl_start_reason.text()
-
-
-def test_start_is_disabled_when_manual_primary_is_missing(qapp):
-    module, _ = _make_module(
-        initial_state=FactoryControllerState(
-            selected_config_ids=(101, 202),
-            manual_primary_config_id=None,
-            run_phase="not_ready",
-        )
-    )
-
-    assert module.btn_start.isEnabled() is False
-    assert "主配置" in module.lbl_start_reason.text()
-
-
-def test_start_is_disabled_when_runtime_validation_fails(qapp):
-    module, _ = _make_module(
-        initial_state=FactoryControllerState(
-            selected_config_ids=(101, 202),
-            manual_primary_config_id=101,
-            run_phase="not_ready",
-            selection_ready=False,
-            selection_ready_reason="分析窗起始偏移加分析时长不能超过录音时长",
-            start_ready=False,
-            start_ready_reason="分析窗起始偏移加分析时长不能超过录音时长",
-        ),
-        runtime_errors_by_id={202: ["分析窗起始偏移加分析时长不能超过录音时长"]},
-    )
-
-    assert module.btn_start.isEnabled() is False
-    assert "分析窗起始偏移加分析时长不能超过录音时长" in module.lbl_start_reason.text()
-
-
-def test_same_id_config_refresh_disables_start_after_runtime_validation_changes_in_reviewing(qapp):
-    workorder_module, control_module, services = _make_real_factory_modules()
-
-    _set_combo_to_data(workorder_module.combo_config_a, 101)
-    _set_combo_to_data(workorder_module.combo_config_b, 202)
-    _set_combo_to_data(workorder_module.combo_primary, 101)
-    _promote_controller_to_reviewing(
-        services,
-        displayed_config_id=101,
-        trigger_source="manual",
-    )
-
-    assert control_module.btn_start.isEnabled() is True
-
-    services.config_service.set_runtime_errors(
-        202,
-        ["分析窗起始偏移加分析时长不能超过录音时长"],
-    )
-    services.bus.config_changed.emit()
-
-    assert control_module.btn_start.isEnabled() is False
-    assert "分析窗起始偏移加分析时长不能超过录音时长" in control_module.lbl_start_reason.text()
-    assert "已就绪" not in workorder_module.lbl_selection_status.text()
-    assert "分析窗起始偏移加分析时长不能超过录音时长" in workorder_module.lbl_selection_status.text()
-    assert "reviewing" in workorder_module.lbl_phase_summary.text().lower()
 
 
 @pytest.mark.parametrize(
-    ("run_phase", "reason_fragment"),
+    ("state", "reason"),
     [
-        ("running", "运行中"),
-        ("analyzing", "分析中"),
-        ("reanalyzing", "重新分析"),
+        (_idle_blocked_state("配置已失效"), "配置已失效"),
+        (_idle_blocked_state("配置加载失败"), "配置加载失败"),
+        (_idle_blocked_state("请至少启用一个配置", selected_config_ids=()), "请至少启用一个配置"),
+        (_idle_blocked_state("analysis window invalid"), "analysis window invalid"),
     ],
 )
-def test_start_is_disabled_during_blocking_factory_phases(qapp, run_phase, reason_fragment):
-    module, _ = _make_module(
+def test_start_button_stays_enabled_for_idle_blocking_reasons_and_click_attempts_manual_start(
+    qapp,
+    state,
+    reason,
+):
+    module, services = _make_module(initial_state=state)
+
+    assert module.btn_start.isEnabled() is True
+    assert module.lbl_start_reason.text() == reason
+
+    module.btn_start.click()
+
+    services.factory_mode.start_manual.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    ("state", "reason"),
+    [
+        (FactoryControllerState(selected_config_ids=(101,), run_phase="running"), "当前测试运行中"),
+        (FactoryControllerState(selected_config_ids=(101,), run_phase="analyzing"), "当前测试分析中"),
+        (FactoryControllerState(selected_config_ids=(101,), run_phase="reanalyzing"), "当前正在重新分析"),
+        (
+            FactoryControllerState(
+                selected_config_ids=(101,),
+                run_phase="armed",
+                selection_ready=True,
+                start_ready=False,
+                start_ready_reason="启动请求处理中",
+            ),
+            "启动请求处理中",
+        ),
+    ],
+)
+def test_start_button_is_disabled_only_for_busy_or_pending_states(qapp, state, reason):
+    module, _ = _make_module(initial_state=state)
+
+    assert module.btn_start.isEnabled() is False
+    assert module.lbl_start_reason.text() == reason
+
+
+def test_start_button_is_disabled_for_review_cleanup_busy_state(qapp):
+    module, services = _make_module(
         initial_state=FactoryControllerState(
-            selected_config_ids=(101, 202),
-            manual_primary_config_id=101,
-            active_config_id=101,
-            displayed_config_id=101,
-            run_phase=run_phase,
-            trigger_source="manual",
+            selected_config_ids=(101,),
+            run_phase="reviewing",
+            selection_ready=True,
+            start_ready=False,
+            start_ready_reason="当前测试运行中",
         )
     )
 
     assert module.btn_start.isEnabled() is False
-    assert reason_fragment in module.lbl_start_reason.text()
+    assert module.lbl_start_reason.text() == "当前测试运行中"
+
+    module.btn_start.click()
+
+    services.factory_mode.start_manual.assert_not_called()
+
+
+def test_start_button_is_disabled_for_controller_owned_busy_reason_in_armed_state(qapp):
+    module, services = _make_module(
+        initial_state=FactoryControllerState(
+            selected_config_ids=(101,),
+            run_phase="armed",
+            selection_ready=True,
+            start_ready=False,
+            start_ready_reason="当前测试运行中",
+        )
+    )
+
+    assert module.btn_start.isEnabled() is False
+    assert module.lbl_start_reason.text() == "当前测试运行中"
+
+    module.btn_start.click()
+
+    services.factory_mode.start_manual.assert_not_called()
+
+
+def test_blocked_start_signal_opens_and_updates_single_modal(qapp, monkeypatch):
+    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
+
+    services.bus.factory_state_changed.emit(_idle_blocked_state("配置已失效"))
+    services.bus.factory_start_blocked.emit(
+        FactoryStartBlockedPayload(reason="配置已失效", trigger_source="manual")
+    )
+    services.bus.factory_state_changed.emit(_idle_blocked_state("配置加载失败"))
+    services.bus.factory_start_blocked.emit(
+        FactoryStartBlockedPayload(reason="配置加载失败", trigger_source="plc")
+    )
+
+    assert recorder.open_count == 1
+    assert recorder.latest_text == "配置加载失败"
+    assert recorder.latest_title == "自动开始已阻止"
+    assert module.lbl_start_reason.text() == "配置加载失败"
+
+
+def test_blocked_start_signal_does_not_override_inline_reason_without_state_change(qapp, monkeypatch):
+    module, services, recorder = _make_module_with_message_box_spy(
+        monkeypatch,
+        initial_state=FactoryControllerState(
+            selected_config_ids=(101,),
+            run_phase="armed",
+            selection_ready=True,
+            start_ready=True,
+        ),
+    )
+
+    services.bus.factory_start_blocked.emit(
+        FactoryStartBlockedPayload(reason="请至少启用一个配置", trigger_source="manual")
+    )
+
+    assert recorder.open_count == 1
+    assert recorder.latest_text == "请至少启用一个配置"
+    assert module.lbl_start_reason.text() == ""
+
+
+def test_blocked_modal_closes_after_reason_clears(qapp, monkeypatch):
+    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
+
+    services.bus.factory_start_blocked.emit(
+        FactoryStartBlockedPayload(reason="配置已失效", trigger_source="manual")
+    )
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            selected_config_ids=(101,),
+            run_phase="armed",
+            selection_ready=True,
+            start_ready=True,
+        )
+    )
+
+    assert recorder.open_count == 1
+    assert recorder.was_closed is True
+    assert recorder.close_count == 1
+
+
+def test_open_blocked_modal_updates_when_background_state_refresh_changes_reason(
+    qapp,
+    monkeypatch,
+):
+    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
+
+    services.bus.factory_start_blocked.emit(
+        FactoryStartBlockedPayload(reason="配置已失效", trigger_source="manual")
+    )
+    services.bus.factory_state_changed.emit(_idle_blocked_state("配置加载失败"))
+
+    assert recorder.open_count == 1
+    assert recorder.latest_text == "配置加载失败"
+    assert module.lbl_start_reason.text() == "配置加载失败"
+
+
+@pytest.mark.parametrize("trigger_source", ["plc", "scan"])
+def test_blocked_external_trigger_signal_uses_same_modal_flow(qapp, monkeypatch, trigger_source):
+    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
+
+    services.bus.factory_start_blocked.emit(
+        FactoryStartBlockedPayload(reason="配置加载失败", trigger_source=trigger_source)
+    )
+
+    assert recorder.open_count == 1
+    assert recorder.latest_text == "配置加载失败"

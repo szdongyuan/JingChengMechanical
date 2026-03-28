@@ -19,6 +19,8 @@ The test page still does not satisfy the operator-facing part of that design:
 
 This spec upgrades the existing test-page cards into real result views without changing the March 20 factory controller model.
 
+Control-timing clarification: the later spec `2026-03-27-factory-post-analysis-controls-design.md` supersedes this document for when manual `分析` becomes eligible and when the STFT selection box is visible or movable after automatic analysis.
+
 ## Scope
 
 This spec covers only the existing test-page analysis/result cards and the runtime data contract they need.
@@ -59,7 +61,7 @@ This is a new project branch. No compatibility layer or schema-preservation work
 
 1. This work upgrades the existing test-page cards. It does not introduce a separate analysis page or popup workflow.
 2. Only `STFT` needs live display during recording.
-3. After recording ends, the operator may move an analysis box on the `STFT` timeline and click `分析` for re-analysis.
+3. After automatic analysis finishes and the page enters `reviewing`, the operator may move an analysis box on the `STFT` timeline and click `分析` for re-analysis, subject to the later March 27 control-timing clarification.
 4. The analysis-box duration remains fixed by config `analysis_duration`; the operator may move it but may not resize it.
 5. During box dragging, committed `SPL` / `FFT` / `倍频程` results do not update immediately.
 6. Manual re-analysis replaces the committed result set only after the operator clicks `分析`.
@@ -160,7 +162,7 @@ Rendering contract:
 
 - in `running`, render the chosen display channel's live full-timeline STFT accumulation
 - in `analyzing`, keep the run context but do not invent a committed result early
-- in `reviewing`, keep showing the full recording timeline and overlay the fixed-duration analysis box
+- in `reviewing`, keep showing the full recording timeline and overlay the fixed-duration analysis box when a valid manual review window exists, per the later March 27 control-timing clarification
 - in `reanalyzing`, keep the same full timeline and box visible but lock box movement until re-analysis finishes
 
 `STFT` is never cropped to only the committed analysis window. The selected window is shown as an overlay because the operator may re-select and analyze again.

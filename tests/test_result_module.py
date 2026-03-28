@@ -129,10 +129,10 @@ def _state(
     *,
     displayed_config_id: int | None = None,
     active_config_id: int | None = None,
+    selected_config_ids: tuple[int, ...] = (101, 202),
 ) -> FactoryControllerState:
     return FactoryControllerState(
-        selected_config_ids=(101, 202),
-        manual_primary_config_id=101,
+        selected_config_ids=selected_config_ids,
         active_config_id=active_config_id,
         displayed_config_id=displayed_config_id,
         run_phase=run_phase,

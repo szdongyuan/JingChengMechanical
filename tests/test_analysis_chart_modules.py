@@ -146,6 +146,24 @@ def _make_services(
     )
 
 
+def _assert_empty_chart_visible(module, qapp) -> None:
+    module.show()
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is False
+    assert module.current_plot_payload() is None
+    assert module.current_render_channel() is None
+    assert module.plot.isHidden() is False
+
+    has_series = getattr(module.plot, "has_series", None)
+    if callable(has_series):
+        assert has_series() is False
+
+    has_bars = getattr(module.plot, "has_bars", None)
+    if callable(has_bars):
+        assert has_bars() is False
+
+
 def test_requirements_txt_lists_runtime_and_test_baseline_dependencies():
     requirements_path = Path(__file__).resolve().parents[1] / "requirements.txt"
     entries = {
@@ -607,10 +625,29 @@ def test_committed_chart_modules_stay_empty_in_reviewing_when_chart_payload_is_m
     )
     qapp.processEvents()
 
-    assert module.has_committed_plot_data() is False
-    assert module.current_plot_payload() is None
-    assert module.current_render_channel() is None
-    assert module.empty_state.isHidden() is False
+    _assert_empty_chart_visible(module, qapp)
+
+
+@pytest.mark.parametrize("module_cls", (SplModule, SpectrumModule, OctaveModule))
+@pytest.mark.parametrize(
+    "initial_state",
+    (
+        FactoryControllerState(),
+        _state(101, "running"),
+        _state(101, "analyzing"),
+        _state(101, "reanalyzing"),
+    ),
+)
+def test_committed_chart_modules_keep_empty_chart_visible_in_no_data_phases(
+    qapp,
+    module_cls,
+    initial_state,
+):
+    services = _make_services(initial_state=initial_state)
+    module = module_cls(services)
+    module.selected_display_channel_provider = lambda: 0
+
+    _assert_empty_chart_visible(module, qapp)
 
 
 @pytest.mark.parametrize(
@@ -634,8 +671,7 @@ def test_chart_modules_ignore_live_frames_and_clear_when_reanalysis_starts(
     getattr(services.bus, live_signal_name).emit(101, "run-101", 0, object())
     qapp.processEvents()
 
-    assert module.has_committed_plot_data() is False
-    assert module.empty_state.isHidden() is False
+    _assert_empty_chart_visible(module, qapp)
 
     services.bus.factory_state_changed.emit(_state(101, "reviewing"))
     services.bus.factory_review_changed.emit(
@@ -648,8 +684,7 @@ def test_chart_modules_ignore_live_frames_and_clear_when_reanalysis_starts(
     services.bus.factory_state_changed.emit(_state(101, "reanalyzing"))
     qapp.processEvents()
 
-    assert module.has_committed_plot_data() is False
-    assert module.empty_state.isHidden() is False
+    _assert_empty_chart_visible(module, qapp)
 
 
 @pytest.mark.parametrize("module_cls", (SplModule, SpectrumModule, OctaveModule))

@@ -376,7 +376,7 @@ class OctaveBarChartWidget(_BasePlotChart):
         _clear_error_bar_item(self._band_range_item)
         self._band_marker_item.setData([])
         self._replace_bar_item(x=np.array([], dtype=float), heights=np.array([], dtype=float))
-        self.plot_item.getAxis("bottom").setTicks([])
+        self.plot_item.getAxis("bottom").setTicks(None)
 
     def has_bars(self) -> bool:
         return self._band_payload is not None

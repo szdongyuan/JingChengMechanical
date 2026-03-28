@@ -144,12 +144,10 @@ def _show(window, qapp):
 
 def _armed_state(
     *,
-    selected_config_ids: tuple[int, int] = (101, 202),
-    manual_primary_config_id: int | None = 101,
+    selected_config_ids: tuple[int, ...] = (101, 202),
 ) -> FactoryControllerState:
     return FactoryControllerState(
         selected_config_ids=selected_config_ids,
-        manual_primary_config_id=manual_primary_config_id,
         run_phase="armed",
     )
 
@@ -157,12 +155,10 @@ def _armed_state(
 def _running_state(
     config_id: int,
     *,
-    selected_config_ids: tuple[int, int] = (101, 202),
-    manual_primary_config_id: int | None = 101,
+    selected_config_ids: tuple[int, ...] = (101, 202),
 ) -> FactoryControllerState:
     return FactoryControllerState(
         selected_config_ids=selected_config_ids,
-        manual_primary_config_id=manual_primary_config_id,
         active_config_id=config_id,
         displayed_config_id=config_id,
         run_phase="running",
@@ -173,12 +169,10 @@ def _running_state(
 def _reviewing_state(
     config_id: int,
     *,
-    selected_config_ids: tuple[int, int] = (101, 202),
-    manual_primary_config_id: int | None = 101,
+    selected_config_ids: tuple[int, ...] = (101, 202),
 ) -> FactoryControllerState:
     return FactoryControllerState(
         selected_config_ids=selected_config_ids,
-        manual_primary_config_id=manual_primary_config_id,
         displayed_config_id=config_id,
         run_phase="reviewing",
         trigger_source="manual",
@@ -374,15 +368,18 @@ def _assert_run_specific_cards_cleared(window, *, result_badge: str = "-") -> No
     assert window.result.lb_empty_text.text() == ""
     assert window.stft.selection_box.isVisible() is False
     assert window.stft.analyze_button.isVisible() is False
-    assert window.spectrum.empty_state.isHidden() is False
-    assert window.spl.empty_state.isHidden() is False
-    assert window.octave.empty_state.isHidden() is False
+    assert window.spectrum.plot.isHidden() is False
+    assert window.spl.plot.isHidden() is False
+    assert window.octave.plot.isHidden() is False
+    assert window.spectrum.has_committed_plot_data() is False
+    assert window.spl.has_committed_plot_data() is False
+    assert window.octave.has_committed_plot_data() is False
 
 
 def _assert_chart_cards_visible(window) -> None:
-    assert window.spectrum.empty_state.isHidden() is True
-    assert window.spl.empty_state.isHidden() is True
-    assert window.octave.empty_state.isHidden() is True
+    assert window.spectrum.plot.isHidden() is False
+    assert window.spl.plot.isHidden() is False
+    assert window.octave.plot.isHidden() is False
     assert window.spectrum.has_committed_plot_data() is True
     assert window.spl.has_committed_plot_data() is True
     assert window.octave.has_committed_plot_data() is True
@@ -585,7 +582,6 @@ def test_selection_changed_reset_clears_result_stft_and_chart_cards(qapp, monkey
     services.bus.factory_state_changed.emit(
         _armed_state(
             selected_config_ids=(303, 404),
-            manual_primary_config_id=303,
         )
     )
     qapp.processEvents()
