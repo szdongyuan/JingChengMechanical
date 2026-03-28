@@ -260,7 +260,7 @@ class WorkOrderModule(QWidget):
     def _update_summary_text(self) -> None:
         selected_config_ids = self.config_selector.enabled_config_ids()
         if not selected_config_ids:
-            self.lbl_factory_summary.setText("Factory summary: 请至少启用一个配置。")
+            self.lbl_factory_summary.setText("Factory summary: 未启用工厂配置。")
             return
 
         lines = []

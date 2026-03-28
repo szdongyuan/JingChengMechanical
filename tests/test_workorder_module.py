@@ -291,6 +291,25 @@ def test_workorder_module_deduplicates_restored_saved_ids_before_syncing_control
 
 
 def test_workorder_module_only_renders_list_local_persistence_notice_not_controller_blockers(qapp):
+    module, services = _make_module()
+
+    assert module.lbl_factory_summary.text() == "Factory summary: 未启用工厂配置。"
+    assert "请至少启用一个配置" not in _workorder_rendered_text(module)
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            selected_config_ids=(),
+            run_phase="not_ready",
+            selection_ready=False,
+            selection_ready_reason="请至少启用一个配置",
+            start_ready=False,
+            start_ready_reason="请至少启用一个配置",
+        )
+    )
+
+    assert module.lbl_factory_summary.text() == "Factory summary: 未启用工厂配置。"
+    assert "请至少启用一个配置" not in _workorder_rendered_text(module)
+
     module, services = _make_module(saved_selected_ids=(303, 999, 101))
 
     assert "配置已失效" not in _workorder_rendered_text(module)
