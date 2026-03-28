@@ -1,6 +1,6 @@
 # Workorder Layout And AI Binding Legacy Save Implementation Plan
 
-> **For agentic workers:** REQUIRED: Use the `subagent-driven-development` skill to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED: Use the `subagent-driven-development` skill to implement this plan. If that skill is unavailable in the execution environment, follow the same fresh-worktree, fresh-implementer, paired-review workflow manually. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Clean up the workorder factory-config UI, keep config-drag previews visually bounded to the actual row size, and restore config-save compatibility for legacy AI binding schemas that still require `analysis_window_offset_ms`.
 
@@ -49,6 +49,8 @@ def test_workorder_module_uses_full_width_factory_config_section(qapp):
     module, _ = _make_module()
     assert module.lbl_factory_configs.text() == "工厂配置 Factory Configs"
     assert hasattr(module, "ed_cfg") is False
+    assert module.form_layout.labelForField(module.config_selector) is None
+    assert module.factory_config_section.layout().indexOf(module.config_selector) >= 0
 
 
 def test_workorder_module_does_not_render_factory_summary_block(qapp):
@@ -68,8 +70,10 @@ Expected: FAIL because the module still creates `ed_cfg` and `lbl_factory_summar
 Implementation requirements:
 
 - keep `条码 SN` and `产品型号 Model` in the form layout
+- expose the form layout as `self.form_layout` so the new layout contract is testable
 - remove `self.ed_cfg`
 - remove `self.lbl_factory_summary`
+- add a dedicated container such as `self.factory_config_section`
 - add a dedicated `QLabel` with exact text `工厂配置 Factory Configs`
 - place `self.config_selector` directly below that label as a full-width section in the module layout
 - preserve the existing workorder payload:
@@ -200,7 +204,21 @@ def test_save_binding_creates_row_when_legacy_binding_offset_column_is_not_null(
 def test_save_binding_updates_existing_row_when_legacy_binding_offset_column_is_not_null(ai_service, config, toolchain):
     db = AiBindingTable._meta.database
     db.execute_sql("DROP TABLE test_config_ai_binding_table")
-    db.execute_sql(...)
+    db.execute_sql(
+        '''
+        CREATE TABLE test_config_ai_binding_table (
+            binding_id INTEGER PRIMARY KEY,
+            config_id INTEGER NOT NULL UNIQUE REFERENCES test_config_table(config_id) ON DELETE CASCADE,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            toolchain_id TEXT REFERENCES ai_toolchain_table(toolchain_id) ON DELETE SET NULL,
+            timeout_ms INTEGER,
+            analysis_window_offset_ms INTEGER NOT NULL,
+            params_json TEXT NOT NULL DEFAULT '{}',
+            score_threshold REAL DEFAULT NULL,
+            updated_time TEXT NOT NULL DEFAULT ''
+        )
+        '''
+    )
     db.execute_sql(
         '''
         INSERT INTO test_config_ai_binding_table (
@@ -221,6 +239,43 @@ def test_save_binding_updates_existing_row_when_legacy_binding_offset_column_is_
     assert binding["enabled"] is True
     assert binding["timeout_ms"] == 5000
     assert "analysis_window_offset_ms" not in binding
+
+
+def test_save_binding_legacy_compatibility_does_not_mask_unrelated_insert_failures(
+    ai_service, config, toolchain, monkeypatch
+):
+    db = AiBindingTable._meta.database
+    db.execute_sql("DROP TABLE test_config_ai_binding_table")
+    db.execute_sql(
+        '''
+        CREATE TABLE test_config_ai_binding_table (
+            binding_id INTEGER PRIMARY KEY,
+            config_id INTEGER NOT NULL UNIQUE REFERENCES test_config_table(config_id) ON DELETE CASCADE,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            toolchain_id TEXT REFERENCES ai_toolchain_table(toolchain_id) ON DELETE SET NULL,
+            timeout_ms INTEGER,
+            analysis_window_offset_ms INTEGER NOT NULL,
+            params_json TEXT NOT NULL DEFAULT '{}',
+            score_threshold REAL DEFAULT NULL,
+            updated_time TEXT NOT NULL DEFAULT ''
+        )
+        '''
+    )
+
+    original_execute_sql = db.execute_sql
+
+    def _raising_execute_sql(sql, params=None):
+        if "INSERT INTO test_config_ai_binding_table" in sql:
+            raise RuntimeError("different failure")
+        return original_execute_sql(sql, params)
+
+    monkeypatch.setattr(db, "execute_sql", _raising_execute_sql)
+
+    with pytest.raises(RuntimeError, match="different failure"):
+        ai_service.save_binding(config.config_id, {
+            "enabled": True,
+            "toolchain_id": "motor-ai",
+        })
 ```
 
 - [ ] **Step 2: Run the focused AI-service tests to verify they fail**
@@ -247,7 +302,7 @@ Implementation requirements:
 
 - [ ] **Step 4: Run the focused AI-service tests to verify they pass**
 
-Run: `pytest tests/test_ai_service.py -k "legacy_binding_offset_column_is_not_null or save_binding_ignores_analysis_window_offset_ms" -v`
+Run: `pytest tests/test_ai_service.py -k "legacy_binding_offset_column_is_not_null or save_binding_ignores_analysis_window_offset_ms or does_not_mask_unrelated_insert_failures" -v`
 
 Expected: PASS
 
