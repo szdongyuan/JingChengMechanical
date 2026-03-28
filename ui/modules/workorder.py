@@ -16,7 +16,6 @@ class WorkOrderModule(QWidget):
         self.services = services
         self._factory_state = getattr(services.factory_mode, "state", FactoryControllerState())
         self._config_rows: list[dict] = []
-        self._config_details: dict[int, dict] = {}
         self._last_workorder_payload: dict | None = None
 
         layout = QVBoxLayout(self)
@@ -27,13 +26,10 @@ class WorkOrderModule(QWidget):
         self.ed_sn.setPlaceholderText("请输入条码")
         self.ed_model = QLineEdit()
         self.ed_model.setPlaceholderText("请输入产品型号")
-        self.ed_cfg = QLineEdit()
-        self.ed_cfg.setPlaceholderText("Factory priority controlled")
-        self.ed_cfg.setReadOnly(True)
-        self.ed_cfg.setEnabled(False)
 
         self.config_selector = FactoryConfigListWidget()
         self.config_selector.setMinimumHeight(180)
+        self.lbl_factory_configs = QLabel("工厂配置 Factory Configs")
 
         self.lbl_persistence_notice = QLabel()
         self.lbl_persistence_notice.setWordWrap(True)
@@ -46,21 +42,24 @@ class WorkOrderModule(QWidget):
         self.lbl_phase_summary.setWordWrap(True)
         self.lbl_trigger_summary = QLabel()
         self.lbl_trigger_summary.setWordWrap(True)
-        self.lbl_factory_summary = QLabel()
-        self.lbl_factory_summary.setWordWrap(True)
 
-        form = QFormLayout()
-        form.addRow("条码 SN", self.ed_sn)
-        form.addRow("产品型号 Model", self.ed_model)
-        form.addRow("测试配置 Config", self.ed_cfg)
-        form.addRow("工厂配置 Factory Configs", self.config_selector)
-        layout.addLayout(form)
+        self.form_layout = QFormLayout()
+        self.form_layout.addRow("条码 SN", self.ed_sn)
+        self.form_layout.addRow("产品型号 Model", self.ed_model)
+        layout.addLayout(self.form_layout)
+
+        self.factory_config_section = QWidget()
+        factory_config_layout = QVBoxLayout(self.factory_config_section)
+        factory_config_layout.setContentsMargins(0, 0, 0, 0)
+        factory_config_layout.setSpacing(6)
+        factory_config_layout.addWidget(self.lbl_factory_configs)
+        factory_config_layout.addWidget(self.config_selector)
+        layout.addWidget(self.factory_config_section)
 
         layout.addWidget(self.lbl_persistence_notice)
         layout.addWidget(self.lbl_selection_status)
         layout.addWidget(self.lbl_phase_summary)
         layout.addWidget(self.lbl_trigger_summary)
-        layout.addWidget(self.lbl_factory_summary)
 
         self.ed_sn.textChanged.connect(lambda _text: self._publish_workorder())
         self.ed_model.textChanged.connect(lambda _text: self._publish_workorder())
@@ -99,8 +98,6 @@ class WorkOrderModule(QWidget):
         else:
             self._update_selection_status()
             self._update_phase_trigger_summary()
-            self._update_cfg_display()
-            self._update_summary_text()
             self._sync_selector_lock_state()
         self._publish_workorder()
         self._persist_selected_config_ids(selected_config_ids)
@@ -119,8 +116,6 @@ class WorkOrderModule(QWidget):
         self.config_selector.sync_enabled_config_ids(state.selected_config_ids)
         self._update_selection_status()
         self._update_phase_trigger_summary()
-        self._update_cfg_display()
-        self._update_summary_text()
         self._sync_selector_lock_state()
         if publish_workorder:
             self._publish_workorder()
@@ -153,8 +148,6 @@ class WorkOrderModule(QWidget):
         else:
             self._update_selection_status()
             self._update_phase_trigger_summary()
-            self._update_cfg_display()
-            self._update_summary_text()
             self._sync_selector_lock_state()
 
     def _load_startup_selection(self) -> tuple[int, ...]:
@@ -200,7 +193,6 @@ class WorkOrderModule(QWidget):
 
     def _reload_config_options(self) -> None:
         self._config_rows = self._list_config_rows()
-        self._config_details = {}
         visible_selection = self.config_selector.enabled_config_ids()
         if not visible_selection:
             visible_selection = tuple(self._factory_state.selected_config_ids)
@@ -211,8 +203,6 @@ class WorkOrderModule(QWidget):
                 config_id for config_id in visible_selection if config_id in available_ids
             ),
         )
-        self._update_cfg_display()
-        self._update_summary_text()
         self._sync_selector_lock_state()
 
     def _available_config_ids(self) -> set[int]:
@@ -249,90 +239,6 @@ class WorkOrderModule(QWidget):
         trigger_source = self._factory_state.trigger_source or "-"
         self.lbl_phase_summary.setText(f"Current phase: {run_phase}")
         self.lbl_trigger_summary.setText(f"Current/last trigger: {trigger_source}")
-
-    def _update_cfg_display(self) -> None:
-        primary_config_id = self.config_selector.primary_config_id()
-        if primary_config_id is None:
-            self.ed_cfg.setText("Factory priority list controlled")
-            return
-        self.ed_cfg.setText(self._config_name(primary_config_id))
-
-    def _update_summary_text(self) -> None:
-        selected_config_ids = self.config_selector.enabled_config_ids()
-        if not selected_config_ids:
-            self.lbl_factory_summary.setText("Factory summary: 未启用工厂配置。")
-            return
-
-        lines = []
-        for index, config_id in enumerate(selected_config_ids, start=1):
-            config = self._config_detail(config_id)
-            if not config:
-                continue
-            prefix = f"Priority {index}"
-            if index == 1:
-                prefix += " (Primary)"
-            lines.append(
-                (
-                    f"{prefix}: {self._config_name(config_id)} | "
-                    f"Scan: {self._scan_summary(config)} | "
-                    f"PLC: {self._plc_summary(config)} | "
-                    f"Channels: {self._channels_summary(config)} | "
-                    f"Record: {self._duration_text(config.get('record_duration'))} | "
-                    f"Analysis: {self._duration_text(config.get('analysis_duration'))}"
-                )
-            )
-        self.lbl_factory_summary.setText("\n".join(lines))
-
-    def _config_name(self, config_id: int) -> str:
-        for row in self._config_rows:
-            if row.get("config_id") == config_id:
-                return row.get("config_name") or f"Config {config_id}"
-        detail = self._config_detail(config_id)
-        return detail.get("config_name") or f"Config {config_id}"
-
-    def _config_detail(self, config_id: int) -> dict:
-        if config_id in self._config_details:
-            return self._config_details[config_id]
-
-        detail = {}
-        config_service = getattr(self.services, "config_service", None)
-        load_config = getattr(config_service, "load_config", None)
-        if callable(load_config):
-            try:
-                detail = dict(load_config(config_id))
-            except Exception:
-                detail = {}
-        detail.setdefault("config_id", config_id)
-        detail.setdefault("config_name", self._config_name_fallback(config_id))
-        self._config_details[config_id] = detail
-        return detail
-
-    def _config_name_fallback(self, config_id: int) -> str:
-        for row in self._config_rows:
-            if row.get("config_id") == config_id:
-                return row.get("config_name") or f"Config {config_id}"
-        return f"Config {config_id}"
-
-    @staticmethod
-    def _plc_summary(config: dict) -> str:
-        return config.get("plc_device_label") or config.get("plc_device_key") or "-"
-
-    @staticmethod
-    def _scan_summary(config: dict) -> str:
-        return "enabled" if bool(config.get("scan_triggers_test")) else "disabled"
-
-    @staticmethod
-    def _channels_summary(config: dict) -> str:
-        channels = config.get("selected_channels") or []
-        if not channels:
-            return "-"
-        return ", ".join(f"CH{channel_index + 1}" for channel_index in channels)
-
-    @staticmethod
-    def _duration_text(value) -> str:
-        if isinstance(value, (int, float)):
-            return f"{float(value):.1f}s"
-        return "-"
 
     def _publish_workorder(self, *, force: bool = False, log: bool = False) -> None:
         payload = self.value()
