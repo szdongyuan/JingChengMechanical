@@ -6,7 +6,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import QPointF, Qt
+from PyQt6.QtCore import QPointF, QItemSelectionModel, Qt
 from PyQt6.QtWidgets import QApplication
 
 import ui.widgets.factory_config_list as factory_config_list
@@ -245,6 +245,53 @@ def test_factory_config_list_start_drag_ignores_current_unchecked_item_without_s
     widget.startDrag(Qt.DropAction.MoveAction)
 
     assert drag_calls == []
+
+
+def test_factory_config_list_drop_event_uses_same_checked_current_drag_source_as_start_drag(
+    qapp, monkeypatch
+):
+    widget = FactoryConfigListWidget()
+    emissions: list[tuple[int, ...]] = []
+    widget.enabled_order_changed.connect(lambda config_ids: emissions.append(config_ids))
+    widget.set_rows(
+        rows=[
+            _row(101, "Config A"),
+            _row(202, "Config B"),
+            {
+                "config_id": 303,
+                "config_name": "Config C",
+                "secondary_text": "Unchecked row stays selected",
+            },
+        ],
+        enabled_config_ids=(101, 202),
+    )
+    _show_widget(widget, qapp)
+    selected_unchecked_item = widget.item(2)
+    current_checked_item = widget.item(0)
+    selected_unchecked_item.setSelected(True)
+    widget.setCurrentItem(current_checked_item, QItemSelectionModel.SelectionFlag.NoUpdate)
+
+    drag_calls: list[_DragSpy] = []
+    monkeypatch.setattr(
+        factory_config_list,
+        "QDrag",
+        lambda source: drag_calls.append(_DragSpy(source)) or drag_calls[-1],
+    )
+    current_row_size = widget.itemWidget(current_checked_item).size()
+
+    widget.startDrag(Qt.DropAction.CopyAction | Qt.DropAction.MoveAction)
+    drop_event = _drop_event_on_row(widget, 2)
+
+    widget.dropEvent(drop_event)
+
+    assert len(drag_calls) == 1
+    assert drag_calls[0].pixmap is not None
+    assert drag_calls[0].pixmap.size() == current_row_size
+    assert widget.enabled_config_ids() == (202, 101)
+    assert widget.visual_config_order() == (202, 101, 303)
+    assert emissions[-1] == (202, 101)
+    assert drop_event.accepted is True
+    assert drop_event.ignored is False
 
 
 def test_factory_config_list_drop_event_preserves_all_checked_configs_when_moving_to_top(

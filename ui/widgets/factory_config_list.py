@@ -255,10 +255,7 @@ class FactoryConfigListWidget(QListWidget):
         event.accept()
 
     def startDrag(self, supported_actions: Qt.DropAction) -> None:
-        indexes = self._selected_draggable_indexes()
-        if not indexes:
-            return
-        dragged_item = self.itemFromIndex(indexes[0])
+        indexes, dragged_item = self._drag_source()
         if dragged_item is None:
             return
 
@@ -363,7 +360,7 @@ class FactoryConfigListWidget(QListWidget):
         self,
         item: QListWidgetItem | None = None,
     ) -> QPixmap:
-        dragged_item = item or self._dragged_item()
+        dragged_item = item or self._drag_source()[1]
         if dragged_item is None:
             return QPixmap()
         row_widget = self.itemWidget(dragged_item)
@@ -371,14 +368,14 @@ class FactoryConfigListWidget(QListWidget):
             return QPixmap()
         return row_widget.grab(row_widget.rect())
 
-    def _dragged_item(self) -> QListWidgetItem | None:
-        selected_items = self.selectedItems()
-        if selected_items:
-            return selected_items[0]
-        return self.currentItem()
+    def _drag_source(self) -> tuple[list, QListWidgetItem | None]:
+        indexes = self._selected_draggable_indexes()
+        if not indexes:
+            return [], None
+        return indexes, self.itemFromIndex(indexes[0])
 
     def _dragged_config_id(self) -> int | None:
-        dragged_item = self._dragged_item()
+        _, dragged_item = self._drag_source()
         if dragged_item is None:
             return None
         config_id = dragged_item.data(Qt.ItemDataRole.UserRole)
