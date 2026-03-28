@@ -87,14 +87,36 @@ This is a direct workflow replacement. No compatibility mode is required for the
 14. Restored missing configs are pruned from the remembered selection instead of creating fake placeholder rows.
 15. If any remembered config was pruned during restore, show `配置已失效`.
 16. `配置已失效` is a blocking warning.
-17. All enabled configs must pass startup/runtime validation before manual start is allowed to proceed.
-18. `自动开始` remains clickable when selection or validation fails.
-19. Clicking `自动开始` while blocked by selection or validation failure must show a modal error in addition to persistent inline warning text.
-20. `自动开始` is disabled only for true in-progress states such as:
+17. `配置已失效` remains blocking until the operator makes any selection change in the factory config list; that first user edit clears the warning and overwrites the saved startup selection.
+18. Checked configs render as a priority block at the top of the list; unchecked configs render below them in the base order returned by `ConfigService.list_configs()`.
+19. Newly checked configs are appended to the end of the checked priority block until the operator drags them elsewhere.
+20. Every ordinary list edit persists the ordered enabled config IDs immediately.
+21. All enabled configs must pass startup/runtime validation before manual start is allowed to proceed.
+22. The same blocking rules apply to PLC-triggered and scan-triggered starts.
+23. If a PLC-triggered or scan-triggered start is blocked by selection or validation, the app must explicitly report that reason to the user rather than failing silently.
+24. External trigger failures should use the same feedback principle as manual start: persistent inline warning plus modal popup with the blocking reason.
+25. Blocking reason precedence is:
+    - `配置已失效`
+    - `配置加载失败`
+    - `请至少启用一个配置`
+    - first runtime validation error from the highest-priority enabled config that has any validation error
+    - normal in-progress phase reasons
+26. Manual `自动开始` remains clickable when selection or validation fails.
+27. Clicking `自动开始` while blocked by selection or validation failure must show a modal error in addition to persistent inline warning text.
+28. If a blocked-start modal is already open, additional blocked manual, PLC, or scan start attempts must not open another modal until the current modal is dismissed.
+29. External triggers received during in-progress states keep the existing ignore-while-busy behavior and do not raise modal feedback.
+30. The factory config list is locked during in-progress states and pending start.
+31. `自动开始` is disabled only for true in-progress states such as:
     - `running`
     - `analyzing`
     - `reanalyzing`
     - pending start request
+32. `配置已失效` is the single blocking warning for any automatic prune of selected configs, whether the prune happens during startup restore or later while the app is running.
+33. Automatic prune during startup restore does not overwrite the saved startup selection until the operator makes the first list edit after restore.
+34. Automatic prune during later `config_changed` handling updates the live selection immediately and attempts to persist the pruned ordered selection immediately, but the blocking `配置已失效` warning still remains until the operator makes a later selection change.
+35. If persisting the ordered enabled config IDs to app settings fails, keep the live selection active for the current session, keep the last successfully saved selection for the next restart, and surface explicit non-blocking `配置保存失败` feedback.
+36. `配置保存失败` clears automatically after the next successful persistence write.
+37. Scan-trigger eligibility continues to use the existing per-config `scan_triggers_test` flag; ordered multi-config selection only changes which eligible config wins by priority.
 
 ## Design Summary
 
@@ -122,6 +144,8 @@ Required behavior:
   - config name
   - enabled checkbox
   - optional compact secondary summary text if helpful
+- checked rows render together as a priority block at the top of the list
+- unchecked rows render below the checked block in the base order returned by `ConfigService.list_configs()`
 - enabled rows may be dragged to change order
 - unchecked rows remain available in the list but are ignored for factory selection
 - checked rows define the enabled ordered selection
@@ -149,6 +173,30 @@ Any user action that changes the enabled ordered selection applies immediately:
 
 Each of these actions updates the controller selection immediately and refreshes the workorder payload immediately.
 
+The replacement workorder payload shape is:
+
+- `sn: str`
+- `model: str`
+- `selected_config_ids: tuple[int, ...]`
+
+When a user newly checks a config, that config is appended to the end of the checked priority block. The user may then drag it higher if a different priority is desired.
+
+Each ordinary list edit is also persisted immediately to app settings:
+
+- check
+- uncheck
+- drag reorder
+
+The factory config list is editable only while the controller is idle. During `running`, `analyzing`, `reanalyzing`, and pending start, the list is locked.
+
+If persisting an ordinary list edit to app settings fails:
+
+- keep the edited enabled order active in the live UI and controller for the current session
+- do not revert the operator's list edit
+- keep the last successfully saved ordered enabled config IDs as the startup restore source for the next restart
+- show explicit non-blocking `配置保存失败` feedback immediately
+- clear `配置保存失败` automatically after the next successful persistence write
+
 ## Persistence
 
 Persist only factory selection UI state:
@@ -171,10 +219,15 @@ On app startup:
 1. load the remembered ordered enabled config IDs
 2. remove any config IDs that no longer exist
 3. restore the remaining existing enabled configs in remembered order
-4. immediately apply the restored selection to the controller
-5. if any remembered config was removed during restore, surface `配置已失效`
+4. place all unchecked configs below the restored checked block in the base order returned by `ConfigService.list_configs()`
+5. immediately apply the restored selection to the controller
+6. if any remembered config was removed during restore, surface `配置已失效`
 
-`配置已失效` is blocking. The operator must resolve the selection before start can proceed.
+`配置已失效` is blocking. The operator must acknowledge the automatically pruned selection with a later list edit before start can proceed.
+
+Startup restore must not overwrite the remembered startup selection merely because it pruned missing configs for the live UI state. The saved startup selection is overwritten only on the first user edit after restore acknowledges the invalid-selection warning.
+
+The first user edit to the config list clears `配置已失效` and immediately overwrites the saved startup selection with the new ordered enabled config IDs.
 
 The app must not create fake or synthetic list rows for deleted configs.
 
@@ -217,6 +270,33 @@ Start readiness passes only when:
 - every enabled config passes runtime validation
 - no in-progress controller state blocks start
 
+When multiple blocking conditions coexist, the user-facing blocking reason must use this precedence:
+
+1. `配置已失效`
+2. `配置加载失败`
+3. `请至少启用一个配置`
+4. first runtime validation error from the highest-priority enabled config that has any validation error
+5. normal in-progress phase reason
+
+For idle states, inline feedback and modal feedback must show the same blocking reason.
+
+During in-progress states, the inline feedback remains phase-owned and shows the in-progress reason. Any load/selection/validation changes discovered while busy are re-evaluated and surfaced when the controller returns to an idle state.
+
+If an enabled config ID still exists in `ConfigService.list_configs()` but `load_config(config_id)` fails while refreshing selection, the user-facing blocking reason is `配置加载失败`.
+
+When `config_changed` fires, the controller must re-run selection refresh for the current `selected_config_ids`. If the underlying config is now loadable and valid, `配置加载失败` clears without requiring the operator to change the selection list.
+
+If `config_changed` reveals that a currently selected enabled config has been deleted, the controller must immediately prune that config from `selected_config_ids` and attempt to persist the new ordered selection. If the controller is idle, it surfaces blocking `配置已失效` immediately. If the controller is in an in-progress state, the prune/persist still happens immediately but the blocking warning is deferred until the controller returns to idle.
+
+Runtime prune uses the same `配置已失效` warning state as startup restore:
+
+- it blocks start until the operator makes any later selection change in the factory config list
+- that later user edit clears `配置已失效`
+- unlike startup restore, runtime prune does not wait for that later user edit before attempting to persist the pruned ordered selection
+- if the persistence write fails, keep the live pruned selection, keep the last successfully saved selection unchanged for restart, and surface explicit non-blocking `配置保存失败`
+
+For runtime validation, the authoritative first error for a config is `validate_factory_runtime(config)[0]`. The controller and tests must not reorder that list.
+
 ## Start Resolution
 
 ### Manual Start
@@ -230,6 +310,8 @@ When the operator clicks `自动开始` and the selection is valid:
 
 When a PLC trigger arrives:
 
+- if the controller is already in an in-progress state, ignore the trigger without opening a modal
+- otherwise, if start is currently blocked by any idle blocking reason, do not start a run, surface that blocking reason explicitly using the same inline-plus-modal feedback principle as manual start, and stop evaluation before any trigger matching
 - find all enabled configs whose PLC mapping matches
 - if exactly one matches, start it
 - if multiple match, start the highest-priority matching config
@@ -239,10 +321,14 @@ When a PLC trigger arrives:
 
 When a scan trigger arrives:
 
-- find all enabled configs eligible for scan-triggered start
+- if the controller is already in an in-progress state, ignore the trigger without opening a modal
+- otherwise, if start is currently blocked by any idle blocking reason, do not start a run, surface that blocking reason explicitly using the same inline-plus-modal feedback principle as manual start, and stop evaluation before any trigger matching
+- find all enabled configs whose current config definition has `scan_triggers_test` enabled
 - if exactly one matches, start it
 - if multiple match, start the highest-priority matching config
 - if none match, ignore the trigger
+
+This continues the existing scan-trigger eligibility contract. Ordered multi-config selection does not add any extra scan-text matching rule beyond reusing the current `scan_triggers_test` predicate and then applying enabled-config priority.
 
 ## Operator Feedback
 
@@ -258,15 +344,36 @@ Required behavior:
 
 ### Click-Time Modal Feedback
 
-`自动开始` should remain clickable for selection and validation failures.
+`自动开始` should remain clickable for all idle blocking reasons, including:
 
-On click, if start is blocked by selection or validation:
+- `配置已失效`
+- `配置加载失败`
+- `请至少启用一个配置`
+- runtime validation failures
+
+On click, if start is blocked by any idle blocking reason:
 
 - do not start a run
 - show a modal popup with the same blocking reason
 - preserve the inline warning
 
 This is required because disabled-only feedback is too silent for operators.
+
+The same feedback principle applies to blocked PLC-triggered and scan-triggered starts when the app is otherwise idle. It does not override the existing ignore-while-busy behavior for in-progress states.
+
+If a blocked-start modal is already open, additional blocked start attempts must not open another modal until the current modal is dismissed. If a later blocked attempt has a different blocking reason, the currently open modal must update in place to the newest blocking reason instead of staying stale or stacking another popup.
+
+If background state refresh changes the highest-precedence idle blocking reason while a blocking modal is already open, the modal must update in place immediately to the newest current blocking reason. If the currently open modal's blocking reason becomes false and no other idle blocking reason replaces it, the modal should close automatically.
+
+### Persistence Failure Feedback
+
+If saving the ordered enabled config IDs to app settings fails:
+
+- keep the live selection unchanged for the current session
+- show explicit non-blocking `配置保存失败` feedback immediately
+- do not treat `配置保存失败` as a start-blocking reason by itself
+- keep using the last successfully saved selection on the next restart
+- clear `配置保存失败` after the next successful persistence write
 
 ### Disabled Button States
 
@@ -296,18 +403,36 @@ It should not be disabled merely because selection or validation is currently fa
 - `自动开始` remains clickable
 - clicking `自动开始` shows a modal and does not start
 
-### Blocking Restored Invalid Config
+### Blocking Load Failure
 
-- startup restore pruned one or more missing configs
+- at least one enabled config exists
+- one or more enabled configs cannot be loaded even though their IDs still exist in `ConfigService.list_configs()`
+- inline warning shows `配置加载失败`
+- `自动开始` remains clickable
+- clicking `自动开始` shows a modal and does not start
+
+### Blocking Zero Selection
+
+- no configs are enabled
+- inline warning shows `请至少启用一个配置`
+- `自动开始` remains clickable
+- clicking `自动开始` shows a modal and does not start
+
+### Blocking Invalid Selected Config
+
+- one or more selected configs were pruned automatically, either during startup restore or later runtime `config_changed` handling
 - inline warning shows `配置已失效`
+- start remains blocked until the operator makes any later selection change in the factory config list
 - `自动开始` remains clickable
 - clicking `自动开始` shows a modal and does not start
 
 ### In-Progress
 
 - controller in `running`, `analyzing`, `reanalyzing`, or pending start state
+- factory config list locked
 - `自动开始` disabled
 - in-progress reason shown inline using the existing controller-phase behavior
+- background config/load/validation refreshes do not replace the inline busy reason until the controller returns to idle
 
 ## Testing Requirements
 
@@ -320,13 +445,32 @@ Add or update tests for:
 - one checked config is selection-ready
 - any number of checked configs is allowed
 - startup restore of checked config IDs and order
+- ordinary list edits persist immediately to app settings
+- persistence write failure keeps the live selection active, surfaces non-blocking `配置保存失败`, and preserves the last successfully saved selection for restart
+- unchecked configs reconstruct below the restored checked block in `ConfigService.list_configs()` order
 - missing restored config IDs are pruned
 - pruned restore surfaces blocking `配置已失效`
+- startup restore does not persist the pruned result until the first user edit acknowledges it
+- first user edit after `配置已失效` clears the warning and overwrites saved startup selection
+- blocking reason precedence is stable across inline and modal feedback
+- replacement workorder payload is `sn`, `model`, and ordered `selected_config_ids`
+- config-load failure surfaces as `配置加载失败`
+- `config_changed` refresh clears `配置加载失败` once loading succeeds again
+- `config_changed` pruning of deleted selected configs persists the new selection and surfaces `配置已失效`
+- runtime-pruned `配置已失效` remains blocking until a later user list edit clears it
+- zero enabled configs surface as `请至少启用一个配置`
+- validation error selection is deterministic by enabled priority, then validator error order
+- factory config list locks during in-progress states
 - manual start chooses the top checked config
 - PLC trigger chooses the highest-priority matching config
-- scan trigger chooses the highest-priority matching config
+- scan trigger uses the existing `scan_triggers_test` eligibility rule and chooses the highest-priority eligible config
 - all enabled configs must pass validation or start is blocked
 - blocked manual start keeps `自动开始` clickable and shows modal feedback
+- blocked PLC-triggered start surfaces inline and modal feedback
+- blocked scan-triggered start surfaces inline and modal feedback
+- in-progress external triggers are ignored without modal popup
+- repeated blocked start attempts do not stack modal popups and update the open modal in place when the blocking reason changes
+- a blocking modal closes automatically once its current reason is no longer true
 - in-progress phases still disable `自动开始`
 
 ## Non-Goals
