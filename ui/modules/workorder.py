@@ -1,28 +1,15 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import QSignalBlocker
-from PyQt6.QtWidgets import (
-    QComboBox,
-    QFormLayout,
-    QHBoxLayout,
-    QLabel,
-    QLineEdit,
-    QPushButton,
-    QVBoxLayout,
-    QWidget,
-)
+from PyQt6.QtWidgets import QFormLayout, QLabel, QLineEdit, QVBoxLayout, QWidget
 
 from app.services_container import FactoryControllerState
-from ui.popups.analysis_overview import open_windows
-from ui.modules.octave import OctaveModule
-from ui.modules.spectrum import SpectrumModule
-from ui.modules.spl import SplModule
-from ui.modules.stft import StftModule
+from ui.widgets.factory_config_list import FactoryConfigListWidget
 
 
 class WorkOrderModule(QWidget):
     module_id = "workorder"
     _LOCKED_SELECTION_PHASES = frozenset({"running", "analyzing", "reanalyzing"})
+    _PENDING_START_REASON = "启动请求处理中"
 
     def __init__(self, services):
         super().__init__()
@@ -32,21 +19,26 @@ class WorkOrderModule(QWidget):
         self._config_details: dict[int, dict] = {}
         self._last_workorder_payload: dict | None = None
 
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(10)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
 
         self.ed_sn = QLineEdit()
         self.ed_sn.setPlaceholderText("请输入条码")
         self.ed_model = QLineEdit()
         self.ed_model.setPlaceholderText("请输入产品型号")
         self.ed_cfg = QLineEdit()
-        self.ed_cfg.setPlaceholderText("Factory mode controlled")
+        self.ed_cfg.setPlaceholderText("Factory priority controlled")
         self.ed_cfg.setReadOnly(True)
         self.ed_cfg.setEnabled(False)
-        self.combo_config_a = QComboBox()
-        self.combo_config_b = QComboBox()
-        self.combo_primary = QComboBox()
+
+        self.config_selector = FactoryConfigListWidget()
+        self.config_selector.setMinimumHeight(180)
+
+        self.lbl_persistence_notice = QLabel()
+        self.lbl_persistence_notice.setWordWrap(True)
+        self.lbl_persistence_notice.setStyleSheet("color: #b45309;")
+        self.lbl_persistence_notice.setVisible(False)
         self.lbl_selection_status = QLabel()
         self.lbl_selection_status.setWordWrap(True)
         self.lbl_phase_summary = QLabel()
@@ -60,120 +52,162 @@ class WorkOrderModule(QWidget):
         form.addRow("条码 SN", self.ed_sn)
         form.addRow("产品型号 Model", self.ed_model)
         form.addRow("测试配置 Config", self.ed_cfg)
-        form.addRow("配置 A Config A", self.combo_config_a)
-        form.addRow("配置 B Config B", self.combo_config_b)
-        form.addRow("手动主配置 Manual Primary", self.combo_primary)
-        lay.addLayout(form)
+        form.addRow("工厂配置 Factory Configs", self.config_selector)
+        layout.addLayout(form)
 
-        lay.addWidget(self.lbl_selection_status)
-        lay.addWidget(self.lbl_phase_summary)
-        lay.addWidget(self.lbl_trigger_summary)
-        lay.addWidget(self.lbl_factory_summary)
+        layout.addWidget(self.lbl_persistence_notice)
+        layout.addWidget(self.lbl_selection_status)
+        layout.addWidget(self.lbl_phase_summary)
+        layout.addWidget(self.lbl_trigger_summary)
+        layout.addWidget(self.lbl_factory_summary)
 
-        row = QHBoxLayout()
-        self.btn_apply = QPushButton("应用")
-        self.btn_apply.setObjectName("Primary")
-
-        # self.btn_analysis = QPushButton("显示所有分析项")
-
-        row.addWidget(self.btn_apply)
-        # row.addWidget(self.btn_analysis)
-        row.addStretch(1)
-        lay.addLayout(row)
-
-        self.btn_apply.clicked.connect(self.apply)
-        # self.btn_analysis.clicked.connect(self.open_analysis_overview)
         self.ed_sn.textChanged.connect(lambda _text: self._publish_workorder())
         self.ed_model.textChanged.connect(lambda _text: self._publish_workorder())
-        self.combo_config_a.currentIndexChanged.connect(
-            lambda _index: self._on_config_selection_changed()
-        )
-        self.combo_config_b.currentIndexChanged.connect(
-            lambda _index: self._on_config_selection_changed()
-        )
-        self.combo_primary.currentIndexChanged.connect(
-            lambda _index: self._on_primary_selection_changed()
-        )
+        self.config_selector.enabled_order_changed.connect(self._on_config_selection_changed)
         if hasattr(self.services.bus, "config_changed"):
             self.services.bus.config_changed.connect(self._reload_config_options)
         if hasattr(self.services.bus, "factory_state_changed"):
             self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
+        if hasattr(self.services.bus, "factory_selection_notice"):
+            self.services.bus.factory_selection_notice.connect(self._on_factory_selection_notice)
 
-        self._analysis_windows = []
         self._reload_config_options()
-        self._sync_factory_state(self._factory_state, publish_workorder=False)
-        self._cache_current_workorder_payload(self.value())
+        self._restore_startup_selection()
+        initial_payload = self.value()
+        self._last_workorder_payload = dict(initial_payload)
+        self._cache_current_workorder_payload(initial_payload)
 
     def value(self) -> dict:
-        state = self._factory_state
-        selected_config_ids = tuple(state.selected_config_ids)
-        manual_primary_config_id = state.manual_primary_config_id
-        if manual_primary_config_id not in selected_config_ids:
-            manual_primary_config_id = None
         return {
             "sn": self.ed_sn.text().strip(),
             "model": self.ed_model.text().strip(),
-            "selected_config_ids": selected_config_ids,
-            "manual_primary_config_id": manual_primary_config_id,
+            "selected_config_ids": self.config_selector.enabled_config_ids(),
         }
 
     def apply(self):
         self._publish_workorder(force=True, log=True)
 
-    def open_analysis_overview(self):
-        items = [
-            ("频谱 (Spectrum)", SpectrumModule),
-            ("STFT 频谱图 (Spectrogram)", StftModule),
-            ("SPL 时间曲线 (A计权)", SplModule),
-            ("倍频程 (Octave)", OctaveModule),
-        ]
-        self._analysis_windows = open_windows(self.services, items, prev=self._analysis_windows)
+    def _on_config_selection_changed(self, selected_config_ids: tuple[int, ...]) -> None:
+        next_state = None
+        factory_mode = getattr(self.services, "factory_mode", None)
+        set_selection = getattr(factory_mode, "set_selection", None)
+        if callable(set_selection):
+            next_state = set_selection(selected_config_ids)
+        if isinstance(next_state, FactoryControllerState):
+            self._sync_factory_state(next_state, publish_workorder=False)
+        else:
+            self._update_selection_status()
+            self._update_phase_trigger_summary()
+            self._update_cfg_display()
+            self._update_summary_text()
+            self._sync_selector_lock_state()
+        self._publish_workorder()
+        self._persist_selected_config_ids(selected_config_ids)
 
-    def _on_config_selection_changed(self):
-        selected_a = self.combo_config_a.currentData()
-        selected_b = self.combo_config_b.currentData()
-        primary_id = self.combo_primary.currentData()
+    def _on_factory_state_changed(self, state) -> None:
+        if isinstance(state, FactoryControllerState):
+            self._sync_factory_state(state)
 
-        if selected_a is not None and selected_a == selected_b:
-            selected_b = None
+    def _sync_factory_state(
+        self,
+        state: FactoryControllerState,
+        *,
+        publish_workorder: bool = True,
+    ) -> None:
+        self._factory_state = state
+        self.config_selector.sync_enabled_config_ids(state.selected_config_ids)
+        self._update_selection_status()
+        self._update_phase_trigger_summary()
+        self._update_cfg_display()
+        self._update_summary_text()
+        self._sync_selector_lock_state()
+        if publish_workorder:
+            self._publish_workorder()
 
-        if primary_id not in {selected_a, selected_b}:
-            primary_id = None
-
-        self._apply_selection_controls(
-            selected_a=selected_a,
-            selected_b=selected_b,
-            primary_id=primary_id,
+    def _restore_startup_selection(self) -> None:
+        startup_selection = self._load_startup_selection()
+        available_ids = self._available_config_ids()
+        restored_selection = tuple(
+            config_id for config_id in startup_selection if config_id in available_ids
         )
-        self._emit_selection_intent()
+        had_missing_configs = restored_selection != startup_selection
 
-    def _on_primary_selection_changed(self):
-        primary_id = self.combo_primary.currentData()
-        if primary_id not in self._selected_pair():
-            primary_id = None
-        self._apply_selection_controls(
-            selected_a=self.combo_config_a.currentData(),
-            selected_b=self.combo_config_b.currentData(),
-            primary_id=primary_id,
-        )
-        self._emit_selection_intent()
+        self.config_selector.sync_enabled_config_ids(restored_selection)
 
-    def _reload_config_options(self):
+        factory_mode = getattr(self.services, "factory_mode", None)
+        next_state = None
+        restore_selection = getattr(factory_mode, "restore_selection", None)
+        if callable(restore_selection):
+            next_state = restore_selection(
+                restored_selection,
+                had_missing_configs=had_missing_configs,
+            )
+        else:
+            set_selection = getattr(factory_mode, "set_selection", None)
+            if callable(set_selection):
+                next_state = set_selection(restored_selection)
+        if isinstance(next_state, FactoryControllerState):
+            self._sync_factory_state(next_state, publish_workorder=False)
+        else:
+            self._update_selection_status()
+            self._update_phase_trigger_summary()
+            self._update_cfg_display()
+            self._update_summary_text()
+            self._sync_selector_lock_state()
+
+    def _load_startup_selection(self) -> tuple[int, ...]:
+        selection_settings = getattr(self.services, "factory_selection_settings", None)
+        load_selected_config_ids = getattr(selection_settings, "load_selected_config_ids", None)
+        if callable(load_selected_config_ids):
+            try:
+                return tuple(load_selected_config_ids())
+            except Exception:
+                return ()
+        return tuple(self._factory_state.selected_config_ids)
+
+    def _persist_selected_config_ids(self, selected_config_ids: tuple[int, ...]) -> None:
+        selection_settings = getattr(self.services, "factory_selection_settings", None)
+        save_selected_config_ids = getattr(selection_settings, "save_selected_config_ids", None)
+        error_message = None
+        if callable(save_selected_config_ids):
+            error_message = save_selected_config_ids(tuple(selected_config_ids))
+        self._emit_selection_notice(error_message or "")
+
+    def _emit_selection_notice(self, message: str) -> None:
+        notice_signal = getattr(self.services.bus, "factory_selection_notice", None)
+        emit = getattr(notice_signal, "emit", None)
+        if callable(emit):
+            emit(message)
+            return
+        self._on_factory_selection_notice(message)
+
+    def _on_factory_selection_notice(self, message: str) -> None:
+        self.lbl_persistence_notice.setText(message)
+        self.lbl_persistence_notice.setVisible(bool(message))
+
+    def _reload_config_options(self) -> None:
         self._config_rows = self._list_config_rows()
         self._config_details = {}
-        current_a, current_b, current_primary = self._selection_controls_from_state()
-        next_a, next_b, next_primary = self._normalized_selection_controls(
-            selected_a=current_a,
-            selected_b=current_b,
-            primary_id=current_primary,
+        visible_selection = self.config_selector.enabled_config_ids()
+        if not visible_selection:
+            visible_selection = tuple(self._factory_state.selected_config_ids)
+        available_ids = self._available_config_ids()
+        self.config_selector.set_rows(
+            rows=self._config_rows,
+            enabled_config_ids=tuple(
+                config_id for config_id in visible_selection if config_id in available_ids
+            ),
         )
-        self._apply_selection_controls(
-            selected_a=next_a,
-            selected_b=next_b,
-            primary_id=next_primary,
-        )
-        if (current_a, current_b, current_primary) != (next_a, next_b, next_primary):
-            self._emit_selection_intent()
+        self._update_cfg_display()
+        self._update_summary_text()
+        self._sync_selector_lock_state()
+
+    def _available_config_ids(self) -> set[int]:
+        return {
+            row.get("config_id")
+            for row in self._config_rows
+            if isinstance(row.get("config_id"), int)
+        }
 
     def _list_config_rows(self) -> list[dict]:
         config_service = getattr(self.services, "config_service", None)
@@ -185,207 +219,12 @@ class WorkOrderModule(QWidget):
         except Exception:
             return []
 
-    def _apply_selection_controls(
-        self,
-        *,
-        selected_a: int | None,
-        selected_b: int | None,
-        primary_id: int | None,
-    ) -> None:
-        selected_a, selected_b, primary_id = self._normalized_selection_controls(
-            selected_a=selected_a,
-            selected_b=selected_b,
-            primary_id=primary_id,
-        )
-
-        primary_candidates = tuple(
-            config_id
-            for config_id in (selected_a, selected_b)
-            if config_id is not None
-        )
-
-        blockers = [
-            QSignalBlocker(self.combo_config_a),
-            QSignalBlocker(self.combo_config_b),
-            QSignalBlocker(self.combo_primary),
-        ]
-        self._populate_config_combo(
-            self.combo_config_a,
-            selected_id=selected_a,
-            excluded_id=selected_b,
-            placeholder="请选择 Config A",
-        )
-        self._populate_config_combo(
-            self.combo_config_b,
-            selected_id=selected_b,
-            excluded_id=selected_a,
-            placeholder="请选择 Config B",
-        )
-        self._populate_primary_combo(primary_candidates, primary_id)
-        del blockers
-        self._update_selection_status()
-        self._update_cfg_display()
-        self._update_summary_text()
-        self._sync_selector_lock_state()
-
-    def _normalized_selection_controls(
-        self,
-        *,
-        selected_a: int | None,
-        selected_b: int | None,
-        primary_id: int | None,
-    ) -> tuple[int | None, int | None, int | None]:
-        available_ids = {
-            config_id
-            for config_id in (row.get("config_id") for row in self._config_rows)
-            if config_id is not None
-        }
-        available_ids.update(self._controller_locked_selection_ids())
-        if selected_a not in available_ids:
-            selected_a = None
-        if selected_b not in available_ids:
-            selected_b = None
-        if selected_a == selected_b:
-            selected_b = None
-
-        if primary_id not in {selected_a, selected_b}:
-            primary_id = None
-        return selected_a, selected_b, primary_id
-
-    def _populate_config_combo(
-        self,
-        combo: QComboBox,
-        *,
-        selected_id: int | None,
-        excluded_id: int | None,
-        placeholder: str,
-    ) -> None:
-        combo.clear()
-        combo.addItem(placeholder, None)
-        listed_ids = set()
-        for row in self._config_rows:
-            config_id = row.get("config_id")
-            if config_id is None or config_id == excluded_id:
-                continue
-            combo.addItem(self._config_name(config_id), config_id)
-            listed_ids.add(config_id)
-
-        if (
-            selected_id is not None
-            and selected_id != excluded_id
-            and selected_id not in listed_ids
-        ):
-            combo.addItem(self._config_name(selected_id), selected_id)
-
-        index = combo.findData(selected_id)
-        combo.setCurrentIndex(index if index >= 0 else 0)
-
-    def _populate_primary_combo(
-        self,
-        primary_candidates: tuple[int | None, ...],
-        primary_id: int | None,
-    ) -> None:
-        self.combo_primary.clear()
-        self.combo_primary.addItem("请选择主配置", None)
-        slots = ("A", "B")
-        for slot, config_id in zip(slots, primary_candidates):
-            if config_id is None:
-                continue
-            self.combo_primary.addItem(
-                f"Config {slot} - {self._config_name(config_id)}",
-                config_id,
-            )
-
-        index = self.combo_primary.findData(primary_id)
-        self.combo_primary.setCurrentIndex(index if index >= 0 else 0)
-
-    def _emit_selection_intent(self) -> None:
-        factory_mode = getattr(self.services, "factory_mode", None)
-        set_selection = getattr(factory_mode, "set_selection", None)
-        if not callable(set_selection):
-            self._update_summary_text()
-            return
-
-        next_state = set_selection(
-            self._selected_pair(),
-            manual_primary_config_id=self._selected_primary_config_id(),
-        )
-        if isinstance(next_state, FactoryControllerState):
-            self._sync_factory_state(next_state)
-        else:
-            self._update_summary_text()
-
-    def _on_factory_state_changed(self, state):
-        if isinstance(state, FactoryControllerState):
-            self._sync_factory_state(state)
-
-    def _sync_factory_state(
-        self,
-        state: FactoryControllerState,
-        *,
-        publish_workorder: bool = True,
-    ) -> None:
-        self._factory_state = state
-        selected_a, selected_b, primary_id = self._selection_controls_from_state(state)
-        normalized_selection = self._normalized_selection_controls(
-            selected_a=selected_a,
-            selected_b=selected_b,
-            primary_id=primary_id,
-        )
-        self._apply_selection_controls(
-            selected_a=normalized_selection[0],
-            selected_b=normalized_selection[1],
-            primary_id=normalized_selection[2],
-        )
-        self._update_phase_trigger_summary()
-        if (
-            state.run_phase not in self._LOCKED_SELECTION_PHASES
-            and (selected_a, selected_b, primary_id) != normalized_selection
-        ):
-            self._emit_selection_intent()
-        if publish_workorder:
-            self._publish_workorder()
-
-    def _selection_controls_from_state(
-        self,
-        state: FactoryControllerState | None = None,
-    ) -> tuple[int | None, int | None, int | None]:
-        state = state or self._factory_state
-        selected_config_ids = tuple(state.selected_config_ids)
-        selected_a = selected_config_ids[0] if len(selected_config_ids) >= 1 else None
-        selected_b = selected_config_ids[1] if len(selected_config_ids) >= 2 else None
-
-        primary_id = state.manual_primary_config_id
-        if primary_id not in {selected_a, selected_b}:
-            primary_id = None
-        return selected_a, selected_b, primary_id
-
     def _sync_selector_lock_state(self) -> None:
-        is_locked = self._factory_state.run_phase in self._LOCKED_SELECTION_PHASES
-        self.combo_config_a.setEnabled(not is_locked)
-        self.combo_config_b.setEnabled(not is_locked)
-        self.combo_primary.setEnabled(not is_locked and len(self._selected_pair()) == 2)
-
-    def _selected_pair(self) -> tuple[int, ...]:
-        selected = []
-        for config_id in (self.combo_config_a.currentData(), self.combo_config_b.currentData()):
-            if config_id is None or config_id in selected:
-                continue
-            selected.append(config_id)
-        return tuple(selected)
-
-    def _selected_primary_config_id(self) -> int | None:
-        primary_id = self.combo_primary.currentData()
-        return primary_id if primary_id in self._selected_pair() else None
-
-    def _controller_locked_selection_ids(self) -> set[int]:
-        if self._factory_state.run_phase not in self._LOCKED_SELECTION_PHASES:
-            return set()
-        return {
-            config_id
-            for config_id in self._factory_state.selected_config_ids
-            if config_id is not None
-        }
+        is_locked = (
+            self._factory_state.run_phase in self._LOCKED_SELECTION_PHASES
+            or self._factory_state.start_ready_reason == self._PENDING_START_REASON
+        )
+        self.config_selector.set_locked(is_locked)
 
     def _update_selection_status(self) -> None:
         if self._factory_state.selection_ready:
@@ -402,28 +241,29 @@ class WorkOrderModule(QWidget):
         self.lbl_trigger_summary.setText(f"Current/last trigger: {trigger_source}")
 
     def _update_cfg_display(self) -> None:
-        primary_id = self._factory_state.manual_primary_config_id
-        if primary_id is None:
-            self.ed_cfg.setText("Factory mode selection controls")
+        primary_config_id = self.config_selector.primary_config_id()
+        if primary_config_id is None:
+            self.ed_cfg.setText("Factory priority list controlled")
             return
-        self.ed_cfg.setText(self._config_name(primary_id))
+        self.ed_cfg.setText(self._config_name(primary_config_id))
 
     def _update_summary_text(self) -> None:
-        selected_pair = self._factory_state.selected_config_ids
-        primary_id = self._factory_state.manual_primary_config_id
-        if not selected_pair:
-            self.lbl_factory_summary.setText("Factory summary: select Config A and Config B.")
+        selected_config_ids = self.config_selector.enabled_config_ids()
+        if not selected_config_ids:
+            self.lbl_factory_summary.setText("Factory summary: 请至少启用一个配置。")
             return
 
         lines = []
-        for index, config_id in enumerate(selected_pair):
+        for index, config_id in enumerate(selected_config_ids, start=1):
             config = self._config_detail(config_id)
             if not config:
                 continue
-            slot = "AB"[index] if index < 2 else str(index + 1)
+            prefix = f"Priority {index}"
+            if index == 1:
+                prefix += " (Primary)"
             lines.append(
                 (
-                    f"Config {slot}: {self._config_name(config_id)} | "
+                    f"{prefix}: {self._config_name(config_id)} | "
                     f"Scan: {self._scan_summary(config)} | "
                     f"PLC: {self._plc_summary(config)} | "
                     f"Channels: {self._channels_summary(config)} | "
@@ -431,12 +271,6 @@ class WorkOrderModule(QWidget):
                     f"Analysis: {self._duration_text(config.get('analysis_duration'))}"
                 )
             )
-
-        if primary_id is None:
-            lines.append("Manual primary: pending confirmation")
-        else:
-            lines.append(f"Manual primary: {self._config_name(primary_id)}")
-
         self.lbl_factory_summary.setText("\n".join(lines))
 
     def _config_name(self, config_id: int) -> str:
