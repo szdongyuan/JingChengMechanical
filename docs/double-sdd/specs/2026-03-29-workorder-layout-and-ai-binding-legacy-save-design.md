@@ -105,7 +105,7 @@ Use Approach A.
 
 The workorder module keeps `SN` and `Model` as simple form rows, but the factory selector becomes its own section below them:
 
-- show a section label such as `工厂配置 Factory Configs`
+- show the exact section label `工厂配置 Factory Configs`
 - render the selector directly below that label, full-width in the workorder content area
 - remove the read-only `测试配置 Config` field entirely
 - remove the factory summary label entirely
@@ -114,7 +114,13 @@ The ordered selector remains the only place where the operator sees enabled conf
 
 ### Drag Preview Behavior
 
-Keep the existing reorder semantics and manual `dropEvent(...)` logic. Add a targeted drag-start customization so the drag preview uses the real rendered row size rather than Qt's oversized default behavior for this embedded-widget list.
+Keep the existing reorder semantics and manual `dropEvent(...)` logic. Add a targeted drag-start customization so the drag preview is derived from the dragged row widget itself instead of Qt's oversized default behavior for this embedded-widget list.
+
+Acceptance criteria:
+
+- the drag preview pixmap is created from the current row widget render
+- the drag preview width and height match the dragged row widget's current rendered size
+- the change does not alter enabled-order calculation, drag eligibility, or persistence behavior
 
 This is a UI-only change. It must not change:
 
@@ -131,7 +137,10 @@ This is a UI-only change. It must not change:
 - inspect `test_config_ai_binding_table` columns at save time
 - if the legacy `analysis_window_offset_ms` column exists, treat it as a compatibility-only field
 - on binding-row creation, insert an explicit legacy value of `0`
-- on binding-row update, preserve normal behavior; if the update path needs to touch the legacy column for compatibility, it should set it to `0` rather than pulling any value from config UI state
+- on binding-row update, preserve normal behavior and do not read any offset value from config UI state
+- if implementation later uses a unified upsert path instead of separate create/update branches, it must remain behaviorally equivalent to the above:
+  - newly created rows receive legacy `analysis_window_offset_ms = 0` when the column exists
+  - existing rows do not require any UI-provided offset value to save successfully
 
 The returned binding ViewModel must continue to exclude `analysis_window_offset_ms`.
 
@@ -147,9 +156,11 @@ Add or update tests for:
 
 - workorder module no longer exposing the `测试配置 Config` row/widget
 - workorder module no longer rendering the factory summary block
+- workorder module using the exact section label `工厂配置 Factory Configs` above the selector
 - workorder config selector rendered as its own section while preserving selection payload behavior
-- config-list drag behavior keeping the preview/start path bounded to the row size, if testable in headless Qt
+- config-list drag-preview helper or drag-start path producing a pixmap whose dimensions match the dragged row widget size
 - AI binding save succeeds when the live binding table still has legacy `analysis_window_offset_ms NOT NULL`
+- AI binding update succeeds when the live binding table still has legacy `analysis_window_offset_ms NOT NULL`
 - AI binding save compatibility does not reintroduce `analysis_window_offset_ms` into resolved binding payloads
 - normal save behavior stays unchanged for fresh schemas without the legacy column
 
