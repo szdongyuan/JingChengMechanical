@@ -9,7 +9,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
-from app.services_container import FactoryControllerState
+from app.service.factory_mode_controller import FactoryModeController
+from app.services_container import EventBus, FactoryControllerState
 from ui.modules.workorder import WorkOrderModule
 
 
@@ -38,9 +39,18 @@ class _BusStub:
 
 
 class _ConfigServiceStub:
-    def __init__(self, configs: list[dict]):
+    def __init__(
+        self,
+        configs: list[dict],
+        *,
+        runtime_errors_by_id: dict[int, list[str]] | None = None,
+    ):
         self._configs = [dict(config) for config in configs]
         self._details = {config["config_id"]: dict(config) for config in configs}
+        self._runtime_errors_by_id = {
+            config_id: list(errors)
+            for config_id, errors in (runtime_errors_by_id or {}).items()
+        }
 
     def list_configs(self):
         return [
@@ -53,6 +63,18 @@ class _ConfigServiceStub:
 
     def load_config(self, config_id: int):
         return dict(self._details[config_id])
+
+    def validate_factory_runtime(self, config: dict):
+        return list(self._runtime_errors_by_id.get(config["config_id"], ()))
+
+    def delete_config(self, config_id: int) -> bool:
+        if config_id not in self._details:
+            return False
+        self._details.pop(config_id, None)
+        self._configs = [
+            config for config in self._configs if config["config_id"] != config_id
+        ]
+        return True
 
 
 class _SharedSettingsStub:
@@ -116,6 +138,12 @@ class _FactoryModeStub:
             run_phase="armed" if selected else "not_ready",
         )
         return self.state
+
+
+class _IdleTestManagerStub:
+    @staticmethod
+    def is_running():
+        return False
 
 
 @pytest.fixture(scope="session")
@@ -191,6 +219,60 @@ def _make_module(
     return WorkOrderModule(services), services
 
 
+def _make_real_controller_module(
+    *,
+    saved_selected_ids: tuple[int, ...] = (),
+    shared_settings: _SharedSettingsStub | None = None,
+    configs: list[dict] | None = None,
+    runtime_errors_by_id: dict[int, list[str]] | None = None,
+):
+    bus = EventBus()
+    settings = shared_settings or _SharedSettingsStub(saved_selected_ids=saved_selected_ids)
+    services = SimpleNamespace(
+        bus=bus,
+        config_service=_ConfigServiceStub(
+            configs
+            or [
+                _make_config(
+                    101,
+                    "Config Alpha",
+                    plc_device_key="plc-a",
+                    plc_device_label="PLC A",
+                    selected_channels=[0, 1],
+                ),
+                _make_config(
+                    202,
+                    "Config Beta",
+                    selected_channels=[1],
+                ),
+                _make_config(
+                    303,
+                    "Config Gamma",
+                    scan_triggers_test=True,
+                    selected_channels=[0],
+                ),
+            ],
+            runtime_errors_by_id=runtime_errors_by_id,
+        ),
+        factory_selection_settings=settings,
+        test=_IdleTestManagerStub(),
+    )
+    services.factory_mode = FactoryModeController(bus, services)
+    return WorkOrderModule(services), services
+
+
+def _workorder_rendered_text(module: WorkOrderModule) -> str:
+    return "\n".join(
+        (
+            module.lbl_persistence_notice.text(),
+            module.lbl_selection_status.text(),
+            module.lbl_phase_summary.text(),
+            module.lbl_trigger_summary.text(),
+            module.lbl_factory_summary.text(),
+        )
+    )
+
+
 def test_workorder_module_restores_saved_ids_prunes_missing_and_marks_invalid_selection(qapp):
     module, services = _make_module(saved_selected_ids=(303, 999, 101))
 
@@ -198,6 +280,40 @@ def test_workorder_module_restores_saved_ids_prunes_missing_and_marks_invalid_se
     assert module.config_selector.visual_config_order() == (303, 101, 202)
     assert services.factory_mode.restore_selection_calls == [((303, 101), True)]
     assert services.factory_selection_settings.save_calls == []
+
+
+def test_workorder_module_deduplicates_restored_saved_ids_before_syncing_controller(qapp):
+    module, services = _make_module(saved_selected_ids=(101, 101, 202))
+
+    assert module.value()["selected_config_ids"] == (101, 202)
+    assert module.config_selector.visual_config_order() == (101, 202, 303)
+    assert services.factory_mode.restore_selection_calls == [((101, 202), False)]
+
+
+def test_workorder_module_only_renders_list_local_persistence_notice_not_controller_blockers(qapp):
+    module, services = _make_module(saved_selected_ids=(303, 999, 101))
+
+    assert "配置已失效" not in _workorder_rendered_text(module)
+
+    blocking_reason = "分析窗起始偏移加分析时长不能超过录音时长"
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            selected_config_ids=(303, 101),
+            run_phase="not_ready",
+            selection_ready=False,
+            selection_ready_reason=blocking_reason,
+            start_ready=False,
+            start_ready_reason=blocking_reason,
+        )
+    )
+
+    rendered_text = _workorder_rendered_text(module)
+    assert blocking_reason not in rendered_text
+    assert module.lbl_persistence_notice.text() == ""
+
+    services.bus.factory_selection_notice.emit("配置保存失败")
+
+    assert module.lbl_persistence_notice.text() == "配置保存失败"
 
 
 def test_first_user_edit_after_invalid_restore_clears_warning_and_overwrites_saved_selection(qapp):
@@ -278,6 +394,24 @@ def test_workorder_persistence_failure_keeps_live_selection_and_shows_non_blocki
     assert "配置保存失败" in module.lbl_persistence_notice.text()
 
 
+def test_failed_save_after_prior_successful_selection_preserves_last_saved_restart_selection(qapp):
+    settings = _SharedSettingsStub(
+        saved_selected_ids=(303, 101),
+        save_errors=["配置保存失败"],
+    )
+    first_module, first_services = _make_module(shared_settings=settings)
+
+    first_module.config_selector.set_checked(202, True)
+
+    assert first_module.value()["selected_config_ids"] == (303, 101, 202)
+    assert first_services.factory_selection_settings.load_selected_config_ids() == (303, 101)
+
+    second_module, second_services = _make_module(shared_settings=settings)
+
+    assert second_module.value()["selected_config_ids"] == (303, 101)
+    assert second_services.factory_mode.restore_selection_calls == [((303, 101), False)]
+
+
 def test_successful_retry_clears_persistence_warning_after_prior_failure(qapp):
     settings = _SharedSettingsStub(save_errors=["配置保存失败", None])
     module, services = _make_module(shared_settings=settings)
@@ -301,6 +435,20 @@ def test_successful_user_save_clears_prior_controller_persistence_notice(qapp):
 
     assert module.lbl_persistence_notice.text() == ""
     assert module.services.bus.factory_selection_notice.emissions[-1][0][0] == ""
+
+
+def test_real_controller_config_changed_prune_sync_updates_ui_without_second_persistence_write(qapp):
+    module, services = _make_real_controller_module(saved_selected_ids=(101, 202, 303))
+    services.factory_selection_settings.save_calls.clear()
+
+    services.config_service.delete_config(202)
+    services.bus.config_changed.emit()
+
+    assert module.value()["selected_config_ids"] == (101, 303)
+    assert module.config_selector.visual_config_order() == (101, 303)
+    assert services.factory_mode.state.selected_config_ids == (101, 303)
+    assert services.factory_mode.state.selection_ready_reason == "配置已失效"
+    assert services.factory_selection_settings.save_calls == [(101, 303)]
 
 
 def test_workorder_restore_keeps_sn_and_model_empty(qapp):

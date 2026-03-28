@@ -41,6 +41,7 @@ class WorkOrderModule(QWidget):
         self.lbl_persistence_notice.setVisible(False)
         self.lbl_selection_status = QLabel()
         self.lbl_selection_status.setWordWrap(True)
+        self.lbl_selection_status.setVisible(False)
         self.lbl_phase_summary = QLabel()
         self.lbl_phase_summary.setWordWrap(True)
         self.lbl_trigger_summary = QLabel()
@@ -131,6 +132,7 @@ class WorkOrderModule(QWidget):
             config_id for config_id in startup_selection if config_id in available_ids
         )
         had_missing_configs = restored_selection != startup_selection
+        restored_selection = self._dedupe_config_ids(restored_selection)
 
         self.config_selector.sync_enabled_config_ids(restored_selection)
 
@@ -164,6 +166,17 @@ class WorkOrderModule(QWidget):
             except Exception:
                 return ()
         return tuple(self._factory_state.selected_config_ids)
+
+    @staticmethod
+    def _dedupe_config_ids(config_ids: tuple[int, ...] | list[int]) -> tuple[int, ...]:
+        seen: set[int] = set()
+        deduped: list[int] = []
+        for config_id in config_ids:
+            if not isinstance(config_id, int) or config_id in seen:
+                continue
+            seen.add(config_id)
+            deduped.append(config_id)
+        return tuple(deduped)
 
     def _persist_selected_config_ids(self, selected_config_ids: tuple[int, ...]) -> None:
         selection_settings = getattr(self.services, "factory_selection_settings", None)
@@ -227,12 +240,9 @@ class WorkOrderModule(QWidget):
         self.config_selector.set_locked(is_locked)
 
     def _update_selection_status(self) -> None:
-        if self._factory_state.selection_ready:
-            text = "Factory selection: 已就绪"
-        else:
-            reason = self._factory_state.selection_ready_reason or "工厂模式未就绪"
-            text = f"Factory selection: {reason}"
-        self.lbl_selection_status.setText(text)
+        # ControlModule owns controller blocking feedback near the start button.
+        self.lbl_selection_status.clear()
+        self.lbl_selection_status.setVisible(False)
 
     def _update_phase_trigger_summary(self) -> None:
         run_phase = self._factory_state.run_phase or "not_ready"

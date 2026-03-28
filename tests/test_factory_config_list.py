@@ -6,7 +6,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QListWidget
 
 from ui.widgets.factory_config_list import FactoryConfigListWidget
 
@@ -84,3 +84,28 @@ def test_factory_config_list_visually_marks_top_checked_row_as_primary(qapp):
 
     assert widget.primary_config_id() == 202
     assert "Primary" in widget.primary_row_badge_text()
+
+
+def test_factory_config_list_drop_event_rebuilds_from_reordered_visual_list(qapp, monkeypatch):
+    widget = FactoryConfigListWidget()
+    emissions: list[tuple[int, ...]] = []
+    widget.enabled_order_changed.connect(lambda config_ids: emissions.append(config_ids))
+    widget.set_rows(
+        rows=[_row(101, "Config A"), _row(202, "Config B"), _row(303, "Config C")],
+        enabled_config_ids=(101, 202, 303),
+    )
+    widget.setCurrentItem(widget.item(2))
+
+    def _fake_drop_event(self, event):
+        dragged_item = self.takeItem(2)
+        self.insertItem(0, dragged_item)
+
+    monkeypatch.setattr(QListWidget, "dropEvent", _fake_drop_event)
+
+    widget.dropEvent(object())
+
+    assert widget.enabled_config_ids() == (303, 101, 202)
+    assert widget.visual_config_order() == (303, 101, 202)
+    assert widget.primary_config_id() == 303
+    assert widget.primary_row_badge_text() == "Primary"
+    assert emissions[-1] == (303, 101, 202)
