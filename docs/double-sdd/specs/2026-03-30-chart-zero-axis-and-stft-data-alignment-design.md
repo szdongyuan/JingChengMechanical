@@ -126,10 +126,21 @@ This applies to:
 
 If a dataset begins above `0`, the chart should still display from `0` to the dataset maximum.
 
+Range authority:
+
+- the visible x-axis maximum must be derived from the chart's primary payload coordinates only
+- auxiliary overlays such as limit lines, markers, error bars, or buttons must not expand the visible x range
+
+Octave-specific rule:
+
+- for the octave bar chart, the x-axis minimum of `0` applies to the underlying bar-center/index coordinate system
+- the bars remain centered at their current positions
+- the x-axis including `0` does not require shifting bar centers so the first bar edge starts at `0`
+
 Degenerate behavior:
 
 - if a chart has no payload, keep the current no-data state rather than forcing a synthetic visible range
-- if a chart has a zero-span x range after normalization, expand to the smallest nonzero display range needed for stable rendering while still keeping the visible minimum at `0` and keeping horizontal padding at `0`
+- if a chart has a zero-span x range after normalization, use a fallback visible x range of `[0.0, 1.0]` in chart x units so rendering remains stable while keeping the visible minimum at `0` and keeping horizontal padding at `0`
 
 ### STFT Y-Axis Policy
 
@@ -140,10 +151,15 @@ For STFT only:
 
 The upper STFT y bound may still follow the rendered frequency payload, but the visible range must begin exactly at `0`.
 
+Range authority:
+
+- the visible STFT y-axis maximum must be derived from the rendered STFT frequency payload only
+- auxiliary overlays must not expand the visible y range
+
 Degenerate behavior:
 
 - if STFT has no rendered payload, keep the current no-data state
-- if the rendered STFT frequency range collapses to a zero span, expand to the smallest nonzero display range needed for stable rendering while keeping the visible minimum at `0`
+- if the rendered STFT frequency range collapses to a zero span, use a fallback visible y range of `[0.0, 1.0]` in STFT frequency units so rendering remains stable while keeping the visible minimum at `0`
 
 ## STFT Overlay Geometry Contract
 
@@ -155,8 +171,10 @@ Chart/overlay interface contract:
 
 - the STFT chart widget owns the pyqtgraph-specific mapping
 - it must expose plot-geometry helpers in widget coordinates
-- it must also expose a chart-owned mapping from STFT x data values to widget-coordinate x positions
-- the STFT module must use that mapping for both the left and right box edges and for drag-time coordinate conversion
+- it must also expose a chart-owned forward mapping from STFT x data values to widget-coordinate x positions
+- it must also expose the inverse mapping from widget-coordinate x positions back to STFT x data values
+- both mappings use widget coordinates relative to the STFT chart widget
+- the STFT module must use those mappings for both the left and right box edges and for drag-time coordinate conversion
 - the STFT module must not map time to pixels by interpolating across the full plot rectangle width
 
 Required behavior:
@@ -181,6 +199,12 @@ Authoritative values:
 Tolerance:
 
 - at most one rendered STFT frame of error at each edge
+
+Rendered-frame formula:
+
+- if the rendered STFT payload has 2 or more time samples, one rendered frame equals the smallest positive difference between consecutive rendered STFT time samples
+- if the rendered STFT payload has exactly 1 time sample, one rendered frame equals `rendered_time_extent_sec()[1] - rendered_time_extent_sec()[0]`
+- tests may convert that frame duration into pixels through the same chart-owned x mapping or an equivalent data-to-widget conversion
 
 The implementation must not introduce additional width error from chart padding or view-box interpolation.
 
