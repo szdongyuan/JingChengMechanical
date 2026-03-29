@@ -825,6 +825,39 @@ def test_selection_box_hides_when_geometry_helper_reports_no_plot_rect_and_drag_
     assert module.selected_window == pytest.approx(selected_before)
 
 
+def test_move_selection_to_start_is_noop_when_geometry_is_unavailable(
+    qapp, monkeypatch
+):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            run_id="run-101",
+            judgment_payload={"overall": "合格", "analysis_window": (1.0, 3.0)},
+        ),
+    )
+    qapp.processEvents()
+
+    selected_before = module.selected_window
+    assert module.selection_box.isVisible() is True
+
+    monkeypatch.setattr(module, "_current_overlay_geometry", lambda: None)
+
+    assert module.move_selection_to_start(0.25) is False
+    assert module.selected_window == pytest.approx(selected_before)
+
+
 def test_selection_box_hides_when_plot_widget_is_hidden_and_recovers_after_show(qapp):
     module, services = _make_module()
     module.selected_display_channel_provider = lambda: 0

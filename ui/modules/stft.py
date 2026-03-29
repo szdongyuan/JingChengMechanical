@@ -208,10 +208,11 @@ class StftModule(QWidget):
         if not self.is_selection_movable() or self._selected_window is None:
             return False
 
-        return self._move_selection_to_start(
-            start_sec,
-            geometry=self._current_overlay_geometry(),
-        )
+        geometry = self._current_overlay_geometry()
+        if geometry is None:
+            return False
+
+        return self._move_selection_to_start(start_sec, geometry=geometry)
 
     def move_selection_to_track_x(self, left_px: float) -> bool:
         geometry = self._current_overlay_geometry()
