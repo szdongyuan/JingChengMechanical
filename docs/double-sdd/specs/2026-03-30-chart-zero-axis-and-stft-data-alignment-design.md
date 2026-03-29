@@ -129,7 +129,7 @@ If a dataset begins above `0`, the chart should still display from `0` to the da
 
 Range authority:
 
-- the visible x-axis maximum must be derived from the chart's primary payload coordinates only
+- the visible x-axis maximum must be derived from the chart's primary payload coordinates only, except that STFT single-sample renders use the rendered single-frame x extent as the authoritative maximum so the only rendered frame stays visible
 - auxiliary overlays such as limit lines, markers, error bars, or buttons must not expand the visible x range
 
 Octave-specific rule:
@@ -143,7 +143,8 @@ Octave-specific rule:
 Degenerate behavior:
 
 - if a chart has no payload, keep the current no-data content state but show the chart axes with a fallback visible x range of `[0.0, 1.0]`
-- if a chart has a zero-span x range after normalization, use a fallback visible x maximum of `max(primary_payload_x_max, 1.0)` so rendering remains stable while still keeping the visible minimum at `0` and keeping horizontal padding at `0`
+- if a chart other than STFT has a zero-span x range after normalization, use a fallback visible x maximum of `max(primary_payload_x_max, 1.0)` so rendering remains stable while still keeping the visible minimum at `0` and keeping horizontal padding at `0`
+- if STFT renders exactly one time sample, the visible x maximum must expand to the rendered single-frame x extent instead of stopping at `max(primary_payload_x_max, 1.0)`, so the only rendered frame stays fully visible while still keeping the visible minimum at `0` and keeping horizontal padding at `0`
 
 ### STFT Y-Axis Policy
 
@@ -156,13 +157,13 @@ The upper STFT y bound may still follow the rendered frequency payload, but the 
 
 Range authority:
 
-- the visible STFT y-axis maximum must be derived from the rendered STFT frequency payload only
+- the visible STFT y-axis maximum must be derived from the rendered STFT frequency payload only, except that a single-row STFT render uses the rendered single-row y extent as the authoritative maximum so the only rendered row stays visible
 - auxiliary overlays must not expand the visible y range
 
 Degenerate behavior:
 
 - if STFT has no rendered payload, keep the current no-data content state but show the chart axes with fallback visible ranges of `x=[0.0, 1.0]` and `y=[0.0, 1.0]`
-- if the rendered STFT frequency range collapses to a zero span, use a fallback visible y maximum of `max(primary_payload_y_max, 1.0)` so rendering remains stable while keeping the visible minimum at `0`
+- if STFT renders exactly one frequency row, the visible y maximum must expand to the rendered single-row y extent instead of stopping at `max(primary_payload_y_max, 1.0)`, so the only rendered row stays fully visible while keeping the visible minimum at `0`
 
 ## STFT Overlay Geometry Contract
 
@@ -231,13 +232,13 @@ Add or update tests for:
 - STFT renders with y-axis minimum `0`
 - STFT renders with no lower-side y padding
 - visible no-payload chart states still show the enforced zero-based axes using the specified fallback ranges
-- zero-span payloads use the specified fallback maximum rules without losing the payload point
+- zero-span payloads use the specified fallback maximum rules without losing the payload point; for single-sample STFT payloads, the rendered one-frame/one-row extent must remain inside the plotted area
 - programmatic chart refresh/reset preserves the same zero-minimum and no-padding axis policy
 - auxiliary overlays such as limit markers and error bars do not expand the visible chart ranges
 - the STFT box left edge aligns to the plotted `x=0.0` position when the selected window starts at `0.0 s`
 - the STFT box right edge aligns to the plotted `x=3.0` position when the selected window ends at `3.0 s`
 - the STFT box width matches the plotted time span within the approved one-frame-per-edge tolerance
-- the single-sample STFT case uses the specified one-frame formula for duration tolerance
+- the single-sample STFT case uses the specified one-frame formula for duration tolerance, and its rendered extent remains inside the plotted area
 - drag and direct-move operations continue to rerender the box at the matching plotted positions
 - unavailable-geometry and recovery behaviors from the existing STFT fix remain intact
 
