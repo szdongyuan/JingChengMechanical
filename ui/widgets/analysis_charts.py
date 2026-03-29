@@ -181,17 +181,11 @@ class StftImageChartWidget(_BasePlotChart):
             return None
         return rect
 
-    def plot_area_rect(self) -> QRect | None:
-        return self.plot_area_rect_in_widget()
-
     def rendered_time_extent_sec(self) -> tuple[float, float] | None:
         rendered_rect = self._rendered_image_rect()
         if rendered_rect is None:
             return None
         return (float(rendered_rect.left()), float(rendered_rect.right()))
-
-    def rendered_time_extent(self) -> tuple[float, float] | None:
-        return self.rendered_time_extent_sec()
 
     def _image_rect(self) -> QRectF:
         assert self._image_payload is not None

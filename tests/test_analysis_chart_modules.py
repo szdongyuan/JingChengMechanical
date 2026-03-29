@@ -279,6 +279,18 @@ def test_stft_image_chart_widget_reports_single_frame_rendered_time_extent_from_
         widget.close()
 
 
+def test_stft_image_chart_widget_exposes_only_task1_geometry_api(qapp):
+    widget = StftImageChartWidget()
+
+    try:
+        assert hasattr(widget, "plot_area_rect_in_widget")
+        assert hasattr(widget, "rendered_time_extent_sec")
+        assert hasattr(widget, "plot_area_rect") is False
+        assert hasattr(widget, "rendered_time_extent") is False
+    finally:
+        widget.close()
+
+
 def test_stft_image_chart_widget_returns_none_geometry_when_plot_is_not_ready(qapp):
     widget = StftImageChartWidget()
 
