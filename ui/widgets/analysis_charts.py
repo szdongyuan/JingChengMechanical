@@ -160,8 +160,16 @@ class StftImageChartWidget(_BasePlotChart):
 
         self._image_item.setImage(normalized_image, autoLevels=True)
         self._image_item.setRect(self._image_rect())
-        self._apply_x_axis_policy(payload_values=normalized_times)
-        self._apply_stft_y_axis_policy(payload_values=normalized_frequencies)
+        rendered_rect = self._rendered_image_rect()
+        if rendered_rect is None:
+            x_axis_values = normalized_times
+            y_axis_values = normalized_frequencies
+        else:
+            x_axis_values = (float(rendered_rect.left()), float(rendered_rect.right()))
+            y_axis_values = (float(rendered_rect.top()), float(rendered_rect.bottom()))
+
+        self._apply_x_axis_policy(payload_values=x_axis_values)
+        self._apply_stft_y_axis_policy(payload_values=y_axis_values)
 
     def clear_data(self) -> None:
         self._image_payload = None

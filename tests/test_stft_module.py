@@ -661,22 +661,27 @@ def test_single_sample_stft_selection_box_uses_one_frame_tolerance_formula(qapp)
     qapp.processEvents()
 
     heatmap_rect = module.canvas.heatmap.geometry()
+    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
     time_extent = module.canvas.heatmap.rendered_time_extent_sec()
     left_x = module.canvas.heatmap.widget_x_for_time_sec(2.0)
     box_rect = module.selection_box.geometry()
 
     assert heatmap_rect.x() == 0
     assert heatmap_rect.y() == 0
+    assert plot_rect is not None
     assert time_extent is not None
 
     right_x = module.canvas.heatmap.widget_x_for_time_sec(time_extent[1])
 
     assert left_x is not None
     assert right_x is not None
+    assert float(plot_rect.left()) - 1.0 <= left_x <= float(plot_rect.right()) + 1.0
+    assert float(plot_rect.left()) - 1.0 <= right_x <= float(plot_rect.right()) + 1.0
 
     frame_px = right_x - left_x
     assert abs(box_rect.left() - left_x) <= frame_px
     assert abs(box_rect.right() - right_x) <= frame_px
+    _assert_box_matches_plot_bounds(module)
 
 
 def test_move_selection_to_track_x_uses_chart_inverse_mapping_for_visual_and_logical_alignment(

@@ -585,8 +585,10 @@ def test_stft_image_chart_widget_single_sample_frame_formula_remains_measurable(
         )
         qapp.processEvents()
 
+        plot_rect = widget.plot_area_rect_in_widget()
         time_extent = widget.rendered_time_extent_sec()
 
+        assert plot_rect is not None
         assert time_extent is not None
 
         left_x = widget.widget_x_for_time_sec(2.0)
@@ -594,6 +596,8 @@ def test_stft_image_chart_widget_single_sample_frame_formula_remains_measurable(
 
         assert left_x is not None
         assert right_x is not None
+        assert float(plot_rect.left()) - 1.0 <= left_x <= float(plot_rect.right()) + 1.0
+        assert float(plot_rect.left()) - 1.0 <= right_x <= float(plot_rect.right()) + 1.0
         assert right_x > left_x
     finally:
         widget.close()
@@ -1112,7 +1116,7 @@ def test_octave_bar_chart_widget_single_bar_uses_one_point_fallback(qapp):
         widget.close()
 
 
-def test_stft_image_chart_widget_zero_span_time_uses_payload_maximum_without_padding(qapp):
+def test_stft_image_chart_widget_zero_span_time_uses_rendered_extent_without_padding(qapp):
     widget = StftImageChartWidget()
 
     try:
@@ -1125,12 +1129,14 @@ def test_stft_image_chart_widget_zero_span_time_uses_payload_maximum_without_pad
         qapp.processEvents()
 
         x_range, _y_range = widget.plot_item.vb.viewRange()
-        assert x_range == pytest.approx((0.0, 5.0))
+        assert x_range == pytest.approx((0.0, 6.0))
     finally:
         widget.close()
 
 
-def test_stft_image_chart_widget_subunit_zero_span_uses_one_point_fallback(qapp):
+def test_stft_image_chart_widget_zero_span_subunit_uses_rendered_single_frame_extent(
+    qapp,
+):
     widget = StftImageChartWidget()
 
     try:
@@ -1142,12 +1148,12 @@ def test_stft_image_chart_widget_subunit_zero_span_uses_one_point_fallback(qapp)
         )
         qapp.processEvents()
 
-        _assert_xy_range(widget, (0.0, 1.0), (0.0, 1.0))
+        _assert_xy_range(widget, (0.0, 1.5), (0.0, 1.25))
     finally:
         widget.close()
 
 
-def test_stft_image_chart_widget_zero_span_frequency_uses_payload_maximum_without_padding(
+def test_stft_image_chart_widget_zero_span_frequency_uses_rendered_extent_without_padding(
     qapp,
 ):
     widget = StftImageChartWidget()
@@ -1162,7 +1168,7 @@ def test_stft_image_chart_widget_zero_span_frequency_uses_payload_maximum_withou
         qapp.processEvents()
 
         _x_range, y_range = widget.plot_item.vb.viewRange()
-        assert y_range == pytest.approx((0.0, 300.0))
+        assert y_range == pytest.approx((0.0, 301.0))
     finally:
         widget.close()
 
