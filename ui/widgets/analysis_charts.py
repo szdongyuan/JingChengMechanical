@@ -5,7 +5,7 @@ from typing import Iterable
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QRectF
+from PyQt6.QtCore import QRect, QRectF
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 pg.setConfigOptions(antialias=True, background="w", foreground="#334155")
@@ -153,6 +153,18 @@ class StftImageChartWidget(_BasePlotChart):
         payload["frequencies_hz"] = list(self._image_payload["frequencies_hz"])
         payload["magnitude_db"] = self._image_payload["magnitude_db"].copy()
         return payload
+
+    def plot_area_rect(self) -> QRect:
+        scene_rect = self.plot_item.vb.sceneBoundingRect()
+        if scene_rect.isEmpty():
+            return QRect()
+        return self.plot_widget.mapFromScene(scene_rect).boundingRect()
+
+    def rendered_time_extent(self) -> tuple[float, float] | None:
+        if self._image_payload is None:
+            return None
+        x_range, _ = self.plot_item.vb.viewRange()
+        return (float(x_range[0]), float(x_range[1]))
 
     def _image_rect(self) -> QRectF:
         assert self._image_payload is not None

@@ -206,6 +206,50 @@ def test_stft_image_chart_widget_image_payload_returns_defensive_copies(qapp):
     )
 
 
+def test_stft_image_chart_widget_exposes_plot_area_rect_for_overlay_geometry(qapp):
+    widget = StftImageChartWidget()
+
+    try:
+        widget.resize(640, 480)
+        widget.show()
+        widget.set_image(
+            times_sec=[0.0, 0.5, 1.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0, 2.0, 3.0], [3.5, 4.5, 5.5]]),
+        )
+        qapp.processEvents()
+
+        expected_rect = widget.plot_widget.mapFromScene(
+            widget.plot_item.vb.sceneBoundingRect()
+        ).boundingRect()
+
+        assert widget.plot_area_rect() == expected_rect
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_exposes_rendered_time_extent(qapp):
+    widget = StftImageChartWidget()
+
+    try:
+        widget.resize(640, 480)
+        widget.show()
+        widget.set_image(
+            times_sec=[0.0, 0.5, 1.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0, 2.0, 3.0], [3.5, 4.5, 5.5]]),
+        )
+        qapp.processEvents()
+
+        expected_extent = tuple(widget.plot_item.vb.viewRange()[0])
+
+        assert widget.rendered_time_extent() == pytest.approx(expected_extent)
+        assert widget.rendered_time_extent()[0] <= 0.0
+        assert widget.rendered_time_extent()[1] >= 1.0
+    finally:
+        widget.close()
+
+
 def test_line_chart_widget_accepts_limit_lines(qapp):
     widget = LineChartWidget()
 
