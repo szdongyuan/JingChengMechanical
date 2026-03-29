@@ -582,12 +582,13 @@ def test_selection_box_rendered_width_matches_exact_mapped_time_span_within_fram
     module, services = _make_module()
     module.selected_display_channel_provider = lambda: 0
     _show(module, qapp)
+    rendered_times = (0.0, 0.5, 1.0)
     _seed_stft_history(
         module,
         services,
         qapp,
         channel_index=0,
-        times=(0.0, 0.5, 1.0),
+        times=rendered_times,
         magnitudes=((1.0, 2.0), (3.0, 4.0), (5.0, 6.0)),
     )
 
@@ -603,20 +604,30 @@ def test_selection_box_rendered_width_matches_exact_mapped_time_span_within_fram
     qapp.processEvents()
 
     heatmap_rect = module.canvas.heatmap.geometry()
-    left_x = module.canvas.heatmap.widget_x_for_time_sec(0.0)
-    frame_step_x = module.canvas.heatmap.widget_x_for_time_sec(0.25)
-    right_x = module.canvas.heatmap.widget_x_for_time_sec(1.0)
+    rendered_sample_x = [
+        module.canvas.heatmap.widget_x_for_time_sec(time_sec)
+        for time_sec in rendered_times
+    ]
     box_rect = module.selection_box.geometry()
 
     assert heatmap_rect.x() == 0
     assert heatmap_rect.y() == 0
+    assert all(sample_x is not None for sample_x in rendered_sample_x)
+
+    left_x = rendered_sample_x[0]
+    right_x = rendered_sample_x[-1]
     assert left_x is not None
-    assert frame_step_x is not None
     assert right_x is not None
 
     consecutive_frame_px = [
-        frame_step_x - left_x,
-        right_x - frame_step_x,
+        right_sample_x - left_sample_x
+        for left_sample_x, right_sample_x in zip(
+            rendered_sample_x,
+            rendered_sample_x[1:],
+        )
+        if left_sample_x is not None
+        and right_sample_x is not None
+        and right_sample_x > left_sample_x
     ]
     frame_px = min(delta for delta in consecutive_frame_px if delta > 0.0)
 
