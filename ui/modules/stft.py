@@ -221,12 +221,26 @@ class StftModule(QWidget):
             return False
 
         plot_rect = geometry.plot_rect
-        left_px = max(float(plot_rect.left()), min(float(left_px), float(plot_rect.right())))
-        start_sec = self.canvas.heatmap.time_sec_for_widget_x(
-            left_px - float(geometry.heatmap_rect.left())
-        )
-        if start_sec is None:
+        duration = self._selected_window[1] - self._selected_window[0]
+        start_bounds = self._selection_start_bounds(duration, geometry=geometry)
+        if start_bounds is None:
             return False
+        min_start_sec, max_start_sec = start_bounds
+
+        requested_left_px = float(left_px)
+        plot_left = float(plot_rect.left())
+        plot_right = float(plot_rect.right())
+        if requested_left_px <= plot_left:
+            start_sec = min_start_sec
+        elif requested_left_px >= plot_right and max_start_sec is not None:
+            start_sec = max_start_sec
+        else:
+            clamped_left_px = max(plot_left, min(requested_left_px, plot_right))
+            start_sec = self.canvas.heatmap.time_sec_for_widget_x(
+                clamped_left_px - float(geometry.heatmap_rect.left())
+            )
+            if start_sec is None:
+                return False
         return self._move_selection_to_start(start_sec, geometry=geometry)
 
     def is_selection_movable(self) -> bool:

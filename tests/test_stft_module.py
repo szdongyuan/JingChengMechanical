@@ -781,6 +781,38 @@ def test_move_selection_to_track_x_clamps_to_plot_start_when_plot_starts_after_z
     _assert_selection_box_matches_selected_window(module)
 
 
+def test_move_selection_to_track_x_clamps_to_zero_start_on_zero_based_plot(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0, 3.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            captured_duration_sec=5.0,
+            run_id="run-101",
+            default_window=FactoryReviewWindow(start_sec=0.0, end_sec=2.0),
+            judgment_payload={"overall": "合格", "analysis_window": (0.0, 2.0)},
+        ),
+    )
+    qapp.processEvents()
+
+    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
+
+    assert plot_rect is not None
+    assert module.move_selection_to_track_x(plot_rect.left() - 100.0) is True
+    assert module.selected_window == (0.0, 2.0)
+    _assert_selection_box_matches_selected_window(module)
+
+
 def test_move_selection_to_start_rerenders_box_to_exact_chart_mapped_positions(qapp):
     module, services = _make_module()
     module.selected_display_channel_provider = lambda: 0
