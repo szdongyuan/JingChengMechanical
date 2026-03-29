@@ -141,6 +141,53 @@ def _make_review_payload(
     )
 
 
+def _seed_stft_history(
+    module,
+    services,
+    qapp,
+    *,
+    displayed_config_id: int = 101,
+    run_id: str | None = None,
+    channel_index: int = 0,
+    times: tuple[float, ...] = (0.0, 1.0, 2.0, 3.0, 4.0, 5.0),
+    magnitudes: tuple[tuple[float, ...], ...] | None = None,
+) -> None:
+    if run_id is None:
+        run_id = f"run-{displayed_config_id}"
+    if magnitudes is None:
+        magnitudes = tuple(
+            (float((index * 2) + 1), float((index * 2) + 2))
+            for index in range(len(times))
+        )
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=displayed_config_id,
+            run_phase="running",
+            trigger_source="manual",
+        )
+    )
+    for time, magnitude_values in zip(times, magnitudes):
+        services.bus.stft_updated.emit(
+            displayed_config_id,
+            run_id,
+            channel_index,
+            _make_stft_frame(time=time, magnitudes=magnitude_values),
+        )
+    qapp.processEvents()
+
+
+def _assert_box_matches_plot_bounds(module) -> None:
+    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
+    box_rect = module.selection_box.geometry()
+
+    assert plot_rect is not None
+    assert box_rect.left() >= plot_rect.left()
+    assert box_rect.right() <= plot_rect.right()
+    assert box_rect.top() == plot_rect.top()
+    assert box_rect.bottom() == plot_rect.bottom()
+
+
 def test_stft_module_keeps_live_frames_visible_in_review_without_chart_payload(qapp):
     module, services = _make_module()
     module.selected_display_channel_provider = lambda: 1
@@ -252,7 +299,9 @@ def test_stft_module_clears_when_selected_channel_has_no_cached_frames_yet(qapp)
 
 def test_review_success_shows_analysis_box_from_automatic_window_with_fixed_duration(qapp):
     module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
     _show(module, qapp)
+    _seed_stft_history(module, services, qapp, channel_index=0)
 
     _emit_reviewing(
         module,
@@ -277,7 +326,15 @@ def test_review_success_shows_analysis_box_from_automatic_window_with_fixed_dura
 
 def test_auto_analysis_failure_uses_first_valid_manual_window_when_reanalysis_is_allowed(qapp):
     module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
     _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0, 3.0),
+    )
 
     _emit_reviewing(
         module,
@@ -346,7 +403,9 @@ def test_analysis_controls_follow_review_only_visibility_rule(
     button_enabled,
 ):
     module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
     _show(module, qapp)
+    _seed_stft_history(module, services, qapp, channel_index=0)
     payload = _make_review_payload(
         judgment_payload={
             "overall": "合格",
@@ -365,7 +424,9 @@ def test_analysis_controls_follow_review_only_visibility_rule(
 
 def test_analysis_action_clamps_selection_to_audio_bounds_without_local_reset_hacks(qapp):
     module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
     _show(module, qapp)
+    _seed_stft_history(module, services, qapp, channel_index=0)
 
     _emit_reviewing(
         module,
@@ -389,38 +450,475 @@ def test_analysis_action_clamps_selection_to_audio_bounds_without_local_reset_ha
     assert len(services.bus.factory_display_reset.emissions) == reset_event_count
 
 
-def test_move_selection_to_track_x_uses_track_mapping_and_audio_clamping(qapp):
+def test_selection_box_left_edge_stays_at_or_right_of_plot_zero_time(qapp):
     module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
     _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0, 3.0),
+    )
 
     _emit_reviewing(
         module,
         services,
         _make_review_payload(
-            judgment_payload={
-                "overall": "合格",
-                "analysis_window": (1.0, 3.0),
-            }
+            run_id="run-101",
+            default_window=FactoryReviewWindow(start_sec=0.0, end_sec=3.0),
+            judgment_payload={"overall": "合格", "analysis_window": (0.0, 3.0)},
         ),
     )
-    track = module._track_rect()
+    qapp.processEvents()
 
-    moved = module.move_selection_to_track_x(track.left() + track.width() / 4.0)
+    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
+    box_rect = module.selection_box.geometry()
 
-    assert moved is True
-    assert module.selected_window == pytest.approx((1.25, 3.25))
+    assert plot_rect is not None
+    assert box_rect.left() >= plot_rect.left()
 
-    clamped = module.move_selection_to_track_x(track.right() + 100.0)
 
-    assert clamped is True
-    assert module.selected_window == pytest.approx((3.0, 5.0))
+def test_selection_box_height_matches_plot_area_and_does_not_extend_below_it(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0, 3.0, 4.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            run_id="run-101",
+            default_window=FactoryReviewWindow(start_sec=1.0, end_sec=4.0),
+            judgment_payload={"overall": "合格", "analysis_window": (1.0, 4.0)},
+        ),
+    )
+    qapp.processEvents()
+
+    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
+    box_rect = module.selection_box.geometry()
+
+    assert plot_rect is not None
+    assert box_rect.top() == plot_rect.top()
+    assert box_rect.height() == plot_rect.height()
+    assert box_rect.bottom() == plot_rect.bottom()
+
+
+def test_selection_box_rendered_width_matches_selected_duration_within_frame_tolerance(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 0.5, 1.0),
+        magnitudes=((1.0, 2.0), (3.0, 4.0), (5.0, 6.0)),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            run_id="run-101",
+            default_window=FactoryReviewWindow(start_sec=0.0, end_sec=1.0),
+            judgment_payload={"overall": "合格", "analysis_window": (0.0, 1.0)},
+        ),
+    )
+    qapp.processEvents()
+
+    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
+    time_extent = module.canvas.heatmap.rendered_time_extent_sec()
+    box_rect = module.selection_box.geometry()
+
+    assert plot_rect is not None
+    assert time_extent is not None
+
+    pixels_per_second = plot_rect.width() / (time_extent[1] - time_extent[0])
+    rendered_column_width_px = 0.5 * pixels_per_second
+    ideal_left = plot_rect.left()
+    ideal_right = plot_rect.left() + (1.0 * pixels_per_second)
+
+    assert abs(box_rect.left() - ideal_left) <= rendered_column_width_px
+    assert abs(box_rect.right() - ideal_right) <= rendered_column_width_px
+    assert box_rect.right() <= plot_rect.right()
+
+
+def test_move_selection_to_track_x_cannot_move_selection_before_zero_or_past_latest_valid_start(
+    qapp,
+):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0, 3.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            captured_duration_sec=5.0,
+            run_id="run-101",
+            default_window=FactoryReviewWindow(start_sec=0.0, end_sec=2.0),
+            judgment_payload={"overall": "合格", "analysis_window": (0.0, 2.0)},
+        ),
+    )
+    qapp.processEvents()
+
+    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
+
+    assert plot_rect is not None
+    assert module.move_selection_to_track_x(plot_rect.left() - 100.0) is True
+    assert module.selected_window == pytest.approx((0.0, 2.0))
+
+    assert module.move_selection_to_track_x(plot_rect.right() + 100.0) is True
+    assert module.selected_window == pytest.approx((1.0, 3.0))
+
+
+def test_move_selection_to_track_x_clamps_to_captured_duration_when_capture_is_tighter_than_plot_extent(
+    qapp,
+):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0, 3.0, 4.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            captured_duration_sec=4.0,
+            run_id="run-101",
+            default_window=FactoryReviewWindow(start_sec=0.0, end_sec=2.0),
+            judgment_payload={"overall": "合格", "analysis_window": (0.0, 2.0)},
+        ),
+    )
+    qapp.processEvents()
+
+    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
+
+    assert plot_rect is not None
+    assert module.move_selection_to_track_x(plot_rect.right() + 100.0) is True
+    assert module.selected_window == pytest.approx((2.0, 4.0))
+
+
+def test_move_selection_to_track_x_clamps_to_plot_start_when_plot_starts_after_zero(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(2.0, 3.0, 4.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            captured_duration_sec=5.0,
+            run_id="run-101",
+            default_window=FactoryReviewWindow(start_sec=2.0, end_sec=3.0),
+            judgment_payload={"overall": "合格", "analysis_window": (2.0, 3.0)},
+        ),
+    )
+    qapp.processEvents()
+
+    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
+
+    assert plot_rect is not None
+    assert module.move_selection_to_track_x(plot_rect.left() - 100.0) is True
+    assert module.selected_window == pytest.approx((2.0, 3.0))
+
+
+def test_move_selection_to_start_clamps_to_captured_plot_intersection(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0, 3.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            captured_duration_sec=5.0,
+            run_id="run-101",
+            default_window=FactoryReviewWindow(start_sec=0.0, end_sec=2.0),
+            judgment_payload={"overall": "合格", "analysis_window": (0.0, 2.0)},
+        ),
+    )
+    qapp.processEvents()
+
+    assert module.move_selection_to_start(9.0) is True
+    assert module.selected_window == pytest.approx((1.0, 3.0))
+
+
+def test_preseeded_selection_box_render_clamps_to_latest_valid_start_inside_captured_plot_intersection(
+    qapp,
+):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0, 3.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            run_id="run-101",
+            captured_duration_sec=5.0,
+            default_window=FactoryReviewWindow(start_sec=2.5, end_sec=4.5),
+            judgment_payload={"overall": "合格", "analysis_window": (2.5, 4.5)},
+        ),
+    )
+    qapp.processEvents()
+
+    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
+    time_extent = module.canvas.heatmap.rendered_time_extent_sec()
+    box_rect = module.selection_box.geometry()
+
+    assert plot_rect is not None
+    assert time_extent is not None
+
+    pixels_per_second = plot_rect.width() / (time_extent[1] - time_extent[0])
+    rendered_column_width_px = 1.0 * pixels_per_second
+    ideal_left = plot_rect.left() + (1.0 * pixels_per_second)
+    ideal_right = plot_rect.left() + (3.0 * pixels_per_second)
+
+    assert module.selected_window == pytest.approx((1.0, 3.0))
+    assert abs(box_rect.left() - ideal_left) <= rendered_column_width_px
+    assert abs(box_rect.right() - ideal_right) <= rendered_column_width_px
+    assert box_rect.right() <= plot_rect.right()
+
+
+def test_selection_box_hides_when_no_full_duration_interval_exists_inside_captured_plot_intersection(
+    qapp,
+):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            run_id="run-101",
+            captured_duration_sec=5.0,
+            default_window=FactoryReviewWindow(start_sec=0.0, end_sec=2.0),
+            judgment_payload={"overall": "合格", "analysis_window": (0.0, 2.0)},
+        ),
+    )
+    qapp.processEvents()
+
+    assert module.selection_box.isVisible() is False
+    assert module.move_selection_to_track_x(999.0) is False
+
+
+def test_selection_box_hides_when_rendered_payload_is_unavailable_and_drag_is_noop(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            run_id="run-101",
+            judgment_payload={"overall": "合格", "analysis_window": (1.0, 3.0)},
+        ),
+    )
+    qapp.processEvents()
+
+    selected_before = module.selected_window
+    assert module.selection_box.isVisible() is True
+
+    module.canvas.heatmap.clear_data()
+    module._update_overlay_geometry()
+
+    assert module.selected_window == pytest.approx(selected_before)
+    assert module.selection_box.isVisible() is False
+    assert module.move_selection_to_track_x(250.0) is False
+    assert module.selected_window == pytest.approx(selected_before)
+
+
+def test_selection_box_hides_when_geometry_helper_reports_no_plot_rect_and_drag_is_noop(
+    qapp, monkeypatch
+):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            run_id="run-101",
+            judgment_payload={"overall": "合格", "analysis_window": (1.0, 3.0)},
+        ),
+    )
+    qapp.processEvents()
+
+    selected_before = module.selected_window
+    assert module.selection_box.isVisible() is True
+
+    monkeypatch.setattr(module, "_current_overlay_geometry", lambda: None)
+    module._update_overlay_geometry()
+
+    assert module.selected_window == pytest.approx(selected_before)
+    assert module.selection_box.isVisible() is False
+    assert module.move_selection_to_track_x(250.0) is False
+    assert module.selected_window == pytest.approx(selected_before)
+
+
+def test_selection_box_hides_when_plot_widget_is_hidden_and_recovers_after_show(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            run_id="run-101",
+            default_window=FactoryReviewWindow(start_sec=0.5, end_sec=1.5),
+            judgment_payload={"overall": "合格", "analysis_window": (0.5, 1.5)},
+        ),
+    )
+    qapp.processEvents()
+
+    selected_before = module.selected_window
+    assert module.selection_box.isVisible() is True
+
+    module.canvas.heatmap.plot_widget.hide()
+    qapp.processEvents()
+    module._update_overlay_geometry()
+
+    assert module.selection_box.isVisible() is False
+    assert module.move_selection_to_track_x(250.0) is False
+    assert module.selected_window == pytest.approx(selected_before)
+
+    module.canvas.heatmap.plot_widget.show()
+    qapp.processEvents()
+    module._update_overlay_geometry()
+
+    assert module.selection_box.isVisible() is True
+    assert module.selected_window == pytest.approx(selected_before)
+    _assert_box_matches_plot_bounds(module)
+
+
+def test_selection_box_rerenders_same_selected_window_after_geometry_returns(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            run_id="run-101",
+            default_window=FactoryReviewWindow(start_sec=0.5, end_sec=1.5),
+            judgment_payload={"overall": "合格", "analysis_window": (0.5, 1.5)},
+        ),
+    )
+    qapp.processEvents()
+
+    selected_before = module.selected_window
+    assert module.selection_box.isVisible() is True
+
+    module.canvas.heatmap.clear_data()
+    module._update_overlay_geometry()
+
+    assert module.selection_box.isVisible() is False
+
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        0,
+        _make_stft_frame(time=3.0, magnitudes=(7.0, 8.0)),
+    )
+    qapp.processEvents()
+
+    assert module.selected_window == pytest.approx(selected_before)
+    assert module.selection_box.isVisible() is True
+    _assert_box_matches_plot_bounds(module)
 
 
 def test_clicking_analysis_preserves_selection_when_controller_clears_review_then_enters_reanalysis(
     qapp,
 ):
     module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
     _show(module, qapp)
+    _seed_stft_history(module, services, qapp, channel_index=0)
     payload = _make_review_payload(
         judgment_payload={
             "overall": "合格",
@@ -462,7 +960,9 @@ def test_clicking_analysis_preserves_selection_when_controller_clears_review_the
 
 def test_reanalysis_failure_keeps_box_visible_and_locked_until_reviewing_unlocks_again(qapp):
     module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
     _show(module, qapp)
+    _seed_stft_history(module, services, qapp, channel_index=0)
 
     _emit_reviewing(
         module,
@@ -518,7 +1018,9 @@ def test_reanalysis_failure_keeps_box_visible_and_locked_until_reviewing_unlocks
 
 def test_reanalysis_success_payload_reseeds_selection_from_controller_window_after_unlock(qapp):
     module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
     _show(module, qapp)
+    _seed_stft_history(module, services, qapp, channel_index=0)
 
     _emit_reviewing(
         module,
@@ -570,7 +1072,9 @@ def test_reanalysis_success_payload_reseeds_selection_from_controller_window_aft
 
 def test_display_reset_clears_selection_and_hides_manual_controls(qapp):
     module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
     _show(module, qapp)
+    _seed_stft_history(module, services, qapp, channel_index=0)
 
     _emit_reviewing(
         module,

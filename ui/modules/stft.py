@@ -50,6 +50,13 @@ class _StftCacheEntry:
         }
 
 
+@dataclass(frozen=True)
+class _OverlayGeometry:
+    plot_rect: QRect
+    rendered_start_sec: float
+    rendered_end_sec: float
+
+
 class _AnalysisSelectionBox(QFrame):
     def __init__(self, owner: "StftModule"):
         super().__init__(owner.canvas)
@@ -116,7 +123,6 @@ class StftModule(QWidget):
     module_id = "stft"
     _DISPLAY_PHASES = frozenset({"running", "analyzing", "reviewing", "reanalyzing"})
     _REVIEW_PHASES = frozenset({"reviewing", "reanalyzing"})
-    _SELECTION_MARGIN_PX = 12
 
     def __init__(self, services):
         super().__init__()
@@ -196,35 +202,28 @@ class StftModule(QWidget):
 
     def refresh_selected_display_channel(self) -> None:
         self._refresh_cached_rendering()
+        self._update_overlay_geometry()
 
     def move_selection_to_start(self, start_sec: float) -> bool:
         if not self.is_selection_movable() or self._selected_window is None:
             return False
 
-        duration = self._selected_window[1] - self._selected_window[0]
-        captured_duration_sec = self._captured_duration_sec()
-        if duration <= 0 or captured_duration_sec is None or captured_duration_sec < duration:
-            return False
-
-        clamped_start = max(0.0, min(float(start_sec), captured_duration_sec - duration))
-        self._selected_window = (clamped_start, clamped_start + duration)
-        self._update_overlay_geometry()
-        return True
+        return self._move_selection_to_start(
+            start_sec,
+            geometry=self._current_overlay_geometry(),
+        )
 
     def move_selection_to_track_x(self, left_px: float) -> bool:
-        track = self._track_rect()
-        captured_duration_sec = self._captured_duration_sec()
-        if (
-            self._selected_window is None
-            or track.width() <= 0
-            or captured_duration_sec is None
-            or captured_duration_sec <= 0
-        ):
+        geometry = self._current_overlay_geometry()
+        if self._selected_window is None or geometry is None:
             return False
 
-        left_px = max(float(track.left()), min(float(left_px), float(track.right())))
-        start_ratio = (left_px - float(track.left())) / float(track.width())
-        return self.move_selection_to_start(start_ratio * captured_duration_sec)
+        plot_rect = geometry.plot_rect
+        left_px = max(float(plot_rect.left()), min(float(left_px), float(plot_rect.right())))
+        rendered_duration_sec = geometry.rendered_end_sec - geometry.rendered_start_sec
+        start_ratio = (left_px - float(plot_rect.left())) / float(plot_rect.width())
+        start_sec = geometry.rendered_start_sec + (start_ratio * rendered_duration_sec)
+        return self._move_selection_to_start(start_sec, geometry=geometry)
 
     def is_selection_movable(self) -> bool:
         return (
@@ -319,6 +318,7 @@ class StftModule(QWidget):
         if run_id != self._display_run_id:
             return
         self._refresh_cached_rendering()
+        self._update_overlay_geometry()
 
     def _begin_reanalysis(self):
         if self._selected_window is None or not self.is_selection_movable():
@@ -454,25 +454,47 @@ class StftModule(QWidget):
         if not has_selection:
             return
 
-        track = self._track_rect()
-        captured_duration_sec = self._captured_duration_sec()
-        if track.width() <= 0 or track.height() <= 0 or captured_duration_sec is None:
+        geometry = self._current_overlay_geometry()
+        if geometry is None:
             self.selection_box.hide()
             self.analyze_button.hide()
             return
 
-        start_sec, end_sec = self._selected_window
-        duration = end_sec - start_sec
-        if duration <= 0 or captured_duration_sec < duration:
+        normalized_window = self._normalized_selection_window(
+            self._selected_window,
+            geometry=geometry,
+        )
+        if normalized_window is None:
             self.selection_box.hide()
             self.analyze_button.hide()
             return
+        self._selected_window = normalized_window
 
-        left = int(round(track.left() + (start_sec / captured_duration_sec) * track.width()))
-        width = max(1, int(round((duration / captured_duration_sec) * track.width())))
-        max_left = track.right() - width + 1
-        left = max(track.left(), min(left, max_left))
-        self.selection_box.setGeometry(left, track.top(), width, track.height())
+        plot_rect = geometry.plot_rect
+        start_sec, end_sec = normalized_window
+        rendered_duration_sec = geometry.rendered_end_sec - geometry.rendered_start_sec
+        left = int(
+            round(
+                plot_rect.left()
+                + (
+                    (start_sec - geometry.rendered_start_sec) / rendered_duration_sec
+                )
+                * plot_rect.width()
+            )
+        )
+        right = int(
+            round(
+                plot_rect.left()
+                + (
+                    (end_sec - geometry.rendered_start_sec) / rendered_duration_sec
+                )
+                * plot_rect.width()
+            )
+        )
+        width = max(1, right - left)
+        max_left = plot_rect.right() - width + 1
+        left = max(plot_rect.left(), min(left, max_left))
+        self.selection_box.setGeometry(left, plot_rect.top(), width, plot_rect.height())
 
         if not button_visible:
             return
@@ -481,9 +503,12 @@ class StftModule(QWidget):
         button_width = max(button_size.width() + 6, 58)
         button_height = button_size.height()
         button_x = left + width + 8
-        if button_x + button_width > track.right() + 1:
-            button_x = max(track.left(), left - button_width - 8)
-        button_y = max(track.top(), min(track.top() + 8, track.bottom() - button_height + 1))
+        if button_x + button_width > plot_rect.right() + 1:
+            button_x = max(plot_rect.left(), left - button_width - 8)
+        button_y = max(
+            plot_rect.top(),
+            min(plot_rect.top() + 8, plot_rect.bottom() - button_height + 1),
+        )
         self.analyze_button.setGeometry(button_x, button_y, button_width, button_height)
 
     def _update_selection_cursor(self) -> None:
@@ -492,13 +517,108 @@ class StftModule(QWidget):
         else:
             self.selection_box.setCursor(Qt.CursorShape.ArrowCursor)
 
-    def _track_rect(self) -> QRect:
-        return self.canvas.rect().adjusted(
-            self._SELECTION_MARGIN_PX,
-            self._SELECTION_MARGIN_PX,
-            -self._SELECTION_MARGIN_PX,
-            -self._SELECTION_MARGIN_PX,
+    def _current_overlay_geometry(self) -> _OverlayGeometry | None:
+        plot_rect = self.canvas.heatmap.plot_area_rect_in_widget()
+        if plot_rect is None or plot_rect.width() <= 0 or plot_rect.height() <= 0:
+            return None
+
+        rendered_time_extent_sec = self.canvas.heatmap.rendered_time_extent_sec()
+        if rendered_time_extent_sec is None:
+            return None
+
+        rendered_start_sec, rendered_end_sec = rendered_time_extent_sec
+        if rendered_end_sec <= rendered_start_sec:
+            return None
+
+        return _OverlayGeometry(
+            plot_rect=QRect(plot_rect),
+            rendered_start_sec=float(rendered_start_sec),
+            rendered_end_sec=float(rendered_end_sec),
         )
+
+    def _move_selection_to_start(
+        self,
+        start_sec: float,
+        *,
+        geometry: _OverlayGeometry | None,
+    ) -> bool:
+        if not self.is_selection_movable() or self._selected_window is None:
+            return False
+
+        duration = self._selected_window[1] - self._selected_window[0]
+        normalized_window = self._normalized_selection_window(
+            (float(start_sec), float(start_sec) + duration),
+            geometry=geometry,
+        )
+        if normalized_window is None:
+            return False
+
+        self._selected_window = normalized_window
+        self._update_overlay_geometry()
+        return True
+
+    def _normalized_selection_window(
+        self,
+        window: tuple[float, float] | None,
+        *,
+        geometry: _OverlayGeometry | None,
+    ) -> tuple[float, float] | None:
+        if window is None:
+            return None
+
+        try:
+            start_sec = float(window[0])
+            end_sec = float(window[1])
+        except (TypeError, ValueError):
+            return None
+
+        duration = end_sec - start_sec
+        if duration <= 0:
+            return None
+
+        start_bounds = self._selection_start_bounds(duration, geometry=geometry)
+        if start_bounds is None:
+            return None
+
+        min_start_sec, max_start_sec = start_bounds
+        clamped_start_sec = max(min_start_sec, start_sec)
+        if max_start_sec is not None:
+            clamped_start_sec = min(clamped_start_sec, max_start_sec)
+        return (clamped_start_sec, clamped_start_sec + duration)
+
+    def _selection_start_bounds(
+        self,
+        duration_sec: float,
+        *,
+        geometry: _OverlayGeometry | None,
+    ) -> tuple[float, float | None] | None:
+        if duration_sec <= 0:
+            return None
+
+        min_start_sec = 0.0
+        max_end_sec: float | None = None
+
+        captured_duration_sec = self._captured_duration_sec()
+        if captured_duration_sec is not None:
+            if captured_duration_sec < duration_sec:
+                return None
+            max_end_sec = captured_duration_sec
+
+        if geometry is not None:
+            min_start_sec = max(min_start_sec, geometry.rendered_start_sec)
+            max_end_sec = (
+                geometry.rendered_end_sec
+                if max_end_sec is None
+                else min(max_end_sec, geometry.rendered_end_sec)
+            )
+
+        if max_end_sec is None:
+            return (min_start_sec, None)
+
+        max_start_sec = max_end_sec - duration_sec
+        if max_start_sec < min_start_sec:
+            return None
+        return (min_start_sec, max_start_sec)
 
     def _has_display_context(self) -> bool:
         return (
