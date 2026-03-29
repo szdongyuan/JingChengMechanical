@@ -5,7 +5,7 @@ from typing import Iterable
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QRect, QRectF
+from PyQt6.QtCore import QPointF, QRect, QRectF
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 pg.setConfigOptions(antialias=True, background="w", foreground="#334155")
@@ -69,6 +69,21 @@ def _clear_error_bar_item(item: pg.ErrorBarItem) -> None:
     item.setData(x=None, y=None, top=None, bottom=None, beam=None)
 
 
+def _visible_axis_max(values: Iterable[float] | None) -> float:
+    if values is None:
+        return 1.0
+
+    normalized = [float(value) for value in values]
+    if not normalized:
+        return 1.0
+
+    payload_min = min(normalized)
+    payload_max = max(normalized)
+    if payload_max <= 0.0 or np.isclose(payload_min, payload_max):
+        return max(payload_max, 1.0)
+    return payload_max
+
+
 class _BasePlotChart(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -84,6 +99,13 @@ class _BasePlotChart(QWidget):
 
         self.plot_item = self.plot_widget.getPlotItem()
         self.plot_item.showGrid(x=True, y=True, alpha=0.18)
+        self._apply_x_axis_policy(payload_values=None)
+
+    def _apply_x_axis_policy(self, *, payload_values: Iterable[float] | None) -> None:
+        visible_max = _visible_axis_max(payload_values)
+        view_box = self.plot_item.vb
+        view_box.enableAutoRange(axis=pg.ViewBox.XAxis, enable=False)
+        view_box.setXRange(0.0, visible_max, padding=0.0)
 
 
 class StftImageChartWidget(_BasePlotChart):
@@ -108,6 +130,7 @@ class StftImageChartWidget(_BasePlotChart):
         self.plot_item.addItem(self._image_item)
         self.plot_item.setLabel("bottom", "Time", units="s")
         self.plot_item.setLabel("left", "Frequency", units="Hz")
+        self._apply_stft_y_axis_policy(payload_values=None)
 
     def set_image(
         self,
@@ -137,10 +160,22 @@ class StftImageChartWidget(_BasePlotChart):
 
         self._image_item.setImage(normalized_image, autoLevels=True)
         self._image_item.setRect(self._image_rect())
+        rendered_rect = self._rendered_image_rect()
+        if rendered_rect is None:
+            x_axis_values = normalized_times
+            y_axis_values = normalized_frequencies
+        else:
+            x_axis_values = (float(rendered_rect.left()), float(rendered_rect.right()))
+            y_axis_values = (float(rendered_rect.top()), float(rendered_rect.bottom()))
+
+        self._apply_x_axis_policy(payload_values=x_axis_values)
+        self._apply_stft_y_axis_policy(payload_values=y_axis_values)
 
     def clear_data(self) -> None:
         self._image_payload = None
         self._image_item.clear()
+        self._apply_x_axis_policy(payload_values=None)
+        self._apply_stft_y_axis_policy(payload_values=None)
 
     def has_image(self) -> bool:
         return self._image_payload is not None
@@ -187,6 +222,48 @@ class StftImageChartWidget(_BasePlotChart):
             return None
         return (float(rendered_rect.left()), float(rendered_rect.right()))
 
+    def widget_x_for_time_sec(self, time_sec: float) -> float | None:
+        mapping_context = self._stft_mapping_context()
+        if mapping_context is None:
+            return None
+
+        view_y, _device_y = mapping_context
+        device_point = self.plot_item.vb.mapViewToDevice(
+            QPointF(float(time_sec), view_y)
+        )
+        device_x = float(device_point.x())
+        if not np.isfinite(device_x):
+            return None
+        return device_x + float(self.plot_widget.x())
+
+    def time_sec_for_widget_x(self, widget_x: float) -> float | None:
+        mapping_context = self._stft_mapping_context()
+        if mapping_context is None:
+            return None
+
+        _view_y, device_y = mapping_context
+        widget_x_value = float(widget_x)
+        if not np.isfinite(widget_x_value):
+            return None
+
+        view_point = self.plot_item.vb.mapDeviceToView(
+            QPointF(widget_x_value - float(self.plot_widget.x()), device_y)
+        )
+        time_sec = float(view_point.x())
+        if not np.isfinite(time_sec):
+            return None
+        return time_sec
+
+    def _apply_stft_y_axis_policy(
+        self,
+        *,
+        payload_values: Iterable[float] | None,
+    ) -> None:
+        visible_max = _visible_axis_max(payload_values)
+        view_box = self.plot_item.vb
+        view_box.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
+        view_box.setYRange(0.0, visible_max, padding=0.0)
+
     def _image_rect(self) -> QRectF:
         assert self._image_payload is not None
         times_sec = self._image_payload["times_sec"]
@@ -210,6 +287,22 @@ class StftImageChartWidget(_BasePlotChart):
         if rendered_rect.isEmpty() or rendered_rect.width() <= 0:
             return None
         return rendered_rect
+
+    def _stft_mapping_context(self) -> tuple[float, float] | None:
+        if self.plot_area_rect_in_widget() is None:
+            return None
+
+        rendered_rect = self._rendered_image_rect()
+        if rendered_rect is None:
+            return None
+
+        view_y = float(rendered_rect.center().y())
+        reference_view = rendered_rect.center()
+        reference_device = self.plot_item.vb.mapViewToDevice(reference_view)
+        device_y = float(reference_device.y())
+        if not np.isfinite(view_y) or not np.isfinite(device_y):
+            return None
+        return (view_y, device_y)
 
 
 class LineChartWidget(_BasePlotChart):
@@ -255,14 +348,22 @@ class LineChartWidget(_BasePlotChart):
         }
 
         self._curve.setData(normalized_x, normalized_y)
-        self._update_limit_line(self._lower_limit_line, self._series_payload["lower_limit"])
-        self._update_limit_line(self._upper_limit_line, self._series_payload["upper_limit"])
+        self._update_limit_line(
+            self._lower_limit_line,
+            self._series_payload["lower_limit"],
+        )
+        self._update_limit_line(
+            self._upper_limit_line,
+            self._series_payload["upper_limit"],
+        )
+        self._apply_x_axis_policy(payload_values=normalized_x)
 
     def clear_data(self) -> None:
         self._series_payload = None
         self._curve.setData([], [])
         self._lower_limit_line.hide()
         self._upper_limit_line.hide()
+        self._apply_x_axis_policy(payload_values=None)
 
     def has_series(self) -> bool:
         return self._series_payload is not None
@@ -314,6 +415,7 @@ class FftLineChartWidget(LineChartWidget):
             x_values=[band["freq_hz"] for band in normalized_limit_bands],
             limit_bands=normalized_limit_bands,
         )
+        self._apply_x_axis_policy(payload_values=normalized_frequencies)
 
     def clear_data(self) -> None:
         _clear_error_bar_item(self._band_range_item)
@@ -413,6 +515,7 @@ class OctaveBarChartWidget(_BasePlotChart):
             ),
             limit_bands=normalized_limit_bands,
         )
+        self._apply_x_axis_policy(payload_values=x_values.tolist())
 
     def clear_data(self) -> None:
         self._band_payload = None
@@ -420,6 +523,7 @@ class OctaveBarChartWidget(_BasePlotChart):
         self._band_marker_item.setData([])
         self._replace_bar_item(x=np.array([], dtype=float), heights=np.array([], dtype=float))
         self.plot_item.getAxis("bottom").setTicks(None)
+        self._apply_x_axis_policy(payload_values=None)
 
     def has_bars(self) -> bool:
         return self._band_payload is not None

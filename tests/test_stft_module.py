@@ -9,6 +9,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtCore import QPoint, QPointF, Qt
 from PyQt6.QtWidgets import QApplication
 
 from app.service.analysis.frames import StftFrame
@@ -193,41 +194,27 @@ def _assert_selection_box_matches_selected_window(
     *,
     tolerance_px: int = 1,
 ) -> None:
-    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
-    time_extent = module.canvas.heatmap.rendered_time_extent_sec()
-    box_rect = module.selection_box.geometry()
     selected_window = module.selected_window
+    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
+    box_rect = module.selection_box.geometry()
+    heatmap_rect = module.canvas.heatmap.geometry()
 
     assert selected_window is not None
     assert plot_rect is not None
-    assert time_extent is not None
+    assert heatmap_rect.x() == 0
+    assert heatmap_rect.y() == 0
+    assert heatmap_rect.size() == module.canvas.rect().size()
 
-    rendered_start_sec, rendered_end_sec = time_extent
-    rendered_duration_sec = rendered_end_sec - rendered_start_sec
+    start_sec, end_sec = selected_window
+    expected_left = module.canvas.heatmap.widget_x_for_time_sec(start_sec)
+    expected_right = module.canvas.heatmap.widget_x_for_time_sec(end_sec)
 
-    assert rendered_duration_sec > 0
-
-    expected_left = round(
-        plot_rect.left()
-        + (
-            (selected_window[0] - rendered_start_sec) / rendered_duration_sec
-        )
-        * plot_rect.width()
-    )
-    expected_right = round(
-        plot_rect.left()
-        + (
-            (selected_window[1] - rendered_start_sec) / rendered_duration_sec
-        )
-        * plot_rect.width()
-    )
-    expected_width = max(1, expected_right - expected_left)
-
-    assert abs(box_rect.left() - expected_left) <= tolerance_px
-    assert abs(box_rect.width() - expected_width) <= tolerance_px
-    assert abs((box_rect.right() + 1) - expected_right) <= tolerance_px
+    assert expected_left is not None
+    assert expected_right is not None
+    assert box_rect.left() == pytest.approx(expected_left, abs=tolerance_px)
+    assert box_rect.right() == pytest.approx(expected_right, abs=tolerance_px)
     assert box_rect.top() == plot_rect.top()
-    assert box_rect.height() == plot_rect.height()
+    assert box_rect.bottom() == plot_rect.bottom()
 
 
 def test_stft_module_keeps_live_frames_visible_in_review_without_chart_payload(qapp):
@@ -493,7 +480,7 @@ def test_analysis_action_clamps_selection_to_audio_bounds_without_local_reset_ha
     assert len(services.bus.factory_display_reset.emissions) == reset_event_count
 
 
-def test_selection_box_left_edge_stays_at_or_right_of_plot_zero_time(qapp):
+def test_selection_box_left_edge_aligns_to_exact_plotted_zero_time_position(qapp):
     module, services = _make_module()
     module.selected_display_channel_provider = lambda: 0
     _show(module, qapp)
@@ -516,11 +503,45 @@ def test_selection_box_left_edge_stays_at_or_right_of_plot_zero_time(qapp):
     )
     qapp.processEvents()
 
-    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
-    box_rect = module.selection_box.geometry()
+    heatmap_rect = module.canvas.heatmap.geometry()
+    left_x = module.canvas.heatmap.widget_x_for_time_sec(0.0)
 
-    assert plot_rect is not None
-    assert box_rect.left() >= plot_rect.left()
+    assert heatmap_rect.x() == 0
+    assert heatmap_rect.y() == 0
+    assert left_x is not None
+    assert module.selection_box.geometry().left() == pytest.approx(left_x, abs=1.0)
+
+
+def test_selection_box_right_edge_aligns_to_exact_plotted_window_end_position(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0, 3.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            run_id="run-101",
+            default_window=FactoryReviewWindow(start_sec=0.0, end_sec=3.0),
+            judgment_payload={"overall": "合格", "analysis_window": (0.0, 3.0)},
+        ),
+    )
+    qapp.processEvents()
+
+    heatmap_rect = module.canvas.heatmap.geometry()
+    right_x = module.canvas.heatmap.widget_x_for_time_sec(3.0)
+
+    assert heatmap_rect.x() == 0
+    assert heatmap_rect.y() == 0
+    assert right_x is not None
+    assert module.selection_box.geometry().right() == pytest.approx(right_x, abs=1.0)
 
 
 def test_selection_box_height_matches_plot_area_and_does_not_extend_below_it(qapp):
@@ -555,16 +576,19 @@ def test_selection_box_height_matches_plot_area_and_does_not_extend_below_it(qap
     assert box_rect.bottom() == plot_rect.bottom()
 
 
-def test_selection_box_rendered_width_matches_selected_duration_within_frame_tolerance(qapp):
+def test_selection_box_rendered_width_matches_exact_mapped_time_span_within_frame_tolerance(
+    qapp,
+):
     module, services = _make_module()
     module.selected_display_channel_provider = lambda: 0
     _show(module, qapp)
+    rendered_times = (0.0, 0.5, 1.0)
     _seed_stft_history(
         module,
         services,
         qapp,
         channel_index=0,
-        times=(0.0, 0.5, 1.0),
+        times=rendered_times,
         magnitudes=((1.0, 2.0), (3.0, 4.0), (5.0, 6.0)),
     )
 
@@ -579,24 +603,88 @@ def test_selection_box_rendered_width_matches_selected_duration_within_frame_tol
     )
     qapp.processEvents()
 
-    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
-    time_extent = module.canvas.heatmap.rendered_time_extent_sec()
+    heatmap_rect = module.canvas.heatmap.geometry()
+    rendered_sample_x = [
+        module.canvas.heatmap.widget_x_for_time_sec(time_sec)
+        for time_sec in rendered_times
+    ]
     box_rect = module.selection_box.geometry()
 
+    assert heatmap_rect.x() == 0
+    assert heatmap_rect.y() == 0
+    assert all(sample_x is not None for sample_x in rendered_sample_x)
+
+    left_x = rendered_sample_x[0]
+    right_x = rendered_sample_x[-1]
+    assert left_x is not None
+    assert right_x is not None
+
+    consecutive_frame_px = [
+        right_sample_x - left_sample_x
+        for left_sample_x, right_sample_x in zip(
+            rendered_sample_x,
+            rendered_sample_x[1:],
+        )
+        if left_sample_x is not None
+        and right_sample_x is not None
+        and right_sample_x > left_sample_x
+    ]
+    frame_px = min(delta for delta in consecutive_frame_px if delta > 0.0)
+
+    assert abs(box_rect.left() - left_x) <= frame_px
+    assert abs(box_rect.right() - right_x) <= frame_px
+
+
+def test_single_sample_stft_selection_box_uses_one_frame_tolerance_formula(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(2.0,),
+        magnitudes=((1.0, 2.0),),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            run_id="run-101",
+            captured_duration_sec=5.0,
+            default_window=FactoryReviewWindow(start_sec=2.0, end_sec=3.0),
+            judgment_payload={"overall": "合格", "analysis_window": (2.0, 3.0)},
+        ),
+    )
+    qapp.processEvents()
+
+    heatmap_rect = module.canvas.heatmap.geometry()
+    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
+    time_extent = module.canvas.heatmap.rendered_time_extent_sec()
+    left_x = module.canvas.heatmap.widget_x_for_time_sec(2.0)
+    box_rect = module.selection_box.geometry()
+
+    assert heatmap_rect.x() == 0
+    assert heatmap_rect.y() == 0
     assert plot_rect is not None
     assert time_extent is not None
 
-    pixels_per_second = plot_rect.width() / (time_extent[1] - time_extent[0])
-    rendered_column_width_px = 0.5 * pixels_per_second
-    ideal_left = plot_rect.left()
-    ideal_right = plot_rect.left() + (1.0 * pixels_per_second)
+    right_x = module.canvas.heatmap.widget_x_for_time_sec(time_extent[1])
 
-    assert abs(box_rect.left() - ideal_left) <= rendered_column_width_px
-    assert abs(box_rect.right() - ideal_right) <= rendered_column_width_px
-    assert box_rect.right() <= plot_rect.right()
+    assert left_x is not None
+    assert right_x is not None
+    assert float(plot_rect.left()) - 1.0 <= left_x <= float(plot_rect.right()) + 1.0
+    assert float(plot_rect.left()) - 1.0 <= right_x <= float(plot_rect.right()) + 1.0
+
+    frame_px = right_x - left_x
+    assert abs(box_rect.left() - left_x) <= frame_px
+    assert abs(box_rect.right() - right_x) <= frame_px
+    _assert_box_matches_plot_bounds(module)
 
 
-def test_move_selection_to_track_x_cannot_move_selection_before_zero_or_past_latest_valid_start(
+def test_move_selection_to_track_x_uses_chart_inverse_mapping_for_visual_and_logical_alignment(
     qapp,
 ):
     module, services = _make_module()
@@ -622,14 +710,13 @@ def test_move_selection_to_track_x_cannot_move_selection_before_zero_or_past_lat
     )
     qapp.processEvents()
 
-    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
+    heatmap_rect = module.canvas.heatmap.geometry()
+    target_x = module.canvas.heatmap.widget_x_for_time_sec(1.0)
 
-    assert plot_rect is not None
-    assert module.move_selection_to_track_x(plot_rect.left() - 100.0) is True
-    assert module.selected_window == pytest.approx((0.0, 2.0))
-    _assert_selection_box_matches_selected_window(module)
-
-    assert module.move_selection_to_track_x(plot_rect.right() + 100.0) is True
+    assert heatmap_rect.x() == 0
+    assert heatmap_rect.y() == 0
+    assert target_x is not None
+    assert module.move_selection_to_track_x(target_x) is True
     assert module.selected_window == pytest.approx((1.0, 3.0))
     _assert_selection_box_matches_selected_window(module)
 
@@ -696,6 +783,68 @@ def test_move_selection_to_track_x_clamps_to_plot_start_when_plot_starts_after_z
     assert plot_rect is not None
     assert module.move_selection_to_track_x(plot_rect.left() - 100.0) is True
     assert module.selected_window == pytest.approx((2.0, 3.0))
+    _assert_selection_box_matches_selected_window(module)
+
+
+def test_move_selection_to_track_x_clamps_to_zero_start_on_zero_based_plot(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0, 3.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            captured_duration_sec=5.0,
+            run_id="run-101",
+            default_window=FactoryReviewWindow(start_sec=0.0, end_sec=2.0),
+            judgment_payload={"overall": "合格", "analysis_window": (0.0, 2.0)},
+        ),
+    )
+    qapp.processEvents()
+
+    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
+
+    assert plot_rect is not None
+    assert module.move_selection_to_track_x(plot_rect.left() - 100.0) is True
+    assert module.selected_window == (0.0, 2.0)
+    _assert_selection_box_matches_selected_window(module)
+
+
+def test_move_selection_to_start_rerenders_box_to_exact_chart_mapped_positions(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0, 3.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            captured_duration_sec=5.0,
+            run_id="run-101",
+            default_window=FactoryReviewWindow(start_sec=0.0, end_sec=2.0),
+            judgment_payload={"overall": "合格", "analysis_window": (0.0, 2.0)},
+        ),
+    )
+    qapp.processEvents()
+
+    assert module.move_selection_to_start(1.0) is True
+    assert module.selected_window == pytest.approx((1.0, 3.0))
+    _assert_selection_box_matches_selected_window(module)
 
 
 def test_move_selection_to_start_clamps_to_captured_plot_intersection(qapp):
@@ -754,22 +903,8 @@ def test_preseeded_selection_box_render_clamps_to_latest_valid_start_inside_capt
     )
     qapp.processEvents()
 
-    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
-    time_extent = module.canvas.heatmap.rendered_time_extent_sec()
-    box_rect = module.selection_box.geometry()
-
-    assert plot_rect is not None
-    assert time_extent is not None
-
-    pixels_per_second = plot_rect.width() / (time_extent[1] - time_extent[0])
-    rendered_column_width_px = 1.0 * pixels_per_second
-    ideal_left = plot_rect.left() + (1.0 * pixels_per_second)
-    ideal_right = plot_rect.left() + (3.0 * pixels_per_second)
-
     assert module.selected_window == pytest.approx((1.0, 3.0))
-    assert abs(box_rect.left() - ideal_left) <= rendered_column_width_px
-    assert abs(box_rect.right() - ideal_right) <= rendered_column_width_px
-    assert box_rect.right() <= plot_rect.right()
+    _assert_selection_box_matches_selected_window(module)
 
 
 def test_selection_box_hides_when_no_full_duration_interval_exists_inside_captured_plot_intersection(
@@ -802,7 +937,87 @@ def test_selection_box_hides_when_no_full_duration_interval_exists_inside_captur
     assert module.move_selection_to_track_x(999.0) is False
 
 
-def test_selection_box_hides_when_rendered_payload_is_unavailable_and_drag_is_noop(qapp):
+def test_dragging_selection_box_uses_chart_mapping_for_visual_and_logical_alignment(qapp):
+    class _MouseEventStub:
+        def __init__(
+            self,
+            *,
+            global_x: float,
+            button=Qt.MouseButton.NoButton,
+        ) -> None:
+            self._global_x = float(global_x)
+            self._button = button
+            self.accepted = False
+
+        def button(self):
+            return self._button
+
+        def globalPosition(self):
+            return QPointF(self._global_x, 0.0)
+
+        def accept(self) -> None:
+            self.accepted = True
+
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 1.0, 2.0, 3.0),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            captured_duration_sec=5.0,
+            run_id="run-101",
+            default_window=FactoryReviewWindow(start_sec=0.0, end_sec=2.0),
+            judgment_payload={"overall": "合格", "analysis_window": (0.0, 2.0)},
+        ),
+    )
+    qapp.processEvents()
+
+    heatmap_rect = module.canvas.heatmap.geometry()
+    target_left_x = module.canvas.heatmap.widget_x_for_time_sec(1.0)
+    box_rect = module.selection_box.geometry()
+
+    assert heatmap_rect.x() == 0
+    assert heatmap_rect.y() == 0
+    assert target_left_x is not None
+
+    drag_offset = float(box_rect.center().x() - box_rect.left())
+    press_global_x = float(module.canvas.mapToGlobal(box_rect.center()).x())
+    move_global_x = float(
+        module.canvas.mapToGlobal(
+            QPoint(int(round(target_left_x + drag_offset)), box_rect.center().y())
+        ).x()
+    )
+
+    press_event = _MouseEventStub(
+        global_x=press_global_x,
+        button=Qt.MouseButton.LeftButton,
+    )
+    move_event = _MouseEventStub(global_x=move_global_x)
+    release_event = _MouseEventStub(global_x=move_global_x)
+
+    module.selection_box.mousePressEvent(press_event)
+    module.selection_box.mouseMoveEvent(move_event)
+    module.selection_box.mouseReleaseEvent(release_event)
+
+    assert press_event.accepted is True
+    assert move_event.accepted is True
+    assert release_event.accepted is True
+    assert module.selected_window == pytest.approx((1.0, 3.0))
+    _assert_selection_box_matches_selected_window(module)
+
+
+def test_selection_box_hides_when_rendered_payload_is_unavailable_and_direct_move_is_noop(
+    qapp,
+):
     module, services = _make_module()
     module.selected_display_channel_provider = lambda: 0
     _show(module, qapp)
@@ -832,7 +1047,8 @@ def test_selection_box_hides_when_rendered_payload_is_unavailable_and_drag_is_no
 
     assert module.selected_window == pytest.approx(selected_before)
     assert module.selection_box.isVisible() is False
-    assert module.move_selection_to_track_x(250.0) is False
+    assert module.move_selection_to_start(0.5) is False
+    assert module.selection_box.isVisible() is False
     assert module.selected_window == pytest.approx(selected_before)
 
 
