@@ -52,6 +52,7 @@ class _StftCacheEntry:
 
 @dataclass(frozen=True)
 class _OverlayGeometry:
+    heatmap_rect: QRect
     plot_rect: QRect
     rendered_start_sec: float
     rendered_end_sec: float
@@ -221,9 +222,11 @@ class StftModule(QWidget):
 
         plot_rect = geometry.plot_rect
         left_px = max(float(plot_rect.left()), min(float(left_px), float(plot_rect.right())))
-        rendered_duration_sec = geometry.rendered_end_sec - geometry.rendered_start_sec
-        start_ratio = (left_px - float(plot_rect.left())) / float(plot_rect.width())
-        start_sec = geometry.rendered_start_sec + (start_ratio * rendered_duration_sec)
+        start_sec = self.canvas.heatmap.time_sec_for_widget_x(
+            left_px - float(geometry.heatmap_rect.left())
+        )
+        if start_sec is None:
+            return False
         return self._move_selection_to_start(start_sec, geometry=geometry)
 
     def is_selection_movable(self) -> bool:
@@ -472,29 +475,34 @@ class StftModule(QWidget):
         self._selected_window = normalized_window
 
         plot_rect = geometry.plot_rect
+        heatmap_left = float(geometry.heatmap_rect.left())
         start_sec, end_sec = normalized_window
-        rendered_duration_sec = geometry.rendered_end_sec - geometry.rendered_start_sec
+        left_px = self.canvas.heatmap.widget_x_for_time_sec(start_sec)
+        right_px = self.canvas.heatmap.widget_x_for_time_sec(end_sec)
+        if left_px is None or right_px is None:
+            self.selection_box.hide()
+            self.analyze_button.hide()
+            return
+
         left = int(
             round(
-                plot_rect.left()
-                + (
-                    (start_sec - geometry.rendered_start_sec) / rendered_duration_sec
+                max(
+                    float(plot_rect.left()),
+                    min(heatmap_left + left_px, float(plot_rect.right())),
                 )
-                * plot_rect.width()
             )
         )
         right = int(
             round(
-                plot_rect.left()
-                + (
-                    (end_sec - geometry.rendered_start_sec) / rendered_duration_sec
+                max(
+                    float(plot_rect.left()),
+                    min(heatmap_left + right_px, float(plot_rect.right())),
                 )
-                * plot_rect.width()
             )
         )
-        width = max(1, right - left)
-        max_left = plot_rect.right() - width + 1
-        left = max(plot_rect.left(), min(left, max_left))
+        if right < left:
+            right = left
+        width = max(1, right - left + 1)
         self.selection_box.setGeometry(left, plot_rect.top(), width, plot_rect.height())
 
         if not button_visible:
@@ -519,6 +527,7 @@ class StftModule(QWidget):
             self.selection_box.setCursor(Qt.CursorShape.ArrowCursor)
 
     def _current_overlay_geometry(self) -> _OverlayGeometry | None:
+        heatmap_rect = self.canvas.heatmap.geometry()
         plot_rect = self.canvas.heatmap.plot_area_rect_in_widget()
         if plot_rect is None or plot_rect.width() <= 0 or plot_rect.height() <= 0:
             return None
@@ -532,7 +541,8 @@ class StftModule(QWidget):
             return None
 
         return _OverlayGeometry(
-            plot_rect=QRect(plot_rect),
+            heatmap_rect=QRect(heatmap_rect),
+            plot_rect=QRect(plot_rect).translated(heatmap_rect.topLeft()),
             rendered_start_sec=float(rendered_start_sec),
             rendered_end_sec=float(rendered_end_sec),
         )
