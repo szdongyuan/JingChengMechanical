@@ -9,6 +9,7 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtCore import QPointF
 from PyQt6.QtWidgets import QApplication
 
 from app.services_container import FactoryControllerState, FactoryReviewPayload
@@ -371,6 +372,229 @@ def test_stft_image_chart_widget_returns_none_geometry_when_view_box_is_zero_siz
         qapp.processEvents()
 
         assert widget.plot_area_rect_in_widget() is None
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_maps_time_values_to_widget_x_positions(qapp):
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=[0.0, 1.0, 2.0, 3.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array(
+                [[1.0, 2.0, 3.0, 4.0], [2.0, 3.0, 4.0, 5.0]]
+            ),
+        )
+        qapp.processEvents()
+
+        plot_rect = widget.plot_area_rect_in_widget()
+
+        assert plot_rect is not None
+        assert widget.widget_x_for_time_sec(0.0) == pytest.approx(
+            plot_rect.left(),
+            abs=1.0,
+        )
+        assert widget.widget_x_for_time_sec(3.0) == pytest.approx(
+            plot_rect.right(),
+            abs=1.0,
+        )
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_matches_actual_pyqtgraph_transform_for_interior_time_values(
+    qapp,
+):
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=[0.0, 1.0, 2.0, 3.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array(
+                [[1.0, 2.0, 3.0, 4.0], [2.0, 3.0, 4.0, 5.0]]
+            ),
+        )
+        qapp.processEvents()
+
+        target_time = 1.5
+        scene_point = widget.plot_item.vb.mapViewToScene(QPointF(target_time, 100.0))
+        expected_x = widget.plot_widget.mapTo(
+            widget,
+            widget.plot_widget.mapFromScene(scene_point),
+        ).x()
+
+        assert widget.widget_x_for_time_sec(target_time) == pytest.approx(
+            expected_x,
+            abs=1.0,
+        )
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_maps_widget_x_positions_back_to_time_values(qapp):
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=[0.0, 1.0, 2.0, 3.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array(
+                [[1.0, 2.0, 3.0, 4.0], [2.0, 3.0, 4.0, 5.0]]
+            ),
+        )
+        qapp.processEvents()
+
+        left_x = widget.widget_x_for_time_sec(0.0)
+        right_x = widget.widget_x_for_time_sec(3.0)
+
+        assert left_x is not None
+        assert right_x is not None
+        assert widget.time_sec_for_widget_x(left_x) == pytest.approx(0.0, abs=0.01)
+        assert widget.time_sec_for_widget_x(right_x) == pytest.approx(3.0, abs=0.01)
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_inverse_mapping_matches_actual_pyqtgraph_transform_for_interior_widget_x(
+    qapp,
+):
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=[0.0, 1.0, 2.0, 3.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array(
+                [[1.0, 2.0, 3.0, 4.0], [2.0, 3.0, 4.0, 5.0]]
+            ),
+        )
+        qapp.processEvents()
+
+        target_time = 1.5
+        scene_point = widget.plot_item.vb.mapViewToScene(QPointF(target_time, 100.0))
+        widget_x = widget.plot_widget.mapTo(
+            widget,
+            widget.plot_widget.mapFromScene(scene_point),
+        ).x()
+
+        assert widget.time_sec_for_widget_x(widget_x) == pytest.approx(
+            target_time,
+            abs=0.01,
+        )
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_mapping_helpers_return_none_when_geometry_is_unavailable(
+    qapp,
+):
+    widget = StftImageChartWidget()
+
+    try:
+        assert widget.widget_x_for_time_sec(0.0) is None
+        assert widget.time_sec_for_widget_x(123.0) is None
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_mapping_helpers_return_none_when_geometry_is_unavailable_due_to_hidden_plot_widget(
+    qapp,
+):
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=[0.0, 1.0, 2.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0, 2.0, 3.0], [3.5, 4.5, 5.5]]),
+        )
+        qapp.processEvents()
+
+        widget.plot_widget.hide()
+        qapp.processEvents()
+
+        assert widget.widget_x_for_time_sec(0.0) is None
+        assert widget.time_sec_for_widget_x(123.0) is None
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_mapping_helpers_return_none_when_geometry_is_unavailable_due_to_hidden_view_box(
+    qapp,
+):
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=[0.0, 1.0, 2.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0, 2.0, 3.0], [3.5, 4.5, 5.5]]),
+        )
+        qapp.processEvents()
+
+        widget.plot_item.vb.hide()
+        qapp.processEvents()
+
+        assert widget.widget_x_for_time_sec(0.0) is None
+        assert widget.time_sec_for_widget_x(123.0) is None
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_mapping_helpers_return_none_when_geometry_is_unavailable_due_to_zero_sized_plot_widget(
+    qapp,
+):
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=[0.0, 1.0, 2.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0, 2.0, 3.0], [3.5, 4.5, 5.5]]),
+        )
+        qapp.processEvents()
+
+        widget.plot_widget.setGeometry(0, 0, 0, 0)
+        qapp.processEvents()
+
+        assert widget.widget_x_for_time_sec(0.0) is None
+        assert widget.time_sec_for_widget_x(123.0) is None
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_single_sample_frame_formula_remains_measurable(qapp):
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=[2.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0], [3.5]]),
+        )
+        qapp.processEvents()
+
+        time_extent = widget.rendered_time_extent_sec()
+
+        assert time_extent is not None
+
+        left_x = widget.widget_x_for_time_sec(2.0)
+        right_x = widget.widget_x_for_time_sec(time_extent[1])
+
+        assert left_x is not None
+        assert right_x is not None
+        assert right_x > left_x
     finally:
         widget.close()
 

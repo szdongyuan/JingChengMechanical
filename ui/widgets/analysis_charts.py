@@ -5,7 +5,7 @@ from typing import Iterable
 
 import numpy as np
 import pyqtgraph as pg
-from PyQt6.QtCore import QRect, QRectF
+from PyQt6.QtCore import QPointF, QRect, QRectF
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 pg.setConfigOptions(antialias=True, background="w", foreground="#334155")
@@ -214,6 +214,38 @@ class StftImageChartWidget(_BasePlotChart):
             return None
         return (float(rendered_rect.left()), float(rendered_rect.right()))
 
+    def widget_x_for_time_sec(self, time_sec: float) -> float | None:
+        mapping_context = self._stft_mapping_context()
+        if mapping_context is None:
+            return None
+
+        view_y, _device_y = mapping_context
+        device_point = self.plot_item.vb.mapViewToDevice(
+            QPointF(float(time_sec), view_y)
+        )
+        device_x = float(device_point.x())
+        if not np.isfinite(device_x):
+            return None
+        return device_x + float(self.plot_widget.x())
+
+    def time_sec_for_widget_x(self, widget_x: float) -> float | None:
+        mapping_context = self._stft_mapping_context()
+        if mapping_context is None:
+            return None
+
+        _view_y, device_y = mapping_context
+        widget_x_value = float(widget_x)
+        if not np.isfinite(widget_x_value):
+            return None
+
+        view_point = self.plot_item.vb.mapDeviceToView(
+            QPointF(widget_x_value - float(self.plot_widget.x()), device_y)
+        )
+        time_sec = float(view_point.x())
+        if not np.isfinite(time_sec):
+            return None
+        return time_sec
+
     def _apply_stft_y_axis_policy(
         self,
         *,
@@ -247,6 +279,22 @@ class StftImageChartWidget(_BasePlotChart):
         if rendered_rect.isEmpty() or rendered_rect.width() <= 0:
             return None
         return rendered_rect
+
+    def _stft_mapping_context(self) -> tuple[float, float] | None:
+        if self.plot_area_rect_in_widget() is None:
+            return None
+
+        rendered_rect = self._rendered_image_rect()
+        if rendered_rect is None:
+            return None
+
+        view_y = float(rendered_rect.center().y())
+        reference_view = rendered_rect.center()
+        reference_device = self.plot_item.vb.mapViewToDevice(reference_view)
+        device_y = float(reference_device.y())
+        if not np.isfinite(view_y) or not np.isfinite(device_y):
+            return None
+        return (view_y, device_y)
 
 
 class LineChartWidget(_BasePlotChart):
