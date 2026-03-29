@@ -136,11 +136,13 @@ Octave-specific rule:
 - for the octave bar chart, the x-axis minimum of `0` applies to the underlying bar-center/index coordinate system
 - the bars remain centered at their current positions
 - the x-axis including `0` does not require shifting bar centers so the first bar edge starts at `0`
+- the octave x-axis maximum is also derived from the underlying bar-center/index coordinate system, not from full bar extents
+- therefore the first or last bar may extend past the visible axis boundary, and that clipping is acceptable in this requirement set
 
 Degenerate behavior:
 
 - if a chart has no payload, keep the current no-data state rather than forcing a synthetic visible range
-- if a chart has a zero-span x range after normalization, use a fallback visible x range of `[0.0, 1.0]` in chart x units so rendering remains stable while keeping the visible minimum at `0` and keeping horizontal padding at `0`
+- if a chart has a zero-span x range after normalization, use a fallback visible x maximum of `max(primary_payload_x_max, 1.0)` so rendering remains stable while still keeping the visible minimum at `0` and keeping horizontal padding at `0`
 
 ### STFT Y-Axis Policy
 
@@ -159,7 +161,7 @@ Range authority:
 Degenerate behavior:
 
 - if STFT has no rendered payload, keep the current no-data state
-- if the rendered STFT frequency range collapses to a zero span, use a fallback visible y range of `[0.0, 1.0]` in STFT frequency units so rendering remains stable while keeping the visible minimum at `0`
+- if the rendered STFT frequency range collapses to a zero span, use a fallback visible y maximum of `max(primary_payload_y_max, 1.0)` so rendering remains stable while keeping the visible minimum at `0`
 
 ## STFT Overlay Geometry Contract
 
@@ -227,6 +229,8 @@ Add or update tests for:
 - all chart widgets render with no horizontal padding
 - STFT renders with y-axis minimum `0`
 - STFT renders with no lower-side y padding
+- programmatic chart refresh/reset preserves the same zero-minimum and no-padding axis policy
+- auxiliary overlays such as limit markers and error bars do not expand the visible chart ranges
 - the STFT box left edge aligns to the plotted `x=0.0` position when the selected window starts at `0.0 s`
 - the STFT box right edge aligns to the plotted `x=3.0` position when the selected window ends at `3.0 s`
 - the STFT box width matches the plotted time span within the approved one-frame-per-edge tolerance
