@@ -160,7 +160,11 @@ class StftImageChartWidget(_BasePlotChart):
         if self.plot_widget.width() <= 0 or self.plot_widget.height() <= 0:
             return None
 
-        scene_rect = self.plot_item.vb.sceneBoundingRect()
+        view_box = self.plot_item.vb
+        if not view_box.isVisible():
+            return None
+
+        scene_rect = view_box.sceneBoundingRect()
         if scene_rect.isEmpty() or scene_rect.width() <= 0 or scene_rect.height() <= 0:
             return None
 

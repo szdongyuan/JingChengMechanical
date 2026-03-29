@@ -310,6 +310,28 @@ def test_stft_image_chart_widget_returns_none_geometry_when_plot_widget_is_hidde
         widget.close()
 
 
+def test_stft_image_chart_widget_returns_none_geometry_when_view_box_is_hidden(qapp):
+    widget = StftImageChartWidget()
+
+    try:
+        widget.resize(640, 260)
+        widget.show()
+        qapp.processEvents()
+        widget.set_image(
+            times_sec=[0.0, 0.5, 1.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0, 2.0, 3.0], [3.5, 4.5, 5.5]]),
+        )
+        qapp.processEvents()
+
+        widget.plot_item.vb.hide()
+        qapp.processEvents()
+
+        assert widget.plot_area_rect_in_widget() is None
+    finally:
+        widget.close()
+
+
 def test_stft_image_chart_widget_returns_none_geometry_when_view_box_is_zero_sized(qapp):
     widget = StftImageChartWidget()
 
