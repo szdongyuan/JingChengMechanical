@@ -69,6 +69,21 @@ def _clear_error_bar_item(item: pg.ErrorBarItem) -> None:
     item.setData(x=None, y=None, top=None, bottom=None, beam=None)
 
 
+def _visible_axis_max(values: Iterable[float] | None) -> float:
+    if values is None:
+        return 1.0
+
+    normalized = [float(value) for value in values]
+    if not normalized:
+        return 1.0
+
+    payload_min = min(normalized)
+    payload_max = max(normalized)
+    if payload_max <= 0.0 or np.isclose(payload_min, payload_max):
+        return max(payload_max, 1.0)
+    return payload_max
+
+
 class _BasePlotChart(QWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -84,6 +99,13 @@ class _BasePlotChart(QWidget):
 
         self.plot_item = self.plot_widget.getPlotItem()
         self.plot_item.showGrid(x=True, y=True, alpha=0.18)
+        self._apply_x_axis_policy(payload_values=None)
+
+    def _apply_x_axis_policy(self, *, payload_values: Iterable[float] | None) -> None:
+        visible_max = _visible_axis_max(payload_values)
+        view_box = self.plot_item.vb
+        view_box.enableAutoRange(axis=pg.ViewBox.XAxis, enable=False)
+        view_box.setXRange(0.0, visible_max, padding=0.0)
 
 
 class StftImageChartWidget(_BasePlotChart):
@@ -108,6 +130,7 @@ class StftImageChartWidget(_BasePlotChart):
         self.plot_item.addItem(self._image_item)
         self.plot_item.setLabel("bottom", "Time", units="s")
         self.plot_item.setLabel("left", "Frequency", units="Hz")
+        self._apply_stft_y_axis_policy(payload_values=None)
 
     def set_image(
         self,
@@ -137,10 +160,14 @@ class StftImageChartWidget(_BasePlotChart):
 
         self._image_item.setImage(normalized_image, autoLevels=True)
         self._image_item.setRect(self._image_rect())
+        self._apply_x_axis_policy(payload_values=normalized_times)
+        self._apply_stft_y_axis_policy(payload_values=normalized_frequencies)
 
     def clear_data(self) -> None:
         self._image_payload = None
         self._image_item.clear()
+        self._apply_x_axis_policy(payload_values=None)
+        self._apply_stft_y_axis_policy(payload_values=None)
 
     def has_image(self) -> bool:
         return self._image_payload is not None
@@ -186,6 +213,16 @@ class StftImageChartWidget(_BasePlotChart):
         if rendered_rect is None:
             return None
         return (float(rendered_rect.left()), float(rendered_rect.right()))
+
+    def _apply_stft_y_axis_policy(
+        self,
+        *,
+        payload_values: Iterable[float] | None,
+    ) -> None:
+        visible_max = _visible_axis_max(payload_values)
+        view_box = self.plot_item.vb
+        view_box.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
+        view_box.setYRange(0.0, visible_max, padding=0.0)
 
     def _image_rect(self) -> QRectF:
         assert self._image_payload is not None
@@ -255,14 +292,22 @@ class LineChartWidget(_BasePlotChart):
         }
 
         self._curve.setData(normalized_x, normalized_y)
-        self._update_limit_line(self._lower_limit_line, self._series_payload["lower_limit"])
-        self._update_limit_line(self._upper_limit_line, self._series_payload["upper_limit"])
+        self._update_limit_line(
+            self._lower_limit_line,
+            self._series_payload["lower_limit"],
+        )
+        self._update_limit_line(
+            self._upper_limit_line,
+            self._series_payload["upper_limit"],
+        )
+        self._apply_x_axis_policy(payload_values=normalized_x)
 
     def clear_data(self) -> None:
         self._series_payload = None
         self._curve.setData([], [])
         self._lower_limit_line.hide()
         self._upper_limit_line.hide()
+        self._apply_x_axis_policy(payload_values=None)
 
     def has_series(self) -> bool:
         return self._series_payload is not None
@@ -314,6 +359,7 @@ class FftLineChartWidget(LineChartWidget):
             x_values=[band["freq_hz"] for band in normalized_limit_bands],
             limit_bands=normalized_limit_bands,
         )
+        self._apply_x_axis_policy(payload_values=normalized_frequencies)
 
     def clear_data(self) -> None:
         _clear_error_bar_item(self._band_range_item)
@@ -413,6 +459,7 @@ class OctaveBarChartWidget(_BasePlotChart):
             ),
             limit_bands=normalized_limit_bands,
         )
+        self._apply_x_axis_policy(payload_values=x_values.tolist())
 
     def clear_data(self) -> None:
         self._band_payload = None
@@ -420,6 +467,7 @@ class OctaveBarChartWidget(_BasePlotChart):
         self._band_marker_item.setData([])
         self._replace_bar_item(x=np.array([], dtype=float), heights=np.array([], dtype=float))
         self.plot_item.getAxis("bottom").setTicks(None)
+        self._apply_x_axis_policy(payload_values=None)
 
     def has_bars(self) -> bool:
         return self._band_payload is not None
