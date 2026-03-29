@@ -206,12 +206,14 @@ def test_stft_image_chart_widget_image_payload_returns_defensive_copies(qapp):
     )
 
 
-def test_stft_image_chart_widget_exposes_plot_area_rect_for_overlay_geometry(qapp):
+def test_stft_image_chart_widget_exposes_view_box_geometry_in_widget_coordinates(qapp):
     widget = StftImageChartWidget()
 
     try:
-        widget.resize(640, 480)
+        widget.resize(640, 260)
         widget.show()
+        qapp.processEvents()
+
         widget.set_image(
             times_sec=[0.0, 0.5, 1.0],
             frequencies_hz=[100.0, 200.0],
@@ -219,21 +221,80 @@ def test_stft_image_chart_widget_exposes_plot_area_rect_for_overlay_geometry(qap
         )
         qapp.processEvents()
 
-        expected_rect = widget.plot_widget.mapFromScene(
-            widget.plot_item.vb.sceneBoundingRect()
-        ).boundingRect()
+        rect = widget.plot_area_rect_in_widget()
+        scene_rect = widget.plot_item.vb.sceneBoundingRect()
+        expected_top_left = widget.plot_widget.mapTo(
+            widget,
+            widget.plot_widget.mapFromScene(scene_rect.topLeft()),
+        )
+        expected_bottom_right = widget.plot_widget.mapTo(
+            widget,
+            widget.plot_widget.mapFromScene(scene_rect.bottomRight()),
+        )
 
-        assert widget.plot_area_rect() == expected_rect
+        assert rect is not None
+        assert abs(rect.left() - expected_top_left.x()) <= 1
+        assert abs(rect.top() - expected_top_left.y()) <= 1
+        assert abs(rect.right() - expected_bottom_right.x()) <= 1
+        assert abs(rect.bottom() - expected_bottom_right.y()) <= 1
     finally:
         widget.close()
 
 
-def test_stft_image_chart_widget_exposes_rendered_time_extent(qapp):
+def test_stft_image_chart_widget_reports_rendered_time_extent_from_payload(qapp):
     widget = StftImageChartWidget()
 
     try:
-        widget.resize(640, 480)
+        widget.set_image(
+            times_sec=[0.0, 0.5, 1.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0, 2.0, 3.0], [3.5, 4.5, 5.5]]),
+        )
+
+        assert widget.rendered_time_extent_sec() == pytest.approx((0.0, 1.0))
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_reports_single_frame_rendered_time_extent_from_image_rect(
+    qapp,
+):
+    widget = StftImageChartWidget()
+
+    try:
+        widget.set_image(
+            times_sec=[2.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0], [3.5]]),
+        )
+
+        image_rect = widget._image_item.mapRectToParent(
+            widget._image_item.boundingRect()
+        )
+
+        assert widget.rendered_time_extent_sec() == pytest.approx(
+            (image_rect.left(), image_rect.right())
+        )
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_returns_none_geometry_when_plot_is_not_ready(qapp):
+    widget = StftImageChartWidget()
+
+    try:
+        assert widget.plot_area_rect_in_widget() is None
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_returns_none_geometry_when_plot_widget_is_hidden(qapp):
+    widget = StftImageChartWidget()
+
+    try:
+        widget.resize(640, 260)
         widget.show()
+        qapp.processEvents()
         widget.set_image(
             times_sec=[0.0, 0.5, 1.0],
             frequencies_hz=[100.0, 200.0],
@@ -241,11 +302,32 @@ def test_stft_image_chart_widget_exposes_rendered_time_extent(qapp):
         )
         qapp.processEvents()
 
-        expected_extent = tuple(widget.plot_item.vb.viewRange()[0])
+        widget.plot_widget.hide()
+        qapp.processEvents()
 
-        assert widget.rendered_time_extent() == pytest.approx(expected_extent)
-        assert widget.rendered_time_extent()[0] <= 0.0
-        assert widget.rendered_time_extent()[1] >= 1.0
+        assert widget.plot_area_rect_in_widget() is None
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_returns_none_geometry_when_view_box_is_zero_sized(qapp):
+    widget = StftImageChartWidget()
+
+    try:
+        widget.resize(640, 260)
+        widget.show()
+        qapp.processEvents()
+        widget.set_image(
+            times_sec=[0.0, 0.5, 1.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0, 2.0, 3.0], [3.5, 4.5, 5.5]]),
+        )
+        qapp.processEvents()
+
+        widget.plot_widget.setGeometry(0, 0, 0, 0)
+        qapp.processEvents()
+
+        assert widget.plot_area_rect_in_widget() is None
     finally:
         widget.close()
 

@@ -154,17 +154,40 @@ class StftImageChartWidget(_BasePlotChart):
         payload["magnitude_db"] = self._image_payload["magnitude_db"].copy()
         return payload
 
-    def plot_area_rect(self) -> QRect:
+    def plot_area_rect_in_widget(self) -> QRect | None:
+        if not self.isVisible() or not self.plot_widget.isVisible():
+            return None
+        if self.plot_widget.width() <= 0 or self.plot_widget.height() <= 0:
+            return None
+
         scene_rect = self.plot_item.vb.sceneBoundingRect()
-        if scene_rect.isEmpty():
-            return QRect()
-        return self.plot_widget.mapFromScene(scene_rect).boundingRect()
+        if scene_rect.isEmpty() or scene_rect.width() <= 0 or scene_rect.height() <= 0:
+            return None
+
+        top_left = self.plot_widget.mapTo(
+            self,
+            self.plot_widget.mapFromScene(scene_rect.topLeft()),
+        )
+        bottom_right = self.plot_widget.mapTo(
+            self,
+            self.plot_widget.mapFromScene(scene_rect.bottomRight()),
+        )
+        rect = QRect(top_left, bottom_right).normalized()
+        if rect.width() <= 0 or rect.height() <= 0:
+            return None
+        return rect
+
+    def plot_area_rect(self) -> QRect | None:
+        return self.plot_area_rect_in_widget()
+
+    def rendered_time_extent_sec(self) -> tuple[float, float] | None:
+        rendered_rect = self._rendered_image_rect()
+        if rendered_rect is None:
+            return None
+        return (float(rendered_rect.left()), float(rendered_rect.right()))
 
     def rendered_time_extent(self) -> tuple[float, float] | None:
-        if self._image_payload is None:
-            return None
-        x_range, _ = self.plot_item.vb.viewRange()
-        return (float(x_range[0]), float(x_range[1]))
+        return self.rendered_time_extent_sec()
 
     def _image_rect(self) -> QRectF:
         assert self._image_payload is not None
@@ -179,6 +202,16 @@ class StftImageChartWidget(_BasePlotChart):
             else frequencies_hz[0] + 1.0
         )
         return QRectF(x_min, y_min, x_max - x_min, y_max - y_min)
+
+    def _rendered_image_rect(self) -> QRectF | None:
+        if self._image_payload is None:
+            return None
+        rendered_rect = self._image_item.mapRectToParent(
+            self._image_item.boundingRect()
+        )
+        if rendered_rect.isEmpty() or rendered_rect.width() <= 0:
+            return None
+        return rendered_rect
 
 
 class LineChartWidget(_BasePlotChart):
