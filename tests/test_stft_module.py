@@ -188,6 +188,48 @@ def _assert_box_matches_plot_bounds(module) -> None:
     assert box_rect.bottom() == plot_rect.bottom()
 
 
+def _assert_selection_box_matches_selected_window(
+    module,
+    *,
+    tolerance_px: int = 1,
+) -> None:
+    plot_rect = module.canvas.heatmap.plot_area_rect_in_widget()
+    time_extent = module.canvas.heatmap.rendered_time_extent_sec()
+    box_rect = module.selection_box.geometry()
+    selected_window = module.selected_window
+
+    assert selected_window is not None
+    assert plot_rect is not None
+    assert time_extent is not None
+
+    rendered_start_sec, rendered_end_sec = time_extent
+    rendered_duration_sec = rendered_end_sec - rendered_start_sec
+
+    assert rendered_duration_sec > 0
+
+    expected_left = round(
+        plot_rect.left()
+        + (
+            (selected_window[0] - rendered_start_sec) / rendered_duration_sec
+        )
+        * plot_rect.width()
+    )
+    expected_right = round(
+        plot_rect.left()
+        + (
+            (selected_window[1] - rendered_start_sec) / rendered_duration_sec
+        )
+        * plot_rect.width()
+    )
+    expected_width = max(1, expected_right - expected_left)
+
+    assert abs(box_rect.left() - expected_left) <= tolerance_px
+    assert abs(box_rect.width() - expected_width) <= tolerance_px
+    assert abs((box_rect.right() + 1) - expected_right) <= tolerance_px
+    assert box_rect.top() == plot_rect.top()
+    assert box_rect.height() == plot_rect.height()
+
+
 def test_stft_module_keeps_live_frames_visible_in_review_without_chart_payload(qapp):
     module, services = _make_module()
     module.selected_display_channel_provider = lambda: 1
@@ -322,6 +364,7 @@ def test_review_success_shows_analysis_box_from_automatic_window_with_fixed_dura
 
     assert module.selected_window == pytest.approx((2.25, 4.25))
     assert module.selected_window[1] - module.selected_window[0] == pytest.approx(2.0)
+    _assert_selection_box_matches_selected_window(module)
 
 
 def test_auto_analysis_failure_uses_first_valid_manual_window_when_reanalysis_is_allowed(qapp):
@@ -584,9 +627,11 @@ def test_move_selection_to_track_x_cannot_move_selection_before_zero_or_past_lat
     assert plot_rect is not None
     assert module.move_selection_to_track_x(plot_rect.left() - 100.0) is True
     assert module.selected_window == pytest.approx((0.0, 2.0))
+    _assert_selection_box_matches_selected_window(module)
 
     assert module.move_selection_to_track_x(plot_rect.right() + 100.0) is True
     assert module.selected_window == pytest.approx((1.0, 3.0))
+    _assert_selection_box_matches_selected_window(module)
 
 
 def test_move_selection_to_track_x_clamps_to_captured_duration_when_capture_is_tighter_than_plot_extent(
@@ -677,8 +722,10 @@ def test_move_selection_to_start_clamps_to_captured_plot_intersection(qapp):
     )
     qapp.processEvents()
 
+    _assert_selection_box_matches_selected_window(module)
     assert module.move_selection_to_start(9.0) is True
     assert module.selected_window == pytest.approx((1.0, 3.0))
+    _assert_selection_box_matches_selected_window(module)
 
 
 def test_preseeded_selection_box_render_clamps_to_latest_valid_start_inside_captured_plot_intersection(
@@ -882,6 +929,7 @@ def test_selection_box_hides_when_plot_widget_is_hidden_and_recovers_after_show(
     qapp.processEvents()
 
     selected_before = module.selected_window
+    geometry_before = module.selection_box.geometry()
     assert module.selection_box.isVisible() is True
 
     module.canvas.heatmap.plot_widget.hide()
@@ -897,6 +945,7 @@ def test_selection_box_hides_when_plot_widget_is_hidden_and_recovers_after_show(
     module._update_overlay_geometry()
 
     assert module.selection_box.isVisible() is True
+    assert module.selection_box.geometry() == geometry_before
     assert module.selected_window == pytest.approx(selected_before)
     _assert_box_matches_plot_bounds(module)
 
