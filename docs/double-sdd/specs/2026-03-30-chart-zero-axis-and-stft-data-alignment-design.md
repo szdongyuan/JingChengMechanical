@@ -66,6 +66,12 @@ Out of scope:
 9. If plot geometry or rendered STFT payload is unavailable, the box must stay hidden and selection-move requests must be no-ops.
 10. No backward-compatibility mode is required for the previous padded-axis behavior.
 
+Scope note:
+
+- this axis policy applies to the normal visible chart ranges owned by the application during render and refresh
+- the charts in this surface are non-interactive, so user zoom/pan behavior is not part of this requirement
+- if application code programmatically refreshes or resets a chart range, it must preserve the same zero-minimum and no-padding policy
+
 ## Root Cause Summary
 
 Two related issues are now confirmed:
@@ -92,14 +98,14 @@ With padded axes, that assumption is false. The actual plotted position of `x=0.
 
 ## Design Summary
 
-Make the shared chart widgets responsible for explicit zero-based axis policy, then make the STFT overlay use the chart's actual data-to-pixel transform.
+Make the shared chart widgets responsible for explicit zero-based axis policy, then make the STFT overlay use a chart-owned data-to-widget-coordinate transform.
 
 This separates two concerns cleanly:
 
 - chart widgets own visible axis ranges and padding policy
 - the STFT module owns review-window selection logic
 
-The STFT module should no longer infer box coordinates by scaling across the plot rectangle width. Instead, it should ask the chart for the plotted pixel positions of the selected `start_sec` and `end_sec` values.
+The STFT module should no longer infer box coordinates by scaling across the plot rectangle width. Instead, it should ask the chart for the plotted widget-coordinate x positions of the selected `start_sec` and `end_sec` values.
 
 ## Chart Axis Policy
 
@@ -120,6 +126,11 @@ This applies to:
 
 If a dataset begins above `0`, the chart should still display from `0` to the dataset maximum.
 
+Degenerate behavior:
+
+- if a chart has no payload, keep the current no-data state rather than forcing a synthetic visible range
+- if a chart has a zero-span x range after normalization, expand to the smallest nonzero display range needed for stable rendering while still keeping the visible minimum at `0` and keeping horizontal padding at `0`
+
 ### STFT Y-Axis Policy
 
 For STFT only:
@@ -129,11 +140,24 @@ For STFT only:
 
 The upper STFT y bound may still follow the rendered frequency payload, but the visible range must begin exactly at `0`.
 
+Degenerate behavior:
+
+- if STFT has no rendered payload, keep the current no-data state
+- if the rendered STFT frequency range collapses to a zero span, expand to the smallest nonzero display range needed for stable rendering while keeping the visible minimum at `0`
+
 ## STFT Overlay Geometry Contract
 
 ### Data-Space Alignment
 
 The STFT selection box must be positioned from actual plotted data coordinates.
+
+Chart/overlay interface contract:
+
+- the STFT chart widget owns the pyqtgraph-specific mapping
+- it must expose plot-geometry helpers in widget coordinates
+- it must also expose a chart-owned mapping from STFT x data values to widget-coordinate x positions
+- the STFT module must use that mapping for both the left and right box edges and for drag-time coordinate conversion
+- the STFT module must not map time to pixels by interpolating across the full plot rectangle width
 
 Required behavior:
 
@@ -146,7 +170,13 @@ The implementation must not approximate those x positions by scaling across the 
 
 ### Duration Rendering
 
-If the logical selected window duration is `D`, the rendered box width must match the plotted span from `start_sec` to `start_sec + D`.
+If the logical selected window duration is `D`, the rendered box width must match the plotted span of the normalized logical selection window.
+
+Authoritative values:
+
+- selection normalization happens before rendering
+- the normalized `selected_window` is authoritative for both left and right edges
+- equivalently, the rendered box must align to the plotted span from normalized `selected_window.start_sec` to normalized `selected_window.end_sec`
 
 Tolerance:
 
