@@ -65,6 +65,7 @@ Out of scope:
 8. Dragging and direct selection moves must use the same data-to-pixel geometry source as rendering.
 9. If plot geometry or rendered STFT payload is unavailable, the box must stay hidden and selection-move requests must be no-ops.
 10. No backward-compatibility mode is required for the previous padded-axis behavior.
+11. When a chart widget is visible but has no payload, it must still show visible axes using the same zero-based axis policy, while keeping no-data content absent.
 
 Scope note:
 
@@ -141,7 +142,7 @@ Octave-specific rule:
 
 Degenerate behavior:
 
-- if a chart has no payload, keep the current no-data state rather than forcing a synthetic visible range
+- if a chart has no payload, keep the current no-data content state but show the chart axes with a fallback visible x range of `[0.0, 1.0]`
 - if a chart has a zero-span x range after normalization, use a fallback visible x maximum of `max(primary_payload_x_max, 1.0)` so rendering remains stable while still keeping the visible minimum at `0` and keeping horizontal padding at `0`
 
 ### STFT Y-Axis Policy
@@ -160,7 +161,7 @@ Range authority:
 
 Degenerate behavior:
 
-- if STFT has no rendered payload, keep the current no-data state
+- if STFT has no rendered payload, keep the current no-data content state but show the chart axes with fallback visible ranges of `x=[0.0, 1.0]` and `y=[0.0, 1.0]`
 - if the rendered STFT frequency range collapses to a zero span, use a fallback visible y maximum of `max(primary_payload_y_max, 1.0)` so rendering remains stable while keeping the visible minimum at `0`
 
 ## STFT Overlay Geometry Contract
@@ -229,11 +230,14 @@ Add or update tests for:
 - all chart widgets render with no horizontal padding
 - STFT renders with y-axis minimum `0`
 - STFT renders with no lower-side y padding
+- visible no-payload chart states still show the enforced zero-based axes using the specified fallback ranges
+- zero-span payloads use the specified fallback maximum rules without losing the payload point
 - programmatic chart refresh/reset preserves the same zero-minimum and no-padding axis policy
 - auxiliary overlays such as limit markers and error bars do not expand the visible chart ranges
 - the STFT box left edge aligns to the plotted `x=0.0` position when the selected window starts at `0.0 s`
 - the STFT box right edge aligns to the plotted `x=3.0` position when the selected window ends at `3.0 s`
 - the STFT box width matches the plotted time span within the approved one-frame-per-edge tolerance
+- the single-sample STFT case uses the specified one-frame formula for duration tolerance
 - drag and direct-move operations continue to rerender the box at the matching plotted positions
 - unavailable-geometry and recovery behaviors from the existing STFT fix remain intact
 
