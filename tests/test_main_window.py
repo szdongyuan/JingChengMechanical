@@ -547,6 +547,27 @@ def _emit_chart_frames(services, *, config_id: int, run_id: str) -> None:
     services.bus.octave_updated.emit(config_id, run_id, 0, object())
 
 
+def _emit_stft_frames_for_review_channels(
+    services,
+    *,
+    config_id: int,
+    run_id: str,
+    channels: tuple[int, ...],
+) -> None:
+    for channel_index in channels:
+        for frame_index, time_sec in enumerate((0.0, 1.0, 2.0, 3.0)):
+            magnitude_base = float((channel_index * 10) + (frame_index * 2) + 1)
+            services.bus.stft_updated.emit(
+                config_id,
+                run_id,
+                channel_index,
+                _make_stft_frame(
+                    time=time_sec,
+                    magnitudes=(magnitude_base, magnitude_base + 1.0),
+                ),
+            )
+
+
 def _emit_review_ready(
     services,
     *,
@@ -554,6 +575,12 @@ def _emit_review_ready(
     run_id: str,
     channels: tuple[int, ...] = (0, 1),
 ) -> None:
+    _emit_stft_frames_for_review_channels(
+        services,
+        config_id=config_id,
+        run_id=run_id,
+        channels=channels,
+    )
     services.bus.factory_state_changed.emit(_reviewing_state(config_id))
     services.bus.factory_review_changed.emit(
         _review_payload_with_chart_payload(
