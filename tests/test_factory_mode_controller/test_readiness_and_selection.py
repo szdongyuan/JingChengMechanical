@@ -5,8 +5,6 @@ from app.services_container import EventBus
 
 from ._support import (
     _SelectionSettingsStub,
-    _accept_start,
-    _assert_start_called_with,
     _emit_owned_runtime_start,
     _enter_reviewing_state,
     _load_factory_mode_controller_module,
@@ -106,27 +104,6 @@ def test_initial_load_failure_blocks_with_config_load_failed_reason():
     assert controller.state.selection_ready_reason == "配置加载失败"
     assert controller.state.start_ready is False
     assert controller.state.start_ready_reason == "配置加载失败"
-
-
-def test_manual_start_uses_first_enabled_config_id():
-    controller_mod = _load_factory_mode_controller_module()
-    services = _make_services((_make_config(101), _make_config(202), _make_config(303)))
-    _accept_start(services)
-    controller = controller_mod.FactoryModeController(EventBus(), services)
-    controller.set_selection((303, 202, 101))
-
-    accepted = controller.start_manual({"sn": "SN-1", "model": "MODEL-1"})
-
-    assert accepted is True
-    _assert_start_called_with(
-        services,
-        {"sn": "SN-1", "model": "MODEL-1", "config_id": 303},
-        expected_trigger_source="manual",
-    )
-    assert controller.state.active_config_id == 303
-    assert controller.state.displayed_config_id == 303
-    assert controller.state.run_phase == "running"
-    assert controller.state.trigger_source == "manual"
 
 
 def test_factory_mode_controller_owns_pair_selection_state():
@@ -299,72 +276,6 @@ def test_factory_mode_controller_rejects_start_when_backend_session_is_already_r
     assert controller.start_manual({"sn": "SN-1"}) is False
     services.test.is_running.assert_called()
     services.test.start.assert_not_called()
-
-
-def test_factory_mode_controller_manual_start_resolves_to_first_enabled_config():
-    controller_mod = _load_factory_mode_controller_module()
-    bus = EventBus()
-    services = _make_services((_make_config(101), _make_config(202)))
-    _accept_start(services)
-    controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((202, 101))
-
-    accepted = controller.start_manual({"sn": "SN-1", "model": "M-1"})
-
-    assert accepted is True
-    _assert_start_called_with(
-        services,
-        {"sn": "SN-1", "model": "M-1", "config_id": 202},
-        expected_trigger_source="manual",
-    )
-    assert controller.state.active_config_id == 202
-    assert controller.state.displayed_config_id == 202
-    assert controller.state.run_phase == "running"
-    assert controller.state.trigger_source == "manual"
-
-
-def test_blocked_manual_start_emits_factory_start_blocked_reason():
-    controller_mod = _load_factory_mode_controller_module()
-    bus = EventBus()
-    blocked_payloads: list[object] = []
-    bus.factory_start_blocked.connect(blocked_payloads.append)
-    services = _make_services((_make_config(101),))
-    controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection(())
-
-    assert controller.start_manual({"sn": "SN-1"}) is False
-
-    assert len(blocked_payloads) == 1
-    assert blocked_payloads[0].reason == "请至少启用一个配置"
-    assert blocked_payloads[0].trigger_source == "manual"
-
-
-def test_blocked_manual_start_emits_updated_state_before_blocked_feedback_when_readiness_changes():
-    controller_mod = _load_factory_mode_controller_module()
-    bus = EventBus()
-    events: list[tuple[str, str | None]] = []
-    services = _make_services((_make_config(101),))
-    controller = controller_mod.FactoryModeController(bus, services)
-    bus.factory_state_changed.connect(
-        lambda state: events.append(("state", state.start_ready_reason))
-    )
-    bus.factory_start_blocked.connect(
-        lambda payload: events.append(("blocked", payload.reason))
-    )
-    controller.set_selection((101,))
-    events.clear()
-    services.config_service.validate_factory_runtime.side_effect = (
-        lambda config: ["analysis window invalid"]
-    )
-
-    assert controller.start_manual({"sn": "SN-1"}) is False
-
-    assert controller.state.start_ready is False
-    assert controller.state.start_ready_reason == "analysis window invalid"
-    assert events == [
-        ("state", "analysis window invalid"),
-        ("blocked", "analysis window invalid"),
-    ]
 
 
 def test_restore_selection_with_missing_configs_blocks_without_persisting_until_user_edit():

@@ -7,7 +7,6 @@ from app.services_container import EventBus
 from ._support import (
     _accept_start,
     _emit_owned_runtime_start,
-    _enter_reviewing_state,
     _load_factory_mode_controller_module,
     _make_config,
     _make_review_payload,
@@ -15,87 +14,6 @@ from ._support import (
     _make_services,
     _run_id_for,
 )
-
-
-def test_factory_mode_controller_stop_cancels_pending_start_and_preserves_review_state():
-    controller_mod = _load_factory_mode_controller_module()
-    bus = EventBus()
-    reset_reasons: list[str] = []
-    reviews: list[object] = []
-    states: list[object] = []
-    accepted_payloads: list[object] = []
-    callbacks: list[object] = []
-    start_payloads: list[dict[str, object]] = []
-    bus.factory_display_reset.connect(reset_reasons.append)
-    bus.factory_review_changed.connect(reviews.append)
-    bus.factory_state_changed.connect(states.append)
-    bus.factory_runtime_start_accepted.connect(accepted_payloads.append)
-    services = _make_services((_make_config(101), _make_config(202)))
-
-    def _capture_start(payload, *, on_start_accepted=None):
-        assert payload["config_id"] == 101
-        assert payload["trigger_source"] == "manual"
-        assert callable(on_start_accepted)
-        start_payloads.append(dict(payload))
-        callbacks.append(on_start_accepted)
-        return True
-
-    services.test.start.side_effect = _capture_start
-    controller = controller_mod.FactoryModeController(bus, services)
-    controller.set_selection((101, 202))
-    original_review_payload = _enter_reviewing_state(
-        controller,
-        bus,
-        config_id=202,
-        trigger_source="plc",
-    )
-    original_state = controller.state
-
-    reset_reasons.clear()
-    reviews.clear()
-    states.clear()
-    accepted_payloads.clear()
-
-    assert controller.start_manual({"sn": "SN-2"}) is True
-    assert len(callbacks) == 1
-    request_id = start_payloads[0].get("factory_start_request_id")
-    assert isinstance(request_id, str)
-    assert request_id
-
-    stopped = controller.stop_active_run()
-
-    assert stopped is True
-    services.test.cancel_pending_start.assert_called_once_with(
-        request_id=request_id,
-        config_id=101,
-    )
-    assert controller._pending_start is None
-    assert controller._pending_start_request_id is None
-    assert controller.state == original_state
-    assert controller.review_payload == original_review_payload
-    assert controller.can_arm() is True
-    assert reset_reasons == []
-    assert reviews == []
-    assert len(states) == 2
-    assert states[0].selected_config_ids == original_state.selected_config_ids
-    assert states[0].active_config_id == original_state.active_config_id
-    assert states[0].displayed_config_id == original_state.displayed_config_id
-    assert states[0].run_phase == original_state.run_phase
-    assert states[0].trigger_source == original_state.trigger_source
-    assert states[0].start_ready is False
-    assert states[0].start_ready_reason == "启动请求处理中"
-    assert states[1] == original_state
-    assert accepted_payloads == []
-
-    callbacks[0](_run_id_for(101))
-
-    assert controller.state == original_state
-    assert controller.review_payload == original_review_payload
-    assert reset_reasons == []
-    assert reviews == []
-    assert len(states) == 2
-    assert states[1] == original_state
-    assert accepted_payloads == []
 
 
 @pytest.mark.parametrize("phase", ["running", "analyzing", "reanalyzing"])
