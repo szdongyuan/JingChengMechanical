@@ -373,6 +373,63 @@ def test_factory_mode_controller_treats_pending_start_as_busy_until_acceptance()
     assert controller.state.trigger_source == "manual"
 
 
+@pytest.mark.parametrize(
+    ("method_name", "reason"),
+    [
+        ("clear_display_state", "selection_changed"),
+        ("clear_for_next_run", "next_run_accepted"),
+    ],
+)
+def test_factory_mode_controller_clear_calls_ignore_pending_start_and_allow_acceptance(
+    method_name,
+    reason,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    states: list[object] = []
+    callbacks: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_state_changed.connect(states.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+
+    def _capture_start(payload, *, on_start_accepted=None):
+        assert payload["config_id"] == 101
+        assert payload["trigger_source"] == "manual"
+        assert callable(on_start_accepted)
+        callbacks.append(on_start_accepted)
+        return True
+
+    services.test.start.side_effect = _capture_start
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+    states.clear()
+
+    assert controller.start_manual({"sn": "pending"}) is True
+    assert len(callbacks) == 1
+
+    reset_reasons.clear()
+    states.clear()
+
+    getattr(controller, method_name)(reason)
+
+    assert controller._pending_start == (101, "manual")
+    assert controller.can_arm() is False
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id is None
+    assert controller.state.run_phase == "armed"
+    assert controller.state.trigger_source is None
+    assert reset_reasons == []
+    assert states == []
+
+    callbacks[0](_run_id_for(101))
+
+    assert controller.state.active_config_id == 101
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "running"
+    assert controller.state.trigger_source == "manual"
+
+
 def test_factory_mode_controller_same_id_invalidating_refresh_keeps_pending_reason_until_idle():
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()
