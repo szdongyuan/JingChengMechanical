@@ -277,7 +277,9 @@ def _workorder_rendered_text(module: WorkOrderModule) -> str:
 def test_workorder_module_uses_full_width_factory_config_section(qapp):
     module, _ = _make_module()
 
-    assert module.lbl_factory_configs.text() == "工厂配置 Factory Configs"
+    assert module.lbl_factory_configs.text() == "配置选择"
+    assert module.form_layout.labelForField(module.ed_model).text() == "产品型号"
+    assert module.form_layout.labelForField(module.ed_sn).text() == "条码 SN"
     assert hasattr(module, "ed_cfg") is False
     assert module.form_layout.labelForField(module.config_selector) is None
     assert module.factory_config_section.layout().indexOf(module.config_selector) >= 0
@@ -495,6 +497,73 @@ def test_workorder_restore_keeps_sn_and_model_empty(qapp):
     }
     assert module.ed_sn.text() == ""
     assert module.ed_model.text() == ""
+
+
+@pytest.mark.parametrize(
+    ("run_phase", "expected_text"),
+    [
+        ("not_ready", "当前阶段：未就绪"),
+        ("armed", "当前阶段：待启动"),
+        ("running", "当前阶段：录音中"),
+        ("analyzing", "当前阶段：分析中"),
+        ("reviewing", "当前阶段：等待复核"),
+        ("reanalyzing", "当前阶段：重新分析中"),
+    ],
+)
+def test_workorder_phase_summary_renders_all_known_chinese_labels(
+    qapp, run_phase, expected_text
+):
+    module, services = _make_module()
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            selected_config_ids=(101,),
+            run_phase=run_phase,
+        )
+    )
+
+    assert module.lbl_phase_summary.text() == expected_text
+
+
+@pytest.mark.parametrize(
+    ("trigger_source", "expected_text"),
+    [
+        ("manual", "最近触发方式：手动"),
+        ("plc", "最近触发方式：PLC"),
+        ("scan", "最近触发方式：扫码"),
+        (None, "最近触发方式：-"),
+        ("", "最近触发方式：-"),
+    ],
+)
+def test_workorder_trigger_summary_renders_all_known_chinese_labels_and_dash_fallback(
+    qapp, trigger_source, expected_text
+):
+    module, services = _make_module()
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            selected_config_ids=(101,),
+            run_phase="armed",
+            trigger_source=trigger_source,
+        )
+    )
+
+    assert module.lbl_trigger_summary.text() == expected_text
+
+
+def test_workorder_summary_preserves_unknown_non_empty_values(qapp):
+    module, services = _make_module()
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            selected_config_ids=(101,),
+            run_phase="future_phase",
+            trigger_source="custom_trigger",
+        )
+    )
+
+    assert module.lbl_phase_summary.text() == "当前阶段：future_phase"
+    assert module.lbl_trigger_summary.text() == "最近触发方式：custom_trigger"
 
 
 @pytest.mark.parametrize(
