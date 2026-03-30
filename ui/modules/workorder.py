@@ -10,6 +10,19 @@ class WorkOrderModule(QWidget):
     module_id = "workorder"
     _LOCKED_SELECTION_PHASES = frozenset({"running", "analyzing", "reanalyzing"})
     _PENDING_START_REASON = "启动请求处理中"
+    _PHASE_LABELS = {
+        "not_ready": "未就绪",
+        "armed": "待启动",
+        "running": "录音中",
+        "analyzing": "分析中",
+        "reviewing": "等待复核",
+        "reanalyzing": "重新分析中",
+    }
+    _TRIGGER_LABELS = {
+        "manual": "手动",
+        "plc": "PLC",
+        "scan": "扫码",
+    }
 
     def __init__(self, services):
         super().__init__()
@@ -29,7 +42,7 @@ class WorkOrderModule(QWidget):
 
         self.config_selector = FactoryConfigListWidget()
         self.config_selector.setMinimumHeight(180)
-        self.lbl_factory_configs = QLabel("工厂配置 Factory Configs")
+        self.lbl_factory_configs = QLabel("配置选择")
 
         self.lbl_persistence_notice = QLabel()
         self.lbl_persistence_notice.setWordWrap(True)
@@ -45,7 +58,7 @@ class WorkOrderModule(QWidget):
 
         self.form_layout = QFormLayout()
         self.form_layout.addRow("条码 SN", self.ed_sn)
-        self.form_layout.addRow("产品型号 Model", self.ed_model)
+        self.form_layout.addRow("产品型号", self.ed_model)
         layout.addLayout(self.form_layout)
 
         self.factory_config_section = QWidget()
@@ -235,10 +248,19 @@ class WorkOrderModule(QWidget):
         self.lbl_selection_status.setVisible(False)
 
     def _update_phase_trigger_summary(self) -> None:
-        run_phase = self._factory_state.run_phase or "not_ready"
-        trigger_source = self._factory_state.trigger_source or "-"
-        self.lbl_phase_summary.setText(f"Current phase: {run_phase}")
-        self.lbl_trigger_summary.setText(f"Current/last trigger: {trigger_source}")
+        display_phase = self._display_phase(self._factory_state.run_phase)
+        display_trigger = self._display_trigger(self._factory_state.trigger_source)
+        self.lbl_phase_summary.setText(f"当前阶段：{display_phase}")
+        self.lbl_trigger_summary.setText(f"最近触发方式：{display_trigger}")
+
+    def _display_phase(self, run_phase: str | None) -> str:
+        phase = run_phase or "not_ready"
+        return self._PHASE_LABELS.get(phase, phase)
+
+    def _display_trigger(self, trigger_source: str | None) -> str:
+        if not trigger_source:
+            return "-"
+        return self._TRIGGER_LABELS.get(trigger_source, trigger_source)
 
     def _publish_workorder(self, *, force: bool = False, log: bool = False) -> None:
         payload = self.value()
