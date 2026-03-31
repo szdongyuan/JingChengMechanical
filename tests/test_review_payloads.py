@@ -653,3 +653,93 @@ def test_build_chart_payload_octave_omits_limit_band_when_configured_bin_level_i
     assert octave["center_freqs_hz"] == [500.0, 2000.0]
     assert octave["levels_db"] == [57.0, 44.0]
     assert octave["limit_bands"] == []
+
+
+@pytest.mark.parametrize("stft_nfft", [512, 4096])
+def test_build_chart_payload_fft_point_count_matches_selected_window_sample_count(
+    stft_nfft,
+):
+    config = _make_config()
+    config["selected_channels"] = [0]
+    config["channels"] = [
+        {
+            **config["channels"][0],
+            "stft_nfft": stft_nfft,
+        }
+    ]
+
+    payload = build_chart_payload(
+        buffer=np.full((200, 1), 0.1, dtype=np.float32),
+        config=config,
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.5, 1.5),
+    )
+
+    assert len(payload[0]["fft"]["frequencies_hz"]) == 51
+
+
+def test_build_chart_payload_fft_point_count_is_independent_of_stft_nfft():
+    small_nfft_config = _make_config()
+    small_nfft_config["selected_channels"] = [0]
+    small_nfft_config["channels"] = [
+        {
+            **small_nfft_config["channels"][0],
+            "stft_nfft": 512,
+        }
+    ]
+
+    large_nfft_config = _make_config()
+    large_nfft_config["selected_channels"] = [0]
+    large_nfft_config["channels"] = [
+        {
+            **large_nfft_config["channels"][0],
+            "stft_nfft": 4096,
+        }
+    ]
+
+    buffer = np.full((200, 1), 0.1, dtype=np.float32)
+
+    small_nfft_payload = build_chart_payload(
+        buffer=buffer,
+        config=small_nfft_config,
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.5, 1.5),
+    )
+    large_nfft_payload = build_chart_payload(
+        buffer=buffer,
+        config=large_nfft_config,
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.5, 1.5),
+    )
+
+    assert len(small_nfft_payload[0]["fft"]["frequencies_hz"]) == 51
+    assert len(large_nfft_payload[0]["fft"]["frequencies_hz"]) == 51
+    assert (
+        len(small_nfft_payload[0]["fft"]["frequencies_hz"])
+        == len(large_nfft_payload[0]["fft"]["frequencies_hz"])
+    )
+
+
+def test_build_chart_payload_fft_uses_selected_analysis_slice_not_full_buffer():
+    sample_rate = 100.0
+    lead = 4.0 * np.sin(2 * np.pi * 2.0 * (np.arange(50) / sample_rate))
+    middle = 1.0 * np.sin(2 * np.pi * 10.0 * (np.arange(100) / sample_rate))
+    tail = np.zeros(50, dtype=np.float64)
+    buffer = np.concatenate([lead, middle, tail]).astype(np.float32).reshape(-1, 1)
+
+    payload = build_chart_payload(
+        buffer=buffer,
+        config=_make_config(),
+        sample_rate=sample_rate,
+        mic_cal={},
+        analysis_window=(0.5, 1.5),
+    )
+
+    frequencies = np.asarray(payload[0]["fft"]["frequencies_hz"], dtype=np.float64)
+    levels = np.asarray(payload[0]["fft"]["levels_db"], dtype=np.float64)
+    peak_frequency = frequencies[int(np.argmax(levels))]
+
+    assert peak_frequency == pytest.approx(10.0, abs=1.0)

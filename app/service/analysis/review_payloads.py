@@ -604,10 +604,7 @@ def _build_spl_chart(*, signal: np.ndarray, sample_rate: float, channel_config: 
 
 
 def _build_fft_chart(*, signal: np.ndarray, sample_rate: float, channel_config: dict) -> dict:
-    try:
-        nfft = int(channel_config.get("stft_nfft", 1024) or 1024)
-    except (TypeError, ValueError):
-        nfft = 1024
+    nfft = int(signal.size)
     frequencies_hz, magnitudes_db = dsp.compute_fft_spectrum(signal, sample_rate, nfft)
     levels_db = _absolute_levels_db(magnitudes_db)
     return {
