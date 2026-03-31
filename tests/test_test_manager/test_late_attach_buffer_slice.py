@@ -670,3 +670,185 @@ class TestLateAttachBufferSlice:
             axis=0,
         )
         np.testing.assert_array_equal(late_session._buffer, expected)
+
+    def test_late_attached_session_clamps_tail_elapsed_to_partial_final_write_boundary(self, monkeypatch):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        services.hss_service.load_io_devices.return_value = {
+            "input": {
+                "id": 0,
+                "name": "Mic",
+                "type": "MME",
+                "samplerate": "22050",
+                "channel_count": "1",
+            },
+            "output": {
+                "id": 1,
+                "name": "Speaker",
+                "type": "MME",
+                "samplerate": "22050",
+                "channel_count": "1",
+            },
+            "mic_cal": {},
+        }
+        services.config_service.load_config.side_effect = [
+            {
+                "config_id": 1,
+                "config_name": "First",
+                "record_duration": 1.0,
+                "analysis_duration": 1.0,
+                "selected_channels": [0],
+                "channels": [{
+                    "channel_index": 0,
+                    "stft_nfft": 1024,
+                    "stft_overlap": 0.5,
+                    "spl_weighting": "Z",
+                    "spl_time_constant": 0.125,
+                    "spl_upper_limit": 85.0,
+                    "spl_lower_limit": 40.0,
+                    "fft_band_limits": [],
+                    "oct_weighting": "Z",
+                    "oct_band_limits": [],
+                }],
+                "input_device_name": "Mic",
+                "input_device_hostapi": "MME",
+                "input_device_samplerate": 22050,
+                "output_device_name": None,
+            },
+            {
+                "config_id": 2,
+                "config_name": "Late",
+                "record_duration": 0.1,
+                "analysis_duration": 1.0,
+                "selected_channels": [0],
+                "channels": [{
+                    "channel_index": 0,
+                    "stft_nfft": 1024,
+                    "stft_overlap": 0.5,
+                    "spl_weighting": "Z",
+                    "spl_time_constant": 0.125,
+                    "spl_upper_limit": 85.0,
+                    "spl_lower_limit": 40.0,
+                    "fft_band_limits": [],
+                    "oct_weighting": "Z",
+                    "oct_band_limits": [],
+                }],
+                "input_device_name": "Mic",
+                "input_device_hostapi": "MME",
+                "input_device_samplerate": 22050,
+                "output_device_name": None,
+            },
+        ]
+
+        class FakePipeline:
+            channel_index = 0
+
+            def __init__(self, elapsed_values):
+                self._elapsed_values = elapsed_values
+
+            def process_chunk(self, mono, elapsed):
+                self._elapsed_values.append(elapsed)
+                return {"stft_frames": [], "stft": None, "spl": None, "octave": None, "fft": None}
+
+        class FakeAttachSnapshot:
+            def __init__(self, chunk_index, sample_index):
+                self.chunk_index = chunk_index
+                self.sample_index = sample_index
+
+        class FakeRecorder:
+            def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+                self._sample_rate = float(sample_rate)
+                self._n_channels = n_channels
+                self._record_duration = float(record_duration)
+                self._buffer = np.zeros(
+                    (int(self._sample_rate * self._record_duration), n_channels),
+                    dtype=np.float32,
+                )
+                self._chunk_samples = int(self._sample_rate * 0.05)
+                self._write_pos = 0
+                self._emitted_chunk_index = 0
+                self._running = False
+                self.chunk_ready = _DummySignal()
+                self.recording_done = _DummySignal()
+                self.error_occurred = _DummySignal()
+
+            def attach_session(self, *, record_duration):
+                return FakeAttachSnapshot(self._emitted_chunk_index, self._write_pos)
+
+            def isRunning(self):
+                return self._running
+
+            def start(self):
+                self._running = True
+
+            def stop(self):
+                self._running = False
+
+            def wait(self, timeout):
+                return True
+
+            def get_buffer_from(self, snapshot):
+                return self._buffer[snapshot.sample_index : self._write_pos].copy()
+
+            def emit_chunk(self, fill_value, *, new_samples=None):
+                n_write = self._chunk_samples if new_samples is None else int(new_samples)
+                end = self._write_pos + n_write
+                self._buffer[self._write_pos : end] = fill_value
+                self._write_pos = end
+                start = max(0, self._write_pos - self._chunk_samples)
+                chunk = self._buffer[start : self._write_pos].copy()
+                chunk_index = self._emitted_chunk_index
+                self._emitted_chunk_index += 1
+                self.chunk_ready.emit(chunk, chunk_index)
+
+        def fake_setup_pipelines(self):
+            self._elapsed_values = []
+            self._pipelines = [FakePipeline(self._elapsed_values)]
+
+        def fake_run_judgment(self):
+            return JudgmentResult(
+                overall="合格",
+                limit_pass=True,
+                ai_pass=None,
+                ai_score=None,
+            )
+
+        monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
+        monkeypatch.setattr("app.service.analysis.test_session.TestSession._setup_pipelines", fake_setup_pipelines)
+        monkeypatch.setattr("app.service.analysis.test_session.TestSession._run_judgment", fake_run_judgment)
+
+        mgr = TestManager(bus, services)
+        mgr.start({"config_id": 1, "sn": "SN1"})
+        shared_rec = mgr._recorders[1]
+        shared_rec.emit_chunk(0.0)
+        shared_rec.emit_chunk(1.0)
+        shared_rec.emit_chunk(2.0)
+        shared_rec.emit_chunk(3.0)
+
+        mgr.start({"config_id": 2, "sn": "SN2"})
+        shared_rec.emit_chunk(4.0)
+        shared_rec.emit_chunk(5.0)
+
+        assert 2 not in mgr._completed_sessions
+
+        shared_rec.emit_chunk(6.0, new_samples=1)
+
+        late_session = mgr._completed_sessions[2]
+        expected_elapsed_values = [1102 / 22050.0, 2204 / 22050.0, 2205 / 22050.0]
+        progress_elapsed_values = [
+            call.args[1]
+            for call in bus.recording_progress.emit.call_args_list
+            if call.args[0] == 2
+        ]
+        expected_buffer = np.concatenate(
+            [
+                np.full((1102, 1), 4.0, dtype=np.float32),
+                np.full((1102, 1), 5.0, dtype=np.float32),
+                np.full((1, 1), 6.0, dtype=np.float32),
+            ],
+            axis=0,
+        )
+
+        assert late_session._elapsed_values == pytest.approx(expected_elapsed_values)
+        assert progress_elapsed_values == pytest.approx(expected_elapsed_values)
+        np.testing.assert_array_equal(late_session._buffer, expected_buffer)

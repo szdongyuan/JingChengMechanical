@@ -248,7 +248,7 @@ class TestTestSessionProcessing:
         assert fake_pipeline.process_chunk.call_args.args[1] == pytest.approx(expected_elapsed)
         assert bus.recording_progress.emit.call_args.args == (1, pytest.approx(expected_elapsed))
 
-    def test_on_chunk_completion_tracks_sample_derived_elapsed_after_attach_at_non_round_sample_rate(self):
+    def test_on_chunk_completion_clamps_elapsed_to_session_target_after_attach_at_non_round_sample_rate(self):
         bus = _make_mock_bus()
         ai = MagicMock()
         config = _make_config()
@@ -274,10 +274,12 @@ class TestTestSessionProcessing:
         session._pipelines = [fake_pipeline]
         session._on_session_done_cb = MagicMock()
         session.attach_to_recorder(chunk_index=4)
-        chunk = np.ones((int(22050 * 0.05), 1), dtype=np.float32)
+        chunk_window_samples = int(22050 * 0.05)
+        total_target_samples = int(22050 * config["record_duration"])
+        chunk = np.ones((chunk_window_samples, 1), dtype=np.float32)
         expected_elapsed_values = [
-            (chunk.shape[0] * multiplier) / 22050.0
-            for multiplier in (1, 2, 3)
+            samples / 22050.0
+            for samples in (chunk_window_samples, chunk_window_samples * 2, total_target_samples)
         ]
 
         session._on_chunk(chunk, 4)
@@ -296,6 +298,7 @@ class TestTestSessionProcessing:
             for call in bus.recording_progress.emit.call_args_list
         ]
         assert progress_elapsed_values == pytest.approx(expected_elapsed_values)
+        assert observed_elapsed_values[-1] == pytest.approx(config["record_duration"])
         session._on_session_done_cb.assert_called_once_with(1)
 
 

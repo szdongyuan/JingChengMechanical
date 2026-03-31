@@ -60,6 +60,7 @@ class TestSession:
         self._attach_chunk_index: int = 0
         self._attach_snapshot: Any | None = None
         self._processed_samples_since_attach: int = 0
+        self._recorder_chunk_window_samples: int = 0
         self._attach_pending: bool = False
         self._pending_attach_chunks: list[tuple[np.ndarray, int]] = []
         self._on_session_done_cb: Callable[[int], Any] | None = None
@@ -100,6 +101,7 @@ class TestSession:
         self._attach_chunk_index = max(0, int(chunk_index))
         self._attach_snapshot = snapshot
         self._processed_samples_since_attach = 0
+        self._recorder_chunk_window_samples = 0
         pending_chunks = self._pending_attach_chunks
         self._pending_attach_chunks = []
         self._attach_pending = False
@@ -113,12 +115,30 @@ class TestSession:
             return
         self._process_chunk(chunk, chunk_index)
 
+    def _processed_sample_boundary_since_attach(self, *, chunk_index: int, chunk_samples: int) -> int:
+        chunk_window_samples = max(0, int(chunk_samples))
+        if chunk_window_samples > self._recorder_chunk_window_samples:
+            self._recorder_chunk_window_samples = chunk_window_samples
+
+        if self._recorder_chunk_window_samples <= 0:
+            return 0
+
+        relative_chunk_count = max(0, int(chunk_index) - self._attach_chunk_index + 1)
+        processed_samples = relative_chunk_count * self._recorder_chunk_window_samples
+        target_samples = max(0, int(self._sample_rate * self._record_duration))
+        if target_samples > 0:
+            return min(processed_samples, target_samples)
+        return processed_samples
+
     def _process_chunk(self, chunk: np.ndarray, chunk_index: int):
         if chunk_index < self._attach_chunk_index:
             return
 
         chunk_samples = int(chunk.shape[0]) if chunk.ndim > 0 else 0
-        self._processed_samples_since_attach += max(0, chunk_samples)
+        self._processed_samples_since_attach = self._processed_sample_boundary_since_attach(
+            chunk_index=chunk_index,
+            chunk_samples=chunk_samples,
+        )
         elapsed = (
             self._processed_samples_since_attach / self._sample_rate
             if self._sample_rate > 0
