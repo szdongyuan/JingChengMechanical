@@ -12,6 +12,7 @@ from dataclasses import asdict, is_dataclass
 import numpy as np
 from PyQt6.QtCore import QObject
 
+from app.service.analysis import dsp
 from app.service.analysis.audio_monitor import AudioMonitor
 from app.service.analysis.audio_recorder import AudioRecorder
 from app.service.analysis.review_payloads import build_chart_payload, build_summary_payload
@@ -378,6 +379,7 @@ class TestManager(QObject):
         chart_payload = self._build_chart_payload(
             session,
             analysis_window=result_dict.get("analysis_window"),
+            judgment_payload=result_dict,
         )
         self._bus.test_finished.emit(config_id, result_dict)
         self._bus.result_changed.emit(result_dict)
@@ -471,6 +473,7 @@ class TestManager(QObject):
             chart_payload = self._build_chart_payload(
                 session,
                 analysis_window=result_dict.get("analysis_window"),
+                judgment_payload=result_dict,
             )
             self._bus.test_finished.emit(config_id, result_dict)
             self._bus.result_changed.emit(result_dict)
@@ -689,18 +692,113 @@ class TestManager(QObject):
             error_message=error_message,
         )
 
-    @staticmethod
-    def _build_chart_payload(session, *, analysis_window) -> dict | None:
+    def _build_chart_payload(
+        self,
+        session,
+        *,
+        analysis_window,
+        judgment_payload: dict | None = None,
+    ) -> dict | None:
         mic_cal = getattr(session, "_mic_cal", None)
         if not isinstance(mic_cal, dict):
             mic_cal = {}
-        return build_chart_payload(
+        chart_payload = build_chart_payload(
             buffer=getattr(session, "_buffer", None),
             config=TestManager._session_config(session),
             sample_rate=float(getattr(session, "_sample_rate", 0) or 0),
             mic_cal=mic_cal,
             analysis_window=analysis_window,
         )
+        self._warn_loudness_chart_issues(
+            session,
+            judgment_payload=judgment_payload,
+            chart_payload=chart_payload,
+        )
+        return chart_payload
+
+    def _warn_loudness_chart_issues(
+        self,
+        session,
+        *,
+        judgment_payload: dict | None,
+        chart_payload: dict | None,
+    ) -> None:
+        if not isinstance(judgment_payload, dict):
+            return
+
+        config = self._session_config(session)
+        config_id = config.get("config_id", getattr(session, "config_id", None))
+        for channel_result in judgment_payload.get("channel_results", []):
+            if not isinstance(channel_result, dict):
+                continue
+
+            channel_index = channel_result.get("channel_index")
+            if not isinstance(channel_index, int) or isinstance(channel_index, bool) or channel_index < 0:
+                continue
+            if channel_result.get("loudness_available") is not True:
+                continue
+
+            channel_payload = chart_payload.get(channel_index) if isinstance(chart_payload, dict) else None
+            loudness_payload = (
+                channel_payload.get("loudness")
+                if isinstance(channel_payload, dict)
+                else None
+            )
+            if not isinstance(loudness_payload, dict):
+                self._bus.log.emit(
+                    "[TestManager] WARNING: loudness chart recompute failed "
+                    f"for config={config_id} channel=CH{channel_index + 1}"
+                )
+                continue
+
+            serialized_peak = self._coerce_finite_float(channel_result.get("loudness_max_sone"))
+            chart_peak = self._loudness_chart_peak_sone(loudness_payload)
+            if serialized_peak is None or chart_peak is None:
+                self._bus.log.emit(
+                    "[TestManager] WARNING: loudness chart recompute failed "
+                    f"for config={config_id} channel=CH{channel_index + 1}"
+                )
+                continue
+
+            if not np.isclose(chart_peak, serialized_peak, atol=1e-4, rtol=1e-4):
+                self._bus.log.emit(
+                    "[TestManager] WARNING: loudness chart scalar mismatch "
+                    f"for config={config_id} channel=CH{channel_index + 1} "
+                    f"serialized={serialized_peak:g} recomputed={chart_peak:g}"
+                )
+
+    @staticmethod
+    def _loudness_chart_peak_sone(loudness_payload: dict) -> float | None:
+        values = loudness_payload.get("values")
+        if not isinstance(values, list) or not values:
+            return None
+
+        unit = str(loudness_payload.get("unit") or "").strip().lower()
+        normalized_values = []
+        for value in values:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not np.isfinite(numeric):
+                return None
+            normalized_values.append(numeric)
+
+        if unit == "phon":
+            return max(dsp.phon_to_sone(value) for value in normalized_values)
+        if unit == "sone":
+            return max(max(value, 0.0) for value in normalized_values)
+        return None
+
+    @staticmethod
+    def _coerce_finite_float(value) -> float | None:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(numeric):
+            return None
+        return numeric
 
     @staticmethod
     def _analysis_duration_sec(config: dict) -> float:

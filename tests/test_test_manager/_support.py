@@ -65,6 +65,9 @@ def _factory_runtime_config(config_id: int = 1) -> dict:
             "spl_time_constant": 0.125,
             "spl_upper_limit": 85.0,
             "spl_lower_limit": 40.0,
+            "loudness_unit": "sone",
+            "loudness_lower_limit": 0.0,
+            "loudness_upper_limit": 10.0,
             "fft_band_limits": [],
             "oct_weighting": "Z",
             "oct_band_limits": [],
@@ -276,10 +279,20 @@ def _expected_summary_payload(*, overall_status: str, error_message: str | None 
                 "constrained": True,
             },
             {
+                "item_key": "loudness",
+                "label": "Loudness",
+                "deviation_value": -2.0,
+                "deviation_display": "-2 sone",
+                "channel_index": 0,
+                "channel_label": "CH1",
+                "status": "OK",
+                "constrained": True,
+            },
+            {
                 "item_key": "fft",
                 "label": "FFT",
-                "deviation_value": -2.0,
-                "deviation_display": "-2 dB",
+                "deviation_value": -3.0,
+                "deviation_display": "-3 dB",
                 "channel_index": 0,
                 "channel_label": "CH1",
                 "status": "OK",
@@ -288,8 +301,8 @@ def _expected_summary_payload(*, overall_status: str, error_message: str | None 
             {
                 "item_key": "octave",
                 "label": "倍频程",
-                "deviation_value": -3.0,
-                "deviation_display": "-3 dB",
+                "deviation_value": -4.0,
+                "deviation_display": "-4 dB",
                 "channel_index": 0,
                 "channel_label": "CH1",
                 "status": "OK",
@@ -311,6 +324,13 @@ def _expected_summary_payload(*, overall_status: str, error_message: str | None 
 def _expected_chart_payload() -> dict:
     return {
         0: {
+            "loudness": {
+                "times_sec": [0.0, 1.0],
+                "values": [2.0, 3.0],
+                "unit": "sone",
+                "lower_limit": 0.0,
+                "upper_limit": 10.0,
+            },
             "spl": {
                 "times_sec": [0.05, 0.1],
                 "values_db": [71.0, 72.0],

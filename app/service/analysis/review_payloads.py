@@ -9,6 +9,7 @@ from app.service.analysis.judgment import _runtime_channel_defaults
 
 _SUMMARY_ROW_DEFS = (
     ("spl", "SPL"),
+    ("loudness", "Loudness"),
     ("fft", "FFT"),
     ("octave", "倍频程"),
     ("ai", "AI分析"),
@@ -47,12 +48,18 @@ def build_summary_payload(
         selected_channels=selected_channels,
         ai_review=ai_review,
     )
+    loudness_row, loudness_error_message = _build_loudness_row(
+        selected_channels=selected_channels,
+        channel_configs=channel_configs,
+        channel_results=channel_results,
+    )
     rows = [
         _build_spl_row(
             selected_channels=selected_channels,
             channel_configs=channel_configs,
             channel_results=channel_results,
         ),
+        loudness_row,
         _build_band_row(
             item_key="fft",
             label="FFT",
@@ -78,7 +85,7 @@ def build_summary_payload(
         "overall_status": overall_status,
         "overall_label": _overall_label(overall_status),
         "error_message": (
-            _normalize_error_message(error_message, ai_error_message)
+            _normalize_error_message(error_message, loudness_error_message, ai_error_message)
             if overall_status == "no_result"
             else None
         ),
@@ -115,7 +122,7 @@ def build_chart_payload(
             continue
         channel_config = _runtime_channel_config(config, channel_index)
         calibrated = _apply_mic_calibration(signal, mic_cal, channel_index)
-        payload[channel_index] = {
+        channel_payload = {
             "spl": _build_spl_chart(signal=calibrated, sample_rate=sample_rate, channel_config=channel_config),
             "fft": _build_fft_chart(signal=calibrated, sample_rate=sample_rate, channel_config=channel_config),
             "octave": _build_octave_chart(
@@ -124,6 +131,15 @@ def build_chart_payload(
                 channel_config=channel_config,
             ),
         }
+        try:
+            channel_payload["loudness"] = _build_loudness_chart(
+                signal=calibrated,
+                sample_rate=sample_rate,
+                channel_config=channel_config,
+            )
+        except Exception:
+            pass
+        payload[channel_index] = channel_payload
     return payload
 
 
@@ -166,7 +182,7 @@ def _build_spl_row(
 ) -> dict:
     candidates = []
     for channel_index in selected_channels:
-        channel_config = channel_configs.get(channel_index, {})
+        channel_config = _effective_channel_config(channel_configs, channel_index)
         lower = _coerce_bound(channel_config.get("spl_lower_limit"))
         upper = _coerce_bound(channel_config.get("spl_upper_limit"))
         if not _has_constraint(lower, upper):
@@ -204,11 +220,11 @@ def _build_band_row(
     selected_channels: tuple[int, ...],
     channel_configs: dict[int, dict],
     channel_results: dict[int, dict],
-) -> dict:
+    ) -> dict:
     configured_any = False
     candidates = []
     for channel_index in selected_channels:
-        channel_config = channel_configs.get(channel_index, {})
+        channel_config = _effective_channel_config(channel_configs, channel_index)
         configured_bands = channel_config.get(config_key, [])
         if isinstance(configured_bands, list) and configured_bands:
             configured_any = True
@@ -267,6 +283,77 @@ def _build_configured_band_candidates(
             }
         )
     return candidates
+
+
+def _build_loudness_row(
+    *,
+    selected_channels: tuple[int, ...],
+    channel_configs: dict[int, dict],
+    channel_results: dict[int, dict],
+) -> tuple[dict, str | None]:
+    if not selected_channels:
+        return _build_unconstrained_row("loudness", "Loudness"), None
+
+    candidates = []
+    for channel_index in selected_channels:
+        channel_result = channel_results.get(channel_index)
+        if not isinstance(channel_result, dict):
+            return _build_constrained_no_result_row("loudness", "Loudness", channel_index=channel_index), None
+
+        if channel_result.get("loudness_available") is not True:
+            return (
+                _build_constrained_no_result_row("loudness", "Loudness", channel_index=channel_index),
+                _normalize_error_message(channel_result.get("loudness_error_message")),
+            )
+
+        actual_sone = _coerce_number(channel_result.get("loudness_max_sone"))
+        if actual_sone is None:
+            return (
+                _build_constrained_no_result_row("loudness", "Loudness", channel_index=channel_index),
+                _normalize_error_message(channel_result.get("loudness_error_message")),
+            )
+
+        channel_config = _effective_channel_config(channel_configs, channel_index)
+        unit = _normalize_loudness_unit(channel_config.get("loudness_unit"))
+        lower_limit = _coerce_bound(channel_config.get("loudness_lower_limit"))
+        upper_limit = _coerce_bound(channel_config.get("loudness_upper_limit"))
+        lower_sone, upper_sone = _loudness_limits_sone(lower_limit, upper_limit, unit)
+        deviation_sone = _compute_deviation(
+            actual=actual_sone,
+            lower=lower_sone,
+            upper=upper_sone,
+        )
+        actual_display = _loudness_value_in_unit(actual_sone, unit)
+        display_deviation = _compute_deviation(
+            actual=actual_display,
+            lower=lower_limit,
+            upper=upper_limit,
+        )
+        if deviation_sone is None or display_deviation is None:
+            return _build_constrained_no_result_row("loudness", "Loudness", channel_index=channel_index), None
+
+        candidates.append(
+            {
+                "deviation_value": deviation_sone,
+                "display_deviation_value": display_deviation,
+                "channel_index": channel_index,
+                "unit": unit,
+            }
+        )
+
+    candidate = _worst_candidate(candidates)
+    return (
+        _build_row(
+            item_key="loudness",
+            label="Loudness",
+            deviation_value=candidate["display_deviation_value"],
+            channel_index=candidate["channel_index"],
+            status=_status_from_deviation(candidate["deviation_value"]),
+            constrained=True,
+            unit=candidate["unit"],
+        ),
+        None,
+    )
 
 
 def _build_ai_row(
@@ -354,16 +441,27 @@ def _build_full_no_result_row(item_key: str, label: str) -> dict:
     return _build_no_result_row(item_key, label, constrained=False)
 
 
-def _build_constrained_no_result_row(item_key: str, label: str) -> dict:
-    return _build_no_result_row(item_key, label, constrained=True)
+def _build_constrained_no_result_row(
+    item_key: str,
+    label: str,
+    *,
+    channel_index: int | None = None,
+) -> dict:
+    return _build_no_result_row(item_key, label, constrained=True, channel_index=channel_index)
 
 
-def _build_no_result_row(item_key: str, label: str, *, constrained: bool) -> dict:
+def _build_no_result_row(
+    item_key: str,
+    label: str,
+    *,
+    constrained: bool,
+    channel_index: int | None = None,
+) -> dict:
     return _build_row(
         item_key=item_key,
         label=label,
         deviation_value=None,
-        channel_index=None,
+        channel_index=channel_index,
         status=_NO_RESULT_STATUS,
         constrained=constrained,
         unit=None,
@@ -544,10 +642,14 @@ def _selected_chart_channels(config: dict, buffer: np.ndarray) -> tuple[int, ...
 
 
 def _runtime_channel_config(config: dict, channel_index: int) -> dict:
-    channel_configs = _channel_config_by_index(config)
-    if channel_index in channel_configs:
-        return channel_configs[channel_index]
-    return _runtime_channel_defaults(channel_index)
+    return _effective_channel_config(_channel_config_by_index(config), channel_index)
+
+
+def _effective_channel_config(channel_configs: dict[int, dict], channel_index: int) -> dict:
+    channel_config = _runtime_channel_defaults(channel_index)
+    if isinstance(channel_configs.get(channel_index), dict):
+        channel_config.update(channel_configs[channel_index])
+    return channel_config
 
 
 def _extract_channel(buffer: np.ndarray, channel_index: int) -> np.ndarray | None:
@@ -600,6 +702,26 @@ def _build_spl_chart(*, signal: np.ndarray, sample_rate: float, channel_config: 
         "values_db": values_db,
         "lower_limit_db": _normalize_chart_number(channel_config.get("spl_lower_limit")),
         "upper_limit_db": _normalize_chart_number(channel_config.get("spl_upper_limit")),
+    }
+
+
+def _build_loudness_chart(*, signal: np.ndarray, sample_rate: float, channel_config: dict) -> dict:
+    times_sec, values_sone, _max_sone = dsp.compute_loudness_trace(signal, sample_rate)
+    unit = _normalize_loudness_unit(channel_config.get("loudness_unit"))
+    values = np.asarray(
+        [_loudness_value_in_unit(value_sone, unit) for value_sone in values_sone],
+        dtype=np.float64,
+    )
+    normalized_times, normalized_values = _normalize_chart_pairs(times_sec, values)
+    if normalized_times.size <= 0 or normalized_values.size <= 0:
+        raise RuntimeError("loudness chart payload is empty")
+
+    return {
+        "times_sec": _normalize_chart_list(normalized_times),
+        "values": _normalize_chart_list(normalized_values),
+        "unit": unit,
+        "lower_limit": _normalize_chart_number(channel_config.get("loudness_lower_limit")),
+        "upper_limit": _normalize_chart_number(channel_config.get("loudness_upper_limit")),
     }
 
 
@@ -724,6 +846,31 @@ def _normalize_chart_number(value) -> float | None:
     if abs(normalized) < 1e-9:
         return 0.0
     return normalized
+
+
+def _normalize_loudness_unit(value) -> str:
+    return "phon" if str(value or "").strip().lower() == "phon" else "sone"
+
+
+def _loudness_value_in_unit(value_sone: float, unit: str) -> float:
+    if unit == "phon":
+        return dsp.sone_to_phon(value_sone)
+    return max(float(value_sone), 0.0)
+
+
+def _loudness_limits_sone(
+    lower_limit: float | None,
+    upper_limit: float | None,
+    unit: str,
+) -> tuple[float | None, float | None]:
+    if unit == "phon":
+        lower = dsp.phon_to_sone(lower_limit) if _is_finite(lower_limit) else None
+        upper = dsp.phon_to_sone(upper_limit) if _is_finite(upper_limit) else None
+        return lower, upper
+
+    lower = max(float(lower_limit), 0.0) if _is_finite(lower_limit) else None
+    upper = max(float(upper_limit), 0.0) if _is_finite(upper_limit) else None
+    return lower, upper
 
 
 __all__ = ["build_chart_payload", "build_summary_payload", "canonical_channel_label"]

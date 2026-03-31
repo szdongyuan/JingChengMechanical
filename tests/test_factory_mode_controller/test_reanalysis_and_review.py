@@ -89,7 +89,7 @@ def test_begin_reanalysis_clears_summary_payload_and_chart_payload_without_reset
         trigger_source="manual",
         judgment_payload={"overall": "合格"},
         summary_payload={"overall_status": "pass", "overall_label": "PASS", "rows": []},
-        chart_payload={0: {"spl": {}, "fft": {}, "octave": {}}},
+        chart_payload={0: {"loudness": {}, "spl": {}, "fft": {}, "octave": {}}},
     )
 
     _emit_owned_runtime_start(
@@ -163,6 +163,16 @@ def test_factory_mode_controller_preserves_committed_partial_no_result_reanalysi
                 "constrained": True,
             },
             {
+                "item_key": "loudness",
+                "label": "Loudness",
+                "deviation_value": None,
+                "deviation_display": "--",
+                "channel_index": 0,
+                "channel_label": "CH1",
+                "status": "无结果",
+                "constrained": True,
+            },
+            {
                 "item_key": "fft",
                 "label": "FFT",
                 "deviation_value": -2.0,
@@ -196,6 +206,7 @@ def test_factory_mode_controller_preserves_committed_partial_no_result_reanalysi
     }
     partial_chart_payload = {
         0: {
+            "loudness": {"series": [2.0, 3.0], "unit": "sone"},
             "spl": {"series": [70.0, 71.0]},
             "fft": {"series": [55.0, 48.0]},
             "octave": {"series": [57.0, 50.0]},

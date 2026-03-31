@@ -91,10 +91,20 @@ def _summary_payload(
                 "constrained": True,
             },
             {
+                "item_key": "loudness",
+                "label": "Loudness",
+                "deviation_value": -2.0,
+                "deviation_display": "-2 sone",
+                "channel_index": 0,
+                "channel_label": "CH1",
+                "status": "OK",
+                "constrained": True,
+            },
+            {
                 "item_key": "fft",
                 "label": "FFT",
-                "deviation_value": -2.0,
-                "deviation_display": "-2 dB",
+                "deviation_value": -3.0,
+                "deviation_display": "-3 dB",
                 "channel_index": 0,
                 "channel_label": "CH1",
                 "status": "OK",
@@ -103,8 +113,8 @@ def _summary_payload(
             {
                 "item_key": "octave",
                 "label": "倍频程",
-                "deviation_value": -3.0,
-                "deviation_display": "-3 dB",
+                "deviation_value": -4.0,
+                "deviation_display": "-4 dB",
                 "channel_index": 0,
                 "channel_label": "CH1",
                 "status": "OK",
@@ -164,7 +174,9 @@ def _make_review_payload(
 
 def _assert_placeholder(module: ResultModule, *, badge_text: str) -> None:
     assert module.lb_overall.text() == badge_text
+    assert module.table.rowCount() == 5
     assert _table_value(module, 0, 0) == "SPL"
+    assert _table_value(module, 1, 0) == "Loudness"
     assert _table_value(module, 0, 1) == "-"
     assert _table_value(module, 0, 2) == "-"
     assert _table_value(module, 0, 3) == "-"
@@ -186,6 +198,16 @@ def test_result_module_renders_completed_summary_rows_from_summary_payload(qapp)
                         "label": "SPL",
                         "deviation_value": 6.0,
                         "deviation_display": "6 dB",
+                        "channel_index": 1,
+                        "channel_label": "CH2",
+                        "status": "NG",
+                        "constrained": True,
+                    },
+                    {
+                        "item_key": "loudness",
+                        "label": "Loudness",
+                        "deviation_value": 4.0,
+                        "deviation_display": "4 sone",
                         "channel_index": 1,
                         "channel_label": "CH2",
                         "status": "NG",
@@ -228,14 +250,19 @@ def test_result_module_renders_completed_summary_rows_from_summary_payload(qapp)
 
     assert module.lb_overall.text() == "FAIL"
     assert module.lb_overall.property("resultLevel") == "fail"
+    assert module.table.rowCount() == 5
     assert _table_value(module, 0, 0) == "SPL"
     assert _table_value(module, 0, 1) == "6 dB"
     assert _table_value(module, 0, 2) == "CH2"
     assert _table_value(module, 0, 3) == "NG"
-    assert _table_value(module, 3, 0) == "AI分析"
-    assert _table_value(module, 3, 1) == "--"
-    assert _table_value(module, 3, 2) == "--"
-    assert _table_value(module, 3, 3) == "OK"
+    assert _table_value(module, 1, 0) == "Loudness"
+    assert _table_value(module, 1, 1) == "4 sone"
+    assert _table_value(module, 1, 2) == "CH2"
+    assert _table_value(module, 1, 3) == "NG"
+    assert _table_value(module, 4, 0) == "AI分析"
+    assert _table_value(module, 4, 1) == "--"
+    assert _table_value(module, 4, 2) == "--"
+    assert _table_value(module, 4, 3) == "OK"
 
 
 @pytest.mark.parametrize("phase", ["analyzing", "reanalyzing"])
@@ -266,11 +293,11 @@ def test_result_module_shows_no_result_plus_error_text_from_summary_payload(qapp
     module.services.bus.factory_review_changed.emit(
         _make_review_payload(
             no_result=True,
-            error_message="AI timeout",
+            error_message="MoSQITo unavailable",
             judgment_payload={"overall": "合格"},
             summary_payload=_summary_payload(
                 overall_status="no_result",
-                error_message="AI timeout",
+                error_message="MoSQITo unavailable",
                 rows=[
                     {
                         "item_key": "spl",
@@ -280,6 +307,16 @@ def test_result_module_shows_no_result_plus_error_text_from_summary_payload(qapp
                         "channel_index": 0,
                         "channel_label": "CH1",
                         "status": "OK",
+                        "constrained": True,
+                    },
+                    {
+                        "item_key": "loudness",
+                        "label": "Loudness",
+                        "deviation_value": None,
+                        "deviation_display": "--",
+                        "channel_index": 1,
+                        "channel_label": "CH2",
+                        "status": "无结果",
                         "constrained": True,
                     },
                     {
@@ -295,8 +332,8 @@ def test_result_module_shows_no_result_plus_error_text_from_summary_payload(qapp
                     {
                         "item_key": "octave",
                         "label": "倍频程",
-                        "deviation_value": -3.0,
-                        "deviation_display": "-3 dB",
+                        "deviation_value": -4.0,
+                        "deviation_display": "-4 dB",
                         "channel_index": 0,
                         "channel_label": "CH1",
                         "status": "OK",
@@ -309,8 +346,8 @@ def test_result_module_shows_no_result_plus_error_text_from_summary_payload(qapp
                         "deviation_display": "--",
                         "channel_index": None,
                         "channel_label": "--",
-                        "status": "无结果",
-                        "constrained": True,
+                        "status": "OK",
+                        "constrained": False,
                     },
                 ],
             ),
@@ -322,10 +359,13 @@ def test_result_module_shows_no_result_plus_error_text_from_summary_payload(qapp
     assert _table_value(module, 0, 1) == "-1 dB"
     assert _table_value(module, 0, 2) == "CH1"
     assert _table_value(module, 0, 3) == "OK"
-    assert _table_value(module, 3, 0) == "AI分析"
-    assert _table_value(module, 3, 3) == "无结果"
+    assert _table_value(module, 1, 0) == "Loudness"
+    assert _table_value(module, 1, 2) == "CH2"
+    assert _table_value(module, 1, 3) == "无结果"
+    assert _table_value(module, 4, 0) == "AI分析"
+    assert _table_value(module, 4, 3) == "OK"
     assert getattr(module, "error_label").isHidden() is False
-    assert getattr(module, "error_label").text() == "AI timeout"
+    assert getattr(module, "error_label").text() == "MoSQITo unavailable"
 
 
 def test_factory_reset_still_clears_to_the_empty_badge_state(qapp):
