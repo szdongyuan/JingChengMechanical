@@ -305,6 +305,11 @@ def _build_loudness_row(
                 _build_constrained_no_result_row("loudness", "Loudness", channel_index=channel_index),
                 _normalize_error_message(channel_result.get("loudness_error_message")),
             )
+        if not isinstance(channel_result.get("loudness_pass"), bool):
+            return (
+                _build_constrained_no_result_row("loudness", "Loudness", channel_index=channel_index),
+                _normalize_error_message(channel_result.get("loudness_error_message")),
+            )
 
         actual_sone = _coerce_number(channel_result.get("loudness_max_sone"))
         if actual_sone is None:
@@ -318,13 +323,13 @@ def _build_loudness_row(
         lower_limit = _coerce_bound(channel_config.get("loudness_lower_limit"))
         upper_limit = _coerce_bound(channel_config.get("loudness_upper_limit"))
         lower_sone, upper_sone = _loudness_limits_sone(lower_limit, upper_limit, unit)
-        deviation_sone = _compute_deviation(
+        deviation_sone = _compute_deviation_raw(
             actual=actual_sone,
             lower=lower_sone,
             upper=upper_sone,
         )
         actual_display = _loudness_value_in_unit(actual_sone, unit)
-        display_deviation = _compute_deviation(
+        display_deviation = _compute_deviation_raw(
             actual=actual_display,
             lower=lower_limit,
             upper=upper_limit,
@@ -334,21 +339,22 @@ def _build_loudness_row(
 
         candidates.append(
             {
-                "deviation_value": deviation_sone,
+                "ranking_deviation_value": deviation_sone,
                 "display_deviation_value": display_deviation,
                 "channel_index": channel_index,
                 "unit": unit,
+                "loudness_pass": channel_result["loudness_pass"],
             }
         )
 
-    candidate = _worst_candidate(candidates)
+    candidate = _worst_loudness_candidate(candidates)
     return (
         _build_row(
             item_key="loudness",
             label="Loudness",
-            deviation_value=candidate["display_deviation_value"],
+            deviation_value=_normalize_deviation(candidate["display_deviation_value"]),
             channel_index=candidate["channel_index"],
-            status=_status_from_deviation(candidate["deviation_value"]),
+            status="OK" if candidate["loudness_pass"] else "NG",
             constrained=True,
             unit=candidate["unit"],
         ),
@@ -496,6 +502,15 @@ def _worst_candidate(candidates: list[dict]) -> dict:
     return max(candidates, key=lambda candidate: candidate["deviation_value"])
 
 
+def _worst_loudness_candidate(candidates: list[dict]) -> dict:
+    failing_candidates = [
+        candidate for candidate in candidates
+        if candidate["loudness_pass"] is False
+    ]
+    ranked_candidates = failing_candidates or candidates
+    return max(ranked_candidates, key=lambda candidate: candidate["ranking_deviation_value"])
+
+
 def _overall_status(rows: list[dict]) -> str:
     if any(row["status"] == _NO_RESULT_STATUS for row in rows):
         return "no_result"
@@ -524,22 +539,34 @@ def _compute_deviation(
     lower: float | None,
     upper: float | None,
 ) -> float | None:
+    deviation = _compute_deviation_raw(actual=actual, lower=lower, upper=upper)
+    if deviation is None:
+        return None
+    return _normalize_deviation(deviation)
+
+
+def _compute_deviation_raw(
+    *,
+    actual: float | None,
+    lower: float | None,
+    upper: float | None,
+) -> float | None:
     if actual is None:
         return None
     if _is_finite(lower) and _is_finite(upper):
         if actual < lower:
-            return _normalize_deviation(lower - actual)
+            return lower - actual
         if actual > upper:
-            return _normalize_deviation(actual - upper)
-        return _normalize_deviation(-min(actual - lower, upper - actual))
+            return actual - upper
+        return -min(actual - lower, upper - actual)
     if _is_finite(lower):
         if actual < lower:
-            return _normalize_deviation(lower - actual)
-        return _normalize_deviation(-(actual - lower))
+            return lower - actual
+        return -(actual - lower)
     if _is_finite(upper):
         if actual > upper:
-            return _normalize_deviation(actual - upper)
-        return _normalize_deviation(-(upper - actual))
+            return actual - upper
+        return -(upper - actual)
     return None
 
 
