@@ -11,9 +11,12 @@ from app.service.analysis.dsp import (
     apply_mic_calibration,
     c_weighting,
     compute_fft_spectrum,
+    compute_loudness_trace,
     compute_octave_bands,
     compute_spl,
     compute_stft,
+    phon_to_sone,
+    sone_to_phon,
 )
 
 
@@ -138,6 +141,29 @@ class TestComputeSpl:
         sig = np.zeros(44100)
         spl = compute_spl(sig, 44100.0, weighting="Z", time_constant=0.125)
         assert spl < -50
+
+
+class TestLoudnessHelpers:
+    def test_sone_to_phon_matches_piecewise_contract(self):
+        assert sone_to_phon(1.0) == pytest.approx(40.0)
+
+    def test_phon_to_sone_clamps_negative_inverse_to_zero(self):
+        assert phon_to_sone(0.0) == pytest.approx(0.0)
+
+    def test_compute_loudness_trace_handles_non_native_sample_rate(self):
+        sample_rate = 44100.0
+        duration_sec = 1.0
+        times = np.arange(int(sample_rate * duration_sec)) / sample_rate
+        rms = 20e-6 * 10 ** (60.0 / 20.0)
+        amplitude = rms * np.sqrt(2.0)
+        signal = amplitude * np.sin(2 * np.pi * 1000.0 * times)
+
+        loudness_times, values_sone, max_sone = compute_loudness_trace(signal, sample_rate)
+
+        assert loudness_times
+        assert values_sone
+        assert max_sone >= 0.0
+        assert max_sone == pytest.approx(max(values_sone))
 
 
 class TestComputeStft:

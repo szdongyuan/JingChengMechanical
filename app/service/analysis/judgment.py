@@ -19,6 +19,9 @@ from app.service.config_service import _CHANNEL_DEFAULTS
 
 
 _REF_PRESSURE = 20e-6
+_DEFAULT_LOUDNESS_UNIT = "sone"
+_DEFAULT_LOUDNESS_LOWER_LIMIT = 0.0
+_DEFAULT_LOUDNESS_UPPER_LIMIT = 60.0
 
 
 def _runtime_channel_defaults(channel_index: int) -> dict:
@@ -142,6 +145,18 @@ class JudgmentEngine:
             spl_hi = ch_cfg.get("spl_upper_limit", 100.0)
             spl_pass = bool(spl_lo <= spl_db <= spl_hi)
 
+            loudness_max_sone: float | None = None
+            loudness_pass: bool | None = None
+            loudness_available = False
+            loudness_error_message: str | None = None
+            try:
+                _, _, loudness_max_sone = dsp.compute_loudness_trace(sig, sample_rate)
+                loudness_lo, loudness_hi = self._loudness_limits_sone(ch_cfg)
+                loudness_pass = bool(loudness_lo <= loudness_max_sone <= loudness_hi)
+                loudness_available = True
+            except Exception as exc:
+                loudness_error_message = str(exc) or exc.__class__.__name__
+
             # FFT band checks
             nfft = ch_cfg.get("stft_nfft", 1024)
             fft_bands = self._check_bands(
@@ -156,8 +171,11 @@ class JudgmentEngine:
                 ch_cfg.get("oct_band_limits", []),
             )
 
-            ch_pass = spl_pass and all(b.passed for b in fft_bands) and all(
-                b.passed for b in oct_bands
+            ch_pass = (
+                spl_pass
+                and loudness_pass is True
+                and all(b.passed for b in fft_bands)
+                and all(b.passed for b in oct_bands)
             )
             if not ch_pass:
                 all_pass = False
@@ -166,6 +184,10 @@ class JudgmentEngine:
                 channel_index=ch_idx,
                 spl_db=spl_db,
                 spl_pass=spl_pass,
+                loudness_max_sone=loudness_max_sone,
+                loudness_pass=loudness_pass,
+                loudness_available=loudness_available,
+                loudness_error_message=loudness_error_message,
                 fft_band_results=fft_bands,
                 oct_band_results=oct_bands,
             ))
@@ -246,6 +268,15 @@ class JudgmentEngine:
                 passed=lo <= level <= hi,
             ))
         return results
+
+    @staticmethod
+    def _loudness_limits_sone(channel_config: dict) -> tuple[float, float]:
+        unit = channel_config.get("loudness_unit", _DEFAULT_LOUDNESS_UNIT)
+        lower = float(channel_config.get("loudness_lower_limit", _DEFAULT_LOUDNESS_LOWER_LIMIT))
+        upper = float(channel_config.get("loudness_upper_limit", _DEFAULT_LOUDNESS_UPPER_LIMIT))
+        if unit == "phon":
+            return dsp.phon_to_sone(lower), dsp.phon_to_sone(upper)
+        return max(lower, 0.0), max(upper, 0.0)
 
     def _run_ai(self, config: dict, audio_file_path: str) -> tuple[bool | None, float | None]:
         """Validate AI binding and return (None, None) — actual call deferred to TestSession.

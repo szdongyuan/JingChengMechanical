@@ -5,6 +5,7 @@ All functions operate on numpy arrays and have no side effects.
 from __future__ import annotations
 
 from functools import lru_cache
+from math import log2
 
 import numpy as np
 from scipy import signal as scipy_signal
@@ -80,6 +81,7 @@ def _c_weight_linear(f: float) -> float:
 
 
 _REF_PRESSURE = 20e-6
+_LOUDNESS_MIN_SAMPLE_RATE = 48000.0
 
 
 def compute_spl(signal: np.ndarray, sample_rate: float,
@@ -125,6 +127,65 @@ def compute_spl(signal: np.ndarray, sample_rate: float,
     if rms <= 0:
         return -np.inf
     return 20.0 * np.log10(rms / _REF_PRESSURE)
+
+
+@lru_cache(maxsize=1)
+def _load_loudness_backend():
+    try:
+        from mosqito.sq_metrics import loudness_zwtv
+    except ImportError as exc:
+        raise RuntimeError("MoSQITo loudness backend is unavailable") from exc
+    return loudness_zwtv
+
+
+def _compute_loudness_zwtv(signal: np.ndarray, sample_rate: float):
+    backend = _load_loudness_backend()
+    return backend(signal, int(round(sample_rate)))
+
+
+def compute_loudness_trace(signal: np.ndarray, sample_rate: float) -> tuple[list[float], list[float], float]:
+    """Compute an ISO 532-1 loudness trace and its maximum in canonical sones."""
+    sig = np.asarray(signal, dtype=np.float64).reshape(-1)
+    if sig.size == 0:
+        raise ValueError("Loudness signal is empty")
+    if sample_rate <= 0.0:
+        raise ValueError("sample_rate must be positive")
+
+    backend_sample_rate = float(sample_rate)
+    if backend_sample_rate < _LOUDNESS_MIN_SAMPLE_RATE:
+        target_size = max(1, int(round(sig.size * _LOUDNESS_MIN_SAMPLE_RATE / backend_sample_rate)))
+        sig = scipy_signal.resample(sig, target_size)
+        backend_sample_rate = _LOUDNESS_MIN_SAMPLE_RATE
+
+    values_sone, _, _, times = _compute_loudness_zwtv(sig, backend_sample_rate)
+    values = np.maximum(np.asarray(values_sone, dtype=np.float64).reshape(-1), 0.0)
+    time_axis = np.asarray(times, dtype=np.float64).reshape(-1)
+
+    if values.size == 0 or time_axis.size == 0 or values.size != time_axis.size:
+        raise RuntimeError("MoSQITo loudness backend returned unusable output")
+    if not np.all(np.isfinite(values)) or not np.all(np.isfinite(time_axis)):
+        raise RuntimeError("MoSQITo loudness backend returned non-finite output")
+
+    max_sone = float(np.max(values))
+    return time_axis.tolist(), values.tolist(), max_sone
+
+
+def sone_to_phon(value_sone: float) -> float:
+    """Convert loudness from sones to phons using the project contract."""
+    sone = max(float(value_sone), 0.0)
+    if sone >= 1.0:
+        return float(40.0 + 10.0 * log2(sone))
+    return float(40.0 * (sone + 0.0005) ** 0.35)
+
+
+def phon_to_sone(value_phon: float) -> float:
+    """Convert loudness from phons to sones using the project contract."""
+    phon = max(float(value_phon), 0.0)
+    if phon >= 40.0:
+        return float(2.0 ** ((phon - 40.0) / 10.0))
+
+    sone = (phon / 40.0) ** (1.0 / 0.35) - 0.0005
+    return float(max(sone, 0.0))
 
 
 # ---------------------------------------------------------------------------

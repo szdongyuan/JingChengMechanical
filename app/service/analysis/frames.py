@@ -54,6 +54,10 @@ class ChannelJudgment:
     channel_index: int
     spl_db: float
     spl_pass: bool
+    loudness_max_sone: float | None = None
+    loudness_pass: bool | None = None
+    loudness_available: bool = False
+    loudness_error_message: str | None = None
     fft_band_results: list[BandResult] = field(default_factory=list)
     oct_band_results: list[BandResult] = field(default_factory=list)
 
