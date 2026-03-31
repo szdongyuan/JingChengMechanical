@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import ClassVar
 
 import numpy as np
-from PyQt6.QtCore import QPoint, QRect, Qt
+from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
 from PyQt6.QtWidgets import QFrame, QPushButton, QVBoxLayout, QWidget
 
 from app.service.analysis.frames import StftFrame
@@ -172,6 +172,7 @@ class StftModule(QWidget):
     module_id = "stft"
     _DISPLAY_PHASES = frozenset({"running", "analyzing", "reviewing", "reanalyzing"})
     _REVIEW_PHASES = frozenset({"reviewing", "reanalyzing"})
+    _LIVE_FLUSH_INTERVAL_MS = 50
 
     def __init__(self, services):
         super().__init__()
@@ -188,6 +189,8 @@ class StftModule(QWidget):
         self._display_run_id = getattr(self._review_payload, "run_id", None)
         self._render_cache_key: tuple[int, str, int] | None = None
         self._stft_cache: dict[tuple[int, str, int], _StftCacheEntry] = {}
+        self._pending_live_flush_key: tuple[int, str, int] | None = None
+        self._live_flush_generation = 0
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -247,10 +250,35 @@ class StftModule(QWidget):
         return self._render_cache_key
 
     def current_image_payload(self) -> dict | None:
+        if self._render_cache_key is not None:
+            cache_entry = self._stft_cache.get(self._render_cache_key)
+            payload = None if cache_entry is None else cache_entry.image_payload()
+            if payload is not None:
+                return payload
         return self.canvas.heatmap.image_payload()
+
+    def pending_live_flush_key(self) -> tuple[int, str, int] | None:
+        return self._pending_live_flush_key
 
     def refresh_selected_display_channel(self) -> None:
         self._refresh_cached_rendering()
+        self._update_overlay_geometry()
+
+    def flush_pending_live_refresh(self) -> None:
+        pending_cache_key = self._pending_live_flush_key
+        if pending_cache_key is None:
+            return
+
+        self._clear_pending_live_flush()
+        resolved_render_target = self._resolve_render_target()
+        if resolved_render_target is None:
+            return
+
+        cache_key, payload = resolved_render_target
+        if cache_key != pending_cache_key:
+            return
+
+        self._render_payload(cache_key, payload)
         self._update_overlay_geometry()
 
     def move_selection_to_start(self, start_sec: float) -> bool:
@@ -336,6 +364,7 @@ class StftModule(QWidget):
         self._drag_offset_px = None
         self._display_run_id = None
         self._render_cache_key = None
+        self._clear_pending_live_flush()
         self._stft_cache.clear()
         self.canvas.heatmap.clear_data()
         self._update_overlay_geometry()
@@ -383,6 +412,25 @@ class StftModule(QWidget):
             self._display_run_id = run_id
         if run_id != self._display_run_id:
             return
+
+        cache_key = (normalized_config_id, run_id, normalized_channel_idx)
+        render_channel = self._resolve_render_channel(normalized_config_id, run_id)
+        if render_channel != normalized_channel_idx:
+            return
+
+        if self._factory_state.run_phase in self._REVIEW_PHASES:
+            self._refresh_cached_rendering()
+            self._update_overlay_geometry()
+            return
+
+        if (
+            self._factory_state.run_phase in {"running", "analyzing"}
+            and self._render_cache_key == cache_key
+            and self.canvas.heatmap.has_image()
+        ):
+            self._schedule_live_refresh(cache_key)
+            return
+
         self._refresh_cached_rendering()
         self._update_overlay_geometry()
 
@@ -718,39 +766,79 @@ class StftModule(QWidget):
         elif self._factory_state.run_phase in self._REVIEW_PHASES:
             self._display_run_id = None
 
-    def _refresh_cached_rendering(self) -> None:
-        if not self._has_display_context():
-            self._render_cache_key = None
-            self.canvas.heatmap.clear_data()
+    def _refresh_cached_rendering(self, *, boundary_render: bool = True) -> None:
+        if boundary_render:
+            self._clear_pending_live_flush()
+
+        resolved_render_target = self._resolve_render_target()
+        if resolved_render_target is None:
+            self._clear_rendering()
             return
+
+        cache_key, payload = resolved_render_target
+        self._render_payload(cache_key, payload)
+
+    def _resolve_render_target(self) -> tuple[tuple[int, str, int], dict] | None:
+        if not self._has_display_context():
+            return None
 
         config_id = self._factory_state.displayed_config_id
         run_id = self._display_run_id or self._review_run_id_for_displayed_config()
         if config_id is None or run_id is None:
-            self._render_cache_key = None
-            self.canvas.heatmap.clear_data()
-            return
+            return None
 
         channel_index = self._resolve_render_channel(config_id, run_id)
         if channel_index is None:
-            self._render_cache_key = None
-            self.canvas.heatmap.clear_data()
-            return
+            return None
 
         cache_key = (config_id, run_id, channel_index)
         cache_entry = self._stft_cache.get(cache_key)
         payload = None if cache_entry is None else cache_entry.image_payload()
         if payload is None:
-            self._render_cache_key = None
-            self.canvas.heatmap.clear_data()
-            return
+            return None
 
+        return (cache_key, payload)
+
+    def _render_payload(self, cache_key: tuple[int, str, int], payload: dict) -> None:
+        reset_levels = cache_key != self._render_cache_key or not self.canvas.heatmap.has_image()
         self._render_cache_key = cache_key
         self.canvas.heatmap.set_image(
             times_sec=payload["times_sec"],
             frequencies_hz=payload["frequencies_hz"],
             magnitude_db=payload["magnitude_db"],
+            reset_levels=reset_levels,
         )
+
+    def _clear_rendering(self) -> None:
+        self._render_cache_key = None
+        self.canvas.heatmap.clear_data()
+
+    def _schedule_live_refresh(self, cache_key: tuple[int, str, int]) -> None:
+        if self._pending_live_flush_key == cache_key:
+            return
+
+        self._pending_live_flush_key = cache_key
+        self._live_flush_generation += 1
+        generation = self._live_flush_generation
+        self._schedule_live_flush_callback(
+            lambda generation=generation: self._flush_pending_live_refresh_if_current(
+                generation
+            )
+        )
+
+    def _schedule_live_flush_callback(self, callback) -> None:
+        QTimer.singleShot(self._LIVE_FLUSH_INTERVAL_MS, callback)
+
+    def _flush_pending_live_refresh_if_current(self, generation: int) -> None:
+        if generation != self._live_flush_generation:
+            return
+        self.flush_pending_live_refresh()
+
+    def _clear_pending_live_flush(self) -> None:
+        if self._pending_live_flush_key is None:
+            return
+        self._pending_live_flush_key = None
+        self._live_flush_generation += 1
 
     def _resolve_render_channel(self, config_id: int, run_id: str) -> int | None:
         selected_channel = None

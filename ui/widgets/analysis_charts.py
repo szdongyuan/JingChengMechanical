@@ -112,6 +112,7 @@ class StftImageChartWidget(_BasePlotChart):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._image_payload: dict | None = None
+        self._cached_levels: tuple[float, float] | None = None
         self._image_item = pg.ImageItem(axisOrder="row-major")
         self._image_item.setLookupTable(
             pg.ColorMap(
@@ -138,6 +139,7 @@ class StftImageChartWidget(_BasePlotChart):
         times_sec: Iterable[float],
         frequencies_hz: Iterable[float],
         magnitude_db,
+        reset_levels: bool = True,
     ) -> None:
         normalized_times = _normalize_vector(times_sec, name="times_sec")
         normalized_frequencies = _normalize_vector(
@@ -158,7 +160,16 @@ class StftImageChartWidget(_BasePlotChart):
             "magnitude_db": normalized_image.copy(),
         }
 
-        self._image_item.setImage(normalized_image, autoLevels=True)
+        should_reset_levels = bool(reset_levels) or self._cached_levels is None
+        self._image_item.setImage(normalized_image, autoLevels=should_reset_levels)
+        if should_reset_levels:
+            levels = self._image_item.getLevels()
+            if levels is None:
+                self._cached_levels = None
+            else:
+                self._cached_levels = (float(levels[0]), float(levels[1]))
+        elif self._cached_levels is not None:
+            self._image_item.setLevels(self._cached_levels)
         self._image_item.setRect(self._image_rect())
         rendered_rect = self._rendered_image_rect()
         if rendered_rect is None:
@@ -173,6 +184,7 @@ class StftImageChartWidget(_BasePlotChart):
 
     def clear_data(self) -> None:
         self._image_payload = None
+        self._cached_levels = None
         self._image_item.clear()
         self._apply_x_axis_policy(payload_values=None)
         self._apply_stft_y_axis_policy(payload_values=None)

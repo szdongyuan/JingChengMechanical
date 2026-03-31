@@ -4,6 +4,7 @@ import numpy as np
 
 from app.services_container import FactoryControllerState
 from ui.modules import stft as stft_module
+from ui.widgets.analysis_charts import StftImageChartWidget
 
 from ._support import _make_module, _make_stft_frame, _show
 
@@ -84,10 +85,11 @@ def test_refresh_selected_display_channel_reuses_cached_matrix_without_column_st
     cached_matrix = cache_entry.image_payload()["magnitude_db"]
     captured: dict[str, object] = {}
 
-    def _capture_set_image(*, times_sec, frequencies_hz, magnitude_db):
+    def _capture_set_image(*, times_sec, frequencies_hz, magnitude_db, reset_levels):
         captured["times_sec"] = times_sec
         captured["frequencies_hz"] = frequencies_hz
         captured["magnitude_db"] = magnitude_db
+        captured["reset_levels"] = reset_levels
 
     def _fail_column_stack(*args, **kwargs):
         raise AssertionError("refresh should reuse the stored matrix directly")
@@ -100,6 +102,7 @@ def test_refresh_selected_display_channel_reuses_cached_matrix_without_column_st
     assert captured["times_sec"] == [0.0, 0.5]
     assert captured["frequencies_hz"] == [100.0, 200.0]
     assert captured["magnitude_db"] is cached_matrix
+    assert captured["reset_levels"] is False
 
 
 def test_stft_module_rejects_mismatched_frequency_frame_and_keeps_prior_cache(qapp):
@@ -191,3 +194,193 @@ def test_refresh_selected_display_channel_clears_when_selected_channel_cache_is_
 
     assert module.current_render_cache_key() is None
     assert module.current_image_payload() is None
+
+
+def test_live_updates_schedule_one_flush_for_many_frames_until_module_flush_runs(
+    qapp,
+    monkeypatch,
+):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+
+    scheduled_flushes: list[object] = []
+    render_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        module,
+        "_schedule_live_flush_callback",
+        lambda callback: scheduled_flushes.append(callback),
+    )
+
+    def _capture_set_image(*, times_sec, frequencies_hz, magnitude_db, reset_levels):
+        render_calls.append(
+            {
+                "times_sec": list(times_sec),
+                "frequencies_hz": list(frequencies_hz),
+                "magnitude_db": magnitude_db,
+                "reset_levels": reset_levels,
+            }
+        )
+
+    monkeypatch.setattr(module.canvas.heatmap, "set_image", _capture_set_image)
+    monkeypatch.setattr(module.canvas.heatmap, "has_image", lambda: bool(render_calls))
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="running",
+            trigger_source="manual",
+        )
+    )
+
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        0,
+        _make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)),
+    )
+
+    assert len(render_calls) == 1
+    assert render_calls[0]["times_sec"] == [0.0]
+    assert render_calls[0]["reset_levels"] is True
+    assert module.pending_live_flush_key() is None
+
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        0,
+        _make_stft_frame(time=0.5, magnitudes=(3.0, 4.0)),
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        0,
+        _make_stft_frame(time=1.0, magnitudes=(5.0, 6.0)),
+    )
+
+    assert len(scheduled_flushes) == 1
+    assert module.pending_live_flush_key() == (101, "run-101", 0)
+    assert len(render_calls) == 1
+
+    module.flush_pending_live_refresh()
+
+    assert module.pending_live_flush_key() is None
+    assert len(render_calls) == 2
+    assert render_calls[1]["times_sec"] == [0.0, 0.5, 1.0]
+    assert render_calls[1]["frequencies_hz"] == [100.0, 200.0]
+    assert render_calls[1]["reset_levels"] is False
+    assert np.array_equal(
+        render_calls[1]["magnitude_db"],
+        np.array([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]]),
+    )
+
+
+def test_refresh_boundary_consumes_pending_live_flush_without_double_render(
+    qapp,
+    monkeypatch,
+):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+
+    scheduled_flushes: list[object] = []
+    render_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        module,
+        "_schedule_live_flush_callback",
+        lambda callback: scheduled_flushes.append(callback),
+    )
+
+    def _capture_set_image(*, times_sec, frequencies_hz, magnitude_db, reset_levels):
+        render_calls.append(
+            {
+                "times_sec": list(times_sec),
+                "frequencies_hz": list(frequencies_hz),
+                "magnitude_db": magnitude_db,
+                "reset_levels": reset_levels,
+            }
+        )
+
+    monkeypatch.setattr(module.canvas.heatmap, "set_image", _capture_set_image)
+    monkeypatch.setattr(module.canvas.heatmap, "has_image", lambda: bool(render_calls))
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="running",
+            trigger_source="manual",
+        )
+    )
+
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        0,
+        _make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)),
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        0,
+        _make_stft_frame(time=0.5, magnitudes=(3.0, 4.0)),
+    )
+
+    assert len(render_calls) == 1
+    assert len(scheduled_flushes) == 1
+    assert module.pending_live_flush_key() == (101, "run-101", 0)
+
+    module.refresh_selected_display_channel()
+
+    assert len(render_calls) == 2
+    assert render_calls[1]["times_sec"] == [0.0, 0.5]
+    assert render_calls[1]["reset_levels"] is False
+    assert module.pending_live_flush_key() is None
+
+    scheduled_flushes[0]()
+
+    assert len(render_calls) == 2
+    assert module.pending_live_flush_key() is None
+
+
+def test_stft_image_chart_widget_reuses_cached_levels_for_live_updates(
+    qapp,
+    monkeypatch,
+):
+    widget = StftImageChartWidget()
+    widget.resize(640, 260)
+    widget.show()
+    qapp.processEvents()
+
+    auto_levels_calls: list[bool] = []
+    reused_levels: list[tuple[float, float]] = []
+
+    monkeypatch.setattr(
+        widget._image_item,
+        "setImage",
+        lambda image, autoLevels=False: auto_levels_calls.append(bool(autoLevels)),
+    )
+    monkeypatch.setattr(widget._image_item, "getLevels", lambda: (1.5, 9.5))
+    monkeypatch.setattr(
+        widget._image_item,
+        "setLevels",
+        lambda levels: reused_levels.append((float(levels[0]), float(levels[1]))),
+    )
+    monkeypatch.setattr(widget._image_item, "setRect", lambda rect: None)
+
+    widget.set_image(
+        times_sec=[0.0],
+        frequencies_hz=[100.0, 200.0],
+        magnitude_db=np.array([[1.0], [2.0]]),
+        reset_levels=True,
+    )
+    widget.set_image(
+        times_sec=[0.0, 0.5],
+        frequencies_hz=[100.0, 200.0],
+        magnitude_db=np.array([[1.0, 3.0], [2.0, 4.0]]),
+        reset_levels=False,
+    )
+
+    assert auto_levels_calls == [True, False]
+    assert reused_levels == [(1.5, 9.5)]
