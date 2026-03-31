@@ -15,7 +15,7 @@ from ui.widgets.analysis_charts import StftImageChartWidget
 class _StftCacheEntry:
     frequencies_hz: list[float] = field(default_factory=list)
     times_sec: list[float] = field(default_factory=list)
-    magnitude_columns: list[np.ndarray] = field(default_factory=list)
+    magnitude_db: np.ndarray | None = None
 
     def append_frame(self, frame: StftFrame) -> bool:
         frequencies = np.asarray(getattr(frame, "frequencies", ()), dtype=float)
@@ -29,16 +29,27 @@ class _StftCacheEntry:
             self.frequencies_hz
             and not np.allclose(frequencies, np.asarray(self.frequencies_hz, dtype=float))
         ):
-            self.times_sec.clear()
-            self.magnitude_columns.clear()
+            return False
 
-        self.frequencies_hz = frequencies.tolist()
+        column = magnitudes[:, np.newaxis].copy()
+        if not self.frequencies_hz:
+            self.frequencies_hz = frequencies.tolist()
+            self.magnitude_db = column
+        else:
+            if self.magnitude_db is None:
+                self.magnitude_db = column
+            else:
+                self.magnitude_db = np.concatenate((self.magnitude_db, column), axis=1)
         self.times_sec.append(float(getattr(frame, "time", 0.0)))
-        self.magnitude_columns.append(magnitudes.copy())
         return True
 
     def has_data(self) -> bool:
-        return bool(self.frequencies_hz and self.times_sec and self.magnitude_columns)
+        return bool(
+            self.frequencies_hz
+            and self.times_sec
+            and self.magnitude_db is not None
+            and self.magnitude_db.size > 0
+        )
 
     def image_payload(self) -> dict | None:
         if not self.has_data():
@@ -46,7 +57,7 @@ class _StftCacheEntry:
         return {
             "times_sec": list(self.times_sec),
             "frequencies_hz": list(self.frequencies_hz),
-            "magnitude_db": np.column_stack(self.magnitude_columns),
+            "magnitude_db": self.magnitude_db,
         }
 
 
