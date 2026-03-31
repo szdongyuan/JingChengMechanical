@@ -105,6 +105,86 @@ def test_refresh_selected_display_channel_reuses_cached_matrix_without_column_st
     assert captured["reset_levels"] is False
 
 
+def test_refresh_selected_display_channel_restores_cached_image_after_heatmap_clear(
+    qapp,
+    monkeypatch,
+):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="running",
+            trigger_source="manual",
+        )
+    )
+    for frame in (
+        _make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)),
+        _make_stft_frame(time=0.5, magnitudes=(3.0, 4.0)),
+    ):
+        services.bus.stft_updated.emit(101, "run-101", 0, frame)
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="reviewing",
+            trigger_source="manual",
+        )
+    )
+    qapp.processEvents()
+
+    cache_key = (101, "run-101", 0)
+    cache_entry = module._stft_cache[cache_key]
+    cached_payload = cache_entry.image_payload()
+    assert cached_payload is not None
+    cached_matrix = cached_payload["magnitude_db"]
+    assert module.current_render_cache_key() == cache_key
+    assert np.array_equal(
+        module.canvas.heatmap.image_payload()["magnitude_db"],
+        np.array([[1.0, 3.0], [2.0, 4.0]]),
+    )
+
+    render_calls: list[dict[str, object]] = []
+    real_set_image = module.canvas.heatmap.set_image
+
+    def _spy_set_image(*, times_sec, frequencies_hz, magnitude_db, reset_levels):
+        render_calls.append(
+            {
+                "times_sec": list(times_sec),
+                "frequencies_hz": list(frequencies_hz),
+                "magnitude_db": magnitude_db,
+                "reset_levels": reset_levels,
+            }
+        )
+        real_set_image(
+            times_sec=times_sec,
+            frequencies_hz=frequencies_hz,
+            magnitude_db=magnitude_db,
+            reset_levels=reset_levels,
+        )
+
+    monkeypatch.setattr(module.canvas.heatmap, "set_image", _spy_set_image)
+
+    module.canvas.heatmap.clear_data()
+
+    assert module.canvas.heatmap.image_payload() is None
+    assert module.current_render_cache_key() == cache_key
+
+    module.refresh_selected_display_channel()
+
+    restored_payload = module.canvas.heatmap.image_payload()
+    assert len(render_calls) == 1
+    assert render_calls[0]["times_sec"] == [0.0, 0.5]
+    assert render_calls[0]["frequencies_hz"] == [100.0, 200.0]
+    assert render_calls[0]["magnitude_db"] is cached_matrix
+    assert render_calls[0]["reset_levels"] is True
+    assert module.current_render_cache_key() == cache_key
+    assert restored_payload is not None
+    assert np.array_equal(restored_payload["magnitude_db"], cached_matrix)
+
+
 def test_stft_module_rejects_mismatched_frequency_frame_and_keeps_prior_cache(qapp):
     module, services = _make_module()
     module.selected_display_channel_provider = lambda: 0
