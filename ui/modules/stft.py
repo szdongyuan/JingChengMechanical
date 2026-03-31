@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 import numpy as np
 from PyQt6.QtCore import QPoint, QRect, Qt
@@ -13,9 +14,13 @@ from ui.widgets.analysis_charts import StftImageChartWidget
 
 @dataclass
 class _StftCacheEntry:
+    _INITIAL_COLUMN_CAPACITY: ClassVar[int] = 8
+
     frequencies_hz: list[float] = field(default_factory=list)
     times_sec: list[float] = field(default_factory=list)
     magnitude_db: np.ndarray | None = None
+    _magnitude_storage: np.ndarray | None = field(default=None, init=False, repr=False)
+    _column_capacity: int = field(default=0, init=False, repr=False)
 
     def append_frame(self, frame: StftFrame) -> bool:
         frequencies = np.asarray(getattr(frame, "frequencies", ()), dtype=float)
@@ -31,15 +36,10 @@ class _StftCacheEntry:
         ):
             return False
 
-        column = magnitudes[:, np.newaxis].copy()
         if not self.frequencies_hz:
             self.frequencies_hz = frequencies.tolist()
-            self.magnitude_db = column
-        else:
-            if self.magnitude_db is None:
-                self.magnitude_db = column
-            else:
-                self.magnitude_db = np.concatenate((self.magnitude_db, column), axis=1)
+
+        self._append_magnitude_column(magnitudes)
         self.times_sec.append(float(getattr(frame, "time", 0.0)))
         return True
 
@@ -59,6 +59,42 @@ class _StftCacheEntry:
             "frequencies_hz": list(self.frequencies_hz),
             "magnitude_db": self.magnitude_db,
         }
+
+    def _append_magnitude_column(self, magnitudes: np.ndarray) -> None:
+        column_count = 0 if self.magnitude_db is None else self.magnitude_db.shape[1]
+        self._ensure_magnitude_capacity(
+            row_count=magnitudes.shape[0],
+            required_columns=column_count + 1,
+        )
+        if self._magnitude_storage is None:
+            raise RuntimeError("STFT cache storage was not initialized")
+        self._magnitude_storage[:, column_count] = magnitudes
+        self.magnitude_db = self._magnitude_storage[:, : column_count + 1]
+
+    def _ensure_magnitude_capacity(self, *, row_count: int, required_columns: int) -> None:
+        if (
+            self._magnitude_storage is not None
+            and self._magnitude_storage.shape[0] == row_count
+            and self._column_capacity >= required_columns
+        ):
+            return
+
+        existing_matrix = self.magnitude_db
+        existing_columns = 0 if existing_matrix is None else existing_matrix.shape[1]
+        new_capacity = self._next_column_capacity(required_columns)
+        new_storage = np.empty((row_count, new_capacity), dtype=float)
+        if existing_matrix is not None and existing_columns > 0:
+            new_storage[:, :existing_columns] = existing_matrix
+        self._magnitude_storage = new_storage
+        self._column_capacity = new_capacity
+        if existing_columns > 0:
+            self.magnitude_db = self._magnitude_storage[:, :existing_columns]
+
+    def _next_column_capacity(self, required_columns: int) -> int:
+        capacity = max(self._column_capacity, self._INITIAL_COLUMN_CAPACITY)
+        while capacity < required_columns:
+            capacity *= 2
+        return capacity
 
 
 @dataclass(frozen=True)

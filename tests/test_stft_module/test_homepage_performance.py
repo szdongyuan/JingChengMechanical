@@ -8,6 +8,28 @@ from ui.modules import stft as stft_module
 from ._support import _make_module, _make_stft_frame, _show
 
 
+def test_stft_cache_entry_appends_frames_without_concatenate_rebuild(monkeypatch):
+    cache_entry = stft_module._StftCacheEntry()
+
+    assert cache_entry.append_frame(_make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)))
+
+    def _fail_concatenate(*args, **kwargs):
+        raise AssertionError("append should grow without concatenating the full matrix")
+
+    monkeypatch.setattr(stft_module.np, "concatenate", _fail_concatenate)
+
+    assert cache_entry.append_frame(_make_stft_frame(time=0.5, magnitudes=(3.0, 4.0)))
+
+    payload = cache_entry.image_payload()
+    assert payload is not None
+    assert payload["times_sec"] == [0.0, 0.5]
+    assert payload["frequencies_hz"] == [100.0, 200.0]
+    assert np.array_equal(
+        payload["magnitude_db"],
+        np.array([[1.0, 3.0], [2.0, 4.0]]),
+    )
+
+
 def test_refresh_selected_display_channel_reuses_cached_matrix_without_column_stack(
     qapp,
     monkeypatch,
