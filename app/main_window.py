@@ -26,6 +26,7 @@ from ui.modules.result import ResultModule
 from ui.modules.video import VideoModule
 from ui.modules.log import LogModule
 from ui.modules.hardware import HardwareModule
+from ui.modules.data_management import DataManagementModule
 from ui.modules.input_calibration import InputCalibrationModule
 from ui.modules.config import ConfigModule
 from ui.modules.channel_select import ChannelSelectModule
@@ -80,13 +81,13 @@ class MainWindow(QMainWindow):
 
         # 页面：测试/数据管理/配置/硬件
         self.tab.addWidget(self.build_test_page())
-        self.tab.addWidget(self.build_placeholder_page("数据管理"))
+        self.tab.addWidget(self.build_data_page())
         self.tab.addWidget(self.build_config_page())
         self.tab.addWidget(self.build_hardware_page())
 
         self.services.bus.status.connect(self.statusBar().showMessage)
 
-        self.services.bus.log.emit("[App] 启动程序")
+        self.services.bus.log.emit("启动程序完成")
         self.set_role()
 
     def showEvent(self, event):
@@ -295,6 +296,16 @@ class MainWindow(QMainWindow):
         body.setStyleSheet("background: white; border: 1px solid #e5e7eb; border-radius: 10px; padding: 18px;")
         lay.addWidget(body)
         lay.addStretch(1)
+        return page
+
+    def build_data_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self.data_management_module = DataManagementModule(self.services)
+        lay.addWidget(Card("数据管理", self.data_management_module), 1)
         return page
 
     def build_config_page(self) -> QWidget:

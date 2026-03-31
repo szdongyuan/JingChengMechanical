@@ -96,16 +96,16 @@ class VideoModule(QWidget):
 
     @pyqtSlot()
     def on_camera_opened(self):
-        self.services.bus.log.emit("[Video] 摄像头打开成功")
+        self.services.bus.log.emit("摄像头打开成功")
 
     @pyqtSlot(str)
     def on_camera_failed(self, message):
-        self.services.bus.log.emit("[Video] 摄像头打开失败")
+        self.services.bus.log.emit("摄像头打开失败")
         self.set_text(message)
 
     @pyqtSlot(str)
     def on_camera_disconnected(self, message):
-        self.services.bus.log.emit("[Video] 摄像头已断开")
+        self.services.bus.log.emit("摄像头已断开")
         self.set_text(message)
 
     @pyqtSlot(object)
