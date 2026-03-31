@@ -11,7 +11,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.modules.setdefault("cv2", SimpleNamespace())
 
-from PyQt6.QtWidgets import QApplication, QWidget
+from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
 from app.service.analysis.frames import StftFrame
 from app.services_container import (
@@ -120,7 +120,6 @@ def _patch_non_target_modules(monkeypatch, *, use_real_control: bool = False):
     module_names = [
         "WorkOrderModule",
         "VideoModule",
-        "LogModule",
         "HardwareModule",
         "InputCalibrationModule",
         "ConfigModule",
@@ -129,7 +128,7 @@ def _patch_non_target_modules(monkeypatch, *, use_real_control: bool = False):
     if not use_real_control:
         module_names.append("ControlModule")
     for name in module_names:
-        monkeypatch.setattr(main_window_mod, name, _StubModule)
+        monkeypatch.setattr(main_window_mod, name, _StubModule, raising=False)
 
 
 def _make_services(
@@ -350,10 +349,14 @@ def _review_payload(config_id: int, *, run_id: str | None = None) -> FactoryRevi
     )
 
 
-def _chart_payload_for_channels(channels: tuple[int, ...]) -> dict:
+def _chart_payload_for_channels(
+    channels: tuple[int, ...],
+    *,
+    missing_loudness_channels: tuple[int, ...] = (),
+) -> dict:
     payload: dict[int, dict] = {}
     for channel_index in channels:
-        payload[channel_index] = {
+        channel_payload = {
             "spl": {
                 "times_sec": [0.0, 1.0],
                 "values_db": [70.0 + channel_index, 71.0 + channel_index],
@@ -387,6 +390,15 @@ def _chart_payload_for_channels(channels: tuple[int, ...]) -> dict:
                 ],
             },
         }
+        if channel_index not in missing_loudness_channels:
+            channel_payload["loudness"] = {
+                "times_sec": [0.0, 1.0],
+                "values": [10.0 + channel_index, 12.0 + channel_index],
+                "unit": "sone",
+                "lower_limit": 0.0,
+                "upper_limit": 60.0,
+            }
+        payload[channel_index] = channel_payload
     return payload
 
 
@@ -395,6 +407,7 @@ def _review_payload_with_chart_payload(
     *,
     run_id: str | None = None,
     channels: tuple[int, ...] = (0, 1),
+    missing_loudness_channels: tuple[int, ...] = (),
 ) -> FactoryReviewPayload:
     return FactoryReviewPayload(
         displayed_config_id=config_id,
@@ -407,7 +420,10 @@ def _review_payload_with_chart_payload(
         no_result=False,
         error_message=None,
         summary_payload={"overall_status": "pass", "rows": []},
-        chart_payload=_chart_payload_for_channels(channels),
+        chart_payload=_chart_payload_for_channels(
+            channels,
+            missing_loudness_channels=missing_loudness_channels,
+        ),
     )
 
 
@@ -455,6 +471,16 @@ def _partial_no_result_review_payload(
                     "label": "SPL",
                     "deviation_value": -1.0,
                     "deviation_display": "-1 dB",
+                    "channel_index": 1,
+                    "channel_label": "CH2",
+                    "status": "OK",
+                    "constrained": True,
+                },
+                {
+                    "item_key": "loudness",
+                    "label": "Loudness",
+                    "deviation_value": -0.5,
+                    "deviation_display": "-0.5 sone",
                     "channel_index": 1,
                     "channel_label": "CH2",
                     "status": "OK",
@@ -513,18 +539,22 @@ def _assert_run_specific_cards_cleared(window, *, result_badge: str = "-") -> No
     assert window.result.lb_empty_text.text() == ""
     assert window.stft.selection_box.isVisible() is False
     assert window.stft.analyze_button.isVisible() is False
+    assert window.loudness.plot.isHidden() is False
     assert window.spectrum.plot.isHidden() is False
     assert window.spl.plot.isHidden() is False
     assert window.octave.plot.isHidden() is False
+    assert window.loudness.has_committed_plot_data() is False
     assert window.spectrum.has_committed_plot_data() is False
     assert window.spl.has_committed_plot_data() is False
     assert window.octave.has_committed_plot_data() is False
 
 
 def _assert_chart_cards_visible(window) -> None:
+    assert window.loudness.plot.isHidden() is False
     assert window.spectrum.plot.isHidden() is False
     assert window.spl.plot.isHidden() is False
     assert window.octave.plot.isHidden() is False
+    assert window.loudness.has_committed_plot_data() is True
     assert window.spectrum.has_committed_plot_data() is True
     assert window.spl.has_committed_plot_data() is True
     assert window.octave.has_committed_plot_data() is True
@@ -592,6 +622,11 @@ def _emit_review_ready(
 
 
 def _assert_committed_chart_channel(window, *, channel_index: int) -> None:
+    assert window.loudness.current_render_channel() == channel_index
+    assert window.loudness.current_plot_payload()["values"] == [
+        10.0 + channel_index,
+        12.0 + channel_index,
+    ]
     assert window.spl.current_render_channel() == channel_index
     assert window.spl.current_plot_payload()["y_values"] == [
         70.0 + channel_index,
@@ -613,6 +648,53 @@ def _result_table_value(window, row: int, column: int) -> str:
     item = window.result.table.item(row, column)
     assert item is not None
     return item.text()
+
+
+def _card_title(card: QWidget) -> str:
+    title = card.findChild(QLabel, "CardTitle")
+    assert title is not None
+    return title.text()
+
+
+def _test_page(window) -> QWidget:
+    return window.tab.widget(window._TEST_PAGE_INDEX)
+
+
+def _test_page_left_slot_card(window, index: int) -> QWidget:
+    page = _test_page(window)
+    content_layout = page.layout()
+    assert content_layout is not None
+    left_column = content_layout.itemAt(0).widget()
+    assert left_column is not None
+    left_layout = left_column.layout()
+    assert left_layout is not None
+    card = left_layout.itemAt(index).widget()
+    assert card is not None
+    return card
+
+
+def _test_page_grid_card(window, row: int, column: int) -> QWidget:
+    page = _test_page(window)
+    content_layout = page.layout()
+    assert content_layout is not None
+    main_panel = content_layout.itemAt(1).widget()
+    assert main_panel is not None
+    main_layout = main_panel.layout()
+    assert main_layout is not None
+    grid = main_layout.itemAt(0).layout()
+    assert grid is not None
+    item = grid.itemAtPosition(row, column)
+    assert item is not None
+    card = item.widget()
+    assert card is not None
+    return card
+
+
+def _test_page_card_titles(window) -> list[str]:
+    return [
+        label.text()
+        for label in _test_page(window).findChildren(QLabel, "CardTitle")
+    ]
 
 
 def _make_stft_frame(
@@ -761,6 +843,41 @@ def test_selection_changed_reset_clears_result_stft_and_chart_cards(qapp, monkey
     _assert_run_specific_cards_cleared(window)
 
 
+def test_main_window_reflows_test_page_for_loudness_and_video(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    assert "系统日志" not in _test_page_card_titles(window)
+    assert _card_title(_test_page_left_slot_card(window, 2)) == "视频预览"
+    assert window.video.parentWidget() is _test_page_left_slot_card(window, 2)
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "Loudness"
+    assert window.loudness.parentWidget() is _test_page_grid_card(window, 2, 0)
+
+
+def test_main_window_routes_latest_log_line_to_status_bar(qapp, monkeypatch):
+    window, services = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    assert window.statusBar().currentMessage() == "[App] 启动程序"
+
+    window.current_user_name = "operator"
+    window.current_user_role = "操作员"
+    window.set_role()
+    qapp.processEvents()
+
+    assert window.statusBar().currentMessage() == "[App] 启动程序"
+
+    services.bus.status.emit("Analyzing...")
+    qapp.processEvents()
+
+    assert window.statusBar().currentMessage() == "[App] 启动程序"
+
+    services.bus.log.emit("line 1\n\n  line 2  \n")
+    qapp.processEvents()
+
+    assert window.statusBar().currentMessage() == "line 2"
+
+
 def test_main_window_channel_toolbar_shows_for_multi_channel_running_config(qapp, monkeypatch):
     window, services = _make_window(
         monkeypatch,
@@ -781,6 +898,7 @@ def test_main_window_channel_toolbar_shows_for_multi_channel_running_config(qapp
     assert window.analysis_toolbar.current_channel_index() == 0
     assert window.display_channel_by_config_id == {101: 0}
     assert callable(window.stft.selected_display_channel_provider)
+    assert callable(window.loudness.selected_display_channel_provider)
     assert callable(window.spl.selected_display_channel_provider)
     assert callable(window.spectrum.selected_display_channel_provider)
     assert callable(window.octave.selected_display_channel_provider)
@@ -1007,17 +1125,21 @@ def test_main_window_ai_partial_no_result_keeps_rule_rows_and_committed_charts_v
     assert _result_table_value(window, 0, 1) == "-1 dB"
     assert _result_table_value(window, 0, 2) == "CH2"
     assert _result_table_value(window, 0, 3) == "OK"
-    assert _result_table_value(window, 1, 0) == "FFT"
-    assert _result_table_value(window, 1, 1) == "2 dB"
-    assert _result_table_value(window, 1, 2) == "CH1"
-    assert _result_table_value(window, 1, 3) == "NG"
-    assert _result_table_value(window, 2, 0) == "倍频程"
-    assert _result_table_value(window, 2, 1) == "-3 dB"
-    assert _result_table_value(window, 2, 2) == "CH2"
-    assert _result_table_value(window, 2, 3) == "OK"
-    assert _result_table_value(window, 3, 0) == "AI分析"
-    assert _result_table_value(window, 3, 2) == "--"
-    assert _result_table_value(window, 3, 3) == "无结果"
+    assert _result_table_value(window, 1, 0) == "Loudness"
+    assert _result_table_value(window, 1, 1) == "-0.5 sone"
+    assert _result_table_value(window, 1, 2) == "CH2"
+    assert _result_table_value(window, 1, 3) == "OK"
+    assert _result_table_value(window, 2, 0) == "FFT"
+    assert _result_table_value(window, 2, 1) == "2 dB"
+    assert _result_table_value(window, 2, 2) == "CH1"
+    assert _result_table_value(window, 2, 3) == "NG"
+    assert _result_table_value(window, 3, 0) == "倍频程"
+    assert _result_table_value(window, 3, 1) == "-3 dB"
+    assert _result_table_value(window, 3, 2) == "CH2"
+    assert _result_table_value(window, 3, 3) == "OK"
+    assert _result_table_value(window, 4, 0) == "AI分析"
+    assert _result_table_value(window, 4, 2) == "--"
+    assert _result_table_value(window, 4, 3) == "无结果"
     _assert_chart_cards_visible(window)
     _assert_committed_chart_channel(window, channel_index=1)
 
@@ -1028,7 +1150,13 @@ def test_main_window_resolves_display_channel_before_analysis_modules_handle_fac
 ):
     for name in ("ResultModule",):
         monkeypatch.setattr(main_window_mod, name, _StubModule)
-    for name in ("SpectrumModule", "StftModule", "SplModule", "OctaveModule"):
+    for name in (
+        "SpectrumModule",
+        "StftModule",
+        "SplModule",
+        "OctaveModule",
+        "LoudnessModule",
+    ):
         monkeypatch.setattr(main_window_mod, name, _ChannelProbeModule)
 
     window, services = _make_window(
@@ -1045,6 +1173,7 @@ def test_main_window_resolves_display_channel_before_analysis_modules_handle_fac
     qapp.processEvents()
 
     assert window.stft.state_seen_channels[-1] == 0
+    assert window.loudness.state_seen_channels[-1] == 0
     assert window.spl.state_seen_channels[-1] == 0
 
     _select_toolbar_channel(window, qapp, 1)
@@ -1056,7 +1185,49 @@ def test_main_window_resolves_display_channel_before_analysis_modules_handle_fac
     qapp.processEvents()
 
     assert window.stft.review_seen_channels[-1] == 0
+    assert window.loudness.review_seen_channels[-1] == 0
     assert window.octave.review_seen_channels[-1] == 0
+
+
+def test_main_window_review_selected_channel_without_loudness_payload_keeps_other_cards_on_channel(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(
+            101,
+            channels=(0, 1),
+            missing_loudness_channels=(1,),
+        ),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(
+            101,
+            channels=(0, 1),
+            missing_loudness_channels=(1,),
+        )
+    )
+    qapp.processEvents()
+
+    _select_toolbar_channel(window, qapp, 1)
+
+    assert window.analysis_toolbar.current_channel_index() == 1
+    assert window.display_channel_by_config_id[101] == 1
+    assert window.spl.current_render_channel() == 1
+    assert window.spectrum.current_render_channel() == 1
+    assert window.octave.current_render_channel() == 1
+    assert window.loudness.has_committed_plot_data() is False
+    assert window.loudness.current_render_channel() is None
+    assert window.loudness.current_plot_payload() is None
 
 
 def test_main_window_channel_toolbar_hides_or_disables_selector_for_single_channel_displayed_config(

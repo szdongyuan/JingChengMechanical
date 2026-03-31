@@ -22,11 +22,11 @@ from ui.modules.workorder import WorkOrderModule
 from ui.modules.control import ControlModule
 from ui.modules.spectrum import SpectrumModule
 from ui.modules.stft import StftModule
+from ui.modules.loudness import LoudnessModule
 from ui.modules.spl import SplModule
 from ui.modules.octave import OctaveModule
 from ui.modules.result import ResultModule
 from ui.modules.video import VideoModule
-from ui.modules.log import LogModule
 from ui.modules.hardware import HardwareModule
 from ui.modules.data_management import DataManagementModule
 from ui.modules.input_calibration import InputCalibrationModule
@@ -98,8 +98,6 @@ class MainWindow(QMainWindow):
         self.tab.addWidget(self.build_config_page())
         self.tab.addWidget(self.build_hardware_page())
         self.tab.currentChanged.connect(self._on_main_tab_changed)
-
-        self.statusBar().showMessage("Idle")
 
         self.services.bus.log.emit("[App] 启动程序")
         self._sync_analysis_toolbar()
@@ -243,11 +241,6 @@ class MainWindow(QMainWindow):
                 self.tab.setCurrentIndex(0)
                 self.top_button_dict["测试"].setChecked(True)
 
-        if self.current_user_name and self.current_user_role:
-            self.statusBar().showMessage(
-                f"当前用户：{self.current_user_name} | 权限：{self.current_user_role}"
-            )
-
     def build_test_page(self) -> QWidget:
         page = QWidget()
         content_lay = QHBoxLayout(page)
@@ -267,8 +260,8 @@ class MainWindow(QMainWindow):
         self.control = ControlModule(self.services)
         left_lay.addWidget(Card("控制面板", self.control))
 
-        self.log = LogModule(self.services)
-        left_lay.addWidget(Card("系统日志", self.log), 1)
+        self.video = VideoModule(self.services)
+        left_lay.addWidget(Card("视频预览", self.video), 1)
 
         content_lay.addWidget(left)
 
@@ -292,9 +285,6 @@ class MainWindow(QMainWindow):
         self.result = ResultModule(self.services)
         grid.addWidget(Card("结果摘要", self.result), 1, 0)
 
-        self.video = VideoModule(self.services)
-        grid.addWidget(Card("视频预览", self.video), 2, 0)
-
         self.analysis_toolbar = AnalysisChannelToolbar()
         self.analysis_toolbar.channel_changed.connect(self._on_analysis_channel_changed)
         self.analysis_toolbar.hide()
@@ -305,6 +295,9 @@ class MainWindow(QMainWindow):
 
         self.stft = StftModule(self.services)
         grid.addWidget(Card("STFT 频谱图 (Spectrogram)", self.stft), 1, 1)
+
+        self.loudness = LoudnessModule(self.services)
+        grid.addWidget(Card("Loudness", self.loudness), 2, 0)
 
         self.spl = SplModule(self.services)
         grid.addWidget(Card("SPL 时间曲线 (A计权)", self.spl), 2, 1)
@@ -404,13 +397,26 @@ class MainWindow(QMainWindow):
         return page
 
     def _connect_bus_signals(self) -> None:
-        self.services.bus.status.connect(self.statusBar().showMessage)
+        if hasattr(self.services.bus, "log"):
+            self.services.bus.log.connect(self._show_latest_log_line)
         if hasattr(self.services.bus, "factory_state_changed"):
             self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
         if hasattr(self.services.bus, "factory_review_changed"):
             self.services.bus.factory_review_changed.connect(self._on_factory_review_changed)
         if hasattr(self.services.bus, "factory_display_reset"):
             self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
+
+    def _show_latest_log_line(self, message) -> None:
+        self.statusBar().showMessage(self._latest_non_empty_log_line(message))
+
+    @staticmethod
+    def _latest_non_empty_log_line(message) -> str:
+        text = message if isinstance(message, str) else ("" if message is None else str(message))
+        for line in reversed(text.splitlines()):
+            normalized = line.strip()
+            if normalized:
+                return normalized
+        return ""
 
     def current_display_channel_index(self) -> int | None:
         config_id = self._factory_state.displayed_config_id
@@ -419,9 +425,9 @@ class MainWindow(QMainWindow):
         return self.display_channel_by_config_id.get(config_id)
 
     def _attach_analysis_channel_providers(self) -> None:
-        for module in (self.stft, self.spl, self.spectrum, self.octave):
+        for module in (self.stft, self.loudness, self.spl, self.spectrum, self.octave):
             module.selected_display_channel_provider = self.current_display_channel_index
-        for module in (self.spl, self.spectrum, self.octave):
+        for module in (self.loudness, self.spl, self.spectrum, self.octave):
             module.selected_display_channel_sync = self._sync_selected_display_channel
 
     def _on_factory_state_changed(self, state) -> None:
@@ -470,7 +476,7 @@ class MainWindow(QMainWindow):
             self._refresh_analysis_display_modules()
 
     def _refresh_analysis_display_modules(self) -> None:
-        for module in (self.stft, self.spl, self.spectrum, self.octave):
+        for module in (self.stft, self.loudness, self.spl, self.spectrum, self.octave):
             refresh = getattr(module, "refresh_selected_display_channel", None)
             if callable(refresh):
                 refresh()
