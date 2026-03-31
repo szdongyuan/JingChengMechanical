@@ -59,6 +59,7 @@ class TestSession:
         self._finished: bool = False
         self._attach_chunk_index: int = 0
         self._attach_snapshot: Any | None = None
+        self._processed_samples_since_attach: int = 0
         self._attach_pending: bool = False
         self._pending_attach_chunks: list[tuple[np.ndarray, int]] = []
         self._on_session_done_cb: Callable[[int], Any] | None = None
@@ -98,6 +99,7 @@ class TestSession:
         """Record the chunk boundary where this session becomes live."""
         self._attach_chunk_index = max(0, int(chunk_index))
         self._attach_snapshot = snapshot
+        self._processed_samples_since_attach = 0
         pending_chunks = self._pending_attach_chunks
         self._pending_attach_chunks = []
         self._attach_pending = False
@@ -115,7 +117,13 @@ class TestSession:
         if chunk_index < self._attach_chunk_index:
             return
 
-        elapsed = max(0, chunk_index - self._attach_chunk_index + 1) * 0.05
+        chunk_samples = int(chunk.shape[0]) if chunk.ndim > 0 else 0
+        self._processed_samples_since_attach += max(0, chunk_samples)
+        elapsed = (
+            self._processed_samples_since_attach / self._sample_rate
+            if self._sample_rate > 0
+            else 0.0
+        )
         frame_run_id = self._runtime_frame_run_id()
 
         for pipeline in self._pipelines:

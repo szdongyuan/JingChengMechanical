@@ -186,7 +186,7 @@ class TestTestSessionProcessing:
         session._setup_pipelines()
         session._on_session_done_cb = MagicMock()
 
-        chunk = np.random.randn(2048, 1).astype(np.float32)
+        chunk = np.random.randn(int(session._sample_rate * 0.05), 1).astype(np.float32)
 
         session._on_chunk(chunk, 2)
         session._on_chunk(chunk, 3)
@@ -207,7 +207,7 @@ class TestTestSessionProcessing:
         session._on_session_done_cb = MagicMock()
         session.attach_to_recorder(chunk_index=4)
 
-        chunk = np.random.randn(2048, 1).astype(np.float32)
+        chunk = np.random.randn(int(session._sample_rate * 0.05), 1).astype(np.float32)
 
         session._on_chunk(chunk, 3)
         bus.recording_progress.emit.assert_not_called()
@@ -215,6 +215,87 @@ class TestTestSessionProcessing:
         session._on_chunk(chunk, 5)
         bus.recording_progress.emit.assert_any_call(1, 0.05)
         bus.recording_progress.emit.assert_any_call(1, 0.1)
+        session._on_session_done_cb.assert_called_once_with(1)
+
+    def test_on_chunk_uses_sample_derived_elapsed_for_pipeline_and_progress_at_non_round_sample_rate(self):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        config = _make_config()
+        config["input_device_samplerate"] = 22050
+        session = TestSession(
+            config=config,
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={},
+            audio_dir="/tmp/audio",
+        )
+        fake_pipeline = MagicMock()
+        fake_pipeline.channel_index = 0
+        fake_pipeline.process_chunk.return_value = {
+            "stft_frames": [],
+            "stft": None,
+            "spl": None,
+            "octave": None,
+            "fft": None,
+        }
+        session._pipelines = [fake_pipeline]
+        chunk = np.ones((int(22050 * 0.05), 1), dtype=np.float32)
+        expected_elapsed = chunk.shape[0] / 22050.0
+
+        session._on_chunk(chunk, 0)
+
+        assert fake_pipeline.process_chunk.call_args.args[1] == pytest.approx(expected_elapsed)
+        assert bus.recording_progress.emit.call_args.args == (1, pytest.approx(expected_elapsed))
+
+    def test_on_chunk_completion_tracks_sample_derived_elapsed_after_attach_at_non_round_sample_rate(self):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        config = _make_config()
+        config["input_device_samplerate"] = 22050
+        config["record_duration"] = 0.1
+        session = TestSession(
+            config=config,
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={},
+            audio_dir="/tmp/audio",
+        )
+        fake_pipeline = MagicMock()
+        fake_pipeline.channel_index = 0
+        fake_pipeline.process_chunk.return_value = {
+            "stft_frames": [],
+            "stft": None,
+            "spl": None,
+            "octave": None,
+            "fft": None,
+        }
+        session._pipelines = [fake_pipeline]
+        session._on_session_done_cb = MagicMock()
+        session.attach_to_recorder(chunk_index=4)
+        chunk = np.ones((int(22050 * 0.05), 1), dtype=np.float32)
+        expected_elapsed_values = [
+            (chunk.shape[0] * multiplier) / 22050.0
+            for multiplier in (1, 2, 3)
+        ]
+
+        session._on_chunk(chunk, 4)
+        session._on_session_done_cb.assert_not_called()
+        session._on_chunk(chunk, 5)
+        session._on_session_done_cb.assert_not_called()
+        session._on_chunk(chunk, 6)
+
+        observed_elapsed_values = [
+            call.args[1]
+            for call in fake_pipeline.process_chunk.call_args_list
+        ]
+        assert observed_elapsed_values == pytest.approx(expected_elapsed_values)
+        progress_elapsed_values = [
+            call.args[1]
+            for call in bus.recording_progress.emit.call_args_list
+        ]
+        assert progress_elapsed_values == pytest.approx(expected_elapsed_values)
         session._on_session_done_cb.assert_called_once_with(1)
 
 
