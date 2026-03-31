@@ -355,3 +355,213 @@ def test_migrate_existing_binding_table_keeps_legacy_offset_column_untouched(
         except OSError:
             pass
 
+
+def test_migrate_channel_config_adds_loudness_columns_and_backfills_existing_rows(
+    monkeypatch,
+):
+    """connect() should add loudness columns to legacy channel rows."""
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        tmp_db = SqliteDatabase(db_path, pragmas={"foreign_keys": 1})
+        import model.base_mode as base_mod
+
+        monkeypatch.setattr(base_mod, "db", tmp_db)
+
+        from app.service.db_connection_service import DbConnectionService
+        import app.service.db_connection_service as svc_mod
+
+        monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+        _bind_all_models(tmp_db)
+
+        tmp_db.connect()
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE test_config_table (
+                config_id INTEGER PRIMARY KEY,
+                config_name TEXT NOT NULL UNIQUE,
+                record_duration REAL NOT NULL DEFAULT 5.0,
+                analysis_duration REAL NOT NULL DEFAULT 3.0,
+                scan_triggers_test INTEGER NOT NULL DEFAULT 0,
+                created_time TEXT NOT NULL DEFAULT '',
+                updated_time TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE channel_config_table (
+                channel_config_id INTEGER PRIMARY KEY,
+                config_id INTEGER NOT NULL REFERENCES test_config_table(config_id) ON DELETE CASCADE,
+                channel_index INTEGER NOT NULL,
+                stft_nfft INTEGER NOT NULL DEFAULT 1024,
+                stft_overlap REAL NOT NULL DEFAULT 0.5,
+                spl_weighting TEXT NOT NULL DEFAULT 'A',
+                spl_time_constant REAL NOT NULL DEFAULT 0.125,
+                spl_upper_limit REAL NOT NULL DEFAULT 85.0,
+                spl_lower_limit REAL NOT NULL DEFAULT 40.0,
+                fft_band_limits TEXT NOT NULL DEFAULT '[]',
+                oct_weighting TEXT NOT NULL DEFAULT 'A',
+                oct_band_limits TEXT NOT NULL DEFAULT '[]',
+                ai_config TEXT NOT NULL DEFAULT '{}'
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO test_config_table (
+                config_id,
+                config_name,
+                record_duration,
+                analysis_duration,
+                scan_triggers_test,
+                created_time,
+                updated_time
+            ) VALUES (1, 'Cfg1', 5.0, 3.0, 0, '', '')
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO channel_config_table (
+                channel_config_id,
+                config_id,
+                channel_index,
+                stft_nfft,
+                stft_overlap,
+                spl_weighting,
+                spl_time_constant,
+                spl_upper_limit,
+                spl_lower_limit,
+                fft_band_limits,
+                oct_weighting,
+                oct_band_limits,
+                ai_config
+            ) VALUES (1, 1, 0, 1024, 0.5, 'A', 0.125, 85.0, 40.0, '[]', 'A', '[]', '{}')
+            """
+        )
+        tmp_db.close()
+
+        DbConnectionService().connect()
+
+        columns = {
+            row[1]: row for row in tmp_db.execute_sql(
+                "PRAGMA table_info(channel_config_table)"
+            ).fetchall()
+        }
+        assert "loudness_unit" in columns
+        assert "loudness_lower_limit" in columns
+        assert "loudness_upper_limit" in columns
+        assert tmp_db.execute_sql(
+            """
+            SELECT loudness_unit, loudness_lower_limit, loudness_upper_limit
+            FROM channel_config_table
+            WHERE channel_config_id = 1
+            """
+        ).fetchone() == ("sone", 0.0, 60.0)
+
+        tmp_db.close()
+    finally:
+        try:
+            os.unlink(db_path)
+        except OSError:
+            pass
+
+
+def test_migrate_channel_config_backfills_null_loudness_values(monkeypatch):
+    """connect() should backfill null loudness values in existing channel rows."""
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        tmp_db = SqliteDatabase(db_path, pragmas={"foreign_keys": 1})
+        import model.base_mode as base_mod
+
+        monkeypatch.setattr(base_mod, "db", tmp_db)
+
+        from app.service.db_connection_service import DbConnectionService
+        import app.service.db_connection_service as svc_mod
+
+        monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+        _bind_all_models(tmp_db)
+
+        tmp_db.connect()
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE test_config_table (
+                config_id INTEGER PRIMARY KEY,
+                config_name TEXT NOT NULL UNIQUE,
+                record_duration REAL NOT NULL DEFAULT 5.0,
+                analysis_duration REAL NOT NULL DEFAULT 3.0,
+                scan_triggers_test INTEGER NOT NULL DEFAULT 0,
+                created_time TEXT NOT NULL DEFAULT '',
+                updated_time TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE channel_config_table (
+                channel_config_id INTEGER PRIMARY KEY,
+                config_id INTEGER NOT NULL REFERENCES test_config_table(config_id) ON DELETE CASCADE,
+                channel_index INTEGER NOT NULL,
+                stft_nfft INTEGER NOT NULL DEFAULT 1024,
+                stft_overlap REAL NOT NULL DEFAULT 0.5,
+                spl_weighting TEXT NOT NULL DEFAULT 'A',
+                spl_time_constant REAL NOT NULL DEFAULT 0.125,
+                spl_upper_limit REAL NOT NULL DEFAULT 85.0,
+                spl_lower_limit REAL NOT NULL DEFAULT 40.0,
+                fft_band_limits TEXT NOT NULL DEFAULT '[]',
+                oct_weighting TEXT NOT NULL DEFAULT 'A',
+                oct_band_limits TEXT NOT NULL DEFAULT '[]',
+                ai_config TEXT NOT NULL DEFAULT '{}',
+                loudness_unit TEXT DEFAULT NULL,
+                loudness_lower_limit REAL DEFAULT NULL,
+                loudness_upper_limit REAL DEFAULT NULL
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO test_config_table (
+                config_id,
+                config_name,
+                record_duration,
+                analysis_duration,
+                scan_triggers_test,
+                created_time,
+                updated_time
+            ) VALUES (1, 'Cfg1', 5.0, 3.0, 0, '', '')
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO channel_config_table (
+                channel_config_id,
+                config_id,
+                channel_index,
+                loudness_unit,
+                loudness_lower_limit,
+                loudness_upper_limit
+            ) VALUES (1, 1, 0, NULL, NULL, NULL)
+            """
+        )
+        tmp_db.close()
+
+        DbConnectionService().connect()
+
+        assert tmp_db.execute_sql(
+            """
+            SELECT loudness_unit, loudness_lower_limit, loudness_upper_limit
+            FROM channel_config_table
+            WHERE channel_config_id = 1
+            """
+        ).fetchone() == ("sone", 0.0, 60.0)
+
+        tmp_db.close()
+    finally:
+        try:
+            os.unlink(db_path)
+        except OSError:
+            pass
+

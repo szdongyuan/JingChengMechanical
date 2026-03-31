@@ -548,6 +548,42 @@ class ConfigModule(QWidget):
         spl.add_widget(spl_form)
         lay.addWidget(spl)
 
+        loudness = CollapsibleGroupBox("响度 参数")
+        loudness_form = QWidget()
+        loud_lay = QFormLayout(loudness_form)
+        loud_lay.setContentsMargins(0, 0, 0, 0)
+        loud_lay.setHorizontalSpacing(10)
+        loud_lay.setVerticalSpacing(6)
+
+        combo_loudness_unit = _NoWheelComboBox()
+        combo_loudness_unit.addItems(["sone", "phon"])
+        combo_loudness_unit.setObjectName("loudness_unit")
+        val = data.get("loudness_unit", "sone") if data else "sone"
+        idx = combo_loudness_unit.findText(val)
+        combo_loudness_unit.setCurrentIndex(idx if idx >= 0 else 0)
+        loud_lay.addRow("单位", combo_loudness_unit)
+
+        spin_loudness_lo = _NoWheelSpinBox()
+        spin_loudness_lo.setObjectName("loudness_lower_limit")
+        spin_loudness_lo.setRange(0.0, 999999.0)
+        spin_loudness_lo.setDecimals(3)
+        spin_loudness_lo.setValue(
+            data.get("loudness_lower_limit", 0.0) if data else 0.0
+        )
+        loud_lay.addRow("响度下限", spin_loudness_lo)
+
+        spin_loudness_hi = _NoWheelSpinBox()
+        spin_loudness_hi.setObjectName("loudness_upper_limit")
+        spin_loudness_hi.setRange(0.0, 999999.0)
+        spin_loudness_hi.setDecimals(3)
+        spin_loudness_hi.setValue(
+            data.get("loudness_upper_limit", 60.0) if data else 60.0
+        )
+        loud_lay.addRow("响度上限", spin_loudness_hi)
+
+        loudness.add_widget(loudness_form)
+        lay.addWidget(loudness)
+
         # FFT band limits section
         fft_section = CollapsibleGroupBox("FFT 频带上下限")
         fft_table = self._build_band_table(
@@ -822,6 +858,27 @@ class ConfigModule(QWidget):
 
             spin_hi = container.findChild(QDoubleSpinBox, "spl_upper_limit")
             ch["spl_upper_limit"] = spin_hi.value() if spin_hi else 85.0
+
+            combo_loudness_unit = container.findChild(QComboBox, "loudness_unit")
+            ch["loudness_unit"] = (
+                combo_loudness_unit.currentText()
+                if combo_loudness_unit
+                else "sone"
+            )
+
+            spin_loudness_lo = container.findChild(
+                QDoubleSpinBox, "loudness_lower_limit"
+            )
+            ch["loudness_lower_limit"] = (
+                spin_loudness_lo.value() if spin_loudness_lo else 0.0
+            )
+
+            spin_loudness_hi = container.findChild(
+                QDoubleSpinBox, "loudness_upper_limit"
+            )
+            ch["loudness_upper_limit"] = (
+                spin_loudness_hi.value() if spin_loudness_hi else 60.0
+            )
 
             combo_oct_w = container.findChild(QComboBox, "oct_weighting")
             ch["oct_weighting"] = combo_oct_w.currentText() if combo_oct_w else "A"

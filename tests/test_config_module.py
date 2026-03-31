@@ -9,6 +9,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QComboBox, QDoubleSpinBox
 
 from ui.modules.config import ConfigModule
 
@@ -114,6 +115,27 @@ def _make_module(
         ),
     )
     return ConfigModule(services)
+
+
+def _detail_payload(channels: list[dict]) -> dict:
+    return {
+        "config_id": 7,
+        "config_name": "Cfg1",
+        "record_duration": 5.0,
+        "analysis_duration": 3.0,
+        "analysis_window_offset_ms": 250,
+        "scan_triggers_test": False,
+        "plc_device_key": "plc-a",
+        "plc_device_label": "PLC A",
+        "input_device_name": "Mic 1",
+        "input_device_hostapi": "ASIO",
+        "input_device_samplerate": 48000,
+        "output_device_name": "Speaker 1",
+        "output_device_hostapi": "WASAPI",
+        "output_device_samplerate": 44100,
+        "selected_channels": [0],
+        "channels": channels,
+    }
 
 
 def test_populate_detail_uses_main_config_analysis_offset_and_plc_fields(qapp):
@@ -242,3 +264,99 @@ def test_on_save_keeps_main_config_analysis_offset_out_of_ai_binding_payload(
             },
         )
     ]
+
+
+def test_populate_detail_loads_loudness_widgets(qapp):
+    module = _make_module()
+
+    module._populate_detail(
+        _detail_payload(
+            [
+                {
+                    "channel_index": 0,
+                    "stft_nfft": 1024,
+                    "stft_overlap": 0.5,
+                    "spl_weighting": "A",
+                    "spl_time_constant": 0.125,
+                    "spl_lower_limit": 40.0,
+                    "spl_upper_limit": 85.0,
+                    "loudness_unit": "phon",
+                    "loudness_lower_limit": 12.5,
+                    "loudness_upper_limit": 70.0,
+                    "fft_band_limits": [],
+                    "oct_weighting": "A",
+                    "oct_band_limits": [],
+                    "ai_config": {},
+                }
+            ]
+        )
+    )
+
+    container = module._channel_containers[0]
+    combo = container.findChild(QComboBox, "loudness_unit")
+    lower = container.findChild(QDoubleSpinBox, "loudness_lower_limit")
+    upper = container.findChild(QDoubleSpinBox, "loudness_upper_limit")
+
+    assert combo is not None
+    assert lower is not None
+    assert upper is not None
+    assert combo.currentText() == "phon"
+    assert lower.value() == pytest.approx(12.5)
+    assert upper.value() == pytest.approx(70.0)
+
+
+def test_collect_data_returns_loudness_fields(qapp):
+    module = _make_module()
+    module._current_config_id = 7
+    module._populate_detail(_detail_payload([]))
+
+    container = module._channel_containers[0]
+    combo = container.findChild(QComboBox, "loudness_unit")
+    lower = container.findChild(QDoubleSpinBox, "loudness_lower_limit")
+    upper = container.findChild(QDoubleSpinBox, "loudness_upper_limit")
+
+    combo.setCurrentText("phon")
+    lower.setValue(10.0)
+    upper.setValue(60.0)
+
+    data = module._collect_data()
+
+    assert data["channels"][0]["loudness_unit"] == "phon"
+    assert data["channels"][0]["loudness_lower_limit"] == pytest.approx(10.0)
+    assert data["channels"][0]["loudness_upper_limit"] == pytest.approx(60.0)
+
+
+def test_loudness_unit_change_keeps_numeric_limits_visible_as_is(qapp):
+    module = _make_module()
+    module._populate_detail(
+        _detail_payload(
+            [
+                {
+                    "channel_index": 0,
+                    "stft_nfft": 1024,
+                    "stft_overlap": 0.5,
+                    "spl_weighting": "A",
+                    "spl_time_constant": 0.125,
+                    "spl_lower_limit": 40.0,
+                    "spl_upper_limit": 85.0,
+                    "loudness_unit": "sone",
+                    "loudness_lower_limit": 8.5,
+                    "loudness_upper_limit": 42.0,
+                    "fft_band_limits": [],
+                    "oct_weighting": "A",
+                    "oct_band_limits": [],
+                    "ai_config": {},
+                }
+            ]
+        )
+    )
+
+    container = module._channel_containers[0]
+    combo = container.findChild(QComboBox, "loudness_unit")
+    lower = container.findChild(QDoubleSpinBox, "loudness_lower_limit")
+    upper = container.findChild(QDoubleSpinBox, "loudness_upper_limit")
+
+    combo.setCurrentText("phon")
+
+    assert lower.value() == pytest.approx(8.5)
+    assert upper.value() == pytest.approx(42.0)

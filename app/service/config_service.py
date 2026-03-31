@@ -18,6 +18,9 @@ _CHANNEL_DEFAULTS = {
     "spl_time_constant": 0.125,
     "spl_lower_limit": 40.0,
     "spl_upper_limit": 85.0,
+    "loudness_unit": "sone",
+    "loudness_lower_limit": 0.0,
+    "loudness_upper_limit": 60.0,
     "fft_band_limits": "[]",
     "oct_weighting": "A",
     "oct_band_limits": "[]",
@@ -27,6 +30,7 @@ _CHANNEL_DEFAULTS = {
 _VALID_NFFT = [256, 512, 1024, 2048, 4096, 8192]
 _VALID_OVERLAP = [0.25, 0.5, 0.75]
 _VALID_WEIGHTING = ["A", "C", "Z"]
+_VALID_LOUDNESS_UNITS = ["sone", "phon"]
 
 
 class ConfigService:
@@ -78,6 +82,18 @@ class ConfigService:
                     "spl_time_constant": ch.spl_time_constant,
                     "spl_upper_limit": ch.spl_upper_limit,
                     "spl_lower_limit": ch.spl_lower_limit,
+                    "loudness_unit": ch.loudness_unit
+                    or _CHANNEL_DEFAULTS["loudness_unit"],
+                    "loudness_lower_limit": (
+                        ch.loudness_lower_limit
+                        if ch.loudness_lower_limit is not None
+                        else _CHANNEL_DEFAULTS["loudness_lower_limit"]
+                    ),
+                    "loudness_upper_limit": (
+                        ch.loudness_upper_limit
+                        if ch.loudness_upper_limit is not None
+                        else _CHANNEL_DEFAULTS["loudness_upper_limit"]
+                    ),
                     "fft_band_limits": self._parse_json(ch.fft_band_limits, []),
                     "oct_weighting": ch.oct_weighting,
                     "oct_band_limits": self._parse_json(ch.oct_band_limits, []),
@@ -156,6 +172,17 @@ class ConfigService:
                         spl_time_constant=ch["spl_time_constant"],
                         spl_upper_limit=ch["spl_upper_limit"],
                         spl_lower_limit=ch["spl_lower_limit"],
+                        loudness_unit=ch.get(
+                            "loudness_unit", _CHANNEL_DEFAULTS["loudness_unit"]
+                        ),
+                        loudness_lower_limit=ch.get(
+                            "loudness_lower_limit",
+                            _CHANNEL_DEFAULTS["loudness_lower_limit"],
+                        ),
+                        loudness_upper_limit=ch.get(
+                            "loudness_upper_limit",
+                            _CHANNEL_DEFAULTS["loudness_upper_limit"],
+                        ),
                         fft_band_limits=json.dumps(ch["fft_band_limits"]),
                         oct_weighting=ch["oct_weighting"],
                         oct_band_limits=json.dumps(ch["oct_band_limits"]),
@@ -256,6 +283,27 @@ class ConfigService:
                 errors.append(f"{prefix}: SPL 上限必须为数值")
             elif sl >= su:
                 errors.append(f"{prefix}: SPL 下限必须小于上限")
+            loudness_unit = ch.get(
+                "loudness_unit", _CHANNEL_DEFAULTS["loudness_unit"]
+            )
+            if loudness_unit not in _VALID_LOUDNESS_UNITS:
+                errors.append(f"{prefix}: 响度单位无效")
+            loudness_lower = ch.get(
+                "loudness_lower_limit", _CHANNEL_DEFAULTS["loudness_lower_limit"]
+            )
+            loudness_upper = ch.get(
+                "loudness_upper_limit", _CHANNEL_DEFAULTS["loudness_upper_limit"]
+            )
+            if not self._is_numeric(loudness_lower):
+                errors.append(f"{prefix}: 响度下限必须为数值")
+            elif loudness_lower < 0:
+                errors.append(f"{prefix}: 响度下限必须大于等于 0")
+            elif not self._is_numeric(loudness_upper):
+                errors.append(f"{prefix}: 响度上限必须为数值")
+            elif loudness_upper < 0:
+                errors.append(f"{prefix}: 响度上限必须大于等于 0")
+            elif loudness_lower >= loudness_upper:
+                errors.append(f"{prefix}: 响度下限必须小于上限")
             if ch.get("oct_weighting") not in _VALID_WEIGHTING:
                 errors.append(f"{prefix}: 倍频程计权模式无效")
 
@@ -323,3 +371,7 @@ class ConfigService:
             return None
         text = value.strip()
         return text or None
+
+    @staticmethod
+    def _is_numeric(value) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)

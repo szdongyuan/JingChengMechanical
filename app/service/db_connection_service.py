@@ -52,6 +52,8 @@ class DbConnectionService:
                 )
             except OperationalError:
                 pass
+        self._ensure_channel_config_columns()
+        self._backfill_channel_loudness_defaults()
         self._ensure_ai_binding_columns()
         self._ensure_ai_binding_indexes()
 
@@ -70,6 +72,43 @@ class DbConnectionService:
                 )
             except OperationalError:
                 pass
+
+    def _ensure_channel_config_columns(self):
+        channel_columns = [
+            ("loudness_unit", "TEXT DEFAULT 'sone'"),
+            ("loudness_lower_limit", "REAL DEFAULT 0"),
+            ("loudness_upper_limit", "REAL DEFAULT 60"),
+        ]
+        for column_name, type_spec in channel_columns:
+            try:
+                db.execute_sql(
+                    f"ALTER TABLE channel_config_table ADD COLUMN {column_name} {type_spec}"
+                )
+            except OperationalError:
+                pass
+
+    def _backfill_channel_loudness_defaults(self):
+        channel_columns = self._get_table_columns("channel_config_table")
+        required = {
+            "loudness_unit",
+            "loudness_lower_limit",
+            "loudness_upper_limit",
+        }
+        if not required.issubset(channel_columns):
+            return
+        db.execute_sql(
+            """
+            UPDATE channel_config_table
+            SET
+                loudness_unit = COALESCE(loudness_unit, 'sone'),
+                loudness_lower_limit = COALESCE(loudness_lower_limit, 0),
+                loudness_upper_limit = COALESCE(loudness_upper_limit, 60)
+            WHERE
+                loudness_unit IS NULL
+                OR loudness_lower_limit IS NULL
+                OR loudness_upper_limit IS NULL
+            """
+        )
 
     def _ensure_ai_binding_indexes(self):
         db.execute_sql(
