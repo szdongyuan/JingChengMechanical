@@ -165,6 +165,45 @@ class TestLoudnessHelpers:
         assert max_sone >= 0.0
         assert max_sone == pytest.approx(max(values_sone))
 
+    def test_compute_loudness_trace_resamples_high_sample_rate_before_backend_call(
+        self,
+        monkeypatch,
+    ):
+        signal = np.linspace(-1.0, 1.0, 200, dtype=np.float64)
+        calls = {}
+
+        def fake_resample(values, target_size):
+            calls["resample"] = {
+                "input_size": int(np.asarray(values).size),
+                "target_size": int(target_size),
+            }
+            return np.full(target_size, 0.25, dtype=np.float64)
+
+        def fake_compute_loudness_zwtv(values, sample_rate):
+            calls["backend"] = {
+                "input_size": int(np.asarray(values).size),
+                "sample_rate": float(sample_rate),
+            }
+            return np.array([1.5, 2.5], dtype=np.float64), None, None, np.array(
+                [0.0, 0.5],
+                dtype=np.float64,
+            )
+
+        monkeypatch.setattr(dsp_module.scipy_signal, "resample", fake_resample)
+        monkeypatch.setattr(
+            dsp_module,
+            "_compute_loudness_zwtv",
+            fake_compute_loudness_zwtv,
+        )
+
+        loudness_times, values_sone, max_sone = compute_loudness_trace(signal, 96000.0)
+
+        assert calls["resample"] == {"input_size": 200, "target_size": 100}
+        assert calls["backend"] == {"input_size": 100, "sample_rate": 48000.0}
+        assert loudness_times == [0.0, 0.5]
+        assert values_sone == [1.5, 2.5]
+        assert max_sone == pytest.approx(2.5)
+
 
 class TestComputeStft:
     def test_output_shapes(self):

@@ -93,6 +93,14 @@ class TestReviewPayloadEmission:
         assert calls["chart"]["config"] == session._config
         assert calls["chart"]["sample_rate"] == 100.0
         assert calls["chart"]["analysis_window"] == (1.0, 3.0)
+        assert calls["chart"]["judgment_payload"] == {
+            "overall": "合格",
+            "limit_pass": True,
+            "ai_pass": True,
+            "ai_score": 0.93,
+            "channel_results": [],
+            "analysis_window": (1.0, 3.0),
+        }
         np.testing.assert_array_equal(calls["chart"]["buffer"], post_attach)
         payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
         assert payload.summary_payload == expected_summary

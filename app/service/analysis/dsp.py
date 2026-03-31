@@ -152,7 +152,7 @@ def compute_loudness_trace(signal: np.ndarray, sample_rate: float) -> tuple[list
         raise ValueError("sample_rate must be positive")
 
     backend_sample_rate = float(sample_rate)
-    if backend_sample_rate < _LOUDNESS_MIN_SAMPLE_RATE:
+    if backend_sample_rate != _LOUDNESS_MIN_SAMPLE_RATE:
         target_size = max(1, int(round(sig.size * _LOUDNESS_MIN_SAMPLE_RATE / backend_sample_rate)))
         sig = scipy_signal.resample(sig, target_size)
         backend_sample_rate = _LOUDNESS_MIN_SAMPLE_RATE

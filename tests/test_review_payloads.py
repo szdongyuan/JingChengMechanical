@@ -892,6 +892,59 @@ def test_build_chart_payload_omits_loudness_for_channel_when_recompute_fails(mon
     assert set(payload[1]) == {"spl", "fft", "octave"}
 
 
+def test_build_chart_payload_omits_loudness_when_serialized_judgment_marks_channel_unavailable(
+    monkeypatch,
+):
+    ref_db = 20.0 * math.log10(20e-6)
+
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_spl",
+        lambda signal, sample_rate, weighting, time_constant: 70.0,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
+        lambda signal, sample_rate, nfft: (
+            np.array([1000.0], dtype=np.float64),
+            np.array([67.0], dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_octave_bands",
+        lambda signal, sample_rate, weighting: (
+            np.array([500.0], dtype=np.float64),
+            np.array([57.0], dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_loudness_trace",
+        lambda signal, sample_rate: ([0.0, 1.0], [2.0, 3.0], 3.0),
+    )
+
+    judgment_payload = _make_judgment_payload()
+    judgment_payload["channel_results"][1]["loudness_max_sone"] = None
+    judgment_payload["channel_results"][1]["loudness_pass"] = None
+    judgment_payload["channel_results"][1]["loudness_available"] = False
+    judgment_payload["channel_results"][1]["loudness_error_message"] = "MoSQITo unavailable"
+
+    payload = build_chart_payload(
+        buffer=np.column_stack(
+            [
+                np.full(200, 0.1, dtype=np.float32),
+                np.full(200, 0.2, dtype=np.float32),
+            ]
+        ),
+        config=_make_config(),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.5, 1.5),
+        judgment_payload=judgment_payload,
+    )
+
+    assert payload[0]["loudness"]["values"] == [2.0, 3.0]
+    assert "loudness" not in payload[1]
+    assert set(payload[1]) == {"spl", "fft", "octave"}
+
+
 def test_build_chart_payload_octave_filters_non_finite_levels_without_axis_mismatch(monkeypatch):
     ref_db = 20.0 * math.log10(20e-6)
 

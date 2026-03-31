@@ -708,6 +708,7 @@ class TestManager(QObject):
             sample_rate=float(getattr(session, "_sample_rate", 0) or 0),
             mic_cal=mic_cal,
             analysis_window=analysis_window,
+            judgment_payload=judgment_payload,
         )
         self._warn_loudness_chart_issues(
             session,

@@ -100,6 +100,7 @@ def build_chart_payload(
     sample_rate: float,
     mic_cal: dict,
     analysis_window: tuple[float, float] | list[float] | None,
+    judgment_payload: dict | None = None,
 ) -> dict[int, dict]:
     if not isinstance(buffer, np.ndarray) or buffer.size <= 0:
         return {}
@@ -115,6 +116,11 @@ def build_chart_payload(
     if window.size <= 0:
         return {}
 
+    channel_results = (
+        _channel_result_by_index(judgment_payload)
+        if isinstance(judgment_payload, dict)
+        else {}
+    )
     payload: dict[int, dict] = {}
     for channel_index in _selected_chart_channels(config, buffer):
         signal = _extract_channel(window, channel_index)
@@ -131,14 +137,16 @@ def build_chart_payload(
                 channel_config=channel_config,
             ),
         }
-        try:
-            channel_payload["loudness"] = _build_loudness_chart(
-                signal=calibrated,
-                sample_rate=sample_rate,
-                channel_config=channel_config,
-            )
-        except Exception:
-            pass
+        channel_result = channel_results.get(channel_index)
+        if not isinstance(channel_result, dict) or channel_result.get("loudness_available") is True:
+            try:
+                channel_payload["loudness"] = _build_loudness_chart(
+                    signal=calibrated,
+                    sample_rate=sample_rate,
+                    channel_config=channel_config,
+                )
+            except Exception:
+                pass
         payload[channel_index] = channel_payload
     return payload
 
