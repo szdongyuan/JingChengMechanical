@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 
-from app.service.analysis.frames import JudgmentResult
+from app.service.analysis.frames import JudgmentResult, SplFrame, StftFrame
 from app.service.analysis.test_session import TestSession
 from app.service.config_service import _CHANNEL_DEFAULTS
 from model.audio_data_table import AudioDataTable
@@ -134,6 +134,44 @@ class TestTestSessionProcessing:
         assert bus.spl_updated.emit.call_args.args[0] == 1
         assert bus.spl_updated.emit.call_args.args[1] == "factory-run-1"
         assert bus.spl_updated.emit.call_args.args[2] == 0
+
+    def test_on_chunk_emits_one_stft_signal_per_stft_frame(self):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        session = TestSession(
+            config=_make_config(),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"factory_run_id": "factory-run-1"},
+            audio_dir="/tmp/audio",
+        )
+        frame_a = StftFrame(
+            time=0.0,
+            frequencies=np.array([100.0]),
+            magnitudes=np.array([1.0]),
+        )
+        frame_b = StftFrame(
+            time=0.5,
+            frequencies=np.array([100.0]),
+            magnitudes=np.array([2.0]),
+        )
+        fake_pipeline = MagicMock()
+        fake_pipeline.channel_index = 0
+        fake_pipeline.process_chunk.return_value = {
+            "stft_frames": [frame_a, frame_b],
+            "stft": frame_b,
+            "spl": SplFrame(time=0.05, spl_db=60.0, weighting="Z"),
+            "octave": None,
+            "fft": None,
+        }
+        session._pipelines = [fake_pipeline]
+
+        session._on_chunk(np.ones((2048, 1), dtype=np.float32), 0)
+
+        assert bus.stft_updated.emit.call_count == 2
+        assert bus.stft_updated.emit.call_args_list[0].args == (1, "factory-run-1", 0, frame_a)
+        assert bus.stft_updated.emit.call_args_list[1].args == (1, "factory-run-1", 0, frame_b)
 
     def test_on_chunk_notifies_when_session_duration_expires(self):
         bus = _make_mock_bus()

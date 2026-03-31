@@ -41,6 +41,7 @@ class TestAnalysisPipeline:
         chunk = np.random.randn(2048).astype(np.float32)
         result = p.process_chunk(chunk, elapsed_time=0.5)
         assert "stft" in result
+        assert "stft_frames" in result
         assert "spl" in result
         assert "octave" in result
         assert "fft" in result
@@ -71,6 +72,7 @@ class TestAnalysisPipeline:
         chunk = np.random.randn(100).astype(np.float32)
         result = p.process_chunk(chunk, elapsed_time=0.0)
         assert result["stft"] is None
+        assert result["stft_frames"] == []
 
     def test_stft_accumulation_across_chunks(self):
         """Two sub-nfft chunks should accumulate and produce STFT on second call."""
@@ -80,8 +82,10 @@ class TestAnalysisPipeline:
         chunk2 = np.random.randn(600).astype(np.float32)
         r1 = p.process_chunk(chunk1, elapsed_time=0.0)
         assert r1["stft"] is None
+        assert r1["stft_frames"] == []
         r2 = p.process_chunk(chunk2, elapsed_time=0.05)
         assert r2["stft"] is not None
+        assert len(r2["stft_frames"]) >= 1
 
     def test_mic_calibration_applied(self):
         """Non-zero sensitivity should change the SPL value."""
@@ -104,3 +108,111 @@ class TestAnalysisPipeline:
         p.reset()
         # After reset, internal buffer should be empty
         assert p._stft_buffer.size == 0 or len(p._stft_buffer) == 0
+
+    def test_process_chunk_returns_stft_frames_starting_at_zero(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_stft",
+            lambda signal, sample_rate, nfft, overlap: (
+                np.array([0.0, 0.5, 1.0], dtype=np.float64),
+                np.array([100.0, 200.0], dtype=np.float64),
+                np.array([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], dtype=np.float64),
+            ),
+        )
+
+        p = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(stft_nfft=8, stft_overlap=0.5),
+            sample_rate=100.0,
+        )
+
+        result = p.process_chunk(np.ones(100), elapsed_time=1.0)
+
+        assert [frame.time for frame in result["stft_frames"]] == [0.0, 0.5, 1.0]
+        assert result["stft"] == result["stft_frames"][-1]
+
+    def test_process_chunk_suppresses_duplicate_stft_frames_across_overlapping_recomputation(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_stft",
+            lambda signal, sample_rate, nfft, overlap: (
+                np.array([0.0, 0.5, 1.0], dtype=np.float64),
+                np.array([100.0], dtype=np.float64),
+                np.array([[1.0, 2.0, 3.0]], dtype=np.float64),
+            ),
+        )
+
+        p = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(stft_nfft=100, stft_overlap=0.5),
+            sample_rate=100.0,
+        )
+
+        first = p.process_chunk(np.ones(100), elapsed_time=1.0)
+        second = p.process_chunk(np.ones(50), elapsed_time=1.5)
+
+        assert [frame.time for frame in first["stft_frames"]] == [0.0, 0.5, 1.0]
+        assert [frame.time for frame in second["stft_frames"]] == [1.5]
+
+    def test_process_chunk_filters_future_padded_stft_frames(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_stft",
+            lambda signal, sample_rate, nfft, overlap: (
+                np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float64),
+                np.array([100.0], dtype=np.float64),
+                np.array([[1.0, 2.0, 3.0, 4.0]], dtype=np.float64),
+            ),
+        )
+
+        p = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(stft_nfft=8, stft_overlap=0.5),
+            sample_rate=100.0,
+        )
+
+        result = p.process_chunk(np.ones(100), elapsed_time=1.0)
+
+        assert [frame.time for frame in result["stft_frames"]] == [0.0, 0.5, 1.0]
+
+    def test_process_chunk_keeps_leading_stft_frame_at_zero_for_small_and_large_windows(self):
+        chunk = np.random.randn(128).astype(np.float32)
+
+        small = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(stft_nfft=8, stft_overlap=0.5),
+            sample_rate=100.0,
+        )
+        large = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(stft_nfft=32, stft_overlap=0.5),
+            sample_rate=100.0,
+        )
+
+        small_result = small.process_chunk(chunk, elapsed_time=1.28)
+        large_result = large.process_chunk(chunk, elapsed_time=1.28)
+
+        assert small_result["stft_frames"][0].time == pytest.approx(0.0)
+        assert large_result["stft_frames"][0].time == pytest.approx(0.0)
+
+    def test_reset_clears_stft_dedupe_state(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_stft",
+            lambda signal, sample_rate, nfft, overlap: (
+                np.array([0.0, 0.5, 1.0], dtype=np.float64),
+                np.array([100.0], dtype=np.float64),
+                np.array([[1.0, 2.0, 3.0]], dtype=np.float64),
+            ),
+        )
+
+        p = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(stft_nfft=8, stft_overlap=0.5),
+            sample_rate=100.0,
+        )
+
+        p.process_chunk(np.ones(100), elapsed_time=1.0)
+        p.reset()
+        second_after_reset = p.process_chunk(np.ones(100), elapsed_time=1.0)
+
+        assert [frame.time for frame in second_after_reset["stft_frames"]] == [0.0, 0.5, 1.0]

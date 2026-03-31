@@ -129,8 +129,8 @@ class TestSession:
 
             result = pipeline.process_chunk(mono, elapsed)
 
-            if result["stft"] is not None:
-                self._bus.stft_updated.emit(self.config_id, frame_run_id, ch_idx, result["stft"])
+            for stft_frame in result["stft_frames"]:
+                self._bus.stft_updated.emit(self.config_id, frame_run_id, ch_idx, stft_frame)
             if result["spl"] is not None:
                 self._bus.spl_updated.emit(self.config_id, frame_run_id, ch_idx, result["spl"])
             if result["octave"] is not None:

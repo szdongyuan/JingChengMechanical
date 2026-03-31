@@ -421,7 +421,7 @@ class TestLateAttachBufferSlice:
 
             def process_chunk(self, mono, elapsed):
                 self._live_values.append(float(mono[0]))
-                return {"stft": None, "spl": None, "octave": None, "fft": None}
+                return {"stft_frames": [], "stft": None, "spl": None, "octave": None, "fft": None}
 
         class FakeAttachSnapshot:
             def __init__(self, chunk_index, sample_index):
@@ -586,7 +586,7 @@ class TestLateAttachBufferSlice:
             channel_index = 0
 
             def process_chunk(self, mono, elapsed):
-                return {"stft": None, "spl": None, "octave": None, "fft": None}
+                return {"stft_frames": [], "stft": None, "spl": None, "octave": None, "fft": None}
 
         class FakeAttachSnapshot:
             def __init__(self, chunk_index, sample_index):

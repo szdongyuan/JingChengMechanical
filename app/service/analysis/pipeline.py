@@ -42,6 +42,7 @@ class AnalysisPipeline:
 
         # Internal STFT overlap buffer
         self._stft_buffer = np.array([], dtype=np.float64)
+        self._latest_stft_frame_sample_index: int | None = None
 
     def process_chunk(self, chunk_mono: np.ndarray,
                       elapsed_time: float) -> dict:
@@ -54,7 +55,7 @@ class AnalysisPipeline:
 
         Returns
         -------
-        dict with keys: "stft", "spl", "octave", "fft"
+        dict with keys: "stft_frames", "stft", "spl", "octave", "fft"
             Values are frame dataclasses or None if not enough data.
         """
         sig = np.asarray(chunk_mono, dtype=np.float64)
@@ -89,24 +90,48 @@ class AnalysisPipeline:
 
         # STFT — accumulate in overlap buffer
         self._stft_buffer = np.concatenate([self._stft_buffer, sig])
+        stft_frames: list[StftFrame] = []
         if self._stft_buffer.size >= self._nfft:
-            # Compute STFT on accumulated buffer, then keep overlap
+            stft_signal = self._stft_buffer
+            buffer_duration_sec = stft_signal.size / self.sample_rate
+            buffer_start_sec = elapsed_time - buffer_duration_sec
+            chunk_end_sample_index = int(round(elapsed_time * self.sample_rate))
             times, freqs, mag_db = dsp.compute_stft(
-                self._stft_buffer, self.sample_rate, self._nfft, self._overlap,
+                stft_signal, self.sample_rate, self._nfft, self._overlap,
             )
-            # Take the last time frame
-            stft_frame = StftFrame(
-                time=elapsed_time,
-                frequencies=freqs,
-                magnitudes=mag_db[:, -1] if mag_db.shape[1] > 0 else mag_db.ravel(),
-            )
+
+            for frame_index, t_rel in enumerate(times):
+                t_abs = buffer_start_sec + float(t_rel)
+                frame_sample_index = int(round(t_abs * self.sample_rate))
+                if frame_sample_index > chunk_end_sample_index:
+                    continue
+                if (
+                    self._latest_stft_frame_sample_index is not None
+                    and frame_sample_index <= self._latest_stft_frame_sample_index
+                ):
+                    continue
+
+                stft_frames.append(
+                    StftFrame(
+                        time=t_abs,
+                        frequencies=freqs,
+                        magnitudes=mag_db[:, frame_index],
+                    )
+                )
+                self._latest_stft_frame_sample_index = frame_sample_index
+
             # Keep only the overlap portion for next chunk
             keep = int(self._nfft * self._overlap)
-            self._stft_buffer = self._stft_buffer[-keep:]
+            if keep > 0:
+                self._stft_buffer = self._stft_buffer[-keep:]
+            else:
+                self._stft_buffer = np.array([], dtype=np.float64)
+            stft_frame = stft_frames[-1] if stft_frames else None
         else:
             stft_frame = None
 
         return {
+            "stft_frames": stft_frames,
             "stft": stft_frame,
             "spl": spl_frame,
             "octave": octave_frame,
@@ -116,3 +141,4 @@ class AnalysisPipeline:
     def reset(self):
         """Clear internal state for reuse."""
         self._stft_buffer = np.array([], dtype=np.float64)
+        self._latest_stft_frame_sample_index = None

@@ -121,3 +121,38 @@ def test_stft_module_clears_when_selected_channel_has_no_cached_frames_yet(qapp)
 
     assert module.current_render_cache_key() is None
     assert module.current_image_payload() is None
+
+
+def test_stft_module_live_cache_begins_at_earliest_pipeline_frame_time(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 1
+    _show(module, qapp)
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="running",
+            trigger_source="manual",
+        )
+    )
+    for frame in (
+        _make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)),
+        _make_stft_frame(time=0.5, magnitudes=(3.0, 4.0)),
+        _make_stft_frame(time=1.0, magnitudes=(5.0, 6.0)),
+    ):
+        services.bus.stft_updated.emit(101, "run-101", 1, frame)
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            run_id="run-101",
+            judgment_payload={"overall": "合格"},
+            summary_payload={"overall_status": "pass", "rows": []},
+            chart_payload=None,
+        ),
+    )
+
+    payload = module.current_image_payload()
+    assert payload is not None
+    assert payload["times_sec"][0] == 0.0
