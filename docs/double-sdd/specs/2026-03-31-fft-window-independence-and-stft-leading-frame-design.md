@@ -122,6 +122,11 @@ Required behavior:
 - `_build_fft_chart()` receives the calibrated mono signal from that exact slice
 - no additional truncation or zero-padding is introduced merely because of `stft_nfft`
 
+Degenerate behavior:
+
+- if the selected slice is empty, `build_chart_payload()` continues returning no FFT chart payload for that channel, consistent with the current empty-window handling
+- if the selected slice has `N >= 1` samples, the committed FFT is still built from exactly those `N` samples
+
 ### FFT Length Rule
 
 Required behavior:
@@ -140,9 +145,13 @@ The pipeline must stop collapsing each STFT update to the last returned column.
 
 Required behavior:
 
+- `AnalysisPipeline.process_chunk()` remains responsible for analysis calculation and does not emit directly to the bus
+- instead of returning only one `stft` frame, the pipeline must return a mandatory result field `result["stft_frames"]`
+- `result["stft_frames"]` must always be present and its value must be a list of `StftFrame` objects in ascending time order
+- `result["stft"]` may remain as the newest emitted STFT frame for compatibility inside the pipeline/test surface, but `TestSession` must treat `result["stft_frames"]` as the authoritative emission source for `stft_updated`
 - after computing STFT on the rolling buffer, inspect every returned STFT column
-- convert each returned STFT column into a `StftFrame`
-- emit every column that is newly available for this run
+- convert every newly available valid column into a `StftFrame`
+- return every newly available column once for session-level bus emission
 
 ### Duplicate Suppression
 
@@ -150,8 +159,20 @@ Because overlapping rolling-buffer recomputation will revisit earlier STFT colum
 
 Required behavior:
 
-- track the latest emitted STFT time per pipeline instance
-- emit only STFT columns whose absolute time is strictly newer than the last emitted time
+- track the latest emitted STFT frame sample index per pipeline instance
+- for each candidate `t_abs`, derive `frame_sample_index = round(t_abs * sample_rate)`
+- emit only frames whose `frame_sample_index` is strictly greater than the stored latest emitted frame sample index
+- after emitting a frame, update the stored latest emitted frame sample index to that frame's `frame_sample_index`
+
+### Dedupe State Lifecycle
+
+The dedupe state is run-local pipeline state.
+
+Required behavior:
+
+- a newly constructed `AnalysisPipeline` starts with no emitted STFT frame sample index
+- `AnalysisPipeline.reset()` must clear the stored latest emitted STFT frame sample index
+- any other existing pipeline reset state continues to reset as today
 
 ### Chunk-End Bound
 
@@ -160,7 +181,22 @@ The pipeline must not emit padded future columns beyond the audio currently avai
 Required behavior:
 
 - derive the current chunk-end time from the chunk boundary already represented by `elapsed_time`
-- only emit STFT columns whose absolute time is at or before the current chunk-end time
+- derive `chunk_end_sample_index = round(elapsed_time * sample_rate)`
+- only emit STFT columns whose derived `frame_sample_index` is less than or equal to `chunk_end_sample_index`
+
+### Absolute-Time Conversion
+
+`compute_stft()` returns times relative to the start of the rolling buffer passed into that call. The pipeline must convert those buffer-relative times into absolute run-relative times before creating `StftFrame`s.
+
+Required behavior:
+
+- let `buffer_duration_sec = len(current_stft_buffer_before_truncation) / sample_rate`
+- let `buffer_start_sec = elapsed_time - buffer_duration_sec`
+- for each returned STFT column time `t_rel`, compute `t_abs = buffer_start_sec + t_rel`
+- use `t_abs` as `StftFrame.time`
+- apply future-column filtering and duplicate suppression against `t_abs`, not `t_rel`
+
+This makes emitted STFT times stable across rolling-buffer overlap and ensures deduplication is based on run-relative time, not per-call local coordinates.
 
 ### Time Axis
 
@@ -179,6 +215,8 @@ Required behavior:
 Allowed change:
 
 - one incoming audio chunk may now cause zero, one, or multiple `stft_updated` emissions for a given channel
+- `TestSession` should iterate over `result["stft_frames"]` and emit one `stft_updated` signal per returned `StftFrame`
+- `TestSession` should no longer depend on `result["stft"]` being the only live STFT output for a chunk
 
 No other signal shapes change in this design.
 
@@ -192,6 +230,8 @@ Add or update regression tests for:
 - first emitted STFT frame time is `0.0 s` when the first sufficiently large chunk yields a `0.0 s` STFT column
 - larger `stft_nfft` values do not create additional leading blank region from dropped STFT columns
 - session-level `stft_updated` propagation works when multiple STFT frames are emitted for one chunk
+- rolling-buffer recomputation suppresses duplicate STFT columns that were already emitted in earlier chunks
+- padded future STFT columns are filtered out when their derived frame sample index is beyond the current chunk-end sample index
 - STFT module cached image payload begins at the earliest emitted STFT time rather than a delayed final-column time
 
 Verification should include:
@@ -208,7 +248,7 @@ Verification should include:
 - `tests/test_review_payloads.py`
 - `tests/test_pipeline.py`
 - `tests/test_test_session.py`
-- `tests/test_stft_module/...`
+- `tests/test_stft_module/test_live_review_rendering.py`
 
 ## Non-Goals
 
