@@ -29,12 +29,27 @@ class HardwareSelectService:
 
     @staticmethod
     def query_devices():
-        """返回设备列表（list[dict]）。"""
+        """返回设备列表（list[dict]）。
+        [
+            {'name': 'xxx', 'index': 0, 'hostapi': 0, 'max_input_channels': 2, 'max_output_channels': 0, 。。'default_samplerate': 44100.0},
+            {'name': 'xxx', 'index': 1, 'hostapi': 0, 'max_input_channels': 2, 'max_output_channels': 0, 。。'default_samplerate': 44100.0},
+            {'name': 'xxx', 'index': 2, 'hostapi': 0, 'max_input_channels': 2, 'max_output_channels': 0, 。。'default_samplerate': 44100.0},
+            {'name': 'xxx', 'index': 3, 'hostapi': 0, 'max_input_channels': 2, 'max_output_channels': 0, 。。'default_samplerate': 44100.0},
+            {'name': 'xxx', 'index': 4, 'hostapi': 0, 'max_input_channels': 2, 'max_output_channels': 0, 。。'default_samplerate': 44100.0},
+        ]
+        """
         return list(sd.query_devices())
 
     @staticmethod
     def query_hostapis():
-        """返回 hostapi 列表（list[dict]）。"""
+        """返回 hostapi 列表（list[dict]）。
+            [
+                {'name': 'MME', 'devices': [0, 1, 2, 3, 4, 5, 6], ...}
+                {'name': 'Windows DirectSound', 'devices': [7, 8, 9, 10, 11, 12, 13], ...}
+                {'name': 'Windows WASAPI', 'devices': [14, 15, 16, 17, 18], ...}
+                {'name': 'Windows WDM-KS', 'devices': [19, 20, 21, 22, 23], ...}
+            ]
+        """
         return list(sd.query_hostapis())
 
     def query_devices_and_hostapis(self, *, refresh: bool = False) -> tuple[list[dict], list[dict]]:
@@ -53,39 +68,11 @@ class HardwareSelectService:
 
     @staticmethod
     def set_default_device(in_id: int, out_id: int):
+        """
+        设置默认设备
+        """
         sd.default.device = (in_id, out_id)
 
-    # -------- 按 hostapi 分组（参考工程）--------
-    def get_device_info_grouped(self, *, refresh: bool = False) -> dict:
-        """
-        返回：
-        {
-          "WASAPI": {"input":[...], "output":[...]},
-          "ASIO":   {"input":[...], "output":[...]},
-          ...
-        }
-        """
-        devices, hostapis = self.query_devices_and_hostapis(refresh=refresh)
-        host_dict: dict[str, dict[str, list[dict]]] = {}
-
-        for api in hostapis:
-            api_name = api.get("name", "N/A")
-            api_input: list[dict] = []
-            api_output: list[dict] = []
-
-            for device_id in api.get("devices") or []:
-                try:
-                    device = devices[device_id]
-                except Exception:
-                    continue
-                if device.get("max_input_channels", 0) > 0:
-                    api_input.append(device)
-                if device.get("max_output_channels", 0) > 0:
-                    api_output.append(device)
-
-            host_dict[api_name] = {"input": api_input, "output": api_output}
-
-        return host_dict
 
     # -------- DB：读取/保存选择 --------
     @staticmethod
@@ -191,7 +178,7 @@ class HardwareSelectService:
             "channel_count": ch,
         }
 
-    def save_io_devices(
+    def save_device_info(
         self,
         input_device_id: int,
         output_device_id: int,
@@ -234,11 +221,42 @@ class HardwareSelectService:
         if updated == 0:
             raise RuntimeError("device_table 中未找到 id=1 的配置行")
 
+        # 设置默认设备
         if sync_sounddevice_default:
-            try:
-                self.set_default_device(int(input_device_id), int(output_device_id))
-            except Exception:
-                pass
+            self.set_default_device(int(input_device_id), int(output_device_id))
 
         return in_dev, out_dev
+
+    def restore_default_device_from_db(self, device_info, devices, hostapis):
+        """
+        根据数据库的设备来恢复当前设备
+        """
+        matched_in = self.find_matched_device(device_info.get("input"), "input", devices, hostapis)
+        matched_out = self.find_matched_device(device_info.get("output"), "output", devices, hostapis)
+        if matched_in is None or matched_out is None:
+            return False
+        in_id = int(matched_in["index"])
+        out_id = int(matched_out["index"])
+        self.set_default_device(in_id, out_id)
+        return True
+
+    @staticmethod
+    def find_matched_device(dev_info, kind, devices, hostapis):
+        if not dev_info:
+            return None
+        for dev in devices:
+            hostapi_name = hostapis[dev["hostapi"]]["name"]
+            samplerate = str(int(dev["default_samplerate"]))
+            if kind == "input":
+                channel_count = int(dev.get("max_input_channels", 0))
+            else:
+                channel_count = int(dev.get("max_output_channels", 0))
+            if (
+                    dev["name"] == dev_info["name"]
+                    and hostapi_name == dev_info["type"]
+                    and samplerate == dev_info["samplerate"]
+                    and channel_count == int(dev_info.get("channel_count") or 0)
+            ):
+                return dev
+        return None
 

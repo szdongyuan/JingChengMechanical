@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app.service.hardwareselect_service import HardwareSelectService
 from app.service.log_manager import LogManager
 
 
@@ -30,16 +31,11 @@ class HardwareModule(QWidget):
         self.device_info = {}
         self.logger = LogManager.set_log_handler("硬件选择")
 
-        self._init_ui()
-        self.btn_refresh.clicked.connect(self.refresh_devices)
-        self.btn_save.clicked.connect(self.save_selected)
-        self.combobox_input.currentIndexChanged.connect(self._update_save_enabled)
-        self.combobox_output.currentIndexChanged.connect(self._update_save_enabled)
-
-        self._load_saved()
+        self.init_ui()
+        self.init_fun()
         self.refresh_devices()
 
-    def _init_ui(self):
+    def init_ui(self):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(10)
@@ -88,22 +84,26 @@ class HardwareModule(QWidget):
         # self.table.setSortingEnabled(True)
         lay.addWidget(self.table, 1)
 
-    def load_saved(self):
-        self._load_saved()
+    def init_fun(self):
+        self.btn_refresh.clicked.connect(self.refresh_devices)
+        self.btn_save.clicked.connect(self.save_selected)
+        self.combobox_input.currentIndexChanged.connect(self._update_save_enabled)
+        self.combobox_output.currentIndexChanged.connect(self._update_save_enabled)
 
-    def _load_saved(self):
-        # 从“硬件服务”（DB）读取上次保存的输入/监听设备信息，并显示在顶部“当前保存”标签里
+    def get_db_device_info(self):
+        # 从DB读取上次保存的输入/输出设备信息
         try:
             self.device_info = self.services.hss_service.load_io_devices()
         except Exception as e:
             # 读取失败时不阻塞页面，其它功能仍可用；给用户一个提示，同时写日志方便排查
             self.lb_current.setText("当前保存：—（数据库未就绪）")
-            self.services.bus.log.emit(f"[Hardware] 读取已保存设备失败: {e}")
+            self.services.bus.log.emit(f"读取已保存设备失败: {e}")
             return
 
-        self._update_current_label()
-
-    def _update_current_label(self):
+    def update_current_label(self):
+        """
+        更新界面上“当前保存/当前设备”的提示文字，并判断这些设备现在有没有被系统检测到
+        """
         in_dev = self.device_info.get("input")
         out_dev = self.device_info.get("output")
         if not (in_dev or out_dev):
@@ -116,55 +116,44 @@ class HardwareModule(QWidget):
                 return "—"
             return f"({dev.get('id','-')})：{dev.get('name','-')}"
 
-        def is_detected(saved_dev):
-            if not saved_dev:
-                return False
-
-            for dev in self._devices:
-                dev_name = dev["name"]
-                dev_type = self._hostapis[dev["hostapi"]]["name"]
-
-                dev_rate = str(int(dev["default_samplerate"]))
-
-                # 名称、驱动、采样率 三者完全相等即为同一个设备
-                if (dev_name == saved_dev["name"] and
-                        dev_type == saved_dev["type"] and
-                        dev_rate == saved_dev["samplerate"]):
-                    return True
-
-            return False
-
         if not self._devices:
-            self.lb_current.setText(
-                f"当前设备：麦克{fmt(in_dev)} | 扬声器{fmt(out_dev)}"
-            )
+            self.services.bus.log.emit(f"USB端口未检测到设备")
+            self.lb_current.setText(f"当前设备：麦克风{fmt(in_dev)}（未检测到）| 扬声器{fmt(out_dev)}（未检测到）")
             return
-        input_status = "" if is_detected(in_dev) else "（未检测到）"
-        output_status = "" if is_detected(out_dev) else "（未检测到）"
+        matched_in = HardwareSelectService.find_matched_device(in_dev, "input", self._devices, self._hostapis)
+        matched_out = HardwareSelectService.find_matched_device(out_dev, "output", self._devices, self._hostapis)
+        input_status = "" if matched_in else "（未检测到）"
+        output_status = "" if matched_out else "（未检测到）"
+
+        if input_status == "（未检测到）" or output_status == "（未检测到）":
+            self.services.bus.log.emit(f"USB端口设备发生变化，请重新检查设备。")
+
         self.lb_current.setText(
-            f"当前设备：麦克{fmt(in_dev)}{input_status} | 扬声器{fmt(out_dev)}{output_status}"
+            f"当前设备：麦克风{fmt(in_dev)}{input_status} | 扬声器{fmt(out_dev)}{output_status}"
         )
 
     def refresh_devices(self):
         try:
             self.services.hss_service.refresh_available_device()
         except Exception as e:
-            self.services.bus.log.emit(f"[Hardware] 刷新音频系统失败: {e}")
+            self.services.bus.log.emit(f"刷新音频系统失败: {e}")
         self.select_devices()
         self.logger.info("刷新设备")
 
     def select_devices(self):
+        self.get_db_device_info()
         try:
-            self._devices, self._hostapis = self.services.hss_service.query_devices_and_hostapis(
-                refresh=False
-            )
+            self._devices, self._hostapis = self.services.hss_service.query_devices_and_hostapis(refresh=False)
         except Exception as e:
-            self.services.bus.log.emit(f"[Hardware] 读取设备失败: {e}")
+            self.services.bus.log.emit(f"读取设备失败: {e}")
             self.table.setRowCount(0)
             return
 
+        res = self.services.hss_service.restore_default_device_from_db(self.device_info, self._devices, self._hostapis)
+        if not res:
+            self.services.bus.log.emit("未找到已保存的设备，未恢复默认设备。")
         default_in, default_out = self.services.hss_service.get_default_device_ids()
-        self.services.bus.log.emit(f"[Hardware] 默认设备：out{default_out}, in{default_in}")
+        self.services.bus.log.emit(f"默认设备：out{default_out}, in{default_in}")
 
         self.combobox_output.clear()
         self.combobox_input.clear()
@@ -217,15 +206,16 @@ class HardwareModule(QWidget):
         self._apply_table_sizing()
         # self.table.setSortingEnabled(True)
 
-        self.services.bus.log.emit(f"[Hardware] 设备列表刷新完成，共 {len(self._devices)} 个")
+        self.services.bus.log.emit(f"设备列表刷新完成，共 {len(self._devices)} 个")
         self.logger.info(f"设备列表刷新完成，共 {len(self._devices)} 个")
 
         # 不自动选中任何设备：刷新后保持在“请选择…”
         self.combobox_input.setCurrentIndex(0)
         self.combobox_output.setCurrentIndex(0)
 
-        self._load_saved()
         self._update_save_enabled()
+        self.update_current_label()
+        self.services.bus.refresh_channels.emit()
 
     def _apply_table_sizing(self):
         """让表格更清爽：名称列自适应，其它列固定宽度"""
@@ -265,7 +255,7 @@ class HardwareModule(QWidget):
             return
 
         try:
-            in_dev, out_dev = self.services.hss_service.save_io_devices(
+            in_dev, out_dev = self.services.hss_service.save_device_info(
                 int(in_id),
                 int(out_id),
                 devices=self._devices,
@@ -273,16 +263,19 @@ class HardwareModule(QWidget):
                 sync_sounddevice_default=True,
             )
 
-            self._load_saved()
+            self.get_db_device_info()
+            self.update_current_label()
+
             self.services.bus.log.emit(
-                f"[Hardware] 已保存输入/监听: IN {in_dev.get('id')} | {in_dev.get('name')} ; "
-                f"OUT {out_dev.get('id')} | {out_dev.get('name')}"
+                f"已保存设备：\n"
+                f"输入设备：{in_dev.get('id')} | {in_dev.get('name')}\n"
+                f"输出设备：{out_dev.get('id')} | {out_dev.get('name')}"
             )
             self.services.bus.status.emit("硬件设备已保存")
             QMessageBox.information(self, "保存成功", "输入/监听设备保存成功！")
             self.services.bus.refresh_channels.emit()
         except Exception as e:
-            self.services.bus.log.emit(f"[Hardware] 保存失败: {e}")
+            self.services.bus.log.emit(f"保存失败: {e}")
             self.services.bus.status.emit("硬件设备保存失败")
             QMessageBox.warning(self, "保存失败", "硬件设备保存失败，请重试！")
 

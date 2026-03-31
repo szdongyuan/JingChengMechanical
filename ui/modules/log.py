@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PyQt6.QtWidgets import QTextEdit, QVBoxLayout, QWidget
+from datetime import datetime
 
 
 class LogModule(QWidget):
@@ -20,5 +21,6 @@ class LogModule(QWidget):
         self.services.bus.log.connect(self.append)
 
     def append(self, s: str):
-        self.txt.append(s)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.txt.append(f"[{now}] {s}")
 
