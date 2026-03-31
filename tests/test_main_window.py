@@ -259,6 +259,24 @@ def test_show_login_window_cancel_reenables_main_window_without_closing_for_swit
     close_spy.assert_not_called()
 
 
+def test_show_change_password_window_when_logged_out_updates_visible_status_via_log(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    assert window.statusBar().currentMessage() == "[App] 启动程序"
+    assert window.change_password_window is None
+
+    window.show_change_password_window()
+    qapp.processEvents()
+
+    assert window.change_password_window is None
+    assert services.bus.log.emissions[-1][0] == ("请先登录",)
+    assert window.statusBar().currentMessage() == "请先登录"
+
+
 def test_show_login_window_cancel_reenables_main_window_before_closing_initial_login(
     qapp,
     monkeypatch,

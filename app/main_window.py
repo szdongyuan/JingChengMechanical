@@ -135,7 +135,7 @@ class MainWindow(QMainWindow):
 
     def show_change_password_window(self):
         if not self.current_user_name:
-            self.services.bus.status.emit("请先登录")
+            self.services.bus.log.emit("请先登录")
             return
 
         self.change_password_window = ChangePasswordWindow(self.current_user_name)
