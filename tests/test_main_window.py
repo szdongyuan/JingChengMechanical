@@ -838,6 +838,116 @@ def test_main_window_toolbar_selection_immediately_refreshes_stft_cached_channel
     )
 
 
+def test_main_window_page_reentry_refreshes_stft_from_existing_cache(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(
+            config_id=101,
+            run_id="run-101",
+            trigger_source="manual",
+        )
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        0,
+        _make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)),
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        1,
+        _make_stft_frame(time=0.0, magnitudes=(9.0, 10.0)),
+    )
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 1)
+
+    assert window.stft.current_render_cache_key() == (101, "run-101", 1)
+    assert np.array_equal(
+        window.stft.canvas.heatmap.image_payload()["magnitude_db"],
+        np.array([[9.0], [10.0]]),
+    )
+
+    window.tab.setCurrentIndex(1)
+    qapp.processEvents()
+    window.stft.canvas.heatmap.clear_data()
+    window.stft._render_cache_key = None
+
+    assert window.stft.current_image_payload() is None
+
+    window.tab.setCurrentIndex(0)
+    qapp.processEvents()
+
+    assert window.stft.current_render_cache_key() == (101, "run-101", 1)
+    assert np.array_equal(
+        window.stft.canvas.heatmap.image_payload()["magnitude_db"],
+        np.array([[9.0], [10.0]]),
+    )
+
+
+def test_main_window_page_reentry_clears_stft_when_selected_channel_has_no_cache(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(
+            config_id=101,
+            run_id="run-101",
+            trigger_source="manual",
+        )
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        0,
+        _make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)),
+    )
+    qapp.processEvents()
+
+    assert window.stft.current_render_cache_key() == (101, "run-101", 0)
+    assert window.stft.current_image_payload() is not None
+
+    window.tab.setCurrentIndex(1)
+    qapp.processEvents()
+    window._sync_selected_display_channel(1, refresh_modules=False)
+
+    assert window.stft.current_render_cache_key() == (101, "run-101", 0)
+    assert np.array_equal(
+        window.stft.canvas.heatmap.image_payload()["magnitude_db"],
+        np.array([[1.0], [2.0]]),
+    )
+
+    window.tab.setCurrentIndex(0)
+    qapp.processEvents()
+
+    assert window.stft.current_render_cache_key() is None
+    assert window.stft.current_image_payload() is None
+
+
 def test_main_window_toolbar_selection_immediately_refreshes_committed_chart_modules(
     qapp,
     monkeypatch,

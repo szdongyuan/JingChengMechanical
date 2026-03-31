@@ -53,6 +53,7 @@ ROLE_PERMISSIONS = {
 
 
 class MainWindow(QMainWindow):
+    _TEST_PAGE_INDEX = 0
     _DISPLAY_CHANNEL_PHASES = frozenset(
         {"running", "analyzing", "reviewing", "reanalyzing"}
     )
@@ -95,6 +96,7 @@ class MainWindow(QMainWindow):
         self.tab.addWidget(self.build_placeholder_page("数据管理"))
         self.tab.addWidget(self.build_config_page())
         self.tab.addWidget(self.build_hardware_page())
+        self.tab.currentChanged.connect(self._on_main_tab_changed)
 
         self.statusBar().showMessage("Idle")
 
@@ -428,6 +430,10 @@ class MainWindow(QMainWindow):
     def _on_factory_display_reset(self, _reason: str) -> None:
         self._review_payload = FactoryReviewPayload()
         self._sync_analysis_toolbar()
+
+    def _on_main_tab_changed(self, index: int) -> None:
+        if index == self._TEST_PAGE_INDEX:
+            self._refresh_analysis_display_modules()
 
     def _on_analysis_channel_changed(self, channel_index: int) -> None:
         self._sync_selected_display_channel(channel_index, refresh_modules=False)
