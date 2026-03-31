@@ -8,15 +8,16 @@ from ui.modules import stft as stft_module
 from ._support import _make_module, _make_stft_frame, _show
 
 
-def test_stft_cache_entry_appends_frames_without_concatenate_rebuild(monkeypatch):
+def test_stft_cache_entry_appends_frames_without_full_matrix_rebuild(monkeypatch):
     cache_entry = stft_module._StftCacheEntry()
 
     assert cache_entry.append_frame(_make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)))
 
-    def _fail_concatenate(*args, **kwargs):
-        raise AssertionError("append should grow without concatenating the full matrix")
+    def _fail_full_matrix_rebuild(*args, **kwargs):
+        raise AssertionError("cache entry should reuse direct matrix storage")
 
-    monkeypatch.setattr(stft_module.np, "concatenate", _fail_concatenate)
+    monkeypatch.setattr(stft_module.np, "concatenate", _fail_full_matrix_rebuild)
+    monkeypatch.setattr(stft_module.np, "column_stack", _fail_full_matrix_rebuild)
 
     assert cache_entry.append_frame(_make_stft_frame(time=0.5, magnitudes=(3.0, 4.0)))
 
@@ -24,10 +25,38 @@ def test_stft_cache_entry_appends_frames_without_concatenate_rebuild(monkeypatch
     assert payload is not None
     assert payload["times_sec"] == [0.0, 0.5]
     assert payload["frequencies_hz"] == [100.0, 200.0]
+    assert payload["magnitude_db"] is cache_entry.magnitude_db
     assert np.array_equal(
         payload["magnitude_db"],
         np.array([[1.0, 3.0], [2.0, 4.0]]),
     )
+
+
+def test_stft_cache_entry_rejects_different_length_frequency_axis_without_mutation():
+    cache_entry = stft_module._StftCacheEntry()
+
+    assert cache_entry.append_frame(_make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)))
+    original_payload = cache_entry.image_payload()
+    assert original_payload is not None
+    original_matrix = original_payload["magnitude_db"]
+
+    assert (
+        cache_entry.append_frame(
+            _make_stft_frame(
+                time=0.5,
+                magnitudes=(3.0, 4.0, 5.0),
+                frequencies=(100.0, 200.0, 300.0),
+            )
+        )
+        is False
+    )
+
+    payload = cache_entry.image_payload()
+    assert payload is not None
+    assert payload["times_sec"] == [0.0]
+    assert payload["frequencies_hz"] == [100.0, 200.0]
+    assert payload["magnitude_db"] is original_matrix
+    assert np.array_equal(payload["magnitude_db"], np.array([[1.0], [2.0]]))
 
 
 def test_refresh_selected_display_channel_reuses_cached_matrix_without_column_stack(

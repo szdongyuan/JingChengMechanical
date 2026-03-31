@@ -30,11 +30,12 @@ class _StftCacheEntry:
         if frequencies.shape != magnitudes.shape or frequencies.size == 0:
             return False
 
-        if (
-            self.frequencies_hz
-            and not np.allclose(frequencies, np.asarray(self.frequencies_hz, dtype=float))
-        ):
-            return False
+        if self.frequencies_hz:
+            cached_frequencies = np.asarray(self.frequencies_hz, dtype=float)
+            if frequencies.shape != cached_frequencies.shape:
+                return False
+            if not np.allclose(frequencies, cached_frequencies):
+                return False
 
         if not self.frequencies_hz:
             self.frequencies_hz = frequencies.tolist()
