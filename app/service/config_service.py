@@ -67,6 +67,7 @@ class PendingConfigSave:
     promoted_paths: tuple[str, ...] = ()
     old_paths: tuple[str, ...] = ()
     staged_paths: tuple[str, ...] = ()
+    golden_bindings_by_channel: tuple[tuple[int, dict], ...] = ()
 
 
 class ConfigService:
@@ -298,6 +299,18 @@ class ConfigService:
             promoted_paths=tuple(promoted_paths),
             old_paths=tuple(cleanup_after_commit),
             staged_paths=tuple(staged_paths),
+            golden_bindings_by_channel=tuple(
+                (
+                    channel["channel_index"],
+                    {
+                        field: channel.get(field)
+                        for field in _GOLDEN_BINDING_FIELDS
+                    },
+                )
+                for channel in channels
+                if isinstance(channel.get("channel_index"), int)
+                and not isinstance(channel.get("channel_index"), bool)
+            ),
         )
 
     def commit_pending_save(self, pending: PendingConfigSave | None) -> None:

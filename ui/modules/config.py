@@ -522,6 +522,40 @@ class ConfigModule(QWidget):
             )
         self._refresh_all_golden_sections()
 
+    def _apply_authoritative_golden_bindings(self, bindings_by_channel) -> None:
+        binding_map: dict[int, dict] = {}
+        for entry in bindings_by_channel or ():
+            if not isinstance(entry, (tuple, list)) or len(entry) != 2:
+                continue
+            channel_index, binding = entry
+            if not isinstance(channel_index, int) or isinstance(channel_index, bool):
+                continue
+            binding_map[channel_index] = self._normalize_golden_binding(binding)
+        if not binding_map:
+            return
+        for container in self._channel_containers:
+            channel_index = container.property("channel_index")
+            if channel_index not in binding_map:
+                continue
+            binding = binding_map[channel_index]
+            self._set_channel_binding(container, binding)
+            self._set_committed_channel_binding(container, binding)
+        self._refresh_all_golden_sections()
+
+    def _reconcile_golden_bindings_after_save_failure(
+        self,
+        pending_save,
+        *,
+        pending_save_committed: bool,
+    ) -> None:
+        self._discard_all_staged_bindings()
+        if pending_save_committed:
+            self._apply_authoritative_golden_bindings(
+                getattr(pending_save, "golden_bindings_by_channel", ()),
+            )
+            return
+        self._restore_committed_golden_bindings()
+
     def _effective_golden_binding(self, container: QWidget) -> dict | None:
         channel_index = container.property("channel_index")
         staged_binding = self._golden_editor_state.get(channel_index)
@@ -1487,8 +1521,10 @@ class ConfigModule(QWidget):
             )
             if callable(rollback_pending_save) and not pending_save_committed:
                 rollback_pending_save(pending_save)
-            self._discard_all_staged_bindings()
-            self._restore_committed_golden_bindings()
+            self._reconcile_golden_bindings_after_save_failure(
+                pending_save,
+                pending_save_committed=pending_save_committed,
+            )
             QMessageBox.warning(self, "保存失败", str(e))
         except Exception as e:
             self._skip_reload = False
@@ -1499,8 +1535,10 @@ class ConfigModule(QWidget):
             )
             if callable(rollback_pending_save) and not pending_save_committed:
                 rollback_pending_save(pending_save)
-            self._discard_all_staged_bindings()
-            self._restore_committed_golden_bindings()
+            self._reconcile_golden_bindings_after_save_failure(
+                pending_save,
+                pending_save_committed=pending_save_committed,
+            )
             QMessageBox.warning(self, "保存失败", str(e))
 
     def _on_hardware_changed(self):
