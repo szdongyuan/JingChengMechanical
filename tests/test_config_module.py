@@ -6,7 +6,9 @@ from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
+from scipy.io import wavfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -14,6 +16,10 @@ from PyQt6.QtCore import qInstallMessageHandler
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QLabel, QPushButton
 
+from app.service.config_service import ConfigService
+from app.service.golden_sample_service import GoldenSampleService
+from model.channel_config_table import ChannelConfigTable
+from model.test_config_table import TestConfigTable as ConfigTable
 from ui.modules.config import ConfigModule
 
 
@@ -39,6 +45,7 @@ class _ConfigServiceStub:
         validation_errors=None,
         golden_validation_errors=None,
         save_error: Exception | None = None,
+        load_error: Exception | None = None,
     ):
         self.saved_configs = []
         self._loaded_configs = {
@@ -48,7 +55,11 @@ class _ConfigServiceStub:
         self._validation_errors = validation_errors
         self._golden_validation_errors = golden_validation_errors
         self._save_error = save_error
+        self._load_error = load_error
         self.golden_sample_service = _GoldenSampleServiceStub()
+        self.begin_calls = 0
+        self.commit_calls = 0
+        self.rollback_calls = 0
 
     def list_configs(self):
         if self._loaded_configs:
@@ -68,6 +79,8 @@ class _ConfigServiceStub:
         ]
 
     def load_config(self, config_id: int):
+        if self._load_error is not None:
+            raise self._load_error
         return dict(self._loaded_configs[config_id])
 
     def validate(self, data):
@@ -99,12 +112,26 @@ class _ConfigServiceStub:
         return list(self._golden_validation_errors)
 
     def save_config(self, data):
+        pending = self.begin_save_config(data)
+        self.commit_pending_save(pending)
+        return pending.config_id
+
+    def begin_save_config(self, data):
+        self.begin_calls += 1
         if self._save_error is not None:
             raise self._save_error
         saved = dict(data)
         self.saved_configs = [saved]
         self._loaded_configs[saved["config_id"]] = saved
-        return saved["config_id"]
+        return SimpleNamespace(config_id=saved["config_id"])
+
+    def commit_pending_save(self, pending):
+        self.commit_calls += 1
+        return None
+
+    def rollback_pending_save(self, pending):
+        self.rollback_calls += 1
+        return None
 
     def create_config(self, name: str):
         config_id = max(self._loaded_configs, default=0) + 1
@@ -149,26 +176,32 @@ class _AiServiceStub:
 
 
 class _HardwareServiceStub:
+    def __init__(self, devices: list[dict] | None = None, hostapis: list[dict] | None = None):
+        self._devices = devices or [
+            {
+                "name": "Mic 1",
+                "hostapi": 0,
+                "default_samplerate": 48000,
+                "max_input_channels": 2,
+                "max_output_channels": 0,
+            },
+            {
+                "name": "Speaker 1",
+                "hostapi": 1,
+                "default_samplerate": 44100,
+                "max_input_channels": 0,
+                "max_output_channels": 2,
+            },
+        ]
+        self._hostapis = hostapis or [{"name": "ASIO"}, {"name": "WASAPI"}]
+
+    def set_devices(self, devices: list[dict], hostapis: list[dict] | None = None):
+        self._devices = devices
+        if hostapis is not None:
+            self._hostapis = hostapis
+
     def query_devices_and_hostapis(self, refresh: bool = False):
-        return (
-            [
-                {
-                    "name": "Mic 1",
-                    "hostapi": 0,
-                    "default_samplerate": 48000,
-                    "max_input_channels": 2,
-                    "max_output_channels": 0,
-                },
-                {
-                    "name": "Speaker 1",
-                    "hostapi": 1,
-                    "default_samplerate": 44100,
-                    "max_input_channels": 0,
-                    "max_output_channels": 2,
-                },
-            ],
-            [{"name": "ASIO"}, {"name": "WASAPI"}],
-        )
+        return (list(self._devices), list(self._hostapis))
 
 
 @contextmanager
@@ -197,15 +230,18 @@ def _make_module(
     binding: dict | None = None,
     config_service: _ConfigServiceStub | None = None,
     ai_service: _AiServiceStub | None = None,
+    hardware_service: _HardwareServiceStub | None = None,
+    bus=None,
 ) -> ConfigModule:
+    services_bus = bus or SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+    )
     services = SimpleNamespace(
         config_service=config_service or _ConfigServiceStub(),
         ai_service=ai_service or _AiServiceStub(binding=binding),
-        hss_service=_HardwareServiceStub(),
-        bus=SimpleNamespace(
-            refresh_channels=_SignalStub(),
-            status=_SignalStub(),
-        ),
+        hss_service=hardware_service or _HardwareServiceStub(),
+        bus=services_bus,
     )
     return ConfigModule(services)
 
@@ -309,6 +345,25 @@ def _detail_payload(
         "selected_channels": [0],
         "channels": channels,
     }
+
+
+def _write_temp_wav(
+    path: Path,
+    *,
+    sample_rate: int = 48_000,
+    samples: int = 144_000,
+    channels: int = 1,
+) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    base = np.linspace(-0.8, 0.8, num=samples, dtype=np.float32)
+    if channels <= 1:
+        data = base
+    else:
+        data = np.column_stack([base + float(index) for index in range(channels)]).astype(
+            np.float32
+        )
+    wavfile.write(path, sample_rate, data)
+    return path
 
 
 def test_populate_detail_uses_main_config_analysis_offset_and_plc_fields(qapp):
@@ -837,3 +892,161 @@ def test_save_failure_discards_staged_file_and_keeps_committed_binding_authorita
     assert data["channels"][0]["golden_sample_label"] == committed["golden_sample_label"]
     assert data["golden_editor_state"] == {}
     assert config_service.golden_sample_service.discarded_paths == [str(staged_path)]
+
+
+def test_outer_transaction_failure_after_begin_save_config_rolls_back_promotions_and_keeps_old_asset(
+    tmp_path,
+):
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        config_changed=_SignalStub(),
+    )
+    golden_service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    config_service = ConfigService(bus, golden_sample_service=golden_service)
+
+    config_id = ConfigTable.create(
+        config_name="Cfg1",
+        input_device_name="Mic 1",
+        input_device_hostapi="ASIO",
+        input_device_samplerate=48_000,
+        output_device_name="Speaker 1",
+        output_device_hostapi="WASAPI",
+        output_device_samplerate=44_100,
+        selected_channels="[0]",
+    ).config_id
+    old_path = _write_temp_wav(tmp_path / "managed" / "config_1" / "old.wav")
+    ChannelConfigTable.create(
+        config=config_id,
+        **_channel_payload(0, **_golden_binding(str(old_path))),
+    )
+
+    source_path = _write_temp_wav(
+        tmp_path / "source.wav",
+        samples=200_000,
+        channels=2,
+    )
+    staged = golden_service.create_staged_sample(
+        source_path=str(source_path),
+        source_channel=1,
+        start_sample=24_000,
+        num_samples=144_000,
+        sample_rate=48_000.0,
+        label="replacement.wav",
+    )
+    staged_path = Path(staged.staged_path)
+    payload = _detail_payload(
+        [_channel_payload(0, **_golden_binding(str(old_path)))],
+        config_id=config_id,
+    )
+    payload["selected_channels"] = [0]
+    payload["golden_editor_state"] = {
+        0: _staged_golden_binding(
+            staged_path,
+            label=staged.label,
+            source_channel=staged.source_channel,
+            start_sample=staged.start_sample,
+            num_samples=staged.num_samples,
+            sample_rate=staged.sample_rate,
+        )
+    }
+
+    pending = None
+    with pytest.raises(RuntimeError, match="outer exploded"):
+        with ConfigTable._meta.database.atomic():
+            pending = config_service.begin_save_config(payload)
+            raise RuntimeError("outer exploded")
+
+    config_service.rollback_pending_save(pending)
+
+    loaded = config_service.load_config(config_id)
+    committed_files = sorted((tmp_path / "managed").glob("config_*/*.wav"))
+
+    assert bus.config_changed.emissions == []
+    assert loaded["channels"][0]["golden_sample_path"] == str(old_path)
+    assert old_path.exists()
+    assert committed_files == [old_path]
+    assert staged_path.exists()
+
+
+def test_input_device_channel_reduction_discards_removed_channel_staged_bindings(
+    qapp,
+    tmp_path,
+):
+    hardware_service = _HardwareServiceStub(
+        devices=[
+            {
+                "name": "Mic 1",
+                "hostapi": 0,
+                "default_samplerate": 48000,
+                "max_input_channels": 2,
+                "max_output_channels": 0,
+            },
+            {
+                "name": "Mic Small",
+                "hostapi": 0,
+                "default_samplerate": 48000,
+                "max_input_channels": 1,
+                "max_output_channels": 0,
+            },
+            {
+                "name": "Speaker 1",
+                "hostapi": 1,
+                "default_samplerate": 44100,
+                "max_input_channels": 0,
+                "max_output_channels": 2,
+            },
+        ]
+    )
+    config_service = _ConfigServiceStub()
+    module = _make_module(
+        config_service=config_service,
+        hardware_service=hardware_service,
+    )
+    payload = _detail_payload(
+        [_channel_payload(0), _channel_payload(1)]
+    )
+    payload["selected_channels"] = [0, 1]
+    module._populate_detail(payload)
+
+    staged_path = tmp_path / "removed-channel.wav"
+    staged_path.write_bytes(b"wav")
+    module._golden_editor_state[1] = _staged_golden_binding(staged_path)
+
+    mic_small_index = module.combo_input_dev.findText("Mic Small (ASIO)")
+    assert mic_small_index >= 0
+
+    module.combo_input_dev.setCurrentIndex(mic_small_index)
+    qapp.processEvents()
+
+    data = module._collect_data()
+
+    assert [channel["channel_index"] for channel in data["channels"]] == [0]
+    assert data["golden_editor_state"] == {}
+    assert config_service.golden_sample_service.discarded_paths == [str(staged_path)]
+
+
+def test_post_commit_reload_failure_does_not_rollback_committed_pending_save(
+    qapp,
+    monkeypatch,
+):
+    config_service = _ConfigServiceStub(load_error=RuntimeError("reload exploded"))
+    module = _make_module(config_service=config_service)
+    module._current_config_id = 7
+    module._populate_detail(_detail_payload([_channel_payload(0)]))
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module._on_save()
+
+    assert config_service.begin_calls == 1
+    assert config_service.commit_calls == 1
+    assert config_service.rollback_calls == 0
+    assert any("reload exploded" in str(args[-1]) for args in warnings)

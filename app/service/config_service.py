@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from decimal import Decimal
 
 from peewee import IntegrityError
@@ -58,6 +59,14 @@ _VALID_OVERLAP = [0.25, 0.5, 0.75]
 _VALID_WEIGHTING = ["A", "C", "Z"]
 _VALID_LOUDNESS_UNITS = ["sone", "phon"]
 _VALID_GOLDEN_MODES = {"off", "absolute", "delta"}
+
+
+@dataclass(frozen=True)
+class PendingConfigSave:
+    config_id: int
+    promoted_paths: tuple[str, ...] = ()
+    old_paths: tuple[str, ...] = ()
+    staged_paths: tuple[str, ...] = ()
 
 
 class ConfigService:
@@ -200,6 +209,11 @@ class ConfigService:
         return cfg.config_id
 
     def save_config(self, data: dict) -> int:
+        pending = self.begin_save_config(data)
+        self.commit_pending_save(pending)
+        return pending.config_id
+
+    def begin_save_config(self, data: dict) -> PendingConfigSave:
         errors = self.validate(data)
         if errors:
             raise ValueError("\n".join(errors))
@@ -279,12 +293,26 @@ class ConfigService:
             self._safe_rollback(promoted_paths)
             raise
 
+        return PendingConfigSave(
+            config_id=config_id,
+            promoted_paths=tuple(promoted_paths),
+            old_paths=tuple(cleanup_after_commit),
+            staged_paths=tuple(staged_paths),
+        )
+
+    def commit_pending_save(self, pending: PendingConfigSave | None) -> None:
+        if pending is None:
+            return
         self._post_commit_cleanup(
-            old_paths=cleanup_after_commit,
-            staged_paths=staged_paths,
+            old_paths=list(pending.old_paths),
+            staged_paths=list(pending.staged_paths),
         )
         self.bus.config_changed.emit()
-        return config_id
+
+    def rollback_pending_save(self, pending: PendingConfigSave | None) -> None:
+        if pending is None:
+            return
+        self._safe_rollback(list(pending.promoted_paths))
 
     def delete_config(self, config_id: int) -> bool:
         with TestConfigTable._meta.database.atomic():

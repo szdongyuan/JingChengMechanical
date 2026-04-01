@@ -408,6 +408,7 @@ class ConfigModule(QWidget):
 
         dev_info = self.combo_input_dev.currentData()
         if not dev_info or not isinstance(dev_info, dict):
+            self._prune_staged_bindings([])
             self._build_channel_tabs([], None)
             return
 
@@ -421,6 +422,7 @@ class ConfigModule(QWidget):
 
         # Rebuild tabs for ALL channels, not just checked ones
         all_indices = list(range(max_ch))
+        self._prune_staged_bindings(all_indices)
         self._build_channel_tabs(all_indices, existing_channel_data)
         self._refresh_all_golden_sections()
 
@@ -479,6 +481,16 @@ class ConfigModule(QWidget):
         ]
         self._golden_editor_state = {}
         self._discard_staged_paths(staged_paths)
+
+    def _prune_staged_bindings(self, valid_channel_indices: list[int]) -> None:
+        valid = set(valid_channel_indices)
+        removed = [
+            channel_index
+            for channel_index in list(self._golden_editor_state)
+            if channel_index not in valid
+        ]
+        for channel_index in removed:
+            self._discard_channel_staged_binding(channel_index)
 
     @staticmethod
     def _set_channel_binding(container: QWidget, binding: dict) -> None:
@@ -1276,9 +1288,16 @@ class ConfigModule(QWidget):
         for container in self._channel_containers:
             data["channels"].append(self._collect_channel_data(container))
 
+        valid_channel_indices = {
+            channel["channel_index"]
+            for channel in data["channels"]
+            if isinstance(channel.get("channel_index"), int)
+            and not isinstance(channel.get("channel_index"), bool)
+        }
         data["golden_editor_state"] = {
             channel_index: dict(binding)
             for channel_index, binding in self._golden_editor_state.items()
+            if channel_index in valid_channel_indices
         }
 
         return data
@@ -1419,6 +1438,8 @@ class ConfigModule(QWidget):
         if errors:
             QMessageBox.warning(self, "验证失败", "\n".join(errors))
             return
+        pending_save = None
+        pending_save_committed = False
         try:
             # Validate AI binding before saving anything
             ai_data = self._collect_ai_binding()
@@ -1434,8 +1455,21 @@ class ConfigModule(QWidget):
 
             from model.base_mode import db
             with db.atomic():
-                saved_id = self.services.config_service.save_config(data)
+                begin_save = getattr(self.services.config_service, "begin_save_config", None)
+                if callable(begin_save):
+                    pending_save = begin_save(data)
+                    saved_id = pending_save.config_id
+                else:
+                    saved_id = self.services.config_service.save_config(data)
                 self.services.ai_service.save_binding(saved_id, ai_data)
+            commit_pending_save = getattr(
+                self.services.config_service,
+                "commit_pending_save",
+                None,
+            )
+            if callable(commit_pending_save):
+                commit_pending_save(pending_save)
+                pending_save_committed = True
             loaded = self.services.config_service.load_config(saved_id)
             self._skip_reload = True
             self._refresh_list()
@@ -1446,11 +1480,25 @@ class ConfigModule(QWidget):
             self.services.bus.status.emit("配置已保存")
         except ValueError as e:
             self._skip_reload = False
+            rollback_pending_save = getattr(
+                self.services.config_service,
+                "rollback_pending_save",
+                None,
+            )
+            if callable(rollback_pending_save) and not pending_save_committed:
+                rollback_pending_save(pending_save)
             self._discard_all_staged_bindings()
             self._restore_committed_golden_bindings()
             QMessageBox.warning(self, "保存失败", str(e))
         except Exception as e:
             self._skip_reload = False
+            rollback_pending_save = getattr(
+                self.services.config_service,
+                "rollback_pending_save",
+                None,
+            )
+            if callable(rollback_pending_save) and not pending_save_committed:
+                rollback_pending_save(pending_save)
             self._discard_all_staged_bindings()
             self._restore_committed_golden_bindings()
             QMessageBox.warning(self, "保存失败", str(e))
