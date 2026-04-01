@@ -142,6 +142,22 @@ class TestLimitChecks:
         assert result.channel_results[0].loudness_error_message == "loudness backend unavailable"
         assert result.limit_pass is False
 
+    def test_judgment_preserves_loudness_failure_contract_when_segmented_backend_errors(self, monkeypatch):
+        engine = self._make_engine()
+        sample_rate = 48000.0
+        buffer = np.zeros((int(sample_rate * 3.0), 1))
+        config = _make_config()
+
+        def _raising_backend_error(*args, **kwargs):
+            raise RuntimeError("backend failed")
+
+        monkeypatch.setattr(dsp, "compute_loudness_trace", _raising_backend_error)
+
+        result = engine.judge(config, buffer, sample_rate, mic_cal={}, audio_file_path="/tmp/test.wav")
+
+        assert result.channel_results[0].loudness_available is False
+        assert result.channel_results[0].loudness_error_message == "backend failed"
+
     def test_spl_above_upper_limit_fails(self):
         engine = self._make_engine()
         sr = 44100.0

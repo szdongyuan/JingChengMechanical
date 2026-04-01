@@ -82,6 +82,8 @@ def _c_weight_linear(f: float) -> float:
 
 _REF_PRESSURE = 20e-6
 _LOUDNESS_MIN_SAMPLE_RATE = 48000.0
+_LOUDNESS_NPERSEG = 2048
+_LOUDNESS_NOVERLAP = 1024
 
 
 def compute_spl(signal: np.ndarray, sample_rate: float,
@@ -132,15 +134,20 @@ def compute_spl(signal: np.ndarray, sample_rate: float,
 @lru_cache(maxsize=1)
 def _load_loudness_backend():
     try:
-        from mosqito.sq_metrics import loudness_zwtv
+        from mosqito.sq_metrics import loudness_zwst_perseg
     except ImportError as exc:
         raise RuntimeError("MoSQITo loudness backend is unavailable") from exc
-    return loudness_zwtv
+    return loudness_zwst_perseg
 
 
-def _compute_loudness_zwtv(signal: np.ndarray, sample_rate: float):
+def _compute_loudness_zwst_perseg(signal: np.ndarray, sample_rate: float):
     backend = _load_loudness_backend()
-    return backend(signal, int(round(sample_rate)))
+    return backend(
+        signal,
+        int(round(sample_rate)),
+        nperseg=_LOUDNESS_NPERSEG,
+        noverlap=_LOUDNESS_NOVERLAP,
+    )
 
 
 def compute_loudness_trace(signal: np.ndarray, sample_rate: float) -> tuple[list[float], list[float], float]:
@@ -157,9 +164,15 @@ def compute_loudness_trace(signal: np.ndarray, sample_rate: float) -> tuple[list
         sig = scipy_signal.resample(sig, target_size)
         backend_sample_rate = _LOUDNESS_MIN_SAMPLE_RATE
 
-    values_sone, _, _, times = _compute_loudness_zwtv(sig, backend_sample_rate)
+    actual_duration_sec = sig.size / backend_sample_rate
+    if sig.size < _LOUDNESS_NPERSEG:
+        sig = np.pad(sig, (0, _LOUDNESS_NPERSEG - sig.size))
+
+    values_sone, _, _, times = _compute_loudness_zwst_perseg(sig, backend_sample_rate)
     values = np.maximum(np.asarray(values_sone, dtype=np.float64).reshape(-1), 0.0)
     time_axis = np.asarray(times, dtype=np.float64).reshape(-1)
+    if time_axis.size:
+        time_axis = np.clip(time_axis, 0.0, actual_duration_sec)
 
     if values.size == 0 or time_axis.size == 0 or values.size != time_axis.size:
         raise RuntimeError("MoSQITo loudness backend returned unusable output")

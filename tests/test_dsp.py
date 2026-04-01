@@ -179,30 +179,190 @@ class TestLoudnessHelpers:
             }
             return np.full(target_size, 0.25, dtype=np.float64)
 
-        def fake_compute_loudness_zwtv(values, sample_rate):
-            calls["backend"] = {
-                "input_size": int(np.asarray(values).size),
-                "sample_rate": float(sample_rate),
-            }
-            return np.array([1.5, 2.5], dtype=np.float64), None, None, np.array(
-                [0.0, 0.5],
-                dtype=np.float64,
-            )
-
         monkeypatch.setattr(dsp_module.scipy_signal, "resample", fake_resample)
-        monkeypatch.setattr(
-            dsp_module,
-            "_compute_loudness_zwtv",
-            fake_compute_loudness_zwtv,
+        _install_fake_segmented_backend(
+            monkeypatch,
+            calls,
+            values=np.array([1.5, 2.5], dtype=np.float64),
+            times=np.array([0.0, 0.5], dtype=np.float64),
         )
 
         loudness_times, values_sone, max_sone = compute_loudness_trace(signal, 96000.0)
 
         assert calls["resample"] == {"input_size": 200, "target_size": 100}
-        assert calls["backend"] == {"input_size": 100, "sample_rate": 48000.0}
-        assert loudness_times == [0.0, 0.5]
+        assert calls["backend"] == {
+            "input_size": 2048,
+            "sample_rate": 48000.0,
+            "nperseg": 2048,
+            "noverlap": 1024,
+        }
+        assert loudness_times == [0.0, pytest.approx(100 / 48000.0)]
         assert values_sone == [1.5, 2.5]
         assert max_sone == pytest.approx(2.5)
+
+
+def _install_fake_segmented_backend(monkeypatch, calls, *, values, times):
+    def fake_backend(signal, sample_rate, *, nperseg=None, noverlap=None):
+        calls["backend"] = {
+            "input_size": int(np.asarray(signal).size),
+            "sample_rate": float(sample_rate),
+            "nperseg": nperseg,
+            "noverlap": noverlap,
+        }
+        return values, None, None, times
+
+    monkeypatch.setattr(dsp_module, "_load_loudness_backend", lambda: fake_backend)
+
+
+def test_compute_loudness_trace_uses_segmented_backend(monkeypatch):
+    signal = np.linspace(-1.0, 1.0, 4096, dtype=np.float64)
+    calls = {}
+    _install_fake_segmented_backend(
+        monkeypatch,
+        calls,
+        values=np.array([1.0, 2.0], dtype=np.float64),
+        times=np.array([0.1, 0.2], dtype=np.float64),
+    )
+
+    compute_loudness_trace(signal, 48000.0)
+
+    assert calls["backend"] == {
+        "input_size": 4096,
+        "sample_rate": 48000.0,
+        "nperseg": 2048,
+        "noverlap": 1024,
+    }
+
+
+def test_compute_loudness_trace_passes_through_native_48k_without_resample(monkeypatch):
+    signal = np.linspace(-1.0, 1.0, 4096, dtype=np.float64)
+    calls = {}
+    _install_fake_segmented_backend(
+        monkeypatch,
+        calls,
+        values=np.array([1.0], dtype=np.float64),
+        times=np.array([0.1], dtype=np.float64),
+    )
+
+    def fake_resample(*args, **kwargs):
+        calls["resample"] = True
+        raise AssertionError("resample should not be called for native 48 kHz input")
+
+    monkeypatch.setattr(dsp_module.scipy_signal, "resample", fake_resample)
+
+    compute_loudness_trace(signal, 48000.0)
+
+    assert "resample" not in calls
+    assert calls["backend"]["sample_rate"] == 48000.0
+
+
+def test_compute_loudness_trace_normalizes_non_native_sample_rate_before_backend_call(monkeypatch):
+    signal = np.linspace(-1.0, 1.0, 200, dtype=np.float64)
+    calls = {}
+    _install_fake_segmented_backend(
+        monkeypatch,
+        calls,
+        values=np.array([1.0], dtype=np.float64),
+        times=np.array([0.1], dtype=np.float64),
+    )
+
+    def fake_resample(values, target_size):
+        calls["resample"] = {
+            "input_size": int(np.asarray(values).size),
+            "target_size": int(target_size),
+        }
+        return np.full(target_size, 0.25, dtype=np.float64)
+
+    monkeypatch.setattr(dsp_module.scipy_signal, "resample", fake_resample)
+
+    compute_loudness_trace(signal, 96000.0)
+
+    assert calls["resample"] == {"input_size": 200, "target_size": 100}
+    assert calls["backend"]["sample_rate"] == 48000.0
+
+
+def test_compute_loudness_trace_preserves_times_values_and_max(monkeypatch):
+    signal = np.linspace(-1.0, 1.0, 48000, dtype=np.float64)
+    calls = {}
+    _install_fake_segmented_backend(
+        monkeypatch,
+        calls,
+        values=np.array([1.5, 2.5], dtype=np.float64),
+        times=np.array([0.1, 0.2], dtype=np.float64),
+    )
+
+    loudness_times, values_sone, max_sone = compute_loudness_trace(signal, 48000.0)
+
+    assert loudness_times == [0.1, 0.2]
+    assert values_sone == [1.5, 2.5]
+    assert max_sone == pytest.approx(2.5)
+
+
+def test_compute_loudness_trace_rejects_non_finite_backend_output(monkeypatch):
+    signal = np.linspace(-1.0, 1.0, 4096, dtype=np.float64)
+    calls = {}
+    _install_fake_segmented_backend(
+        monkeypatch,
+        calls,
+        values=np.array([1.0, np.nan], dtype=np.float64),
+        times=np.array([0.1, 0.2], dtype=np.float64),
+    )
+
+    with pytest.raises(RuntimeError, match="non-finite output"):
+        compute_loudness_trace(signal, 48000.0)
+
+
+def test_compute_loudness_trace_pads_short_input_and_clamps_time_axis(monkeypatch):
+    signal = np.linspace(-1.0, 1.0, 1000, dtype=np.float64)
+    calls = {}
+    actual_duration_sec = signal.size / 48000.0
+    _install_fake_segmented_backend(
+        monkeypatch,
+        calls,
+        values=4.0,
+        times=0.0213229167,
+    )
+
+    loudness_times, values_sone, max_sone = compute_loudness_trace(signal, 48000.0)
+
+    assert calls["backend"]["input_size"] == 2048
+    assert loudness_times == [pytest.approx(actual_duration_sec)]
+    assert values_sone == [pytest.approx(4.0)]
+    assert max_sone == pytest.approx(4.0)
+
+
+def test_compute_loudness_trace_normalizes_scalar_one_segment_output(monkeypatch):
+    signal = np.linspace(-1.0, 1.0, 1024, dtype=np.float64)
+    calls = {}
+    _install_fake_segmented_backend(
+        monkeypatch,
+        calls,
+        values=4.0,
+        times=0.0213229167,
+    )
+
+    loudness_times, values_sone, max_sone = compute_loudness_trace(signal, 48000.0)
+
+    assert loudness_times == [pytest.approx(0.0213229167)]
+    assert values_sone == [pytest.approx(4.0)]
+    assert max_sone == pytest.approx(4.0)
+
+
+def test_compute_loudness_trace_accepts_exact_2048_sample_one_point_output(monkeypatch):
+    signal = np.linspace(-1.0, 1.0, 2048, dtype=np.float64)
+    calls = {}
+    _install_fake_segmented_backend(
+        monkeypatch,
+        calls,
+        values=4.0,
+        times=0.0213229167,
+    )
+
+    loudness_times, values_sone, max_sone = compute_loudness_trace(signal, 48000.0)
+
+    assert loudness_times == [pytest.approx(0.0213229167)]
+    assert values_sone == [pytest.approx(4.0)]
+    assert max_sone == pytest.approx(4.0)
 
 
 class TestComputeStft:
