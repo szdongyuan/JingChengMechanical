@@ -184,6 +184,12 @@ class ConfigService:
             data.get("golden_editor_state")
         )
         channels = [dict(channel) for channel in data.get("channels", [])]
+        staged_channel_errors = self._validate_staged_channel_mapping(
+            channels=channels,
+            staged_by_channel=staged_by_channel,
+        )
+        if staged_channel_errors:
+            raise ValueError("\n".join(staged_channel_errors))
         promoted_paths: list[str] = []
         cleanup_after_commit = self._collect_replaced_paths(config_id, channels)
         staged_paths = [sample.staged_path for sample in staged_by_channel.values()]
@@ -400,6 +406,12 @@ class ConfigService:
                     sample_rate=sample_rate,
                 )
             )
+        errors.extend(
+            self._validate_staged_channel_mapping(
+                channels=channels,
+                staged_by_channel=staged_by_channel,
+            )
+        )
         return errors
 
     def validate_factory_runtime(self, data: dict) -> list[str]:
@@ -519,6 +531,28 @@ class ConfigService:
             if channel_index in promoted_by_channel:
                 channel.update(promoted_by_channel[channel_index])
 
+    def _validate_staged_channel_mapping(
+        self,
+        *,
+        channels: list[dict],
+        staged_by_channel: dict[int, StagedGoldenSample],
+    ) -> list[str]:
+        if not staged_by_channel:
+            return []
+        valid_indexes = {
+            channel.get("channel_index")
+            for channel in channels
+            if isinstance(channel, dict)
+            and isinstance(channel.get("channel_index"), int)
+            and not isinstance(channel.get("channel_index"), bool)
+        }
+        errors: list[str] = []
+        for channel_index in sorted(set(staged_by_channel) - valid_indexes):
+            errors.append(
+                f"暂存黄金样本通道 {channel_index + 1} 缺少对应通道配置"
+            )
+        return errors
+
     def _collect_replaced_paths(
         self,
         config_id: int,
@@ -542,7 +576,11 @@ class ConfigService:
 
         cleanup: list[str] = []
         for channel_index, old_path in existing_paths.items():
-            if old_path and old_path != new_paths.get(channel_index):
+            if (
+                old_path
+                and old_path != new_paths.get(channel_index)
+                and self._golden_samples.is_managed_path(old_path)
+            ):
                 cleanup.append(old_path)
         return cleanup
 
@@ -606,8 +644,11 @@ class ConfigService:
         old_paths: list[str],
         staged_paths: list[str],
     ) -> None:
+        managed_old_paths = [
+            path for path in old_paths if self._golden_samples.is_managed_path(path)
+        ]
         for label, paths, cleaner in (
-            ("旧黄金样本", old_paths, self._golden_samples.cleanup_paths),
+            ("旧黄金样本", managed_old_paths, self._golden_samples.cleanup_paths),
             ("黄金样本暂存文件", staged_paths, self._golden_samples.discard_staged_samples),
         ):
             if not paths:

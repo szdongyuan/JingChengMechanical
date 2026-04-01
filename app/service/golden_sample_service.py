@@ -45,6 +45,9 @@ class GoldenSampleService:
     def managed_root(self) -> str:
         return self._root_dir
 
+    def is_managed_path(self, path: str) -> bool:
+        return self._is_within_root(path)
+
     def create_staged_sample(
         self,
         *,

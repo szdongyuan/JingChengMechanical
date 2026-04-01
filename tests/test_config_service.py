@@ -1006,6 +1006,56 @@ def test_save_config_allocates_unique_committed_paths_per_binding(tmp_path):
     assert all(Path(path).exists() for path in paths)
 
 
+def test_save_config_rejects_unmatched_staged_entries_before_any_promotion(tmp_path):
+    svc = _service(tmp_path / "managed")
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    staged_match = _write_temp_wav(tmp_path / "staged-match.wav")
+    staged_stray = _write_temp_wav(tmp_path / "staged-stray.wav")
+
+    with pytest.raises(ValueError, match="暂存黄金样本.*缺少对应通道"):
+        svc.save_config(
+            _config_payload(
+                config_id,
+                channels=[_channel_payload(0)],
+                selected_channels=[0],
+                golden_editor_state={
+                    0: _staged_golden_binding(staged_match),
+                    9: _staged_golden_binding(staged_stray),
+                },
+            )
+        )
+
+    loaded = svc.load_config(config_id)
+
+    assert loaded["channels"] == []
+    assert list((tmp_path / "managed").rglob("*.wav")) == []
+
+
+def test_save_config_replacement_leaves_external_persisted_path_untouched(tmp_path):
+    svc = _service(tmp_path / "managed")
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    external_old_path = _write_temp_wav(tmp_path / "external-old.wav")
+    ChannelConfigTable.create(
+        config=config_id,
+        **_channel_payload_with_golden(0, **_golden_binding(external_old_path)),
+    )
+    staged = _write_temp_wav(tmp_path / "replacement.wav")
+
+    saved_id = svc.save_config(
+        _config_payload(
+            config_id,
+            channels=[_channel_payload(0)],
+            selected_channels=[0],
+            golden_editor_state={0: _staged_golden_binding(staged)},
+        )
+    )
+
+    loaded = svc.load_config(saved_id)
+
+    assert loaded["channels"][0]["golden_sample_path"] != str(external_old_path)
+    assert external_old_path.exists()
+
+
 def test_save_config_logs_warning_when_post_commit_cleanup_fails(
     tmp_path,
     monkeypatch,
