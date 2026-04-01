@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtCore import qInstallMessageHandler
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtWidgets import QComboBox, QDoubleSpinBox
+from PyQt6.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QLabel, QPushButton
 
 from ui.modules.config import ConfigModule
 
@@ -29,10 +32,33 @@ class _SignalStub:
 
 
 class _ConfigServiceStub:
-    def __init__(self):
+    def __init__(
+        self,
+        *,
+        loaded_configs: dict[int, dict] | None = None,
+        validation_errors=None,
+        golden_validation_errors=None,
+        save_error: Exception | None = None,
+    ):
         self.saved_configs = []
+        self._loaded_configs = {
+            config_id: dict(payload)
+            for config_id, payload in (loaded_configs or {}).items()
+        }
+        self._validation_errors = validation_errors
+        self._golden_validation_errors = golden_validation_errors
+        self._save_error = save_error
+        self.golden_sample_service = _GoldenSampleServiceStub()
 
     def list_configs(self):
+        if self._loaded_configs:
+            return [
+                {
+                    "config_id": config_id,
+                    "config_name": payload["config_name"],
+                }
+                for config_id, payload in sorted(self._loaded_configs.items())
+            ]
         return [
             {
                 "config_id": saved["config_id"],
@@ -41,13 +67,66 @@ class _ConfigServiceStub:
             for saved in self.saved_configs
         ]
 
-    def validate(self, _data):
-        return []
+    def load_config(self, config_id: int):
+        return dict(self._loaded_configs[config_id])
+
+    def validate(self, data):
+        if callable(self._validation_errors):
+            return list(self._validation_errors(data))
+        if self._validation_errors is None:
+            return []
+        return list(self._validation_errors)
+
+    def validate_golden_binding(
+        self,
+        *,
+        channel: dict,
+        staged_binding: dict | None,
+        analysis_duration: float,
+        sample_rate,
+    ):
+        if callable(self._golden_validation_errors):
+            return list(
+                self._golden_validation_errors(
+                    channel=channel,
+                    staged_binding=staged_binding,
+                    analysis_duration=analysis_duration,
+                    sample_rate=sample_rate,
+                )
+            )
+        if self._golden_validation_errors is None:
+            return []
+        return list(self._golden_validation_errors)
 
     def save_config(self, data):
+        if self._save_error is not None:
+            raise self._save_error
         saved = dict(data)
         self.saved_configs = [saved]
+        self._loaded_configs[saved["config_id"]] = saved
         return saved["config_id"]
+
+    def create_config(self, name: str):
+        config_id = max(self._loaded_configs, default=0) + 1
+        self._loaded_configs[config_id] = _detail_payload(
+            [], config_id=config_id, config_name=name
+        )
+        return config_id
+
+    def delete_config(self, config_id: int):
+        self._loaded_configs.pop(config_id, None)
+        self.saved_configs = [
+            saved for saved in self.saved_configs if saved["config_id"] != config_id
+        ]
+        return True
+
+
+class _GoldenSampleServiceStub:
+    def __init__(self):
+        self.discarded_paths: list[str] = []
+
+    def discard_staged_samples(self, staged_paths: list[str]):
+        self.discarded_paths.extend(staged_paths)
 
 
 class _AiServiceStub:
@@ -92,6 +171,20 @@ class _HardwareServiceStub:
         )
 
 
+@contextmanager
+def _capture_qt_messages():
+    messages: list[str] = []
+
+    def _handler(_message_type, _context, message):
+        messages.append(str(message))
+
+    previous_handler = qInstallMessageHandler(_handler)
+    try:
+        yield messages
+    finally:
+        qInstallMessageHandler(previous_handler)
+
+
 @pytest.fixture(scope="session")
 def qapp():
     app = QApplication.instance()
@@ -117,10 +210,90 @@ def _make_module(
     return ConfigModule(services)
 
 
-def _detail_payload(channels: list[dict]) -> dict:
+def _channel_payload(channel_index: int, **updates) -> dict:
+    payload = {
+        "channel_index": channel_index,
+        "stft_nfft": 1024,
+        "stft_overlap": 0.5,
+        "spl_weighting": "A",
+        "spl_time_constant": 0.125,
+        "spl_lower_limit": 40.0,
+        "spl_upper_limit": 85.0,
+        "loudness_unit": "sone",
+        "loudness_lower_limit": 0.0,
+        "loudness_upper_limit": 60.0,
+        "fft_band_limits": [],
+        "oct_weighting": "A",
+        "oct_band_limits": [],
+        "ai_config": {},
+        "golden_sample_path": None,
+        "golden_sample_label": None,
+        "golden_sample_source_channel": None,
+        "golden_sample_start_sample": None,
+        "golden_sample_num_samples": None,
+        "golden_sample_start_ms": None,
+        "golden_sample_duration_ms": None,
+        "golden_sample_sample_rate": None,
+        "fft_golden_mode": "off",
+        "fft_show_golden_overlay": False,
+        "oct_golden_mode": "off",
+        "oct_show_golden_overlay": False,
+    }
+    payload.update(updates)
+    return payload
+
+
+def _golden_binding(
+    path: str = "D:/managed/golden.wav",
+    *,
+    label: str = "gold.wav",
+    source_channel: int = 1,
+    start_sample: int = 24_000,
+    num_samples: int = 144_000,
+    sample_rate: float = 48_000.0,
+) -> dict:
     return {
-        "config_id": 7,
-        "config_name": "Cfg1",
+        "golden_sample_path": path,
+        "golden_sample_label": label,
+        "golden_sample_source_channel": source_channel,
+        "golden_sample_start_sample": start_sample,
+        "golden_sample_num_samples": num_samples,
+        "golden_sample_start_ms": round(start_sample * 1000 / sample_rate),
+        "golden_sample_duration_ms": round(num_samples * 1000 / sample_rate),
+        "golden_sample_sample_rate": sample_rate,
+    }
+
+
+def _staged_golden_binding(
+    path: Path | str,
+    *,
+    label: str = "pending.wav",
+    source_channel: int = 1,
+    start_sample: int = 24_000,
+    num_samples: int = 144_000,
+    sample_rate: float = 48_000.0,
+) -> dict:
+    return {
+        "staged_path": str(path),
+        "label": label,
+        "source_channel": source_channel,
+        "start_sample": start_sample,
+        "num_samples": num_samples,
+        "start_ms": round(start_sample * 1000 / sample_rate),
+        "duration_ms": round(num_samples * 1000 / sample_rate),
+        "sample_rate": sample_rate,
+    }
+
+
+def _detail_payload(
+    channels: list[dict],
+    *,
+    config_id: int = 7,
+    config_name: str = "Cfg1",
+) -> dict:
+    return {
+        "config_id": config_id,
+        "config_name": config_name,
         "record_duration": 5.0,
         "analysis_duration": 3.0,
         "analysis_window_offset_ms": 250,
@@ -201,6 +374,7 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_fields(qapp):
     assert data["analysis_window_offset_ms"] == 500
     assert data["plc_device_key"] == "plc-a"
     assert data["plc_device_label"] == "PLC A"
+    assert data["golden_editor_state"] == {}
     assert set(data) == {
         "config_id",
         "config_name",
@@ -218,6 +392,7 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_fields(qapp):
         "output_device_samplerate",
         "selected_channels",
         "channels",
+        "golden_editor_state",
     }
 
 
@@ -360,3 +535,305 @@ def test_loudness_unit_change_keeps_numeric_limits_visible_as_is(qapp):
 
     assert lower.value() == pytest.approx(8.5)
     assert upper.value() == pytest.approx(42.0)
+
+
+def test_config_module_build_channel_tabs_emit_no_unknown_cursor_warning(qapp):
+    module = _make_module()
+
+    with _capture_qt_messages() as messages:
+        module._build_channel_tabs([0], None)
+
+    assert module.channel_stack.count() == 1
+    assert all("Unknown property cursor" not in message for message in messages)
+
+    module.close()
+
+
+def test_populate_detail_renders_golden_summary_and_controls(qapp):
+    module = _make_module()
+    module._populate_detail(
+        _detail_payload(
+            [
+                _channel_payload(
+                    0,
+                    **_golden_binding(),
+                    fft_golden_mode="absolute",
+                    fft_show_golden_overlay=True,
+                    oct_golden_mode="delta",
+                    oct_show_golden_overlay=False,
+                )
+            ]
+        )
+    )
+
+    container = module._channel_containers[0]
+
+    label = container.findChild(QLabel, "golden_sample_label_value")
+    sample_rate = container.findChild(QLabel, "golden_sample_sample_rate_value")
+    source_channel = container.findChild(QLabel, "golden_sample_source_channel_value")
+    start_ms = container.findChild(QLabel, "golden_sample_start_ms_value")
+    duration_ms = container.findChild(QLabel, "golden_sample_duration_ms_value")
+    status = container.findChild(QLabel, "golden_sample_status_value")
+    import_button = container.findChild(QPushButton, "golden_sample_import_button")
+    replace_button = container.findChild(QPushButton, "golden_sample_replace_button")
+    clear_button = container.findChild(QPushButton, "golden_sample_clear_button")
+    fft_mode = container.findChild(QComboBox, "fft_golden_mode")
+    fft_overlay = container.findChild(QCheckBox, "fft_show_golden_overlay")
+    oct_mode = container.findChild(QComboBox, "oct_golden_mode")
+    oct_overlay = container.findChild(QCheckBox, "oct_show_golden_overlay")
+
+    assert label is not None
+    assert sample_rate is not None
+    assert source_channel is not None
+    assert start_ms is not None
+    assert duration_ms is not None
+    assert status is not None
+    assert import_button is not None
+    assert replace_button is not None
+    assert clear_button is not None
+    assert fft_mode is not None
+    assert fft_overlay is not None
+    assert oct_mode is not None
+    assert oct_overlay is not None
+    assert label.text() == "gold.wav"
+    assert "48000" in sample_rate.text()
+    assert source_channel.text() == "2"
+    assert "500" in start_ms.text()
+    assert "3000" in duration_ms.text()
+    assert "有效" in status.text()
+    assert import_button.text() == "Import WAV..."
+    assert replace_button.text() == "Replace WAV..."
+    assert clear_button.text() == "Clear"
+    assert fft_mode.currentText() == "Absolute"
+    assert fft_overlay.isChecked() is True
+    assert oct_mode.currentText() == "Delta"
+    assert oct_overlay.isChecked() is False
+    assert oct_overlay.isEnabled() is False
+
+
+@pytest.mark.parametrize(
+    ("mode_name", "overlay_name"),
+    [
+        ("fft_golden_mode", "fft_show_golden_overlay"),
+        ("oct_golden_mode", "oct_show_golden_overlay"),
+    ],
+)
+def test_delta_mode_disables_overlay_checkbox(qapp, mode_name, overlay_name):
+    module = _make_module()
+    module._populate_detail(_detail_payload([_channel_payload(0)]))
+
+    container = module._channel_containers[0]
+    combo = container.findChild(QComboBox, mode_name)
+    checkbox = container.findChild(QCheckBox, overlay_name)
+
+    checkbox.setChecked(True)
+    combo.setCurrentText("Delta")
+
+    assert checkbox.isChecked() is False
+    assert checkbox.isEnabled() is False
+
+
+def test_collect_data_includes_golden_fields_and_editor_only_staged_metadata(qapp):
+    module = _make_module()
+    committed = _channel_payload(
+        0,
+        **_golden_binding(),
+        fft_golden_mode="absolute",
+        fft_show_golden_overlay=True,
+        oct_golden_mode="off",
+        oct_show_golden_overlay=False,
+    )
+    module._populate_detail(_detail_payload([committed]))
+    module._golden_editor_state[0] = _staged_golden_binding(
+        "D:/temp/staged.wav",
+        label="pending.wav",
+        source_channel=2,
+        start_sample=12_000,
+    )
+
+    data = module._collect_data()
+    channel = data["channels"][0]
+
+    assert channel["golden_sample_path"] == committed["golden_sample_path"]
+    assert channel["golden_sample_label"] == committed["golden_sample_label"]
+    assert channel["golden_sample_source_channel"] == committed["golden_sample_source_channel"]
+    assert channel["golden_sample_start_sample"] == committed["golden_sample_start_sample"]
+    assert channel["golden_sample_num_samples"] == committed["golden_sample_num_samples"]
+    assert channel["golden_sample_start_ms"] == committed["golden_sample_start_ms"]
+    assert channel["golden_sample_duration_ms"] == committed["golden_sample_duration_ms"]
+    assert channel["golden_sample_sample_rate"] == committed["golden_sample_sample_rate"]
+    assert channel["fft_golden_mode"] == "absolute"
+    assert channel["fft_show_golden_overlay"] is True
+    assert channel["oct_golden_mode"] == "off"
+    assert channel["oct_show_golden_overlay"] is False
+    assert data["golden_editor_state"] == {
+        0: _staged_golden_binding(
+            "D:/temp/staged.wav",
+            label="pending.wav",
+            source_channel=2,
+            start_sample=12_000,
+        )
+    }
+
+
+def test_analysis_duration_change_marks_binding_invalid_without_rewriting_golden_settings(
+    qapp,
+):
+    def _golden_errors(*, channel, analysis_duration, **_kwargs):
+        if channel.get("golden_sample_path") and analysis_duration != 3.0:
+            return ["黄金样本长度与当前分析时长不一致"]
+        return []
+
+    module = _make_module(
+        config_service=_ConfigServiceStub(golden_validation_errors=_golden_errors)
+    )
+    module._populate_detail(
+        _detail_payload(
+            [
+                _channel_payload(
+                    0,
+                    **_golden_binding(),
+                    fft_golden_mode="absolute",
+                    fft_show_golden_overlay=True,
+                    oct_golden_mode="off",
+                    oct_show_golden_overlay=False,
+                )
+            ]
+        )
+    )
+
+    container = module._channel_containers[0]
+    fft_mode = container.findChild(QComboBox, "fft_golden_mode")
+    fft_overlay = container.findChild(QCheckBox, "fft_show_golden_overlay")
+    status = container.findChild(QLabel, "golden_sample_status_value")
+
+    module.spin_analysis.setValue(2.0)
+    qapp.processEvents()
+
+    assert fft_mode.currentText() == "Absolute"
+    assert fft_overlay.isChecked() is True
+    assert "无效" in status.text()
+    assert "分析时长" in status.text()
+
+
+def test_clear_discards_staged_file_and_preserves_existing_golden_settings(qapp, tmp_path):
+    config_service = _ConfigServiceStub()
+    module = _make_module(config_service=config_service)
+    module._populate_detail(
+        _detail_payload(
+            [
+                _channel_payload(
+                    0,
+                    **_golden_binding(),
+                    fft_golden_mode="absolute",
+                    fft_show_golden_overlay=True,
+                    oct_golden_mode="delta",
+                    oct_show_golden_overlay=False,
+                )
+            ]
+        )
+    )
+    staged_path = tmp_path / "staged.wav"
+    staged_path.write_bytes(b"wav")
+    module._golden_editor_state[0] = _staged_golden_binding(staged_path)
+
+    container = module._channel_containers[0]
+    clear_button = container.findChild(QPushButton, "golden_sample_clear_button")
+
+    clear_button.click()
+
+    data = module._collect_data()
+    channel = data["channels"][0]
+
+    assert channel["golden_sample_path"] is None
+    assert channel["golden_sample_label"] is None
+    assert channel["golden_sample_source_channel"] is None
+    assert channel["golden_sample_start_sample"] is None
+    assert channel["golden_sample_num_samples"] is None
+    assert channel["golden_sample_start_ms"] is None
+    assert channel["golden_sample_duration_ms"] is None
+    assert channel["golden_sample_sample_rate"] is None
+    assert channel["fft_golden_mode"] == "absolute"
+    assert channel["fft_show_golden_overlay"] is True
+    assert channel["oct_golden_mode"] == "delta"
+    assert channel["oct_show_golden_overlay"] is False
+    assert data["golden_editor_state"] == {}
+    assert config_service.golden_sample_service.discarded_paths == [str(staged_path)]
+
+
+def test_selection_change_discards_unsaved_staged_files(qapp, tmp_path):
+    config_service = _ConfigServiceStub(
+        loaded_configs={
+            7: _detail_payload([_channel_payload(0)], config_id=7, config_name="Cfg1"),
+            8: _detail_payload([_channel_payload(0)], config_id=8, config_name="Cfg2"),
+        }
+    )
+    module = _make_module(config_service=config_service)
+    staged_path = tmp_path / "staged.wav"
+    staged_path.write_bytes(b"wav")
+    module._golden_editor_state[0] = _staged_golden_binding(staged_path)
+
+    module.config_list.setCurrentRow(1)
+    qapp.processEvents()
+
+    assert module._current_config_id == 8
+    assert module.ed_name.text() == "Cfg2"
+    assert module._golden_editor_state == {}
+    assert config_service.golden_sample_service.discarded_paths == [str(staged_path)]
+
+
+def test_reloading_detail_discards_unsaved_staged_files(qapp, tmp_path):
+    config_service = _ConfigServiceStub()
+    module = _make_module(config_service=config_service)
+    module._populate_detail(_detail_payload([_channel_payload(0)]))
+    staged_path = tmp_path / "staged.wav"
+    staged_path.write_bytes(b"wav")
+    module._golden_editor_state[0] = _staged_golden_binding(staged_path)
+
+    module._populate_detail(_detail_payload([_channel_payload(0)], config_name="Reloaded"))
+
+    assert module.ed_name.text() == "Reloaded"
+    assert module._golden_editor_state == {}
+    assert config_service.golden_sample_service.discarded_paths == [str(staged_path)]
+
+
+@pytest.mark.parametrize(
+    "save_error",
+    [ValueError("save exploded"), RuntimeError("save exploded")],
+)
+def test_save_failure_discards_staged_file_and_keeps_committed_binding_authoritative(
+    qapp,
+    tmp_path,
+    monkeypatch,
+    save_error,
+):
+    committed = _channel_payload(0, **_golden_binding())
+    config_service = _ConfigServiceStub(save_error=save_error)
+    module = _make_module(config_service=config_service)
+    module._current_config_id = 7
+    module._populate_detail(_detail_payload([committed]))
+    staged_path = tmp_path / "staged.wav"
+    staged_path.write_bytes(b"wav")
+    module._golden_editor_state[0] = _staged_golden_binding(
+        staged_path,
+        label="replacement.wav",
+    )
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module._on_save()
+
+    data = module._collect_data()
+
+    assert any("save exploded" in str(args[-1]) for args in warnings)
+    assert data["channels"][0]["golden_sample_path"] == committed["golden_sample_path"]
+    assert data["channels"][0]["golden_sample_label"] == committed["golden_sample_label"]
+    assert data["golden_editor_state"] == {}
+    assert config_service.golden_sample_service.discarded_paths == [str(staged_path)]

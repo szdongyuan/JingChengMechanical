@@ -64,6 +64,34 @@ class ConfigService:
     def __init__(self, bus, golden_sample_service: GoldenSampleService | None = None):
         self.bus = bus
         self._golden_samples = golden_sample_service or GoldenSampleService()
+        self.golden_sample_service = self._golden_samples
+
+    def validate_golden_binding(
+        self,
+        *,
+        channel: dict,
+        staged_binding: StagedGoldenSample | dict | None,
+        analysis_duration: float,
+        sample_rate,
+    ) -> list[str]:
+        errors = self._validate_golden_channel(
+            prefix="",
+            channel=channel,
+            staged_binding=(
+                StagedGoldenSample.from_mapping(staged_binding)
+                if staged_binding is not None
+                else None
+            ),
+            analysis_duration=analysis_duration,
+            sample_rate=sample_rate,
+        )
+        cleaned_errors: list[str] = []
+        for error in errors:
+            if error.startswith(": "):
+                cleaned_errors.append(error[2:])
+            else:
+                cleaned_errors.append(error)
+        return cleaned_errors
 
     def list_configs(self) -> list[dict]:
         rows = (

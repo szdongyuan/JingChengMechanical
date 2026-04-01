@@ -7,6 +7,7 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGridLayout,
     QHBoxLayout,
@@ -29,8 +30,20 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from ui.popups.golden_sample_import_dialog import GoldenSampleImportDialog
 from ui.widgets.cards import Card
 from ui.widgets.collapsible_group_box import CollapsibleGroupBox
+
+_GOLDEN_BINDING_FIELDS = (
+    "golden_sample_path",
+    "golden_sample_label",
+    "golden_sample_source_channel",
+    "golden_sample_start_sample",
+    "golden_sample_num_samples",
+    "golden_sample_start_ms",
+    "golden_sample_duration_ms",
+    "golden_sample_sample_rate",
+)
 
 
 class _NoWheelSpinBox(QDoubleSpinBox):
@@ -91,6 +104,7 @@ class ConfigModule(QWidget):
         self.services = services
         self._current_config_id: int | None = None
         self._skip_reload = False
+        self._golden_editor_state: dict[int, dict] = {}
 
         self._init_ui()
         self._connect_signals()
@@ -345,6 +359,9 @@ class ConfigModule(QWidget):
         self.btn_save.clicked.connect(self._on_save)
         self.config_list.currentItemChanged.connect(self._on_item_changed)
         self.combo_input_dev.currentIndexChanged.connect(self._on_input_device_changed)
+        self.spin_analysis.valueChanged.connect(
+            lambda _value: self._refresh_all_golden_sections()
+        )
         self.services.bus.refresh_channels.connect(self._on_hardware_changed)
 
     def _populate_devices(self):
@@ -381,6 +398,7 @@ class ConfigModule(QWidget):
 
     def _on_input_device_changed(self, index):
         """Rebuild channel checkboxes and tabs when input device changes."""
+        existing_channel_data = self._current_channel_editor_data()
         for cb in self._channel_checkboxes:
             cb.deleteLater()
         self._channel_checkboxes = []
@@ -403,11 +421,262 @@ class ConfigModule(QWidget):
 
         # Rebuild tabs for ALL channels, not just checked ones
         all_indices = list(range(max_ch))
-        self._build_channel_tabs(all_indices, None)
+        self._build_channel_tabs(all_indices, existing_channel_data)
+        self._refresh_all_golden_sections()
 
     def _on_channel_selection_changed(self):
         """Channel checkbox toggled — tabs are built by _on_input_device_changed."""
         pass
+
+    @staticmethod
+    def _empty_golden_binding() -> dict:
+        return {field: None for field in _GOLDEN_BINDING_FIELDS}
+
+    @staticmethod
+    def _normalize_golden_binding(data: dict | None) -> dict:
+        if not isinstance(data, dict):
+            return ConfigModule._empty_golden_binding()
+        return {
+            field: data.get(field)
+            for field in _GOLDEN_BINDING_FIELDS
+        }
+
+    def _current_channel_editor_data(self) -> list[dict] | None:
+        if not self._channel_containers:
+            return None
+        return [self._collect_channel_data(container) for container in self._channel_containers]
+
+    def _current_input_sample_rate(self):
+        input_dev = self.combo_input_dev.currentData()
+        if isinstance(input_dev, dict):
+            return input_dev.get("default_samplerate")
+        return None
+
+    def _golden_sample_service(self):
+        return getattr(self.services.config_service, "golden_sample_service", None)
+
+    def _discard_staged_paths(self, staged_paths: list[str]) -> None:
+        if not staged_paths:
+            return
+        golden_service = self._golden_sample_service()
+        if golden_service is None:
+            return
+        golden_service.discard_staged_samples(staged_paths)
+
+    def _discard_channel_staged_binding(self, channel_index: int) -> None:
+        staged_binding = self._golden_editor_state.pop(channel_index, None)
+        if staged_binding is None:
+            return
+        staged_path = staged_binding.get("staged_path")
+        if staged_path:
+            self._discard_staged_paths([str(staged_path)])
+
+    def _discard_all_staged_bindings(self) -> None:
+        staged_paths = [
+            str(binding.get("staged_path"))
+            for binding in self._golden_editor_state.values()
+            if binding.get("staged_path")
+        ]
+        self._golden_editor_state = {}
+        self._discard_staged_paths(staged_paths)
+
+    @staticmethod
+    def _set_channel_binding(container: QWidget, binding: dict) -> None:
+        normalized = ConfigModule._normalize_golden_binding(binding)
+        container.setProperty("golden_binding", dict(normalized))
+
+    @staticmethod
+    def _channel_binding(container: QWidget) -> dict:
+        return ConfigModule._normalize_golden_binding(
+            container.property("golden_binding")
+        )
+
+    @staticmethod
+    def _set_committed_channel_binding(container: QWidget, binding: dict) -> None:
+        normalized = ConfigModule._normalize_golden_binding(binding)
+        container.setProperty("golden_committed_binding", dict(normalized))
+
+    @staticmethod
+    def _committed_channel_binding(container: QWidget) -> dict:
+        return ConfigModule._normalize_golden_binding(
+            container.property("golden_committed_binding")
+        )
+
+    def _restore_committed_golden_bindings(self) -> None:
+        for container in self._channel_containers:
+            self._set_channel_binding(
+                container,
+                self._committed_channel_binding(container),
+            )
+        self._refresh_all_golden_sections()
+
+    def _effective_golden_binding(self, container: QWidget) -> dict | None:
+        channel_index = container.property("channel_index")
+        staged_binding = self._golden_editor_state.get(channel_index)
+        if staged_binding is not None:
+            return {
+                "golden_sample_path": staged_binding.get("staged_path"),
+                "golden_sample_label": staged_binding.get("label"),
+                "golden_sample_source_channel": staged_binding.get("source_channel"),
+                "golden_sample_start_sample": staged_binding.get("start_sample"),
+                "golden_sample_num_samples": staged_binding.get("num_samples"),
+                "golden_sample_start_ms": staged_binding.get("start_ms"),
+                "golden_sample_duration_ms": staged_binding.get("duration_ms"),
+                "golden_sample_sample_rate": staged_binding.get("sample_rate"),
+            }
+        binding = self._channel_binding(container)
+        if any(binding.get(field) is not None for field in _GOLDEN_BINDING_FIELDS):
+            return binding
+        return None
+
+    @staticmethod
+    def _human_source_channel(value) -> str:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return str(value + 1)
+        return "-"
+
+    @staticmethod
+    def _format_ms(value) -> str:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return f"{value} ms"
+        return "-"
+
+    @staticmethod
+    def _format_sample_rate(value) -> str:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return f"{float(value):g} Hz"
+        return "-"
+
+    @staticmethod
+    def _set_text(container: QWidget, object_name: str, text: str) -> None:
+        label = container.findChild(QLabel, object_name)
+        if label is not None:
+            label.setText(text)
+
+    def _refresh_channel_golden_section(self, container: QWidget) -> None:
+        effective_binding = self._effective_golden_binding(container)
+        if effective_binding is None:
+            label_text = "-"
+            sample_rate_text = "-"
+            source_channel_text = "-"
+            start_text = "-"
+            duration_text = "-"
+            status_text = "未绑定"
+        else:
+            label_text = str(effective_binding.get("golden_sample_label") or "-")
+            sample_rate_text = self._format_sample_rate(
+                effective_binding.get("golden_sample_sample_rate")
+            )
+            source_channel_text = self._human_source_channel(
+                effective_binding.get("golden_sample_source_channel")
+            )
+            start_text = self._format_ms(
+                effective_binding.get("golden_sample_start_ms")
+            )
+            duration_text = self._format_ms(
+                effective_binding.get("golden_sample_duration_ms")
+            )
+            channel_data = self._collect_channel_data(container)
+            staged_binding = self._golden_editor_state.get(
+                container.property("channel_index")
+            )
+            validator = getattr(self.services.config_service, "validate_golden_binding", None)
+            errors = []
+            if callable(validator):
+                errors = validator(
+                    channel=channel_data,
+                    staged_binding=staged_binding,
+                    analysis_duration=self.spin_analysis.value(),
+                    sample_rate=self._current_input_sample_rate(),
+                )
+            if errors:
+                status_text = f"无效: {errors[0]}"
+            elif staged_binding is not None:
+                status_text = "有效 (待保存)"
+            else:
+                status_text = "有效"
+
+        self._set_text(container, "golden_sample_label_value", label_text)
+        self._set_text(container, "golden_sample_sample_rate_value", sample_rate_text)
+        self._set_text(
+            container, "golden_sample_source_channel_value", source_channel_text
+        )
+        self._set_text(container, "golden_sample_start_ms_value", start_text)
+        self._set_text(
+            container, "golden_sample_duration_ms_value", duration_text
+        )
+        self._set_text(container, "golden_sample_status_value", status_text)
+
+    def _refresh_all_golden_sections(self) -> None:
+        for container in self._channel_containers:
+            self._refresh_channel_golden_section(container)
+
+    def _apply_golden_mode_state(
+        self,
+        combo: QComboBox | None,
+        checkbox: QCheckBox | None,
+    ) -> None:
+        if combo is None or checkbox is None:
+            return
+        if combo.currentData() == "delta":
+            checkbox.blockSignals(True)
+            checkbox.setChecked(False)
+            checkbox.blockSignals(False)
+            checkbox.setEnabled(False)
+        else:
+            checkbox.setEnabled(True)
+
+    def _on_golden_mode_changed(
+        self,
+        combo: QComboBox,
+        checkbox: QCheckBox,
+        container: QWidget,
+    ) -> None:
+        self._apply_golden_mode_state(combo, checkbox)
+        self._refresh_channel_golden_section(container)
+
+    def _on_import_golden_sample(self, channel_index: int) -> None:
+        source_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "选择 Golden Sample WAV",
+            "",
+            "WAV Files (*.wav)",
+        )
+        if not source_path:
+            return
+
+        golden_service = self._golden_sample_service()
+        if golden_service is None:
+            return
+
+        dialog = GoldenSampleImportDialog(
+            source_path=source_path,
+            analysis_duration=self.spin_analysis.value(),
+            config_sample_rate=self._current_input_sample_rate(),
+            golden_sample_service=golden_service,
+            parent=self,
+        )
+        if dialog.exec() != int(dialog.DialogCode.Accepted):
+            return
+
+        staged_metadata = dialog.staged_metadata()
+        if staged_metadata is None:
+            return
+
+        previous = self._golden_editor_state.get(channel_index)
+        if previous and previous.get("staged_path"):
+            self._discard_staged_paths([str(previous["staged_path"])])
+        self._golden_editor_state[channel_index] = staged_metadata
+        for container in self._channel_containers:
+            if container.property("channel_index") == channel_index:
+                self._refresh_channel_golden_section(container)
+                break
+
+    def _on_clear_golden_binding(self, container: QWidget) -> None:
+        channel_index = container.property("channel_index")
+        self._discard_channel_staged_binding(channel_index)
+        self._set_channel_binding(container, self._empty_golden_binding())
+        self._refresh_channel_golden_section(container)
 
     # ── Channel tab building ────────────────────────────────
 
@@ -465,6 +734,9 @@ class ConfigModule(QWidget):
     def _build_channel_tab(self, ch_index: int, data: dict | None) -> QWidget:
         container = QWidget()
         container.setProperty("channel_index", ch_index)
+        golden_binding = self._normalize_golden_binding(data)
+        self._set_channel_binding(container, golden_binding)
+        self._set_committed_channel_binding(container, golden_binding)
         lay = QVBoxLayout(container)
         lay.setContentsMargins(4, 4, 4, 4)
         lay.setSpacing(8)
@@ -584,13 +856,95 @@ class ConfigModule(QWidget):
         loudness.add_widget(loudness_form)
         lay.addWidget(loudness)
 
+        golden_section = CollapsibleGroupBox("Golden Sample")
+        golden_form = QWidget()
+        golden_layout = QVBoxLayout(golden_form)
+        golden_layout.setContentsMargins(0, 0, 0, 0)
+        golden_layout.setSpacing(8)
+
+        summary_widget = QWidget()
+        summary_form = QFormLayout(summary_widget)
+        summary_form.setContentsMargins(0, 0, 0, 0)
+        summary_form.setHorizontalSpacing(10)
+        summary_form.setVerticalSpacing(6)
+
+        for field_label, object_name in (
+            ("绑定文件", "golden_sample_label_value"),
+            ("采样率", "golden_sample_sample_rate_value"),
+            ("源通道", "golden_sample_source_channel_value"),
+            ("窗起点", "golden_sample_start_ms_value"),
+            ("窗时长", "golden_sample_duration_ms_value"),
+            ("状态", "golden_sample_status_value"),
+        ):
+            label = QLabel("-")
+            label.setObjectName(object_name)
+            summary_form.addRow(field_label, label)
+
+        golden_layout.addWidget(summary_widget)
+
+        golden_buttons = QWidget()
+        golden_buttons_layout = QHBoxLayout(golden_buttons)
+        golden_buttons_layout.setContentsMargins(0, 0, 0, 0)
+        golden_buttons_layout.setSpacing(6)
+
+        btn_import = QPushButton("Import WAV...")
+        btn_import.setObjectName("golden_sample_import_button")
+        btn_import.clicked.connect(lambda _checked=False, idx=ch_index: self._on_import_golden_sample(idx))
+        golden_buttons_layout.addWidget(btn_import)
+
+        btn_replace = QPushButton("Replace WAV...")
+        btn_replace.setObjectName("golden_sample_replace_button")
+        btn_replace.clicked.connect(lambda _checked=False, idx=ch_index: self._on_import_golden_sample(idx))
+        golden_buttons_layout.addWidget(btn_replace)
+
+        btn_clear = QPushButton("Clear")
+        btn_clear.setObjectName("golden_sample_clear_button")
+        btn_clear.clicked.connect(lambda _checked=False, current=container: self._on_clear_golden_binding(current))
+        golden_buttons_layout.addWidget(btn_clear)
+        golden_buttons_layout.addStretch(1)
+
+        golden_layout.addWidget(golden_buttons)
+        golden_section.add_widget(golden_form)
+        lay.addWidget(golden_section)
+
         # FFT band limits section
         fft_section = CollapsibleGroupBox("FFT 频带上下限")
+        fft_widget = QWidget()
+        fft_layout = QVBoxLayout(fft_widget)
+        fft_layout.setContentsMargins(0, 0, 0, 0)
+        fft_layout.setSpacing(6)
+
+        fft_controls = QWidget()
+        fft_controls_form = QFormLayout(fft_controls)
+        fft_controls_form.setContentsMargins(0, 0, 0, 0)
+        fft_controls_form.setHorizontalSpacing(10)
+        fft_controls_form.setVerticalSpacing(6)
+
+        fft_mode = _NoWheelComboBox()
+        fft_mode.setObjectName("fft_golden_mode")
+        fft_mode.addItem("Off", "off")
+        fft_mode.addItem("Absolute", "absolute")
+        fft_mode.addItem("Delta", "delta")
+        fft_mode_index = fft_mode.findData(data.get("fft_golden_mode", "off") if data else "off")
+        fft_mode.setCurrentIndex(fft_mode_index if fft_mode_index >= 0 else 0)
+        fft_controls_form.addRow("Golden mode", fft_mode)
+
+        fft_overlay = QCheckBox("Show golden curve")
+        fft_overlay.setObjectName("fft_show_golden_overlay")
+        fft_overlay.setChecked(bool(data.get("fft_show_golden_overlay", False)) if data else False)
+        fft_controls_form.addRow("Golden curve", fft_overlay)
+        fft_layout.addWidget(fft_controls)
+
+        fft_mode.currentIndexChanged.connect(
+            lambda _index, combo=fft_mode, checkbox=fft_overlay, current=container: self._on_golden_mode_changed(combo, checkbox, current)
+        )
+
         fft_table = self._build_band_table(
             "fft_band_table",
             data.get("fft_band_limits", []) if data else [],
         )
-        fft_section.add_widget(fft_table)
+        fft_layout.addWidget(fft_table)
+        fft_section.add_widget(fft_widget)
         lay.addWidget(fft_section)
 
         # Octave section
@@ -610,7 +964,23 @@ class ConfigModule(QWidget):
         idx = combo_oct_w.findText(val)
         combo_oct_w.setCurrentIndex(idx if idx >= 0 else 0)
         ow_lay.addRow("计权模式", combo_oct_w)
+        oct_mode = _NoWheelComboBox()
+        oct_mode.setObjectName("oct_golden_mode")
+        oct_mode.addItem("Off", "off")
+        oct_mode.addItem("Absolute", "absolute")
+        oct_mode.addItem("Delta", "delta")
+        oct_mode_index = oct_mode.findData(data.get("oct_golden_mode", "off") if data else "off")
+        oct_mode.setCurrentIndex(oct_mode_index if oct_mode_index >= 0 else 0)
+        ow_lay.addRow("Golden mode", oct_mode)
+        oct_overlay = QCheckBox("Show golden curve")
+        oct_overlay.setObjectName("oct_show_golden_overlay")
+        oct_overlay.setChecked(bool(data.get("oct_show_golden_overlay", False)) if data else False)
+        ow_lay.addRow("Golden curve", oct_overlay)
         of_lay.addWidget(oct_w_row)
+
+        oct_mode.currentIndexChanged.connect(
+            lambda _index, combo=oct_mode, checkbox=oct_overlay, current=container: self._on_golden_mode_changed(combo, checkbox, current)
+        )
 
         oct_table = self._build_band_table(
             "oct_band_table",
@@ -619,6 +989,10 @@ class ConfigModule(QWidget):
         of_lay.addWidget(oct_table)
         oct_section.add_widget(oct_form)
         lay.addWidget(oct_section)
+
+        self._apply_golden_mode_state(fft_mode, fft_overlay)
+        self._apply_golden_mode_state(oct_mode, oct_overlay)
+        self._refresh_channel_golden_section(container)
 
         return container
 
@@ -809,6 +1183,68 @@ class ConfigModule(QWidget):
 
     # ── Data collection ─────────────────────────────────────
 
+    def _collect_channel_data(self, container: QWidget) -> dict:
+        ch_index = container.property("channel_index")
+        ch = {"channel_index": ch_index}
+
+        combo_nfft = container.findChild(QComboBox, "stft_nfft")
+        ch["stft_nfft"] = combo_nfft.currentData() if combo_nfft else 1024
+
+        combo_overlap = container.findChild(QComboBox, "stft_overlap")
+        ch["stft_overlap"] = combo_overlap.currentData() if combo_overlap else 0.5
+
+        combo_spl_w = container.findChild(QComboBox, "spl_weighting")
+        ch["spl_weighting"] = combo_spl_w.currentText() if combo_spl_w else "A"
+
+        spin_tc = container.findChild(QDoubleSpinBox, "spl_time_constant")
+        ch["spl_time_constant"] = spin_tc.value() if spin_tc else 0.125
+
+        spin_lo = container.findChild(QDoubleSpinBox, "spl_lower_limit")
+        ch["spl_lower_limit"] = spin_lo.value() if spin_lo else 40.0
+
+        spin_hi = container.findChild(QDoubleSpinBox, "spl_upper_limit")
+        ch["spl_upper_limit"] = spin_hi.value() if spin_hi else 85.0
+
+        combo_loudness_unit = container.findChild(QComboBox, "loudness_unit")
+        ch["loudness_unit"] = (
+            combo_loudness_unit.currentText()
+            if combo_loudness_unit
+            else "sone"
+        )
+
+        spin_loudness_lo = container.findChild(
+            QDoubleSpinBox, "loudness_lower_limit"
+        )
+        ch["loudness_lower_limit"] = (
+            spin_loudness_lo.value() if spin_loudness_lo else 0.0
+        )
+
+        spin_loudness_hi = container.findChild(
+            QDoubleSpinBox, "loudness_upper_limit"
+        )
+        ch["loudness_upper_limit"] = (
+            spin_loudness_hi.value() if spin_loudness_hi else 60.0
+        )
+
+        combo_oct_w = container.findChild(QComboBox, "oct_weighting")
+        ch["oct_weighting"] = combo_oct_w.currentText() if combo_oct_w else "A"
+
+        fft_mode = container.findChild(QComboBox, "fft_golden_mode")
+        ch["fft_golden_mode"] = fft_mode.currentData() if fft_mode else "off"
+        fft_overlay = container.findChild(QCheckBox, "fft_show_golden_overlay")
+        ch["fft_show_golden_overlay"] = fft_overlay.isChecked() if fft_overlay else False
+
+        oct_mode = container.findChild(QComboBox, "oct_golden_mode")
+        ch["oct_golden_mode"] = oct_mode.currentData() if oct_mode else "off"
+        oct_overlay = container.findChild(QCheckBox, "oct_show_golden_overlay")
+        ch["oct_show_golden_overlay"] = oct_overlay.isChecked() if oct_overlay else False
+
+        ch.update(self._channel_binding(container))
+        ch["fft_band_limits"] = self._read_band_table(container, "fft_band_table")
+        ch["oct_band_limits"] = self._read_band_table(container, "oct_band_table")
+        ch["ai_config"] = {}
+        return ch
+
     def _collect_data(self) -> dict:
         input_dev = self.combo_input_dev.currentData()
         output_dev = self.combo_output_dev.currentData()
@@ -834,60 +1270,16 @@ class ConfigModule(QWidget):
             "output_device_samplerate": output_dev.get("default_samplerate") if isinstance(output_dev, dict) else None,
             "selected_channels": selected_channels,
             "channels": [],
+            "golden_editor_state": {},
         }
 
         for container in self._channel_containers:
-            ch_index = container.property("channel_index")
+            data["channels"].append(self._collect_channel_data(container))
 
-            ch = {"channel_index": ch_index}
-
-            combo_nfft = container.findChild(QComboBox, "stft_nfft")
-            ch["stft_nfft"] = combo_nfft.currentData() if combo_nfft else 1024
-
-            combo_overlap = container.findChild(QComboBox, "stft_overlap")
-            ch["stft_overlap"] = combo_overlap.currentData() if combo_overlap else 0.5
-
-            combo_spl_w = container.findChild(QComboBox, "spl_weighting")
-            ch["spl_weighting"] = combo_spl_w.currentText() if combo_spl_w else "A"
-
-            spin_tc = container.findChild(QDoubleSpinBox, "spl_time_constant")
-            ch["spl_time_constant"] = spin_tc.value() if spin_tc else 0.125
-
-            spin_lo = container.findChild(QDoubleSpinBox, "spl_lower_limit")
-            ch["spl_lower_limit"] = spin_lo.value() if spin_lo else 40.0
-
-            spin_hi = container.findChild(QDoubleSpinBox, "spl_upper_limit")
-            ch["spl_upper_limit"] = spin_hi.value() if spin_hi else 85.0
-
-            combo_loudness_unit = container.findChild(QComboBox, "loudness_unit")
-            ch["loudness_unit"] = (
-                combo_loudness_unit.currentText()
-                if combo_loudness_unit
-                else "sone"
-            )
-
-            spin_loudness_lo = container.findChild(
-                QDoubleSpinBox, "loudness_lower_limit"
-            )
-            ch["loudness_lower_limit"] = (
-                spin_loudness_lo.value() if spin_loudness_lo else 0.0
-            )
-
-            spin_loudness_hi = container.findChild(
-                QDoubleSpinBox, "loudness_upper_limit"
-            )
-            ch["loudness_upper_limit"] = (
-                spin_loudness_hi.value() if spin_loudness_hi else 60.0
-            )
-
-            combo_oct_w = container.findChild(QComboBox, "oct_weighting")
-            ch["oct_weighting"] = combo_oct_w.currentText() if combo_oct_w else "A"
-
-            ch["fft_band_limits"] = self._read_band_table(container, "fft_band_table")
-            ch["oct_band_limits"] = self._read_band_table(container, "oct_band_table")
-            ch["ai_config"] = {}
-
-            data["channels"].append(ch)
+        data["golden_editor_state"] = {
+            channel_index: dict(binding)
+            for channel_index, binding in self._golden_editor_state.items()
+        }
 
         return data
 
@@ -922,6 +1314,7 @@ class ConfigModule(QWidget):
     # ── Populate UI from data ───────────────────────────────
 
     def _populate_detail(self, data: dict):
+        self._discard_all_staged_bindings()
         self.ed_name.setText(data["config_name"])
         self.spin_record.setValue(data["record_duration"])
         self.spin_analysis.setValue(data["analysis_duration"])
@@ -944,6 +1337,7 @@ class ConfigModule(QWidget):
             all_indices = [ch["channel_index"] for ch in data["channels"]]
         self._build_channel_tabs(all_indices, data.get("channels"))
         self._populate_ai_binding(data["config_id"])
+        self._refresh_all_golden_sections()
 
     # ── Interactions ────────────────────────────────────────
 
@@ -1042,13 +1436,23 @@ class ConfigModule(QWidget):
             with db.atomic():
                 saved_id = self.services.config_service.save_config(data)
                 self.services.ai_service.save_binding(saved_id, ai_data)
+            loaded = self.services.config_service.load_config(saved_id)
             self._skip_reload = True
             self._refresh_list()
             self._select_config_by_id(saved_id)
             self._skip_reload = False
+            self._current_config_id = saved_id
+            self._populate_detail(loaded)
             self.services.bus.status.emit("配置已保存")
         except ValueError as e:
             self._skip_reload = False
+            self._discard_all_staged_bindings()
+            self._restore_committed_golden_bindings()
+            QMessageBox.warning(self, "保存失败", str(e))
+        except Exception as e:
+            self._skip_reload = False
+            self._discard_all_staged_bindings()
+            self._restore_committed_golden_bindings()
             QMessageBox.warning(self, "保存失败", str(e))
 
     def _on_hardware_changed(self):

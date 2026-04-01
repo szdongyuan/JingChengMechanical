@@ -19,7 +19,7 @@ class CollapsibleGroupBox(QWidget):
         self._header = QLabel(f"▼ {title}")
         self._header.setStyleSheet(
             "font-weight: 700; color: #334155; font-size: 12px; "
-            "padding: 6px 4px; cursor: pointer;"
+            "padding: 6px 4px;"
         )
         self._header.setCursor(Qt.CursorShape.PointingHandCursor)
         self._header.mousePressEvent = self._toggle
