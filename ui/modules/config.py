@@ -1502,8 +1502,8 @@ class ConfigModule(QWidget):
                 None,
             )
             if callable(commit_pending_save):
-                commit_pending_save(pending_save)
                 pending_save_committed = True
+                commit_pending_save(pending_save)
             loaded = self.services.config_service.load_config(saved_id)
             self._skip_reload = True
             self._refresh_list()

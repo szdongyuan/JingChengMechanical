@@ -1052,6 +1052,98 @@ def test_post_commit_reload_failure_does_not_rollback_committed_pending_save(
     assert any("reload exploded" in str(args[-1]) for args in warnings)
 
 
+def test_post_commit_commit_pending_save_failure_keeps_new_authoritative_replacement_binding(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        config_changed=_SignalStub(),
+    )
+    golden_service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    config_service = ConfigService(bus, golden_sample_service=golden_service)
+    module = _make_module(
+        config_service=config_service,
+        ai_service=_AiServiceStub(),
+        hardware_service=_HardwareServiceStub(),
+        bus=bus,
+    )
+
+    config_id = ConfigTable.create(
+        config_name="Cfg1",
+        input_device_name="Mic 1",
+        input_device_hostapi="ASIO",
+        input_device_samplerate=48_000,
+        output_device_name="Speaker 1",
+        output_device_hostapi="WASAPI",
+        output_device_samplerate=44_100,
+        selected_channels="[0]",
+    ).config_id
+    old_path = _write_temp_wav(tmp_path / "managed" / "config_1" / "old.wav")
+    ChannelConfigTable.create(
+        config=config_id,
+        **_channel_payload(0, **_golden_binding(str(old_path))),
+    )
+
+    module._current_config_id = config_id
+    original_load_config = config_service.load_config
+    module._populate_detail(original_load_config(config_id))
+
+    source_path = _write_temp_wav(
+        tmp_path / "source.wav",
+        samples=200_000,
+        channels=2,
+    )
+    staged = golden_service.create_staged_sample(
+        source_path=str(source_path),
+        source_channel=1,
+        start_sample=24_000,
+        num_samples=144_000,
+        sample_rate=48_000.0,
+        label="replacement.wav",
+    )
+    staged_path = Path(staged.staged_path)
+    module._golden_editor_state[0] = _staged_golden_binding(
+        staged_path,
+        label=staged.label,
+        source_channel=staged.source_channel,
+        start_sample=staged.start_sample,
+        num_samples=staged.num_samples,
+        sample_rate=staged.sample_rate,
+    )
+
+    def _raise_post_commit(*_args, **_kwargs):
+        raise RuntimeError("post-commit exploded")
+
+    monkeypatch.setattr(bus.config_changed, "emit", _raise_post_commit)
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module._on_save()
+
+    authoritative = original_load_config(config_id)
+    editor_data = module._collect_data()
+    editor_channel = editor_data["channels"][0]
+    authoritative_path = authoritative["channels"][0]["golden_sample_path"]
+
+    assert any("post-commit exploded" in str(args[-1]) for args in warnings)
+    assert authoritative_path != str(old_path)
+    assert Path(authoritative_path).exists()
+    assert old_path.exists() is False
+    assert staged_path.exists() is False
+    assert editor_channel["golden_sample_path"] == authoritative_path
+    assert editor_data["golden_editor_state"] == {}
+
+
 def test_post_commit_reload_failure_keeps_new_authoritative_replacement_binding(
     qapp,
     tmp_path,
