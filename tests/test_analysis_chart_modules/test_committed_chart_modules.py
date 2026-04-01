@@ -83,6 +83,20 @@ def test_loudness_module_renders_committed_chart_for_selected_channel(qapp):
     assert module.plot.plot_item.getAxis("left").labelText == "Loudness (phon)"
 
 
+def test_loudness_module_uses_data_focused_y_range_when_default_limits_are_far_away(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = LoudnessModule(services)
+    module.selected_display_channel_provider = lambda: 0
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(
+        _with_loudness_payload(_review_payload_with_chart_payload(101, channels=(0,)))
+    )
+    qapp.processEvents()
+
+    assert module.plot.plot_item.vb.viewRange()[1] == pytest.approx((1.9, 3.1))
+
+
 def test_spectrum_module_renders_committed_chart_for_selected_channel(qapp):
     services = _make_services(initial_state=_state(101, "reviewing"))
     module = SpectrumModule(services)

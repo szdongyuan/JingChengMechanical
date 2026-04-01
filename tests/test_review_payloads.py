@@ -602,6 +602,48 @@ def test_build_summary_payload_marks_loudness_row_no_result_from_serialized_judg
     assert summary["rows"][1]["constrained"] is True
 
 
+def test_build_summary_payload_preserves_loudness_partial_no_result_after_backend_failure_serialization():
+    summary = build_summary_payload(
+        config=_make_config(),
+        judgment_payload={
+            "overall": "不合格",
+            "limit_pass": False,
+            "ai_pass": None,
+            "ai_score": None,
+            "analysis_window": (1.0, 3.0),
+            "channel_results": [
+                {
+                    "channel_index": 0,
+                    "spl_db": 70.0,
+                    "spl_pass": True,
+                    "loudness_max_sone": 5.0,
+                    "loudness_pass": True,
+                    "loudness_available": True,
+                    "loudness_error_message": None,
+                    "fft_band_results": [],
+                    "oct_band_results": [],
+                },
+                {
+                    "channel_index": 1,
+                    "spl_db": 72.0,
+                    "spl_pass": True,
+                    "loudness_max_sone": None,
+                    "loudness_pass": None,
+                    "loudness_available": False,
+                    "loudness_error_message": "backend failed",
+                    "fft_band_results": [],
+                    "oct_band_results": [],
+                },
+            ],
+        },
+        ai_review={"status": "not_enabled"},
+    )
+
+    assert summary["overall_status"] == "no_result"
+    assert summary["rows"][1]["status"] == "无结果"
+    assert summary["error_message"] == "backend failed"
+
+
 def test_build_summary_payload_keeps_loudness_row_ng_when_serialized_loudness_pass_is_false_even_if_scalar_is_in_range():
     summary = build_summary_payload(
         config={
@@ -839,6 +881,54 @@ def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch
         "upper_db": 55.0,
         "actual_db": 57.0,
         "passed": False,
+    }
+
+
+def test_build_chart_payload_keeps_loudness_payload_shape_with_segmented_backend(monkeypatch):
+    ref_db = 20.0 * math.log10(20e-6)
+
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_spl",
+        lambda signal, sample_rate, weighting, time_constant: 70.0,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
+        lambda signal, sample_rate, nfft: (
+            np.array([1000.0], dtype=np.float64),
+            np.array([67.0], dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_octave_bands",
+        lambda signal, sample_rate, weighting: (
+            np.array([500.0], dtype=np.float64),
+            np.array([57.0], dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_loudness_trace",
+        lambda signal, sample_rate: ([0.0, 1.0], [2.0, 3.0], 3.0),
+    )
+
+    payload = build_chart_payload(
+        buffer=np.column_stack(
+            [
+                np.full(200, 0.1, dtype=np.float32),
+                np.full(200, 0.2, dtype=np.float32),
+            ]
+        ),
+        config=_make_config(),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.5, 1.5),
+    )
+
+    assert payload[0]["loudness"] == {
+        "times_sec": [0.0, 1.0],
+        "values": [2.0, 3.0],
+        "unit": "sone",
+        "lower_limit": 0.0,
+        "upper_limit": 10.0,
     }
 
 

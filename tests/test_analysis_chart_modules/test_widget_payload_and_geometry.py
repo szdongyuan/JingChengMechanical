@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import numpy as np
 import pytest
 from PyQt6.QtCore import QPointF
@@ -443,6 +445,31 @@ def test_line_chart_widget_accepts_limit_lines(qapp):
     assert widget.series_payload()["y_values"] == [70.0, 72.0]
     assert widget.series_payload()["lower_limit"] == 60.0
     assert widget.series_payload()["upper_limit"] == 80.0
+
+
+def test_line_chart_widget_default_auto_mode_preserves_existing_series_payload_shape(qapp):
+    widget = LineChartWidget()
+
+    widget.set_series(
+        x_values=[0.0, 1.0],
+        y_values=[7.0, 8.0],
+        y_axis_mode="auto",
+    )
+
+    assert widget.series_payload() == {
+        "x_values": [0.0, 1.0],
+        "y_values": [7.0, 8.0],
+        "lower_limit": None,
+        "upper_limit": None,
+    }
+
+
+def test_line_chart_widget_auto_mode_keeps_existing_non_finite_acceptance(qapp):
+    widget = LineChartWidget()
+
+    widget.set_series([0.0, 1.0], [7.0, float("nan")], y_axis_mode="auto")
+
+    assert math.isnan(widget.series_payload()["y_values"][1])
 
 
 def test_fft_line_chart_widget_accepts_limit_band_markers(qapp):

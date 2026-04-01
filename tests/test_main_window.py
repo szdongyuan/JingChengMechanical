@@ -1112,6 +1112,30 @@ def test_main_window_toolbar_selection_immediately_refreshes_committed_chart_mod
     _assert_committed_chart_channel(window, channel_index=1)
 
 
+def test_main_window_review_loudness_card_uses_data_focused_y_range(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0,)),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0,))
+    )
+    qapp.processEvents()
+
+    assert window.loudness.plot.plot_item.vb.viewRange()[1] == pytest.approx((9.8, 12.2))
+
+
 def test_main_window_ai_partial_no_result_keeps_rule_rows_and_committed_charts_visible(
     qapp,
     monkeypatch,

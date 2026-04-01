@@ -10,6 +10,8 @@ from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 pg.setConfigOptions(antialias=True, background="w", foreground="#334155")
 
+_LINE_CHART_Y_AXIS_MODES = frozenset({"auto", "data_focus"})
+
 
 def _normalize_vector(values: Iterable[float], *, name: str) -> list[float]:
     normalized: list[float] = []
@@ -82,6 +84,32 @@ def _visible_axis_max(values: Iterable[float] | None) -> float:
     if payload_max <= 0.0 or np.isclose(payload_min, payload_max):
         return max(payload_max, 1.0)
     return payload_max
+
+
+def _normalize_line_chart_y_axis_mode(mode: str) -> str:
+    normalized = str(mode).strip().lower()
+    if normalized not in _LINE_CHART_Y_AXIS_MODES:
+        raise ValueError(f"y_axis_mode must be one of {sorted(_LINE_CHART_Y_AXIS_MODES)}")
+    return normalized
+
+
+def _validate_data_focus_series(*, x_values: list[float], y_values: list[float]) -> tuple[float, float]:
+    if not x_values or not y_values:
+        raise ValueError("data_focus requires a non-empty series")
+
+    x_array = np.asarray(x_values, dtype=float)
+    y_array = np.asarray(y_values, dtype=float)
+    if not np.all(np.isfinite(x_array)) or not np.all(np.isfinite(y_array)):
+        raise ValueError("data_focus requires only finite plotted values")
+
+    y_min = float(y_array.min())
+    y_max = float(y_array.max())
+    if np.isclose(y_min, y_max):
+        padding = max(0.1 * abs(y_min), 0.5)
+        return (y_min - padding, y_max + padding)
+
+    padding = max(0.1 * (y_max - y_min), 0.1)
+    return (y_min - padding, y_max + padding)
 
 
 class _BasePlotChart(QWidget):
@@ -321,6 +349,7 @@ class LineChartWidget(_BasePlotChart):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._series_payload: dict | None = None
+        self._y_axis_mode = "auto"
         self._curve = self.plot_item.plot(
             pen=pg.mkPen(color="#2563eb", width=2),
         )
@@ -346,11 +375,19 @@ class LineChartWidget(_BasePlotChart):
         *,
         lower_limit: float | None = None,
         upper_limit: float | None = None,
+        y_axis_mode: str = "auto",
     ) -> None:
         normalized_x = _normalize_vector(x_values, name="x_values")
         normalized_y = _normalize_vector(y_values, name="y_values")
         if len(normalized_x) != len(normalized_y):
             raise ValueError("x_values and y_values must be the same length")
+        normalized_mode = _normalize_line_chart_y_axis_mode(y_axis_mode)
+        data_focus_y_range = None
+        if normalized_mode == "data_focus":
+            data_focus_y_range = _validate_data_focus_series(
+                x_values=normalized_x,
+                y_values=normalized_y,
+            )
 
         self._series_payload = {
             "x_values": normalized_x,
@@ -358,6 +395,7 @@ class LineChartWidget(_BasePlotChart):
             "lower_limit": None if lower_limit is None else float(lower_limit),
             "upper_limit": None if upper_limit is None else float(upper_limit),
         }
+        self._y_axis_mode = normalized_mode
 
         self._curve.setData(normalized_x, normalized_y)
         self._update_limit_line(
@@ -369,6 +407,10 @@ class LineChartWidget(_BasePlotChart):
             self._series_payload["upper_limit"],
         )
         self._apply_x_axis_policy(payload_values=normalized_x)
+        if data_focus_y_range is None:
+            self._apply_auto_y_axis_policy()
+        else:
+            self._apply_data_focus_y_axis_policy(*data_focus_y_range)
 
     def clear_data(self) -> None:
         self._series_payload = None
@@ -376,6 +418,10 @@ class LineChartWidget(_BasePlotChart):
         self._lower_limit_line.hide()
         self._upper_limit_line.hide()
         self._apply_x_axis_policy(payload_values=None)
+        if self._y_axis_mode == "data_focus":
+            self._apply_data_focus_y_axis_policy(0.0, 1.0)
+        else:
+            self._apply_auto_y_axis_policy()
 
     def has_series(self) -> bool:
         return self._series_payload is not None
@@ -390,6 +436,16 @@ class LineChartWidget(_BasePlotChart):
             return
         limit_line.setPos(value)
         limit_line.show()
+
+    def _apply_auto_y_axis_policy(self) -> None:
+        view_box = self.plot_item.vb
+        view_box.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+        view_box.updateAutoRange()
+
+    def _apply_data_focus_y_axis_policy(self, y_min: float, y_max: float) -> None:
+        view_box = self.plot_item.vb
+        view_box.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
+        view_box.setYRange(y_min, y_max, padding=0.0)
 
 
 class FftLineChartWidget(LineChartWidget):
