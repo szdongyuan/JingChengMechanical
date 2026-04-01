@@ -128,6 +128,17 @@ def test_promote_staged_samples_leaves_no_committed_files_when_a_stage_is_invali
     assert list((tmp_path / "managed").rglob("*.wav")) == []
 
 
+def test_discard_staged_samples_only_deletes_managed_staged_files(tmp_path):
+    svc = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    managed_staged_path, _ = _write_temp_wav(tmp_path / "managed" / "staged" / "clip.wav")
+    external_staged_path, _ = _write_temp_wav(tmp_path / "external.wav")
+
+    svc.discard_staged_samples([str(managed_staged_path), str(external_staged_path)])
+
+    assert not managed_staged_path.exists()
+    assert external_staged_path.exists()
+
+
 def test_validate_committed_binding_accepts_valid_binding(tmp_path):
     svc = GoldenSampleService(root_dir=str(tmp_path / "managed"))
     managed_path, _ = _write_temp_wav(tmp_path / "managed" / "config_1" / "gold.wav")

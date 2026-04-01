@@ -48,6 +48,17 @@ class GoldenSampleService:
     def is_managed_path(self, path: str) -> bool:
         return self._is_within_root(path)
 
+    def staged_root(self) -> str:
+        return os.path.join(self.managed_root(), "staged")
+
+    def is_managed_staged_path(self, path: str) -> bool:
+        staged_root = os.path.realpath(self.staged_root())
+        candidate = os.path.realpath(os.path.abspath(str(path)))
+        try:
+            return os.path.commonpath([staged_root, candidate]) == staged_root
+        except ValueError:
+            return False
+
     def create_staged_sample(
         self,
         *,
@@ -76,7 +87,7 @@ class GoldenSampleService:
         if end_sample > mono.shape[0]:
             raise ValueError("黄金样本窗口超出音频长度")
 
-        staged_dir = os.path.join(self.managed_root(), "staged")
+        staged_dir = self.staged_root()
         os.makedirs(staged_dir, exist_ok=True)
         staged_path = os.path.abspath(
             os.path.join(staged_dir, f"{uuid.uuid4().hex}.wav")
@@ -264,7 +275,10 @@ class GoldenSampleService:
         return promoted
 
     def discard_staged_samples(self, staged_paths: list[str]) -> None:
-        self.cleanup_paths(staged_paths)
+        managed_staged_paths = [
+            path for path in staged_paths if self.is_managed_staged_path(path)
+        ]
+        self.cleanup_paths(managed_staged_paths)
 
     def rollback_promoted_samples(self, promoted_paths: list[str]) -> None:
         self.cleanup_paths(promoted_paths)

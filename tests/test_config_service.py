@@ -903,6 +903,26 @@ def test_save_config_promotes_staged_golden_asset_and_persists_committed_metadat
     assert channel["fft_golden_mode"] == "off"
 
 
+def test_save_config_success_keeps_external_staged_source_file(tmp_path):
+    svc = _service(tmp_path / "managed")
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    external_staged = _write_temp_wav(tmp_path / "external-staged.wav")
+
+    saved_id = svc.save_config(
+        _config_payload(
+            config_id,
+            channels=[_channel_payload(0)],
+            selected_channels=[0],
+            golden_editor_state={0: _staged_golden_binding(external_staged)},
+        )
+    )
+
+    loaded = svc.load_config(saved_id)
+
+    assert loaded["channels"][0]["golden_sample_path"] != str(external_staged)
+    assert external_staged.exists()
+
+
 def test_save_config_deletes_replaced_committed_golden_asset_after_success(tmp_path):
     svc = _service(tmp_path / "managed")
     config_id = ConfigTable.create(config_name="Cfg1").config_id
