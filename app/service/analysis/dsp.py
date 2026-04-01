@@ -171,13 +171,13 @@ def compute_loudness_trace(signal: np.ndarray, sample_rate: float) -> tuple[list
     values_sone, _, _, times = _compute_loudness_zwst_perseg(sig, backend_sample_rate)
     values = np.maximum(np.asarray(values_sone, dtype=np.float64).reshape(-1), 0.0)
     time_axis = np.asarray(times, dtype=np.float64).reshape(-1)
-    if time_axis.size:
-        time_axis = np.clip(time_axis, 0.0, actual_duration_sec)
 
     if values.size == 0 or time_axis.size == 0 or values.size != time_axis.size:
         raise RuntimeError("MoSQITo loudness backend returned unusable output")
     if not np.all(np.isfinite(values)) or not np.all(np.isfinite(time_axis)):
         raise RuntimeError("MoSQITo loudness backend returned non-finite output")
+    if time_axis.size:
+        time_axis = np.clip(time_axis, 0.0, actual_duration_sec)
 
     max_sone = float(np.max(values))
     return time_axis.tolist(), values.tolist(), max_sone

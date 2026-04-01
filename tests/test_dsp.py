@@ -312,6 +312,24 @@ def test_compute_loudness_trace_rejects_non_finite_backend_output(monkeypatch):
         compute_loudness_trace(signal, 48000.0)
 
 
+@pytest.mark.parametrize("backend_time", [np.inf, -np.inf])
+def test_compute_loudness_trace_rejects_non_finite_backend_timestamps_before_clamp(
+    monkeypatch,
+    backend_time,
+):
+    signal = np.linspace(-1.0, 1.0, 1000, dtype=np.float64)
+    calls = {}
+    _install_fake_segmented_backend(
+        monkeypatch,
+        calls,
+        values=4.0,
+        times=backend_time,
+    )
+
+    with pytest.raises(RuntimeError, match="non-finite output"):
+        compute_loudness_trace(signal, 48000.0)
+
+
 def test_compute_loudness_trace_pads_short_input_and_clamps_time_axis(monkeypatch):
     signal = np.linspace(-1.0, 1.0, 1000, dtype=np.float64)
     calls = {}
