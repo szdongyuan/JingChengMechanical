@@ -1,12 +1,307 @@
 """Test that ServiceContainer wires AiService."""
 from __future__ import annotations
 
+from dataclasses import fields, is_dataclass
+import importlib
+import importlib.util
 import inspect
+from unittest.mock import MagicMock
 
 import app.services_container as mod
+from app.service.factory_selection_settings import FactorySelectionSettings
+from app.service.analysis.test_manager import TestManager
+from app.services_container import EventBus
+
+
+def _load_factory_mode_controller_module():
+    spec = importlib.util.find_spec("app.service.factory_mode_controller")
+    assert spec is not None, "app.service.factory_mode_controller module is missing"
+    return importlib.import_module("app.service.factory_mode_controller")
+
+
+def _normalized_signal_argument_types(signal) -> tuple[str, ...]:
+    signatures = tuple(signal.signatures)
+    assert len(signatures) == 1
+
+    signature = signatures[0]
+    if "(" in signature:
+        signature = signature.split("(", 1)[1]
+    signature = signature.removesuffix(")")
+    return tuple(part.strip() for part in signature.split(","))
 
 
 def test_service_container_has_ai_service():
     source = inspect.getsource(mod.ServiceContainer.__post_init__)
     assert "ai_service" in source
     assert "AiService" in source
+
+
+def test_analysis_signals_exist():
+    """All analysis kernel signals should be defined on EventBus."""
+    for name in (
+        "stft_updated",
+        "spl_updated",
+        "octave_updated",
+        "fft_updated",
+        "recording_progress",
+        "test_started",
+        "test_finished",
+    ):
+        assert hasattr(EventBus, name), f"Missing signal: {name}"
+
+
+def test_analysis_frame_signals_include_run_id_contract():
+    expected_argument_types = ("int", "QString", "int", "PyQt_PyObject")
+
+    assert _normalized_signal_argument_types(EventBus.stft_updated) == expected_argument_types
+    assert _normalized_signal_argument_types(EventBus.spl_updated) == expected_argument_types
+    assert _normalized_signal_argument_types(EventBus.octave_updated) == expected_argument_types
+    assert _normalized_signal_argument_types(EventBus.fft_updated) == expected_argument_types
+
+    EventBus()
+
+    assert _normalized_signal_argument_types(EventBus.stft_updated) == expected_argument_types
+    assert _normalized_signal_argument_types(EventBus.spl_updated) == expected_argument_types
+    assert _normalized_signal_argument_types(EventBus.octave_updated) == expected_argument_types
+    assert _normalized_signal_argument_types(EventBus.fft_updated) == expected_argument_types
+
+
+def test_factory_mode_signals_exist():
+    for name in (
+        "factory_plc_event",
+        "factory_scan_event",
+        "factory_start_blocked",
+        "factory_selection_notice",
+        "factory_runtime_start_accepted",
+        "factory_runtime_analyzing_entered",
+        "factory_runtime_auto_analysis_succeeded",
+        "factory_runtime_auto_analysis_no_result",
+        "factory_runtime_auto_analysis_error",
+        "factory_runtime_auto_analysis_cleanup_settled",
+        "factory_runtime_aborted",
+        "factory_runtime_reanalysis_completed",
+        "factory_state_changed",
+        "factory_review_changed",
+        "factory_display_reset",
+    ):
+        assert hasattr(EventBus, name), f"Missing factory signal: {name}"
+
+
+def test_factory_runtime_payload_contract_includes_run_id():
+    start_payload_cls = getattr(mod, "FactoryRuntimeStartPayload", None)
+    runtime_payload_cls = getattr(mod, "FactoryRuntimeConfigPayload", None)
+    abort_payload_cls = getattr(mod, "FactoryRuntimeAbortPayload", None)
+
+    assert start_payload_cls is not None, "FactoryRuntimeStartPayload is missing"
+    assert runtime_payload_cls is not None, "FactoryRuntimeConfigPayload is missing"
+    assert abort_payload_cls is not None, "FactoryRuntimeAbortPayload is missing"
+    assert is_dataclass(start_payload_cls)
+    assert is_dataclass(runtime_payload_cls)
+    assert is_dataclass(abort_payload_cls)
+    assert [field.name for field in fields(start_payload_cls)] == [
+        "config_id",
+        "run_id",
+        "trigger_source",
+    ]
+    assert [field.name for field in fields(runtime_payload_cls)] == [
+        "config_id",
+        "run_id",
+    ]
+    assert [field.name for field in fields(abort_payload_cls)] == [
+        "config_id",
+        "run_id",
+        "trigger_source",
+        "error_message",
+    ]
+
+    start_payload = start_payload_cls(
+        config_id=101,
+        run_id="run-101-1",
+        trigger_source="manual",
+    )
+    runtime_payload = runtime_payload_cls(
+        config_id=101,
+        run_id="run-101-1",
+    )
+    abort_payload = abort_payload_cls(
+        config_id=101,
+        run_id="run-101-1",
+        trigger_source="manual",
+        error_message="runtime exploded",
+    )
+
+    assert start_payload.run_id == "run-101-1"
+    assert runtime_payload.run_id == "run-101-1"
+    assert abort_payload.run_id == "run-101-1"
+
+
+def test_factory_controller_state_contract_exposes_only_spec_fields():
+    state_cls = getattr(mod, "FactoryControllerState", None)
+
+    assert state_cls is not None, "FactoryControllerState is missing"
+    assert is_dataclass(state_cls)
+    assert [field.name for field in fields(state_cls)] == [
+        "selected_config_ids",
+        "active_config_id",
+        "displayed_config_id",
+        "run_phase",
+        "trigger_source",
+        "selection_ready",
+        "selection_ready_reason",
+        "start_ready",
+        "start_ready_reason",
+    ]
+
+
+def test_factory_controller_state_derives_readiness_from_ordered_selection_without_manual_primary():
+    ready_state = mod.FactoryControllerState(selected_config_ids=(101,), run_phase="armed")
+    blocked_state = mod.FactoryControllerState(selected_config_ids=(), run_phase="not_ready")
+    not_ready_selected_state = mod.FactoryControllerState(
+        selected_config_ids=(101,),
+        run_phase="not_ready",
+    )
+    reviewing_state = mod.FactoryControllerState(selected_config_ids=(101, 202), run_phase="reviewing")
+    busy_state = mod.FactoryControllerState(selected_config_ids=(101,), run_phase="running")
+
+    assert ready_state.selection_ready is True
+    assert ready_state.selection_ready_reason is None
+    assert ready_state.start_ready is True
+    assert ready_state.start_ready_reason is None
+
+    assert blocked_state.selection_ready is False
+    assert blocked_state.selection_ready_reason == "请至少启用一个配置"
+    assert blocked_state.start_ready is False
+    assert blocked_state.start_ready_reason == "请至少启用一个配置"
+
+    assert not_ready_selected_state.selection_ready is True
+    assert not_ready_selected_state.selection_ready_reason is None
+    assert not_ready_selected_state.start_ready is False
+    assert not_ready_selected_state.start_ready_reason == "工厂模式未就绪"
+
+    assert reviewing_state.selection_ready is True
+    assert reviewing_state.start_ready is True
+    assert reviewing_state.start_ready_reason is None
+
+    assert busy_state.selection_ready is True
+    assert busy_state.start_ready is False
+    assert busy_state.start_ready_reason == "当前测试运行中"
+
+
+def test_factory_start_blocked_payload_contract_is_explicit():
+    payload_cls = getattr(mod, "FactoryStartBlockedPayload", None)
+
+    assert payload_cls is not None, "FactoryStartBlockedPayload is missing"
+    assert is_dataclass(payload_cls)
+    assert [field.name for field in fields(payload_cls)] == [
+        "reason",
+        "trigger_source",
+    ]
+
+    payload = payload_cls(reason="请至少启用一个配置", trigger_source="manual")
+
+    assert payload.reason == "请至少启用一个配置"
+    assert payload.trigger_source == "manual"
+
+
+def test_factory_review_payload_contract_is_explicit():
+    review_payload_cls = getattr(mod, "FactoryReviewPayload", None)
+    review_window_cls = getattr(mod, "FactoryReviewWindow", None)
+    plc_payload_cls = getattr(mod, "FactoryPlcIngressPayload", None)
+    abort_payload_cls = getattr(mod, "FactoryRuntimeAbortPayload", None)
+
+    assert review_payload_cls is not None, "FactoryReviewPayload is missing"
+    assert review_window_cls is not None, "FactoryReviewWindow is missing"
+    assert plc_payload_cls is not None, "FactoryPlcIngressPayload is missing"
+    assert abort_payload_cls is not None, "FactoryRuntimeAbortPayload is missing"
+    assert is_dataclass(review_payload_cls)
+    assert is_dataclass(abort_payload_cls)
+    assert [field.name for field in fields(review_payload_cls)] == [
+        "displayed_config_id",
+        "run_id",
+        "trigger_source",
+        "captured_duration_sec",
+        "default_window",
+        "fallback_window",
+        "manual_reanalysis_allowed",
+        "no_result",
+        "error_message",
+        "judgment_payload",
+        "summary_payload",
+        "chart_payload",
+    ]
+    assert [field.name for field in fields(abort_payload_cls)] == [
+        "config_id",
+        "run_id",
+        "trigger_source",
+        "error_message",
+    ]
+
+    review_window = review_window_cls(start_sec=1.0, end_sec=3.0)
+    payload = review_payload_cls(run_id="run-101-1", default_window=review_window)
+    plc_payload = plc_payload_cls(plc_device_key="plc-a")
+    abort_payload = abort_payload_cls(
+        config_id=101,
+        run_id="run-101-1",
+        trigger_source="manual",
+        error_message="runtime exploded",
+    )
+
+    assert payload.default_window == review_window
+    assert payload.run_id == "run-101-1"
+    assert plc_payload.plc_device_key == "plc-a"
+    assert abort_payload.config_id == 101
+    assert abort_payload.run_id == "run-101-1"
+    assert abort_payload.trigger_source == "manual"
+    assert abort_payload.error_message == "runtime exploded"
+
+
+def test_factory_review_payload_exposes_summary_and_chart_payload_fields():
+    payload = mod.FactoryReviewPayload()
+
+    assert hasattr(payload, "summary_payload")
+    assert hasattr(payload, "chart_payload")
+    assert payload.summary_payload is None
+    assert payload.chart_payload is None
+
+
+def test_service_container_uses_test_manager(monkeypatch):
+    monkeypatch.setattr(mod.DbConnectionService, "connect", lambda self: None)
+    monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "InputCalibrationService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "ConfigService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "AiService", MagicMock(return_value=MagicMock()))
+
+    services = mod.ServiceContainer()
+
+    assert isinstance(services.test, TestManager)
+    assert services.test._bus is services.bus
+    assert services.test._services is services
+
+
+def test_service_container_owns_factory_mode_controller(monkeypatch):
+    controller_mod = _load_factory_mode_controller_module()
+    controller_cls = controller_mod.FactoryModeController
+
+    monkeypatch.setattr(mod.DbConnectionService, "connect", lambda self: None)
+    monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "InputCalibrationService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "ConfigService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "AiService", MagicMock(return_value=MagicMock()))
+
+    services = mod.ServiceContainer()
+
+    assert isinstance(services.factory_mode, controller_cls)
+    assert services.factory_mode.bus is services.bus
+    assert services.factory_mode.services is services
+
+
+def test_service_container_exposes_factory_selection_settings(monkeypatch):
+    monkeypatch.setattr(mod.DbConnectionService, "connect", lambda self: None)
+    monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "InputCalibrationService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "ConfigService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "AiService", MagicMock(return_value=MagicMock()))
+
+    services = mod.ServiceContainer()
+
+    assert isinstance(services.factory_selection_settings, FactorySelectionSettings)

@@ -1,13 +1,160 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal
+from dataclasses import dataclass, field
+from PyQt6.QtCore import QObject, pyqtSignal
 
+from app.service.ai_service import AiService
+from app.service.analysis.test_manager import TestManager
+from app.service.config_service import ConfigService
 from app.service.db_connection_service import DbConnectionService
+from app.service.factory_selection_settings import FactorySelectionSettings
 from app.service.hardwareselect_service import HardwareSelectService
 from app.service.input_calibration_service import InputCalibrationService
-from app.service.config_service import ConfigService
-from app.service.ai_service import AiService
+
+
+@dataclass(frozen=True)
+class FactoryControllerState:
+    selected_config_ids: tuple[int, ...] = ()
+    active_config_id: int | None = None
+    displayed_config_id: int | None = None
+    run_phase: str = "not_ready"
+    trigger_source: str | None = None
+    selection_ready: bool | None = None
+    selection_ready_reason: str | None = None
+    start_ready: bool | None = None
+    start_ready_reason: str | None = None
+
+    _BLOCKED_START_PHASE_REASONS = {
+        "running": "当前测试运行中",
+        "analyzing": "当前测试分析中",
+        "reanalyzing": "当前正在重新分析",
+    }
+    _START_READY_SELECTION_PHASES = frozenset({"idle", "armed", "reviewing"})
+
+    def __post_init__(self):
+        selection_ready = self.selection_ready
+        selection_ready_reason = self.selection_ready_reason
+        start_ready = self.start_ready
+        start_ready_reason = self.start_ready_reason
+
+        if selection_ready is None:
+            selection_ready, derived_reason = self._derive_selection_readiness()
+            if selection_ready_reason is None:
+                selection_ready_reason = derived_reason
+        elif not selection_ready and selection_ready_reason is None:
+            _, selection_ready_reason = self._derive_selection_readiness()
+
+        if start_ready is None:
+            start_ready, derived_reason = self._derive_start_readiness(
+                selection_ready=bool(selection_ready),
+                selection_ready_reason=selection_ready_reason,
+            )
+            if start_ready_reason is None:
+                start_ready_reason = derived_reason
+        elif not start_ready and start_ready_reason is None:
+            _, start_ready_reason = self._derive_start_readiness(
+                selection_ready=bool(selection_ready),
+                selection_ready_reason=selection_ready_reason,
+            )
+
+        object.__setattr__(self, "selection_ready", bool(selection_ready))
+        object.__setattr__(
+            self,
+            "selection_ready_reason",
+            None if selection_ready else selection_ready_reason,
+        )
+        object.__setattr__(self, "start_ready", bool(start_ready))
+        object.__setattr__(
+            self,
+            "start_ready_reason",
+            None if start_ready else start_ready_reason,
+        )
+
+    def _derive_selection_readiness(self) -> tuple[bool, str | None]:
+        selected = tuple(self.selected_config_ids)
+        if not selected:
+            return False, "请至少启用一个配置"
+        return True, None
+
+    def _derive_start_readiness(
+        self,
+        *,
+        selection_ready: bool,
+        selection_ready_reason: str | None,
+    ) -> tuple[bool, str | None]:
+        blocked_phase_reason = self._BLOCKED_START_PHASE_REASONS.get(self.run_phase)
+        if blocked_phase_reason is not None:
+            return False, blocked_phase_reason
+        if not selection_ready:
+            return False, selection_ready_reason
+        if self.run_phase in self._START_READY_SELECTION_PHASES:
+            return True, None
+        if self.run_phase not in {"armed", "reviewing"}:
+            return False, "工厂模式未就绪"
+        return True, None
+
+    @property
+    def is_ready(self) -> bool:
+        return self.selection_ready
+
+
+@dataclass(frozen=True)
+class FactoryReviewWindow:
+    start_sec: float
+    end_sec: float
+
+
+@dataclass(frozen=True)
+class FactoryReviewPayload:
+    displayed_config_id: int | None = None
+    run_id: str | None = None
+    trigger_source: str | None = None
+    captured_duration_sec: float | None = None
+    default_window: FactoryReviewWindow | None = None
+    fallback_window: FactoryReviewWindow | None = None
+    manual_reanalysis_allowed: bool = False
+    no_result: bool = False
+    error_message: str | None = None
+    judgment_payload: dict | None = None
+    summary_payload: dict | None = None
+    chart_payload: dict | None = None
+
+
+@dataclass(frozen=True)
+class FactoryPlcIngressPayload:
+    plc_device_key: str
+
+
+@dataclass(frozen=True)
+class FactoryScanIngressPayload:
+    scan_text: str
+
+
+@dataclass(frozen=True)
+class FactoryStartBlockedPayload:
+    reason: str
+    trigger_source: str
+
+
+@dataclass(frozen=True)
+class FactoryRuntimeStartPayload:
+    config_id: int
+    run_id: str
+    trigger_source: str
+
+
+@dataclass(frozen=True)
+class FactoryRuntimeConfigPayload:
+    config_id: int
+    run_id: str
+
+
+@dataclass(frozen=True)
+class FactoryRuntimeAbortPayload:
+    config_id: int
+    run_id: str
+    trigger_source: str | None = None
+    error_message: str | None = None
 
 
 class EventBus(QObject):
@@ -35,87 +182,50 @@ class EventBus(QObject):
     # 配置变化（供外部模块监听，如工单模块刷新可选配置列表）
     config_changed = pyqtSignal()
 
+    # ── Analysis kernel real-time signals ──
+    # Real-time analysis frames (~20 Hz per channel)
+    stft_updated = pyqtSignal(int, str, int, object)     # config_id, run_id, channel_idx, StftFrame
+    spl_updated = pyqtSignal(int, str, int, object)      # config_id, run_id, channel_idx, SplFrame
+    octave_updated = pyqtSignal(int, str, int, object)   # config_id, run_id, channel_idx, OctaveFrame
+    fft_updated = pyqtSignal(int, str, int, object)      # config_id, run_id, channel_idx, FftFrame
 
-class TestService(QObject):
-    """
-    演示用的“假测试服务”。
-    目的：让 UI 联动跑起来（按钮 -> 状态/日志 -> 结果摘要刷新）。
-    你接入真实流程时，一般会把 start/stop 替换成：
-    - 启动采集/播放/分析线程（QThread/QRunnable）
-    - 持续发日志、状态、分析结果到 bus
-    """
+    # Session lifecycle
+    recording_progress = pyqtSignal(int, float)     # config_id, elapsed_sec
+    test_started = pyqtSignal(int)                  # config_id
+    test_finished = pyqtSignal(int, dict)           # config_id, JudgmentResult as dict
 
-    def __init__(self, bus):
-        super().__init__()
-        self.bus = bus
-        self._timer: QTimer | None = None
-        self._tick_count = 0
-        self._last_workorder: dict = {}
+    # ── Factory-mode ingress and controller contracts ──
+    factory_plc_event = pyqtSignal(object)                  # FactoryPlcIngressPayload
+    factory_scan_event = pyqtSignal(object)                 # FactoryScanIngressPayload
+    factory_start_blocked = pyqtSignal(object)              # FactoryStartBlockedPayload
+    factory_selection_notice = pyqtSignal(str)
+    factory_runtime_start_accepted = pyqtSignal(object)     # FactoryRuntimeStartPayload
+    factory_runtime_analyzing_entered = pyqtSignal(object)  # FactoryRuntimeConfigPayload
+    factory_runtime_auto_analysis_succeeded = pyqtSignal(object)  # FactoryReviewPayload
+    factory_runtime_auto_analysis_no_result = pyqtSignal(object)  # FactoryReviewPayload
+    factory_runtime_auto_analysis_error = pyqtSignal(object)      # FactoryReviewPayload
+    factory_runtime_auto_analysis_cleanup_settled = pyqtSignal(object)  # FactoryRuntimeConfigPayload
+    factory_runtime_aborted = pyqtSignal(object)                  # FactoryRuntimeAbortPayload
+    factory_runtime_reanalysis_completed = pyqtSignal(object)     # FactoryReviewPayload
+    factory_state_changed = pyqtSignal(object)              # FactoryControllerState
+    factory_review_changed = pyqtSignal(object)             # FactoryReviewPayload
+    factory_display_reset = pyqtSignal(str)                 # reset reason
 
-    def start(self, workorder: dict):
-        # 重入保护：重复点击“开始”先停止上一次
-        self.stop(silent=True)
-
-        self._tick_count = 0
-        self._last_workorder = workorder or {}
-
-        # 通知 UI：进入测试状态 + 打印日志
-        self.bus.status.emit("Testing...")
-        self.bus.log.emit(f"[Test] started, workorder={self._last_workorder}")
-
-        # 用定时器模拟“测试进行中”
-        self._timer = QTimer(self)
-        self._timer.setInterval(500)
-        self._timer.timeout.connect(self._on_tick)
-        self._timer.start()
-
-    def _on_tick(self):
-        self._tick_count += 1
-        self.bus.log.emit(f"[Test] running... t={self._tick_count}")
-
-        # 模拟 3 秒后产出一份结果
-        if self._tick_count >= 6:
-            result = {
-                "overall": "不合格",
-                "ai_score": 89.1,
-                "spl_db": 72.5,
-            }
-
-            # 通知 UI：结果更新 + 状态恢复
-            self.bus.result_changed.emit(result)
-            self.bus.log.emit(
-                f"[Test] stopped. Result: FAIL (Score: {result['ai_score']})"
-            )
-            self.bus.status.emit("Idle")
-
-            self.stop(silent=True)
-
-    def stop(self, silent: bool = False):
-        # 停止模拟计时器（真实实现里一般是停止线程/设备）
-        if self._timer is not None:
-            self._timer.stop()
-            self._timer.deleteLater()
-            self._timer = None
-
-        if not silent:
-            self.bus.log.emit("[Test] stop")
-
-        self.bus.status.emit("Stopped")
 
 @dataclass
 class ServiceContainer:
     """
     暂时不创建多个ServiceContainer
     """
-    bus = EventBus()
+    bus: EventBus = field(default_factory=EventBus)
 
     def __post_init__(self):
-        self.test = TestService(self.bus)
+        self.test = TestManager(self.bus, self)
         # 数据库连接服务（长连接）
         self.db = DbConnectionService()
         self.db.connect()
 
-        # 设备服务（刷新/枚举/保存输入输出设备）
+        # 设备服务（刷新/枚举/保存输入监听设备）
         self.hss_service = HardwareSelectService()
 
         # 输入校准服务（后续扩展）
@@ -125,3 +235,8 @@ class ServiceContainer:
         self.config_service = ConfigService(self.bus)
 
         self.ai_service = AiService()
+        self.factory_selection_settings = FactorySelectionSettings()
+
+        from app.service.factory_mode_controller import FactoryModeController
+
+        self.factory_mode = FactoryModeController(self.bus, self)

@@ -116,6 +116,48 @@ class TestRunAiAnalysis:
         assert record.module_status == "success"
         assert record.is_current_effective is True
 
+    def test_run_ai_analysis_writes_window_info_to_request_json(
+        self, ai_service, fake_audio_file, fake_toolchain_script, tmp_path
+    ):
+        cfg = TestConfigTable.create(config_name="Window Request Test")
+        tc = AiToolchainTable.create(
+            toolchain_id="window-tc",
+            display_name="Window TC",
+            version="0.1.0",
+            entrypoint=f"{sys.executable} {fake_toolchain_script}",
+            default_timeout_ms=10000,
+        )
+        TestConfigAiBindingTable.create(
+            config=cfg, toolchain=tc, enabled=True, params_json="{}"
+        )
+
+        segments = [{
+            "segment_id": "dev_1", "role": "device_1",
+            "audio_path": fake_audio_file, "channels": [1],
+            "duration_ms": 400, "sample_rate": 48000, "metadata": {},
+        }]
+        window_info = {
+            "window_overridden": True,
+            "default_window_offset_ms": 0,
+            "default_window_duration_ms": 1000,
+            "final_window_offset_ms": 100,
+            "final_window_duration_ms": 400,
+        }
+
+        result = ai_service.run_ai_analysis(
+            config_id=cfg.config_id,
+            test_run_id="run_window_001",
+            segments=segments,
+            context={"config_id": cfg.config_id, "config_name": "Window Request Test"},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+            window_info=window_info,
+        )
+
+        with open(result["request_json_path"], "r", encoding="utf-8") as f:
+            request_payload = json.load(f)
+
+        assert request_payload["window_info"] == window_info
+
     def test_preflight_failure_persisted(self, ai_service, tmp_path):
         cfg = TestConfigTable.create(config_name="PF Fail")
         result = ai_service.run_ai_analysis(

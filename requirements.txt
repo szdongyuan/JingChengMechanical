@@ -8,6 +8,7 @@ pycparser==3.0
 PyQt6==6.10.2
 PyQt6-Qt6==6.10.2
 PyQt6_sip==13.11.0
+pyqtgraph==0.13.7
 pywin32==311
 scipy==1.17.1
 sounddevice==0.5.5

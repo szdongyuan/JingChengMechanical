@@ -1,0 +1,439 @@
+from __future__ import annotations
+
+from unittest.mock import MagicMock
+
+import numpy as np
+
+from app.service.analysis.frames import JudgmentResult
+from app.service.analysis.test_manager import TestManager
+
+from ._support import (
+    _expected_chart_payload,
+    _expected_summary_payload,
+    _mock_bus,
+    _mock_services,
+)
+
+
+class TestReviewPayloadEmission:
+    def test_on_session_done_emits_summary_and_chart_payload_on_success(self, monkeypatch):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        post_attach = np.arange(500, dtype=np.float32).reshape(500, 1)
+        attach_snapshot = object()
+        rec = MagicMock()
+        rec.get_buffer_from.return_value = post_attach
+        rec._sample_rate = 100.0
+        session = MagicMock()
+        session.config_id = 1
+        session._buffer = None
+        session._attach_snapshot = attach_snapshot
+        session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+            "selected_channels": [0],
+            "channels": [{"channel_index": 0}],
+        }
+        session._workorder = {
+            "trigger_source": "scan",
+            "factory_run_id": "run-1",
+        }
+        session._audio_file_path = "captured.wav"
+        session.last_ai_review = {
+            "status": "success",
+            "threshold": 0.8,
+            "score": 0.93,
+        }
+        session._run_judgment.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=True,
+            ai_score=0.93,
+            analysis_window=(1.0, 3.0),
+        )
+        expected_summary = _expected_summary_payload(overall_status="pass")
+        expected_chart = _expected_chart_payload()
+        calls = {}
+
+        def fake_build_summary_payload(**kwargs):
+            calls["summary"] = kwargs
+            return expected_summary
+
+        def fake_build_chart_payload(**kwargs):
+            calls["chart"] = kwargs
+            return expected_chart
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_summary_payload",
+            fake_build_summary_payload,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_chart_payload",
+            fake_build_chart_payload,
+            raising=False,
+        )
+        mgr._sessions[1] = session
+        mgr._recorders[1] = rec
+
+        mgr._on_session_done(1)
+
+        assert calls["summary"]["config"] == session._config
+        assert calls["summary"]["ai_review"] == session.last_ai_review
+        assert calls["summary"]["error_message"] is None
+        assert calls["summary"]["judgment_payload"] == {
+            "overall": "合格",
+            "limit_pass": True,
+            "ai_pass": True,
+            "ai_score": 0.93,
+            "channel_results": [],
+            "analysis_window": (1.0, 3.0),
+        }
+        assert calls["chart"]["config"] == session._config
+        assert calls["chart"]["sample_rate"] == 100.0
+        assert calls["chart"]["analysis_window"] == (1.0, 3.0)
+        np.testing.assert_array_equal(calls["chart"]["buffer"], post_attach)
+        payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
+        assert payload.summary_payload == expected_summary
+        assert payload.chart_payload == expected_chart
+        assert payload.no_result is False
+        assert payload.error_message is None
+
+    def test_on_session_done_emits_partial_no_result_summary_when_ai_fails_but_rules_pass(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        post_attach = np.arange(500, dtype=np.float32).reshape(500, 1)
+        attach_snapshot = object()
+        rec = MagicMock()
+        rec.get_buffer_from.return_value = post_attach
+        rec._sample_rate = 100.0
+        session = MagicMock()
+        session.config_id = 1
+        session._buffer = None
+        session._attach_snapshot = attach_snapshot
+        session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+            "selected_channels": [0],
+            "channels": [{"channel_index": 0}],
+        }
+        session._workorder = {"factory_run_id": "run-1"}
+        session._audio_file_path = "captured.wav"
+        session.last_ai_review = {
+            "status": "timeout",
+            "threshold": 0.8,
+            "score": None,
+            "error_message": "AI timeout",
+        }
+        session._run_judgment.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+            analysis_window=(1.0, 3.0),
+        )
+        expected_summary = _expected_summary_payload(
+            overall_status="no_result",
+            error_message="AI timeout",
+        )
+        expected_chart = _expected_chart_payload()
+        expected_summary["rows"][-1]["status"] = "无结果"
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_summary_payload",
+            lambda **kwargs: expected_summary,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_chart_payload",
+            lambda **kwargs: expected_chart,
+            raising=False,
+        )
+        mgr._sessions[1] = session
+        mgr._recorders[1] = rec
+
+        mgr._on_session_done(1)
+
+        payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
+        assert payload.summary_payload["overall_status"] == "no_result"
+        assert payload.summary_payload["rows"][-1]["status"] == "无结果"
+        assert payload.summary_payload["error_message"] == "AI timeout"
+        assert payload.chart_payload == expected_chart
+        assert payload.no_result is False
+        assert payload.error_message is None
+
+    def test_on_session_done_required_window_failure_emits_no_chart_payload_and_no_result_summary(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        post_attach = np.arange(10, 20, dtype=np.float32).reshape(10, 1)
+        attach_snapshot = object()
+        rec = MagicMock()
+        rec.get_buffer_from.return_value = post_attach
+        rec._sample_rate = 100.0
+        session = MagicMock()
+        session.config_id = 1
+        session._buffer = None
+        session._attach_snapshot = attach_snapshot
+        session._audio_file_path = None
+        session._audio_data_id = None
+        session._workorder = {"factory_run_id": "run-1"}
+        session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 1500,
+            "selected_channels": [0],
+            "channels": [{"channel_index": 0}],
+        }
+
+        def raise_required_window_failure():
+            session._audio_file_path = "captured.wav"
+            session._audio_data_id = "audio-123"
+            raise ValueError("analysis window not fully captured")
+
+        expected_summary = _expected_summary_payload(
+            overall_status="no_result",
+            error_message="analysis window not fully captured",
+        )
+        for row in expected_summary["rows"]:
+            row["deviation_value"] = None
+            row["deviation_display"] = "--"
+            row["channel_index"] = None
+            row["channel_label"] = "--"
+            row["status"] = "无结果"
+            row["constrained"] = False
+
+        build_summary_calls = []
+
+        def fake_build_summary_payload(**kwargs):
+            build_summary_calls.append(kwargs)
+            return expected_summary
+
+        def fail_build_chart_payload(**kwargs):
+            raise AssertionError("chart payload should not be built for full no-result")
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_summary_payload",
+            fake_build_summary_payload,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_chart_payload",
+            fail_build_chart_payload,
+            raising=False,
+        )
+        session._run_judgment.side_effect = raise_required_window_failure
+        mgr._sessions[1] = session
+        mgr._recorders[1] = rec
+
+        mgr._on_session_done(1)
+
+        assert build_summary_calls == [
+            {
+                "config": session._config,
+                "judgment_payload": None,
+                "ai_review": None,
+                "error_message": "analysis window not fully captured",
+            }
+        ]
+        payload = bus.factory_runtime_auto_analysis_no_result.emit.call_args.args[0]
+        assert payload.summary_payload["overall_status"] == "no_result"
+        assert payload.summary_payload["error_message"] == "analysis window not fully captured"
+        assert len(payload.summary_payload["rows"]) == 4
+        assert all(row["status"] == "无结果" for row in payload.summary_payload["rows"])
+        assert payload.chart_payload is None
+        assert payload.no_result is True
+
+    def test_on_session_done_none_result_emits_no_chart_payload_and_no_result_summary(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        post_attach = np.arange(10, 20, dtype=np.float32).reshape(10, 1)
+        attach_snapshot = object()
+        rec = MagicMock()
+        rec.get_buffer_from.return_value = post_attach
+        rec._sample_rate = 100.0
+        session = MagicMock()
+        session.config_id = 1
+        session._buffer = None
+        session._attach_snapshot = attach_snapshot
+        session._audio_file_path = "captured.wav"
+        session._audio_data_id = "audio-123"
+        session._workorder = {"factory_run_id": "run-1"}
+        session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+            "selected_channels": [0],
+            "channels": [{"channel_index": 0}],
+        }
+
+        expected_summary = _expected_summary_payload(
+            overall_status="no_result",
+            error_message="analysis result unavailable",
+        )
+        for row in expected_summary["rows"]:
+            row["deviation_value"] = None
+            row["deviation_display"] = "--"
+            row["channel_index"] = None
+            row["channel_label"] = "--"
+            row["status"] = "无结果"
+            row["constrained"] = False
+
+        build_summary_calls = []
+
+        def fake_build_summary_payload(**kwargs):
+            build_summary_calls.append(kwargs)
+            return expected_summary
+
+        def fail_build_chart_payload(**kwargs):
+            raise AssertionError("chart payload should not be built for full no-result")
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_summary_payload",
+            fake_build_summary_payload,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_chart_payload",
+            fail_build_chart_payload,
+            raising=False,
+        )
+        session._run_judgment.return_value = None
+        mgr._sessions[1] = session
+        mgr._recorders[1] = rec
+
+        mgr._on_session_done(1)
+
+        assert build_summary_calls == [
+            {
+                "config": session._config,
+                "judgment_payload": None,
+                "ai_review": None,
+                "error_message": "analysis result unavailable",
+            }
+        ]
+        payload = bus.factory_runtime_auto_analysis_no_result.emit.call_args.args[0]
+        assert payload.summary_payload["overall_status"] == "no_result"
+        assert payload.summary_payload["error_message"] == "analysis result unavailable"
+        assert len(payload.summary_payload["rows"]) == 4
+        assert all(row["status"] == "无结果" for row in payload.summary_payload["rows"])
+        assert payload.chart_payload is None
+        assert payload.no_result is True
+
+    def test_rejudge_success_emits_replacement_summary_and_chart_payload(self, monkeypatch):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        mock_session = MagicMock()
+        mock_session.config_id = 1
+        mock_session._workorder = {
+            "trigger_source": "manual",
+            "factory_run_id": "run-1",
+        }
+        mock_session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+            "selected_channels": [0],
+            "channels": [{"channel_index": 0}],
+        }
+        mock_session._buffer = np.zeros((500, 1), dtype=np.float32)
+        mock_session._sample_rate = 100.0
+        mock_session._audio_file_path = "captured.wav"
+        mock_session.last_ai_review = {
+            "status": "success",
+            "threshold": 0.8,
+            "score": 0.88,
+        }
+        mock_session.rejudge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=True,
+            ai_score=0.88,
+            analysis_window=(1.0, 3.0),
+        )
+        expected_summary = _expected_summary_payload(overall_status="pass")
+        expected_chart = _expected_chart_payload()
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_summary_payload",
+            lambda **kwargs: expected_summary,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_chart_payload",
+            lambda **kwargs: expected_chart,
+            raising=False,
+        )
+        mgr._completed_sessions[1] = mock_session
+
+        mgr.rejudge(config_id=1, start_sec=1.0, end_sec=3.0)
+
+        payload = bus.factory_runtime_reanalysis_completed.emit.call_args.args[0]
+        assert payload.summary_payload["overall_status"] in {"pass", "fail", "no_result"}
+        assert payload.summary_payload == expected_summary
+        assert payload.chart_payload == expected_chart
+        assert payload.no_result is False
+        assert payload.error_message is None
+
+    def test_rejudge_failure_emits_full_no_result_summary_without_chart_payload(self, monkeypatch):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        mock_session = MagicMock()
+        mock_session.config_id = 1
+        mock_session._workorder = {"factory_run_id": "run-1"}
+        mock_session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 1500,
+            "selected_channels": [0],
+            "channels": [{"channel_index": 0}],
+        }
+        mock_session._buffer = np.zeros((500, 1), dtype=np.float32)
+        mock_session._sample_rate = 100.0
+        mock_session._audio_file_path = "captured.wav"
+        mock_session.rejudge.side_effect = ValueError("analysis window not fully captured")
+        expected_summary = _expected_summary_payload(
+            overall_status="no_result",
+            error_message="analysis window not fully captured",
+        )
+        for row in expected_summary["rows"]:
+            row["deviation_value"] = None
+            row["deviation_display"] = "--"
+            row["channel_index"] = None
+            row["channel_label"] = "--"
+            row["status"] = "无结果"
+            row["constrained"] = False
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_summary_payload",
+            lambda **kwargs: expected_summary,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_chart_payload",
+            lambda **kwargs: (_ for _ in ()).throw(
+                AssertionError("chart payload should not be built for reanalysis failure")
+            ),
+            raising=False,
+        )
+        mgr._completed_sessions[1] = mock_session
+
+        mgr.rejudge(config_id=1, start_sec=0.0, end_sec=2.0)
+
+        payload = bus.factory_runtime_reanalysis_completed.emit.call_args.args[0]
+        assert payload.summary_payload["overall_status"] == "no_result"
+        assert len(payload.summary_payload["rows"]) == 4
+        assert all(row["status"] == "无结果" for row in payload.summary_payload["rows"])
+        assert payload.chart_payload is None
+        assert payload.no_result is True
+        assert payload.error_message == "analysis window not fully captured"

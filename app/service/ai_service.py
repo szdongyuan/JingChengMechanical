@@ -7,6 +7,7 @@ and UI ViewModel adaptation.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -17,7 +18,6 @@ from datetime import datetime, timedelta, timezone
 
 from peewee import DoesNotExist
 
-from model.base_mode import db
 from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable
 from model.ai_execution_table import AiExecutionTable
@@ -78,22 +78,59 @@ class AiService:
             "toolchain_id": tc_id,
             "timeout_ms": binding.timeout_ms,
             "effective_timeout_ms": effective_timeout,
-            "analysis_window_offset_ms": binding.analysis_window_offset_ms,
             "params_json": binding.params_json,
+            "score_threshold": binding.score_threshold,
         }
 
     # ── Binding CRUD (for config UI) ────────────────────────
 
+    def _binding_table_has_legacy_offset_column(self, database) -> bool:
+        cursor = database.execute_sql("PRAGMA table_info(test_config_ai_binding_table)")
+        return any(row[1] == "analysis_window_offset_ms" for row in cursor.fetchall())
+
+    def _create_binding_with_legacy_offset(self, config_id: int, data: dict) -> int:
+        from consts.time_consts import now_str
+
+        database = TestConfigAiBindingTable._meta.database
+        cursor = database.execute_sql(
+            """
+            INSERT INTO test_config_ai_binding_table (
+                config_id,
+                enabled,
+                toolchain_id,
+                timeout_ms,
+                analysis_window_offset_ms,
+                params_json,
+                score_threshold,
+                updated_time
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                config_id,
+                data.get("enabled", False),
+                data.get("toolchain_id"),
+                data.get("timeout_ms"),
+                0,
+                data.get("params_json", "{}"),
+                data.get("score_threshold"),
+                now_str(),
+            ),
+        )
+        return cursor.lastrowid
+
     def save_binding(self, config_id: int, data: dict) -> int:
         """Create or update the AI binding for a test config.
-
-        Validates analysis_window_offset_ms >= 0.
         """
-        offset = data.get("analysis_window_offset_ms", 0)
-        if not isinstance(offset, int) or offset < 0:
-            raise ValueError("analysis_window_offset_ms must be a non-negative integer")
+        if "score_threshold" in data:
+            st = data["score_threshold"]
+            if st is not None:
+                if isinstance(st, bool) or not isinstance(st, (int, float)):
+                    raise ValueError("score_threshold must be numeric (int or float, not bool)")
+                if math.isnan(st) or math.isinf(st):
+                    raise ValueError("score_threshold must be finite (not NaN or inf)")
 
-        with db.atomic():
+        database = TestConfigAiBindingTable._meta.database
+        with database.atomic():
             try:
                 existing = TestConfigAiBindingTable.get(
                     TestConfigAiBindingTable.config == config_id
@@ -101,24 +138,23 @@ class AiService:
                 existing.enabled = data.get("enabled", False)
                 existing.toolchain_id = data.get("toolchain_id")
                 existing.timeout_ms = data.get("timeout_ms")
-                existing.analysis_window_offset_ms = data.get(
-                    "analysis_window_offset_ms", 0
-                )
                 existing.params_json = data.get("params_json", "{}")
+                if "score_threshold" in data:
+                    existing.score_threshold = data["score_threshold"]
                 from consts.time_consts import now_str
                 existing.updated_time = now_str()
                 existing.save()
                 return existing.binding_id
             except DoesNotExist:
+                if self._binding_table_has_legacy_offset_column(database):
+                    return self._create_binding_with_legacy_offset(config_id, data)
                 row = TestConfigAiBindingTable.create(
                     config=config_id,
                     enabled=data.get("enabled", False),
                     toolchain=data.get("toolchain_id"),
                     timeout_ms=data.get("timeout_ms"),
-                    analysis_window_offset_ms=data.get(
-                        "analysis_window_offset_ms", 0
-                    ),
                     params_json=data.get("params_json", "{}"),
+                    score_threshold=data.get("score_threshold"),
                 )
                 return row.binding_id
 
@@ -202,6 +238,7 @@ class AiService:
         segments: list[dict],
         context: dict,
         params: dict,
+        window_info: dict | None = None,
     ) -> dict:
         return {
             "protocol_version": 1,
@@ -211,6 +248,7 @@ class AiService:
             "segments": segments,
             "context": context,
             "params": params,
+            "window_info": window_info or {},
         }
 
     # ── Executor (oneshot process) ──────────────────────────
@@ -453,6 +491,7 @@ class AiService:
             segments=segments,
             context=context,
             params=params,
+            window_info=window_info,
         )
         with open(request_json_path, "w", encoding="utf-8") as f:
             json.dump(request_data, f, ensure_ascii=False, indent=2)

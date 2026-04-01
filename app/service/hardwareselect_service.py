@@ -15,7 +15,7 @@ class HardwareSelectService:
     """
     设备服务：
     - 刷新/枚举 sounddevice 设备与 hostapi（驱动后端）
-    - 读取/保存已选输入/输出设备到 DB（device_table.id=1）
+    - 读取/保存已选输入/监听设备到 DB（device_table.id=1）
     """
     logger = LogManager.set_log_handler("硬件选择")
 
@@ -77,7 +77,7 @@ class HardwareSelectService:
     # -------- DB：读取/保存选择 --------
     @staticmethod
     def load_io_devices() -> dict:
-        """读取输入/输出设备信息（device_table.id=1）。"""
+        """读取输入/监听设备信息（device_table.id=1）。"""
         row = DeviceTable.select().where(DeviceTable.id == 1).first()
         if not row:
             return {}
@@ -188,7 +188,7 @@ class HardwareSelectService:
         sync_sounddevice_default: bool = True,
     ) -> tuple[dict, dict]:
         """
-        保存输入/输出设备到 DB，并可选同步 sd.default.device。
+        保存输入/监听设备到 DB，并可选同步 sd.default.device。
         返回 (in_dev, out_dev) 两个 dict（已整理为 DB 结构）。
         """
         if devices is None or hostapis is None:
