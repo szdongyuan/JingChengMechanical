@@ -1,4 +1,11 @@
-from peewee import AutoField, FloatField, ForeignKeyField, IntegerField, TextField
+from peewee import (
+    AutoField,
+    BooleanField,
+    FloatField,
+    ForeignKeyField,
+    IntegerField,
+    TextField,
+)
 
 from model.base_mode import BaseModel
 from model.test_config_table import TestConfigTable
@@ -25,6 +32,18 @@ class ChannelConfigTable(BaseModel):
     oct_weighting = TextField(default="A")
     oct_band_limits = TextField(default="[]")
     ai_config = TextField(default="{}")
+    golden_sample_path = TextField(null=True, default=None)
+    golden_sample_label = TextField(null=True, default=None)
+    golden_sample_source_channel = IntegerField(null=True, default=None)
+    golden_sample_start_sample = IntegerField(null=True, default=None)
+    golden_sample_num_samples = IntegerField(null=True, default=None)
+    golden_sample_start_ms = IntegerField(null=True, default=None)
+    golden_sample_duration_ms = IntegerField(null=True, default=None)
+    golden_sample_sample_rate = FloatField(null=True, default=None)
+    fft_golden_mode = TextField(default="off")
+    fft_show_golden_overlay = BooleanField(default=False)
+    oct_golden_mode = TextField(default="off")
+    oct_show_golden_overlay = BooleanField(default=False)
 
     class Meta:
         table_name = "channel_config_table"

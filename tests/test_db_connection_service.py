@@ -138,6 +138,69 @@ def test_connect_creates_test_config_table_with_exact_fresh_schema_columns(monke
             pass
 
 
+def test_connect_creates_channel_config_table_with_golden_columns_in_fresh_schema(
+    monkeypatch,
+):
+    """DbConnectionService.connect() must create fresh golden binding columns."""
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    try:
+        tmp_db = SqliteDatabase(db_path, pragmas={"foreign_keys": 1})
+        import model.base_mode as base_mod
+
+        monkeypatch.setattr(base_mod, "db", tmp_db)
+
+        from app.service.db_connection_service import DbConnectionService
+        import app.service.db_connection_service as svc_mod
+
+        monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+        _bind_all_models(tmp_db)
+
+        DbConnectionService().connect()
+
+        cursor = tmp_db.execute_sql("PRAGMA table_info(channel_config_table)")
+        column_names = {row[1] for row in cursor.fetchall()}
+
+        assert {
+            "channel_config_id",
+            "config_id",
+            "channel_index",
+            "stft_nfft",
+            "stft_overlap",
+            "spl_weighting",
+            "spl_time_constant",
+            "spl_upper_limit",
+            "spl_lower_limit",
+            "loudness_unit",
+            "loudness_lower_limit",
+            "loudness_upper_limit",
+            "fft_band_limits",
+            "oct_weighting",
+            "oct_band_limits",
+            "ai_config",
+            "golden_sample_path",
+            "golden_sample_label",
+            "golden_sample_source_channel",
+            "golden_sample_start_sample",
+            "golden_sample_num_samples",
+            "golden_sample_start_ms",
+            "golden_sample_duration_ms",
+            "golden_sample_sample_rate",
+            "fft_golden_mode",
+            "fft_show_golden_overlay",
+            "oct_golden_mode",
+            "oct_show_golden_overlay",
+        } <= column_names
+
+        tmp_db.close()
+    finally:
+        try:
+            os.unlink(db_path)
+        except OSError:
+            pass
+
+
 def test_migrate_adds_only_supported_columns_to_existing_db(monkeypatch):
     """DbConnectionService.connect() must not restore removed trigger columns."""
     fd, db_path = tempfile.mkstemp(suffix=".db")
