@@ -60,6 +60,34 @@ def test_stft_cache_entry_rejects_different_length_frequency_axis_without_mutati
     assert np.array_equal(payload["magnitude_db"], np.array([[1.0], [2.0]]))
 
 
+def test_stft_cache_entry_increments_render_revision_only_for_valid_frames():
+    cache_entry = stft_module._StftCacheEntry()
+
+    assert cache_entry.render_revision == 0
+    assert cache_entry.append_frame(_make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)))
+    assert cache_entry.render_revision == 1
+    assert cache_entry.append_frame(_make_stft_frame(time=0.5, magnitudes=(3.0, 4.0)))
+    assert cache_entry.render_revision == 2
+
+
+def test_stft_cache_entry_rejects_mismatched_frequency_frame_without_revision_advance():
+    cache_entry = stft_module._StftCacheEntry()
+    assert cache_entry.append_frame(_make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)))
+
+    assert cache_entry.render_revision == 1
+    assert (
+        cache_entry.append_frame(
+            _make_stft_frame(
+                time=0.5,
+                magnitudes=(3.0, 4.0),
+                frequencies=(125.0, 250.0),
+            )
+        )
+        is False
+    )
+    assert cache_entry.render_revision == 1
+
+
 def test_refresh_selected_display_channel_reuses_cached_matrix_without_column_stack(
     qapp,
     monkeypatch,

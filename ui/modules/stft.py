@@ -19,6 +19,7 @@ class _StftCacheEntry:
     frequencies_hz: list[float] = field(default_factory=list)
     times_sec: list[float] = field(default_factory=list)
     magnitude_db: np.ndarray | None = None
+    render_revision: int = 0
     _magnitude_storage: np.ndarray | None = field(default=None, init=False, repr=False)
     _column_capacity: int = field(default=0, init=False, repr=False)
 
@@ -42,6 +43,7 @@ class _StftCacheEntry:
 
         self._append_magnitude_column(magnitudes)
         self.times_sec.append(float(getattr(frame, "time", 0.0)))
+        self.render_revision += 1
         return True
 
     def has_data(self) -> bool:
