@@ -202,3 +202,41 @@ def test_dialog_returns_normalized_multichannel_staged_metadata_on_confirm(qapp,
         staged_data[:32],
         data[12_000 : 12_000 + 72_000, 2][:32],
     )
+
+
+def test_dialog_keeps_open_and_surfaces_error_when_staging_fails(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    wav_path, _ = _write_temp_wav(
+        tmp_path / "source.wav",
+        duration_sec=4.0,
+        channels=2,
+    )
+
+    class _ExplodingGoldenSampleService:
+        def create_staged_sample(self, **_kwargs):
+            raise OSError("source vanished")
+
+    dialog = GoldenSampleImportDialog(
+        source_path=str(wav_path),
+        analysis_duration=1.5,
+        config_sample_rate=48_000.0,
+        golden_sample_service=_ExplodingGoldenSampleService(),
+    )
+    warnings = []
+    monkeypatch.setattr(
+        "ui.popups.golden_sample_import_dialog.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    dialog._on_confirm()
+
+    status = dialog.findChild(QLabel, "validation_message")
+
+    assert warnings
+    assert "source vanished" in str(warnings[-1][-1])
+    assert dialog.result() != int(QDialog.DialogCode.Accepted)
+    assert dialog.staged_metadata() is None
+    assert "导入失败" in status.text()

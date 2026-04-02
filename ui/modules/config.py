@@ -556,6 +556,55 @@ class ConfigModule(QWidget):
             return
         self._restore_committed_golden_bindings()
 
+    def _reload_authoritative_config_state(self, config_id: int) -> None:
+        loaded = self.services.config_service.load_config(config_id)
+        self._skip_reload = True
+        try:
+            self._refresh_list()
+            self._select_config_by_id(config_id)
+        finally:
+            self._skip_reload = False
+        self._current_config_id = config_id
+        self._populate_detail(loaded)
+
+    def _finalize_failed_save(
+        self,
+        *,
+        message_title: str,
+        message_text: str,
+        pending_save=None,
+        pending_save_committed: bool = False,
+    ) -> None:
+        rollback_pending_save = getattr(
+            self.services.config_service,
+            "rollback_pending_save",
+            None,
+        )
+        if callable(rollback_pending_save) and not pending_save_committed:
+            rollback_pending_save(pending_save)
+
+        if pending_save_committed:
+            config_id = getattr(pending_save, "config_id", self._current_config_id)
+            reloaded = False
+            if isinstance(config_id, int) and not isinstance(config_id, bool):
+                try:
+                    self._reload_authoritative_config_state(config_id)
+                    reloaded = True
+                except Exception:
+                    reloaded = False
+            if not reloaded:
+                self._reconcile_golden_bindings_after_save_failure(
+                    pending_save,
+                    pending_save_committed=True,
+                )
+        else:
+            self._reconcile_golden_bindings_after_save_failure(
+                pending_save,
+                pending_save_committed=False,
+            )
+
+        QMessageBox.warning(self, message_title, message_text)
+
     def _effective_golden_binding(self, container: QWidget) -> dict | None:
         channel_index = container.property("channel_index")
         staged_binding = self._golden_editor_state.get(channel_index)
@@ -1470,7 +1519,10 @@ class ConfigModule(QWidget):
         data = self._collect_data()
         errors = self.services.config_service.validate(data)
         if errors:
-            QMessageBox.warning(self, "验证失败", "\n".join(errors))
+            self._finalize_failed_save(
+                message_title="验证失败",
+                message_text="\n".join(errors),
+            )
             return
         pending_save = None
         pending_save_committed = False
@@ -1484,7 +1536,10 @@ class ConfigModule(QWidget):
                 if not isinstance(parsed, dict):
                     raise ValueError("JSON 必须是对象")
             except (ValueError, _json.JSONDecodeError) as e:
-                QMessageBox.warning(self, "AI 配置错误", f"参数(JSON) 格式无效：{e}")
+                self._finalize_failed_save(
+                    message_title="AI 配置错误",
+                    message_text=f"参数(JSON) 格式无效：{e}",
+                )
                 return
 
             from model.base_mode import db
@@ -1514,32 +1569,20 @@ class ConfigModule(QWidget):
             self.services.bus.status.emit("配置已保存")
         except ValueError as e:
             self._skip_reload = False
-            rollback_pending_save = getattr(
-                self.services.config_service,
-                "rollback_pending_save",
-                None,
-            )
-            if callable(rollback_pending_save) and not pending_save_committed:
-                rollback_pending_save(pending_save)
-            self._reconcile_golden_bindings_after_save_failure(
-                pending_save,
+            self._finalize_failed_save(
+                message_title="保存失败",
+                message_text=str(e),
+                pending_save=pending_save,
                 pending_save_committed=pending_save_committed,
             )
-            QMessageBox.warning(self, "保存失败", str(e))
         except Exception as e:
             self._skip_reload = False
-            rollback_pending_save = getattr(
-                self.services.config_service,
-                "rollback_pending_save",
-                None,
-            )
-            if callable(rollback_pending_save) and not pending_save_committed:
-                rollback_pending_save(pending_save)
-            self._reconcile_golden_bindings_after_save_failure(
-                pending_save,
+            self._finalize_failed_save(
+                message_title="保存失败",
+                message_text=str(e),
+                pending_save=pending_save,
                 pending_save_committed=pending_save_committed,
             )
-            QMessageBox.warning(self, "保存失败", str(e))
 
     def _on_hardware_changed(self):
         """Global hardware changed — refresh device combos, preserve current selection."""

@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -359,14 +360,21 @@ class GoldenSampleImportDialog(QDialog):
         if self._validation_error is not None or self._required_num_samples is None:
             return
         start_sample = self._normalized_start_sample(self._start_ms_spin.value())
-        staged = self._golden_sample_service.create_staged_sample(
-            source_path=self._source_path,
-            source_channel=self._selected_channel_index(),
-            start_sample=start_sample,
-            num_samples=self._required_num_samples,
-            sample_rate=float(self._config_sample_rate),
-            label=os.path.basename(self._source_path),
-        )
+        try:
+            staged = self._golden_sample_service.create_staged_sample(
+                source_path=self._source_path,
+                source_channel=self._selected_channel_index(),
+                start_sample=start_sample,
+                num_samples=self._required_num_samples,
+                sample_rate=float(self._config_sample_rate),
+                label=os.path.basename(self._source_path),
+            )
+        except Exception as exc:
+            self._staged_metadata = None
+            error_text = f"导入失败：{exc}"
+            self._validation_message.setText(error_text)
+            QMessageBox.warning(self, "导入失败", error_text)
+            return
         self._staged_metadata = asdict(staged)
         self.accept()
 

@@ -894,6 +894,77 @@ def test_save_failure_discards_staged_file_and_keeps_committed_binding_authorita
     assert config_service.golden_sample_service.discarded_paths == [str(staged_path)]
 
 
+def test_validation_failure_discards_staged_file_and_keeps_committed_binding_authoritative(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    committed = _channel_payload(0, **_golden_binding())
+    config_service = _ConfigServiceStub(validation_errors=["配置无效"])
+    module = _make_module(config_service=config_service)
+    module._current_config_id = 7
+    module._populate_detail(_detail_payload([committed]))
+    staged_path = tmp_path / "staged.wav"
+    staged_path.write_bytes(b"wav")
+    module._golden_editor_state[0] = _staged_golden_binding(
+        staged_path,
+        label="replacement.wav",
+    )
+
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module._on_save()
+
+    data = module._collect_data()
+
+    assert any("配置无效" in str(args[-1]) for args in warnings)
+    assert data["channels"][0]["golden_sample_path"] == committed["golden_sample_path"]
+    assert data["channels"][0]["golden_sample_label"] == committed["golden_sample_label"]
+    assert data["golden_editor_state"] == {}
+    assert config_service.begin_calls == 0
+    assert config_service.golden_sample_service.discarded_paths == [str(staged_path)]
+
+
+def test_invalid_ai_json_discards_staged_file_and_keeps_committed_binding_authoritative(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    committed = _channel_payload(0, **_golden_binding())
+    config_service = _ConfigServiceStub()
+    module = _make_module(config_service=config_service)
+    module._current_config_id = 7
+    module._populate_detail(_detail_payload([committed]))
+    module.txt_ai_params.setPlainText("{invalid")
+    staged_path = tmp_path / "staged.wav"
+    staged_path.write_bytes(b"wav")
+    module._golden_editor_state[0] = _staged_golden_binding(
+        staged_path,
+        label="replacement.wav",
+    )
+
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module._on_save()
+
+    data = module._collect_data()
+
+    assert any("参数(JSON) 格式无效" in str(args[-1]) for args in warnings)
+    assert data["channels"][0]["golden_sample_path"] == committed["golden_sample_path"]
+    assert data["channels"][0]["golden_sample_label"] == committed["golden_sample_label"]
+    assert data["golden_editor_state"] == {}
+    assert config_service.begin_calls == 0
+    assert config_service.golden_sample_service.discarded_paths == [str(staged_path)]
+
+
 def test_outer_transaction_failure_after_begin_save_config_rolls_back_promotions_and_keeps_old_asset(
     tmp_path,
 ):
@@ -1050,6 +1121,63 @@ def test_post_commit_reload_failure_does_not_rollback_committed_pending_save(
     assert config_service.commit_calls == 1
     assert config_service.rollback_calls == 0
     assert any("reload exploded" in str(args[-1]) for args in warnings)
+
+
+def test_post_commit_failure_reloads_authoritative_config_list_and_detail(
+    qapp,
+    monkeypatch,
+):
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        config_changed=_SignalStub(),
+    )
+    config_id = ConfigTable.create(
+        config_name="Cfg1",
+        input_device_name="Mic 1",
+        input_device_hostapi="ASIO",
+        input_device_samplerate=48_000,
+        output_device_name="Speaker 1",
+        output_device_hostapi="WASAPI",
+        output_device_samplerate=44_100,
+        selected_channels="[0]",
+    ).config_id
+    ChannelConfigTable.create(
+        config=config_id,
+        **_channel_payload(0),
+    )
+    config_service = ConfigService(bus)
+    module = _make_module(
+        config_service=config_service,
+        ai_service=_AiServiceStub(),
+        hardware_service=_HardwareServiceStub(),
+        bus=bus,
+    )
+
+    module._current_config_id = config_id
+    module._populate_detail(config_service.load_config(config_id))
+    module.ed_name.setText("  Renamed  ")
+
+    def _raise_post_commit(*_args, **_kwargs):
+        raise RuntimeError("post-commit exploded")
+
+    monkeypatch.setattr(bus.config_changed, "emit", _raise_post_commit)
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module._on_save()
+
+    assert any("post-commit exploded" in str(args[-1]) for args in warnings)
+    assert config_service.load_config(config_id)["config_name"] == "Renamed"
+    assert module.ed_name.text() == "Renamed"
+    assert module.config_list.currentItem().text() == "Renamed"
 
 
 def test_post_commit_commit_pending_save_failure_keeps_new_authoritative_replacement_binding(
