@@ -92,13 +92,13 @@ class OctaveModule(QWidget):
             else None
         )
         if not isinstance(octave_payload, dict):
-            self._clear_plot()
+            self._clear_plot(rendered_channel_index=channel_index)
             return
 
         center_freqs_hz = octave_payload.get("center_freqs_hz") or []
         levels_db = octave_payload.get("levels_db") or []
         if not center_freqs_hz or not levels_db:
-            self._clear_plot()
+            self._clear_plot(rendered_channel_index=channel_index)
             return
 
         try:
@@ -106,17 +106,19 @@ class OctaveModule(QWidget):
                 center_freqs_hz=center_freqs_hz,
                 levels_db=levels_db,
                 limit_bands=octave_payload.get("limit_bands"),
+                golden_overlay_levels_db=octave_payload.get("golden_overlay_levels_db"),
+                show_zero_reference=bool(octave_payload.get("show_zero_reference")),
             )
         except (TypeError, ValueError):
-            self._clear_plot()
+            self._clear_plot(rendered_channel_index=channel_index)
             return
 
         self._has_plot_data = True
         self._rendered_channel_index = channel_index
 
-    def _clear_plot(self) -> None:
+    def _clear_plot(self, *, rendered_channel_index: int | None = None) -> None:
         self._has_plot_data = False
-        self._rendered_channel_index = None
+        self._rendered_channel_index = rendered_channel_index
         self.plot.clear_data()
 
     def _can_render_committed_chart(self) -> bool:

@@ -496,6 +496,61 @@ def test_fft_line_chart_widget_accepts_limit_band_markers(qapp):
     assert widget.spectrum_payload()["limit_bands"] == limit_bands
 
 
+def test_fft_line_chart_widget_accepts_golden_overlay_payload(qapp):
+    widget = FftLineChartWidget()
+
+    widget.set_spectrum(
+        frequencies_hz=[125.0, 250.0, 500.0],
+        levels_db=[42.0, 45.0, 51.0],
+        limit_bands=[],
+        golden_overlay_levels_db=[40.0, 44.0, 49.0],
+        show_zero_reference=False,
+    )
+
+    assert widget.spectrum_payload() == {
+        "frequencies_hz": [125.0, 250.0, 500.0],
+        "levels_db": [42.0, 45.0, 51.0],
+        "limit_bands": [],
+        "golden_overlay_levels_db": [40.0, 44.0, 49.0],
+        "show_zero_reference": False,
+    }
+
+
+def test_fft_line_chart_widget_renders_golden_overlay_as_second_line_item(qapp):
+    widget = FftLineChartWidget()
+
+    widget.set_spectrum(
+        frequencies_hz=[125.0, 250.0, 500.0],
+        levels_db=[42.0, 45.0, 51.0],
+        limit_bands=[],
+        golden_overlay_levels_db=[40.0, 44.0, 49.0],
+    )
+
+    overlay_x, overlay_y = widget._golden_overlay_curve_item.getData()
+
+    assert list(overlay_x) == [125.0, 250.0, 500.0]
+    assert list(overlay_y) == [40.0, 44.0, 49.0]
+    assert widget._zero_reference_line.isVisible() is False
+
+
+def test_fft_line_chart_widget_shows_zero_reference_line_in_delta_mode(qapp):
+    widget = FftLineChartWidget()
+
+    widget.set_spectrum(
+        frequencies_hz=[125.0, 250.0, 500.0],
+        levels_db=[2.0, -1.0, 3.0],
+        limit_bands=[],
+        show_zero_reference=True,
+    )
+
+    overlay_x, overlay_y = widget._golden_overlay_curve_item.getData()
+
+    assert overlay_x is None
+    assert overlay_y is None
+    assert widget._zero_reference_line.isVisible() is True
+    assert widget._zero_reference_line.value() == pytest.approx(0.0)
+
+
 def test_fft_line_chart_widget_keeps_two_limit_band_markers_renderable(qapp):
     widget = FftLineChartWidget()
     limit_bands = [
@@ -606,6 +661,65 @@ def test_octave_bar_chart_widget_accepts_limit_band_markers(qapp):
     assert widget.band_payload()["center_freqs_hz"] == [125.0, 250.0, 500.0, 1000.0]
     assert widget.band_payload()["levels_db"] == [33.0, 41.0, 57.0, 49.0]
     assert widget.band_payload()["limit_bands"] == limit_bands
+
+
+def test_octave_bar_chart_widget_accepts_golden_overlay_payload(qapp):
+    widget = OctaveBarChartWidget()
+
+    widget.set_bands(
+        center_freqs_hz=[125.0, 250.0, 500.0],
+        levels_db=[33.0, 41.0, 57.0],
+        limit_bands=[],
+        golden_overlay_levels_db=[31.0, 39.0, 54.0],
+        show_zero_reference=False,
+    )
+
+    assert widget.band_payload() == {
+        "center_freqs_hz": [125.0, 250.0, 500.0],
+        "levels_db": [33.0, 41.0, 57.0],
+        "limit_bands": [],
+        "golden_overlay_levels_db": [31.0, 39.0, 54.0],
+        "show_zero_reference": False,
+    }
+
+
+def test_octave_bar_chart_widget_renders_golden_overlay_comparison_series(qapp):
+    widget = OctaveBarChartWidget()
+
+    widget.set_bands(
+        center_freqs_hz=[125.0, 250.0, 500.0],
+        levels_db=[33.0, 41.0, 57.0],
+        limit_bands=[],
+        golden_overlay_levels_db=[31.0, 39.0, 54.0],
+    )
+
+    overlay_x, overlay_y = widget._golden_overlay_item.getData()
+
+    assert list(overlay_x) == [0.0, 1.0, 2.0]
+    assert list(overlay_y) == [31.0, 39.0, 54.0]
+    assert widget._zero_reference_line.isVisible() is False
+
+
+def test_octave_bar_chart_widget_keeps_negative_delta_bars_anchored_to_zero(qapp):
+    widget = OctaveBarChartWidget()
+
+    widget.set_bands(
+        center_freqs_hz=[125.0, 250.0, 500.0],
+        levels_db=[-3.0, -5.0, -1.0],
+        limit_bands=[],
+        show_zero_reference=True,
+    )
+
+    assert widget._zero_reference_line.isVisible() is True
+    assert widget._zero_reference_line.value() == pytest.approx(0.0)
+    assert widget._bar_item is not None
+    assert widget._bar_item.opts["y0"] == pytest.approx(0.0)
+    assert list(np.asarray(widget._bar_item.opts["height"], dtype=float)) == [
+        -3.0,
+        -5.0,
+        -1.0,
+    ]
+    assert widget._bar_item.dataBounds(1) == pytest.approx((-5.0, 0.0))
 
 
 def test_octave_bar_chart_widget_keeps_two_limit_band_markers_renderable(qapp):

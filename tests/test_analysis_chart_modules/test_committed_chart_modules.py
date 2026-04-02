@@ -114,6 +114,31 @@ def test_spectrum_module_renders_committed_chart_for_selected_channel(qapp):
     assert module.current_render_channel() == 1
 
 
+def test_spectrum_module_consumes_golden_overlay_fields_from_committed_payload(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = SpectrumModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["fft"].update(
+        {
+            "golden_mode": "absolute",
+            "golden_overlay_levels_db": [38.0, 41.0],
+            "show_zero_reference": False,
+        }
+    )
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is True
+    assert module.current_plot_payload()["golden_overlay_levels_db"] == [38.0, 41.0]
+    assert module.current_plot_payload()["show_zero_reference"] is False
+    overlay_x, overlay_y = module.plot._golden_overlay_curve_item.getData()
+    assert list(overlay_x) == [125.0, 250.0]
+    assert list(overlay_y) == [38.0, 41.0]
+
+
 def test_spectrum_module_renders_committed_chart_without_limit_band_markers(qapp):
     services = _make_services(initial_state=_state(101, "reviewing"))
     module = SpectrumModule(services)
@@ -162,6 +187,26 @@ def test_spectrum_module_keeps_two_committed_limit_band_markers_renderable(qapp)
     module.plot._band_range_item.boundingRect()
 
 
+def test_spectrum_module_keeps_selected_channel_when_fft_payload_is_missing(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = SpectrumModule(services)
+    fallback_calls: list[int] = []
+    module.selected_display_channel_provider = lambda: 1
+    module.selected_display_channel_sync = fallback_calls.append
+    review_payload = _review_payload_with_chart_payload(101, channels=(0, 1))
+    del review_payload.chart_payload[1]["fft"]
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is False
+    assert module.current_plot_payload() is None
+    assert module.current_render_channel() == 1
+    assert module.plot.isHidden() is False
+    assert fallback_calls == []
+
+
 def test_octave_module_renders_committed_chart_for_selected_channel(qapp):
     services = _make_services(initial_state=_state(101, "reviewing"))
     module = OctaveModule(services)
@@ -177,6 +222,31 @@ def test_octave_module_renders_committed_chart_for_selected_channel(qapp):
     assert module.current_plot_payload()["center_freqs_hz"] == [125.0, 250.0]
     assert module.current_plot_payload()["levels_db"] == [33.0, 35.0]
     assert module.current_render_channel() == 1
+
+
+def test_octave_module_consumes_golden_overlay_fields_from_committed_payload(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = OctaveModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["octave"].update(
+        {
+            "golden_mode": "absolute",
+            "golden_overlay_levels_db": [30.0, 33.0],
+            "show_zero_reference": False,
+        }
+    )
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is True
+    assert module.current_plot_payload()["golden_overlay_levels_db"] == [30.0, 33.0]
+    assert module.current_plot_payload()["show_zero_reference"] is False
+    overlay_x, overlay_y = module.plot._golden_overlay_item.getData()
+    assert list(overlay_x) == [0.0, 1.0]
+    assert list(overlay_y) == [30.0, 33.0]
 
 
 def test_octave_module_renders_committed_chart_without_limit_band_markers(qapp):
@@ -225,6 +295,26 @@ def test_octave_module_keeps_two_committed_limit_band_markers_renderable(qapp):
     assert module.has_committed_plot_data() is True
     assert len(module.current_plot_payload()["limit_bands"]) == 2
     module.plot._band_range_item.boundingRect()
+
+
+def test_octave_module_keeps_selected_channel_when_octave_payload_is_missing(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = OctaveModule(services)
+    fallback_calls: list[int] = []
+    module.selected_display_channel_provider = lambda: 1
+    module.selected_display_channel_sync = fallback_calls.append
+    review_payload = _review_payload_with_chart_payload(101, channels=(0, 1))
+    del review_payload.chart_payload[1]["octave"]
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is False
+    assert module.current_plot_payload() is None
+    assert module.current_render_channel() == 1
+    assert module.plot.isHidden() is False
+    assert fallback_calls == []
 
 
 def test_loudness_module_keeps_selected_channel_without_fallback_when_only_loudness_payload_is_missing(

@@ -393,6 +393,9 @@ def _chart_payload_for_channels(
                         "passed": True,
                     }
                 ],
+                "golden_mode": "off",
+                "golden_overlay_levels_db": None,
+                "show_zero_reference": False,
             },
             "octave": {
                 "center_freqs_hz": [125.0, 250.0],
@@ -406,6 +409,9 @@ def _chart_payload_for_channels(
                         "passed": True,
                     }
                 ],
+                "golden_mode": "off",
+                "golden_overlay_levels_db": None,
+                "show_zero_reference": False,
             },
         }
         if channel_index not in missing_loudness_channels:
@@ -655,11 +661,15 @@ def _assert_committed_chart_channel(window, *, channel_index: int) -> None:
         40.0 + channel_index,
         42.0 + channel_index,
     ]
+    assert window.spectrum.current_plot_payload()["golden_overlay_levels_db"] is None
+    assert window.spectrum.current_plot_payload()["show_zero_reference"] is False
     assert window.octave.current_render_channel() == channel_index
     assert window.octave.current_plot_payload()["levels_db"] == [
         32.0 + channel_index,
         34.0 + channel_index,
     ]
+    assert window.octave.current_plot_payload()["golden_overlay_levels_db"] is None
+    assert window.octave.current_plot_payload()["show_zero_reference"] is False
 
 
 def _result_table_value(window, row: int, column: int) -> str:
@@ -1270,6 +1280,42 @@ def test_main_window_review_selected_channel_without_loudness_payload_keeps_othe
     assert window.loudness.has_committed_plot_data() is False
     assert window.loudness.current_render_channel() is None
     assert window.loudness.current_plot_payload() is None
+
+
+def test_main_window_review_selected_channel_missing_fft_and_octave_payloads_keeps_channel_selected(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0, 1)),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    review_payload = _review_payload_with_chart_payload(101, channels=(0, 1))
+    del review_payload.chart_payload[1]["fft"]
+    del review_payload.chart_payload[1]["octave"]
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 1)
+
+    assert window.analysis_toolbar.current_channel_index() == 1
+    assert window.display_channel_by_config_id[101] == 1
+    assert window.spl.current_render_channel() == 1
+    assert window.loudness.current_render_channel() == 1
+    assert window.spectrum.has_committed_plot_data() is False
+    assert window.spectrum.current_render_channel() == 1
+    assert window.spectrum.current_plot_payload() is None
+    assert window.octave.has_committed_plot_data() is False
+    assert window.octave.current_render_channel() == 1
+    assert window.octave.current_plot_payload() is None
 
 
 def test_main_window_channel_toolbar_hides_or_disables_selector_for_single_channel_displayed_config(
