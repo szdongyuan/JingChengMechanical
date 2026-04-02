@@ -121,7 +121,7 @@ class HardwareSelectService:
             payload["input"] = input_payload
         if output_payload:
             payload["output"] = output_payload
-        if mic_cal:
+        if payload:
             payload["mic_cal"] = mic_cal
         return payload
 

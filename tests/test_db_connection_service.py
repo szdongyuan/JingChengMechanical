@@ -6,6 +6,7 @@ import tempfile
 from contextlib import contextmanager
 from types import SimpleNamespace
 
+import pytest
 from peewee import SqliteDatabase
 
 from app.service.config_service import ConfigService
@@ -261,6 +262,37 @@ def test_connect_blank_device_singleton_stays_safe_for_startup_consumers(monkeyp
         input_info = device_info.get("input", {})
         assert float(input_info.get("samplerate", 48000.0)) == 48000.0
         assert int(input_info.get("channel_count", 1)) == 1
+
+
+@pytest.mark.parametrize("mic_cal_value", [None, ""])
+def test_connect_sparse_saved_device_row_keeps_mic_cal_mapping_for_startup_consumers(
+    monkeypatch,
+    mic_cal_value,
+):
+    with _temporary_runtime_db(monkeypatch) as (_, svc, _):
+        svc.connect()
+        DeviceTable.update(
+            input_selected_device_id=7,
+            input_selected_device_name="Legacy Input",
+            input_selected_device_type="ASIO",
+            input_selected_device_samplerate="48000",
+            input_channel_count="2",
+            mic_cal=mic_cal_value,
+        ).where(DeviceTable.id == 1).execute()
+
+        device_info = HardwareSelectService.load_io_devices()
+
+        assert device_info == {
+            "input": {
+                "id": 7,
+                "name": "Legacy Input",
+                "type": "ASIO",
+                "samplerate": "48000",
+                "channel_count": "2",
+            },
+            "mic_cal": {},
+        }
+        assert device_info.get("mic_cal").get("In1", {}).get("is_selected") is None
 
 
 def test_connect_migrates_legacy_config_tables_and_preserves_extra_columns(
