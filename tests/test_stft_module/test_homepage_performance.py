@@ -6,7 +6,14 @@ from app.services_container import FactoryControllerState
 from ui.modules import stft as stft_module
 from ui.widgets.analysis_charts import StftImageChartWidget
 
-from ._support import _make_module, _make_stft_frame, _show
+from ._support import (
+    _emit_reviewing,
+    _make_module,
+    _make_review_payload,
+    _make_stft_frame,
+    _seed_stft_history,
+    _show,
+)
 
 
 def test_stft_cache_entry_appends_frames_without_full_matrix_rebuild(monkeypatch):
@@ -131,6 +138,120 @@ def test_refresh_selected_display_channel_reuses_cached_matrix_without_column_st
     assert captured["frequencies_hz"] == [100.0, 200.0]
     assert captured["magnitude_db"] is cached_matrix
     assert captured["reset_levels"] is False
+
+
+def test_refresh_selected_display_channel_skips_redraw_when_same_signature_is_visible(
+    qapp,
+    monkeypatch,
+):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="running",
+            trigger_source="manual",
+        )
+    )
+    for frame in (
+        _make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)),
+        _make_stft_frame(time=0.5, magnitudes=(3.0, 4.0)),
+    ):
+        services.bus.stft_updated.emit(101, "run-101", 0, frame)
+    qapp.processEvents()
+    module.flush_pending_live_refresh()
+    qapp.processEvents()
+
+    redraw_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        module.canvas.heatmap,
+        "set_image",
+        lambda **kwargs: redraw_calls.append(kwargs),
+    )
+
+    module.refresh_selected_display_channel()
+
+    assert redraw_calls == []
+
+
+def test_review_metadata_churn_skips_redraw_for_same_run_without_new_frames(
+    qapp,
+    monkeypatch,
+):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(module, services, qapp, channel_index=0)
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            run_id="run-101",
+            judgment_payload={"overall": "合格"},
+        ),
+    )
+    qapp.processEvents()
+
+    redraw_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        module.canvas.heatmap,
+        "set_image",
+        lambda **kwargs: redraw_calls.append(kwargs),
+    )
+
+    services.bus.factory_review_changed.emit(
+        _make_review_payload(
+            run_id="run-101",
+            judgment_payload=None,
+        )
+    )
+    qapp.processEvents()
+
+    assert redraw_calls == []
+    assert module.selection_box.isVisible() is True
+
+
+def test_review_and_reanalysis_state_churn_skip_redraw_for_unchanged_signature(
+    qapp,
+    monkeypatch,
+):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(module, services, qapp, channel_index=0)
+    payload = _make_review_payload(
+        run_id="run-101",
+        judgment_payload={"overall": "合格"},
+    )
+    _emit_reviewing(module, services, payload)
+    qapp.processEvents()
+
+    redraw_calls: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        module.canvas.heatmap,
+        "set_image",
+        lambda **kwargs: redraw_calls.append(kwargs),
+    )
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="reanalyzing",
+            trigger_source="manual",
+        )
+    )
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="reviewing",
+            trigger_source="manual",
+        )
+    )
+    qapp.processEvents()
+
+    assert redraw_calls == []
 
 
 def test_refresh_selected_display_channel_restores_cached_image_after_heatmap_clear(
