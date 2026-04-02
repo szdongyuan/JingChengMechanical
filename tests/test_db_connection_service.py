@@ -1,123 +1,348 @@
-"""Tests for DbConnectionService creating AI tables at startup."""
+"""Regression tests for startup DB bootstrap and migration repair."""
 from __future__ import annotations
 
 import os
 import tempfile
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 from peewee import SqliteDatabase
 
+from app.service.config_service import ConfigService
+from app.service.hardwareselect_service import HardwareSelectService
 from model.ai_execution_table import AiExecutionTable
 from model.ai_toolchain_table import AiToolchainTable
+from model.audio_data_table import AudioDataTable
+from model.channel_config_table import ChannelConfigTable
+from model.device_table import DeviceTable
+from model.system_info_table import SystemInfoTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable as AiBindingTable
+from model.test_config_table import TestConfigTable as ConfigTable
+from model.training_model_table import TrainingModelTable
+from model.users_table import UsersTable
+from ui.modules.login import encrypt_password
 
 
-def _index_definitions(tmp_db, table_name: str) -> list[tuple[tuple[str, ...], bool]]:
+EXPECTED_RUNTIME_TABLES = {
+    "test_config_table",
+    "channel_config_table",
+    "ai_toolchain_table",
+    "test_config_ai_binding_table",
+    "ai_execution_table",
+    "device_table",
+    "audio_data_table",
+    "users_table",
+    "system_info_table",
+    "training_model_table",
+}
+
+RUNTIME_MODELS = [
+    ConfigTable,
+    ChannelConfigTable,
+    AiToolchainTable,
+    AiBindingTable,
+    AiExecutionTable,
+    DeviceTable,
+    AudioDataTable,
+    UsersTable,
+    SystemInfoTable,
+    TrainingModelTable,
+]
+
+
+@contextmanager
+def _temporary_runtime_db(monkeypatch):
+    fd, db_path = tempfile.mkstemp(suffix=".db")
+    os.close(fd)
+    tmp_db = SqliteDatabase(db_path, pragmas={"foreign_keys": 1})
+
+    import app.service.db_connection_service as svc_mod
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", tmp_db)
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    with tmp_db.bind_ctx(RUNTIME_MODELS):
+        try:
+            yield tmp_db, svc_mod.DbConnectionService(), svc_mod
+        finally:
+            if not tmp_db.is_closed():
+                tmp_db.close()
+
+    try:
+        os.unlink(db_path)
+    except OSError:
+        pass
+
+
+def _index_definitions(tmp_db, table_name: str) -> list[tuple[str, tuple[str, ...], bool]]:
     cursor = tmp_db.execute_sql(f"PRAGMA index_list({table_name})")
     definitions = []
     for _, index_name, unique, *_ in cursor.fetchall():
         info = tmp_db.execute_sql(f"PRAGMA index_info({index_name})").fetchall()
-        definitions.append((tuple(row[2] for row in info), bool(unique)))
+        definitions.append((index_name, tuple(row[2] for row in info), bool(unique)))
     return definitions
 
 
-def _bind_all_models(tmp_db):
-    from model.channel_config_table import ChannelConfigTable
-    from model.test_config_table import TestConfigTable
-
-    all_models = [
-        TestConfigTable,
-        ChannelConfigTable,
-        AiToolchainTable,
-        AiBindingTable,
-        AiExecutionTable,
-    ]
-    tmp_db.bind(all_models)
-    return all_models
+def _table_columns(tmp_db, table_name: str) -> dict[str, tuple]:
+    cursor = tmp_db.execute_sql(f"PRAGMA table_info({table_name})")
+    return {row[1]: row for row in cursor.fetchall()}
 
 
-def test_connect_creates_ai_tables(monkeypatch):
-    """DbConnectionService.connect() must create all 3 AI tables in a fresh DB."""
-    # Use a temp file DB so we can inspect it independently
-    fd, db_path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    try:
-        tmp_db = SqliteDatabase(db_path, pragmas={"foreign_keys": 1})
-        # Monkeypatch the module-level db object used by DbConnectionService
-        import model.base_mode as base_mod
+def _runtime_table_names(tmp_db) -> set[str]:
+    cursor = tmp_db.execute_sql(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+        """
+    )
+    return {row[0] for row in cursor.fetchall()}
 
-        monkeypatch.setattr(base_mod, "db", tmp_db)
 
-        # Re-import to pick up monkeypatched db
-        from app.service.db_connection_service import DbConnectionService
-
-        svc = DbConnectionService()
-        # We need to also monkeypatch the db reference in the service module
-        import app.service.db_connection_service as svc_mod
-
-        monkeypatch.setattr(svc_mod, "db", tmp_db)
-
-        # Rebind all model classes to the temp DB
-        _bind_all_models(tmp_db)
+def test_connect_bootstraps_full_runtime_schema_and_default_rows(monkeypatch):
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, svc_mod):
+        assert {
+            model._meta.table_name
+            for model in svc_mod.DbConnectionService.BOOTSTRAP_MODELS
+        } == EXPECTED_RUNTIME_TABLES
 
         svc.connect()
 
-        # Verify all AI tables exist by querying them
-        cursor = tmp_db.execute_sql(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        assert _runtime_table_names(tmp_db) == EXPECTED_RUNTIME_TABLES
+        assert tmp_db.execute_sql(
+            "SELECT id FROM device_table ORDER BY id"
+        ).fetchall() == [(1,)]
+
+        admin_row = tmp_db.execute_sql(
+            """
+            SELECT user_name, password, access_level, user_created_time, user_updated_time
+            FROM users_table
+            ORDER BY user_id
+            """
+        ).fetchone()
+        assert admin_row[:3] == (
+            "admin",
+            encrypt_password("admin", "admin"),
+            "Admin",
         )
-        table_names = {row[0] for row in cursor.fetchall()}
-        assert "ai_toolchain_table" in table_names
-        assert "test_config_ai_binding_table" in table_names
-        assert "ai_execution_table" in table_names
-        assert "migration_marker_table" not in table_names
+        assert admin_row[3]
+        assert admin_row[4]
 
-        cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_ai_binding_table)")
-        column_names = {row[1] for row in cursor.fetchall()}
-        assert "score_threshold" in column_names
-        assert "analysis_window_offset_ms" not in column_names
-        assert (("toolchain_id",), False) in _index_definitions(
-            tmp_db, "test_config_ai_binding_table"
+        login_user = (
+            UsersTable.select()
+            .where(
+                UsersTable.user_name == "admin",
+                UsersTable.password == encrypt_password("admin", "admin"),
+                UsersTable.access_level == "Admin",
+            )
+            .first()
+        )
+        assert login_user is not None
+
+
+def test_connect_is_idempotent_for_seeded_rows(monkeypatch):
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
+        svc.connect()
+        svc.connect()
+
+        assert tmp_db.execute_sql(
+            "SELECT COUNT(*) FROM device_table WHERE id = 1"
+        ).fetchone() == (1,)
+        assert tmp_db.execute_sql("SELECT COUNT(*) FROM users_table").fetchone() == (1,)
+        assert tmp_db.execute_sql(
+            "SELECT COUNT(*) FROM users_table WHERE user_name = 'admin'"
+        ).fetchone() == (1,)
+
+
+def test_connect_repairs_device_singleton_and_preserves_existing_rows(monkeypatch):
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
+        tmp_db.connect()
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE device_table (
+                id INTEGER PRIMARY KEY,
+                input_selected_device_id INTEGER,
+                input_selected_device_name TEXT,
+                input_selected_device_type TEXT,
+                input_selected_device_samplerate TEXT,
+                input_channel_count TEXT,
+                output_selected_device_id INTEGER,
+                output_selected_device_name TEXT,
+                output_selected_device_type TEXT,
+                output_selected_device_samplerate TEXT,
+                output_channel_count TEXT,
+                mic_cal TEXT
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO device_table (
+                id,
+                input_selected_device_id,
+                input_selected_device_name,
+                input_selected_device_type,
+                input_selected_device_samplerate,
+                input_channel_count,
+                output_selected_device_id,
+                output_selected_device_name,
+                output_selected_device_type,
+                output_selected_device_samplerate,
+                output_channel_count,
+                mic_cal
+            ) VALUES (
+                2,
+                7,
+                'Legacy Input',
+                'ASIO',
+                '48000',
+                '2',
+                9,
+                'Legacy Output',
+                'WASAPI',
+                '48000',
+                '2',
+                '{"In1": {"deviation_value": "1"}}'
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE users_table (
+                user_id INTEGER PRIMARY KEY,
+                user_name TEXT NOT NULL UNIQUE,
+                password TEXT NOT NULL,
+                access_level TEXT NOT NULL,
+                user_created_time TEXT,
+                user_updated_time TEXT
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO users_table (
+                user_id,
+                user_name,
+                password,
+                access_level,
+                user_created_time,
+                user_updated_time
+            ) VALUES (1, 'engineer', 'seeded', 'Engineer', '2026-04-02 00:00:00', '2026-04-02 00:00:00')
+            """
         )
 
-        svc.close()
-        tmp_db.close()
-    finally:
-        try:
-            os.unlink(db_path)
-        except OSError:
-            pass  # Windows may still hold the file briefly
+        svc.connect()
+
+        assert tmp_db.execute_sql(
+            "SELECT id FROM device_table ORDER BY id"
+        ).fetchall() == [(1,), (2,)]
+        assert tmp_db.execute_sql(
+            """
+            SELECT input_selected_device_name, output_selected_device_name
+            FROM device_table
+            WHERE id = 2
+            """
+        ).fetchone() == ("Legacy Input", "Legacy Output")
+        assert tmp_db.execute_sql(
+            "SELECT user_name, access_level FROM users_table ORDER BY user_id"
+        ).fetchall() == [("engineer", "Engineer")]
+
+        assert HardwareSelectService.load_io_devices() == {
+            "input": {
+                "id": None,
+                "name": None,
+                "type": None,
+                "samplerate": None,
+                "channel_count": None,
+            },
+            "output": {
+                "id": None,
+                "name": None,
+                "type": None,
+                "samplerate": None,
+                "channel_count": None,
+            },
+            "mic_cal": {},
+        }
 
 
-def test_connect_creates_test_config_table_with_exact_fresh_schema_columns(monkeypatch):
-    """DbConnectionService.connect() must create the trigger-cleanup config schema."""
-    fd, db_path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    try:
-        tmp_db = SqliteDatabase(db_path, pragmas={"foreign_keys": 1})
-        import model.base_mode as base_mod
+def test_connect_migrates_legacy_config_tables_and_preserves_extra_columns(
+    monkeypatch,
+):
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
+        tmp_db.connect()
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE test_config_table (
+                config_id INTEGER PRIMARY KEY,
+                config_name TEXT NOT NULL UNIQUE,
+                record_duration REAL NOT NULL DEFAULT 5.0,
+                analysis_duration REAL NOT NULL DEFAULT 3.0,
+                scan_triggers_test INTEGER NOT NULL DEFAULT 0,
+                created_time TEXT NOT NULL DEFAULT '',
+                updated_time TEXT NOT NULL DEFAULT '',
+                legacy_note TEXT DEFAULT ''
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE channel_config_table (
+                channel_config_id INTEGER PRIMARY KEY,
+                config_id INTEGER NOT NULL REFERENCES test_config_table(config_id) ON DELETE CASCADE,
+                channel_index INTEGER NOT NULL,
+                stft_nfft INTEGER NOT NULL DEFAULT 1024,
+                stft_overlap REAL NOT NULL DEFAULT 0.5,
+                spl_weighting TEXT NOT NULL DEFAULT 'A',
+                spl_time_constant REAL NOT NULL DEFAULT 0.125,
+                spl_upper_limit REAL NOT NULL DEFAULT 85.0,
+                spl_lower_limit REAL NOT NULL DEFAULT 40.0,
+                fft_band_limits TEXT NOT NULL DEFAULT '[]',
+                oct_weighting TEXT NOT NULL DEFAULT 'A',
+                oct_band_limits TEXT NOT NULL DEFAULT '[]',
+                ai_config TEXT NOT NULL DEFAULT '{}'
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO test_config_table (
+                config_id,
+                config_name,
+                record_duration,
+                analysis_duration,
+                scan_triggers_test,
+                created_time,
+                updated_time,
+                legacy_note
+            ) VALUES (1, 'Legacy Config', 5.0, 3.0, 0, '', '', 'keep me')
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO channel_config_table (
+                channel_config_id,
+                config_id,
+                channel_index,
+                stft_nfft,
+                stft_overlap,
+                spl_weighting,
+                spl_time_constant,
+                spl_upper_limit,
+                spl_lower_limit,
+                fft_band_limits,
+                oct_weighting,
+                oct_band_limits,
+                ai_config
+            ) VALUES (1, 1, 0, 1024, 0.5, 'A', 0.125, 85.0, 40.0, '[]', 'A', '[]', '{}')
+            """
+        )
 
-        monkeypatch.setattr(base_mod, "db", tmp_db)
+        svc.connect()
 
-        from app.service.db_connection_service import DbConnectionService
-        import app.service.db_connection_service as svc_mod
-
-        monkeypatch.setattr(svc_mod, "db", tmp_db)
-
-        _bind_all_models(tmp_db)
-
-        DbConnectionService().connect()
-
-        cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_table)")
-        column_names = {row[1] for row in cursor.fetchall()}
-
-        assert column_names == {
-            "config_id",
-            "config_name",
-            "record_duration",
-            "analysis_duration",
-            "scan_triggers_test",
-            "created_time",
-            "updated_time",
+        config_columns = _table_columns(tmp_db, "test_config_table")
+        assert {
             "input_device_name",
             "input_device_hostapi",
             "input_device_samplerate",
@@ -128,57 +353,17 @@ def test_connect_creates_test_config_table_with_exact_fresh_schema_columns(monke
             "plc_device_key",
             "plc_device_label",
             "analysis_window_offset_ms",
-        }
+            "legacy_note",
+        } <= set(config_columns)
+        assert tmp_db.execute_sql(
+            "SELECT legacy_note FROM test_config_table WHERE config_id = 1"
+        ).fetchone() == ("keep me",)
 
-        tmp_db.close()
-    finally:
-        try:
-            os.unlink(db_path)
-        except OSError:
-            pass
-
-
-def test_connect_creates_channel_config_table_with_golden_columns_in_fresh_schema(
-    monkeypatch,
-):
-    """DbConnectionService.connect() must create fresh golden binding columns."""
-    fd, db_path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    try:
-        tmp_db = SqliteDatabase(db_path, pragmas={"foreign_keys": 1})
-        import model.base_mode as base_mod
-
-        monkeypatch.setattr(base_mod, "db", tmp_db)
-
-        from app.service.db_connection_service import DbConnectionService
-        import app.service.db_connection_service as svc_mod
-
-        monkeypatch.setattr(svc_mod, "db", tmp_db)
-
-        _bind_all_models(tmp_db)
-
-        DbConnectionService().connect()
-
-        cursor = tmp_db.execute_sql("PRAGMA table_info(channel_config_table)")
-        column_names = {row[1] for row in cursor.fetchall()}
-
+        channel_columns = _table_columns(tmp_db, "channel_config_table")
         assert {
-            "channel_config_id",
-            "config_id",
-            "channel_index",
-            "stft_nfft",
-            "stft_overlap",
-            "spl_weighting",
-            "spl_time_constant",
-            "spl_upper_limit",
-            "spl_lower_limit",
             "loudness_unit",
             "loudness_lower_limit",
             "loudness_upper_limit",
-            "fft_band_limits",
-            "oct_weighting",
-            "oct_band_limits",
-            "ai_config",
             "golden_sample_path",
             "golden_sample_label",
             "golden_sample_source_channel",
@@ -191,107 +376,50 @@ def test_connect_creates_channel_config_table_with_golden_columns_in_fresh_schem
             "fft_show_golden_overlay",
             "oct_golden_mode",
             "oct_show_golden_overlay",
-        } <= column_names
+        } <= set(channel_columns)
 
-        tmp_db.close()
-    finally:
-        try:
-            os.unlink(db_path)
-        except OSError:
-            pass
-
-
-def test_migrate_adds_only_supported_columns_to_existing_db(monkeypatch):
-    """DbConnectionService.connect() must not restore removed trigger columns."""
-    fd, db_path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    try:
-        tmp_db = SqliteDatabase(db_path, pragmas={"foreign_keys": 1})
-        import model.base_mode as base_mod
-
-        monkeypatch.setattr(base_mod, "db", tmp_db)
-
-        from app.service.db_connection_service import DbConnectionService
-
-        svc = DbConnectionService()
-        import app.service.db_connection_service as svc_mod
-
-        monkeypatch.setattr(svc_mod, "db", tmp_db)
-
-        _bind_all_models(tmp_db)
-
-        tmp_db.connect()
-        tmp_db.execute_sql(
-            """
-            CREATE TABLE test_config_table (
-                config_id INTEGER PRIMARY KEY,
-                config_name TEXT NOT NULL UNIQUE,
-                record_duration REAL NOT NULL DEFAULT 5.0,
-                analysis_duration REAL NOT NULL DEFAULT 3.0,
-                scan_triggers_test INTEGER NOT NULL DEFAULT 0,
-                created_time TEXT NOT NULL,
-                updated_time TEXT NOT NULL
-            )
-            """
-        )
-        tmp_db.close()
-
-        svc.connect()
-
-        cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_table)")
-        column_names = {row[1] for row in cursor.fetchall()}
-
-        assert column_names == {
-            "config_id",
-            "config_name",
-            "record_duration",
-            "analysis_duration",
-            "scan_triggers_test",
-            "created_time",
-            "updated_time",
-            "input_device_name",
-            "input_device_hostapi",
-            "input_device_samplerate",
-            "output_device_name",
-            "output_device_hostapi",
-            "output_device_samplerate",
-            "selected_channels",
-            "analysis_window_offset_ms",
-        }
-        assert "plc_device_key" not in column_names
-        assert "plc_device_label" not in column_names
-
-        svc.close()
-        tmp_db.close()
-    finally:
-        try:
-            os.unlink(db_path)
-        except OSError:
-            pass  # Windows may still hold the file briefly
+        loaded = ConfigService(
+            bus=None,
+            golden_sample_service=SimpleNamespace(),
+        ).load_config(1)
+        assert loaded["analysis_window_offset_ms"] == 0
+        assert loaded["plc_device_key"] is None
+        assert loaded["plc_device_label"] is None
+        assert loaded["selected_channels"] == [0]
+        assert loaded["channels"] == [
+            {
+                "channel_index": 0,
+                "stft_nfft": 1024,
+                "stft_overlap": 0.5,
+                "spl_weighting": "A",
+                "spl_time_constant": 0.125,
+                "spl_upper_limit": 85.0,
+                "spl_lower_limit": 40.0,
+                "loudness_unit": "sone",
+                "loudness_lower_limit": 0.0,
+                "loudness_upper_limit": 60.0,
+                "fft_band_limits": [],
+                "oct_weighting": "A",
+                "oct_band_limits": [],
+                "ai_config": {},
+                "golden_sample_path": None,
+                "golden_sample_label": None,
+                "golden_sample_source_channel": None,
+                "golden_sample_start_sample": None,
+                "golden_sample_num_samples": None,
+                "golden_sample_start_ms": None,
+                "golden_sample_duration_ms": None,
+                "golden_sample_sample_rate": None,
+                "fft_golden_mode": "off",
+                "fft_show_golden_overlay": False,
+                "oct_golden_mode": "off",
+                "oct_show_golden_overlay": False,
+            }
+        ]
 
 
-def test_migrate_existing_binding_table_keeps_legacy_offset_column_untouched(
-    monkeypatch,
-):
-    """connect() should not run legacy binding-table rebuild logic for old offset columns."""
-    fd, db_path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    try:
-        tmp_db = SqliteDatabase(db_path, pragmas={"foreign_keys": 1})
-        import model.base_mode as base_mod
-
-        monkeypatch.setattr(base_mod, "db", tmp_db)
-
-        from app.service.db_connection_service import DbConnectionService
-
-        svc = DbConnectionService()
-        import app.service.db_connection_service as svc_mod
-
-        monkeypatch.setattr(svc_mod, "db", tmp_db)
-
-        _bind_all_models(tmp_db)
-
-        # Create a binding table WITHOUT score_threshold (simulating old schema)
+def test_connect_migrates_legacy_ai_binding_table_in_place(monkeypatch):
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
         tmp_db.connect()
         tmp_db.execute_sql(
             """
@@ -336,6 +464,12 @@ def test_migrate_existing_binding_table_keeps_legacy_offset_column_untouched(
         )
         tmp_db.execute_sql(
             """
+            CREATE INDEX testconfigaibindingtable_toolchain_id
+            ON test_config_ai_binding_table (toolchain_id)
+            """
+        )
+        tmp_db.execute_sql(
+            """
             INSERT INTO ai_toolchain_table (
                 toolchain_id,
                 display_name,
@@ -375,33 +509,19 @@ def test_migrate_existing_binding_table_keeps_legacy_offset_column_untouched(
             ) VALUES (1, 1, 1, 'legacy-toolchain', 1200, 250, '{"legacy": true}', '')
             """
         )
-        tmp_db.close()
 
         svc.connect()
 
-        cursor = tmp_db.execute_sql("PRAGMA table_info(test_config_ai_binding_table)")
-        columns = {row[1]: row for row in cursor.fetchall()}
+        columns = _table_columns(tmp_db, "test_config_ai_binding_table")
         assert "score_threshold" in columns
         assert "analysis_window_offset_ms" in columns
-        assert columns["score_threshold"][4] == "NULL"
-        assert (("toolchain_id",), False) in _index_definitions(
-            tmp_db, "test_config_ai_binding_table"
-        )
-
-        cursor = tmp_db.execute_sql(
-            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-        )
-        table_names = {row[0] for row in cursor.fetchall()}
-        assert "migration_marker_table" not in table_names
-
-        cursor = tmp_db.execute_sql(
+        assert tmp_db.execute_sql(
             """
             SELECT enabled, toolchain_id, timeout_ms, analysis_window_offset_ms, params_json, score_threshold
             FROM test_config_ai_binding_table
             WHERE config_id = 1
             """
-        )
-        assert cursor.fetchone() == (
+        ).fetchone() == (
             1,
             "legacy-toolchain",
             1200,
@@ -409,222 +529,178 @@ def test_migrate_existing_binding_table_keeps_legacy_offset_column_untouched(
             '{"legacy": true}',
             None,
         )
-
-        svc.close()
-        tmp_db.close()
-    finally:
-        try:
-            os.unlink(db_path)
-        except OSError:
-            pass
+        assert (
+            "testconfigaibindingtable_toolchain_id",
+            ("toolchain_id",),
+            False,
+        ) in _index_definitions(tmp_db, "test_config_ai_binding_table")
 
 
-def test_migrate_channel_config_adds_loudness_columns_and_backfills_existing_rows(
-    monkeypatch,
-):
-    """connect() should add loudness columns to legacy channel rows."""
-    fd, db_path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    try:
-        tmp_db = SqliteDatabase(db_path, pragmas={"foreign_keys": 1})
-        import model.base_mode as base_mod
-
-        monkeypatch.setattr(base_mod, "db", tmp_db)
-
-        from app.service.db_connection_service import DbConnectionService
-        import app.service.db_connection_service as svc_mod
-
-        monkeypatch.setattr(svc_mod, "db", tmp_db)
-
-        _bind_all_models(tmp_db)
-
+def test_connect_migrates_legacy_ai_runtime_tables(monkeypatch):
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
         tmp_db.connect()
         tmp_db.execute_sql(
             """
-            CREATE TABLE test_config_table (
-                config_id INTEGER PRIMARY KEY,
-                config_name TEXT NOT NULL UNIQUE,
-                record_duration REAL NOT NULL DEFAULT 5.0,
-                analysis_duration REAL NOT NULL DEFAULT 3.0,
-                scan_triggers_test INTEGER NOT NULL DEFAULT 0,
+            CREATE TABLE ai_toolchain_table (
+                toolchain_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                version TEXT NOT NULL DEFAULT '',
+                entrypoint TEXT NOT NULL,
+                default_timeout_ms INTEGER NOT NULL DEFAULT 30000,
+                enabled INTEGER NOT NULL DEFAULT 1,
                 created_time TEXT NOT NULL DEFAULT '',
-                updated_time TEXT NOT NULL DEFAULT ''
+                updated_time TEXT NOT NULL DEFAULT '',
+                legacy_source TEXT DEFAULT ''
             )
             """
         )
         tmp_db.execute_sql(
             """
-            CREATE TABLE channel_config_table (
-                channel_config_id INTEGER PRIMARY KEY,
-                config_id INTEGER NOT NULL REFERENCES test_config_table(config_id) ON DELETE CASCADE,
-                channel_index INTEGER NOT NULL,
-                stft_nfft INTEGER NOT NULL DEFAULT 1024,
-                stft_overlap REAL NOT NULL DEFAULT 0.5,
-                spl_weighting TEXT NOT NULL DEFAULT 'A',
-                spl_time_constant REAL NOT NULL DEFAULT 0.125,
-                spl_upper_limit REAL NOT NULL DEFAULT 85.0,
-                spl_lower_limit REAL NOT NULL DEFAULT 40.0,
-                fft_band_limits TEXT NOT NULL DEFAULT '[]',
-                oct_weighting TEXT NOT NULL DEFAULT 'A',
-                oct_band_limits TEXT NOT NULL DEFAULT '[]',
-                ai_config TEXT NOT NULL DEFAULT '{}'
+            CREATE TABLE ai_execution_table (
+                request_id TEXT PRIMARY KEY,
+                test_run_id TEXT NOT NULL,
+                config_id INTEGER NOT NULL,
+                toolchain_id TEXT NOT NULL,
+                module_status TEXT NOT NULL,
+                started_time TEXT,
+                finished_time TEXT,
+                duration_ms INTEGER,
+                exit_code INTEGER,
+                error_summary TEXT,
+                stdout_excerpt TEXT,
+                stderr_excerpt TEXT,
+                ai_label TEXT,
+                score REAL,
+                summary TEXT,
+                confidence REAL,
+                extra_json TEXT,
+                artifacts_json TEXT,
+                raw_response_json TEXT,
+                legacy_payload TEXT DEFAULT ''
             )
             """
         )
         tmp_db.execute_sql(
             """
-            INSERT INTO test_config_table (
-                config_id,
-                config_name,
-                record_duration,
-                analysis_duration,
-                scan_triggers_test,
+            INSERT INTO ai_toolchain_table (
+                toolchain_id,
+                display_name,
+                version,
+                entrypoint,
+                default_timeout_ms,
+                enabled,
                 created_time,
-                updated_time
-            ) VALUES (1, 'Cfg1', 5.0, 3.0, 0, '', '')
+                updated_time,
+                legacy_source
+            ) VALUES (
+                'legacy-toolchain',
+                'Legacy Toolchain',
+                '1.0.0',
+                'legacy.entry',
+                30000,
+                1,
+                '',
+                '',
+                'keep'
+            )
             """
         )
         tmp_db.execute_sql(
             """
-            INSERT INTO channel_config_table (
-                channel_config_id,
+            INSERT INTO ai_execution_table (
+                request_id,
+                test_run_id,
                 config_id,
-                channel_index,
-                stft_nfft,
-                stft_overlap,
-                spl_weighting,
-                spl_time_constant,
-                spl_upper_limit,
-                spl_lower_limit,
-                fft_band_limits,
-                oct_weighting,
-                oct_band_limits,
-                ai_config
-            ) VALUES (1, 1, 0, 1024, 0.5, 'A', 0.125, 85.0, 40.0, '[]', 'A', '[]', '{}')
+                toolchain_id,
+                module_status,
+                started_time,
+                finished_time,
+                duration_ms,
+                exit_code,
+                error_summary,
+                stdout_excerpt,
+                stderr_excerpt,
+                ai_label,
+                score,
+                summary,
+                confidence,
+                extra_json,
+                artifacts_json,
+                raw_response_json,
+                legacy_payload
+            ) VALUES (
+                'req-1',
+                'run-1',
+                99,
+                'legacy-toolchain',
+                'completed',
+                '2026-04-02 00:00:00',
+                '2026-04-02 00:00:01',
+                1000,
+                0,
+                NULL,
+                'stdout',
+                NULL,
+                'OK',
+                0.9,
+                'summary',
+                0.8,
+                '{}',
+                '[]',
+                '{}',
+                'keep'
+            )
             """
         )
-        tmp_db.close()
 
-        DbConnectionService().connect()
+        svc.connect()
 
-        columns = {
-            row[1]: row for row in tmp_db.execute_sql(
-                "PRAGMA table_info(channel_config_table)"
-            ).fetchall()
-        }
-        assert "loudness_unit" in columns
-        assert "loudness_lower_limit" in columns
-        assert "loudness_upper_limit" in columns
+        toolchain_columns = _table_columns(tmp_db, "ai_toolchain_table")
+        assert {
+            "protocol_version",
+            "execution_mode",
+            "description",
+            "legacy_source",
+        } <= set(toolchain_columns)
         assert tmp_db.execute_sql(
             """
-            SELECT loudness_unit, loudness_lower_limit, loudness_upper_limit
-            FROM channel_config_table
-            WHERE channel_config_id = 1
+            SELECT protocol_version, execution_mode, description, legacy_source
+            FROM ai_toolchain_table
+            WHERE toolchain_id = 'legacy-toolchain'
             """
-        ).fetchone() == ("sone", 0.0, 60.0)
+        ).fetchone() == (1, "oneshot_process", "", "keep")
 
-        tmp_db.close()
-    finally:
-        try:
-            os.unlink(db_path)
-        except OSError:
-            pass
-
-
-def test_migrate_channel_config_backfills_null_loudness_values(monkeypatch):
-    """connect() should backfill null loudness values in existing channel rows."""
-    fd, db_path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    try:
-        tmp_db = SqliteDatabase(db_path, pragmas={"foreign_keys": 1})
-        import model.base_mode as base_mod
-
-        monkeypatch.setattr(base_mod, "db", tmp_db)
-
-        from app.service.db_connection_service import DbConnectionService
-        import app.service.db_connection_service as svc_mod
-
-        monkeypatch.setattr(svc_mod, "db", tmp_db)
-
-        _bind_all_models(tmp_db)
-
-        tmp_db.connect()
-        tmp_db.execute_sql(
-            """
-            CREATE TABLE test_config_table (
-                config_id INTEGER PRIMARY KEY,
-                config_name TEXT NOT NULL UNIQUE,
-                record_duration REAL NOT NULL DEFAULT 5.0,
-                analysis_duration REAL NOT NULL DEFAULT 3.0,
-                scan_triggers_test INTEGER NOT NULL DEFAULT 0,
-                created_time TEXT NOT NULL DEFAULT '',
-                updated_time TEXT NOT NULL DEFAULT ''
-            )
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            CREATE TABLE channel_config_table (
-                channel_config_id INTEGER PRIMARY KEY,
-                config_id INTEGER NOT NULL REFERENCES test_config_table(config_id) ON DELETE CASCADE,
-                channel_index INTEGER NOT NULL,
-                stft_nfft INTEGER NOT NULL DEFAULT 1024,
-                stft_overlap REAL NOT NULL DEFAULT 0.5,
-                spl_weighting TEXT NOT NULL DEFAULT 'A',
-                spl_time_constant REAL NOT NULL DEFAULT 0.125,
-                spl_upper_limit REAL NOT NULL DEFAULT 85.0,
-                spl_lower_limit REAL NOT NULL DEFAULT 40.0,
-                fft_band_limits TEXT NOT NULL DEFAULT '[]',
-                oct_weighting TEXT NOT NULL DEFAULT 'A',
-                oct_band_limits TEXT NOT NULL DEFAULT '[]',
-                ai_config TEXT NOT NULL DEFAULT '{}',
-                loudness_unit TEXT DEFAULT NULL,
-                loudness_lower_limit REAL DEFAULT NULL,
-                loudness_upper_limit REAL DEFAULT NULL
-            )
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            INSERT INTO test_config_table (
-                config_id,
-                config_name,
-                record_duration,
-                analysis_duration,
-                scan_triggers_test,
-                created_time,
-                updated_time
-            ) VALUES (1, 'Cfg1', 5.0, 3.0, 0, '', '')
-            """
-        )
-        tmp_db.execute_sql(
-            """
-            INSERT INTO channel_config_table (
-                channel_config_id,
-                config_id,
-                channel_index,
-                loudness_unit,
-                loudness_lower_limit,
-                loudness_upper_limit
-            ) VALUES (1, 1, 0, NULL, NULL, NULL)
-            """
-        )
-        tmp_db.close()
-
-        DbConnectionService().connect()
-
+        execution_columns = _table_columns(tmp_db, "ai_execution_table")
+        assert {
+            "toolchain_name",
+            "toolchain_version",
+            "protocol_version",
+            "window_overridden",
+            "default_window_offset_ms",
+            "default_window_duration_ms",
+            "final_window_offset_ms",
+            "final_window_duration_ms",
+            "is_current_effective",
+            "request_json_path",
+            "response_json_path",
+            "artifacts_dir",
+            "legacy_payload",
+        } <= set(execution_columns)
         assert tmp_db.execute_sql(
             """
-            SELECT loudness_unit, loudness_lower_limit, loudness_upper_limit
-            FROM channel_config_table
-            WHERE channel_config_id = 1
+            SELECT
+                protocol_version,
+                window_overridden,
+                default_window_offset_ms,
+                default_window_duration_ms,
+                final_window_offset_ms,
+                final_window_duration_ms,
+                is_current_effective,
+                request_json_path,
+                response_json_path,
+                artifacts_dir,
+                legacy_payload
+            FROM ai_execution_table
+            WHERE request_id = 'req-1'
             """
-        ).fetchone() == ("sone", 0.0, 60.0)
-
-        tmp_db.close()
-    finally:
-        try:
-            os.unlink(db_path)
-        except OSError:
-            pass
-
+        ).fetchone() == (1, 0, 0, 0, 0, 0, 0, None, None, None, "keep")
