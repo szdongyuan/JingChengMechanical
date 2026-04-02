@@ -984,6 +984,60 @@ def test_main_window_toolbar_selection_immediately_refreshes_stft_cached_channel
     )
 
 
+def test_main_window_page_reentry_does_not_redraw_visible_unchanged_stft(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(
+            config_id=101,
+            run_id="run-101",
+            trigger_source="manual",
+        )
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        0,
+        _make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)),
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        1,
+        _make_stft_frame(time=0.0, magnitudes=(9.0, 10.0)),
+    )
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 1)
+
+    redraw_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        window.stft.canvas.heatmap,
+        "set_image",
+        lambda **kwargs: redraw_calls.append(kwargs),
+    )
+
+    window.tab.setCurrentIndex(1)
+    qapp.processEvents()
+    window.tab.setCurrentIndex(0)
+    qapp.processEvents()
+
+    assert redraw_calls == []
+    assert window.stft.current_render_cache_key() == (101, "run-101", 1)
+
+
 def test_main_window_page_reentry_refreshes_stft_from_existing_cache(
     qapp,
     monkeypatch,
