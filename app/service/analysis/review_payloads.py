@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 import math
 
 import numpy as np
 
 from app.service.analysis import dsp
+from app.service.analysis.golden_reference import GoldenReferenceCache
 from app.service.analysis.judgment import _runtime_channel_defaults
 
 _SUMMARY_ROW_DEFS = (
@@ -18,6 +20,7 @@ _NO_RESULT_FALLBACK_MESSAGE = "分析结果不可用"
 _NO_RESULT_STATUS = "无结果"
 _REF_PRESSURE = 20e-6
 _SPL_CHUNK_DURATION_SEC = 0.05
+logger = logging.getLogger(__name__)
 
 
 def canonical_channel_label(channel_index: int | None) -> str:
@@ -53,6 +56,28 @@ def build_summary_payload(
         channel_configs=channel_configs,
         channel_results=channel_results,
     )
+    fft_row, fft_error_message = _build_band_row(
+        item_key="fft",
+        label="FFT",
+        config_key="fft_band_limits",
+        result_key="fft_band_results",
+        available_key="fft_available",
+        error_key="fft_error_message",
+        selected_channels=selected_channels,
+        channel_configs=channel_configs,
+        channel_results=channel_results,
+    )
+    octave_row, octave_error_message = _build_band_row(
+        item_key="octave",
+        label="倍频程",
+        config_key="oct_band_limits",
+        result_key="oct_band_results",
+        available_key="octave_available",
+        error_key="octave_error_message",
+        selected_channels=selected_channels,
+        channel_configs=channel_configs,
+        channel_results=channel_results,
+    )
     rows = [
         _build_spl_row(
             selected_channels=selected_channels,
@@ -60,24 +85,8 @@ def build_summary_payload(
             channel_results=channel_results,
         ),
         loudness_row,
-        _build_band_row(
-            item_key="fft",
-            label="FFT",
-            config_key="fft_band_limits",
-            result_key="fft_band_results",
-            selected_channels=selected_channels,
-            channel_configs=channel_configs,
-            channel_results=channel_results,
-        ),
-        _build_band_row(
-            item_key="octave",
-            label="倍频程",
-            config_key="oct_band_limits",
-            result_key="oct_band_results",
-            selected_channels=selected_channels,
-            channel_configs=channel_configs,
-            channel_results=channel_results,
-        ),
+        fft_row,
+        octave_row,
         ai_row,
     ]
     overall_status = _overall_status(rows)
@@ -85,7 +94,13 @@ def build_summary_payload(
         "overall_status": overall_status,
         "overall_label": _overall_label(overall_status),
         "error_message": (
-            _normalize_error_message(error_message, loudness_error_message, ai_error_message)
+            _normalize_error_message(
+                error_message,
+                loudness_error_message,
+                fft_error_message,
+                octave_error_message,
+                ai_error_message,
+            )
             if overall_status == "no_result"
             else None
         ),
@@ -121,22 +136,50 @@ def build_chart_payload(
         if isinstance(judgment_payload, dict)
         else {}
     )
+    golden_cache = GoldenReferenceCache()
+    configured_input_sample_rate = config.get("input_device_samplerate")
     payload: dict[int, dict] = {}
     for channel_index in _selected_chart_channels(config, buffer):
         signal = _extract_channel(window, channel_index)
         if signal is None or signal.size <= 0:
             continue
         channel_config = _runtime_channel_config(config, channel_index)
-        calibrated = _apply_mic_calibration(signal, mic_cal, channel_index)
+        mic_sensitivity = _mic_sensitivity(mic_cal, channel_index)
+        calibrated = dsp.apply_mic_calibration(signal, mic_sensitivity)
+        channel_result = channel_results.get(channel_index)
+        golden_bundle_loader = _build_golden_bundle_loader(
+            channel_index=channel_index,
+            channel_config=channel_config,
+            configured_input_sample_rate=configured_input_sample_rate,
+            runtime_sample_rate=sample_rate,
+            mic_sensitivity=mic_sensitivity,
+            golden_cache=golden_cache,
+        )
         channel_payload = {
             "spl": _build_spl_chart(signal=calibrated, sample_rate=sample_rate, channel_config=channel_config),
-            "fft": _build_fft_chart(signal=calibrated, sample_rate=sample_rate, channel_config=channel_config),
-            "octave": _build_octave_chart(
-                signal=calibrated,
-                sample_rate=sample_rate,
-                channel_config=channel_config,
-            ),
         }
+        fft_payload = _build_fft_chart(
+            channel_index=channel_index,
+            signal=calibrated,
+            sample_rate=sample_rate,
+            channel_config=channel_config,
+            channel_result=channel_result,
+            golden_cache=golden_cache,
+            golden_bundle_loader=golden_bundle_loader,
+        )
+        if isinstance(fft_payload, dict):
+            channel_payload["fft"] = fft_payload
+        octave_payload = _build_octave_chart(
+            channel_index=channel_index,
+            signal=calibrated,
+            sample_rate=sample_rate,
+            channel_config=channel_config,
+            channel_result=channel_result,
+            golden_cache=golden_cache,
+            golden_bundle_loader=golden_bundle_loader,
+        )
+        if isinstance(octave_payload, dict):
+            channel_payload["octave"] = octave_payload
         channel_result = channel_results.get(channel_index)
         if not isinstance(channel_result, dict) or channel_result.get("loudness_available") is True:
             try:
@@ -225,10 +268,12 @@ def _build_band_row(
     label: str,
     config_key: str,
     result_key: str,
+    available_key: str,
+    error_key: str,
     selected_channels: tuple[int, ...],
     channel_configs: dict[int, dict],
     channel_results: dict[int, dict],
-    ) -> dict:
+) -> tuple[dict, str | None]:
     configured_any = False
     candidates = []
     for channel_index in selected_channels:
@@ -239,24 +284,40 @@ def _build_band_row(
         if not isinstance(configured_bands, list) or not configured_bands:
             continue
         channel_result = channel_results.get(channel_index)
+        if not isinstance(channel_result, dict):
+            return (
+                _build_constrained_no_result_row(item_key, label),
+                None,
+            )
+        if channel_result.get(available_key) is False:
+            return (
+                _build_constrained_no_result_row(item_key, label, channel_index=channel_index),
+                _normalize_error_message(channel_result.get(error_key)),
+            )
         channel_candidates = _build_configured_band_candidates(
             configured_bands=configured_bands,
-            band_results=channel_result.get(result_key) if isinstance(channel_result, dict) else None,
+            band_results=channel_result.get(result_key),
             channel_index=channel_index,
         )
         if channel_candidates is None:
-            return _build_constrained_no_result_row(item_key, label)
+            return (
+                _build_constrained_no_result_row(item_key, label),
+                _normalize_error_message(channel_result.get(error_key)),
+            )
         candidates.extend(channel_candidates)
     if not configured_any:
-        return _build_unconstrained_row(item_key, label)
+        return _build_unconstrained_row(item_key, label), None
     if not candidates:
-        return _build_constrained_no_result_row(item_key, label)
-    return _build_row_from_candidate(
-        item_key=item_key,
-        label=label,
-        candidate=_worst_candidate(candidates),
-        unit="dB",
-        constrained=True,
+        return _build_constrained_no_result_row(item_key, label), None
+    return (
+        _build_row_from_candidate(
+            item_key=item_key,
+            label=label,
+            candidate=_worst_candidate(candidates),
+            unit="dB",
+            constrained=True,
+        ),
+        None,
     )
 
 
@@ -695,16 +756,46 @@ def _extract_channel(buffer: np.ndarray, channel_index: int) -> np.ndarray | Non
     return np.asarray(buffer[:, channel_index], dtype=np.float64)
 
 
-def _apply_mic_calibration(signal: np.ndarray, mic_cal: dict, channel_index: int) -> np.ndarray:
+def _mic_sensitivity(mic_cal: dict, channel_index: int) -> float:
     if not isinstance(mic_cal, dict):
-        return dsp.apply_mic_calibration(signal, 0.0)
+        return 0.0
     entry = mic_cal.get(f"In{channel_index + 1}", {})
     raw = entry.get("deviation_value", "0")
     try:
-        sensitivity = float(raw)
+        return float(raw)
     except (TypeError, ValueError):
-        sensitivity = 0.0
-    return dsp.apply_mic_calibration(signal, sensitivity)
+        return 0.0
+
+
+def _build_golden_bundle_loader(
+    *,
+    channel_index: int,
+    channel_config: dict,
+    configured_input_sample_rate,
+    runtime_sample_rate: float,
+    mic_sensitivity: float,
+    golden_cache: GoldenReferenceCache,
+):
+    state: dict[str, object] = {"loaded": False, "bundle": None, "error": None}
+
+    def _load():
+        if state["loaded"] is not True:
+            try:
+                state["bundle"] = golden_cache.bundle_for_channel(
+                    channel_index=channel_index,
+                    channel_config=channel_config,
+                    configured_input_sample_rate=configured_input_sample_rate,
+                    runtime_sample_rate=runtime_sample_rate,
+                    mic_sensitivity=mic_sensitivity,
+                )
+            except Exception as exc:  # pragma: no cover - exercised through callers
+                state["error"] = exc
+            state["loaded"] = True
+        if state["error"] is not None:
+            raise state["error"]  # type: ignore[misc]
+        return state["bundle"]
+
+    return _load
 
 
 def _build_spl_chart(*, signal: np.ndarray, sample_rate: float, channel_config: dict) -> dict:
@@ -760,36 +851,217 @@ def _build_loudness_chart(*, signal: np.ndarray, sample_rate: float, channel_con
     }
 
 
-def _build_fft_chart(*, signal: np.ndarray, sample_rate: float, channel_config: dict) -> dict:
-    nfft = int(signal.size)
-    frequencies_hz, magnitudes_db = dsp.compute_fft_spectrum(signal, sample_rate, nfft)
-    levels_db = _absolute_levels_db(magnitudes_db)
-    return {
+def _build_fft_chart(
+    *,
+    channel_index: int,
+    signal: np.ndarray,
+    sample_rate: float,
+    channel_config: dict,
+    channel_result: dict | None,
+    golden_cache: GoldenReferenceCache,
+    golden_bundle_loader,
+) -> dict | None:
+    mode = _golden_mode(channel_config.get("fft_golden_mode"))
+    overlay_requested = bool(channel_config.get("fft_show_golden_overlay")) and mode != "delta"
+    if mode != "off" and isinstance(channel_result, dict) and channel_result.get("fft_available") is False:
+        _log_chart_warning(
+            "FFT chart payload omitted",
+            channel_index=channel_index,
+            error=channel_result.get("fft_error_message"),
+        )
+        return None
+
+    try:
+        frequencies_hz, measured_levels_db = _measure_fft_levels(signal, sample_rate)
+    except Exception:
+        if mode != "off":
+            logger.warning(
+                "FFT chart payload omitted for CH%s: measured recompute failed",
+                channel_index + 1,
+                exc_info=True,
+            )
+            return None
+        raise
+
+    if mode == "off":
+        chart = {
+            "frequencies_hz": _normalize_chart_list(frequencies_hz),
+            "levels_db": _normalize_chart_list(measured_levels_db),
+            "golden_mode": "off",
+            "limit_bands": _limit_bands_for_chart(
+                channel_result=channel_result,
+                result_key="fft_band_results",
+                frequencies=frequencies_hz,
+                levels_db=measured_levels_db,
+                configured_bands=channel_config.get("fft_band_limits", []),
+                mode=mode,
+            ),
+        }
+        if overlay_requested:
+            try:
+                golden_bundle = golden_bundle_loader()
+                golden_freqs_hz, golden_levels_db = golden_cache.ensure_fft(golden_bundle)
+                _validate_matching_axis(frequencies_hz, golden_freqs_hz, "FFT")
+            except Exception as exc:
+                logger.warning("黄金样本加载失败，FFT 对比曲线已忽略: %s", exc)
+            else:
+                chart["golden_overlay_levels_db"] = _normalize_chart_list(golden_levels_db)
+        return chart
+
+    try:
+        golden_bundle = golden_bundle_loader()
+        golden_freqs_hz, golden_levels_db = golden_cache.ensure_fft(golden_bundle)
+        _validate_matching_axis(frequencies_hz, golden_freqs_hz, "FFT")
+    except Exception as exc:
+        _log_chart_warning("FFT chart payload omitted", channel_index=channel_index, error=exc)
+        return None
+
+    plotted_levels_db = (
+        measured_levels_db if mode == "absolute" else measured_levels_db - golden_levels_db
+    )
+    chart = {
         "frequencies_hz": _normalize_chart_list(frequencies_hz),
-        "levels_db": _normalize_chart_list(levels_db),
-        "limit_bands": _build_limit_band_payloads(
+        "levels_db": _normalize_chart_list(plotted_levels_db),
+        "golden_mode": mode,
+        "limit_bands": _limit_bands_for_chart(
+            channel_result=channel_result,
+            result_key="fft_band_results",
             frequencies=frequencies_hz,
-            levels_db=levels_db,
+            levels_db=measured_levels_db,
             configured_bands=channel_config.get("fft_band_limits", []),
+            golden_levels_db=golden_levels_db,
+            mode=mode,
         ),
     }
+    if mode == "delta":
+        chart["show_zero_reference"] = True
+    elif overlay_requested:
+        chart["golden_overlay_levels_db"] = _normalize_chart_list(golden_levels_db)
+    return chart
 
 
-def _build_octave_chart(*, signal: np.ndarray, sample_rate: float, channel_config: dict) -> dict:
+def _build_octave_chart(
+    *,
+    channel_index: int,
+    signal: np.ndarray,
+    sample_rate: float,
+    channel_config: dict,
+    channel_result: dict | None,
+    golden_cache: GoldenReferenceCache,
+    golden_bundle_loader,
+) -> dict | None:
     weighting = str(channel_config.get("oct_weighting", "Z") or "Z")
-    center_freqs_hz, levels_db = dsp.compute_octave_bands(signal, sample_rate, weighting)
-    absolute_levels_db = _absolute_levels_db(levels_db)
-    chart_center_freqs_hz, chart_levels_db = _normalize_chart_pairs(center_freqs_hz, absolute_levels_db)
-    return {
+    mode = _golden_mode(channel_config.get("oct_golden_mode"))
+    overlay_requested = bool(channel_config.get("oct_show_golden_overlay")) and mode != "delta"
+    if mode != "off" and isinstance(channel_result, dict) and channel_result.get("octave_available") is False:
+        _log_chart_warning(
+            "octave chart payload omitted",
+            channel_index=channel_index,
+            error=channel_result.get("octave_error_message"),
+        )
+        return None
+
+    try:
+        center_freqs_hz, measured_levels_db = _measure_octave_levels(signal, sample_rate, weighting)
+    except Exception:
+        if mode != "off":
+            logger.warning(
+                "octave chart payload omitted for CH%s: measured recompute failed",
+                channel_index + 1,
+                exc_info=True,
+            )
+            return None
+        raise
+
+    if mode == "off":
+        chart_center_freqs_hz, chart_levels_db = _normalize_chart_pairs(
+            center_freqs_hz,
+            measured_levels_db,
+        )
+        chart = {
+            "center_freqs_hz": _normalize_chart_list(chart_center_freqs_hz),
+            "levels_db": _normalize_chart_list(chart_levels_db),
+            "golden_mode": "off",
+            "limit_bands": _limit_bands_for_chart(
+                channel_result=channel_result,
+                result_key="oct_band_results",
+                frequencies=center_freqs_hz,
+                levels_db=measured_levels_db,
+                configured_bands=channel_config.get("oct_band_limits", []),
+                require_exact_frequency=True,
+                mode=mode,
+            ),
+        }
+        if overlay_requested:
+            try:
+                golden_bundle = golden_bundle_loader()
+                golden_center_freqs_hz, golden_levels_db = golden_cache.ensure_octave(
+                    golden_bundle,
+                    weighting=weighting,
+                )
+                _validate_matching_axis(center_freqs_hz, golden_center_freqs_hz, "倍频程")
+            except Exception as exc:
+                logger.warning("黄金样本加载失败，倍频程对比曲线已忽略: %s", exc)
+            else:
+                chart["golden_overlay_levels_db"] = _normalize_chart_list(golden_levels_db)
+        return chart
+
+    try:
+        golden_bundle = golden_bundle_loader()
+        golden_center_freqs_hz, golden_levels_db = golden_cache.ensure_octave(
+            golden_bundle,
+            weighting=weighting,
+        )
+        _validate_matching_axis(center_freqs_hz, golden_center_freqs_hz, "倍频程")
+    except Exception as exc:
+        _log_chart_warning("octave chart payload omitted", channel_index=channel_index, error=exc)
+        return None
+
+    plotted_levels_db = (
+        measured_levels_db if mode == "absolute" else measured_levels_db - golden_levels_db
+    )
+    chart_center_freqs_hz, chart_levels_db = _normalize_chart_pairs(
+        center_freqs_hz,
+        plotted_levels_db,
+    )
+    chart = {
         "center_freqs_hz": _normalize_chart_list(chart_center_freqs_hz),
         "levels_db": _normalize_chart_list(chart_levels_db),
-        "limit_bands": _build_limit_band_payloads(
+        "golden_mode": mode,
+        "limit_bands": _limit_bands_for_chart(
+            channel_result=channel_result,
+            result_key="oct_band_results",
             frequencies=center_freqs_hz,
-            levels_db=absolute_levels_db,
+            levels_db=measured_levels_db,
             configured_bands=channel_config.get("oct_band_limits", []),
+            golden_levels_db=golden_levels_db,
             require_exact_frequency=True,
+            mode=mode,
         ),
     }
+    if mode == "delta":
+        chart["show_zero_reference"] = True
+    elif overlay_requested:
+        chart["golden_overlay_levels_db"] = _normalize_chart_list(golden_levels_db)
+    return chart
+
+
+def _measure_fft_levels(
+    signal: np.ndarray,
+    sample_rate: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    nfft = int(signal.size)
+    frequencies_hz, magnitudes_db = dsp.compute_fft_spectrum(signal, sample_rate, nfft)
+    return np.asarray(frequencies_hz, dtype=np.float64), _absolute_levels_db(magnitudes_db)
+
+
+def _measure_octave_levels(
+    signal: np.ndarray,
+    sample_rate: float,
+    weighting: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    center_freqs_hz, levels_db = dsp.compute_octave_bands(signal, sample_rate, weighting)
+    return np.asarray(center_freqs_hz, dtype=np.float64), _absolute_levels_db(levels_db)
 
 
 def _absolute_levels_db(levels_db: np.ndarray | list[float]) -> np.ndarray:
@@ -797,15 +1069,97 @@ def _absolute_levels_db(levels_db: np.ndarray | list[float]) -> np.ndarray:
     return levels - 20.0 * math.log10(_REF_PRESSURE)
 
 
+def _golden_mode(value) -> str:
+    mode = str(value or "off").strip().lower()
+    if mode in {"absolute", "delta"}:
+        return mode
+    return "off"
+
+
+def _validate_matching_axis(
+    measured_axis: np.ndarray,
+    golden_axis: np.ndarray,
+    label: str,
+) -> None:
+    if measured_axis.shape != golden_axis.shape:
+        raise RuntimeError(f"黄金样本{label}频轴不匹配")
+    if not np.allclose(measured_axis, golden_axis):
+        raise RuntimeError(f"黄金样本{label}频轴不匹配")
+
+
+def _log_chart_warning(message: str, *, channel_index: int, error) -> None:
+    logger.warning("%s for CH%s: %s", message, channel_index + 1, error)
+
+
+def _limit_bands_for_chart(
+    *,
+    channel_result: dict | None,
+    result_key: str,
+    frequencies: np.ndarray | list[float],
+    levels_db: np.ndarray | list[float],
+    configured_bands,
+    golden_levels_db: np.ndarray | list[float] | None = None,
+    require_exact_frequency: bool = False,
+    mode: str = "off",
+) -> list[dict]:
+    serialized = _build_limit_band_payloads_from_serialized_results(
+        channel_result.get(result_key) if isinstance(channel_result, dict) else None
+    )
+    if serialized is not None:
+        return serialized
+    return _build_limit_band_payloads(
+        frequencies=frequencies,
+        levels_db=levels_db,
+        configured_bands=configured_bands,
+        golden_levels_db=golden_levels_db,
+        require_exact_frequency=require_exact_frequency,
+        mode=mode,
+    )
+
+
+def _build_limit_band_payloads_from_serialized_results(band_results) -> list[dict] | None:
+    if not isinstance(band_results, list):
+        return None
+
+    payload: list[dict] = []
+    for band_result in band_results:
+        if not isinstance(band_result, dict):
+            continue
+        freq_hz = _normalize_chart_number(band_result.get("freq"))
+        actual_db = _normalize_chart_number(band_result.get("level"))
+        lower_db = _normalize_chart_number(band_result.get("lower"))
+        upper_db = _normalize_chart_number(band_result.get("upper"))
+        if freq_hz is None or actual_db is None:
+            continue
+        passed = band_result.get("passed")
+        payload.append(
+            {
+                "freq_hz": freq_hz,
+                "lower_db": lower_db,
+                "upper_db": upper_db,
+                "actual_db": actual_db,
+                "passed": passed if isinstance(passed, bool) else _passes_limit(actual_db, lower_db, upper_db),
+            }
+        )
+    return payload
+
+
 def _build_limit_band_payloads(
     *,
     frequencies: np.ndarray | list[float],
     levels_db: np.ndarray | list[float],
     configured_bands,
+    golden_levels_db: np.ndarray | list[float] | None = None,
     require_exact_frequency: bool = False,
+    mode: str = "off",
 ) -> list[dict]:
     frequency_axis = np.asarray(frequencies, dtype=np.float64)
     level_axis = np.asarray(levels_db, dtype=np.float64)
+    golden_axis = (
+        np.asarray(golden_levels_db, dtype=np.float64)
+        if golden_levels_db is not None
+        else None
+    )
     if frequency_axis.size == 0 or level_axis.size == 0:
         return []
 
@@ -823,9 +1177,21 @@ def _build_limit_band_payloads(
             idx = int(matches[0])
         else:
             idx = int(np.argmin(np.abs(frequency_axis - target_freq)))
-        actual_db = _normalize_chart_number(level_axis[idx])
-        lower_db = _normalize_chart_number(band.get("lower"))
-        upper_db = _normalize_chart_number(band.get("upper"))
+        golden_level = (
+            float(golden_axis[idx])
+            if golden_axis is not None and idx < int(golden_axis.size)
+            else None
+        )
+        actual_db, lower_db, upper_db = _chart_band_space(
+            actual_level=float(level_axis[idx]),
+            golden_level=golden_level,
+            lower=band.get("lower"),
+            upper=band.get("upper"),
+            mode=mode,
+        )
+        actual_db = _normalize_chart_number(actual_db)
+        lower_db = _normalize_chart_number(lower_db)
+        upper_db = _normalize_chart_number(upper_db)
         if actual_db is None:
             continue
         payload.append(
@@ -838,6 +1204,27 @@ def _build_limit_band_payloads(
             }
         )
     return payload
+
+
+def _chart_band_space(
+    *,
+    actual_level: float,
+    golden_level: float | None,
+    lower,
+    upper,
+    mode: str,
+) -> tuple[float, float | None, float | None]:
+    lower_value = _coerce_bound(lower)
+    upper_value = _coerce_bound(upper)
+    if mode == "absolute" and golden_level is not None:
+        if lower_value is not None:
+            lower_value = golden_level + lower_value
+        if upper_value is not None:
+            upper_value = golden_level + upper_value
+        return actual_level, lower_value, upper_value
+    if mode == "delta" and golden_level is not None:
+        return actual_level - golden_level, lower_value, upper_value
+    return actual_level, lower_value, upper_value
 
 
 def _passes_limit(actual_db: float, lower_db: float | None, upper_db: float | None) -> bool:

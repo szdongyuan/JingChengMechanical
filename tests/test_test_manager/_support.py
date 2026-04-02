@@ -340,6 +340,7 @@ def _expected_chart_payload() -> dict:
             "fft": {
                 "frequencies_hz": [1000.0],
                 "levels_db": [67.0],
+                "golden_mode": "off",
                 "limit_bands": [
                     {
                         "freq_hz": 1000.0,
@@ -353,6 +354,7 @@ def _expected_chart_payload() -> dict:
             "octave": {
                 "center_freqs_hz": [500.0],
                 "levels_db": [57.0],
+                "golden_mode": "off",
                 "limit_bands": [
                     {
                         "freq_hz": 500.0,

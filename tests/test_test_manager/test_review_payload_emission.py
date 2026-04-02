@@ -175,6 +175,84 @@ class TestReviewPayloadEmission:
         assert payload.no_result is False
         assert payload.error_message is None
 
+    def test_on_session_done_preserves_summary_when_fft_chart_item_is_omitted(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        post_attach = np.arange(500, dtype=np.float32).reshape(500, 1)
+        attach_snapshot = object()
+        rec = MagicMock()
+        rec.get_buffer_from.return_value = post_attach
+        rec._sample_rate = 100.0
+        session = MagicMock()
+        session.config_id = 1
+        session._buffer = None
+        session._attach_snapshot = attach_snapshot
+        session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+            "selected_channels": [0],
+            "channels": [{"channel_index": 0}],
+        }
+        session._workorder = {
+            "trigger_source": "scan",
+            "factory_run_id": "run-1",
+        }
+        session._audio_file_path = "captured.wav"
+        session.last_ai_review = {"status": "not_enabled"}
+        session._run_judgment.return_value = JudgmentResult(
+            overall="不合格",
+            limit_pass=False,
+            ai_pass=None,
+            ai_score=None,
+            analysis_window=(1.0, 3.0),
+            channel_results=[
+                ChannelJudgment(
+                    channel_index=0,
+                    spl_db=70.0,
+                    spl_pass=True,
+                    loudness_max_sone=3.0,
+                    loudness_pass=True,
+                    loudness_available=True,
+                    loudness_error_message=None,
+                    fft_available=True,
+                    fft_band_results=[],
+                    octave_available=True,
+                    oct_band_results=[],
+                )
+            ],
+        )
+        expected_summary = _expected_summary_payload(overall_status="no_result")
+        expected_summary["rows"][2]["status"] = "无结果"
+        expected_summary["rows"][2]["deviation_value"] = None
+        expected_summary["rows"][2]["deviation_display"] = "--"
+        expected_chart = _expected_chart_payload()
+        expected_chart[0].pop("fft")
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_summary_payload",
+            lambda **kwargs: expected_summary,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_chart_payload",
+            lambda **kwargs: expected_chart,
+            raising=False,
+        )
+        mgr._sessions[1] = session
+        mgr._recorders[1] = rec
+
+        mgr._on_session_done(1)
+
+        payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
+        assert payload.summary_payload == expected_summary
+        assert payload.chart_payload == expected_chart
+        assert payload.no_result is False
+        assert payload.error_message is None
+
     def test_on_session_done_required_window_failure_emits_no_chart_payload_and_no_result_summary(
         self,
         monkeypatch,

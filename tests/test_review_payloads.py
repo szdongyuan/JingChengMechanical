@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from app.service.analysis import dsp
+from app.service.analysis.golden_reference import GoldenReferenceError
 from app.service.analysis.review_payloads import build_chart_payload, build_summary_payload
 
 
@@ -101,6 +102,65 @@ def _make_judgment_payload():
     }
 
 
+def _make_single_channel_config(**channel_overrides):
+    config = _make_config()
+    channel = dict(config["channels"][0])
+    channel.update(channel_overrides)
+    config["selected_channels"] = [0]
+    config["channels"] = [channel]
+    return config
+
+
+def _make_single_channel_judgment_payload(**channel_overrides):
+    payload = _make_judgment_payload()
+    channel_result = dict(payload["channel_results"][0])
+    channel_result.update(channel_overrides)
+    payload["channel_results"] = [channel_result]
+    return payload
+
+
+class _GoldenCacheStub:
+    def __init__(
+        self,
+        *,
+        fft_axis=None,
+        fft_levels=None,
+        octave_axis=None,
+        octave_levels=None,
+        bundle_error: Exception | None = None,
+        fft_error: Exception | None = None,
+        octave_error: Exception | None = None,
+    ):
+        self.bundle_calls = 0
+        self.ensure_fft_calls = 0
+        self.ensure_octave_calls = 0
+        self.fft_axis = np.asarray(fft_axis or [], dtype=np.float64)
+        self.fft_levels = np.asarray(fft_levels or [], dtype=np.float64)
+        self.octave_axis = np.asarray(octave_axis or [], dtype=np.float64)
+        self.octave_levels = np.asarray(octave_levels or [], dtype=np.float64)
+        self.bundle_error = bundle_error
+        self.fft_error = fft_error
+        self.octave_error = octave_error
+
+    def bundle_for_channel(self, **kwargs):
+        self.bundle_calls += 1
+        if self.bundle_error is not None:
+            raise self.bundle_error
+        return object()
+
+    def ensure_fft(self, bundle):
+        self.ensure_fft_calls += 1
+        if self.fft_error is not None:
+            raise self.fft_error
+        return self.fft_axis, self.fft_levels
+
+    def ensure_octave(self, bundle, *, weighting):
+        self.ensure_octave_calls += 1
+        if self.octave_error is not None:
+            raise self.octave_error
+        return self.octave_axis, self.octave_levels
+
+
 def _build_single_channel_band_summary(*, config_key, result_key, band_results):
     configured_bands = [
         {"freq": 500.0, "lower": 35.0, "upper": 55.0},
@@ -142,6 +202,39 @@ def _build_single_channel_band_summary(*, config_key, result_key, band_results):
             ],
         },
         ai_review={"status": "not_enabled"},
+    )
+
+
+def _patch_basic_chart_backends(
+    monkeypatch,
+    *,
+    fft_axis=(1000.0, 2000.0),
+    fft_levels=(67.0, 45.0),
+    octave_axis=(500.0, 1000.0),
+    octave_levels=(57.0, 43.0),
+):
+    ref_db = 20.0 * math.log10(20e-6)
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_spl",
+        lambda signal, sample_rate, weighting, time_constant: 70.0,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
+        lambda signal, sample_rate, nfft: (
+            np.asarray(fft_axis, dtype=np.float64),
+            np.asarray(fft_levels, dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_octave_bands",
+        lambda signal, sample_rate, weighting: (
+            np.asarray(octave_axis, dtype=np.float64),
+            np.asarray(octave_levels, dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_loudness_trace",
+        lambda signal, sample_rate: ([0.0, 1.0], [2.0, 3.0], 3.0),
     )
 
 
@@ -783,6 +876,109 @@ def test_build_summary_payload_renders_five_no_result_rows_for_full_no_result():
     assert all(row["channel_label"] == "--" for row in summary["rows"])
 
 
+@pytest.mark.parametrize(
+    ("config_key", "result_key", "available_key", "error_key", "row_index", "label"),
+    [
+        ("fft_band_limits", "fft_band_results", "fft_available", "fft_error_message", 2, "FFT"),
+        ("oct_band_limits", "oct_band_results", "octave_available", "octave_error_message", 3, "倍频程"),
+    ],
+)
+def test_build_summary_payload_treats_serialized_band_availability_as_authoritative_no_result(
+    config_key,
+    result_key,
+    available_key,
+    error_key,
+    row_index,
+    label,
+):
+    summary = build_summary_payload(
+        config={
+            "config_id": 101,
+            "selected_channels": [0],
+            "channels": [
+                {
+                    "channel_index": 0,
+                    "spl_lower_limit": 40.0,
+                    "spl_upper_limit": 80.0,
+                    "fft_band_limits": (
+                        [{"freq": 1000.0, "lower": -1.0, "upper": 1.0}]
+                        if config_key == "fft_band_limits"
+                        else []
+                    ),
+                    "oct_band_limits": (
+                        [{"freq": 1000.0, "lower": -1.0, "upper": 1.0}]
+                        if config_key == "oct_band_limits"
+                        else []
+                    ),
+                }
+            ],
+        },
+        judgment_payload={
+            "overall": "不合格",
+            "limit_pass": False,
+            "ai_pass": None,
+            "ai_score": None,
+            "analysis_window": (1.0, 3.0),
+            "channel_results": [
+                {
+                    "channel_index": 0,
+                    "spl_db": 70.0,
+                    "spl_pass": True,
+                    "loudness_max_sone": 5.0,
+                    "loudness_pass": True,
+                    "loudness_available": True,
+                    "loudness_error_message": None,
+                    "fft_available": available_key != "fft_available",
+                    "fft_error_message": (
+                        "fft golden reference unavailable"
+                        if error_key == "fft_error_message"
+                        else None
+                    ),
+                    "octave_available": available_key != "octave_available",
+                    "octave_error_message": (
+                        "octave golden reference unavailable"
+                        if error_key == "octave_error_message"
+                        else None
+                    ),
+                    "fft_band_results": [
+                        {
+                            "freq": 1000.0,
+                            "level": 0.5,
+                            "lower": -1.0,
+                            "upper": 1.0,
+                            "passed": True,
+                        }
+                    ],
+                    "oct_band_results": [
+                        {
+                            "freq": 1000.0,
+                            "level": 0.5,
+                            "lower": -1.0,
+                            "upper": 1.0,
+                            "passed": True,
+                        }
+                    ],
+                }
+            ],
+        },
+        ai_review={"status": "not_enabled"},
+    )
+
+    assert summary["overall_status"] == "no_result"
+    assert summary["overall_label"] == "无结果"
+    assert summary["error_message"] in {
+        "fft golden reference unavailable",
+        "octave golden reference unavailable",
+    }
+    assert summary["rows"][row_index]["label"] == label
+    assert summary["rows"][row_index]["deviation_value"] is None
+    assert summary["rows"][row_index]["deviation_display"] == "--"
+    assert summary["rows"][row_index]["channel_index"] == 0
+    assert summary["rows"][row_index]["channel_label"] == "CH1"
+    assert summary["rows"][row_index]["status"] == "无结果"
+    assert summary["rows"][row_index]["constrained"] is True
+
+
 def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch):
     ref_db = 20.0 * math.log10(20e-6)
 
@@ -866,6 +1062,7 @@ def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch
     assert payload[0]["spl"]["upper_limit_db"] == 80.0
     assert payload[0]["fft"]["frequencies_hz"] == [1000.0, 2000.0]
     assert payload[0]["fft"]["levels_db"] == [67.0, 45.0]
+    assert payload[0]["fft"]["golden_mode"] == "off"
     assert payload[0]["fft"]["limit_bands"][0] == {
         "freq_hz": 1000.0,
         "lower_db": 40.0,
@@ -875,6 +1072,7 @@ def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch
     }
     assert payload[0]["octave"]["center_freqs_hz"] == [500.0, 1000.0]
     assert payload[0]["octave"]["levels_db"] == [57.0, 43.0]
+    assert payload[0]["octave"]["golden_mode"] == "off"
     assert payload[0]["octave"]["limit_bands"][0] == {
         "freq_hz": 500.0,
         "lower_db": 35.0,
@@ -882,6 +1080,378 @@ def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch
         "actual_db": 57.0,
         "passed": False,
     }
+
+
+def test_build_chart_payload_fft_absolute_mode_uses_serialized_markers_and_overlay(
+    monkeypatch,
+):
+    _patch_basic_chart_backends(
+        monkeypatch,
+        fft_levels=(64.0, 45.0),
+    )
+    cache = _GoldenCacheStub(
+        fft_axis=(1000.0, 2000.0),
+        fft_levels=(60.0, 41.0),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.GoldenReferenceCache",
+        lambda: cache,
+    )
+
+    payload = build_chart_payload(
+        buffer=np.full((200, 1), 0.1, dtype=np.float32),
+        config=_make_single_channel_config(
+            fft_golden_mode="absolute",
+            fft_show_golden_overlay=True,
+            fft_band_limits=[{"freq": 1000.0, "lower": -1.0, "upper": 1.0}],
+            oct_band_limits=[],
+        ),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.0, 2.0),
+        judgment_payload=_make_single_channel_judgment_payload(
+            fft_available=True,
+            fft_error_message=None,
+            fft_band_results=[
+                {
+                    "freq": 1000.0,
+                    "level": 64.0,
+                    "lower": 61.0,
+                    "upper": 66.0,
+                    "passed": True,
+                }
+            ],
+            oct_band_results=[],
+        ),
+    )
+
+    assert cache.bundle_calls == 1
+    assert cache.ensure_fft_calls == 1
+    fft_payload = payload[0]["fft"]
+    assert fft_payload["frequencies_hz"] == [1000.0, 2000.0]
+    assert fft_payload["levels_db"] == [64.0, 45.0]
+    assert fft_payload["golden_mode"] == "absolute"
+    assert fft_payload["golden_overlay_levels_db"] == [60.0, 41.0]
+    assert "show_zero_reference" not in fft_payload
+    assert fft_payload["limit_bands"] == [
+        {
+            "freq_hz": 1000.0,
+            "lower_db": 61.0,
+            "upper_db": 66.0,
+            "actual_db": 64.0,
+            "passed": True,
+        }
+    ]
+
+
+def test_build_chart_payload_fft_delta_mode_serializes_main_series_in_delta_space(
+    monkeypatch,
+):
+    _patch_basic_chart_backends(
+        monkeypatch,
+        fft_levels=(64.0, 45.0),
+    )
+    cache = _GoldenCacheStub(
+        fft_axis=(1000.0, 2000.0),
+        fft_levels=(66.0, 44.0),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.GoldenReferenceCache",
+        lambda: cache,
+    )
+
+    payload = build_chart_payload(
+        buffer=np.full((200, 1), 0.1, dtype=np.float32),
+        config=_make_single_channel_config(
+            fft_golden_mode="delta",
+            fft_show_golden_overlay=False,
+            fft_band_limits=[{"freq": 1000.0, "lower": -5.0, "upper": 5.0}],
+            oct_band_limits=[],
+        ),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.0, 2.0),
+        judgment_payload=_make_single_channel_judgment_payload(
+            fft_available=True,
+            fft_error_message=None,
+            fft_band_results=[
+                {
+                    "freq": 1000.0,
+                    "level": -2.0,
+                    "lower": -3.0,
+                    "upper": 3.0,
+                    "passed": True,
+                }
+            ],
+            oct_band_results=[],
+        ),
+    )
+
+    fft_payload = payload[0]["fft"]
+    assert fft_payload["levels_db"] == [-2.0, 1.0]
+    assert fft_payload["golden_mode"] == "delta"
+    assert fft_payload["show_zero_reference"] is True
+    assert "golden_overlay_levels_db" not in fft_payload
+    assert fft_payload["limit_bands"] == [
+        {
+            "freq_hz": 1000.0,
+            "lower_db": -3.0,
+            "upper_db": 3.0,
+            "actual_db": -2.0,
+            "passed": True,
+        }
+    ]
+
+
+def test_build_chart_payload_octave_absolute_mode_uses_serialized_markers_and_overlay(
+    monkeypatch,
+):
+    _patch_basic_chart_backends(
+        monkeypatch,
+        octave_levels=(57.0, 43.0),
+    )
+    cache = _GoldenCacheStub(
+        octave_axis=(500.0, 1000.0),
+        octave_levels=(55.0, 40.0),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.GoldenReferenceCache",
+        lambda: cache,
+    )
+
+    payload = build_chart_payload(
+        buffer=np.full((200, 1), 0.1, dtype=np.float32),
+        config=_make_single_channel_config(
+            fft_band_limits=[],
+            oct_golden_mode="absolute",
+            oct_show_golden_overlay=True,
+            oct_band_limits=[{"freq": 500.0, "lower": -2.0, "upper": 2.0}],
+        ),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.0, 2.0),
+        judgment_payload=_make_single_channel_judgment_payload(
+            fft_band_results=[],
+            octave_available=True,
+            octave_error_message=None,
+            oct_band_results=[
+                {
+                    "freq": 500.0,
+                    "level": 57.0,
+                    "lower": 54.0,
+                    "upper": 58.0,
+                    "passed": True,
+                }
+            ],
+        ),
+    )
+
+    octave_payload = payload[0]["octave"]
+    assert octave_payload["center_freqs_hz"] == [500.0, 1000.0]
+    assert octave_payload["levels_db"] == [57.0, 43.0]
+    assert octave_payload["golden_mode"] == "absolute"
+    assert octave_payload["golden_overlay_levels_db"] == [55.0, 40.0]
+    assert "show_zero_reference" not in octave_payload
+    assert octave_payload["limit_bands"] == [
+        {
+            "freq_hz": 500.0,
+            "lower_db": 54.0,
+            "upper_db": 58.0,
+            "actual_db": 57.0,
+            "passed": True,
+        }
+    ]
+
+
+def test_build_chart_payload_octave_delta_mode_serializes_main_series_in_delta_space(
+    monkeypatch,
+):
+    _patch_basic_chart_backends(
+        monkeypatch,
+        octave_levels=(57.0, 43.0),
+    )
+    cache = _GoldenCacheStub(
+        octave_axis=(500.0, 1000.0),
+        octave_levels=(55.0, 42.0),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.GoldenReferenceCache",
+        lambda: cache,
+    )
+
+    payload = build_chart_payload(
+        buffer=np.full((200, 1), 0.1, dtype=np.float32),
+        config=_make_single_channel_config(
+            fft_band_limits=[],
+            oct_golden_mode="delta",
+            oct_show_golden_overlay=False,
+            oct_band_limits=[{"freq": 500.0, "lower": 1.0, "upper": 3.0}],
+        ),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.0, 2.0),
+        judgment_payload=_make_single_channel_judgment_payload(
+            fft_band_results=[],
+            octave_available=True,
+            octave_error_message=None,
+            oct_band_results=[
+                {
+                    "freq": 500.0,
+                    "level": 2.0,
+                    "lower": 1.0,
+                    "upper": 3.0,
+                    "passed": True,
+                }
+            ],
+        ),
+    )
+
+    octave_payload = payload[0]["octave"]
+    assert octave_payload["levels_db"] == [2.0, 1.0]
+    assert octave_payload["golden_mode"] == "delta"
+    assert octave_payload["show_zero_reference"] is True
+    assert "golden_overlay_levels_db" not in octave_payload
+    assert octave_payload["limit_bands"] == [
+        {
+            "freq_hz": 500.0,
+            "lower_db": 1.0,
+            "upper_db": 3.0,
+            "actual_db": 2.0,
+            "passed": True,
+        }
+    ]
+
+
+def test_build_chart_payload_omits_fft_item_when_golden_recompute_fails(
+    monkeypatch,
+    caplog,
+):
+    _patch_basic_chart_backends(monkeypatch)
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.GoldenReferenceCache",
+        lambda: _GoldenCacheStub(
+            fft_error=RuntimeError("fft recompute failed"),
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger="app.service.analysis.review_payloads"):
+        payload = build_chart_payload(
+            buffer=np.full((200, 1), 0.1, dtype=np.float32),
+            config=_make_single_channel_config(
+                fft_golden_mode="absolute",
+                fft_band_limits=[{"freq": 1000.0, "lower": -1.0, "upper": 1.0}],
+                oct_band_limits=[],
+            ),
+            sample_rate=100.0,
+            mic_cal={},
+            analysis_window=(0.0, 2.0),
+            judgment_payload=_make_single_channel_judgment_payload(
+                fft_available=True,
+                fft_error_message=None,
+                fft_band_results=[
+                    {
+                        "freq": 1000.0,
+                        "level": 64.0,
+                        "lower": 61.0,
+                        "upper": 66.0,
+                        "passed": True,
+                    }
+                ],
+                oct_band_results=[],
+            ),
+        )
+
+    assert set(payload[0]) == {"loudness", "spl", "octave"}
+    assert "fft" not in payload[0]
+    assert "fft recompute failed" in caplog.text
+
+
+def test_build_chart_payload_keeps_off_mode_fft_payload_when_overlay_load_fails(
+    monkeypatch,
+    caplog,
+):
+    _patch_basic_chart_backends(monkeypatch)
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.GoldenReferenceCache",
+        lambda: _GoldenCacheStub(
+            bundle_error=GoldenReferenceError("golden overlay missing"),
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger="app.service.analysis.review_payloads"):
+        payload = build_chart_payload(
+            buffer=np.full((200, 1), 0.1, dtype=np.float32),
+            config=_make_single_channel_config(
+                fft_golden_mode="off",
+                fft_show_golden_overlay=True,
+                fft_band_limits=[{"freq": 1000.0, "lower": 40.0, "upper": 60.0}],
+                oct_band_limits=[],
+            ),
+            sample_rate=100.0,
+            mic_cal={},
+            analysis_window=(0.0, 2.0),
+        )
+
+    assert payload[0]["fft"]["golden_mode"] == "off"
+    assert payload[0]["fft"]["levels_db"] == [67.0, 45.0]
+    assert "golden_overlay_levels_db" not in payload[0]["fft"]
+    assert "show_zero_reference" not in payload[0]["fft"]
+    assert "golden overlay missing" in caplog.text
+
+
+def test_build_chart_payload_reuses_one_golden_bundle_across_fft_and_octave(
+    monkeypatch,
+):
+    _patch_basic_chart_backends(monkeypatch)
+    cache = _GoldenCacheStub(
+        fft_axis=(1000.0, 2000.0),
+        fft_levels=(60.0, 41.0),
+        octave_axis=(500.0, 1000.0),
+        octave_levels=(55.0, 40.0),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.GoldenReferenceCache",
+        lambda: cache,
+    )
+
+    build_chart_payload(
+        buffer=np.full((200, 1), 0.1, dtype=np.float32),
+        config=_make_single_channel_config(
+            fft_golden_mode="absolute",
+            fft_band_limits=[{"freq": 1000.0, "lower": -1.0, "upper": 1.0}],
+            oct_golden_mode="absolute",
+            oct_band_limits=[{"freq": 500.0, "lower": -2.0, "upper": 2.0}],
+        ),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.0, 2.0),
+        judgment_payload=_make_single_channel_judgment_payload(
+            fft_available=True,
+            octave_available=True,
+            fft_band_results=[
+                {
+                    "freq": 1000.0,
+                    "level": 64.0,
+                    "lower": 61.0,
+                    "upper": 66.0,
+                    "passed": True,
+                }
+            ],
+            oct_band_results=[
+                {
+                    "freq": 500.0,
+                    "level": 57.0,
+                    "lower": 54.0,
+                    "upper": 58.0,
+                    "passed": True,
+                }
+            ],
+        ),
+    )
+
+    assert cache.bundle_calls == 1
+    assert cache.ensure_fft_calls == 1
+    assert cache.ensure_octave_calls == 1
 
 
 def test_build_chart_payload_keeps_loudness_payload_shape_with_segmented_backend(monkeypatch):
