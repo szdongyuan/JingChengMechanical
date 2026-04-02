@@ -418,6 +418,131 @@ class TestLimitChecks:
         assert band.passed is True
         assert result.channel_results[0].fft_available is True
 
+    def test_fft_empty_band_limits_stay_unconstrained_in_absolute_mode_with_missing_golden(
+        self,
+        tmp_path,
+    ):
+        service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+        engine = self._make_engine(golden_sample_service=service)
+        sr = 48_000.0
+        t = np.arange(int(sr * 3.0)) / sr
+        amplitude = 20e-6 * 10 ** (60 / 20)
+        sig = amplitude * np.sin(2 * np.pi * 1000 * t)
+        buf = sig.reshape(-1, 1)
+        missing_path = tmp_path / "managed" / "config_1" / "missing.wav"
+        config = _make_config(
+            input_device_samplerate=sr,
+            channels=[
+                _make_channel_config(
+                    0,
+                    fft_golden_mode="absolute",
+                    **_golden_binding(missing_path, sample_rate=sr),
+                )
+            ],
+        )
+
+        result = engine.judge(
+            config,
+            buf,
+            sr,
+            mic_cal={},
+            audio_file_path="/tmp/test.wav",
+        )
+
+        channel_result = result.channel_results[0]
+
+        assert channel_result.fft_band_results == []
+        assert channel_result.fft_available is True
+        assert channel_result.fft_error_message is None
+        assert result.limit_pass is True
+
+    def test_octave_empty_band_limits_stay_unconstrained_in_delta_mode_with_corrupt_golden(
+        self,
+        tmp_path,
+    ):
+        service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+        engine = self._make_engine(golden_sample_service=service)
+        sr = 48_000.0
+        t = np.arange(int(sr * 3.0)) / sr
+        amplitude = 20e-6 * 10 ** (60 / 20)
+        sig = amplitude * np.sin(2 * np.pi * 1000 * t)
+        buf = sig.reshape(-1, 1)
+        corrupt_path = tmp_path / "managed" / "config_1" / "corrupt.wav"
+        corrupt_path.parent.mkdir(parents=True, exist_ok=True)
+        corrupt_path.write_bytes(b"not a wav")
+        config = _make_config(
+            input_device_samplerate=sr,
+            channels=[
+                _make_channel_config(
+                    0,
+                    oct_golden_mode="delta",
+                    **_golden_binding(corrupt_path, sample_rate=sr),
+                )
+            ],
+        )
+
+        result = engine.judge(
+            config,
+            buf,
+            sr,
+            mic_cal={},
+            audio_file_path="/tmp/test.wav",
+        )
+
+        channel_result = result.channel_results[0]
+
+        assert channel_result.oct_band_results == []
+        assert channel_result.octave_available is True
+        assert channel_result.octave_error_message is None
+        assert result.limit_pass is True
+
+    def test_fft_golden_derive_failure_becomes_unavailable_instead_of_raising(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+        engine = self._make_engine(golden_sample_service=service)
+        golden_path = _write_temp_wav(
+            tmp_path / "managed" / "config_1" / "gold.wav",
+            fill_value=0.5,
+        )
+        sr = 48_000.0
+        buf = np.full((int(sr * 3.0), 1), 0.25, dtype=np.float32)
+        config = _make_config(
+            input_device_samplerate=sr,
+            channels=[
+                _make_channel_config(
+                    0,
+                    fft_band_limits=[
+                        {"freq": 1000.0, "lower": -1.0, "upper": 1.0},
+                    ],
+                    fft_golden_mode="absolute",
+                    **_golden_binding(golden_path, sample_rate=sr),
+                )
+            ],
+        )
+
+        def _raising_fft(*args, **kwargs):
+            raise RuntimeError("fft backend exploded")
+
+        monkeypatch.setattr(dsp, "compute_fft_spectrum", _raising_fft)
+
+        result = engine.judge(
+            config,
+            buf,
+            sr,
+            mic_cal={},
+            audio_file_path="/tmp/test.wav",
+        )
+
+        channel_result = result.channel_results[0]
+
+        assert channel_result.fft_available is False
+        assert channel_result.fft_band_results == []
+        assert "fft backend exploded" in (channel_result.fft_error_message or "")
+        assert result.limit_pass is False
+
     def test_octave_absolute_mode_uses_golden_offset_bounds(self, tmp_path, monkeypatch):
         service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
         engine = self._make_engine(golden_sample_service=service)
@@ -527,6 +652,110 @@ class TestLimitChecks:
         assert band.upper == pytest.approx(3.0)
         assert band.passed is True
         assert result.channel_results[0].octave_available is True
+
+    def test_octave_golden_derive_failure_becomes_unavailable_instead_of_raising(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+        engine = self._make_engine(golden_sample_service=service)
+        golden_path = _write_temp_wav(
+            tmp_path / "managed" / "config_1" / "gold.wav",
+            fill_value=0.5,
+        )
+        sr = 48_000.0
+        buf = np.full((int(sr * 3.0), 1), 0.25, dtype=np.float32)
+        config = _make_config(
+            input_device_samplerate=sr,
+            channels=[
+                _make_channel_config(
+                    0,
+                    oct_band_limits=[
+                        {"freq": 1000.0, "lower": -1.0, "upper": 1.0},
+                    ],
+                    oct_golden_mode="absolute",
+                    **_golden_binding(golden_path, sample_rate=sr),
+                )
+            ],
+        )
+
+        def _raising_octave(*args, **kwargs):
+            raise RuntimeError("octave backend exploded")
+
+        monkeypatch.setattr(dsp, "compute_octave_bands", _raising_octave)
+
+        result = engine.judge(
+            config,
+            buf,
+            sr,
+            mic_cal={},
+            audio_file_path="/tmp/test.wav",
+        )
+
+        channel_result = result.channel_results[0]
+
+        assert channel_result.octave_available is False
+        assert channel_result.oct_band_results == []
+        assert "octave backend exploded" in (channel_result.octave_error_message or "")
+        assert result.limit_pass is False
+
+    def test_wrong_length_golden_file_becomes_unavailable_instead_of_producing_result(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+        engine = self._make_engine(golden_sample_service=service)
+        golden_path = _write_temp_wav(
+            tmp_path / "managed" / "config_1" / "gold.wav",
+            samples=120_000,
+            fill_value=0.5,
+        )
+        sr = 48_000.0
+        buf = np.full((int(sr * 3.0), 1), 0.25, dtype=np.float32)
+        config = _make_config(
+            input_device_samplerate=sr,
+            channels=[
+                _make_channel_config(
+                    0,
+                    oct_band_limits=[
+                        {"freq": 1000.0, "lower": -2.0, "upper": 2.0},
+                    ],
+                    oct_golden_mode="absolute",
+                    **_golden_binding(golden_path, sample_rate=sr),
+                )
+            ],
+        )
+
+        def fake_octave(signal, sample_rate, weighting):
+            if np.isclose(float(signal[0]), 0.25):
+                level = 14.0
+            elif np.isclose(float(signal[0]), 0.5):
+                level = 12.0
+            else:  # pragma: no cover - makes failures easier to read
+                raise AssertionError(f"unexpected signal marker {float(signal[0])}")
+            return np.array([1000.0], dtype=np.float64), np.array(
+                [level + _REF_DB],
+                dtype=np.float64,
+            )
+
+        monkeypatch.setattr(dsp, "compute_octave_bands", fake_octave)
+
+        result = engine.judge(
+            config,
+            buf,
+            sr,
+            mic_cal={},
+            audio_file_path="/tmp/test.wav",
+        )
+
+        channel_result = result.channel_results[0]
+
+        assert channel_result.octave_available is False
+        assert channel_result.oct_band_results == []
+        assert "长度" in (channel_result.octave_error_message or "")
+        assert result.limit_pass is False
 
     def test_golden_enabled_judgment_marks_fft_and_octave_unavailable_on_runtime_sample_rate_mismatch(
         self,

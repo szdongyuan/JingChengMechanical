@@ -33,10 +33,16 @@ def _write_temp_wav(
     return path, data
 
 
-def _binding(path: Path | str, *, sample_rate: float = 48_000.0) -> dict:
+def _binding(
+    path: Path | str,
+    *,
+    sample_rate: float = 48_000.0,
+    num_samples: int = 144_000,
+) -> dict:
     return {
         "golden_sample_path": str(path),
         "golden_sample_sample_rate": sample_rate,
+        "golden_sample_num_samples": num_samples,
     }
 
 
@@ -113,6 +119,83 @@ def test_bundle_for_channel_rejects_staged_and_multichannel_wavs(tmp_path):
             runtime_sample_rate=48_000.0,
             mic_sensitivity=1.0,
         )
+
+
+def test_bundle_for_channel_rejects_sample_count_mismatch_against_binding_metadata(
+    tmp_path,
+):
+    service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    golden_path, _ = _write_temp_wav(
+        tmp_path / "managed" / "config_1" / "gold.wav",
+        samples=120_000,
+    )
+    cache = GoldenReferenceCache(golden_sample_service=service)
+
+    with pytest.raises(GoldenReferenceError, match="长度"):
+        cache.bundle_for_channel(
+            channel_index=0,
+            channel_config={
+                **_binding(golden_path),
+                "golden_sample_num_samples": 144_000,
+            },
+            configured_input_sample_rate=48_000.0,
+            runtime_sample_rate=48_000.0,
+            mic_sensitivity=1.0,
+        )
+
+
+def test_ensure_fft_wraps_derivation_failures_in_golden_reference_error(
+    tmp_path,
+    monkeypatch,
+):
+    service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    golden_path, _ = _write_temp_wav(tmp_path / "managed" / "config_1" / "gold.wav")
+    cache = GoldenReferenceCache(golden_sample_service=service)
+    bundle = cache.bundle_for_channel(
+        channel_index=0,
+        channel_config={
+            **_binding(golden_path),
+            "golden_sample_num_samples": 144_000,
+        },
+        configured_input_sample_rate=48_000.0,
+        runtime_sample_rate=48_000.0,
+        mic_sensitivity=1.0,
+    )
+
+    def _raising_fft(*args, **kwargs):
+        raise RuntimeError("fft backend exploded")
+
+    monkeypatch.setattr(golden_reference_module.dsp, "compute_fft_spectrum", _raising_fft)
+
+    with pytest.raises(GoldenReferenceError, match="fft backend exploded"):
+        cache.ensure_fft(bundle)
+
+
+def test_ensure_octave_wraps_derivation_failures_in_golden_reference_error(
+    tmp_path,
+    monkeypatch,
+):
+    service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    golden_path, _ = _write_temp_wav(tmp_path / "managed" / "config_1" / "gold.wav")
+    cache = GoldenReferenceCache(golden_sample_service=service)
+    bundle = cache.bundle_for_channel(
+        channel_index=0,
+        channel_config={
+            **_binding(golden_path),
+            "golden_sample_num_samples": 144_000,
+        },
+        configured_input_sample_rate=48_000.0,
+        runtime_sample_rate=48_000.0,
+        mic_sensitivity=1.0,
+    )
+
+    def _raising_octave(*args, **kwargs):
+        raise RuntimeError("octave backend exploded")
+
+    monkeypatch.setattr(golden_reference_module.dsp, "compute_octave_bands", _raising_octave)
+
+    with pytest.raises(GoldenReferenceError, match="octave backend exploded"):
+        cache.ensure_octave(bundle, weighting="A")
 
 
 def test_cache_reuses_loaded_bundle_and_derived_fft_and_octave_once_per_channel(

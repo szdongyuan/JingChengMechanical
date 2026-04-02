@@ -85,6 +85,13 @@ class GoldenReferenceCache:
         signal = signal.reshape(-1)
         if signal.size <= 0:
             raise GoldenReferenceError("黄金样本为空")
+        expected_num_samples = _coerce_positive_int(
+            channel_config.get("golden_sample_num_samples")
+        )
+        if expected_num_samples is None:
+            raise GoldenReferenceError("黄金样本长度无效")
+        if signal.size != expected_num_samples:
+            raise GoldenReferenceError("黄金样本文件长度与记录元数据不一致")
 
         calibrated = dsp.apply_mic_calibration(signal, mic_sensitivity)
         bundle = GoldenReferenceBundle(
@@ -100,11 +107,15 @@ class GoldenReferenceCache:
     ) -> tuple[np.ndarray, np.ndarray]:
         if bundle.fft_frequencies_hz is None or bundle.fft_levels_db is None:
             nfft = max(1, int(bundle.signal.size))
-            frequencies_hz, magnitudes_db = dsp.compute_fft_spectrum(
-                bundle.signal,
-                bundle.sample_rate,
-                nfft,
-            )
+            try:
+                frequencies_hz, magnitudes_db = dsp.compute_fft_spectrum(
+                    bundle.signal,
+                    bundle.sample_rate,
+                    nfft,
+                )
+            except Exception as exc:
+                message = str(exc) or "黄金样本 FFT 参考计算失败"
+                raise GoldenReferenceError(message) from exc
             bundle.fft_frequencies_hz = np.asarray(frequencies_hz, dtype=np.float64)
             bundle.fft_levels_db = _absolute_levels_db(magnitudes_db)
         return bundle.fft_frequencies_hz, bundle.fft_levels_db
@@ -119,11 +130,15 @@ class GoldenReferenceCache:
             bundle.octave_center_freqs_hz is None
             or bundle.octave_levels_db is None
         ):
-            center_freqs_hz, levels_db = dsp.compute_octave_bands(
-                bundle.signal,
-                bundle.sample_rate,
-                str(weighting or "Z"),
-            )
+            try:
+                center_freqs_hz, levels_db = dsp.compute_octave_bands(
+                    bundle.signal,
+                    bundle.sample_rate,
+                    str(weighting or "Z"),
+                )
+            except Exception as exc:
+                message = str(exc) or "黄金样本倍频程参考计算失败"
+                raise GoldenReferenceError(message) from exc
             bundle.octave_center_freqs_hz = np.asarray(
                 center_freqs_hz,
                 dtype=np.float64,
@@ -153,6 +168,16 @@ def _coerce_positive_float(value) -> float | None:
     if isinstance(value, (int, float, np.integer, np.floating)):
         numeric = float(value)
         if math.isfinite(numeric) and numeric > 0.0:
+            return numeric
+    return None
+
+
+def _coerce_positive_int(value) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, np.integer)):
+        numeric = int(value)
+        if numeric > 0:
             return numeric
     return None
 

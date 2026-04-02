@@ -259,6 +259,9 @@ class JudgmentEngine:
         mode = self._golden_mode(channel_config.get("fft_golden_mode"))
         overlay_requested = bool(channel_config.get("fft_show_golden_overlay"))
 
+        if not isinstance(band_limits, list) or not band_limits:
+            return [], True, None
+
         if mode != "off":
             try:
                 golden_bundle = golden_cache.bundle_for_channel(
@@ -282,9 +285,6 @@ class JudgmentEngine:
                 )
             except GoldenReferenceError as exc:
                 logger.warning("黄金样本加载失败，FFT 对比曲线已忽略: %s", exc)
-
-        if not isinstance(band_limits, list) or not band_limits:
-            return [], True, None
 
         measured_freqs, measured_levels = self._measure_fft(sig, sample_rate)
         if mode == "off":
@@ -333,6 +333,9 @@ class JudgmentEngine:
         mode = self._golden_mode(channel_config.get("oct_golden_mode"))
         overlay_requested = bool(channel_config.get("oct_show_golden_overlay"))
 
+        if not isinstance(band_limits, list) or not band_limits:
+            return [], True, None
+
         if mode != "off":
             try:
                 golden_bundle = golden_cache.bundle_for_channel(
@@ -359,9 +362,6 @@ class JudgmentEngine:
                 )
             except GoldenReferenceError as exc:
                 logger.warning("黄金样本加载失败，倍频程对比曲线已忽略: %s", exc)
-
-        if not isinstance(band_limits, list) or not band_limits:
-            return [], True, None
 
         measured_centers, measured_levels = self._measure_octave(
             sig,
