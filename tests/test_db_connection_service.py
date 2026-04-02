@@ -248,23 +248,19 @@ def test_connect_repairs_device_singleton_and_preserves_existing_rows(monkeypatc
             "SELECT user_name, access_level FROM users_table ORDER BY user_id"
         ).fetchall() == [("engineer", "Engineer")]
 
-        assert HardwareSelectService.load_io_devices() == {
-            "input": {
-                "id": None,
-                "name": None,
-                "type": None,
-                "samplerate": None,
-                "channel_count": None,
-            },
-            "output": {
-                "id": None,
-                "name": None,
-                "type": None,
-                "samplerate": None,
-                "channel_count": None,
-            },
-            "mic_cal": {},
-        }
+        assert HardwareSelectService.load_io_devices() == {}
+
+
+def test_connect_blank_device_singleton_stays_safe_for_startup_consumers(monkeypatch):
+    with _temporary_runtime_db(monkeypatch) as (_, svc, _):
+        svc.connect()
+
+        device_info = HardwareSelectService.load_io_devices()
+
+        assert device_info == {}
+        input_info = device_info.get("input", {})
+        assert float(input_info.get("samplerate", 48000.0)) == 48000.0
+        assert int(input_info.get("channel_count", 1)) == 1
 
 
 def test_connect_migrates_legacy_config_tables_and_preserves_extra_columns(

@@ -76,28 +76,54 @@ class HardwareSelectService:
 
     # -------- DB：读取/保存选择 --------
     @staticmethod
+    def _saved_device_payload(
+        *,
+        device_id,
+        name,
+        device_type,
+        samplerate,
+        channel_count,
+    ) -> dict | None:
+        if any(value in (None, "") for value in (name, device_type, samplerate, channel_count)):
+            return None
+        return {
+            "id": device_id,
+            "name": name,
+            "type": device_type,
+            "samplerate": samplerate,
+            "channel_count": channel_count,
+        }
+
+    @staticmethod
     def load_io_devices() -> dict:
-        """读取输入/监听设备信息（device_table.id=1）。"""
+        """读取输入/监听设备信息（device_table.id=1），空白单例行视为未保存设备。"""
         row = DeviceTable.select().where(DeviceTable.id == 1).first()
         if not row:
             return {}
-        return {
-            "input": {
-                "id": row.input_selected_device_id,
-                "name": row.input_selected_device_name,
-                "type": row.input_selected_device_type,
-                "samplerate": row.input_selected_device_samplerate,
-                "channel_count": row.input_channel_count,
-            },
-            "output": {
-                "id": row.output_selected_device_id,
-                "name": row.output_selected_device_name,
-                "type": row.output_selected_device_type,
-                "samplerate": row.output_selected_device_samplerate,
-                "channel_count": row.output_channel_count,
-            },
-            "mic_cal": json.loads(row.mic_cal) if row.mic_cal else {},
-        }
+        input_payload = HardwareSelectService._saved_device_payload(
+            device_id=row.input_selected_device_id,
+            name=row.input_selected_device_name,
+            device_type=row.input_selected_device_type,
+            samplerate=row.input_selected_device_samplerate,
+            channel_count=row.input_channel_count,
+        )
+        output_payload = HardwareSelectService._saved_device_payload(
+            device_id=row.output_selected_device_id,
+            name=row.output_selected_device_name,
+            device_type=row.output_selected_device_type,
+            samplerate=row.output_selected_device_samplerate,
+            channel_count=row.output_channel_count,
+        )
+        mic_cal = json.loads(row.mic_cal) if row.mic_cal else {}
+
+        payload = {}
+        if input_payload:
+            payload["input"] = input_payload
+        if output_payload:
+            payload["output"] = output_payload
+        if mic_cal:
+            payload["mic_cal"] = mic_cal
+        return payload
 
     @staticmethod
     def save_mic_cal(mic_cal_dict):
