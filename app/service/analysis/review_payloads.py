@@ -863,6 +863,7 @@ def _build_fft_chart(
 ) -> dict | None:
     mode = _golden_mode(channel_config.get("fft_golden_mode"))
     overlay_requested = bool(channel_config.get("fft_show_golden_overlay")) and mode != "delta"
+    nfft = int(signal.size)
     if mode != "off" and isinstance(channel_result, dict) and channel_result.get("fft_available") is False:
         _log_chart_warning(
             "FFT chart payload omitted",
@@ -900,7 +901,10 @@ def _build_fft_chart(
         if overlay_requested:
             try:
                 golden_bundle = golden_bundle_loader()
-                golden_freqs_hz, golden_levels_db = golden_cache.ensure_fft(golden_bundle)
+                golden_freqs_hz, golden_levels_db = golden_cache.ensure_fft(
+                    golden_bundle,
+                    nfft=nfft,
+                )
                 _validate_matching_axis(frequencies_hz, golden_freqs_hz, "FFT")
             except Exception as exc:
                 logger.warning("黄金样本加载失败，FFT 对比曲线已忽略: %s", exc)
@@ -910,7 +914,10 @@ def _build_fft_chart(
 
     try:
         golden_bundle = golden_bundle_loader()
-        golden_freqs_hz, golden_levels_db = golden_cache.ensure_fft(golden_bundle)
+        golden_freqs_hz, golden_levels_db = golden_cache.ensure_fft(
+            golden_bundle,
+            nfft=nfft,
+        )
         _validate_matching_axis(frequencies_hz, golden_freqs_hz, "FFT")
     except Exception as exc:
         _log_chart_warning("FFT chart payload omitted", channel_index=channel_index, error=exc)

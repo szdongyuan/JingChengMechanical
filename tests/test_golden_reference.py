@@ -168,7 +168,7 @@ def test_ensure_fft_wraps_derivation_failures_in_golden_reference_error(
     monkeypatch.setattr(golden_reference_module.dsp, "compute_fft_spectrum", _raising_fft)
 
     with pytest.raises(GoldenReferenceError, match="fft backend exploded"):
-        cache.ensure_fft(bundle)
+        cache.ensure_fft(bundle, nfft=4096)
 
 
 def test_ensure_octave_wraps_derivation_failures_in_golden_reference_error(
@@ -198,12 +198,13 @@ def test_ensure_octave_wraps_derivation_failures_in_golden_reference_error(
         cache.ensure_octave(bundle, weighting="A")
 
 
-def test_cache_reuses_loaded_bundle_and_derived_fft_and_octave_once_per_channel(
+def test_cache_reuses_loaded_bundle_and_derived_fft_by_nfft_and_octave_once_per_channel(
     tmp_path,
     monkeypatch,
 ):
     service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
     golden_path, _ = _write_temp_wav(tmp_path / "managed" / "config_1" / "gold.wav")
+    golden_path_b, _ = _write_temp_wav(tmp_path / "managed" / "config_2" / "gold.wav")
     cache = GoldenReferenceCache(golden_sample_service=service)
 
     read_calls: list[str] = []
@@ -218,7 +219,9 @@ def test_cache_reuses_loaded_bundle_and_derived_fft_and_octave_once_per_channel(
 
     def fake_fft(signal, sample_rate, nfft):
         fft_calls.append((float(sample_rate), int(nfft)))
-        return np.array([1000.0], dtype=np.float64), np.array([1.0], dtype=np.float64)
+        axis = np.arange((int(nfft) // 2) + 1, dtype=np.float64)
+        levels = np.full(axis.shape, 1.0, dtype=np.float64)
+        return axis, levels
 
     def fake_octave(signal, sample_rate, weighting):
         octave_calls.append((float(sample_rate), str(weighting)))
@@ -242,16 +245,32 @@ def test_cache_reuses_loaded_bundle_and_derived_fft_and_octave_once_per_channel(
         runtime_sample_rate=48_000.0,
         mic_sensitivity=1.0,
     )
+    bundle_b = cache.bundle_for_channel(
+        channel_index=1,
+        channel_config=_binding(golden_path_b),
+        configured_input_sample_rate=48_000.0,
+        runtime_sample_rate=48_000.0,
+        mic_sensitivity=1.0,
+    )
 
     assert bundle1 is bundle2
 
-    fft_ref_1 = cache.ensure_fft(bundle1)
-    fft_ref_2 = cache.ensure_fft(bundle1)
+    fft_ref_1 = cache.ensure_fft(bundle1, nfft=4096)
+    fft_ref_2 = cache.ensure_fft(bundle1, nfft=2048)
+    fft_ref_3 = cache.ensure_fft(bundle1, nfft=4096)
+    fft_ref_b = cache.ensure_fft(bundle_b, nfft=4096)
     octave_ref_1 = cache.ensure_octave(bundle1, weighting="A")
     octave_ref_2 = cache.ensure_octave(bundle1, weighting="A")
 
-    assert fft_ref_1[0].tolist() == fft_ref_2[0].tolist()
+    assert len(fft_ref_1[0]) == 2049
+    assert len(fft_ref_2[0]) == 1025
+    assert fft_ref_1[0] is fft_ref_3[0]
+    assert fft_ref_b[0] is not fft_ref_1[0]
     assert octave_ref_1[0].tolist() == octave_ref_2[0].tolist()
-    assert len(read_calls) == 1
-    assert fft_calls == [(48_000.0, 144_000)]
+    assert len(read_calls) == 2
+    assert fft_calls == [
+        (48_000.0, 4096),
+        (48_000.0, 2048),
+        (48_000.0, 4096),
+    ]
     assert octave_calls == [(48_000.0, "A")]

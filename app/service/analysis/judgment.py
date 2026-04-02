@@ -263,6 +263,7 @@ class JudgmentEngine:
             return [], True, None
 
         if mode != "off":
+            nfft = max(1, int(np.asarray(sig).size))
             try:
                 golden_bundle = golden_cache.bundle_for_channel(
                     channel_index=channel_index,
@@ -271,7 +272,10 @@ class JudgmentEngine:
                     runtime_sample_rate=sample_rate,
                     mic_sensitivity=mic_sensitivity,
                 )
-                golden_freqs, golden_levels = golden_cache.ensure_fft(golden_bundle)
+                golden_freqs, golden_levels = golden_cache.ensure_fft(
+                    golden_bundle,
+                    nfft=nfft,
+                )
             except GoldenReferenceError as exc:
                 return [], False, str(exc)
         elif overlay_requested:

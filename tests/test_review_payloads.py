@@ -148,7 +148,7 @@ class _GoldenCacheStub:
             raise self.bundle_error
         return object()
 
-    def ensure_fft(self, bundle):
+    def ensure_fft(self, bundle, *, nfft):
         self.ensure_fft_calls += 1
         if self.fft_error is not None:
             raise self.fft_error

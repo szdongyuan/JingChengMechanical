@@ -253,14 +253,27 @@ def compute_fft_spectrum(signal: np.ndarray, sample_rate: float,
     -------
     (frequencies, magnitudes_db) -- both 1-D, length nfft//2+1
     """
-    sig = np.asarray(signal, dtype=np.float64)
-    if sig.size < nfft:
-        sig = np.pad(sig, (0, nfft - sig.size))
+    sig = np.asarray(signal, dtype=np.float64).reshape(-1)
+    if sig.size <= nfft:
+        if sig.size < nfft:
+            sig = np.pad(sig, (0, nfft - sig.size))
+        window = np.hanning(nfft)
+        spectrum = np.fft.rfft(sig * window)
+        mag = np.abs(spectrum) * 2.0 / nfft
     else:
-        sig = sig[:nfft]
-    window = np.hanning(nfft)
-    spectrum = np.fft.rfft(sig * window)
-    mag = np.abs(spectrum) * 2.0 / nfft
+        hop = max(1, nfft // 2)
+        starts = list(range(0, sig.size - nfft + 1, hop))
+        tail_start = sig.size - nfft
+        if not starts or starts[-1] != tail_start:
+            starts.append(tail_start)
+
+        window = np.hanning(nfft)
+        linear_magnitudes = []
+        for start in starts:
+            windowed = sig[start:start + nfft] * window
+            spectrum = np.fft.rfft(windowed)
+            linear_magnitudes.append(np.abs(spectrum) * 2.0 / nfft)
+        mag = np.mean(np.vstack(linear_magnitudes), axis=0)
     mag_db = 20.0 * np.log10(np.maximum(mag, 1e-30))
     freqs = np.fft.rfftfreq(nfft, d=1.0 / sample_rate)
     return freqs, mag_db
