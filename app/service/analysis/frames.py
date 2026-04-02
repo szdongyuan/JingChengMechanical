@@ -58,6 +58,10 @@ class ChannelJudgment:
     loudness_pass: bool | None = None
     loudness_available: bool = False
     loudness_error_message: str | None = None
+    fft_available: bool = True
+    fft_error_message: str | None = None
+    octave_available: bool = True
+    octave_error_message: str | None = None
     fft_band_results: list[BandResult] = field(default_factory=list)
     oct_band_results: list[BandResult] = field(default_factory=list)
 

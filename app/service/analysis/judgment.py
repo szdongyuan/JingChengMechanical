@@ -6,6 +6,7 @@ and produces a pass/fail verdict. AI execution is deferred to TestSession.
 from __future__ import annotations
 
 import json
+import logging
 
 import numpy as np
 
@@ -15,13 +16,20 @@ from app.service.analysis.frames import (
     ChannelJudgment,
     JudgmentResult,
 )
+from app.service.analysis.golden_reference import (
+    GoldenReferenceCache,
+    GoldenReferenceError,
+)
+from app.service.golden_sample_service import GoldenSampleService
 from app.service.config_service import _CHANNEL_DEFAULTS
 
 
 _REF_PRESSURE = 20e-6
+_REF_PRESSURE_DB = 20.0 * np.log10(_REF_PRESSURE)
 _DEFAULT_LOUDNESS_UNIT = "sone"
 _DEFAULT_LOUDNESS_LOWER_LIMIT = 0.0
 _DEFAULT_LOUDNESS_UPPER_LIMIT = 60.0
+logger = logging.getLogger(__name__)
 
 
 def _runtime_channel_defaults(channel_index: int) -> dict:
@@ -42,8 +50,13 @@ def _runtime_channel_defaults(channel_index: int) -> dict:
 class JudgmentEngine:
     """Compute pass/fail verdict for a completed recording."""
 
-    def __init__(self, ai_service):
+    def __init__(
+        self,
+        ai_service,
+        golden_sample_service: GoldenSampleService | None = None,
+    ):
         self._ai = ai_service
+        self._golden_sample_service = golden_sample_service
 
     def judge(
         self,
@@ -112,6 +125,10 @@ class JudgmentEngine:
 
         selected = config.get("selected_channels", [])
         channels_cfg = {ch["channel_index"]: ch for ch in config.get("channels", [])}
+        golden_cache = GoldenReferenceCache(
+            golden_sample_service=self._golden_sample_service
+        )
+        configured_input_sample_rate = config.get("input_device_samplerate")
 
         channel_results: list[ChannelJudgment] = []
         all_pass = True
@@ -132,8 +149,7 @@ class JudgmentEngine:
 
             # Apply mic calibration
             sensitivity = self._get_sensitivity(mic_cal, ch_idx)
-            if sensitivity != 0.0:
-                sig = dsp.apply_mic_calibration(sig, sensitivity)
+            sig = dsp.apply_mic_calibration(sig, sensitivity)
 
             # SPL check
             spl_db = float(dsp.compute_spl(
@@ -158,22 +174,32 @@ class JudgmentEngine:
                 loudness_error_message = str(exc) or exc.__class__.__name__
 
             # FFT band checks
-            nfft = ch_cfg.get("stft_nfft", 1024)
-            fft_bands = self._check_bands(
-                sig, sample_rate, nfft,
-                ch_cfg.get("fft_band_limits", []),
+            fft_bands, fft_available, fft_error_message = self._check_fft_bands(
+                channel_index=ch_idx,
+                channel_config=ch_cfg,
+                sig=sig,
+                sample_rate=sample_rate,
+                configured_input_sample_rate=configured_input_sample_rate,
+                mic_sensitivity=sensitivity,
+                golden_cache=golden_cache,
             )
 
             # Octave band checks
-            oct_bands = self._check_octave_bands(
-                sig, sample_rate,
-                ch_cfg.get("oct_weighting", "Z"),
-                ch_cfg.get("oct_band_limits", []),
+            oct_bands, octave_available, octave_error_message = self._check_octave_bands(
+                channel_index=ch_idx,
+                channel_config=ch_cfg,
+                sig=sig,
+                sample_rate=sample_rate,
+                configured_input_sample_rate=configured_input_sample_rate,
+                mic_sensitivity=sensitivity,
+                golden_cache=golden_cache,
             )
 
             ch_pass = (
                 spl_pass
                 and loudness_pass is True
+                and fft_available
+                and octave_available
                 and all(b.passed for b in fft_bands)
                 and all(b.passed for b in oct_bands)
             )
@@ -188,6 +214,10 @@ class JudgmentEngine:
                 loudness_pass=loudness_pass,
                 loudness_available=loudness_available,
                 loudness_error_message=loudness_error_message,
+                fft_available=fft_available,
+                fft_error_message=fft_error_message,
+                octave_available=octave_available,
+                octave_error_message=octave_error_message,
                 fft_band_results=fft_bands,
                 oct_band_results=oct_bands,
             ))
@@ -214,60 +244,285 @@ class JudgmentEngine:
             analysis_window=(start_sec, end_sec),
         )
 
-    def _check_bands(
+    def _check_fft_bands(
+        self,
+        *,
+        channel_index: int,
+        channel_config: dict,
+        sig: np.ndarray,
+        sample_rate: float,
+        configured_input_sample_rate,
+        mic_sensitivity: float,
+        golden_cache: GoldenReferenceCache,
+    ) -> tuple[list[BandResult], bool, str | None]:
+        band_limits = channel_config.get("fft_band_limits", [])
+        mode = self._golden_mode(channel_config.get("fft_golden_mode"))
+        overlay_requested = bool(channel_config.get("fft_show_golden_overlay"))
+
+        if mode != "off":
+            try:
+                golden_bundle = golden_cache.bundle_for_channel(
+                    channel_index=channel_index,
+                    channel_config=channel_config,
+                    configured_input_sample_rate=configured_input_sample_rate,
+                    runtime_sample_rate=sample_rate,
+                    mic_sensitivity=mic_sensitivity,
+                )
+                golden_freqs, golden_levels = golden_cache.ensure_fft(golden_bundle)
+            except GoldenReferenceError as exc:
+                return [], False, str(exc)
+        elif overlay_requested:
+            try:
+                golden_cache.bundle_for_channel(
+                    channel_index=channel_index,
+                    channel_config=channel_config,
+                    configured_input_sample_rate=configured_input_sample_rate,
+                    runtime_sample_rate=sample_rate,
+                    mic_sensitivity=mic_sensitivity,
+                )
+            except GoldenReferenceError as exc:
+                logger.warning("黄金样本加载失败，FFT 对比曲线已忽略: %s", exc)
+
+        if not isinstance(band_limits, list) or not band_limits:
+            return [], True, None
+
+        measured_freqs, measured_levels = self._measure_fft(sig, sample_rate)
+        if mode == "off":
+            return (
+                self._build_fft_band_results(
+                    measured_freqs=measured_freqs,
+                    measured_levels=measured_levels,
+                    band_limits=band_limits,
+                    golden_levels=None,
+                    mode=mode,
+                ),
+                True,
+                None,
+            )
+
+        try:
+            self._validate_matching_axis(measured_freqs, golden_freqs, "FFT")
+        except GoldenReferenceError as exc:
+            return [], False, str(exc)
+
+        return (
+            self._build_fft_band_results(
+                measured_freqs=measured_freqs,
+                measured_levels=measured_levels,
+                band_limits=band_limits,
+                golden_levels=golden_levels,
+                mode=mode,
+            ),
+            True,
+            None,
+        )
+
+    def _check_octave_bands(
+        self,
+        *,
+        channel_index: int,
+        channel_config: dict,
+        sig: np.ndarray,
+        sample_rate: float,
+        configured_input_sample_rate,
+        mic_sensitivity: float,
+        golden_cache: GoldenReferenceCache,
+    ) -> tuple[list[BandResult], bool, str | None]:
+        band_limits = channel_config.get("oct_band_limits", [])
+        weighting = str(channel_config.get("oct_weighting", "Z") or "Z")
+        mode = self._golden_mode(channel_config.get("oct_golden_mode"))
+        overlay_requested = bool(channel_config.get("oct_show_golden_overlay"))
+
+        if mode != "off":
+            try:
+                golden_bundle = golden_cache.bundle_for_channel(
+                    channel_index=channel_index,
+                    channel_config=channel_config,
+                    configured_input_sample_rate=configured_input_sample_rate,
+                    runtime_sample_rate=sample_rate,
+                    mic_sensitivity=mic_sensitivity,
+                )
+                golden_centers, golden_levels = golden_cache.ensure_octave(
+                    golden_bundle,
+                    weighting=weighting,
+                )
+            except GoldenReferenceError as exc:
+                return [], False, str(exc)
+        elif overlay_requested:
+            try:
+                golden_cache.bundle_for_channel(
+                    channel_index=channel_index,
+                    channel_config=channel_config,
+                    configured_input_sample_rate=configured_input_sample_rate,
+                    runtime_sample_rate=sample_rate,
+                    mic_sensitivity=mic_sensitivity,
+                )
+            except GoldenReferenceError as exc:
+                logger.warning("黄金样本加载失败，倍频程对比曲线已忽略: %s", exc)
+
+        if not isinstance(band_limits, list) or not band_limits:
+            return [], True, None
+
+        measured_centers, measured_levels = self._measure_octave(
+            sig,
+            sample_rate,
+            weighting,
+        )
+        if mode == "off":
+            return (
+                self._build_octave_band_results(
+                    measured_centers=measured_centers,
+                    measured_levels=measured_levels,
+                    band_limits=band_limits,
+                    golden_levels=None,
+                    mode=mode,
+                ),
+                True,
+                None,
+            )
+
+        try:
+            self._validate_matching_axis(measured_centers, golden_centers, "倍频程")
+        except GoldenReferenceError as exc:
+            return [], False, str(exc)
+
+        return (
+            self._build_octave_band_results(
+                measured_centers=measured_centers,
+                measured_levels=measured_levels,
+                band_limits=band_limits,
+                golden_levels=golden_levels,
+                mode=mode,
+            ),
+            True,
+            None,
+        )
+
+    def _measure_fft(
         self,
         sig: np.ndarray,
         sample_rate: float,
-        nfft: int,
-        band_limits: list[dict],
-    ) -> list[BandResult]:
-        """Check FFT band limits."""
-        if not band_limits:
-            return []
+    ) -> tuple[np.ndarray, np.ndarray]:
+        nfft = max(1, int(np.asarray(sig).size))
         freqs, mag_db = dsp.compute_fft_spectrum(sig, sample_rate, nfft)
-        results = []
-        for bl in band_limits:
-            target_freq = bl["freq"]
-            # Find nearest frequency bin
-            idx = np.argmin(np.abs(freqs - target_freq))
-            level = float(mag_db[idx] - 20.0 * np.log10(_REF_PRESSURE))
-            lo = bl.get("lower", -np.inf)
-            hi = bl.get("upper", np.inf)
-            results.append(BandResult(
-                freq=float(freqs[idx]),
-                level=level,
-                lower=lo,
-                upper=hi,
-                passed=lo <= level <= hi,
-            ))
-        return results
+        return np.asarray(freqs, dtype=np.float64), self._absolute_levels_db(mag_db)
 
-    def _check_octave_bands(
+    def _measure_octave(
         self,
         sig: np.ndarray,
         sample_rate: float,
         weighting: str,
-        band_limits: list[dict],
-    ) -> list[BandResult]:
-        """Check 1/3-octave band limits."""
-        if not band_limits:
-            return []
+    ) -> tuple[np.ndarray, np.ndarray]:
         centers, levels = dsp.compute_octave_bands(sig, sample_rate, weighting)
-        results = []
-        for bl in band_limits:
-            target_freq = bl["freq"]
-            idx = np.argmin(np.abs(centers - target_freq))
-            level = float(levels[idx] - 20.0 * np.log10(_REF_PRESSURE))
-            lo = bl.get("lower", -np.inf)
-            hi = bl.get("upper", np.inf)
-            results.append(BandResult(
-                freq=float(centers[idx]),
-                level=level,
-                lower=lo,
-                upper=hi,
-                passed=lo <= level <= hi,
-            ))
+        return np.asarray(centers, dtype=np.float64), self._absolute_levels_db(levels)
+
+    def _build_fft_band_results(
+        self,
+        *,
+        measured_freqs: np.ndarray,
+        measured_levels: np.ndarray,
+        band_limits: list[dict],
+        golden_levels: np.ndarray | None,
+        mode: str,
+    ) -> list[BandResult]:
+        results: list[BandResult] = []
+        for band_limit in band_limits:
+            target_freq = band_limit["freq"]
+            idx = int(np.argmin(np.abs(measured_freqs - target_freq)))
+            measured_level = float(measured_levels[idx])
+            level, lower, upper = self._judged_band_space(
+                measured_level=measured_level,
+                golden_level=(
+                    float(golden_levels[idx]) if golden_levels is not None else None
+                ),
+                lower=band_limit.get("lower", -np.inf),
+                upper=band_limit.get("upper", np.inf),
+                mode=mode,
+            )
+            results.append(
+                BandResult(
+                    freq=float(measured_freqs[idx]),
+                    level=level,
+                    lower=lower,
+                    upper=upper,
+                    passed=lower <= level <= upper,
+                )
+            )
         return results
+
+    def _build_octave_band_results(
+        self,
+        *,
+        measured_centers: np.ndarray,
+        measured_levels: np.ndarray,
+        band_limits: list[dict],
+        golden_levels: np.ndarray | None,
+        mode: str,
+    ) -> list[BandResult]:
+        results: list[BandResult] = []
+        for band_limit in band_limits:
+            target_freq = band_limit["freq"]
+            idx = int(np.argmin(np.abs(measured_centers - target_freq)))
+            measured_level = float(measured_levels[idx])
+            level, lower, upper = self._judged_band_space(
+                measured_level=measured_level,
+                golden_level=(
+                    float(golden_levels[idx]) if golden_levels is not None else None
+                ),
+                lower=band_limit.get("lower", -np.inf),
+                upper=band_limit.get("upper", np.inf),
+                mode=mode,
+            )
+            results.append(
+                BandResult(
+                    freq=float(measured_centers[idx]),
+                    level=level,
+                    lower=lower,
+                    upper=upper,
+                    passed=lower <= level <= upper,
+                )
+            )
+        return results
+
+    @staticmethod
+    def _judged_band_space(
+        *,
+        measured_level: float,
+        golden_level: float | None,
+        lower,
+        upper,
+        mode: str,
+    ) -> tuple[float, float, float]:
+        if mode == "absolute" and golden_level is not None:
+            lower = float(golden_level + lower)
+            upper = float(golden_level + upper)
+            return measured_level, lower, upper
+        if mode == "delta" and golden_level is not None:
+            return float(measured_level - golden_level), float(lower), float(upper)
+        return measured_level, float(lower), float(upper)
+
+    @staticmethod
+    def _validate_matching_axis(
+        measured_axis: np.ndarray,
+        golden_axis: np.ndarray,
+        label: str,
+    ) -> None:
+        if measured_axis.shape != golden_axis.shape:
+            raise GoldenReferenceError(f"黄金样本{label}频轴不匹配")
+        if not np.allclose(measured_axis, golden_axis):
+            raise GoldenReferenceError(f"黄金样本{label}频轴不匹配")
+
+    @staticmethod
+    def _golden_mode(value) -> str:
+        mode = str(value or "off").strip().lower()
+        if mode in {"absolute", "delta"}:
+            return mode
+        return "off"
+
+    @staticmethod
+    def _absolute_levels_db(levels_db: np.ndarray | list[float]) -> np.ndarray:
+        levels = np.asarray(levels_db, dtype=np.float64)
+        return levels - _REF_PRESSURE_DB
 
     @staticmethod
     def _loudness_limits_sone(channel_config: dict) -> tuple[float, float]:

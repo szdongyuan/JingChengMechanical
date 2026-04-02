@@ -75,6 +75,24 @@ class TestChannelJudgment:
         assert payload["loudness_available"] is True
         assert payload["loudness_error_message"] is None
 
+    def test_serializes_fft_and_octave_availability_fields(self):
+        judgment = ChannelJudgment(
+            channel_index=0,
+            spl_db=65.0,
+            spl_pass=True,
+            fft_available=False,
+            fft_error_message="fft golden unavailable",
+            octave_available=False,
+            octave_error_message="octave golden unavailable",
+        )
+
+        payload = asdict(judgment)
+
+        assert payload["fft_available"] is False
+        assert payload["fft_error_message"] == "fft golden unavailable"
+        assert payload["octave_available"] is False
+        assert payload["octave_error_message"] == "octave golden unavailable"
+
 
 class TestJudgmentResult:
     def test_pass_verdict(self):
