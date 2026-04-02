@@ -111,6 +111,7 @@ def test_connect_bootstraps_full_runtime_schema_and_default_rows(monkeypatch):
         svc.connect()
 
         assert _runtime_table_names(tmp_db) == EXPECTED_RUNTIME_TABLES
+        assert "fft_nfft" in _table_columns(tmp_db, "channel_config_table")
         assert tmp_db.execute_sql(
             "SELECT id FROM device_table ORDER BY id"
         ).fetchall() == [(1,)]
@@ -389,6 +390,7 @@ def test_connect_migrates_legacy_config_tables_and_preserves_extra_columns(
 
         channel_columns = _table_columns(tmp_db, "channel_config_table")
         assert {
+            "fft_nfft",
             "loudness_unit",
             "loudness_lower_limit",
             "loudness_upper_limit",
@@ -418,6 +420,7 @@ def test_connect_migrates_legacy_config_tables_and_preserves_extra_columns(
             {
                 "channel_index": 0,
                 "stft_nfft": 1024,
+                "fft_nfft": 4096,
                 "stft_overlap": 0.5,
                 "spl_weighting": "A",
                 "spl_time_constant": 0.125,

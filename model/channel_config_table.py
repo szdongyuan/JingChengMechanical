@@ -20,6 +20,7 @@ class ChannelConfigTable(BaseModel):
     )
     channel_index = IntegerField()
     stft_nfft = IntegerField(default=1024)
+    fft_nfft = IntegerField(default=4096)
     stft_overlap = FloatField(default=0.5)
     spl_weighting = TextField(default="A")
     spl_time_constant = FloatField(default=0.125)

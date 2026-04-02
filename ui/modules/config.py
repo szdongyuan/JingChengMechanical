@@ -1015,6 +1015,17 @@ class ConfigModule(QWidget):
         fft_controls_form.setHorizontalSpacing(10)
         fft_controls_form.setVerticalSpacing(6)
 
+        fft_resolution = _NoWheelComboBox()
+        for value in [256, 512, 1024, 2048, 4096, 8192]:
+            fft_resolution.addItem(str(value), value)
+        fft_resolution.setObjectName("fft_nfft")
+        fft_resolution_value = data.get("fft_nfft", 4096) if data else 4096
+        fft_resolution_index = fft_resolution.findData(fft_resolution_value)
+        fft_resolution.setCurrentIndex(
+            fft_resolution_index if fft_resolution_index >= 0 else 4
+        )
+        fft_controls_form.addRow("FFT 分辨率", fft_resolution)
+
         fft_mode = _NoWheelComboBox()
         fft_mode.setObjectName("fft_golden_mode")
         fft_mode.addItem("Off", "off")
@@ -1284,6 +1295,9 @@ class ConfigModule(QWidget):
 
         combo_nfft = container.findChild(QComboBox, "stft_nfft")
         ch["stft_nfft"] = combo_nfft.currentData() if combo_nfft else 1024
+
+        combo_fft_nfft = container.findChild(QComboBox, "fft_nfft")
+        ch["fft_nfft"] = combo_fft_nfft.currentData() if combo_fft_nfft else 4096
 
         combo_overlap = container.findChild(QComboBox, "stft_overlap")
         ch["stft_overlap"] = combo_overlap.currentData() if combo_overlap else 0.5

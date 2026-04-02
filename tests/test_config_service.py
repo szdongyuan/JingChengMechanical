@@ -484,6 +484,16 @@ def test_load_config_returns_default_loudness_fields_for_channel_rows():
     assert result["channels"][0]["loudness_upper_limit"] == 60.0
 
 
+def test_load_config_returns_default_fft_resolution_for_channel_rows():
+    svc = _service()
+    cfg = ConfigTable.create(config_name="Cfg1")
+    ChannelConfigTable.create(config=cfg, **_channel_payload(0))
+
+    result = svc.load_config(cfg.config_id)
+
+    assert result["channels"][0]["fft_nfft"] == 4096
+
+
 def test_save_config_persists_loudness_fields():
     svc = _service()
     config_id = ConfigTable.create(config_name="Cfg1").config_id
@@ -516,6 +526,34 @@ def test_save_config_persists_loudness_fields():
     assert row.loudness_unit == "phon"
     assert row.loudness_lower_limit == 12.5
     assert row.loudness_upper_limit == 70.0
+
+
+def test_save_config_persists_fft_resolution():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    channel = _channel_payload(0)
+    channel["fft_nfft"] = 2048
+
+    svc.save_config(
+        {
+            "config_id": config_id,
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "scan_triggers_test": False,
+            "selected_channels": [0],
+            "channels": [channel],
+        }
+    )
+
+    loaded = svc.load_config(config_id)
+    row = ChannelConfigTable.get(
+        (ChannelConfigTable.config == config_id)
+        & (ChannelConfigTable.channel_index == 0)
+    )
+
+    assert loaded["channels"][0]["fft_nfft"] == 2048
+    assert getattr(row, "fft_nfft", None) == 2048
 
 
 def test_validate_device_without_channels_error():
@@ -555,6 +593,25 @@ def test_validate_rejects_invalid_loudness_unit():
     )
 
     assert any("响度单位" in err for err in errors)
+
+
+def test_validate_rejects_invalid_fft_resolution():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_nfft"] = 123
+
+    errors = svc.validate(
+        {
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "scan_triggers_test": False,
+            "selected_channels": [0],
+            "channels": [channel],
+        }
+    )
+
+    assert any("FFT 分辨率" in err for err in errors)
 
 
 def test_validate_rejects_negative_loudness_limits():
