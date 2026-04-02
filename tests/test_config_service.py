@@ -735,6 +735,51 @@ def test_validate_rejects_committed_golden_path_outside_managed_root(tmp_path):
     assert any("受管目录" in err for err in errors)
 
 
+def test_validate_rejects_committed_golden_path_under_managed_staged_root(tmp_path):
+    svc = _service(tmp_path / "managed")
+    staged = _write_temp_wav(tmp_path / "managed" / "staged" / "gold.wav")
+
+    errors = svc.validate(
+        _config_payload(
+            1,
+            channels=[
+                _channel_payload_with_golden(
+                    0,
+                    **_golden_binding(staged),
+                    fft_golden_mode="absolute",
+                )
+            ],
+            selected_channels=[0],
+        )
+    )
+
+    assert any("已提交目录" in err for err in errors)
+
+
+def test_validate_rejects_committed_stereo_golden_asset(tmp_path):
+    svc = _service(tmp_path / "managed")
+    managed = _write_temp_wav(
+        tmp_path / "managed" / "config_1" / "gold.wav",
+        channels=2,
+    )
+
+    errors = svc.validate(
+        _config_payload(
+            1,
+            channels=[
+                _channel_payload_with_golden(
+                    0,
+                    **_golden_binding(managed),
+                    fft_golden_mode="absolute",
+                )
+            ],
+            selected_channels=[0],
+        )
+    )
+
+    assert any("单声道" in err for err in errors)
+
+
 @pytest.mark.parametrize(
     ("mutate", "expected_fragment"),
     [
@@ -1115,4 +1160,60 @@ def test_save_config_logs_warning_when_post_commit_cleanup_fails(
     assert saved_id == config_id
     assert loaded["channels"][0]["golden_sample_path"] != str(old_path)
     assert old_path.exists()
+    assert any("cleanup failed" in message for message in caplog.messages)
+
+
+def test_delete_config_deletes_managed_committed_golden_assets(tmp_path):
+    svc = _service(tmp_path / "managed")
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    managed_path = _write_temp_wav(tmp_path / "managed" / "config_1" / "old.wav")
+    ChannelConfigTable.create(
+        config=config_id,
+        **_channel_payload_with_golden(0, **_golden_binding(managed_path)),
+    )
+
+    deleted = svc.delete_config(config_id)
+
+    assert deleted is True
+    assert not ConfigTable.select().where(ConfigTable.config_id == config_id).exists()
+    assert (
+        ChannelConfigTable.select()
+        .where(ChannelConfigTable.config == config_id)
+        .count()
+        == 0
+    )
+    assert not managed_path.exists()
+
+
+def test_delete_config_logs_warning_when_managed_cleanup_fails(
+    tmp_path,
+    monkeypatch,
+    caplog,
+):
+    golden_service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    svc = ConfigService(FakeBus(), golden_sample_service=golden_service)
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    managed_path = _write_temp_wav(tmp_path / "managed" / "config_1" / "old.wav")
+    ChannelConfigTable.create(
+        config=config_id,
+        **_channel_payload_with_golden(0, **_golden_binding(managed_path)),
+    )
+
+    def _cleanup_with_failure(paths):
+        raise OSError(f"cleanup failed for {paths}")
+
+    monkeypatch.setattr(golden_service, "cleanup_paths", _cleanup_with_failure)
+
+    with caplog.at_level(logging.WARNING):
+        deleted = svc.delete_config(config_id)
+
+    assert deleted is True
+    assert not ConfigTable.select().where(ConfigTable.config_id == config_id).exists()
+    assert (
+        ChannelConfigTable.select()
+        .where(ChannelConfigTable.config == config_id)
+        .count()
+        == 0
+    )
+    assert managed_path.exists()
     assert any("cleanup failed" in message for message in caplog.messages)

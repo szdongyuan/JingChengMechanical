@@ -328,6 +328,7 @@ class ConfigService:
         self._safe_rollback(list(pending.promoted_paths))
 
     def delete_config(self, config_id: int) -> bool:
+        cleanup_paths = self._collect_managed_config_paths(config_id)
         with TestConfigTable._meta.database.atomic():
             count = (
                 TestConfigTable.delete()
@@ -335,6 +336,7 @@ class ConfigService:
                 .execute()
             )
         if count > 0:
+            self._post_commit_cleanup(old_paths=cleanup_paths, staged_paths=[])
             self.bus.config_changed.emit()
             return True
         return False
@@ -652,6 +654,16 @@ class ConfigService:
             ):
                 cleanup.append(old_path)
         return cleanup
+
+    def _collect_managed_config_paths(self, config_id: int) -> list[str]:
+        paths: list[str] = []
+        for row in ChannelConfigTable.select(ChannelConfigTable.golden_sample_path).where(
+            ChannelConfigTable.config == config_id
+        ):
+            path = self._normalize_optional_text(row.golden_sample_path)
+            if path and self._golden_samples.is_managed_path(path):
+                paths.append(path)
+        return paths
 
     def _channel_db_values(self, channel: dict) -> dict:
         return {

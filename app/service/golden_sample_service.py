@@ -179,6 +179,8 @@ class GoldenSampleService:
             return ["黄金样本路径不存在或不可读"]
         if not self._is_within_root(path):
             errors.append("黄金样本路径必须位于受管目录内")
+        elif self.is_managed_staged_path(path):
+            errors.append("黄金样本必须位于受管已提交目录")
         if not self._is_non_negative_int(channel_config.get("golden_sample_start_sample")):
             errors.append("黄金样本起始采样点必须大于等于 0")
         if not self._is_non_negative_int(channel_config.get("golden_sample_source_channel")):
@@ -227,6 +229,8 @@ class GoldenSampleService:
 
         if float(actual_sample_rate) != float(stored_sample_rate):
             errors.append("黄金样本采样率与当前输入采样率不一致")
+        if getattr(data, "ndim", 1) != 1:
+            errors.append("黄金样本必须是单声道 WAV")
         if self._sample_count(data) != int(num_samples):
             errors.append("黄金样本文件长度与记录元数据不一致")
         return errors

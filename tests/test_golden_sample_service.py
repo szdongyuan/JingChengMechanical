@@ -152,6 +152,35 @@ def test_validate_committed_binding_accepts_valid_binding(tmp_path):
     assert errors == []
 
 
+def test_validate_committed_binding_rejects_managed_staged_root_path(tmp_path):
+    svc = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    staged_path, _ = _write_temp_wav(tmp_path / "managed" / "staged" / "gold.wav")
+
+    errors = svc.validate_committed_binding(
+        channel_config=_binding(staged_path),
+        analysis_duration=3.0,
+        sample_rate=48_000.0,
+    )
+
+    assert any("已提交目录" in err for err in errors)
+
+
+def test_validate_committed_binding_rejects_stereo_wav(tmp_path):
+    svc = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    managed_path, _ = _write_temp_wav(
+        tmp_path / "managed" / "config_1" / "gold.wav",
+        channels=2,
+    )
+
+    errors = svc.validate_committed_binding(
+        channel_config=_binding(managed_path),
+        analysis_duration=3.0,
+        sample_rate=48_000.0,
+    )
+
+    assert any("单声道" in err for err in errors)
+
+
 @pytest.mark.parametrize(
     ("binding_updates", "path_factory", "expected_fragment"),
     [
