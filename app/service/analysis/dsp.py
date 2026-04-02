@@ -261,22 +261,32 @@ def compute_fft_spectrum(signal: np.ndarray, sample_rate: float,
         spectrum = np.fft.rfft(sig * window)
         mag = np.abs(spectrum) * 2.0 / nfft
     else:
-        hop = max(1, nfft // 2)
-        starts = list(range(0, sig.size - nfft + 1, hop))
-        tail_start = sig.size - nfft
-        if not starts or starts[-1] != tail_start:
-            starts.append(tail_start)
-
         window = np.hanning(nfft)
-        linear_magnitudes = []
-        for start in starts:
+        mag_sum = np.zeros(nfft // 2 + 1, dtype=np.float64)
+        window_count = 0
+        for start in _iter_fft_window_starts(sig.size, nfft):
             windowed = sig[start:start + nfft] * window
             spectrum = np.fft.rfft(windowed)
-            linear_magnitudes.append(np.abs(spectrum) * 2.0 / nfft)
-        mag = np.mean(np.vstack(linear_magnitudes), axis=0)
+            mag_sum += np.abs(spectrum) * 2.0 / nfft
+            window_count += 1
+        mag = mag_sum / max(window_count, 1)
     mag_db = 20.0 * np.log10(np.maximum(mag, 1e-30))
     freqs = np.fft.rfftfreq(nfft, d=1.0 / sample_rate)
     return freqs, mag_db
+
+
+def _iter_fft_window_starts(signal_size: int, nfft: int):
+    hop = max(1, nfft // 2)
+    start = 0
+    last_start = None
+    while start + nfft <= signal_size:
+        yield start
+        last_start = start
+        start += hop
+
+    tail_start = signal_size - nfft
+    if last_start != tail_start:
+        yield tail_start
 
 
 # ---------------------------------------------------------------------------

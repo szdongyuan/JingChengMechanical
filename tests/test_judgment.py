@@ -361,6 +361,67 @@ class TestLimitChecks:
         assert band.passed is True
         assert result.channel_results[0].fft_available is True
 
+    def test_fft_absolute_mode_uses_selected_window_sample_count_for_measured_and_golden_fft(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+        engine = self._make_engine(golden_sample_service=service)
+        golden_path = _write_temp_wav(
+            tmp_path / "managed" / "config_1" / "gold.wav",
+            fill_value=0.5,
+        )
+        sr = 48_000.0
+        window_samples = int(sr * 3.0)
+        buf = np.full((window_samples, 1), 0.25, dtype=np.float32)
+        config = _make_config(
+            input_device_samplerate=sr,
+            channels=[
+                _make_channel_config(
+                    0,
+                    stft_nfft=512,
+                    fft_band_limits=[
+                        {"freq": 1000.0, "lower": -1.0, "upper": 1.0},
+                    ],
+                    fft_golden_mode="absolute",
+                    **_golden_binding(golden_path),
+                )
+            ],
+        )
+        fft_calls: list[dict[str, int | str]] = []
+
+        def fake_fft(signal, sample_rate, nfft):
+            if np.isclose(float(signal[0]), 0.25):
+                source = "measured"
+                level = 11.0
+            elif np.isclose(float(signal[0]), 0.5):
+                source = "golden"
+                level = 10.0
+            else:  # pragma: no cover - makes failures easier to read
+                raise AssertionError(f"unexpected signal marker {float(signal[0])}")
+            fft_calls.append({"source": source, "nfft": int(nfft)})
+            return np.array([1000.0], dtype=np.float64), np.array(
+                [level + _REF_DB],
+                dtype=np.float64,
+            )
+
+        monkeypatch.setattr(dsp, "compute_fft_spectrum", fake_fft)
+
+        result = engine.judge(
+            config,
+            buf,
+            sr,
+            mic_cal={},
+            audio_file_path="/tmp/test.wav",
+        )
+
+        assert fft_calls == [
+            {"source": "golden", "nfft": window_samples},
+            {"source": "measured", "nfft": window_samples},
+        ]
+        assert result.channel_results[0].fft_available is True
+
     def test_fft_delta_mode_serializes_band_result_in_delta_space(
         self,
         tmp_path,

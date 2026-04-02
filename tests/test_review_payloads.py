@@ -133,6 +133,7 @@ class _GoldenCacheStub:
     ):
         self.bundle_calls = 0
         self.ensure_fft_calls = 0
+        self.ensure_fft_nffts: list[int] = []
         self.ensure_octave_calls = 0
         self.fft_axis = np.asarray(fft_axis or [], dtype=np.float64)
         self.fft_levels = np.asarray(fft_levels or [], dtype=np.float64)
@@ -150,6 +151,7 @@ class _GoldenCacheStub:
 
     def ensure_fft(self, bundle, *, nfft):
         self.ensure_fft_calls += 1
+        self.ensure_fft_nffts.append(int(nfft))
         if self.fft_error is not None:
             raise self.fft_error
         return self.fft_axis, self.fft_levels
@@ -1085,6 +1087,7 @@ def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch
 def test_build_chart_payload_fft_absolute_mode_uses_serialized_markers_and_overlay(
     monkeypatch,
 ):
+    expected_nfft = int(100.0 * (2.0 - 0.0))
     _patch_basic_chart_backends(
         monkeypatch,
         fft_levels=(64.0, 45.0),
@@ -1127,6 +1130,7 @@ def test_build_chart_payload_fft_absolute_mode_uses_serialized_markers_and_overl
 
     assert cache.bundle_calls == 1
     assert cache.ensure_fft_calls == 1
+    assert cache.ensure_fft_nffts == [expected_nfft]
     fft_payload = payload[0]["fft"]
     assert fft_payload["frequencies_hz"] == [1000.0, 2000.0]
     assert fft_payload["levels_db"] == [64.0, 45.0]
@@ -1147,6 +1151,7 @@ def test_build_chart_payload_fft_absolute_mode_uses_serialized_markers_and_overl
 def test_build_chart_payload_fft_delta_mode_serializes_main_series_in_delta_space(
     monkeypatch,
 ):
+    expected_nfft = int(100.0 * (2.0 - 0.0))
     _patch_basic_chart_backends(
         monkeypatch,
         fft_levels=(64.0, 45.0),
@@ -1187,6 +1192,7 @@ def test_build_chart_payload_fft_delta_mode_serializes_main_series_in_delta_spac
         ),
     )
 
+    assert cache.ensure_fft_nffts == [expected_nfft]
     fft_payload = payload[0]["fft"]
     assert fft_payload["levels_db"] == [-2.0, 1.0]
     assert fft_payload["golden_mode"] == "delta"
