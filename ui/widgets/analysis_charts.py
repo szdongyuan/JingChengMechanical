@@ -681,9 +681,28 @@ class OctaveBarChartWidget(_BasePlotChart):
             levels_db=normalized_golden_overlay,
         )
         self._update_zero_reference_line(bool(show_zero_reference))
-        self.plot_item.getAxis("bottom").setTicks(
-            [[(float(index), self._format_frequency_label(freq_hz)) for index, freq_hz in enumerate(normalized_frequencies)]]
-        )
+        visible_labels_hz = {
+            40.0,
+            80.0,
+            160.0,
+            315.0,
+            630.0,
+            1250.0,
+            2500.0,
+            5000.0,
+            10000.0,
+            16000.0,
+        }
+        ticks = [
+            (
+                float(index),
+                self._format_frequency_label(freq_hz)
+                if freq_hz in visible_labels_hz
+                else "",
+            )
+            for index, freq_hz in enumerate(normalized_frequencies)
+        ]
+        self.plot_item.getAxis("bottom").setTicks([ticks])
         self._render_band_markers(
             x_values=_nearest_positions(
                 normalized_frequencies,

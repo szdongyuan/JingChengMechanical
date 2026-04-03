@@ -700,6 +700,119 @@ def test_octave_bar_chart_widget_renders_golden_overlay_comparison_series(qapp):
     assert widget._zero_reference_line.isVisible() is False
 
 
+def test_octave_bar_chart_widget_downsamples_visible_axis_labels_to_approved_subset(
+    qapp,
+):
+    widget = OctaveBarChartWidget()
+
+    widget.set_bands(
+        center_freqs_hz=[
+            31.5,
+            40.0,
+            50.0,
+            63.0,
+            80.0,
+            100.0,
+            125.0,
+            160.0,
+            200.0,
+            250.0,
+            315.0,
+            400.0,
+            500.0,
+            630.0,
+            800.0,
+            1000.0,
+            1250.0,
+            1600.0,
+            2000.0,
+            2500.0,
+            3150.0,
+            4000.0,
+            5000.0,
+            6300.0,
+            8000.0,
+            10000.0,
+            12500.0,
+            16000.0,
+            20000.0,
+        ],
+        levels_db=[0.0] * 29,
+        limit_bands=[],
+    )
+
+    ticks = widget.plot_item.getAxis("bottom")._tickLevels
+    labels = [text for _value, text in ticks[0]]
+
+    assert labels == [
+        "",
+        "40",
+        "",
+        "",
+        "80",
+        "",
+        "",
+        "160",
+        "",
+        "",
+        "315",
+        "",
+        "",
+        "630",
+        "",
+        "",
+        "1250",
+        "",
+        "",
+        "2500",
+        "",
+        "",
+        "5000",
+        "",
+        "",
+        "10000",
+        "",
+        "16000",
+        "",
+    ]
+    assert widget.band_payload()["center_freqs_hz"] == [
+        31.5,
+        40.0,
+        50.0,
+        63.0,
+        80.0,
+        100.0,
+        125.0,
+        160.0,
+        200.0,
+        250.0,
+        315.0,
+        400.0,
+        500.0,
+        630.0,
+        800.0,
+        1000.0,
+        1250.0,
+        1600.0,
+        2000.0,
+        2500.0,
+        3150.0,
+        4000.0,
+        5000.0,
+        6300.0,
+        8000.0,
+        10000.0,
+        12500.0,
+        16000.0,
+        20000.0,
+    ]
+    assert widget._bar_item is not None
+    assert list(np.asarray(widget._bar_item.opts["x"], dtype=float)) == list(
+        np.arange(29, dtype=float)
+    )
+    assert len(np.asarray(widget._bar_item.opts["height"], dtype=float)) == 29
+
+
 def test_octave_bar_chart_widget_keeps_negative_delta_bars_anchored_to_zero(qapp):
     widget = OctaveBarChartWidget()
 
