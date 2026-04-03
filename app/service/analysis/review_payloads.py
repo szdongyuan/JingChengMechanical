@@ -863,7 +863,10 @@ def _build_fft_chart(
 ) -> dict | None:
     mode = _golden_mode(channel_config.get("fft_golden_mode"))
     overlay_requested = bool(channel_config.get("fft_show_golden_overlay")) and mode != "delta"
-    nfft = int(signal.size)
+    nfft = channel_config.get(
+        "fft_nfft",
+        _runtime_channel_defaults(channel_index).get("fft_nfft"),
+    )
     if mode != "off" and isinstance(channel_result, dict) and channel_result.get("fft_available") is False:
         _log_chart_warning(
             "FFT chart payload omitted",
@@ -873,16 +876,14 @@ def _build_fft_chart(
         return None
 
     try:
-        frequencies_hz, measured_levels_db = _measure_fft_levels(signal, sample_rate)
-    except Exception:
-        if mode != "off":
-            logger.warning(
-                "FFT chart payload omitted for CH%s: measured recompute failed",
-                channel_index + 1,
-                exc_info=True,
-            )
-            return None
-        raise
+        frequencies_hz, measured_levels_db = _measure_fft_levels(
+            signal,
+            sample_rate,
+            nfft=nfft,
+        )
+    except Exception as exc:
+        _log_chart_warning("FFT chart payload omitted", channel_index=channel_index, error=exc)
+        return None
 
     if mode == "off":
         chart = {
@@ -1056,8 +1057,9 @@ def _build_octave_chart(
 def _measure_fft_levels(
     signal: np.ndarray,
     sample_rate: float,
+    *,
+    nfft: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    nfft = int(signal.size)
     frequencies_hz, magnitudes_db = dsp.compute_fft_spectrum(signal, sample_rate, nfft)
     return np.asarray(frequencies_hz, dtype=np.float64), _absolute_levels_db(magnitudes_db)
 

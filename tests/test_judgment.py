@@ -48,6 +48,7 @@ def _make_channel_config(idx, **overrides) -> dict:
     cfg = {
         "channel_index": idx,
         "stft_nfft": 1024,
+        "fft_nfft": 4096,
         "stft_overlap": 0.5,
         "spl_weighting": "Z",
         "spl_time_constant": 0.125,
@@ -260,7 +261,7 @@ class TestLimitChecks:
                               audio_file_path="/tmp/test.wav")
         assert result.channel_results[0].fft_band_results[0].passed is False
 
-    def test_fft_off_mode_uses_full_window_fft_and_preserves_absolute_band_space(
+    def test_fft_off_mode_uses_configured_fft_nfft_and_preserves_absolute_band_space(
         self,
         monkeypatch,
     ):
@@ -274,6 +275,7 @@ class TestLimitChecks:
                 _make_channel_config(
                     0,
                     stft_nfft=512,
+                    fft_nfft=4096,
                     fft_band_limits=[
                         {"freq": 1000.0, "lower": 9.0, "upper": 13.0},
                     ],
@@ -302,7 +304,7 @@ class TestLimitChecks:
 
         band = result.channel_results[0].fft_band_results[0]
 
-        assert fft_calls == [window_samples]
+        assert fft_calls == [4096]
         assert band.level == pytest.approx(11.0)
         assert band.lower == pytest.approx(9.0)
         assert band.upper == pytest.approx(13.0)
@@ -361,7 +363,7 @@ class TestLimitChecks:
         assert band.passed is True
         assert result.channel_results[0].fft_available is True
 
-    def test_fft_absolute_mode_uses_selected_window_sample_count_for_measured_and_golden_fft(
+    def test_fft_absolute_mode_uses_configured_fft_nfft_for_measured_and_golden_fft(
         self,
         tmp_path,
         monkeypatch,
@@ -381,6 +383,7 @@ class TestLimitChecks:
                 _make_channel_config(
                     0,
                     stft_nfft=512,
+                    fft_nfft=4096,
                     fft_band_limits=[
                         {"freq": 1000.0, "lower": -1.0, "upper": 1.0},
                     ],
@@ -417,10 +420,54 @@ class TestLimitChecks:
         )
 
         assert fft_calls == [
-            {"source": "golden", "nfft": window_samples},
-            {"source": "measured", "nfft": window_samples},
+            {"source": "golden", "nfft": 4096},
+            {"source": "measured", "nfft": 4096},
         ]
         assert result.channel_results[0].fft_available is True
+
+    def test_fft_measured_recompute_failure_soft_fails_in_off_mode(
+        self,
+        monkeypatch,
+    ):
+        engine = self._make_engine()
+        sr = 48_000.0
+        buf = np.full((int(sr * 3.0), 1), 0.25, dtype=np.float32)
+        config = _make_config(
+            input_device_samplerate=sr,
+            channels=[
+                _make_channel_config(
+                    0,
+                    fft_nfft=4096,
+                    fft_band_limits=[
+                        {"freq": 1000.0, "lower": 9.0, "upper": 13.0},
+                    ],
+                    fft_golden_mode="off",
+                )
+            ],
+        )
+        fft_calls: list[int] = []
+
+        def raising_fft(signal, sample_rate, nfft):
+            fft_calls.append(int(nfft))
+            raise ValueError("empty fft input")
+
+        monkeypatch.setattr(dsp, "compute_fft_spectrum", raising_fft)
+
+        result = engine.judge(
+            config,
+            buf,
+            sr,
+            mic_cal={},
+            audio_file_path="/tmp/test.wav",
+        )
+
+        channel_result = result.channel_results[0]
+
+        assert fft_calls == [4096]
+        assert channel_result.fft_available is False
+        assert channel_result.fft_band_results == []
+        assert "empty" in (channel_result.fft_error_message or "").lower()
+        assert result.limit_pass is False
 
     def test_fft_delta_mode_serializes_band_result_in_delta_space(
         self,

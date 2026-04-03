@@ -429,6 +429,20 @@ class TestComputeFftSpectrum:
         assert freqs.shape[0] == 4096 // 2 + 1
         assert mag_db.shape == freqs.shape
 
+    @pytest.mark.parametrize(
+        ("signal", "sample_rate", "nfft"),
+        [
+            (np.array([], dtype=np.float64), 44100.0, 4096),
+            (np.ones(8, dtype=np.float64), 0.0, 4096),
+            (np.ones(8, dtype=np.float64), float("nan"), 4096),
+            (np.ones(8, dtype=np.float64), 44100.0, 1024.5),
+            (np.ones(8, dtype=np.float64), 44100.0, 0),
+        ],
+    )
+    def test_invalid_inputs_raise_value_error(self, signal, sample_rate, nfft):
+        with pytest.raises(ValueError):
+            compute_fft_spectrum(signal, sample_rate, nfft)
+
     def test_short_signal_zero_pads_to_nfft(self, monkeypatch):
         captured_windows: list[np.ndarray] = []
 

@@ -106,7 +106,7 @@ class GoldenReferenceCache:
         *,
         nfft: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        resolved_nfft = int(nfft)
+        resolved_nfft = _validated_positive_nfft(nfft)
         cached = bundle.fft_by_nfft.get(resolved_nfft)
         if cached is not None:
             return cached
@@ -188,6 +188,13 @@ def _coerce_positive_int(value) -> int | None:
         if numeric > 0:
             return numeric
     return None
+
+
+def _validated_positive_nfft(value) -> int:
+    numeric = _coerce_positive_int(value)
+    if numeric is None:
+        raise ValueError("nfft must be a positive integer")
+    return numeric
 
 
 __all__ = [

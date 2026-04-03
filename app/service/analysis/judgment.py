@@ -258,12 +258,12 @@ class JudgmentEngine:
         band_limits = channel_config.get("fft_band_limits", [])
         mode = self._golden_mode(channel_config.get("fft_golden_mode"))
         overlay_requested = bool(channel_config.get("fft_show_golden_overlay"))
+        nfft = channel_config.get("fft_nfft", _CHANNEL_DEFAULTS["fft_nfft"])
 
         if not isinstance(band_limits, list) or not band_limits:
             return [], True, None
 
         if mode != "off":
-            nfft = max(1, int(np.asarray(sig).size))
             try:
                 golden_bundle = golden_cache.bundle_for_channel(
                     channel_index=channel_index,
@@ -290,7 +290,14 @@ class JudgmentEngine:
             except GoldenReferenceError as exc:
                 logger.warning("黄金样本加载失败，FFT 对比曲线已忽略: %s", exc)
 
-        measured_freqs, measured_levels = self._measure_fft(sig, sample_rate)
+        try:
+            measured_freqs, measured_levels = self._measure_fft(
+                sig,
+                sample_rate,
+                nfft=nfft,
+            )
+        except Exception as exc:
+            return [], False, str(exc) or exc.__class__.__name__
         if mode == "off":
             return (
                 self._build_fft_band_results(
@@ -406,8 +413,9 @@ class JudgmentEngine:
         self,
         sig: np.ndarray,
         sample_rate: float,
+        *,
+        nfft: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        nfft = max(1, int(np.asarray(sig).size))
         freqs, mag_db = dsp.compute_fft_spectrum(sig, sample_rate, nfft)
         return np.asarray(freqs, dtype=np.float64), self._absolute_levels_db(mag_db)
 
