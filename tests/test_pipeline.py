@@ -13,6 +13,7 @@ def _make_config(**overrides) -> dict:
     cfg = {
         "channel_index": 0,
         "stft_nfft": 1024,
+        "fft_nfft": 4096,
         "stft_overlap": 0.5,
         "spl_weighting": "A",
         "spl_time_constant": 0.125,
@@ -100,6 +101,57 @@ class TestAnalysisPipeline:
         # Calibrated signal is 2x amplitude → ~6 dB higher SPL
         assert r_cal["spl"].spl_db > r_raw["spl"].spl_db
 
+    def test_live_fft_uses_fft_nfft_instead_of_stft_nfft(self):
+        cfg = _make_config(stft_nfft=512, fft_nfft=4096)
+        p = AnalysisPipeline(channel_index=0, channel_config=cfg, sample_rate=48_000.0)
+
+        first = p.process_chunk(np.ones(2048, dtype=np.float32), elapsed_time=0.05)
+        second = p.process_chunk(np.ones(2048, dtype=np.float32), elapsed_time=0.10)
+
+        assert first["fft"] is None
+        assert isinstance(second["fft"], FftFrame)
+        assert second["fft"].frequencies.shape[0] == 4096 // 2 + 1
+
+    def test_live_fft_waits_for_rolling_buffer_then_emits_one_frame_per_chunk(
+        self,
+        monkeypatch,
+    ):
+        captured_fft_inputs: list[np.ndarray] = []
+
+        def fake_compute_fft_spectrum(signal, sample_rate, nfft):
+            captured_fft_inputs.append(np.asarray(signal, dtype=np.float64).copy())
+            return (
+                np.arange(nfft // 2 + 1, dtype=np.float64),
+                np.zeros(nfft // 2 + 1, dtype=np.float64),
+            )
+
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_fft_spectrum",
+            fake_compute_fft_spectrum,
+        )
+
+        cfg = _make_config(stft_nfft=128, fft_nfft=8)
+        p = AnalysisPipeline(channel_index=0, channel_config=cfg, sample_rate=100.0)
+
+        first = p.process_chunk(np.array([1.0, 2.0, 3.0], dtype=np.float32), elapsed_time=0.03)
+        second = p.process_chunk(np.array([4.0, 5.0, 6.0], dtype=np.float32), elapsed_time=0.06)
+        third = p.process_chunk(np.array([7.0, 8.0], dtype=np.float32), elapsed_time=0.08)
+        fourth = p.process_chunk(np.array([9.0], dtype=np.float32), elapsed_time=0.09)
+
+        assert first["fft"] is None
+        assert second["fft"] is None
+        assert isinstance(third["fft"], FftFrame)
+        assert isinstance(fourth["fft"], FftFrame)
+        assert len(captured_fft_inputs) == 2
+        np.testing.assert_array_equal(
+            captured_fft_inputs[0],
+            np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], dtype=np.float64),
+        )
+        np.testing.assert_array_equal(
+            captured_fft_inputs[1],
+            np.array([2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], dtype=np.float64),
+        )
+
     def test_reset_clears_buffer(self):
         p = AnalysisPipeline(channel_index=0, channel_config=_make_config(),
                              sample_rate=44100.0)
@@ -108,6 +160,18 @@ class TestAnalysisPipeline:
         p.reset()
         # After reset, internal buffer should be empty
         assert p._stft_buffer.size == 0 or len(p._stft_buffer) == 0
+
+    def test_reset_clears_fft_buffer(self):
+        p = AnalysisPipeline(channel_index=0, channel_config=_make_config(),
+                             sample_rate=44100.0)
+
+        p.process_chunk(np.random.randn(2048).astype(np.float32), elapsed_time=0.0)
+
+        assert p._fft_buffer.size > 0
+
+        p.reset()
+
+        assert p._fft_buffer.size == 0
 
     def test_process_chunk_returns_stft_frames_starting_at_zero(self, monkeypatch):
         monkeypatch.setattr(
