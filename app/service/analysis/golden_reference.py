@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 from scipy.io import wavfile
@@ -23,8 +23,7 @@ class GoldenReferenceError(RuntimeError):
 class GoldenReferenceBundle:
     signal: np.ndarray
     sample_rate: float
-    fft_frequencies_hz: np.ndarray | None = None
-    fft_levels_db: np.ndarray | None = None
+    fft_by_nfft: dict[int, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
     octave_center_freqs_hz: np.ndarray | None = None
     octave_levels_db: np.ndarray | None = None
 
@@ -104,21 +103,30 @@ class GoldenReferenceCache:
     def ensure_fft(
         self,
         bundle: GoldenReferenceBundle,
+        *,
+        nfft: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        if bundle.fft_frequencies_hz is None or bundle.fft_levels_db is None:
-            nfft = max(1, int(bundle.signal.size))
-            try:
-                frequencies_hz, magnitudes_db = dsp.compute_fft_spectrum(
-                    bundle.signal,
-                    bundle.sample_rate,
-                    nfft,
-                )
-            except Exception as exc:
-                message = str(exc) or "黄金样本 FFT 参考计算失败"
-                raise GoldenReferenceError(message) from exc
-            bundle.fft_frequencies_hz = np.asarray(frequencies_hz, dtype=np.float64)
-            bundle.fft_levels_db = _absolute_levels_db(magnitudes_db)
-        return bundle.fft_frequencies_hz, bundle.fft_levels_db
+        try:
+            resolved_nfft = _validated_positive_nfft(nfft)
+            cached = bundle.fft_by_nfft.get(resolved_nfft)
+            if cached is not None:
+                return cached
+
+            frequencies_hz, magnitudes_db = dsp.compute_fft_spectrum(
+                bundle.signal,
+                bundle.sample_rate,
+                resolved_nfft,
+            )
+        except Exception as exc:
+            message = str(exc) or "黄金样本 FFT 参考计算失败"
+            raise GoldenReferenceError(message) from exc
+
+        cached = (
+            np.asarray(frequencies_hz, dtype=np.float64),
+            _absolute_levels_db(magnitudes_db),
+        )
+        bundle.fft_by_nfft[resolved_nfft] = cached
+        return cached
 
     def ensure_octave(
         self,
@@ -180,6 +188,13 @@ def _coerce_positive_int(value) -> int | None:
         if numeric > 0:
             return numeric
     return None
+
+
+def _validated_positive_nfft(value) -> int:
+    numeric = _coerce_positive_int(value)
+    if numeric is None:
+        raise ValueError("nfft must be a positive integer")
+    return numeric
 
 
 __all__ = [

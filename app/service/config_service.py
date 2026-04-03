@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 # Default values for new channel configs
 _CHANNEL_DEFAULTS = {
     "stft_nfft": 1024,
+    "fft_nfft": 4096,
     "stft_overlap": 0.5,
     "spl_weighting": "A",
     "spl_time_constant": 0.125,
@@ -55,6 +56,7 @@ _GOLDEN_BINDING_FIELDS = (
     "golden_sample_sample_rate",
 )
 _VALID_NFFT = [256, 512, 1024, 2048, 4096, 8192]
+_VALID_FFT_NFFT = [256, 512, 1024, 2048, 4096, 8192]
 _VALID_OVERLAP = [0.25, 0.5, 0.75]
 _VALID_WEIGHTING = ["A", "C", "Z"]
 _VALID_LOUDNESS_UNITS = ["sone", "phon"]
@@ -143,6 +145,11 @@ class ConfigService:
                 {
                     "channel_index": ch.channel_index,
                     "stft_nfft": ch.stft_nfft,
+                    "fft_nfft": (
+                        ch.fft_nfft
+                        if ch.fft_nfft is not None
+                        else _CHANNEL_DEFAULTS["fft_nfft"]
+                    ),
                     "stft_overlap": ch.stft_overlap,
                     "spl_weighting": ch.spl_weighting,
                     "spl_time_constant": ch.spl_time_constant,
@@ -408,6 +415,8 @@ class ConfigService:
 
             if ch.get("stft_nfft") not in _VALID_NFFT:
                 errors.append(f"{prefix}: STFT FFT 点数无效")
+            if ch.get("fft_nfft", _CHANNEL_DEFAULTS["fft_nfft"]) not in _VALID_FFT_NFFT:
+                errors.append(f"{prefix}: FFT 分辨率无效")
             if ch.get("stft_overlap") not in _VALID_OVERLAP:
                 errors.append(f"{prefix}: STFT 重叠率无效")
             if ch.get("spl_weighting") not in _VALID_WEIGHTING:
@@ -669,6 +678,7 @@ class ConfigService:
         return {
             "channel_index": channel["channel_index"],
             "stft_nfft": channel["stft_nfft"],
+            "fft_nfft": channel.get("fft_nfft", _CHANNEL_DEFAULTS["fft_nfft"]),
             "stft_overlap": channel["stft_overlap"],
             "spl_weighting": channel["spl_weighting"],
             "spl_time_constant": channel["spl_time_constant"],

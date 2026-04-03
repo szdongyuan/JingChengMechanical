@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from math import log2
+from numbers import Integral
 
 import numpy as np
 from scipy import signal as scipy_signal
@@ -253,17 +254,54 @@ def compute_fft_spectrum(signal: np.ndarray, sample_rate: float,
     -------
     (frequencies, magnitudes_db) -- both 1-D, length nfft//2+1
     """
-    sig = np.asarray(signal, dtype=np.float64)
-    if sig.size < nfft:
-        sig = np.pad(sig, (0, nfft - sig.size))
+    sig = np.asarray(signal, dtype=np.float64).reshape(-1)
+    if sig.size <= 0:
+        raise ValueError("FFT input is empty")
+    try:
+        resolved_sample_rate = float(sample_rate)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("sample_rate must be a finite positive number") from exc
+    if not np.isfinite(resolved_sample_rate) or resolved_sample_rate <= 0.0:
+        raise ValueError("sample_rate must be a finite positive number")
+    if isinstance(nfft, (bool, np.bool_)) or not isinstance(nfft, Integral):
+        raise ValueError("nfft must be a positive integer")
+    resolved_nfft = int(nfft)
+    if resolved_nfft <= 0:
+        raise ValueError("nfft must be a positive integer")
+
+    if sig.size <= resolved_nfft:
+        if sig.size < resolved_nfft:
+            sig = np.pad(sig, (0, resolved_nfft - sig.size))
+        window = np.hanning(resolved_nfft)
+        spectrum = np.fft.rfft(sig * window)
+        mag = np.abs(spectrum) * 2.0 / resolved_nfft
     else:
-        sig = sig[:nfft]
-    window = np.hanning(nfft)
-    spectrum = np.fft.rfft(sig * window)
-    mag = np.abs(spectrum) * 2.0 / nfft
+        window = np.hanning(resolved_nfft)
+        mag_sum = np.zeros(resolved_nfft // 2 + 1, dtype=np.float64)
+        window_count = 0
+        for start in _iter_fft_window_starts(sig.size, resolved_nfft):
+            windowed = sig[start:start + resolved_nfft] * window
+            spectrum = np.fft.rfft(windowed)
+            mag_sum += np.abs(spectrum) * 2.0 / resolved_nfft
+            window_count += 1
+        mag = mag_sum / max(window_count, 1)
     mag_db = 20.0 * np.log10(np.maximum(mag, 1e-30))
-    freqs = np.fft.rfftfreq(nfft, d=1.0 / sample_rate)
+    freqs = np.fft.rfftfreq(resolved_nfft, d=1.0 / resolved_sample_rate)
     return freqs, mag_db
+
+
+def _iter_fft_window_starts(signal_size: int, nfft: int):
+    hop = max(1, nfft // 2)
+    start = 0
+    last_start = None
+    while start + nfft <= signal_size:
+        yield start
+        last_start = start
+        start += hop
+
+    tail_start = signal_size - nfft
+    if last_start != tail_start:
+        yield tail_start
 
 
 # ---------------------------------------------------------------------------

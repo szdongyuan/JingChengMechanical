@@ -63,6 +63,7 @@ class DbConnectionService:
         self._ensure_columns(
             "channel_config_table",
             [
+                ("fft_nfft", "INTEGER NOT NULL DEFAULT 4096"),
                 ("loudness_unit", "TEXT DEFAULT 'sone'"),
                 ("loudness_lower_limit", "REAL DEFAULT 0"),
                 ("loudness_upper_limit", "REAL DEFAULT 60"),
@@ -111,6 +112,7 @@ class DbConnectionService:
                 ("artifacts_dir", "TEXT"),
             ],
         )
+        self._backfill_channel_fft_defaults()
         self._backfill_channel_loudness_defaults()
         self._ensure_ai_binding_indexes()
 
@@ -147,6 +149,17 @@ class DbConnectionService:
                 loudness_unit IS NULL
                 OR loudness_lower_limit IS NULL
                 OR loudness_upper_limit IS NULL
+            """
+        )
+
+    def _backfill_channel_fft_defaults(self):
+        if "fft_nfft" not in self._get_table_columns("channel_config_table"):
+            return
+        db.execute_sql(
+            """
+            UPDATE channel_config_table
+            SET fft_nfft = COALESCE(fft_nfft, 4096)
+            WHERE fft_nfft IS NULL
             """
         )
 

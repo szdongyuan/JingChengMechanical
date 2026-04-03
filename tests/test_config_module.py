@@ -14,13 +14,22 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import qInstallMessageHandler
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QLabel, QPushButton
+from PyQt6.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QLabel,
+    QPushButton,
+    QWidget,
+)
 
 from app.service.config_service import ConfigService
 from app.service.golden_sample_service import GoldenSampleService
 from model.channel_config_table import ChannelConfigTable
 from model.test_config_table import TestConfigTable as ConfigTable
 from ui.modules.config import ConfigModule
+from ui.widgets.collapsible_group_box import CollapsibleGroupBox
 
 
 class _SignalStub:
@@ -250,6 +259,7 @@ def _channel_payload(channel_index: int, **updates) -> dict:
     payload = {
         "channel_index": channel_index,
         "stft_nfft": 1024,
+        "fft_nfft": 4096,
         "stft_overlap": 0.5,
         "spl_weighting": "A",
         "spl_time_constant": 0.125,
@@ -345,6 +355,31 @@ def _detail_payload(
         "selected_channels": [0],
         "channels": channels,
     }
+
+
+def _field_label_text(container: QWidget, object_name: str) -> str | None:
+    field = container.findChild(QWidget, object_name)
+    assert field is not None
+    parent = field.parentWidget()
+    while parent is not None:
+        layout = parent.layout()
+        if isinstance(layout, QFormLayout):
+            row, _role = layout.getWidgetPosition(field)
+            if row >= 0:
+                label_item = layout.itemAt(row, QFormLayout.ItemRole.LabelRole)
+                label = label_item.widget() if label_item else None
+                return label.text() if isinstance(label, QLabel) else None
+        parent = parent.parentWidget()
+    return None
+
+
+def _ancestor_group_title(widget: QWidget | None) -> str | None:
+    parent = widget.parentWidget() if widget is not None else None
+    while parent is not None:
+        if isinstance(parent, CollapsibleGroupBox):
+            return getattr(parent, "_title", None)
+        parent = parent.parentWidget()
+    return None
 
 
 def _write_temp_wav(
@@ -554,6 +589,36 @@ def test_collect_data_returns_loudness_fields(qapp):
     assert data["channels"][0]["loudness_unit"] == "phon"
     assert data["channels"][0]["loudness_lower_limit"] == pytest.approx(10.0)
     assert data["channels"][0]["loudness_upper_limit"] == pytest.approx(60.0)
+
+
+def test_populate_detail_loads_fft_resolution_in_fft_section(qapp):
+    module = _make_module()
+    module._populate_detail(_detail_payload([_channel_payload(0)]))
+
+    container = module._channel_containers[0]
+    fft_resolution = container.findChild(QComboBox, "fft_nfft")
+    stft_nfft = container.findChild(QComboBox, "stft_nfft")
+
+    assert fft_resolution is not None
+    assert fft_resolution.currentData() == 4096
+    assert _field_label_text(container, "fft_nfft") == "FFT 分辨率"
+    assert _ancestor_group_title(fft_resolution) == "FFT 频带上下限"
+    assert _ancestor_group_title(stft_nfft) == "STFT 参数"
+
+
+def test_collect_data_returns_fft_resolution_from_fft_section(qapp):
+    module = _make_module()
+    module._current_config_id = 7
+    module._populate_detail(_detail_payload([_channel_payload(0)]))
+
+    container = module._channel_containers[0]
+    fft_resolution = container.findChild(QComboBox, "fft_nfft")
+    assert fft_resolution is not None
+    fft_resolution.setCurrentIndex(fft_resolution.findData(2048))
+
+    data = module._collect_data()
+
+    assert data["channels"][0]["fft_nfft"] == 2048
 
 
 def test_loudness_unit_change_keeps_numeric_limits_visible_as_is(qapp):

@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 
-from app.service.analysis.frames import JudgmentResult, SplFrame, StftFrame
+from app.service.analysis.frames import FftFrame, JudgmentResult, SplFrame, StftFrame
 from app.service.analysis.test_session import TestSession
 from app.service.config_service import _CHANNEL_DEFAULTS
 from model.audio_data_table import AudioDataTable
@@ -51,6 +51,7 @@ def _make_config() -> dict:
         "channels": [{
             "channel_index": 0,
             "stft_nfft": 1024,
+            "fft_nfft": 4096,
             "stft_overlap": 0.5,
             "spl_weighting": "Z",
             "spl_time_constant": 0.125,
@@ -172,6 +173,37 @@ class TestTestSessionProcessing:
         assert bus.stft_updated.emit.call_count == 2
         assert bus.stft_updated.emit.call_args_list[0].args == (1, "factory-run-1", 0, frame_a)
         assert bus.stft_updated.emit.call_args_list[1].args == (1, "factory-run-1", 0, frame_b)
+
+    def test_on_chunk_re_emits_fft_frame_with_factory_run_id(self):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        session = TestSession(
+            config=_make_config(),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"factory_run_id": "factory-run-1"},
+            audio_dir="/tmp/audio",
+        )
+        fft_frame = FftFrame(
+            time=0.10,
+            frequencies=np.array([0.0, 100.0], dtype=np.float64),
+            magnitudes=np.array([1.0, 2.0], dtype=np.float64),
+        )
+        fake_pipeline = MagicMock()
+        fake_pipeline.channel_index = 0
+        fake_pipeline.process_chunk.return_value = {
+            "stft_frames": [],
+            "stft": None,
+            "spl": SplFrame(time=0.05, spl_db=60.0, weighting="Z"),
+            "octave": None,
+            "fft": fft_frame,
+        }
+        session._pipelines = [fake_pipeline]
+
+        session._on_chunk(np.ones((2048, 1), dtype=np.float32), 0)
+
+        assert bus.fft_updated.emit.call_args.args == (1, "factory-run-1", 0, fft_frame)
 
     def test_on_chunk_notifies_when_session_duration_expires(self):
         bus = _make_mock_bus()

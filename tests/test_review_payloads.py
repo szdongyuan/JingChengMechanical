@@ -12,6 +12,7 @@ def _make_config(*, fft_limits=True, octave_limits=True):
     def _channel(channel_index: int):
         return {
             "channel_index": channel_index,
+            "fft_nfft": 4096,
             "spl_lower_limit": 40.0,
             "spl_upper_limit": 80.0,
             "loudness_unit": "sone",
@@ -52,6 +53,10 @@ def _make_judgment_payload():
                 "loudness_pass": True,
                 "loudness_available": True,
                 "loudness_error_message": None,
+                "fft_available": True,
+                "fft_error_message": None,
+                "octave_available": True,
+                "octave_error_message": None,
                 "fft_band_results": [
                     {
                         "freq": 1000.0,
@@ -79,6 +84,10 @@ def _make_judgment_payload():
                 "loudness_pass": False,
                 "loudness_available": True,
                 "loudness_error_message": None,
+                "fft_available": True,
+                "fft_error_message": None,
+                "octave_available": True,
+                "octave_error_message": None,
                 "fft_band_results": [
                     {
                         "freq": 1000.0,
@@ -133,6 +142,7 @@ class _GoldenCacheStub:
     ):
         self.bundle_calls = 0
         self.ensure_fft_calls = 0
+        self.ensure_fft_nffts: list[int] = []
         self.ensure_octave_calls = 0
         self.fft_axis = np.asarray(fft_axis or [], dtype=np.float64)
         self.fft_levels = np.asarray(fft_levels or [], dtype=np.float64)
@@ -148,8 +158,9 @@ class _GoldenCacheStub:
             raise self.bundle_error
         return object()
 
-    def ensure_fft(self, bundle):
+    def ensure_fft(self, bundle, *, nfft):
         self.ensure_fft_calls += 1
+        self.ensure_fft_nffts.append(int(nfft))
         if self.fft_error is not None:
             raise self.fft_error
         return self.fft_axis, self.fft_levels
@@ -1085,6 +1096,7 @@ def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch
 def test_build_chart_payload_fft_absolute_mode_uses_serialized_markers_and_overlay(
     monkeypatch,
 ):
+    expected_nfft = 4096
     _patch_basic_chart_backends(
         monkeypatch,
         fft_levels=(64.0, 45.0),
@@ -1101,6 +1113,7 @@ def test_build_chart_payload_fft_absolute_mode_uses_serialized_markers_and_overl
     payload = build_chart_payload(
         buffer=np.full((200, 1), 0.1, dtype=np.float32),
         config=_make_single_channel_config(
+            fft_nfft=expected_nfft,
             fft_golden_mode="absolute",
             fft_show_golden_overlay=True,
             fft_band_limits=[{"freq": 1000.0, "lower": -1.0, "upper": 1.0}],
@@ -1127,6 +1140,7 @@ def test_build_chart_payload_fft_absolute_mode_uses_serialized_markers_and_overl
 
     assert cache.bundle_calls == 1
     assert cache.ensure_fft_calls == 1
+    assert cache.ensure_fft_nffts == [expected_nfft]
     fft_payload = payload[0]["fft"]
     assert fft_payload["frequencies_hz"] == [1000.0, 2000.0]
     assert fft_payload["levels_db"] == [64.0, 45.0]
@@ -1147,6 +1161,7 @@ def test_build_chart_payload_fft_absolute_mode_uses_serialized_markers_and_overl
 def test_build_chart_payload_fft_delta_mode_serializes_main_series_in_delta_space(
     monkeypatch,
 ):
+    expected_nfft = 4096
     _patch_basic_chart_backends(
         monkeypatch,
         fft_levels=(64.0, 45.0),
@@ -1163,6 +1178,7 @@ def test_build_chart_payload_fft_delta_mode_serializes_main_series_in_delta_spac
     payload = build_chart_payload(
         buffer=np.full((200, 1), 0.1, dtype=np.float32),
         config=_make_single_channel_config(
+            fft_nfft=expected_nfft,
             fft_golden_mode="delta",
             fft_show_golden_overlay=False,
             fft_band_limits=[{"freq": 1000.0, "lower": -5.0, "upper": 5.0}],
@@ -1187,6 +1203,7 @@ def test_build_chart_payload_fft_delta_mode_serializes_main_series_in_delta_spac
         ),
     )
 
+    assert cache.ensure_fft_nffts == [expected_nfft]
     fft_payload = payload[0]["fft"]
     assert fft_payload["levels_db"] == [-2.0, 1.0]
     assert fft_payload["golden_mode"] == "delta"
@@ -1364,6 +1381,37 @@ def test_build_chart_payload_omits_fft_item_when_golden_recompute_fails(
     assert set(payload[0]) == {"loudness", "spl", "octave"}
     assert "fft" not in payload[0]
     assert "fft recompute failed" in caplog.text
+
+
+def test_build_chart_payload_omits_only_fft_item_when_measured_recompute_fails_in_off_mode(
+    monkeypatch,
+    caplog,
+):
+    _patch_basic_chart_backends(monkeypatch)
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
+        lambda signal, sample_rate, nfft: (_ for _ in ()).throw(
+            ValueError("empty fft input")
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger="app.service.analysis.review_payloads"):
+        payload = build_chart_payload(
+            buffer=np.full((200, 1), 0.1, dtype=np.float32),
+            config=_make_single_channel_config(
+                fft_nfft=4096,
+                fft_golden_mode="off",
+                fft_band_limits=[{"freq": 1000.0, "lower": 40.0, "upper": 60.0}],
+                oct_band_limits=[],
+            ),
+            sample_rate=100.0,
+            mic_cal={},
+            analysis_window=(0.0, 2.0),
+        )
+
+    assert set(payload[0]) == {"loudness", "spl", "octave"}
+    assert "fft" not in payload[0]
+    assert "FFT chart payload omitted" in caplog.text
 
 
 def test_build_chart_payload_keeps_off_mode_fft_payload_when_overlay_load_fails(
@@ -1719,15 +1767,17 @@ def test_build_chart_payload_octave_omits_limit_band_when_configured_bin_level_i
 
 
 @pytest.mark.parametrize("stft_nfft", [512, 4096])
-def test_build_chart_payload_fft_point_count_matches_selected_window_sample_count(
+def test_build_chart_payload_fft_point_count_matches_fft_nfft(
     stft_nfft,
 ):
+    fft_nfft = 128
     config = _make_config()
     config["selected_channels"] = [0]
     config["channels"] = [
         {
             **config["channels"][0],
             "stft_nfft": stft_nfft,
+            "fft_nfft": fft_nfft,
         }
     ]
 
@@ -1739,16 +1789,18 @@ def test_build_chart_payload_fft_point_count_matches_selected_window_sample_coun
         analysis_window=(0.5, 1.5),
     )
 
-    assert len(payload[0]["fft"]["frequencies_hz"]) == 51
+    assert len(payload[0]["fft"]["frequencies_hz"]) == fft_nfft // 2 + 1
 
 
 def test_build_chart_payload_fft_point_count_is_independent_of_stft_nfft():
+    fft_nfft = 128
     small_nfft_config = _make_config()
     small_nfft_config["selected_channels"] = [0]
     small_nfft_config["channels"] = [
         {
             **small_nfft_config["channels"][0],
             "stft_nfft": 512,
+            "fft_nfft": fft_nfft,
         }
     ]
 
@@ -1758,6 +1810,7 @@ def test_build_chart_payload_fft_point_count_is_independent_of_stft_nfft():
         {
             **large_nfft_config["channels"][0],
             "stft_nfft": 4096,
+            "fft_nfft": fft_nfft,
         }
     ]
 
@@ -1778,8 +1831,8 @@ def test_build_chart_payload_fft_point_count_is_independent_of_stft_nfft():
         analysis_window=(0.5, 1.5),
     )
 
-    assert len(small_nfft_payload[0]["fft"]["frequencies_hz"]) == 51
-    assert len(large_nfft_payload[0]["fft"]["frequencies_hz"]) == 51
+    assert len(small_nfft_payload[0]["fft"]["frequencies_hz"]) == fft_nfft // 2 + 1
+    assert len(large_nfft_payload[0]["fft"]["frequencies_hz"]) == fft_nfft // 2 + 1
     assert (
         len(small_nfft_payload[0]["fft"]["frequencies_hz"])
         == len(large_nfft_payload[0]["fft"]["frequencies_hz"])

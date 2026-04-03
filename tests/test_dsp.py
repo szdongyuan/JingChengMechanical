@@ -429,6 +429,37 @@ class TestComputeFftSpectrum:
         assert freqs.shape[0] == 4096 // 2 + 1
         assert mag_db.shape == freqs.shape
 
+    @pytest.mark.parametrize(
+        ("signal", "sample_rate", "nfft"),
+        [
+            (np.array([], dtype=np.float64), 44100.0, 4096),
+            (np.ones(8, dtype=np.float64), 0.0, 4096),
+            (np.ones(8, dtype=np.float64), float("nan"), 4096),
+            (np.ones(8, dtype=np.float64), 44100.0, 1024.5),
+            (np.ones(8, dtype=np.float64), 44100.0, 0),
+        ],
+    )
+    def test_invalid_inputs_raise_value_error(self, signal, sample_rate, nfft):
+        with pytest.raises(ValueError):
+            compute_fft_spectrum(signal, sample_rate, nfft)
+
+    def test_short_signal_zero_pads_to_nfft(self, monkeypatch):
+        captured_windows: list[np.ndarray] = []
+
+        monkeypatch.setattr(dsp_module.np, "hanning", lambda n: np.ones(n, dtype=np.float64))
+
+        def fake_rfft(values):
+            captured_windows.append(np.asarray(values, dtype=np.float64).copy())
+            return np.array([1.0 + 0j, 2.0 + 0j, 3.0 + 0j], dtype=np.complex128)
+
+        monkeypatch.setattr(dsp_module.np.fft, "rfft", fake_rfft)
+
+        compute_fft_spectrum(np.array([1.0, 2.0], dtype=np.float64), 1.0, 4)
+
+        assert [window.tolist() for window in captured_windows] == [
+            [1.0, 2.0, 0.0, 0.0],
+        ]
+
     def test_sine_peak(self):
         sr = 44100.0
         t = np.arange(4096) / sr
@@ -436,6 +467,72 @@ class TestComputeFftSpectrum:
         freqs, mag_db = compute_fft_spectrum(sig, sr, 4096)
         peak_freq = freqs[np.argmax(mag_db)]
         assert abs(peak_freq - 1000.0) < 20
+
+    def test_long_signal_uses_full_signal_with_bounded_axis(self):
+        sr = 48_000.0
+        nfft = 4096
+        lead_bin = 17
+        tail_bin = 171
+        lead_freq = lead_bin * sr / nfft
+        tail_freq = tail_bin * sr / nfft
+        t = np.arange(nfft, dtype=np.float64) / sr
+        lead = np.sin(2 * np.pi * lead_freq * t)
+        tail = np.sin(2 * np.pi * tail_freq * t)
+
+        freqs, mag_db = compute_fft_spectrum(
+            np.concatenate([lead, tail]),
+            sr,
+            nfft,
+        )
+
+        assert len(freqs) == nfft // 2 + 1
+        assert mag_db[lead_bin] > -20.0
+        assert mag_db[tail_bin] > -20.0
+
+    def test_long_signal_appends_tail_window_and_averages_linear_magnitudes(self, monkeypatch):
+        captured_windows: list[np.ndarray] = []
+
+        monkeypatch.setattr(dsp_module.np, "hanning", lambda n: np.ones(n, dtype=np.float64))
+
+        def fake_rfft(values):
+            window = np.asarray(values, dtype=np.float64).copy()
+            captured_windows.append(window)
+            if float(window[0]) == 0.0:
+                return np.array([1.0 + 0j, 2.0 + 0j, 3.0 + 0j], dtype=np.complex128)
+            return np.array([5.0 + 0j, 7.0 + 0j, 11.0 + 0j], dtype=np.complex128)
+
+        monkeypatch.setattr(dsp_module.np.fft, "rfft", fake_rfft)
+
+        _, mag_db = compute_fft_spectrum(np.arange(5, dtype=np.float64), 1.0, 4)
+
+        assert [window.tolist() for window in captured_windows] == [
+            [0.0, 1.0, 2.0, 3.0],
+            [1.0, 2.0, 3.0, 4.0],
+        ]
+        np.testing.assert_allclose(
+            10 ** (mag_db / 20.0),
+            np.array([1.5, 2.25, 3.5], dtype=np.float64),
+        )
+
+    def test_long_signal_deduplicates_tail_window_when_last_hop_matches_tail(self, monkeypatch):
+        captured_windows: list[np.ndarray] = []
+
+        monkeypatch.setattr(dsp_module.np, "hanning", lambda n: np.ones(n, dtype=np.float64))
+        monkeypatch.setattr(
+            dsp_module.np.fft,
+            "rfft",
+            lambda values: (
+                captured_windows.append(np.asarray(values, dtype=np.float64).copy())
+                or np.array([1.0 + 0j, 2.0 + 0j, 3.0 + 0j], dtype=np.complex128)
+            ),
+        )
+
+        compute_fft_spectrum(np.arange(6, dtype=np.float64), 1.0, 4)
+
+        assert [window.tolist() for window in captured_windows] == [
+            [0.0, 1.0, 2.0, 3.0],
+            [2.0, 3.0, 4.0, 5.0],
+        ]
 
     def test_frequency_range(self):
         freqs, _ = compute_fft_spectrum(np.zeros(1024), 44100.0, 1024)
