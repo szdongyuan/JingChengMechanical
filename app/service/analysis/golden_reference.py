@@ -106,12 +106,12 @@ class GoldenReferenceCache:
         *,
         nfft: int,
     ) -> tuple[np.ndarray, np.ndarray]:
-        resolved_nfft = _validated_positive_nfft(nfft)
-        cached = bundle.fft_by_nfft.get(resolved_nfft)
-        if cached is not None:
-            return cached
-
         try:
+            resolved_nfft = _validated_positive_nfft(nfft)
+            cached = bundle.fft_by_nfft.get(resolved_nfft)
+            if cached is not None:
+                return cached
+
             frequencies_hz, magnitudes_db = dsp.compute_fft_spectrum(
                 bundle.signal,
                 bundle.sample_rate,

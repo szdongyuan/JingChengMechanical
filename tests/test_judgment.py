@@ -469,6 +469,48 @@ class TestLimitChecks:
         assert "empty" in (channel_result.fft_error_message or "").lower()
         assert result.limit_pass is False
 
+    def test_fft_golden_mode_invalid_fft_nfft_soft_fails_instead_of_crashing(
+        self,
+        tmp_path,
+    ):
+        service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+        engine = self._make_engine(golden_sample_service=service)
+        golden_path = _write_temp_wav(
+            tmp_path / "managed" / "config_1" / "gold.wav",
+            fill_value=0.5,
+        )
+        sr = 48_000.0
+        buf = np.full((int(sr * 3.0), 1), 0.25, dtype=np.float32)
+        config = _make_config(
+            input_device_samplerate=sr,
+            channels=[
+                _make_channel_config(
+                    0,
+                    fft_nfft=0,
+                    fft_band_limits=[
+                        {"freq": 1000.0, "lower": -1.0, "upper": 1.0},
+                    ],
+                    fft_golden_mode="absolute",
+                    **_golden_binding(golden_path),
+                )
+            ],
+        )
+
+        result = engine.judge(
+            config,
+            buf,
+            sr,
+            mic_cal={},
+            audio_file_path="/tmp/test.wav",
+        )
+
+        channel_result = result.channel_results[0]
+
+        assert channel_result.fft_available is False
+        assert channel_result.fft_band_results == []
+        assert "nfft" in (channel_result.fft_error_message or "").lower()
+        assert result.limit_pass is False
+
     def test_fft_delta_mode_serializes_band_result_in_delta_space(
         self,
         tmp_path,
