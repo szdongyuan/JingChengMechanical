@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from PyQt6.QtGui import QAction, QCloseEvent
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QAction, QCloseEvent, QKeyEvent
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
@@ -11,7 +12,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QToolButton,
     QVBoxLayout,
-    QWidget,
+    QWidget, QApplication, QLineEdit, QPlainTextEdit, QTextEdit,
 )
 
 from app.services_container import FactoryControllerState, FactoryReviewPayload
@@ -32,6 +33,7 @@ from ui.modules.data_management import DataManagementModule
 from ui.modules.input_calibration import InputCalibrationModule
 from ui.modules.config import ConfigModule
 from ui.modules.channel_select import ChannelSelectModule
+from ui.modules.plc_settings import PlcSettingsModule
 from ui.modules.login import LoginWindow
 from ui.modules.change_password import ChangePasswordWindow
 from ui.modules.add_user import AddUserWindow
@@ -101,7 +103,7 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("Idle")
 
-        self.services.bus.log.emit("[App] 启动程序")
+        self.services.bus.log.emit("启动程序")
         self._sync_analysis_toolbar()
         self._refresh_analysis_display_modules()
         self.set_role()
@@ -111,6 +113,29 @@ class MainWindow(QMainWindow):
         if not self.login_shown:
             self.login_shown = True
             self.show_login_window(close_main_window=True, window_title="登录")
+
+    def keyPressEvent(self, event: QKeyEvent):
+        focus_widget = QApplication.focusWidget()
+        is_text_input = (
+                isinstance(focus_widget, QLineEdit)
+                or isinstance(focus_widget, QPlainTextEdit)
+                or (isinstance(focus_widget, QTextEdit) and not focus_widget.isReadOnly())
+        )
+        print("回车被按下")
+        print("is_text_input =", is_text_input)
+        print("event.key", event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter)
+        if (event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter) and not is_text_input:
+            print("有没有 plc 服务：", hasattr(self.services, "plc"))
+            if hasattr(self.services, "plc"):
+                print("有 plc 服务")
+                self.services.plc.simulate_rising_edge()
+                event.accept()
+                return
+            else:
+                print("没有 plc 服务")
+        else:
+            print("没有进入 PLC 模拟分支")
+        super().keyPressEvent(event)
 
     def show_login_window(self, close_main_window=False, window_title="登录"):
         self.setEnabled(False)
@@ -137,7 +162,7 @@ class MainWindow(QMainWindow):
 
     def show_change_password_window(self):
         if not self.current_user_name:
-            self.services.bus.status.emit("请先登录")
+            self.services.bus.log.emit("请先登录")
             return
 
         self.change_password_window = ChangePasswordWindow(self.current_user_name)
@@ -363,7 +388,7 @@ class MainWindow(QMainWindow):
 
         # 左侧栏
         left = QWidget()
-        left.setFixedWidth(1200)
+        left.setFixedWidth(1500)
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
         left_lay.setSpacing(12)
@@ -382,7 +407,7 @@ class MainWindow(QMainWindow):
         cal_card = Card("输入校准", cal)
         # 让右侧校准区域更紧凑（类似参考图）
         cal_card.setMaximumWidth(560)
-        cal_card.setFixedHeight(420)
+        cal_card.setFixedHeight(380)
 
         cal_row = QWidget()
         cal_row_lay = QHBoxLayout(cal_row)
@@ -393,11 +418,17 @@ class MainWindow(QMainWindow):
 
         channel = ChannelSelectModule(self.services)
         channel_card = Card("通道选择", channel)
-        channel_card.setMaximumWidth(380)
+        channel_card.setMaximumWidth(560)
         channel_card.setFixedHeight(100)
+
+        plc = PlcSettingsModule(self.services)
+        plc_card = Card("PLC设置", plc)
+        plc_card.setMaximumWidth(560)
+        plc_card.setFixedHeight(420)
 
         main_lay.addWidget(channel_card, 0)
         main_lay.addWidget(cal_row, 0)
+        main_lay.addWidget(plc_card, 0)
 
         main_lay.addStretch(1)
         content_lay.addWidget(main, 1)
@@ -586,12 +617,15 @@ class MainWindow(QMainWindow):
         return f"配置 {config_id} / CH{channel_index + 1}"
 
     def closeEvent(self, event: QCloseEvent):
-        self.services.bus.log.emit("[App] 关闭程序")
+        self.services.bus.log.emit("关闭程序")
         try:
+            # 停止 PLC 监听
+            if hasattr(self.services, "plc"):
+                self.services.plc.stop()
+            # 关闭 DB 长连接
             self.services.db.close()
-            stop_camera = getattr(getattr(self, "video", None), "stop_camera", None)
-            if callable(stop_camera):
-                stop_camera()
+            # 视频关闭
+            self.video.stop_camera()
         except Exception:
             pass
         super().closeEvent(event)

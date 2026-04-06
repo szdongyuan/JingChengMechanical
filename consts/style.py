@@ -147,6 +147,9 @@ QLineEdit {
   border-radius: 8px;
   padding: 8px 10px;
 }
+QLineEdit#PlcField {
+  padding: 4px 8px;
+}
 QLineEdit:focus {
   border: 1px solid #93c5fd;
   background: white;

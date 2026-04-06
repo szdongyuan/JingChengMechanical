@@ -207,3 +207,24 @@ def write_config_content(filename, config):
     except Exception as e:
         print(f"写入文件失败: {e}")
         return False
+
+def text_or_empty(value):
+    """None/空字符串转成空文本，其余值转字符串。"""
+    return "" if value is None or value == "" else str(value)
+
+
+def text_or_none(value):
+    """输入框文本去空白后，空字符串转成 None。"""
+    text = value.strip()
+    return text or None
+
+
+def int_or_none(value, label):
+    """整数字段允许留空；有值时必须能转成 int。"""
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise ValueError(f"{label}必须是整数") from exc
