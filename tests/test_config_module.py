@@ -12,7 +12,7 @@ from scipy.io import wavfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import qInstallMessageHandler
+from PyQt6.QtCore import Qt, qInstallMessageHandler
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -401,6 +401,17 @@ def _write_temp_wav(
     return path
 
 
+def test_collapsible_group_box_exposes_public_section_state_api(qapp):
+    box = CollapsibleGroupBox("FFT 频带上下限", section_id="fft")
+
+    assert box.section_id() == "fft"
+    assert box.is_expanded() is True
+
+    box.set_expanded(False)
+
+    assert box.is_expanded() is False
+
+
 def test_populate_detail_uses_main_config_analysis_offset_and_plc_fields(qapp):
     module = _make_module(
         binding={
@@ -510,6 +521,10 @@ def test_on_save_keeps_main_config_analysis_offset_out_of_ai_binding_payload(
     monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
     warnings = []
     monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.information",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
         "ui.modules.config.QMessageBox.warning",
         lambda *args: warnings.append(args),
     )
@@ -529,6 +544,231 @@ def test_on_save_keeps_main_config_analysis_offset_out_of_ai_binding_payload(
             },
         )
     ]
+
+
+def test_on_save_preserves_selected_channel_and_collapsed_sections_and_shows_success(
+    qapp, monkeypatch
+):
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        config_changed=_SignalStub(),
+    )
+    config_service = _ConfigServiceStub()
+    module = _make_module(config_service=config_service, bus=bus)
+    module._current_config_id = 7
+    module._populate_detail(_detail_payload([_channel_payload(0), _channel_payload(1)]))
+    first_container = module._channel_containers[0]
+    module._on_channel_tab_clicked(1)
+
+    selected_container = module.channel_stack.currentWidget()
+    first_spl_box = next(
+        box
+        for box in first_container.findChildren(CollapsibleGroupBox)
+        if box.section_id() == "spl"
+    )
+    fft_box = next(
+        box
+        for box in selected_container.findChildren(CollapsibleGroupBox)
+        if box.section_id() == "fft"
+    )
+    spl_box = next(
+        box
+        for box in selected_container.findChildren(CollapsibleGroupBox)
+        if box.section_id() == "spl"
+    )
+    first_spl_box.set_expanded(False)
+    fft_box.set_expanded(False)
+    spl_box.set_expanded(True)
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    infos = []
+    status_count_at_info = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.information",
+        lambda *args: (
+            status_count_at_info.append(len(bus.status.emissions)),
+            infos.append(args),
+        ),
+    )
+
+    module._on_save()
+
+    restored_container = module.channel_stack.currentWidget()
+    restored_first_container = next(
+        container
+        for container in module._channel_containers
+        if container.property("channel_index") == 0
+    )
+    restored_first_boxes = {
+        box.section_id(): box
+        for box in restored_first_container.findChildren(CollapsibleGroupBox)
+    }
+    restored_boxes = {
+        box.section_id(): box
+        for box in restored_container.findChildren(CollapsibleGroupBox)
+    }
+
+    assert module._current_config_id == 7
+    assert module.config_list.currentItem().data(Qt.ItemDataRole.UserRole) == 7
+    assert set(restored_boxes) == {
+        "stft",
+        "spl",
+        "loudness",
+        "golden_sample",
+        "fft",
+        "octave",
+    }
+    assert restored_container.property("channel_index") == 1
+    assert restored_first_boxes["spl"].is_expanded() is False
+    assert restored_boxes["fft"].is_expanded() is False
+    assert restored_boxes["spl"].is_expanded() is True
+    assert bus.status.emissions == [(("配置已保存",), {})]
+    assert status_count_at_info == [1]
+    assert infos[-1][-2:] == ("保存成功", "配置保存成功！")
+
+
+def test_on_save_falls_back_to_first_available_channel_when_selected_channel_disappears(
+    qapp, monkeypatch
+):
+    hardware_service = _HardwareServiceStub(
+        devices=[
+            {
+                "name": "Mic 1",
+                "hostapi": 0,
+                "default_samplerate": 48000,
+                "max_input_channels": 2,
+                "max_output_channels": 0,
+            },
+            {
+                "name": "Mic Small",
+                "hostapi": 0,
+                "default_samplerate": 48000,
+                "max_input_channels": 1,
+                "max_output_channels": 0,
+            },
+            {
+                "name": "Speaker 1",
+                "hostapi": 1,
+                "default_samplerate": 44100,
+                "max_input_channels": 0,
+                "max_output_channels": 2,
+            },
+        ]
+    )
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        config_changed=_SignalStub(),
+    )
+    config_service = _ConfigServiceStub()
+    module = _make_module(
+        config_service=config_service,
+        hardware_service=hardware_service,
+        bus=bus,
+    )
+    module._current_config_id = 7
+    module._populate_detail(_detail_payload([_channel_payload(0), _channel_payload(1)]))
+    module._on_channel_tab_clicked(1)
+
+    monkeypatch.setattr(
+        config_service,
+        "load_config",
+        lambda _config_id: {
+            **_detail_payload([_channel_payload(0)]),
+            "input_device_name": "Mic Small",
+            "input_device_hostapi": "ASIO",
+            "input_device_samplerate": 48000,
+        },
+    )
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    monkeypatch.setattr("ui.modules.config.QMessageBox.information", lambda *args: None)
+
+    module._on_save()
+
+    assert module.channel_stack.currentWidget().property("channel_index") == 0
+
+
+def test_on_save_keeps_no_channel_state_when_reloaded_editor_has_no_channels(
+    qapp, monkeypatch
+):
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        config_changed=_SignalStub(),
+    )
+    config_service = _ConfigServiceStub()
+    module = _make_module(config_service=config_service, bus=bus)
+    module.show()
+    qapp.processEvents()
+    module._current_config_id = 7
+    module._populate_detail(_detail_payload([_channel_payload(0)]))
+
+    monkeypatch.setattr(
+        config_service,
+        "load_config",
+        lambda _config_id: {
+            **_detail_payload([]),
+            "input_device_name": None,
+            "input_device_hostapi": None,
+            "input_device_samplerate": None,
+            "selected_channels": [],
+        },
+    )
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    infos = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.information",
+        lambda *args: infos.append(args),
+    )
+
+    module._on_save()
+    qapp.processEvents()
+
+    assert module.channel_host.isVisible() is False
+    assert module.channel_warning.isVisible() is True
+    assert module.channel_stack.count() == 0
+    assert infos
+
+
+def test_on_save_failure_does_not_show_success_feedback(qapp, monkeypatch):
+    config_service = _ConfigServiceStub(save_error=ValueError("save exploded"))
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        config_changed=_SignalStub(),
+    )
+    module = _make_module(config_service=config_service, bus=bus)
+    module._current_config_id = 7
+    module._populate_detail(_detail_payload([_channel_payload(0)]))
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    infos = []
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.information",
+        lambda *args: infos.append(args),
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module._on_save()
+
+    assert infos == []
+    assert warnings
+    assert bus.status.emissions == []
 
 
 def test_populate_detail_loads_loudness_widgets(qapp):
@@ -1174,7 +1414,12 @@ def test_post_commit_reload_failure_does_not_rollback_committed_pending_save(
     import model.base_mode as base_mod
 
     monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    infos = []
     warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.information",
+        lambda *args: infos.append(args),
+    )
     monkeypatch.setattr(
         "ui.modules.config.QMessageBox.warning",
         lambda *args: warnings.append(args),
@@ -1182,6 +1427,8 @@ def test_post_commit_reload_failure_does_not_rollback_committed_pending_save(
 
     module._on_save()
 
+    assert infos == []
+    assert module.services.bus.status.emissions == []
     assert config_service.begin_calls == 1
     assert config_service.commit_calls == 1
     assert config_service.rollback_calls == 0
@@ -1231,7 +1478,12 @@ def test_post_commit_failure_reloads_authoritative_config_list_and_detail(
     import model.base_mode as base_mod
 
     monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    infos = []
     warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.information",
+        lambda *args: infos.append(args),
+    )
     monkeypatch.setattr(
         "ui.modules.config.QMessageBox.warning",
         lambda *args: warnings.append(args),
@@ -1239,6 +1491,8 @@ def test_post_commit_failure_reloads_authoritative_config_list_and_detail(
 
     module._on_save()
 
+    assert infos == []
+    assert bus.status.emissions == []
     assert any("post-commit exploded" in str(args[-1]) for args in warnings)
     assert config_service.load_config(config_id)["config_name"] == "Renamed"
     assert module.ed_name.text() == "Renamed"

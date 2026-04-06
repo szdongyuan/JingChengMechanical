@@ -556,8 +556,54 @@ class ConfigModule(QWidget):
             return
         self._restore_committed_golden_bindings()
 
-    def _reload_authoritative_config_state(self, config_id: int) -> None:
-        loaded = self.services.config_service.load_config(config_id)
+    @staticmethod
+    def _channel_container_index(container: QWidget | None) -> int | None:
+        if container is None:
+            return None
+        channel_index = container.property("channel_index")
+        if isinstance(channel_index, int) and not isinstance(channel_index, bool):
+            return channel_index
+        return None
+
+    def _selected_channel_index(self) -> int | None:
+        return self._channel_container_index(self.channel_stack.currentWidget())
+
+    def _capture_collapsible_section_state(self) -> dict[tuple[int, str], bool]:
+        section_state: dict[tuple[int, str], bool] = {}
+        for container in self._channel_containers:
+            channel_index = self._channel_container_index(container)
+            if channel_index is None:
+                continue
+            for box in container.findChildren(CollapsibleGroupBox):
+                section_state[(channel_index, box.section_id())] = box.is_expanded()
+        return section_state
+
+    def _restore_collapsible_section_state(
+        self,
+        section_state: dict[tuple[int, str], bool],
+    ) -> None:
+        if not section_state:
+            return
+        for container in self._channel_containers:
+            channel_index = self._channel_container_index(container)
+            if channel_index is None:
+                continue
+            for box in container.findChildren(CollapsibleGroupBox):
+                key = (channel_index, box.section_id())
+                if key in section_state:
+                    box.set_expanded(section_state[key])
+
+    def _restore_selected_channel_tab(self, selected_channel_index: int | None) -> None:
+        if not self._channel_tab_buttons:
+            return
+        if selected_channel_index is not None:
+            for page_idx, container in enumerate(self._channel_containers):
+                if self._channel_container_index(container) == selected_channel_index:
+                    self._on_channel_tab_clicked(page_idx)
+                    return
+        self._on_channel_tab_clicked(0)
+
+    def _apply_loaded_config_state(self, config_id: int, loaded: dict) -> None:
         self._skip_reload = True
         try:
             self._refresh_list()
@@ -566,6 +612,10 @@ class ConfigModule(QWidget):
             self._skip_reload = False
         self._current_config_id = config_id
         self._populate_detail(loaded)
+
+    def _reload_authoritative_config_state(self, config_id: int) -> None:
+        loaded = self.services.config_service.load_config(config_id)
+        self._apply_loaded_config_state(config_id, loaded)
 
     def _finalize_failed_save(
         self,
@@ -837,7 +887,7 @@ class ConfigModule(QWidget):
         lay.setSpacing(8)
 
         # STFT section
-        stft = CollapsibleGroupBox("STFT 参数")
+        stft = CollapsibleGroupBox("STFT 参数", section_id="stft")
         stft_form = QWidget()
         sf_lay = QFormLayout(stft_form)
         sf_lay.setContentsMargins(0, 0, 0, 0)
@@ -866,7 +916,7 @@ class ConfigModule(QWidget):
         lay.addWidget(stft)
 
         # SPL section
-        spl = CollapsibleGroupBox("SPL 参数")
+        spl = CollapsibleGroupBox("SPL 参数", section_id="spl")
         spl_form = QWidget()
         sp_lay = QFormLayout(spl_form)
         sp_lay.setContentsMargins(0, 0, 0, 0)
@@ -915,7 +965,7 @@ class ConfigModule(QWidget):
         spl.add_widget(spl_form)
         lay.addWidget(spl)
 
-        loudness = CollapsibleGroupBox("响度 参数")
+        loudness = CollapsibleGroupBox("响度 参数", section_id="loudness")
         loudness_form = QWidget()
         loud_lay = QFormLayout(loudness_form)
         loud_lay.setContentsMargins(0, 0, 0, 0)
@@ -951,7 +1001,10 @@ class ConfigModule(QWidget):
         loudness.add_widget(loudness_form)
         lay.addWidget(loudness)
 
-        golden_section = CollapsibleGroupBox("Golden Sample")
+        golden_section = CollapsibleGroupBox(
+            "Golden Sample",
+            section_id="golden_sample",
+        )
         golden_form = QWidget()
         golden_layout = QVBoxLayout(golden_form)
         golden_layout.setContentsMargins(0, 0, 0, 0)
@@ -1003,7 +1056,7 @@ class ConfigModule(QWidget):
         lay.addWidget(golden_section)
 
         # FFT band limits section
-        fft_section = CollapsibleGroupBox("FFT 频带上下限")
+        fft_section = CollapsibleGroupBox("FFT 频带上下限", section_id="fft")
         fft_widget = QWidget()
         fft_layout = QVBoxLayout(fft_widget)
         fft_layout.setContentsMargins(0, 0, 0, 0)
@@ -1054,7 +1107,7 @@ class ConfigModule(QWidget):
         lay.addWidget(fft_section)
 
         # Octave section
-        oct_section = CollapsibleGroupBox("1/3 倍频程参数")
+        oct_section = CollapsibleGroupBox("1/3 倍频程参数", section_id="octave")
         oct_form = QWidget()
         of_lay = QVBoxLayout(oct_form)
         of_lay.setContentsMargins(0, 0, 0, 0)
@@ -1556,6 +1609,9 @@ class ConfigModule(QWidget):
                 )
                 return
 
+            selected_channel_index = self._selected_channel_index()
+            section_state = self._capture_collapsible_section_state()
+
             from model.base_mode import db
             with db.atomic():
                 begin_save = getattr(self.services.config_service, "begin_save_config", None)
@@ -1574,13 +1630,11 @@ class ConfigModule(QWidget):
                 pending_save_committed = True
                 commit_pending_save(pending_save)
             loaded = self.services.config_service.load_config(saved_id)
-            self._skip_reload = True
-            self._refresh_list()
-            self._select_config_by_id(saved_id)
-            self._skip_reload = False
-            self._current_config_id = saved_id
-            self._populate_detail(loaded)
+            self._apply_loaded_config_state(saved_id, loaded)
+            self._restore_collapsible_section_state(section_state)
+            self._restore_selected_channel_tab(selected_channel_index)
             self.services.bus.status.emit("配置已保存")
+            QMessageBox.information(self, "保存成功", "配置保存成功！")
         except ValueError as e:
             self._skip_reload = False
             self._finalize_failed_save(
