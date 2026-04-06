@@ -1093,6 +1093,90 @@ def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch
     }
 
 
+def test_build_chart_payload_spl_omits_trailing_partial_tail_for_a_weighted_series():
+    sample_rate = 48000.0
+    chunk_samples = int(round(sample_rate * 0.05))
+    signal = np.full(chunk_samples * 2 + 1, 0.1, dtype=np.float32).reshape(-1, 1)
+
+    config = _make_config()
+    config["selected_channels"] = [0]
+    config["channels"][0]["spl_weighting"] = "A"
+
+    payload = build_chart_payload(
+        buffer=signal,
+        config=config,
+        sample_rate=sample_rate,
+        mic_cal={},
+        analysis_window=(0.0, signal.shape[0] / sample_rate),
+    )
+
+    assert payload[0]["spl"]["times_sec"] == [0.05, 0.1]
+    assert len(payload[0]["spl"]["values_db"]) == 2
+
+
+def test_build_chart_payload_spl_omits_trailing_partial_tail_for_c_weighted_series():
+    sample_rate = 48000.0
+    chunk_samples = int(round(sample_rate * 0.05))
+    signal = np.full(chunk_samples * 2 + 1, 0.1, dtype=np.float32).reshape(-1, 1)
+
+    config = _make_config()
+    config["selected_channels"] = [0]
+    config["channels"][0]["spl_weighting"] = "C"
+
+    payload = build_chart_payload(
+        buffer=signal,
+        config=config,
+        sample_rate=sample_rate,
+        mic_cal={},
+        analysis_window=(0.0, signal.shape[0] / sample_rate),
+    )
+
+    assert payload[0]["spl"]["times_sec"] == [0.05, 0.1]
+    assert len(payload[0]["spl"]["values_db"]) == 2
+
+
+def test_build_chart_payload_spl_exact_chunk_boundary_keeps_full_point_count():
+    sample_rate = 48000.0
+    chunk_samples = int(round(sample_rate * 0.05))
+    signal = np.full(chunk_samples * 2, 0.1, dtype=np.float32).reshape(-1, 1)
+
+    payload = build_chart_payload(
+        buffer=signal,
+        config=_make_config(),
+        sample_rate=sample_rate,
+        mic_cal={},
+        analysis_window=(0.0, signal.shape[0] / sample_rate),
+    )
+
+    assert payload[0]["spl"]["times_sec"] == [0.05, 0.1]
+    assert len(payload[0]["spl"]["values_db"]) == 2
+
+
+def test_build_chart_payload_spl_shorter_than_one_chunk_returns_empty_series():
+    sample_rate = 48000.0
+    chunk_samples = int(round(sample_rate * 0.05))
+    signal = np.full(chunk_samples - 1, 0.1, dtype=np.float32).reshape(-1, 1)
+
+    config = _make_config()
+    config["selected_channels"] = [0]
+    config["channels"][0]["spl_weighting"] = "C"
+
+    payload = build_chart_payload(
+        buffer=signal,
+        config=config,
+        sample_rate=sample_rate,
+        mic_cal={},
+        analysis_window=(0.0, signal.shape[0] / sample_rate),
+    )
+
+    assert payload[0]["spl"] == {
+        "times_sec": [],
+        "values_db": [],
+        "lower_limit_db": 40.0,
+        "upper_limit_db": 80.0,
+    }
+
+
 def test_build_chart_payload_fft_absolute_mode_uses_serialized_markers_and_overlay(
     monkeypatch,
 ):

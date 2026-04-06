@@ -810,7 +810,7 @@ def _build_spl_chart(*, signal: np.ndarray, sample_rate: float, channel_config: 
 
     for start in range(0, int(signal.size), chunk_samples):
         chunk = signal[start : start + chunk_samples]
-        if chunk.size <= 0:
+        if chunk.size < chunk_samples:
             continue
         value = _normalize_chart_number(
             dsp.compute_spl(chunk, sample_rate, weighting, time_constant)

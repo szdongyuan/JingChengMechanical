@@ -60,6 +60,25 @@ def test_spl_module_renders_committed_chart_for_selected_channel(qapp):
     assert module.current_render_channel() == 1
 
 
+def test_spl_module_keeps_chart_blank_when_committed_payload_has_no_series_points(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = SplModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["spl"] = {
+        "times_sec": [],
+        "values_db": [],
+        "lower_limit_db": 40.0,
+        "upper_limit_db": 80.0,
+    }
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    _assert_empty_chart_visible(module, qapp)
+
+
 def test_loudness_module_renders_committed_chart_for_selected_channel(qapp):
     services = _make_services(initial_state=_state(101, "reviewing"))
     module = LoudnessModule(services)
