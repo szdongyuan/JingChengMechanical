@@ -882,6 +882,13 @@ def test_main_window_reflows_test_page_for_loudness_and_video(qapp, monkeypatch)
     assert window.loudness.parentWidget() is _test_page_grid_card(window, 2, 0)
 
 
+def test_test_page_uses_renamed_spl_card_title(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    assert _card_title(_test_page_grid_card(window, 2, 1)) == "声压级 (SPL)"
+
+
 def test_main_window_routes_latest_log_line_to_status_bar(qapp, monkeypatch):
     window, services = _make_window(monkeypatch)
     _show(window, qapp)

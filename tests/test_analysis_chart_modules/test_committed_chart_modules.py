@@ -58,9 +58,11 @@ def test_spl_module_renders_committed_chart_for_selected_channel(qapp):
     assert module.current_plot_payload()["x_values"] == [0.0, 1.0]
     assert module.current_plot_payload()["y_values"] == [71.0, 72.0]
     assert module.current_render_channel() == 1
+    assert module.plot.plot_item.getAxis("bottom").labelText == "Time (s)"
+    assert module.plot.plot_item.getAxis("left").labelText == "SPL (dB)"
 
 
-def test_spl_module_keeps_chart_blank_when_committed_payload_has_no_series_points(qapp):
+def test_spl_module_keeps_axis_labels_when_committed_payload_has_no_series_points(qapp):
     services = _make_services(initial_state=_state(101, "reviewing"))
     module = SplModule(services)
     module.selected_display_channel_provider = lambda: 0
@@ -77,6 +79,8 @@ def test_spl_module_keeps_chart_blank_when_committed_payload_has_no_series_point
     qapp.processEvents()
 
     _assert_empty_chart_visible(module, qapp)
+    assert module.plot.plot_item.getAxis("bottom").labelText == "Time (s)"
+    assert module.plot.plot_item.getAxis("left").labelText == "SPL (dB)"
 
 
 def test_loudness_module_renders_committed_chart_for_selected_channel(qapp):

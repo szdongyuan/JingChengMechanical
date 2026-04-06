@@ -300,7 +300,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(Card("Loudness", self.loudness), 2, 0)
 
         self.spl = SplModule(self.services)
-        grid.addWidget(Card("SPL 时间曲线 (A计权)", self.spl), 2, 1)
+        grid.addWidget(Card("声压级 (SPL)", self.spl), 2, 1)
 
         self.octave = OctaveModule(self.services)
         grid.addWidget(Card("倍频程 (Octave)", self.octave), 2, 2)
