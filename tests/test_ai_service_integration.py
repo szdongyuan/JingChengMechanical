@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import uuid
 
 import pytest
 
@@ -74,6 +75,92 @@ with open(args["response"], "w", encoding="utf-8") as f:
         encoding="utf-8",
     )
     return str(script)
+
+
+def _write_threshold_toolchain_script(tmp_path, *, extra_payload: dict) -> str:
+    script = tmp_path / f"threshold_toolchain_{uuid.uuid4().hex[:8]}.py"
+    script.write_text(
+        f'''
+import json, sys
+
+args = {{}}
+i = 1
+while i < len(sys.argv):
+    if sys.argv[i] == "--request":
+        args["request"] = sys.argv[i+1]; i += 2
+    elif sys.argv[i] == "--response":
+        args["response"] = sys.argv[i+1]; i += 2
+    elif sys.argv[i] == "--artifacts-dir":
+        args["artifacts_dir"] = sys.argv[i+1]; i += 2
+    else:
+        i += 1
+
+with open(args["request"], "r", encoding="utf-8") as f:
+    req = json.load(f)
+
+response = {{
+    "protocol_version": 1,
+    "request_id": req["request_id"],
+    "toolchain_name": "Threshold Toolchain",
+    "toolchain_version": "0.1.0",
+    "ai_result": {{
+        "ai_label": "PASS",
+        "score": 0.95,
+        "summary": "Threshold test",
+        "confidence": 0.9,
+        "artifacts": [],
+        "extra": json.loads(r"""{json.dumps(extra_payload, ensure_ascii=False)}"""),
+    }},
+}}
+
+with open(args["response"], "w", encoding="utf-8") as f:
+    json.dump(response, f, ensure_ascii=False, indent=2)
+''',
+        encoding="utf-8",
+    )
+    return str(script)
+
+
+def _run_threshold_analysis(
+    ai_service,
+    fake_audio_file: str,
+    tmp_path,
+    *,
+    response_extra: dict,
+    request_params: dict,
+) -> dict:
+    cfg = TestConfigTable.create(config_name=f"Threshold Test {uuid.uuid4().hex[:8]}")
+    tc = AiToolchainTable.create(
+        toolchain_id=f"threshold-tc-{uuid.uuid4().hex[:8]}",
+        display_name="Threshold TC",
+        version="0.1.0",
+        entrypoint=f"{sys.executable} {_write_threshold_toolchain_script(tmp_path, extra_payload=response_extra)}",
+        default_timeout_ms=10000,
+    )
+    TestConfigAiBindingTable.create(
+        config=cfg,
+        toolchain=tc,
+        enabled=True,
+        params_json=json.dumps(request_params),
+    )
+
+    segments = [{
+        "segment_id": "dev_1",
+        "role": "device_1",
+        "audio_path": fake_audio_file,
+        "channels": [1],
+        "duration_ms": 5000,
+        "sample_rate": 48000,
+        "metadata": {},
+    }]
+
+    return ai_service.run_ai_analysis(
+        config_id=cfg.config_id,
+        test_run_id=f"run_threshold_{uuid.uuid4().hex[:8]}",
+        segments=segments,
+        context={"config_id": cfg.config_id},
+        ai_runs_dir=str(tmp_path / "ai_runs"),
+    )
 
 
 class TestRunAiAnalysis:
@@ -157,6 +244,63 @@ class TestRunAiAnalysis:
             request_payload = json.load(f)
 
         assert request_payload["window_info"] == window_info
+
+    def test_run_ai_analysis_uses_response_threshold_when_present(
+        self, ai_service, fake_audio_file, tmp_path
+    ):
+        result = _run_threshold_analysis(
+            ai_service,
+            fake_audio_file,
+            tmp_path,
+            response_extra={"decision_threshold": 0.8},
+            request_params={"decision_threshold": 0.6},
+        )
+
+        assert result["module_status"] == "success"
+        assert result["decision_threshold"] == pytest.approx(0.8)
+        assert result["decision_threshold_source"] == "response_extra"
+
+    def test_run_ai_analysis_falls_back_to_request_threshold_when_response_threshold_invalid(
+        self, ai_service, fake_audio_file, tmp_path
+    ):
+        result = _run_threshold_analysis(
+            ai_service,
+            fake_audio_file,
+            tmp_path,
+            response_extra={"decision_threshold": "not-a-number"},
+            request_params={"decision_threshold": 0.6},
+        )
+
+        assert result["module_status"] == "success"
+        assert result["decision_threshold"] == pytest.approx(0.6)
+        assert result["decision_threshold_source"] == "request_params"
+
+    @pytest.mark.parametrize(
+        ("response_extra", "request_params"),
+        [
+            ({"decision_threshold": 1.2}, {"decision_threshold": -0.1}),
+            ({}, {"decision_threshold": "bad"}),
+        ],
+    )
+    def test_run_ai_analysis_falls_back_to_default_point_five_when_no_valid_threshold_exists(
+        self,
+        ai_service,
+        fake_audio_file,
+        tmp_path,
+        response_extra,
+        request_params,
+    ):
+        result = _run_threshold_analysis(
+            ai_service,
+            fake_audio_file,
+            tmp_path,
+            response_extra=response_extra,
+            request_params=request_params,
+        )
+
+        assert result["module_status"] == "success"
+        assert result["decision_threshold"] == pytest.approx(0.5)
+        assert result["decision_threshold_source"] == "default"
 
     def test_preflight_failure_persisted(self, ai_service, tmp_path):
         cfg = TestConfigTable.create(config_name="PF Fail")

@@ -7,6 +7,7 @@ and UI ViewModel adaptation.
 from __future__ import annotations
 
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -36,6 +37,40 @@ def _gen_request_id() -> str:
     ts = datetime.now(_TZ8).strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:8]
     return f"req_{ts}_{short}"
+
+
+def _coerce_probability(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    probability = float(value)
+    if not math.isfinite(probability):
+        return None
+    if 0.0 <= probability <= 1.0:
+        return probability
+    return None
+
+
+def _resolve_effective_decision_threshold(
+    ai_result: dict, request_params: dict
+) -> tuple[float, str]:
+    extra = ai_result.get("extra")
+    response_threshold = None
+    if isinstance(extra, dict):
+        response_threshold = _coerce_probability(extra.get("decision_threshold"))
+    if response_threshold is not None:
+        return response_threshold, "response_extra"
+
+    request_threshold = None
+    if isinstance(request_params, dict):
+        request_threshold = _coerce_probability(
+            request_params.get("decision_threshold")
+        )
+    if request_threshold is not None:
+        return request_threshold, "request_params"
+
+    return 0.5, "default"
 
 
 class AiService:
@@ -548,7 +583,12 @@ class AiService:
 
     def save_execution(self, envelope: dict) -> AiExecutionTable:
         """Persist an AI execution record."""
-        return AiExecutionTable.create(**envelope)
+        persisted_fields = {
+            key: value
+            for key, value in envelope.items()
+            if key in AiExecutionTable._meta.fields
+        }
+        return AiExecutionTable.create(**persisted_fields)
 
     def mark_previous_ineffective(self, test_run_id: str):
         """Set is_current_effective=False for all records of a test run."""
@@ -710,12 +750,18 @@ class AiService:
 
         if module_status == "success":
             ai_result = validation["ai_result"]
+            decision_threshold, threshold_source = _resolve_effective_decision_threshold(
+                ai_result,
+                params,
+            )
             envelope["toolchain_name"] = validation.get("toolchain_name")
             envelope["toolchain_version"] = validation.get("toolchain_version")
             envelope["ai_label"] = ai_result.get("ai_label")
             envelope["score"] = ai_result.get("score")
             envelope["summary"] = ai_result.get("summary")
             envelope["confidence"] = ai_result.get("confidence")
+            envelope["decision_threshold"] = decision_threshold
+            envelope["decision_threshold_source"] = threshold_source
             envelope["extra_json"] = json.dumps(
                 ai_result.get("extra", {}), ensure_ascii=False
             )
