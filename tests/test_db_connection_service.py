@@ -143,6 +143,15 @@ def test_connect_bootstraps_full_runtime_schema_and_default_rows(monkeypatch):
         assert login_user is not None
 
 
+def test_connect_bootstraps_ai_binding_table_without_score_threshold(monkeypatch):
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
+        svc.connect()
+
+        columns = _table_columns(tmp_db, "test_config_ai_binding_table")
+
+        assert "score_threshold" not in columns
+
+
 def test_connect_is_idempotent_for_seeded_rows(monkeypatch):
     with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
         svc.connect()
@@ -449,7 +458,7 @@ def test_connect_migrates_legacy_config_tables_and_preserves_extra_columns(
         ]
 
 
-def test_connect_migrates_legacy_ai_binding_table_in_place(monkeypatch):
+def test_connect_removes_score_threshold_from_legacy_ai_binding_table(monkeypatch):
     with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
         tmp_db.connect()
         tmp_db.execute_sql(
@@ -489,6 +498,7 @@ def test_connect_migrates_legacy_ai_binding_table_in_place(monkeypatch):
                 timeout_ms INTEGER,
                 analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0,
                 params_json TEXT NOT NULL DEFAULT '{}',
+                score_threshold REAL DEFAULT NULL,
                 updated_time TEXT NOT NULL DEFAULT ''
             )
             """
@@ -536,19 +546,20 @@ def test_connect_migrates_legacy_ai_binding_table_in_place(monkeypatch):
                 timeout_ms,
                 analysis_window_offset_ms,
                 params_json,
+                score_threshold,
                 updated_time
-            ) VALUES (1, 1, 1, 'legacy-toolchain', 1200, 250, '{"legacy": true}', '')
+            ) VALUES (1, 1, 1, 'legacy-toolchain', 1200, 250, '{"legacy": true}', 0.72, '')
             """
         )
 
         svc.connect()
 
         columns = _table_columns(tmp_db, "test_config_ai_binding_table")
-        assert "score_threshold" in columns
+        assert "score_threshold" not in columns
         assert "analysis_window_offset_ms" in columns
         assert tmp_db.execute_sql(
             """
-            SELECT enabled, toolchain_id, timeout_ms, analysis_window_offset_ms, params_json, score_threshold
+            SELECT enabled, toolchain_id, timeout_ms, analysis_window_offset_ms, params_json
             FROM test_config_ai_binding_table
             WHERE config_id = 1
             """
@@ -558,7 +569,6 @@ def test_connect_migrates_legacy_ai_binding_table_in_place(monkeypatch):
             1200,
             250,
             '{"legacy": true}',
-            None,
         )
         assert (
             "testconfigaibindingtable_toolchain_id",

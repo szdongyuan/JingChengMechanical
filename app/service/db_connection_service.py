@@ -81,12 +81,7 @@ class DbConnectionService:
                 ("oct_show_golden_overlay", "INTEGER NOT NULL DEFAULT 0"),
             ],
         )
-        self._ensure_columns(
-            "test_config_ai_binding_table",
-            [
-                ("score_threshold", "REAL DEFAULT NULL"),
-            ],
-        )
+        self._remove_obsolete_ai_binding_score_threshold()
         self._ensure_columns(
             "ai_toolchain_table",
             [
@@ -128,6 +123,63 @@ class DbConnectionService:
     def _get_table_columns(self, table_name: str) -> set[str]:
         cursor = db.execute_sql(f"PRAGMA table_info({table_name})")
         return {row[1] for row in cursor.fetchall()}
+
+    def _remove_obsolete_ai_binding_score_threshold(self):
+        columns = self._get_table_columns("test_config_ai_binding_table")
+        if "score_threshold" not in columns:
+            return
+
+        column_definitions = [
+            "binding_id INTEGER PRIMARY KEY",
+            "config_id INTEGER NOT NULL UNIQUE REFERENCES test_config_table(config_id) ON DELETE CASCADE",
+            "enabled INTEGER NOT NULL DEFAULT 0",
+            "toolchain_id TEXT REFERENCES ai_toolchain_table(toolchain_id) ON DELETE SET NULL",
+            "timeout_ms INTEGER",
+        ]
+        copy_columns = [
+            "binding_id",
+            "config_id",
+            "enabled",
+            "toolchain_id",
+            "timeout_ms",
+        ]
+        if "analysis_window_offset_ms" in columns:
+            column_definitions.append(
+                "analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0"
+            )
+            copy_columns.append("analysis_window_offset_ms")
+        column_definitions.extend(
+            [
+                "params_json TEXT NOT NULL DEFAULT '{}'",
+                "updated_time TEXT NOT NULL DEFAULT ''",
+            ]
+        )
+        copy_columns.extend(["params_json", "updated_time"])
+        column_list_sql = ", ".join(copy_columns)
+
+        with db.atomic():
+            db.execute_sql(
+                """
+                ALTER TABLE test_config_ai_binding_table
+                RENAME TO test_config_ai_binding_table_old
+                """
+            )
+            db.execute_sql(
+                """
+                CREATE TABLE test_config_ai_binding_table (
+                    {}
+                )
+                """.format(",\n                    ".join(column_definitions))
+            )
+            db.execute_sql(
+                f"""
+                INSERT INTO test_config_ai_binding_table ({column_list_sql})
+                SELECT {column_list_sql}
+                FROM test_config_ai_binding_table_old
+                """
+            )
+            db.execute_sql("DROP TABLE test_config_ai_binding_table_old")
+            self._ensure_ai_binding_indexes()
 
     def _backfill_channel_loudness_defaults(self):
         channel_columns = self._get_table_columns("channel_config_table")
