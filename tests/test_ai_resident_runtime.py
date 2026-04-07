@@ -591,6 +591,49 @@ def test_timeout_waiting_for_response_discards_cache(tmp_path: Path, runtime):
     assert runtime.has_cached_process("tc-1") is False
 
 
+def test_timeout_does_not_materially_overrun_request_deadline(
+    tmp_path: Path, runtime, monkeypatch
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    entrypoint = _entrypoint(script_path)
+
+    monkeypatch.setattr(
+        ai_resident_runtime._ResidentProcess,
+        "_settle_idle_stderr_before_reuse",
+        lambda self: False,
+    )
+
+    warmup = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-warmup",
+        request_payload=_request_payload("req-warmup"),
+        artifacts_dir=str(tmp_path / "artifacts-warmup"),
+        timeout_ms=1000,
+    )
+
+    started = time.monotonic()
+    result = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-timeout",
+        request_payload=_request_payload(
+            "req-timeout",
+            behavior="timeout",
+            sleep_s=0.3,
+        ),
+        artifacts_dir=str(tmp_path / "artifacts-timeout"),
+        timeout_ms=20,
+    )
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+
+    assert warmup["module_status"] == "success"
+    assert result["module_status"] == "timeout"
+    assert result["error_summary"] == "Process timed out"
+    assert elapsed_ms < 55, elapsed_ms
+    assert runtime.has_cached_process("tc-1") is False
+
+
 def test_startup_stderr_before_first_request_does_not_discard_or_leak_into_run(
     tmp_path: Path, runtime, monkeypatch
 ):
@@ -632,6 +675,48 @@ def test_startup_stderr_before_first_request_does_not_discard_or_leak_into_run(
     assert result["module_status"] == "success"
     assert result["stderr_excerpt"] == ""
     assert launch_count == 1
+
+
+def test_pre_activation_broken_pipe_preserves_current_run_stderr_excerpt(
+    tmp_path: Path, runtime, monkeypatch
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    entrypoint = _entrypoint(script_path)
+    expected_stderr = "send-window-stderr"
+
+    def fail_after_send_window_stderr(
+        self,
+        *,
+        cached_process,
+        request_id: str,
+        request_payload: dict,
+        artifacts_dir: str,
+    ) -> None:
+        assert cached_process.ready_to_send() is True
+        assert cached_process.mark_request_send_started() is True
+        cached_process.mark_request_flushed()
+        cached_process.append_stderr(expected_stderr)
+        raise BrokenPipeError("simulated broken pipe")
+
+    monkeypatch.setattr(
+        ai_resident_runtime.ResidentToolchainRuntime,
+        "_send_request",
+        fail_after_send_window_stderr,
+    )
+
+    result = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-1",
+        request_payload=_request_payload("req-1"),
+        artifacts_dir=str(tmp_path / "artifacts"),
+        timeout_ms=1000,
+    )
+
+    assert result["module_status"] == "process_error"
+    assert result["error_summary"] == "simulated broken pipe"
+    assert result["stderr_excerpt"] == expected_stderr
+    assert runtime.has_cached_process("tc-1") is False
 
 
 def test_immediate_response_during_send_window_is_not_classified_as_idle_output(
@@ -1086,13 +1171,13 @@ def test_stale_idle_stderr_backlog_does_not_leak_into_next_run_excerpt(
         except Exception:
             return
 
-    def capture_after_stale_append(self, cached_process):
+    def capture_after_stale_append(self, cached_process, *, deadline=None):
         nonlocal capture_calls
         capture_calls += 1
         if capture_calls == 2:
             assert stale_chunk_appended.wait(timeout=2)
             time.sleep(0.05)
-        return original_capture(self, cached_process)
+        return original_capture(self, cached_process, deadline=deadline)
 
     monkeypatch.setattr(
         ai_resident_runtime._ResidentProcess,

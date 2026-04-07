@@ -189,7 +189,38 @@ class _ResidentProcess:
             self.request_active = True
         return True
 
-    def cancel_request(self) -> None:
+    def _current_request_stderr_excerpt_locked(self) -> str:
+        if self.active_stderr_excerpt:
+            return self.active_stderr_excerpt
+
+        start_position = self.active_stderr_start_position
+        if start_position is None:
+            start_position = self.pending_stderr_start_position
+        if start_position is None:
+            return ""
+
+        parts: list[str] = []
+        remaining = _EXCERPT_LIMIT
+        for chunk_start, chunk_text, chunk_bytes in self.stderr_chunks:
+            chunk_end = chunk_start + chunk_bytes
+            if chunk_end <= start_position:
+                continue
+            if chunk_start < start_position:
+                excerpt_chunk = _slice_utf8_text(
+                    chunk_text,
+                    start_position - chunk_start,
+                )
+            else:
+                excerpt_chunk = chunk_text
+            if not excerpt_chunk:
+                continue
+            parts.append(excerpt_chunk[:remaining])
+            remaining -= len(parts[-1])
+            if remaining <= 0:
+                break
+        return "".join(parts)
+
+    def cancel_request(self, *, capture_stderr: bool = False) -> str:
         with self.state_lock:
             self.request_pending_send = False
             self.request_send_started = False
@@ -198,9 +229,15 @@ class _ResidentProcess:
             self.active_stdout_line_count = 0
             self.active_stdout_protocol_error = None
         with self.stderr_lock:
+            excerpt = (
+                self._current_request_stderr_excerpt_locked()
+                if capture_stderr
+                else ""
+            )
             self.pending_stderr_start_position = None
             self.active_stderr_start_position = None
             self.active_stderr_excerpt = ""
+        return excerpt
 
     def finish_request(self) -> tuple[str | None, str]:
         with self.state_lock:
@@ -452,7 +489,9 @@ class ResidentToolchainRuntime:
                         process_instance_id = None
                         continue
                     except TimeoutError:
-                        cached_process.cancel_request()
+                        stderr_excerpt = cached_process.cancel_request(
+                            capture_stderr=True
+                        )
                         self._discard_cached_process(
                             toolchain_id,
                             cached_process,
@@ -463,11 +502,13 @@ class ResidentToolchainRuntime:
                             started_at=started_at,
                             started_mono=started_mono,
                             error_summary="Process timed out",
-                            stderr_excerpt="",
+                            stderr_excerpt=stderr_excerpt,
                             process_instance_id=process_instance_id,
                         )
                     except (BrokenPipeError, OSError, ValueError) as exc:
-                        cached_process.cancel_request()
+                        stderr_excerpt = cached_process.cancel_request(
+                            capture_stderr=True
+                        )
                         self._discard_cached_process(
                             toolchain_id,
                             cached_process,
@@ -478,7 +519,7 @@ class ResidentToolchainRuntime:
                             started_at=started_at,
                             started_mono=started_mono,
                             error_summary=str(exc)[:_EXCERPT_LIMIT],
-                            stderr_excerpt="",
+                            stderr_excerpt=stderr_excerpt,
                             process_instance_id=process_instance_id,
                         )
                 self._discard_cached_process(
@@ -493,7 +534,10 @@ class ResidentToolchainRuntime:
                 )
             except TimeoutError:
                 if request_started:
-                    _, stderr_excerpt = self._complete_request(cached_process)
+                    _, stderr_excerpt = self._complete_request(
+                        cached_process,
+                        deadline=deadline,
+                    )
                     request_finished = True
                 else:
                     cached_process.cancel_request()
@@ -513,7 +557,10 @@ class ResidentToolchainRuntime:
                 )
             except (BrokenPipeError, OSError, ValueError) as exc:
                 if request_started:
-                    _, stderr_excerpt = self._complete_request(cached_process)
+                    _, stderr_excerpt = self._complete_request(
+                        cached_process,
+                        deadline=deadline,
+                    )
                     request_finished = True
                 else:
                     cached_process.cancel_request()
@@ -615,7 +662,10 @@ class ResidentToolchainRuntime:
                                 process_instance_id=cached_process.instance_id,
                             )
 
-            active_stdout_error, stderr_excerpt = self._complete_request(cached_process)
+            active_stdout_error, stderr_excerpt = self._complete_request(
+                cached_process,
+                deadline=deadline,
+            )
             request_finished = True
             result["stderr_excerpt"] = stderr_excerpt
             if active_stdout_error is not None:
@@ -644,10 +694,14 @@ class ResidentToolchainRuntime:
         except Exception as exc:
             if cached_process is not None:
                 if request_started and not request_finished:
-                    _, stderr_excerpt = self._complete_request(cached_process)
+                    _, stderr_excerpt = self._complete_request(
+                        cached_process,
+                        deadline=deadline if "deadline" in locals() else None,
+                    )
                 elif not request_started:
-                    cached_process.cancel_request()
-                    stderr_excerpt = ""
+                    stderr_excerpt = cached_process.cancel_request(
+                        capture_stderr=True
+                    )
                 else:
                     stderr_excerpt = ""
                 self._discard_cached_process(
@@ -850,11 +904,23 @@ class ResidentToolchainRuntime:
             raise TimeoutError("Timed out waiting for resident response")
         return remaining
 
-    def _capture_stderr_excerpt(self, cached_process: _ResidentProcess) -> str:
+    def _capture_stderr_excerpt(
+        self,
+        cached_process: _ResidentProcess,
+        *,
+        deadline: float | None = None,
+    ) -> str:
         last_seen = cached_process.stderr_position()
         saw_post_response_growth = False
-        for _ in range(10):
-            time.sleep(0.01)
+        settle_timeout = self._bounded_wait_timeout(0.1, deadline)
+        if settle_timeout is None:
+            return cached_process.current_stderr_excerpt()
+        settle_deadline = time.monotonic() + settle_timeout
+        while True:
+            remaining = settle_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(0.01, remaining))
             current = cached_process.stderr_position()
             if current == last_seen:
                 break
@@ -917,13 +983,24 @@ class ResidentToolchainRuntime:
                     time.monotonic() + _STARTUP_STDERR_SETTLE_QUIET_SECONDS
                 )
 
-    def _capture_active_stdout_violation(self, cached_process: _ResidentProcess) -> None:
+    def _capture_active_stdout_violation(
+        self,
+        cached_process: _ResidentProcess,
+        *,
+        deadline: float | None = None,
+    ) -> None:
         _, violation = cached_process.active_stdout_state()
         if violation is not None:
             return
-        deadline = time.monotonic() + _POST_RESPONSE_STDOUT_SETTLE_SECONDS
+        settle_timeout = self._bounded_wait_timeout(
+            _POST_RESPONSE_STDOUT_SETTLE_SECONDS,
+            deadline,
+        )
+        if settle_timeout is None:
+            return
+        settle_deadline = time.monotonic() + settle_timeout
         while True:
-            remaining = deadline - time.monotonic()
+            remaining = settle_deadline - time.monotonic()
             if remaining <= 0:
                 return
             time.sleep(min(_POST_RESPONSE_STDOUT_SETTLE_POLL_SECONDS, remaining))
@@ -932,10 +1009,13 @@ class ResidentToolchainRuntime:
                 return
 
     def _complete_request(
-        self, cached_process: _ResidentProcess
+        self,
+        cached_process: _ResidentProcess,
+        *,
+        deadline: float | None = None,
     ) -> tuple[str | None, str]:
-        self._capture_stderr_excerpt(cached_process)
-        self._capture_active_stdout_violation(cached_process)
+        self._capture_stderr_excerpt(cached_process, deadline=deadline)
+        self._capture_active_stdout_violation(cached_process, deadline=deadline)
         return cached_process.finish_request()
 
     @staticmethod
