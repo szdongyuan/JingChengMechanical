@@ -128,6 +128,25 @@ def _make_single_channel_judgment_payload(**channel_overrides):
     return payload
 
 
+def _make_ai_only_config():
+    return {
+        "config_id": 101,
+        "selected_channels": [],
+        "channels": [],
+    }
+
+
+def _make_ai_only_judgment_payload(*, ai_pass, ai_score):
+    return {
+        "overall": "合格" if ai_pass is not False else "不合格",
+        "limit_pass": True,
+        "ai_pass": ai_pass,
+        "ai_score": ai_score,
+        "analysis_window": (1.0, 3.0),
+        "channel_results": [],
+    }
+
+
 class _GoldenCacheStub:
     def __init__(
         self,
@@ -293,7 +312,58 @@ def test_build_summary_payload_handles_bounded_pass_margin_and_exact_boundary():
     assert summary["rows"][3]["status"] == "OK"
 
 
-def test_build_summary_payload_renders_unconstrained_rows_and_ai_channel_fallback():
+def test_build_summary_payload_uses_ai_threshold_for_numeric_success():
+    summary = build_summary_payload(
+        config=_make_ai_only_config(),
+        judgment_payload=_make_ai_only_judgment_payload(ai_pass=False, ai_score=0.48),
+        ai_review={"status": "success", "threshold": 0.5, "score": 0.48},
+    )
+
+    assert summary["overall_status"] == "fail"
+    assert summary["rows"][-1]["label"] == "AI分析"
+    assert summary["rows"][-1]["deviation_value"] == 0.02
+    assert summary["rows"][-1]["deviation_display"] == "0.02"
+    assert summary["rows"][-1]["status"] == "NG"
+    assert summary["rows"][-1]["constrained"] is True
+
+
+def test_build_summary_payload_keeps_scoreless_success_with_ai_threshold_as_no_result_even_when_judgment_used_ai_label():
+    summary = build_summary_payload(
+        config=_make_ai_only_config(),
+        judgment_payload=_make_ai_only_judgment_payload(ai_pass=True, ai_score=None),
+        ai_review={"status": "success", "threshold": 0.5, "score": None},
+    )
+
+    assert summary["overall_status"] == "no_result"
+    assert summary["rows"][-1]["label"] == "AI分析"
+    assert summary["rows"][-1]["deviation_value"] is None
+    assert summary["rows"][-1]["deviation_display"] == "--"
+    assert summary["rows"][-1]["status"] == "无结果"
+    assert summary["rows"][-1]["constrained"] is True
+
+
+def test_build_summary_payload_marks_successful_numeric_ai_with_missing_ai_threshold_as_no_result():
+    summary = build_summary_payload(
+        config=_make_ai_only_config(),
+        judgment_payload=_make_ai_only_judgment_payload(ai_pass=True, ai_score=0.81),
+        ai_review={
+            "status": "success",
+            "threshold": None,
+            "score": 0.81,
+            "error_message": "missing threshold",
+        },
+    )
+
+    assert summary["overall_status"] == "no_result"
+    assert summary["error_message"] == "AI decision threshold unavailable"
+    assert summary["rows"][-1]["label"] == "AI分析"
+    assert summary["rows"][-1]["deviation_value"] is None
+    assert summary["rows"][-1]["deviation_display"] == "--"
+    assert summary["rows"][-1]["status"] == "无结果"
+    assert summary["rows"][-1]["constrained"] is True
+
+
+def test_build_summary_payload_renders_unconstrained_rows_and_scoreless_success_ai_as_no_result():
     summary = build_summary_payload(
         config=_make_config(fft_limits=False, octave_limits=False),
         judgment_payload={
@@ -330,7 +400,7 @@ def test_build_summary_payload_renders_unconstrained_rows_and_ai_channel_fallbac
         ai_review={"status": "success", "channel_index": None},
     )
 
-    assert summary["overall_status"] == "pass"
+    assert summary["overall_status"] == "no_result"
     assert summary["rows"][1]["label"] == "Loudness"
     assert summary["rows"][1]["status"] == "OK"
     assert summary["rows"][1]["constrained"] is True
@@ -346,8 +416,8 @@ def test_build_summary_payload_renders_unconstrained_rows_and_ai_channel_fallbac
     assert summary["rows"][3]["deviation_display"] == "--"
     assert summary["rows"][4]["label"] == "AI分析"
     assert summary["rows"][4]["channel_label"] == "--"
-    assert summary["rows"][4]["status"] == "OK"
-    assert summary["rows"][4]["constrained"] is False
+    assert summary["rows"][4]["status"] == "无结果"
+    assert summary["rows"][4]["constrained"] is True
 
 
 @pytest.mark.parametrize("status", ["not_enabled", "not_configured", "disabled", "skipped"])

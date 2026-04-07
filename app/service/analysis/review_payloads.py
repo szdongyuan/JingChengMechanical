@@ -451,9 +451,12 @@ def _build_ai_row(
         return _build_unconstrained_row("ai", "AI分析"), None
     if status == "" and threshold is None:
         return _build_unconstrained_row("ai", "AI分析"), None
-    if status == "success" and threshold is None:
-        return _build_unconstrained_row("ai", "AI分析"), None
-    if status == "success" and score is not None:
+    if status == "success" and score is not None and threshold is None:
+        return (
+            _build_constrained_no_result_row("ai", "AI分析", channel_index=channel_index),
+            "AI decision threshold unavailable",
+        )
+    if status == "success" and score is not None and threshold is not None:
         deviation = _compute_deviation(actual=score, lower=threshold, upper=None)
         return (
             _build_row(
