@@ -365,6 +365,23 @@ def test_operator_role_cannot_access_ai_tool_management_tab(qapp, monkeypatch):
     assert window.top_button_dict["AI工具管理"].isEnabled() is False
 
 
+def test_no_role_programmatic_page_reentry_remains_allowed(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    window.tab.setCurrentIndex(1)
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == 1
+    assert window.top_button_dict["数据管理"].isChecked() is True
+
+    window.tab.setCurrentIndex(0)
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == 0
+    assert window.top_button_dict["测试"].isChecked() is True
+
+
 def test_operator_cannot_activate_ai_tool_management_via_programmatic_tab_change(
     qapp,
     monkeypatch,

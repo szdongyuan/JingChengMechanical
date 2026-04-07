@@ -529,8 +529,12 @@ class MainWindow(QMainWindow):
         if index is None or index < 0 or index >= len(getattr(self, "tab_names", [])):
             return False
 
+        effective_role = self.current_user_role if role is None else role
+        if effective_role is None:
+            return True
+
         tab_name = self.tab_names[index]
-        allowed_tabs = self._role_permissions(self.current_user_role if role is None else role)["tabs"]
+        allowed_tabs = self._role_permissions(effective_role)["tabs"]
         return tab_name in allowed_tabs
 
     def _ensure_role_compatible_main_tab(self, role) -> bool:
