@@ -591,6 +591,42 @@ def test_timeout_waiting_for_response_discards_cache(tmp_path: Path, runtime):
     assert runtime.has_cached_process("tc-1") is False
 
 
+def test_immediate_reuse_fence_timeout_stays_within_request_budget(
+    tmp_path: Path, runtime
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    entrypoint = _entrypoint(script_path)
+
+    warmup = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-warmup",
+        request_payload=_request_payload("req-warmup"),
+        artifacts_dir=str(tmp_path / "artifacts-warmup"),
+        timeout_ms=1000,
+    )
+
+    started = time.monotonic()
+    result = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-reuse-timeout",
+        request_payload=_request_payload("req-reuse-timeout"),
+        artifacts_dir=str(tmp_path / "artifacts-reuse-timeout"),
+        timeout_ms=20,
+    )
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+
+    assert warmup["module_status"] == "success"
+    assert warmup["process_instance_id"] is not None
+    assert result["module_status"] == "timeout"
+    assert result["error_summary"] == "Process timed out"
+    assert result["process_instance_id"] == warmup["process_instance_id"]
+    assert elapsed_ms < 80, elapsed_ms
+    assert result["duration_ms"] < 80
+    assert runtime.has_cached_process("tc-1") is False
+
+
 def test_timeout_does_not_materially_overrun_request_deadline(
     tmp_path: Path, runtime, monkeypatch
 ):
@@ -600,7 +636,7 @@ def test_timeout_does_not_materially_overrun_request_deadline(
     monkeypatch.setattr(
         ai_resident_runtime._ResidentProcess,
         "_settle_idle_stderr_before_reuse",
-        lambda self: False,
+        lambda self, **kwargs: False,
     )
 
     warmup = runtime.analyze(
@@ -770,12 +806,12 @@ def test_startup_retry_loop_respects_request_deadline(tmp_path: Path, runtime, m
     begin_request_calls = 0
     discard_calls = 0
 
-    def fail_first_begin_request(self) -> bool:
+    def fail_first_begin_request(self, **kwargs) -> bool:
         nonlocal begin_request_calls
         begin_request_calls += 1
         if begin_request_calls == 1:
             return False
-        return original_begin_request(self)
+        return original_begin_request(self, **kwargs)
 
     def slow_first_discard(self, toolchain_id: str, cached_process, *args, **kwargs):
         nonlocal discard_calls
@@ -1232,9 +1268,9 @@ def test_stale_idle_stderr_backlog_does_not_leak_into_next_run_excerpt(
     begin_request_calls = 0
     capture_calls = 0
 
-    def release_on_second_request(self) -> bool:
+    def release_on_second_request(self, **kwargs) -> bool:
         nonlocal begin_request_calls
-        started = original_begin_request(self)
+        started = original_begin_request(self, **kwargs)
         if not started:
             return started
         begin_request_calls += 1

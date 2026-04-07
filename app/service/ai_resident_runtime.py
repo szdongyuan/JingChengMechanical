@@ -119,8 +119,8 @@ class _ResidentProcess:
         with self.stdout_condition:
             return bool(self.stdout_items)
 
-    def begin_request(self) -> bool:
-        if self._settle_idle_stderr_before_reuse():
+    def begin_request(self, *, request_deadline: float | None = None) -> bool:
+        if self._settle_idle_stderr_before_reuse(request_deadline=request_deadline):
             return False
         with self.state_lock:
             if self.request_active or self.request_pending_send:
@@ -299,22 +299,35 @@ class _ResidentProcess:
         with self.state_lock:
             self.idle_stderr_invalidated = True
 
-    def _settle_idle_stderr_before_reuse(self) -> bool:
+    def _settle_idle_stderr_before_reuse(
+        self,
+        *,
+        request_deadline: float | None = None,
+    ) -> bool:
         with self.state_lock:
             if self.completed_request_count <= 0:
                 return False
             if self.idle_stdout_invalidated or self.idle_stderr_invalidated:
                 return True
-            deadline = self.post_request_reuse_fence_deadline
-        if deadline is None:
+            fence_deadline = self.post_request_reuse_fence_deadline
+        if fence_deadline is None:
             return False
         while True:
-            remaining = deadline - time.monotonic()
+            wait_deadline = fence_deadline
+            if request_deadline is not None:
+                wait_deadline = min(wait_deadline, request_deadline)
+            remaining = wait_deadline - time.monotonic()
             if remaining <= 0:
                 with self.state_lock:
                     if self.idle_stdout_invalidated or self.idle_stderr_invalidated:
                         return True
-                    if self.post_request_reuse_fence_deadline == deadline:
+                    if (
+                        self.post_request_reuse_fence_deadline == fence_deadline
+                        and (
+                            request_deadline is None
+                            or fence_deadline <= request_deadline
+                        )
+                    ):
                         self.post_request_reuse_fence_deadline = None
                 return False
             time.sleep(min(_POST_REQUEST_REUSE_FENCE_POLL_SECONDS, remaining))
@@ -474,7 +487,7 @@ class ResidentToolchainRuntime:
                         process_instance_id=process_instance_id,
                     )
                 process_instance_id = cached_process.instance_id
-                if cached_process.begin_request():
+                if cached_process.begin_request(request_deadline=deadline):
                     try:
                         self._remaining_timeout(deadline)
                         self._send_request(
