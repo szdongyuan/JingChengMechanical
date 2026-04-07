@@ -167,6 +167,16 @@ def test_module_shows_empty_state_when_no_toolchains_exist(qapp):
     assert module.btn_delete.isEnabled() is False
 
 
+def test_new_toolchain_defaults_execution_mode_to_resident_process(qapp):
+    module, _service, _bus = _make_module(toolchains=[])
+    _show(module, qapp)
+
+    module.btn_new.click()
+    qapp.processEvents()
+
+    assert module.combo_execution_mode.currentData() == "resident_process"
+
+
 def test_left_list_sorts_rows_and_marks_disabled_toolchains(qapp):
     module, _service, _bus = _make_module(
         toolchains=[
@@ -203,7 +213,7 @@ def test_left_list_sorts_rows_and_marks_disabled_toolchains(qapp):
     assert item_texts[1].endswith("[禁用]")
 
 
-def test_selecting_row_populates_editor_and_runtime_helper_text(qapp):
+def test_selecting_row_populates_execution_mode_and_runtime_helper_text(qapp):
     module, _service, _bus = _make_module(
         toolchains=[
             _toolchain(
@@ -214,6 +224,7 @@ def test_selecting_row_populates_editor_and_runtime_helper_text(qapp):
                 default_timeout_ms=45000,
                 enabled=False,
                 description="updated registry entry",
+                execution_mode="oneshot_process",
             )
         ]
     )
@@ -229,8 +240,27 @@ def test_selecting_row_populates_editor_and_runtime_helper_text(qapp):
     assert module.spin_timeout.value() == 45000
     assert module.chk_enabled.isChecked() is False
     assert module.txt_description.toPlainText() == "updated registry entry"
+    assert module.combo_execution_mode.currentData() == "oneshot_process"
     assert "protocol_version = 1" in module.runtime_helper.text()
-    assert "execution_mode = oneshot_process" in module.runtime_helper.text()
+    assert "resident_process" in module.runtime_helper.text()
+    assert "oneshot_process" in module.runtime_helper.text()
+
+
+def test_save_persists_selected_execution_mode(qapp):
+    module, service, _bus = _make_module(toolchains=[])
+    _show(module, qapp)
+
+    module.btn_new.click()
+    module.ed_toolchain_id.setText("motor-ai")
+    module.ed_display_name.setText("Motor AI")
+    module.ed_entrypoint.setPlainText("python motor_ai.py")
+    module.combo_execution_mode.setCurrentIndex(
+        module.combo_execution_mode.findData("oneshot_process")
+    )
+
+    module.btn_save.click()
+
+    assert service.saved_requests[-1][1]["execution_mode"] == "oneshot_process"
 
 
 def test_large_timeout_value_loads_and_saves_without_clamping(qapp):
@@ -488,6 +518,71 @@ def test_local_validation_shows_warning_before_service_write(
 
     assert warnings == [("保存失败", expected_message)]
     assert service.saved_requests == []
+
+
+def test_busy_save_error_shows_user_warning(qapp, monkeypatch):
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.ai_tool_management.QMessageBox.warning",
+        lambda *args: warnings.append(args[1:3]),
+    )
+    module, service, _bus = _make_module(
+        toolchains=[],
+        save_error=RuntimeError("Resident toolchain is busy"),
+    )
+    _show(module, qapp)
+
+    module.btn_new.click()
+    module.ed_toolchain_id.setText("motor-ai")
+    module.ed_display_name.setText("Motor AI")
+    module.ed_entrypoint.setPlainText("python motor_ai.py")
+    module.combo_execution_mode.setCurrentIndex(
+        module.combo_execution_mode.findData("resident_process")
+    )
+
+    module.btn_save.click()
+
+    assert service.saved_requests == [
+        (
+            None,
+            {
+                "toolchain_id": "motor-ai",
+                "display_name": "Motor AI",
+                "version": "",
+                "entrypoint": "python motor_ai.py",
+                "default_timeout_ms": 30000,
+                "enabled": True,
+                "description": "",
+                "execution_mode": "resident_process",
+            },
+        )
+    ]
+    assert warnings == [("保存失败", "Resident toolchain is busy")]
+
+
+def test_busy_delete_error_shows_user_warning(qapp, monkeypatch):
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.ai_tool_management.QMessageBox.warning",
+        lambda *args: warnings.append(args[1:3]),
+    )
+    monkeypatch.setattr(
+        "ui.modules.ai_tool_management.QMessageBox.question",
+        lambda *args: args[3].Yes,
+    )
+    module, service, _bus = _make_module(
+        toolchains=[_toolchain("motor-ai")],
+        delete_error=RuntimeError("Resident toolchain is busy"),
+    )
+    _show(module, qapp)
+
+    module._select_toolchain("motor-ai")
+    qapp.processEvents()
+
+    module.btn_delete.click()
+
+    assert service.deleted_toolchain_ids == ["motor-ai"]
+    assert warnings == [("删除失败", "Resident toolchain is busy")]
 
 
 def test_delete_dirty_row_prompts_unsaved_changes_before_delete_confirmation(

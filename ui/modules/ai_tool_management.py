@@ -5,6 +5,7 @@ from PyQt6.QtGui import QRegularExpressionValidator
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QComboBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -17,6 +18,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+_DEFAULT_EXECUTION_MODE = "resident_process"
 
 
 class _LargeIntegerEditor(QLineEdit):
@@ -157,16 +160,22 @@ class AiToolManagementModule(QWidget):
         self.chk_enabled = QCheckBox("启用")
         form_lay.addRow("状态", self.chk_enabled)
 
+        self.combo_execution_mode = QComboBox()
+        self.combo_execution_mode.addItem("常驻进程（推荐）", "resident_process")
+        self.combo_execution_mode.addItem("单次进程", "oneshot_process")
+        form_lay.addRow("执行模式", self.combo_execution_mode)
+
         self.txt_description = QPlainTextEdit()
         self.txt_description.setMaximumHeight(100)
         form_lay.addRow("描述", self.txt_description)
 
         self.runtime_helper = QLabel(
-            "运行时固定: protocol_version = 1, execution_mode = oneshot_process"
+            "protocol_version = 1（固定）；推荐使用 resident_process 以复用预加载模型；"
+            "oneshot_process 适用于仍使用基于文件 CLI 的工具链。"
         )
         self.runtime_helper.setObjectName("Muted")
         self.runtime_helper.setWordWrap(True)
-        form_lay.addRow("运行时", self.runtime_helper)
+        form_lay.addRow("运行时说明", self.runtime_helper)
 
         detail_lay.addWidget(form_host)
 
@@ -193,6 +202,7 @@ class AiToolManagementModule(QWidget):
         self.ed_entrypoint.textChanged.connect(self._on_editor_changed)
         self.spin_timeout.textChanged.connect(self._on_editor_changed)
         self.chk_enabled.toggled.connect(self._on_editor_changed)
+        self.combo_execution_mode.currentIndexChanged.connect(self._on_editor_changed)
         self.txt_description.textChanged.connect(self._on_editor_changed)
 
     def _refresh_list(self, selected_toolchain_id: str | None = None):
@@ -234,6 +244,7 @@ class AiToolManagementModule(QWidget):
             "entrypoint": "",
             "default_timeout_ms": 30000,
             "enabled": True,
+            "execution_mode": _DEFAULT_EXECUTION_MODE,
             "description": "",
         }
 
@@ -250,6 +261,7 @@ class AiToolManagementModule(QWidget):
                 "entrypoint": row.get("entrypoint", ""),
                 "default_timeout_ms": int(row.get("default_timeout_ms") or 0),
                 "enabled": bool(row.get("enabled", True)),
+                "execution_mode": row.get("execution_mode", _DEFAULT_EXECUTION_MODE),
                 "description": row.get("description", ""),
             }
         )
@@ -309,9 +321,18 @@ class AiToolManagementModule(QWidget):
             self.ed_entrypoint.setPlainText(row.get("entrypoint", ""))
             self.spin_timeout.setValue(int(row.get("default_timeout_ms") or 0))
             self.chk_enabled.setChecked(bool(row.get("enabled", True)))
+            self._set_execution_mode(
+                row.get("execution_mode", _DEFAULT_EXECUTION_MODE)
+            )
             self.txt_description.setPlainText(row.get("description", ""))
         finally:
             self._suspend_editor_change_tracking = False
+
+    def _set_execution_mode(self, execution_mode: str):
+        index = self.combo_execution_mode.findData(execution_mode)
+        if index < 0:
+            index = self.combo_execution_mode.findData(_DEFAULT_EXECUTION_MODE)
+        self.combo_execution_mode.setCurrentIndex(index)
 
     def _clear_editor(self):
         self._set_editor_payload(self._empty_draft_payload())
@@ -368,6 +389,8 @@ class AiToolManagementModule(QWidget):
             "entrypoint": self.ed_entrypoint.toPlainText(),
             "default_timeout_ms": self.spin_timeout.value(),
             "enabled": self.chk_enabled.isChecked(),
+            "execution_mode": self.combo_execution_mode.currentData()
+            or _DEFAULT_EXECUTION_MODE,
             "description": self.txt_description.toPlainText(),
         }
 
@@ -380,6 +403,7 @@ class AiToolManagementModule(QWidget):
             "entrypoint": payload["entrypoint"].strip(),
             "default_timeout_ms": payload["default_timeout_ms"],
             "enabled": payload["enabled"],
+            "execution_mode": payload["execution_mode"],
             "description": payload["description"].strip(),
         }
 
