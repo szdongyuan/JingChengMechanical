@@ -402,6 +402,26 @@ def test_operator_cannot_activate_ai_tool_management_via_programmatic_tab_change
     assert window.top_button_dict["AI工具管理"].isChecked() is False
 
 
+def test_engineer_cannot_activate_data_management_via_programmatic_tab_change(
+    qapp,
+    monkeypatch,
+):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    window.current_user_role = "工程师"
+    window.set_role()
+
+    data_management_index = window.tab_names.index("数据管理")
+
+    window.tab.setCurrentIndex(data_management_index)
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == 0
+    assert window.top_button_dict["测试"].isChecked() is True
+    assert window.top_button_dict["数据管理"].isChecked() is False
+
+
 def test_switching_away_from_ai_tool_management_is_blocked_when_confirm_leave_rejects(
     qapp,
     monkeypatch,
@@ -425,6 +445,36 @@ def test_switching_away_from_ai_tool_management_is_blocked_when_confirm_leave_re
     qapp.processEvents()
 
     assert window.tab.currentIndex() == ai_index
+    assert window.ai_tool_management_module.confirm_leave_calls == 1
+
+
+def test_programmatic_tab_change_reverts_when_ai_tool_management_rejects_leave(
+    qapp,
+    monkeypatch,
+):
+    window, _ = _make_window(
+        monkeypatch,
+        ai_tool_management_cls=_make_guarded_ai_tool_management_module(False),
+    )
+    _show(window, qapp)
+
+    window.current_user_role = "管理员"
+    window.set_role()
+
+    ai_index = window.tab_names.index("AI工具管理")
+    hardware_index = window.tab_names.index("硬件")
+
+    window.top_button_dict["AI工具管理"].click()
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == ai_index
+
+    window.tab.setCurrentIndex(hardware_index)
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == ai_index
+    assert window.top_button_dict["AI工具管理"].isChecked() is True
+    assert window.top_button_dict["硬件"].isChecked() is False
     assert window.ai_tool_management_module.confirm_leave_calls == 1
 
 
