@@ -66,6 +66,8 @@ class AiToolManagementModule(QWidget):
         self._current_toolchain_id: str | None = None
         self._editor_snapshot: dict | None = None
         self._is_new_draft = False
+        self._suspend_editor_change_tracking = False
+        self._suppress_selection_change = False
         self._init_ui()
         self._connect_signals()
         self._refresh_list()
@@ -185,6 +187,13 @@ class AiToolManagementModule(QWidget):
         self.btn_delete.clicked.connect(self._on_delete)
         self.btn_save.clicked.connect(self._on_save)
         self.toolchain_list.currentItemChanged.connect(self._on_item_changed)
+        self.ed_toolchain_id.textChanged.connect(self._on_editor_changed)
+        self.ed_display_name.textChanged.connect(self._on_editor_changed)
+        self.ed_version.textChanged.connect(self._on_editor_changed)
+        self.ed_entrypoint.textChanged.connect(self._on_editor_changed)
+        self.spin_timeout.textChanged.connect(self._on_editor_changed)
+        self.chk_enabled.toggled.connect(self._on_editor_changed)
+        self.txt_description.textChanged.connect(self._on_editor_changed)
 
     def _refresh_list(self, selected_toolchain_id: str | None = None):
         rows = sorted(
@@ -217,6 +226,36 @@ class AiToolManagementModule(QWidget):
             self._update_action_state()
 
     @staticmethod
+    def _empty_draft_payload() -> dict:
+        return {
+            "toolchain_id": "",
+            "display_name": "",
+            "version": "",
+            "entrypoint": "",
+            "default_timeout_ms": 30000,
+            "enabled": True,
+            "description": "",
+        }
+
+    @classmethod
+    def _normalize_editor_payload(cls, row: dict | None) -> dict:
+        payload = cls._empty_draft_payload()
+        if row is None:
+            return payload
+        payload.update(
+            {
+                "toolchain_id": row.get("toolchain_id", ""),
+                "display_name": row.get("display_name", ""),
+                "version": row.get("version", ""),
+                "entrypoint": row.get("entrypoint", ""),
+                "default_timeout_ms": int(row.get("default_timeout_ms") or 0),
+                "enabled": bool(row.get("enabled", True)),
+                "description": row.get("description", ""),
+            }
+        )
+        return payload
+
+    @staticmethod
     def _format_list_text(row: dict) -> str:
         version = row.get("version") or "-"
         text = f'{row["display_name"]} ({version}) - {row["toolchain_id"]}'
@@ -232,58 +271,89 @@ class AiToolManagementModule(QWidget):
                 return
 
     def _on_item_changed(self, current: QListWidgetItem | None, _previous):
+        if self._suppress_selection_change:
+            return
         if current is None:
             self._update_action_state()
             return
         toolchain_id = current.data(Qt.ItemDataRole.UserRole)
-        row = self._toolchain_rows.get(toolchain_id)
-        if row is None:
+        if toolchain_id == self._current_toolchain_id and not self._is_new_draft:
             self._update_action_state()
             return
+        if not self._resolve_pending_editor_action("switch"):
+            self._restore_selection()
+            return
+        row = self._toolchain_rows.get(toolchain_id)
+        if row is None:
+            self._restore_selection()
+            self._update_action_state()
+            return
+        self._set_selection_by_toolchain_id(toolchain_id)
         self._load_toolchain(row)
 
     def _load_toolchain(self, row: dict):
         self._current_toolchain_id = row["toolchain_id"]
         self._is_new_draft = False
-        self._editor_snapshot = dict(row)
-        self._set_editor_payload(row)
+        self._editor_snapshot = self._normalize_editor_payload(row)
+        self._set_editor_payload(self._editor_snapshot)
         self.empty_label.setVisible(False)
         self.detail.setVisible(True)
         self._update_action_state()
 
     def _set_editor_payload(self, row: dict):
-        self.ed_toolchain_id.setText(row.get("toolchain_id", ""))
-        self.ed_display_name.setText(row.get("display_name", ""))
-        self.ed_version.setText(row.get("version", ""))
-        self.ed_entrypoint.setPlainText(row.get("entrypoint", ""))
-        self.spin_timeout.setValue(int(row.get("default_timeout_ms") or 0))
-        self.chk_enabled.setChecked(bool(row.get("enabled", True)))
-        self.txt_description.setPlainText(row.get("description", ""))
+        self._suspend_editor_change_tracking = True
+        try:
+            self.ed_toolchain_id.setText(row.get("toolchain_id", ""))
+            self.ed_display_name.setText(row.get("display_name", ""))
+            self.ed_version.setText(row.get("version", ""))
+            self.ed_entrypoint.setPlainText(row.get("entrypoint", ""))
+            self.spin_timeout.setValue(int(row.get("default_timeout_ms") or 0))
+            self.chk_enabled.setChecked(bool(row.get("enabled", True)))
+            self.txt_description.setPlainText(row.get("description", ""))
+        finally:
+            self._suspend_editor_change_tracking = False
 
     def _clear_editor(self):
-        self.ed_toolchain_id.clear()
-        self.ed_display_name.clear()
-        self.ed_version.clear()
-        self.ed_entrypoint.clear()
-        self.spin_timeout.setValue(30000)
-        self.chk_enabled.setChecked(True)
-        self.txt_description.clear()
+        self._set_editor_payload(self._empty_draft_payload())
 
     def _on_new(self):
+        if not self._resolve_pending_editor_action("new"):
+            return
         self._current_toolchain_id = None
-        self._editor_snapshot = None
+        self._editor_snapshot = self._empty_draft_payload()
         self._is_new_draft = True
-        self.toolchain_list.blockSignals(True)
-        self.toolchain_list.setCurrentRow(-1)
-        self.toolchain_list.clearSelection()
-        self.toolchain_list.blockSignals(False)
+        self._clear_selection()
         self._clear_editor()
         self.empty_label.setVisible(False)
         self.detail.setVisible(True)
         self._update_action_state()
 
     def _on_delete(self):
-        return
+        toolchain_id = self._current_toolchain_id
+        if toolchain_id is None:
+            return
+        if not self._resolve_pending_editor_action("delete"):
+            return
+        toolchain_id = self._current_toolchain_id
+        if toolchain_id is None:
+            return
+        row = self._toolchain_rows.get(toolchain_id)
+        if row is None:
+            return
+        bindings = self.services.ai_service.list_toolchain_bindings(toolchain_id)
+        if not self._confirm_delete(row, bindings):
+            return
+        try:
+            self.services.ai_service.delete_toolchain(toolchain_id)
+        except Exception as exc:
+            QMessageBox.warning(self, "删除失败", str(exc))
+            return
+
+        self._current_toolchain_id = None
+        self._editor_snapshot = None
+        self._is_new_draft = False
+        self._refresh_list()
+        self._emit_ai_toolchains_changed()
 
     def _collect_payload(self) -> dict:
         return {
@@ -310,6 +380,9 @@ class AiToolManagementModule(QWidget):
             raise ValueError("工具链标识已存在")
 
     def _on_save(self):
+        self._save_current_editor()
+
+    def _save_current_editor(self) -> bool:
         payload = self._collect_payload()
         try:
             self._validate_payload(payload)
@@ -319,21 +392,141 @@ class AiToolManagementModule(QWidget):
             )
         except ValueError as exc:
             QMessageBox.warning(self, "保存失败", str(exc))
-            return
+            return False
         except Exception as exc:
             QMessageBox.warning(self, "保存失败", str(exc))
-            return
+            return False
 
         self._current_toolchain_id = saved_toolchain_id
+        self._editor_snapshot = dict(payload)
         self._is_new_draft = False
         self._refresh_list(selected_toolchain_id=saved_toolchain_id)
+        self._emit_ai_toolchains_changed()
+        return True
+
+    def _emit_ai_toolchains_changed(self):
         ai_toolchains_changed = getattr(self.services.bus, "ai_toolchains_changed", None)
         if ai_toolchains_changed is not None:
             ai_toolchains_changed.emit()
 
+    def _on_editor_changed(self, *_args):
+        if self._suspend_editor_change_tracking:
+            return
+        self._update_action_state()
+
+    def _has_active_editor(self) -> bool:
+        return self._is_new_draft or self._current_toolchain_id is not None
+
+    def _is_dirty(self) -> bool:
+        if not self._has_active_editor():
+            return False
+        snapshot = self._editor_snapshot or self._empty_draft_payload()
+        return self._collect_payload() != snapshot
+
+    def _clear_selection(self):
+        self._suppress_selection_change = True
+        try:
+            self.toolchain_list.setCurrentRow(-1)
+            self.toolchain_list.clearSelection()
+        finally:
+            self._suppress_selection_change = False
+
+    def _restore_selection(self):
+        if self._current_toolchain_id is None:
+            self._clear_selection()
+            self._update_action_state()
+            return
+        self._set_selection_by_toolchain_id(self._current_toolchain_id)
+        self._update_action_state()
+
+    def _set_selection_by_toolchain_id(self, toolchain_id: str):
+        self._suppress_selection_change = True
+        try:
+            for index in range(self.toolchain_list.count()):
+                item = self.toolchain_list.item(index)
+                if item.data(Qt.ItemDataRole.UserRole) == toolchain_id:
+                    self.toolchain_list.setCurrentRow(index)
+                    return
+            self.toolchain_list.setCurrentRow(-1)
+            self.toolchain_list.clearSelection()
+        finally:
+            self._suppress_selection_change = False
+
+    def _restore_snapshot(self):
+        if not self._has_active_editor():
+            return
+        snapshot = self._editor_snapshot or self._empty_draft_payload()
+        self._set_editor_payload(snapshot)
+
+    def _prompt_unsaved_changes(self, action: str) -> str:
+        action_label = {
+            "switch": "切换工具链",
+            "new": "新建工具链",
+            "delete": "删除当前工具链",
+            "leave": "离开当前页面",
+        }.get(action, "继续当前操作")
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("未保存的更改")
+        dialog.setText(f"当前编辑内容尚未保存。是否先保存后再{action_label}？")
+        save_button = dialog.addButton("保存并继续", QMessageBox.ButtonRole.AcceptRole)
+        discard_button = dialog.addButton("放弃更改", QMessageBox.ButtonRole.DestructiveRole)
+        cancel_button = dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(save_button)
+        dialog.setEscapeButton(cancel_button)
+        dialog.exec()
+        clicked = dialog.clickedButton()
+        if clicked is save_button:
+            return "save"
+        if clicked is discard_button:
+            return "discard"
+        return "cancel"
+
+    def _resolve_pending_editor_action(self, action: str) -> bool:
+        if not self._is_dirty():
+            return True
+
+        decision = self._prompt_unsaved_changes(action)
+        if decision == "cancel":
+            return False
+        if decision == "discard":
+            self._restore_snapshot()
+            return True
+        if decision == "save":
+            return self._save_current_editor()
+        return False
+
+    def _build_delete_confirmation_text(self, row: dict, bindings: list[dict]) -> str:
+        version = row.get("version") or "-"
+        identity = f'{row.get("display_name") or row["toolchain_id"]} ({version}) / {row["toolchain_id"]}'
+        lines = [f"确定要删除 AI 工具链「{identity}」吗？"]
+        if bindings:
+            lines.append(f"受影响配置（{len(bindings)} 个）:")
+            for binding in bindings:
+                config_name = binding.get("config_name") or str(binding.get("config_id"))
+                config_id = binding.get("config_id")
+                if config_id is None:
+                    lines.append(f"- {config_name}")
+                else:
+                    lines.append(f"- {config_name} (ID: {config_id})")
+        else:
+            lines.append("受影响配置：0 个")
+        lines.append("删除后这些配置将解除绑定，需要重新选择 AI 工具链。")
+        return "\n".join(lines)
+
+    def _confirm_delete(self, row: dict, bindings: list[dict]) -> bool:
+        reply = QMessageBox.question(
+            self,
+            "确认删除",
+            self._build_delete_confirmation_text(row, bindings),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
     def _update_action_state(self):
-        # Delete remains deferred until Task 4 adds the actual mediation flow.
-        self.btn_delete.setEnabled(False)
+        can_delete = self.toolchain_list.currentItem() is not None and not self._is_new_draft
+        self.btn_delete.setEnabled(can_delete)
+        self.btn_save.setEnabled(self._has_active_editor())
 
     def confirm_leave(self) -> bool:
-        return True
+        return self._resolve_pending_editor_action("leave")

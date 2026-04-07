@@ -8,7 +8,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from ui.modules.ai_tool_management import AiToolManagementModule
 
@@ -32,11 +32,21 @@ class _AiServiceStub:
         self,
         *,
         toolchains: list[dict] | None = None,
+        bindings_by_toolchain: dict[str, list[dict]] | None = None,
         save_error: Exception | None = None,
+        delete_error: Exception | None = None,
     ):
         self.toolchains = [dict(toolchain) for toolchain in (toolchains or [])]
+        self.bindings_by_toolchain = {
+            toolchain_id: [dict(binding) for binding in bindings]
+            for toolchain_id, bindings in (bindings_by_toolchain or {}).items()
+        }
         self.save_error = save_error
+        self.delete_error = delete_error
         self.saved_requests: list[tuple[str | None, dict]] = []
+        self.list_binding_requests: list[str] = []
+        self.deleted_toolchain_ids: list[str] = []
+        self.cleared_binding_rows: list[dict] = []
 
     def list_toolchains(self) -> list[dict]:
         return [dict(toolchain) for toolchain in self.toolchains]
@@ -55,6 +65,33 @@ class _AiServiceStub:
                 for toolchain in self.toolchains
             ]
         return payload["toolchain_id"]
+
+    def list_toolchain_bindings(self, toolchain_id: str) -> list[dict]:
+        self.list_binding_requests.append(toolchain_id)
+        return [
+            dict(binding)
+            for binding in self.bindings_by_toolchain.get(toolchain_id, [])
+        ]
+
+    def delete_toolchain(self, toolchain_id: str) -> None:
+        self.deleted_toolchain_ids.append(toolchain_id)
+        if self.delete_error is not None:
+            raise self.delete_error
+        bindings = self.bindings_by_toolchain.get(toolchain_id, [])
+        self.cleared_binding_rows = [
+            {
+                **binding,
+                "enabled": False,
+                "toolchain_id": None,
+            }
+            for binding in bindings
+        ]
+        self.bindings_by_toolchain[toolchain_id] = []
+        self.toolchains = [
+            toolchain
+            for toolchain in self.toolchains
+            if toolchain["toolchain_id"] != toolchain_id
+        ]
 
 
 def _toolchain(toolchain_id: str, **updates) -> dict:
@@ -84,13 +121,20 @@ def qapp():
 def _make_module(
     *,
     toolchains: list[dict] | None = None,
+    bindings_by_toolchain: dict[str, list[dict]] | None = None,
     save_error: Exception | None = None,
+    delete_error: Exception | None = None,
 ):
     bus = SimpleNamespace(
         ai_toolchains_changed=_SignalStub(),
         status=_SignalStub(),
     )
-    service = _AiServiceStub(toolchains=toolchains, save_error=save_error)
+    service = _AiServiceStub(
+        toolchains=toolchains,
+        bindings_by_toolchain=bindings_by_toolchain,
+        save_error=save_error,
+        delete_error=delete_error,
+    )
     services = SimpleNamespace(ai_service=service, bus=bus)
     module = AiToolManagementModule(services)
     return module, service, bus
@@ -99,6 +143,13 @@ def _make_module(
 def _show(module: AiToolManagementModule, qapp):
     module.show()
     qapp.processEvents()
+
+
+def _current_toolchain_item_id(module: AiToolManagementModule) -> str | None:
+    current = module.toolchain_list.currentItem()
+    if current is None:
+        return None
+    return current.data(Qt.ItemDataRole.UserRole)
 
 
 def test_module_shows_empty_state_when_no_toolchains_exist(qapp):
@@ -289,7 +340,38 @@ def test_edit_save_updates_existing_row_without_creating_duplicate(qapp):
     assert module.toolchain_list.item(0).text().endswith("[禁用]")
 
 
-def test_delete_button_remains_disabled_when_row_is_selected(qapp):
+def test_edit_enabled_persists_false_then_true_and_emits_refresh(qapp):
+    module, service, bus = _make_module(
+        toolchains=[
+            _toolchain(
+                "motor-ai",
+                enabled=True,
+            )
+        ]
+    )
+    _show(module, qapp)
+
+    module._select_toolchain("motor-ai")
+    qapp.processEvents()
+
+    module.chk_enabled.setChecked(False)
+    module.btn_save.click()
+
+    module.chk_enabled.setChecked(True)
+    module.btn_save.click()
+
+    assert [saved["enabled"] for _original_id, saved in service.saved_requests[-2:]] == [
+        False,
+        True,
+    ]
+    assert bus.ai_toolchains_changed.emissions == [
+        ((), {}),
+        ((), {}),
+    ]
+    assert module.toolchain_list.item(0).text().endswith("[禁用]") is False
+
+
+def test_delete_button_is_enabled_when_row_is_selected(qapp):
     module, _service, _bus = _make_module(toolchains=[_toolchain("motor-ai")])
     _show(module, qapp)
 
@@ -297,7 +379,7 @@ def test_delete_button_remains_disabled_when_row_is_selected(qapp):
     qapp.processEvents()
 
     assert module.toolchain_list.currentItem() is not None
-    assert module.btn_delete.isEnabled() is False
+    assert module.btn_delete.isEnabled() is True
 
 
 def test_delete_button_is_disabled_for_new_draft_without_selection(qapp):
@@ -350,3 +432,272 @@ def test_local_validation_shows_warning_before_service_write(
 
     assert warnings == [("保存失败", expected_message)]
     assert service.saved_requests == []
+
+
+def test_delete_dirty_row_prompts_unsaved_changes_before_delete_confirmation(
+    qapp,
+    monkeypatch,
+):
+    module, service, _bus = _make_module(toolchains=[_toolchain("motor-ai")])
+    _show(module, qapp)
+
+    module._select_toolchain("motor-ai")
+    qapp.processEvents()
+    module.ed_display_name.setText("Edited Name")
+    qapp.processEvents()
+
+    flow = []
+    monkeypatch.setattr(
+        module,
+        "_prompt_unsaved_changes",
+        lambda action: flow.append(("dirty", action)) or "discard",
+    )
+    monkeypatch.setattr(
+        module,
+        "_confirm_delete",
+        lambda *args, **kwargs: flow.append(("delete", None)) or False,
+    )
+
+    module.btn_delete.click()
+
+    assert flow == [("dirty", "delete"), ("delete", None)]
+    assert service.deleted_toolchain_ids == []
+
+
+def test_row_switch_cancel_keeps_current_dirty_editor(qapp, monkeypatch):
+    module, _service, _bus = _make_module(
+        toolchains=[_toolchain("a"), _toolchain("b")]
+    )
+    _show(module, qapp)
+
+    module._select_toolchain("a")
+    qapp.processEvents()
+    module.ed_display_name.setText("Unsaved")
+    qapp.processEvents()
+    monkeypatch.setattr(module, "_prompt_unsaved_changes", lambda action: "cancel")
+
+    module._select_toolchain("b")
+    qapp.processEvents()
+
+    assert module._current_toolchain_id == "a"
+    assert _current_toolchain_item_id(module) == "a"
+    assert module.ed_display_name.text() == "Unsaved"
+
+
+def test_new_while_dirty_cancel_keeps_current_editor(qapp, monkeypatch):
+    module, _service, _bus = _make_module(
+        toolchains=[_toolchain("a"), _toolchain("b")]
+    )
+    _show(module, qapp)
+
+    module._select_toolchain("a")
+    qapp.processEvents()
+    module.ed_display_name.setText("Unsaved")
+    qapp.processEvents()
+    calls = []
+    monkeypatch.setattr(
+        module,
+        "_prompt_unsaved_changes",
+        lambda action: calls.append(action) or "cancel",
+    )
+
+    module.btn_new.click()
+    qapp.processEvents()
+
+    assert calls == ["new"]
+    assert module._current_toolchain_id == "a"
+    assert module._is_new_draft is False
+    assert _current_toolchain_item_id(module) == "a"
+    assert module.ed_display_name.text() == "Unsaved"
+
+
+def test_confirm_leave_returns_false_when_unsaved_prompt_cancels(qapp, monkeypatch):
+    module, _service, _bus = _make_module(toolchains=[_toolchain("motor-ai")])
+    _show(module, qapp)
+
+    module._select_toolchain("motor-ai")
+    qapp.processEvents()
+    module.ed_display_name.setText("Unsaved")
+    qapp.processEvents()
+    actions = []
+    monkeypatch.setattr(
+        module,
+        "_prompt_unsaved_changes",
+        lambda action: actions.append(action) or "cancel",
+    )
+
+    result = module.confirm_leave()
+
+    assert result is False
+    assert actions == ["leave"]
+    assert module.ed_display_name.text() == "Unsaved"
+    assert module._current_toolchain_id == "motor-ai"
+
+
+def test_delete_confirmation_dialog_includes_identity_binding_names_count_and_warning(
+    qapp,
+    monkeypatch,
+):
+    question_calls = []
+    monkeypatch.setattr(
+        "ui.modules.ai_tool_management.QMessageBox.question",
+        lambda *args: question_calls.append(args[1:3])
+        or QMessageBox.StandardButton.No,
+    )
+    module, service, _bus = _make_module(
+        toolchains=[
+            _toolchain(
+                "motor-ai",
+                display_name="Motor AI",
+                version="2.0",
+            )
+        ],
+        bindings_by_toolchain={
+            "motor-ai": [
+                {"config_id": 7, "config_name": "Cfg Alpha"},
+                {"config_id": 9, "config_name": "Cfg Beta"},
+            ]
+        },
+    )
+    _show(module, qapp)
+
+    module._select_toolchain("motor-ai")
+    qapp.processEvents()
+
+    module.btn_delete.click()
+
+    assert service.list_binding_requests == ["motor-ai"]
+    assert len(question_calls) == 1
+    title, text = question_calls[0]
+    assert title == "确认删除"
+    assert "Motor AI" in text
+    assert "motor-ai" in text
+    assert "2" in text
+    assert "Cfg Alpha" in text
+    assert "Cfg Beta" in text
+    assert "解除绑定" in text
+    assert service.deleted_toolchain_ids == []
+
+
+def test_delete_clears_bindings_and_emits_ai_toolchains_changed(qapp, monkeypatch):
+    monkeypatch.setattr(
+        "ui.modules.ai_tool_management.QMessageBox.question",
+        lambda *args: args[3].Yes,
+    )
+    module, service, bus = _make_module(
+        toolchains=[
+            _toolchain("motor-ai"),
+            _toolchain("other-ai"),
+        ],
+        bindings_by_toolchain={
+            "motor-ai": [
+                {
+                    "config_id": 1,
+                    "config_name": "Cfg One",
+                    "toolchain_id": "motor-ai",
+                    "enabled": True,
+                    "timeout_ms": 3000,
+                    "params_json": '{"mode":"a"}',
+                    "score_threshold": 0.8,
+                },
+                {
+                    "config_id": 2,
+                    "config_name": "Cfg Two",
+                    "toolchain_id": "motor-ai",
+                    "enabled": False,
+                    "timeout_ms": 4000,
+                    "params_json": '{"mode":"b"}',
+                    "score_threshold": None,
+                },
+            ]
+        },
+    )
+    _show(module, qapp)
+
+    module._select_toolchain("motor-ai")
+    qapp.processEvents()
+
+    module.btn_delete.click()
+    qapp.processEvents()
+
+    assert service.deleted_toolchain_ids == ["motor-ai"]
+    assert service.list_binding_requests == ["motor-ai"]
+    assert service.cleared_binding_rows == [
+        {
+            "config_id": 1,
+            "config_name": "Cfg One",
+            "toolchain_id": None,
+            "enabled": False,
+            "timeout_ms": 3000,
+            "params_json": '{"mode":"a"}',
+            "score_threshold": 0.8,
+        },
+        {
+            "config_id": 2,
+            "config_name": "Cfg Two",
+            "toolchain_id": None,
+            "enabled": False,
+            "timeout_ms": 4000,
+            "params_json": '{"mode":"b"}',
+            "score_threshold": None,
+        },
+    ]
+    assert bus.ai_toolchains_changed.emissions == [((), {})]
+    assert _current_toolchain_item_id(module) == "other-ai"
+    assert service.bindings_by_toolchain["motor-ai"] == []
+
+
+@pytest.mark.parametrize(
+    "pending_action",
+    ["switch", "delete", "leave"],
+)
+def test_save_failure_during_unsaved_prompt_blocks_pending_action_and_keeps_editor_visible(
+    qapp,
+    monkeypatch,
+    pending_action,
+):
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.ai_tool_management.QMessageBox.warning",
+        lambda *args: warnings.append(args[1:3]),
+    )
+    module, service, _bus = _make_module(
+        toolchains=[_toolchain("a"), _toolchain("b")]
+    )
+    _show(module, qapp)
+
+    module._select_toolchain("a")
+    qapp.processEvents()
+    module.ed_display_name.setText("")
+    qapp.processEvents()
+    monkeypatch.setattr(module, "_prompt_unsaved_changes", lambda action: "save")
+    delete_calls = []
+    monkeypatch.setattr(
+        module,
+        "_confirm_delete",
+        lambda *args, **kwargs: delete_calls.append("confirm") or True,
+    )
+
+    if pending_action == "switch":
+        result = None
+        module._select_toolchain("b")
+        qapp.processEvents()
+    elif pending_action == "delete":
+        result = None
+        module.btn_delete.click()
+        qapp.processEvents()
+    else:
+        result = module.confirm_leave()
+
+    if pending_action == "leave":
+        assert result is False
+    else:
+        assert result is None
+    assert warnings == [("保存失败", "工具链标识、显示名称和入口命令不能为空")]
+    assert service.saved_requests == []
+    assert service.deleted_toolchain_ids == []
+    assert delete_calls == []
+    assert module.detail.isVisible() is True
+    assert module._current_toolchain_id == "a"
+    assert _current_toolchain_item_id(module) == "a"
+    assert module.ed_display_name.text() == ""
