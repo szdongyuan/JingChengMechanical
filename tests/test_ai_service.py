@@ -5,6 +5,7 @@ import math
 
 import pytest
 
+from model.ai_execution_table import AiExecutionTable
 from model.test_config_table import TestConfigTable as ConfigTable
 from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable as AiBindingTable
@@ -27,7 +28,21 @@ def _recreate_legacy_ai_binding_table(db):
             updated_time TEXT NOT NULL DEFAULT ''
         )
         """
-    )
+        )
+
+
+def _toolchain_payload(**overrides):
+    payload = {
+        "toolchain_id": "motor-ai",
+        "display_name": "Motor AI",
+        "version": "1.0",
+        "entrypoint": "python motor_ai.py",
+        "default_timeout_ms": 30000,
+        "enabled": True,
+        "description": "",
+    }
+    payload.update(overrides)
+    return payload
 
 
 @pytest.fixture
@@ -58,6 +73,19 @@ class TestToolchainRegistry:
         assert result[0]["toolchain_id"] == "motor-ai"
         assert result[0]["display_name"] == "Motor AI"
 
+    def test_list_toolchains_includes_disabled_rows(self, ai_service, toolchain):
+        AiToolchainTable.create(
+            toolchain_id="disabled-tc",
+            display_name="Disabled",
+            version="2",
+            entrypoint="disabled.py",
+            enabled=False,
+        )
+
+        result = ai_service.list_toolchains()
+
+        assert [row["toolchain_id"] for row in result] == ["disabled-tc", "motor-ai"]
+
     def test_list_excludes_disabled(self, ai_service):
         AiToolchainTable.create(
             toolchain_id="disabled-tc",
@@ -75,6 +103,371 @@ class TestToolchainRegistry:
 
     def test_get_toolchain_not_found(self, ai_service):
         assert ai_service.get_toolchain("nonexistent") is None
+
+    def test_list_toolchain_bindings_returns_config_id_and_name(
+        self, ai_service, config, toolchain
+    ):
+        second = ConfigTable.create(config_name="Cfg2")
+        AiBindingTable.create(config=config, toolchain=toolchain, enabled=True)
+        AiBindingTable.create(config=second, toolchain=toolchain, enabled=False)
+
+        result = ai_service.list_toolchain_bindings("motor-ai")
+
+        assert result == [
+            {"config_id": config.config_id, "config_name": "Cfg1"},
+            {"config_id": second.config_id, "config_name": "Cfg2"},
+        ]
+
+
+class TestToolchainRegistryCrud:
+    def test_save_toolchain_creates_new_row_and_forces_supported_runtime_fields(
+        self, ai_service
+    ):
+        ai_service.save_toolchain(
+            None,
+            _toolchain_payload(
+                toolchain_id="new-ai",
+                display_name="New AI",
+                protocol_version=999,
+                execution_mode="streaming",
+            ),
+        )
+
+        row = AiToolchainTable.get_by_id("new-ai")
+
+        assert row.display_name == "New AI"
+        assert row.protocol_version == 1
+        assert row.execution_mode == "oneshot_process"
+
+    def test_save_toolchain_create_trims_persisted_string_fields(self, ai_service):
+        ai_service.save_toolchain(
+            None,
+            _toolchain_payload(
+                toolchain_id="  trimmed-ai  ",
+                display_name="  Trimmed AI  ",
+                version="  2.0  ",
+                entrypoint="  python trimmed.py  ",
+                description="  trimmed description  ",
+            ),
+        )
+
+        row = AiToolchainTable.get_by_id("trimmed-ai")
+
+        assert row.display_name == "Trimmed AI"
+        assert row.version == "2.0"
+        assert row.entrypoint == "python trimmed.py"
+        assert row.description == "trimmed description"
+
+    def test_save_toolchain_updates_existing_row_and_forces_supported_runtime_fields(
+        self, ai_service, toolchain
+    ):
+        toolchain.protocol_version = 9
+        toolchain.execution_mode = "daemon"
+        toolchain.save()
+
+        ai_service.save_toolchain(
+            "motor-ai",
+            _toolchain_payload(
+                display_name="Updated Motor AI",
+                version="2.0",
+                entrypoint="python motor_ai_v2.py",
+                default_timeout_ms=45000,
+                protocol_version=999,
+                execution_mode="streaming",
+            ),
+        )
+
+        row = AiToolchainTable.get_by_id("motor-ai")
+
+        assert row.display_name == "Updated Motor AI"
+        assert row.version == "2.0"
+        assert row.entrypoint == "python motor_ai_v2.py"
+        assert row.default_timeout_ms == 45000
+        assert row.protocol_version == 1
+        assert row.execution_mode == "oneshot_process"
+
+    def test_save_toolchain_update_trims_persisted_string_fields(
+        self, ai_service, toolchain
+    ):
+        ai_service.save_toolchain(
+            "motor-ai",
+            _toolchain_payload(
+                toolchain_id="  motor-ai  ",
+                display_name="  Updated Motor AI  ",
+                version="  2.1  ",
+                entrypoint="  python updated.py  ",
+                description="  updated description  ",
+            ),
+        )
+
+        row = AiToolchainTable.get_by_id("motor-ai")
+
+        assert row.display_name == "Updated Motor AI"
+        assert row.version == "2.1"
+        assert row.entrypoint == "python updated.py"
+        assert row.description == "updated description"
+
+    @pytest.mark.parametrize("toolchain_id", ["", "   "])
+    def test_save_toolchain_rejects_empty_toolchain_id(self, ai_service, toolchain_id):
+        with pytest.raises(ValueError, match="toolchain_id"):
+            ai_service.save_toolchain(
+                None,
+                _toolchain_payload(toolchain_id=toolchain_id),
+            )
+
+    def test_save_toolchain_rejects_duplicate_toolchain_id(self, ai_service, toolchain):
+        with pytest.raises(ValueError, match="toolchain_id"):
+            ai_service.save_toolchain(
+                None,
+                _toolchain_payload(toolchain_id=" motor-ai "),
+            )
+
+    @pytest.mark.parametrize(
+        ("field_name", "value"),
+        [("display_name", ""), ("display_name", "   "), ("entrypoint", ""), ("entrypoint", "   ")],
+    )
+    def test_save_toolchain_rejects_empty_required_text_fields(
+        self, ai_service, field_name, value
+    ):
+        with pytest.raises(ValueError, match=field_name):
+            ai_service.save_toolchain(
+                None,
+                _toolchain_payload(**{field_name: value}),
+            )
+
+    @pytest.mark.parametrize("timeout_ms", [0, -1])
+    def test_save_toolchain_rejects_non_positive_default_timeout_ms(
+        self, ai_service, timeout_ms
+    ):
+        with pytest.raises(ValueError, match="default_timeout_ms"):
+            ai_service.save_toolchain(
+                None,
+                _toolchain_payload(default_timeout_ms=timeout_ms),
+            )
+
+    def test_save_toolchain_rename_rewrites_all_binding_rows_but_not_history(
+        self, ai_service, config, toolchain
+    ):
+        toolchain.created_time = "2024-01-01 00:00:00"
+        toolchain.updated_time = "2024-01-01 00:00:01"
+        toolchain.save()
+        original_created_time = toolchain.created_time
+        second = ConfigTable.create(config_name="Cfg2")
+        first_binding = AiBindingTable.create(
+            config=config,
+            toolchain=toolchain,
+            enabled=True,
+            timeout_ms=1234,
+            params_json='{"a": 1}',
+            score_threshold=0.8,
+            updated_time="binding-before-1",
+        )
+        second_binding = AiBindingTable.create(
+            config=second,
+            toolchain=toolchain,
+            enabled=False,
+            timeout_ms=4321,
+            params_json='{"b": 2}',
+            score_threshold=None,
+            updated_time="binding-before-2",
+        )
+        AiExecutionTable.create(
+            request_id="req-1",
+            test_run_id="run-1",
+            config_id=config.config_id,
+            toolchain_id="motor-ai",
+            module_status="success",
+            is_current_effective=True,
+        )
+
+        ai_service.save_toolchain(
+            "motor-ai",
+            _toolchain_payload(
+                toolchain_id="motor-ai-v2",
+                version="2.0",
+                entrypoint="python motor_ai_v2.py",
+                default_timeout_ms=45000,
+                description="updated",
+            ),
+        )
+
+        renamed_toolchain = AiToolchainTable.get_by_id("motor-ai-v2")
+        assert renamed_toolchain.created_time == original_created_time
+        assert renamed_toolchain.updated_time != "2024-01-01 00:00:01"
+        rebound_first = AiBindingTable.get_by_id(first_binding.binding_id)
+        rebound_second = AiBindingTable.get_by_id(second_binding.binding_id)
+        assert rebound_first.binding_id == first_binding.binding_id
+        assert rebound_first.config_id == config.config_id
+        assert rebound_first.toolchain_id == "motor-ai-v2"
+        assert rebound_first.timeout_ms == 1234
+        assert rebound_first.params_json == '{"a": 1}'
+        assert rebound_first.score_threshold == 0.8
+        assert rebound_first.updated_time != "binding-before-1"
+        assert rebound_second.binding_id == second_binding.binding_id
+        assert rebound_second.config_id == second.config_id
+        assert rebound_second.toolchain_id == "motor-ai-v2"
+        assert rebound_second.timeout_ms == 4321
+        assert rebound_second.params_json == '{"b": 2}'
+        assert rebound_second.score_threshold is None
+        assert rebound_second.updated_time != "binding-before-2"
+        assert AiExecutionTable.get_by_id("req-1").toolchain_id == "motor-ai"
+
+    def test_save_toolchain_rename_rolls_back_when_binding_rewrite_fails(
+        self, ai_service, config, toolchain, monkeypatch
+    ):
+        AiBindingTable.create(
+            config=config,
+            toolchain=toolchain,
+            enabled=True,
+            timeout_ms=1234,
+            params_json='{"a": 1}',
+            score_threshold=0.8,
+        )
+
+        def _raise_after_partial_rewrite(old_id, new_id):
+            (
+                AiBindingTable.update(toolchain=new_id)
+                .where(AiBindingTable.toolchain == old_id)
+                .execute()
+            )
+            raise RuntimeError("boom during rename")
+
+        monkeypatch.setattr(
+            ai_service,
+            "_rewrite_toolchain_binding_ids",
+            _raise_after_partial_rewrite,
+            raising=False,
+        )
+
+        with pytest.raises(RuntimeError, match="boom during rename"):
+            ai_service.save_toolchain(
+                "motor-ai",
+                _toolchain_payload(toolchain_id="motor-ai-v2"),
+            )
+
+        assert AiToolchainTable.get_by_id("motor-ai").display_name == "Motor AI"
+        assert ai_service.get_toolchain("motor-ai-v2") is None
+        binding = AiBindingTable.get(AiBindingTable.config == config.config_id)
+        assert binding.toolchain_id == "motor-ai"
+
+    def test_delete_toolchain_clears_affected_bindings_before_deleting_row(
+        self, ai_service, config, toolchain
+    ):
+        second = ConfigTable.create(config_name="Cfg2")
+        first_binding = AiBindingTable.create(
+            config=config,
+            toolchain=toolchain,
+            enabled=True,
+            timeout_ms=1234,
+            params_json='{"a": 1}',
+            score_threshold=0.8,
+            updated_time="delete-before-1",
+        )
+        second_binding = AiBindingTable.create(
+            config=second,
+            toolchain=toolchain,
+            enabled=False,
+            timeout_ms=4321,
+            params_json='{"b": 2}',
+            score_threshold=None,
+            updated_time="delete-before-2",
+        )
+        AiExecutionTable.create(
+            request_id="req-2",
+            test_run_id="run-2",
+            config_id=config.config_id,
+            toolchain_id="motor-ai",
+            module_status="success",
+            is_current_effective=True,
+        )
+
+        ai_service.delete_toolchain("motor-ai")
+
+        assert ai_service.get_toolchain("motor-ai") is None
+        cleared_first = AiBindingTable.get_by_id(first_binding.binding_id)
+        cleared_second = AiBindingTable.get_by_id(second_binding.binding_id)
+        assert cleared_first.binding_id == first_binding.binding_id
+        assert cleared_first.config_id == config.config_id
+        assert cleared_first.enabled is False
+        assert cleared_first.toolchain_id is None
+        assert cleared_first.timeout_ms == 1234
+        assert cleared_first.params_json == '{"a": 1}'
+        assert cleared_first.score_threshold == 0.8
+        assert cleared_first.updated_time != "delete-before-1"
+        assert cleared_second.binding_id == second_binding.binding_id
+        assert cleared_second.config_id == second.config_id
+        assert cleared_second.enabled is False
+        assert cleared_second.toolchain_id is None
+        assert cleared_second.timeout_ms == 4321
+        assert cleared_second.params_json == '{"b": 2}'
+        assert cleared_second.score_threshold is None
+        assert cleared_second.updated_time != "delete-before-2"
+        assert AiExecutionTable.get_by_id("req-2").toolchain_id == "motor-ai"
+
+    def test_delete_toolchain_rolls_back_when_binding_clear_fails(
+        self, ai_service, config, toolchain, monkeypatch
+    ):
+        AiBindingTable.create(
+            config=config,
+            toolchain=toolchain,
+            enabled=True,
+            timeout_ms=1234,
+            params_json='{"a": 1}',
+            score_threshold=0.8,
+        )
+
+        def _raise_after_partial_clear(toolchain_id):
+            (
+                AiBindingTable.update(enabled=False, toolchain=None)
+                .where(AiBindingTable.toolchain == toolchain_id)
+                .execute()
+            )
+            raise RuntimeError("boom during clear")
+
+        monkeypatch.setattr(
+            ai_service,
+            "_clear_toolchain_bindings",
+            _raise_after_partial_clear,
+            raising=False,
+        )
+
+        with pytest.raises(RuntimeError, match="boom during clear"):
+            ai_service.delete_toolchain("motor-ai")
+
+        assert ai_service.get_toolchain("motor-ai") is not None
+        binding = AiBindingTable.get(AiBindingTable.config == config.config_id)
+        assert binding.enabled is True
+        assert binding.toolchain_id == "motor-ai"
+
+    def test_delete_toolchain_rolls_back_when_row_delete_fails(
+        self, ai_service, config, toolchain, monkeypatch
+    ):
+        AiBindingTable.create(
+            config=config,
+            toolchain=toolchain,
+            enabled=True,
+            timeout_ms=1234,
+            params_json='{"a": 1}',
+            score_threshold=0.8,
+        )
+
+        def _raise_before_delete(toolchain_id):
+            raise RuntimeError("boom during delete")
+
+        monkeypatch.setattr(
+            ai_service,
+            "_delete_toolchain_row",
+            _raise_before_delete,
+            raising=False,
+        )
+
+        with pytest.raises(RuntimeError, match="boom during delete"):
+            ai_service.delete_toolchain("motor-ai")
+
+        assert ai_service.get_toolchain("motor-ai") is not None
+        binding = AiBindingTable.get(AiBindingTable.config == config.config_id)
+        assert binding.enabled is True
+        assert binding.toolchain_id == "motor-ai"
 
 
 class TestBindingResolver:

@@ -21,6 +21,10 @@ from peewee import DoesNotExist
 from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable
 from model.ai_execution_table import AiExecutionTable
+from model.test_config_table import TestConfigTable
+
+_SUPPORTED_PROTOCOL_VERSION = 1
+_SUPPORTED_EXECUTION_MODE = "oneshot_process"
 
 _TZ8 = timezone(timedelta(hours=8))
 
@@ -40,6 +44,14 @@ class AiService:
 
     # ── Toolchain Registry ──────────────────────────────────
 
+    def list_toolchains(self) -> list[dict]:
+        rows = (
+            AiToolchainTable.select()
+            .order_by(AiToolchainTable.toolchain_id)
+            .dicts()
+        )
+        return list(rows)
+
     def list_enabled_toolchains(self) -> list[dict]:
         rows = (
             AiToolchainTable.select()
@@ -54,6 +66,152 @@ class AiService:
             return AiToolchainTable.get_by_id(toolchain_id)
         except DoesNotExist:
             return None
+
+    def list_toolchain_bindings(self, toolchain_id: str) -> list[dict]:
+        rows = (
+            TestConfigAiBindingTable.select(
+                TestConfigAiBindingTable.config_id.alias("config_id"),
+                TestConfigTable.config_name,
+            )
+            .join(TestConfigTable)
+            .where(TestConfigAiBindingTable.toolchain == toolchain_id)
+            .order_by(TestConfigAiBindingTable.config_id)
+            .dicts()
+        )
+        return list(rows)
+
+    def _normalize_toolchain_text(
+        self, value: str | None, field_name: str, *, allow_empty: bool
+    ) -> str:
+        if value is None:
+            value = ""
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
+        normalized = value.strip()
+        if not allow_empty and not normalized:
+            raise ValueError(f"{field_name} must not be empty")
+        return normalized
+
+    def _normalize_toolchain_payload(
+        self, original_toolchain_id: str | None, data: dict
+    ) -> dict:
+        normalized = {
+            "toolchain_id": self._normalize_toolchain_text(
+                data.get("toolchain_id"), "toolchain_id", allow_empty=False
+            ),
+            "display_name": self._normalize_toolchain_text(
+                data.get("display_name"), "display_name", allow_empty=False
+            ),
+            "version": self._normalize_toolchain_text(
+                data.get("version", ""), "version", allow_empty=True
+            ),
+            "entrypoint": self._normalize_toolchain_text(
+                data.get("entrypoint"), "entrypoint", allow_empty=False
+            ),
+            "description": self._normalize_toolchain_text(
+                data.get("description", ""), "description", allow_empty=True
+            ),
+            "enabled": bool(data.get("enabled", True)),
+            "protocol_version": _SUPPORTED_PROTOCOL_VERSION,
+            "execution_mode": _SUPPORTED_EXECUTION_MODE,
+        }
+
+        timeout_ms = data.get("default_timeout_ms")
+        if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms <= 0:
+            raise ValueError("default_timeout_ms must be a positive integer")
+        normalized["default_timeout_ms"] = timeout_ms
+
+        existing = self.get_toolchain(normalized["toolchain_id"])
+        if existing is not None and normalized["toolchain_id"] != original_toolchain_id:
+            raise ValueError("toolchain_id must be unique")
+
+        return normalized
+
+    def _rewrite_toolchain_binding_ids(self, old_toolchain_id: str, new_toolchain_id: str):
+        from consts.time_consts import now_str
+
+        (
+            TestConfigAiBindingTable.update(
+                toolchain=new_toolchain_id,
+                updated_time=now_str(),
+            )
+            .where(TestConfigAiBindingTable.toolchain == old_toolchain_id)
+            .execute()
+        )
+
+    def _clear_toolchain_bindings(self, toolchain_id: str):
+        from consts.time_consts import now_str
+
+        (
+            TestConfigAiBindingTable.update(
+                enabled=False,
+                toolchain=None,
+                updated_time=now_str(),
+            )
+            .where(TestConfigAiBindingTable.toolchain == toolchain_id)
+            .execute()
+        )
+
+    def _delete_toolchain_row(self, toolchain_id: str):
+        (
+            AiToolchainTable.delete()
+            .where(AiToolchainTable.toolchain_id == toolchain_id)
+            .execute()
+        )
+
+    def save_toolchain(self, original_toolchain_id: str | None, data: dict) -> str:
+        from consts.time_consts import now_str
+
+        database = AiToolchainTable._meta.database
+        normalized = self._normalize_toolchain_payload(original_toolchain_id, data)
+        timestamp = now_str()
+
+        with database.atomic():
+            if original_toolchain_id is None:
+                row = AiToolchainTable.create(
+                    **normalized,
+                    created_time=timestamp,
+                    updated_time=timestamp,
+                )
+                return row.toolchain_id
+
+            existing = self.get_toolchain(original_toolchain_id)
+            if existing is None:
+                raise ValueError("toolchain_id not found")
+
+            if normalized["toolchain_id"] == original_toolchain_id:
+                existing.display_name = normalized["display_name"]
+                existing.version = normalized["version"]
+                existing.entrypoint = normalized["entrypoint"]
+                existing.default_timeout_ms = normalized["default_timeout_ms"]
+                existing.enabled = normalized["enabled"]
+                existing.description = normalized["description"]
+                existing.protocol_version = _SUPPORTED_PROTOCOL_VERSION
+                existing.execution_mode = _SUPPORTED_EXECUTION_MODE
+                existing.updated_time = timestamp
+                existing.save()
+                return existing.toolchain_id
+
+            AiToolchainTable.create(
+                **normalized,
+                created_time=existing.created_time,
+                updated_time=timestamp,
+            )
+            self._rewrite_toolchain_binding_ids(
+                original_toolchain_id, normalized["toolchain_id"]
+            )
+            self._delete_toolchain_row(original_toolchain_id)
+            return normalized["toolchain_id"]
+
+    def delete_toolchain(self, toolchain_id: str):
+        database = AiToolchainTable._meta.database
+
+        with database.atomic():
+            existing = self.get_toolchain(toolchain_id)
+            if existing is None:
+                raise ValueError("toolchain_id not found")
+            self._clear_toolchain_bindings(toolchain_id)
+            self._delete_toolchain_row(toolchain_id)
 
     # ── Binding Resolver ────────────────────────────────────
 
