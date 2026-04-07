@@ -177,7 +177,7 @@ def test_selecting_row_populates_editor_and_runtime_helper_text(qapp):
 
 
 def test_large_timeout_value_loads_and_saves_without_clamping(qapp):
-    large_timeout_ms = 900001
+    large_timeout_ms = 5_000_000_000
     module, service, bus = _make_module(
         toolchains=[
             _toolchain(
@@ -199,6 +199,38 @@ def test_large_timeout_value_loads_and_saves_without_clamping(qapp):
     assert saved_original_id == "motor-ai"
     assert saved["default_timeout_ms"] == large_timeout_ms
     assert bus.ai_toolchains_changed.emissions == [((), {})]
+
+
+def test_left_list_labels_include_toolchain_id_for_duplicate_name_version_rows(qapp):
+    module, _service, _bus = _make_module(
+        toolchains=[
+            _toolchain(
+                "motor-ai-a",
+                display_name="Motor AI",
+                version="1.0",
+            ),
+            _toolchain(
+                "motor-ai-b",
+                display_name="Motor AI",
+                version="1.0",
+            ),
+        ]
+    )
+    _show(module, qapp)
+
+    item_texts = [
+        module.toolchain_list.item(index).text()
+        for index in range(module.toolchain_list.count())
+    ]
+
+    assert len(item_texts) == 2
+    assert item_texts[0] != item_texts[1]
+    assert "Motor AI" in item_texts[0]
+    assert "1.0" in item_texts[0]
+    assert "motor-ai-a" in item_texts[0]
+    assert "Motor AI" in item_texts[1]
+    assert "1.0" in item_texts[1]
+    assert "motor-ai-b" in item_texts[1]
 
 
 def test_save_new_toolchain_emits_registry_refresh(qapp):

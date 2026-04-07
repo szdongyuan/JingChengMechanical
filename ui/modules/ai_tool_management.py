@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QRegularExpression, Qt
+from PyQt6.QtGui import QRegularExpressionValidator
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -13,10 +14,46 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
-    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
+
+
+class _LargeIntegerEditor(QLineEdit):
+    """QLineEdit-based integer editor that supports values beyond QSpinBox limits."""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._suffix = ""
+        self._single_step = 1
+        self._minimum = 0
+        self.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.setValidator(
+            QRegularExpressionValidator(
+                QRegularExpression(r"(?:0|[1-9]\d*)?"),
+                self,
+            )
+        )
+
+    def setRange(self, minimum: int, _maximum: int):
+        self._minimum = minimum
+
+    def setSingleStep(self, step: int):
+        self._single_step = step
+
+    def setSuffix(self, suffix: str):
+        self._suffix = suffix
+        if suffix:
+            self.setPlaceholderText(suffix.strip())
+
+    def setValue(self, value: int):
+        self.setText(str(int(value)))
+
+    def value(self) -> int:
+        text = self.text().strip()
+        if not text:
+            return max(self._minimum, 0)
+        return int(text)
 
 
 class AiToolManagementModule(QWidget):
@@ -108,7 +145,7 @@ class AiToolManagementModule(QWidget):
         self.ed_entrypoint.setMaximumHeight(80)
         form_lay.addRow("入口命令", self.ed_entrypoint)
 
-        self.spin_timeout = QSpinBox()
+        self.spin_timeout = _LargeIntegerEditor()
         self.spin_timeout.setRange(0, 2_147_483_647)
         self.spin_timeout.setSingleStep(1000)
         self.spin_timeout.setSuffix(" ms")
@@ -182,7 +219,7 @@ class AiToolManagementModule(QWidget):
     @staticmethod
     def _format_list_text(row: dict) -> str:
         version = row.get("version") or "-"
-        text = f'{row["display_name"]} ({version})'
+        text = f'{row["display_name"]} ({version}) - {row["toolchain_id"]}'
         if not row.get("enabled", True):
             text = f"{text} [禁用]"
         return text
