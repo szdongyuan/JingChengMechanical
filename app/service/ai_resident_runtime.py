@@ -15,6 +15,10 @@ from itertools import count
 _STDERR_BUFFER_LIMIT = 64 * 1024
 _EXCERPT_LIMIT = 2000
 _SHUTDOWN_GRACE_SECONDS = 2.0
+_IDLE_STDERR_SETTLE_SECONDS = 0.05
+_IDLE_STDERR_SETTLE_POLL_SECONDS = 0.005
+_POST_RESPONSE_STDOUT_SETTLE_SECONDS = 0.02
+_POST_RESPONSE_STDOUT_SETTLE_POLL_SECONDS = 0.005
 _TZ8 = timezone(timedelta(hours=8))
 _STDOUT_EOF = object()
 
@@ -36,6 +40,15 @@ def _split_entrypoint(entrypoint: str) -> list[str]:
     return shlex.split(entrypoint)
 
 
+def _slice_utf8_text(text: str, start_offset: int) -> str:
+    if start_offset <= 0:
+        return text
+    encoded = text.encode("utf-8")
+    if start_offset >= len(encoded):
+        return ""
+    return encoded[start_offset:].decode("utf-8", errors="ignore")
+
+
 @dataclass
 class _ResidentProcess:
     toolchain_id: str
@@ -52,10 +65,12 @@ class _ResidentProcess:
     stderr_buffer_char_count: int = 0
     request_active: bool = False
     idle_stdout_invalidated: bool = False
+    idle_stderr_invalidated: bool = False
     active_stdout_line_count: int = 0
     active_stdout_protocol_error: str | None = None
+    active_stderr_start_position: int | None = None
     active_stderr_excerpt: str = ""
-    active_stderr_capture: bool = False
+    completed_request_count: int = 0
 
     def push_stdout_item(self, item: object) -> None:
         with self.stdout_condition:
@@ -76,22 +91,32 @@ class _ResidentProcess:
         with self.stdout_condition:
             return bool(self.stdout_items)
 
-    def begin_request(self) -> None:
+    def begin_request(self) -> bool:
+        if self._settle_idle_stderr_before_reuse():
+            return False
         with self.state_lock:
+            if self.idle_stdout_invalidated or self.idle_stderr_invalidated:
+                return False
             self.request_active = True
             self.active_stdout_line_count = 0
             self.active_stdout_protocol_error = None
         with self.stderr_lock:
+            self.active_stderr_start_position = self.stderr_total_bytes
             self.active_stderr_excerpt = ""
-            self.active_stderr_capture = True
+        return True
 
-    def finish_request(self) -> str | None:
+    def finish_request(self) -> tuple[str | None, str]:
         with self.state_lock:
             self.request_active = False
+            self.completed_request_count += 1
             violation = self.active_stdout_protocol_error
             self.active_stdout_line_count = 0
             self.active_stdout_protocol_error = None
-        return violation
+        with self.stderr_lock:
+            excerpt = self.active_stderr_excerpt
+            self.active_stderr_start_position = None
+            self.active_stderr_excerpt = ""
+        return violation, excerpt
 
     def route_stdout_line(self, line: str) -> None:
         with self.state_lock:
@@ -116,27 +141,75 @@ class _ResidentProcess:
         if self.has_pending_stdout():
             return True
         with self.state_lock:
-            return self.idle_stdout_invalidated
+            return self.idle_stdout_invalidated or self.idle_stderr_invalidated
+
+    def active_stdout_state(self) -> tuple[int, str | None]:
+        with self.state_lock:
+            return self.active_stdout_line_count, self.active_stdout_protocol_error
+
+    def mark_idle_stderr_invalidated(self) -> None:
+        with self.state_lock:
+            self.idle_stderr_invalidated = True
+
+    def _settle_idle_stderr_before_reuse(self) -> bool:
+        with self.state_lock:
+            if self.completed_request_count <= 0:
+                return False
+            if self.idle_stdout_invalidated or self.idle_stderr_invalidated:
+                return self.idle_stderr_invalidated
+        baseline = self.stderr_position()
+        deadline = time.monotonic() + _IDLE_STDERR_SETTLE_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(_IDLE_STDERR_SETTLE_POLL_SECONDS, remaining))
+            current = self.stderr_position()
+            if current != baseline:
+                self.mark_idle_stderr_invalidated()
+                return True
 
     def stderr_position(self) -> int:
         with self.stderr_lock:
             return self.stderr_total_bytes
 
-    def append_stderr(self, chunk: str) -> None:
-        if not chunk:
-            return
+    def reserve_stderr_chunk(self, chunk: str) -> tuple[int, int]:
         chunk_bytes = len(chunk.encode("utf-8"))
-        if chunk_bytes <= 0:
-            return
         with self.stderr_lock:
             start = self.stderr_total_bytes
-            self.stderr_chunks.append((start, chunk, chunk_bytes))
             self.stderr_total_bytes += chunk_bytes
+            return start, chunk_bytes
+
+    def append_stderr(self, chunk: str, *, start_position: int | None = None) -> None:
+        if not chunk:
+            return
+        if start_position is None:
+            start_position, chunk_bytes = self.reserve_stderr_chunk(chunk)
+        else:
+            chunk_bytes = len(chunk.encode("utf-8"))
+        if chunk_bytes <= 0:
+            return
+        mark_idle_stderr = False
+        with self.stderr_lock:
+            self.stderr_chunks.append((start_position, chunk, chunk_bytes))
             self.stderr_buffer_byte_count += chunk_bytes
             self.stderr_buffer_char_count += len(chunk)
-            if self.active_stderr_capture and len(self.active_stderr_excerpt) < _EXCERPT_LIMIT:
+            active_start = self.active_stderr_start_position
+            if active_start is None:
+                mark_idle_stderr = True
+            if (
+                active_start is not None
+                and len(self.active_stderr_excerpt) < _EXCERPT_LIMIT
+                and (start_position + chunk_bytes) > active_start
+            ):
+                excerpt_chunk = chunk
+                if start_position < active_start:
+                    excerpt_chunk = _slice_utf8_text(
+                        chunk,
+                        active_start - start_position,
+                    )
                 remaining = _EXCERPT_LIMIT - len(self.active_stderr_excerpt)
-                self.active_stderr_excerpt += chunk[:remaining]
+                self.active_stderr_excerpt += excerpt_chunk[:remaining]
             while (
                 self.stderr_buffer_byte_count > _STDERR_BUFFER_LIMIT
                 and self.stderr_chunks
@@ -144,6 +217,8 @@ class _ResidentProcess:
                 _, chunk_text, buffered_bytes = self.stderr_chunks.popleft()
                 self.stderr_buffer_byte_count -= buffered_bytes
                 self.stderr_buffer_char_count -= len(chunk_text)
+        if mark_idle_stderr:
+            self.mark_idle_stderr_invalidated()
 
     def stderr_since(self, position: int) -> str:
         with self.stderr_lock:
@@ -152,15 +227,15 @@ class _ResidentProcess:
                 chunk_end = chunk_start + chunk_bytes
                 if chunk_end <= position:
                     continue
+                if chunk_start < position:
+                    parts.append(_slice_utf8_text(chunk_text, position - chunk_start))
+                    continue
                 parts.append(chunk_text)
             return "".join(parts)
 
-    def capture_stderr_excerpt(self) -> str:
+    def current_stderr_excerpt(self) -> str:
         with self.stderr_lock:
-            excerpt = self.active_stderr_excerpt
-            self.active_stderr_capture = False
-            self.active_stderr_excerpt = ""
-            return excerpt
+            return self.active_stderr_excerpt
 
 
 class ResidentToolchainRuntime:
@@ -197,10 +272,16 @@ class ResidentToolchainRuntime:
             )
 
         cached_process: _ResidentProcess | None = None
+        request_started = False
+        request_finished = False
         try:
             deadline = started_mono + (timeout_ms / 1000.0)
-            cached_process, _ = self._acquire_process(toolchain_id, entrypoint)
-            cached_process.begin_request()
+            while True:
+                cached_process, _ = self._acquire_process(toolchain_id, entrypoint)
+                if cached_process.begin_request():
+                    break
+                self._discard_cached_process(toolchain_id, cached_process)
+            request_started = True
             try:
                 self._send_request(
                     cached_process=cached_process,
@@ -212,30 +293,116 @@ class ResidentToolchainRuntime:
                     self._remaining_timeout(deadline)
                 )
             except TimeoutError:
-                cached_process.finish_request()
+                _, stderr_excerpt = self._complete_request(cached_process)
+                request_finished = True
                 self._discard_cached_process(toolchain_id, cached_process)
                 return self._build_result(
                     status="timeout",
                     started_at=started_at,
                     started_mono=started_mono,
                     error_summary="Process timed out",
-                    stderr_excerpt=self._capture_stderr_excerpt(cached_process),
+                    stderr_excerpt=stderr_excerpt,
                     process_instance_id=cached_process.instance_id,
                 )
             except (BrokenPipeError, OSError, ValueError) as exc:
-                cached_process.finish_request()
+                _, stderr_excerpt = self._complete_request(cached_process)
+                request_finished = True
                 self._discard_cached_process(toolchain_id, cached_process)
                 return self._build_result(
                     status="process_error",
                     started_at=started_at,
                     started_mono=started_mono,
                     error_summary=str(exc)[:_EXCERPT_LIMIT],
-                    stderr_excerpt=self._capture_stderr_excerpt(cached_process),
+                    stderr_excerpt=stderr_excerpt,
                     process_instance_id=cached_process.instance_id,
                 )
 
             parsed = self._parse_response_line(response_line)
-            active_stdout_error = cached_process.finish_request()
+            discard_after_completion = False
+
+            if parsed["status"] == "process_exit":
+                discard_after_completion = True
+                result = self._build_result(
+                    status="process_error",
+                    started_at=started_at,
+                    started_mono=started_mono,
+                    error_summary="Resident process exited unexpectedly",
+                    stderr_excerpt="",
+                    process_instance_id=cached_process.instance_id,
+                )
+            elif parsed["status"] == "protocol_error":
+                discard_after_completion = True
+                result = self._build_result(
+                    status="protocol_error",
+                    started_at=started_at,
+                    started_mono=started_mono,
+                    error_summary=parsed["error"],
+                    stderr_excerpt="",
+                    process_instance_id=cached_process.instance_id,
+                )
+            else:
+                envelope = parsed["envelope"]
+                outer_request_id = envelope.get("request_id")
+                if not isinstance(outer_request_id, str) or outer_request_id != request_id:
+                    discard_after_completion = True
+                    result = self._build_result(
+                        status="protocol_error",
+                        started_at=started_at,
+                        started_mono=started_mono,
+                        error_summary="Resident response request_id mismatch",
+                        stderr_excerpt="",
+                        process_instance_id=cached_process.instance_id,
+                    )
+                else:
+                    message_type = envelope.get("message_type")
+                    if message_type == "error":
+                        error_summary = envelope.get("error")
+                        if not isinstance(error_summary, str) or not error_summary:
+                            error_summary = "Resident process reported an error"
+                        discard_after_completion = True
+                        result = self._build_result(
+                            status="process_error",
+                            started_at=started_at,
+                            started_mono=started_mono,
+                            error_summary=error_summary,
+                            stderr_excerpt="",
+                            process_instance_id=cached_process.instance_id,
+                        )
+                    elif message_type != "result":
+                        discard_after_completion = True
+                        result = self._build_result(
+                            status="protocol_error",
+                            started_at=started_at,
+                            started_mono=started_mono,
+                            error_summary="Resident response message_type is invalid",
+                            stderr_excerpt="",
+                            process_instance_id=cached_process.instance_id,
+                        )
+                    else:
+                        response_payload = envelope.get("response")
+                        if not isinstance(response_payload, dict):
+                            discard_after_completion = True
+                            result = self._build_result(
+                                status="protocol_error",
+                                started_at=started_at,
+                                started_mono=started_mono,
+                                error_summary="Resident response is missing response",
+                                stderr_excerpt="",
+                                process_instance_id=cached_process.instance_id,
+                            )
+                        else:
+                            result = self._build_result(
+                                status="success",
+                                started_at=started_at,
+                                started_mono=started_mono,
+                                response_payload=response_payload,
+                                stderr_excerpt="",
+                                process_instance_id=cached_process.instance_id,
+                            )
+
+            active_stdout_error, stderr_excerpt = self._complete_request(cached_process)
+            request_finished = True
+            result["stderr_excerpt"] = stderr_excerpt
             if active_stdout_error is not None:
                 self._discard_cached_process(toolchain_id, cached_process)
                 return self._build_result(
@@ -243,95 +410,19 @@ class ResidentToolchainRuntime:
                     started_at=started_at,
                     started_mono=started_mono,
                     error_summary=self._build_extra_stdout_error(active_stdout_error),
-                    stderr_excerpt=self._capture_stderr_excerpt(cached_process),
+                    stderr_excerpt=stderr_excerpt,
                     process_instance_id=cached_process.instance_id,
                 )
-            if parsed["status"] == "process_exit":
+            if discard_after_completion:
                 self._discard_cached_process(toolchain_id, cached_process)
-                return self._build_result(
-                    status="process_error",
-                    started_at=started_at,
-                    started_mono=started_mono,
-                    error_summary="Resident process exited unexpectedly",
-                    stderr_excerpt=self._capture_stderr_excerpt(cached_process),
-                    process_instance_id=cached_process.instance_id,
-                )
-
-            if parsed["status"] == "protocol_error":
-                self._discard_cached_process(toolchain_id, cached_process)
-                return self._build_result(
-                    status="protocol_error",
-                    started_at=started_at,
-                    started_mono=started_mono,
-                    error_summary=parsed["error"],
-                    stderr_excerpt=self._capture_stderr_excerpt(cached_process),
-                    process_instance_id=cached_process.instance_id,
-                )
-
-            envelope = parsed["envelope"]
-            outer_request_id = envelope.get("request_id")
-            if not isinstance(outer_request_id, str) or outer_request_id != request_id:
-                self._discard_cached_process(toolchain_id, cached_process)
-                return self._build_result(
-                    status="protocol_error",
-                    started_at=started_at,
-                    started_mono=started_mono,
-                    error_summary="Resident response request_id mismatch",
-                    stderr_excerpt=self._capture_stderr_excerpt(cached_process),
-                    process_instance_id=cached_process.instance_id,
-                )
-
-            message_type = envelope.get("message_type")
-            if message_type == "error":
-                error_summary = envelope.get("error")
-                if not isinstance(error_summary, str) or not error_summary:
-                    error_summary = "Resident process reported an error"
-                self._discard_cached_process(toolchain_id, cached_process)
-                return self._build_result(
-                    status="process_error",
-                    started_at=started_at,
-                    started_mono=started_mono,
-                    error_summary=error_summary,
-                    stderr_excerpt=self._capture_stderr_excerpt(cached_process),
-                    process_instance_id=cached_process.instance_id,
-                )
-
-            if message_type != "result":
-                self._discard_cached_process(toolchain_id, cached_process)
-                return self._build_result(
-                    status="protocol_error",
-                    started_at=started_at,
-                    started_mono=started_mono,
-                    error_summary="Resident response message_type is invalid",
-                    stderr_excerpt=self._capture_stderr_excerpt(cached_process),
-                    process_instance_id=cached_process.instance_id,
-                )
-
-            response_payload = envelope.get("response")
-            if not isinstance(response_payload, dict):
-                self._discard_cached_process(toolchain_id, cached_process)
-                return self._build_result(
-                    status="protocol_error",
-                    started_at=started_at,
-                    started_mono=started_mono,
-                    error_summary="Resident response is missing response",
-                    stderr_excerpt=self._capture_stderr_excerpt(cached_process),
-                    process_instance_id=cached_process.instance_id,
-                )
-
-            return self._build_result(
-                status="success",
-                started_at=started_at,
-                started_mono=started_mono,
-                response_payload=response_payload,
-                stderr_excerpt=self._capture_stderr_excerpt(cached_process),
-                process_instance_id=cached_process.instance_id,
-            )
+            return result
         except Exception as exc:
             if cached_process is not None:
-                cached_process.finish_request()
+                if request_started and not request_finished:
+                    _, stderr_excerpt = self._complete_request(cached_process)
+                else:
+                    stderr_excerpt = ""
                 self._discard_cached_process(toolchain_id, cached_process)
-                stderr_excerpt = self._capture_stderr_excerpt(cached_process)
                 process_instance_id = cached_process.instance_id
             else:
                 stderr_excerpt = ""
@@ -457,7 +548,8 @@ class ResidentToolchainRuntime:
                 chunk = cached_process.process.stderr.read(1)
                 if not chunk:
                     break
-                cached_process.append_stderr(chunk)
+                start_position, _ = cached_process.reserve_stderr_chunk(chunk)
+                cached_process.append_stderr(chunk, start_position=start_position)
         except Exception:
             return
 
@@ -510,13 +602,38 @@ class ResidentToolchainRuntime:
 
     def _capture_stderr_excerpt(self, cached_process: _ResidentProcess) -> str:
         last_seen = cached_process.stderr_position()
+        saw_post_response_growth = False
         for _ in range(10):
             time.sleep(0.01)
             current = cached_process.stderr_position()
             if current == last_seen:
                 break
+            saw_post_response_growth = True
             last_seen = current
-        return cached_process.capture_stderr_excerpt()
+        if saw_post_response_growth:
+            cached_process.mark_idle_stderr_invalidated()
+        return cached_process.current_stderr_excerpt()
+
+    def _capture_active_stdout_violation(self, cached_process: _ResidentProcess) -> None:
+        _, violation = cached_process.active_stdout_state()
+        if violation is not None:
+            return
+        deadline = time.monotonic() + _POST_RESPONSE_STDOUT_SETTLE_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(_POST_RESPONSE_STDOUT_SETTLE_POLL_SECONDS, remaining))
+            _, violation = cached_process.active_stdout_state()
+            if violation is not None:
+                return
+
+    def _complete_request(
+        self, cached_process: _ResidentProcess
+    ) -> tuple[str | None, str]:
+        self._capture_stderr_excerpt(cached_process)
+        self._capture_active_stdout_violation(cached_process)
+        return cached_process.finish_request()
 
     @staticmethod
     def _build_extra_stdout_error(extra_line: str) -> str:

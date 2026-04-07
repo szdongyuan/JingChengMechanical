@@ -20,6 +20,7 @@ import json
 import os
 import sys
 import time
+import threading
 import uuid
 from pathlib import Path
 
@@ -42,6 +43,14 @@ def write_stderr(text: str) -> None:
     if text:
         sys.stderr.write(text)
         sys.stderr.flush()
+
+
+def write_slow_stderr(text: str, repeat: int, delay_s: float, marker_file: str = "") -> None:
+    for _ in range(repeat):
+        write_stderr(text)
+        time.sleep(delay_s)
+    if marker_file:
+        Path(marker_file).write_text("written", encoding="utf-8")
 
 
 def build_response(request: dict) -> dict:
@@ -140,6 +149,42 @@ def handle_analyze(message: dict) -> None:
         )
         return
 
+    if behavior == "stderr_after_success":
+        emit_message(
+            {
+                "message_type": "result",
+                "request_id": request_id,
+                "response": build_response(request),
+            }
+        )
+        time.sleep(float(params.get("late_stderr_delay_s", 0.05)))
+        write_stderr(params.get("late_stderr_text", "late stderr"))
+        late_stderr_written_file = params.get("late_stderr_written_file")
+        if late_stderr_written_file:
+            Path(late_stderr_written_file).write_text("written", encoding="utf-8")
+        return
+
+    if behavior == "slow_stderr_after_success":
+        thread = threading.Thread(
+            target=write_slow_stderr,
+            args=(
+                params.get("late_stderr_text", "late stderr"),
+                int(params.get("late_stderr_repeat", 40)),
+                float(params.get("late_stderr_delay_s", 0.01)),
+                params.get("late_stderr_written_file", ""),
+            ),
+            daemon=True,
+        )
+        thread.start()
+        emit_message(
+            {
+                "message_type": "result",
+                "request_id": request_id,
+                "response": build_response(request),
+            }
+        )
+        return
+
     if behavior == "extra_stdout_after_success":
         emit_message(
             {
@@ -150,6 +195,20 @@ def handle_analyze(message: dict) -> None:
         )
         time.sleep(float(params.get("extra_stdout_delay_s", 0.05)))
         emit_text("idle stdout noise\\n")
+        return
+
+    if behavior == "extra_stdout_after_gate":
+        emit_message(
+            {
+                "message_type": "result",
+                "request_id": request_id,
+                "response": build_response(request),
+            }
+        )
+        release_file = Path(params["extra_stdout_release_file"])
+        while not release_file.exists():
+            time.sleep(0.01)
+        emit_text(params.get("extra_stdout_text", "unexpected extra stdout") + "\\n")
         return
 
     if behavior == "extra_stdout_during_active_request":
@@ -492,6 +551,58 @@ def test_idle_extra_stdout_invalidates_cache_before_next_reuse(
     assert second["process_instance_id"] != first["process_instance_id"]
 
 
+def test_idle_extra_stdout_arriving_between_reuse_and_begin_request_discards_before_reuse(
+    tmp_path: Path, runtime, monkeypatch
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    entrypoint = _entrypoint(script_path)
+    original_acquire_process = ai_resident_runtime.ResidentToolchainRuntime._acquire_process
+    reuse_gap_opened = threading.Event()
+    second_request_started = False
+
+    def delayed_reuse(self, toolchain_id: str, entrypoint: str):
+        nonlocal second_request_started
+        cached_process, created = original_acquire_process(self, toolchain_id, entrypoint)
+        if not created and not second_request_started:
+            second_request_started = True
+            reuse_gap_opened.set()
+            time.sleep(0.15)
+        return cached_process, created
+
+    monkeypatch.setattr(
+        ai_resident_runtime.ResidentToolchainRuntime,
+        "_acquire_process",
+        delayed_reuse,
+    )
+
+    first = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-1",
+        request_payload=_request_payload(
+            "req-1",
+            behavior="extra_stdout_after_success",
+            extra_stdout_delay_s=0.05,
+        ),
+        artifacts_dir=str(tmp_path / "artifacts-1"),
+        timeout_ms=1000,
+    )
+
+    second = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-2",
+        request_payload=_request_payload("req-2"),
+        artifacts_dir=str(tmp_path / "artifacts-2"),
+        timeout_ms=1000,
+    )
+
+    assert reuse_gap_opened.is_set()
+    assert first["module_status"] == "success"
+    assert second["module_status"] == "success"
+    assert second["process_instance_id"] != first["process_instance_id"]
+
+
 def test_stderr_capture_is_per_run_truncated_and_buffered(
     tmp_path: Path, runtime
 ):
@@ -575,22 +686,172 @@ def test_stderr_excerpt_keeps_first_2000_chars_even_after_buffer_eviction(
     assert result["stderr_excerpt"] == stderr_text[:2000]
 
 
-def test_extra_stdout_during_active_request_fails_current_run_with_protocol_error(
+def test_natural_late_stderr_from_previous_request_does_not_leak_into_next_run_excerpt(
+    tmp_path: Path, runtime
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    entrypoint = _entrypoint(script_path)
+
+    first = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-1",
+        request_payload=_request_payload(
+            "req-1",
+            behavior="slow_stderr_after_success",
+            late_stderr_text="FIRST|",
+            late_stderr_repeat=40,
+            late_stderr_delay_s=0.01,
+        ),
+        artifacts_dir=str(tmp_path / "artifacts-1"),
+        timeout_ms=2000,
+    )
+
+    second = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-2",
+        request_payload=_request_payload(
+            "req-2",
+            stderr_text="SECOND|",
+        ),
+        artifacts_dir=str(tmp_path / "artifacts-2"),
+        timeout_ms=2000,
+    )
+
+    assert first["module_status"] == "success"
+    assert second["module_status"] == "success"
+    assert second["stderr_excerpt"] == "SECOND|"
+    assert "FIRST|" not in second["stderr_excerpt"]
+
+
+def test_stale_idle_stderr_backlog_does_not_leak_into_next_run_excerpt(
     tmp_path: Path, runtime, monkeypatch
 ):
     script_path = _write_fake_resident_script(tmp_path)
     entrypoint = _entrypoint(script_path)
-    original_wait = ai_resident_runtime._ResidentProcess.wait_for_stdout_item
+    stale_text = "stale-idle-stderr"
+    release_stale_append = threading.Event()
+    stale_chunk_buffered = threading.Event()
+    stale_chunk_appended = threading.Event()
+    original_begin_request = ai_resident_runtime._ResidentProcess.begin_request
+    original_append_stderr = ai_resident_runtime._ResidentProcess.append_stderr
+    original_capture = ai_resident_runtime.ResidentToolchainRuntime._capture_stderr_excerpt
+    begin_request_calls = 0
+    capture_calls = 0
 
-    def delayed_wait(self, timeout_s: float):
-        item = original_wait(self, timeout_s)
-        time.sleep(0.05)
-        return item
+    def release_on_second_request(self) -> bool:
+        nonlocal begin_request_calls
+        started = original_begin_request(self)
+        if not started:
+            return started
+        begin_request_calls += 1
+        if begin_request_calls == 2:
+            release_stale_append.set()
+        return started
+
+    def drain_with_buffered_stale_chunk(self, cached_process) -> None:
+        try:
+            assert cached_process.process.stderr is not None
+            stale_chunk = cached_process.process.stderr.read(len(stale_text))
+            if stale_chunk:
+                stale_start, _ = cached_process.reserve_stderr_chunk(stale_chunk)
+                stale_chunk_buffered.set()
+                assert release_stale_append.wait(timeout=2)
+                original_append_stderr(
+                    cached_process,
+                    stale_chunk,
+                    start_position=stale_start,
+                )
+                stale_chunk_appended.set()
+            while True:
+                chunk = cached_process.process.stderr.read(1)
+                if not chunk:
+                    break
+                chunk_start, _ = cached_process.reserve_stderr_chunk(chunk)
+                original_append_stderr(
+                    cached_process,
+                    chunk,
+                    start_position=chunk_start,
+                )
+        except Exception:
+            return
+
+    def capture_after_stale_append(self, cached_process):
+        nonlocal capture_calls
+        capture_calls += 1
+        if capture_calls == 2:
+            assert stale_chunk_appended.wait(timeout=2)
+            time.sleep(0.05)
+        return original_capture(self, cached_process)
 
     monkeypatch.setattr(
         ai_resident_runtime._ResidentProcess,
-        "wait_for_stdout_item",
-        delayed_wait,
+        "begin_request",
+        release_on_second_request,
+    )
+    monkeypatch.setattr(
+        ai_resident_runtime.ResidentToolchainRuntime,
+        "_drain_stderr",
+        drain_with_buffered_stale_chunk,
+    )
+    monkeypatch.setattr(
+        ai_resident_runtime.ResidentToolchainRuntime,
+        "_capture_stderr_excerpt",
+        capture_after_stale_append,
+    )
+
+    first = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-1",
+        request_payload=_request_payload(
+            "req-1",
+            behavior="stderr_after_success",
+            late_stderr_text=stale_text,
+        ),
+        artifacts_dir=str(tmp_path / "artifacts-1"),
+        timeout_ms=1000,
+    )
+    assert stale_chunk_buffered.wait(timeout=2)
+
+    second = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-2",
+        request_payload=_request_payload(
+            "req-2",
+            stderr_text="fresh-run-stderr",
+        ),
+        artifacts_dir=str(tmp_path / "artifacts-2"),
+        timeout_ms=1000,
+    )
+
+    assert first["module_status"] == "success"
+    assert second["module_status"] == "success"
+    assert second["stderr_excerpt"] == "fresh-run-stderr"
+
+
+def test_extra_stdout_after_first_response_line_fails_current_run_with_protocol_error(
+    tmp_path: Path, runtime, monkeypatch
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    entrypoint = _entrypoint(script_path)
+    release_file = tmp_path / "release-extra-stdout.txt"
+    success_commit_opened = threading.Event()
+    original_build_result = ai_resident_runtime.ResidentToolchainRuntime._build_result
+
+    def delayed_build_result(*, status, **kwargs):
+        if status == "success":
+            success_commit_opened.set()
+            release_file.write_text("release", encoding="utf-8")
+            time.sleep(0.05)
+        return original_build_result(status=status, **kwargs)
+
+    monkeypatch.setattr(
+        ai_resident_runtime.ResidentToolchainRuntime,
+        "_build_result",
+        staticmethod(delayed_build_result),
     )
 
     result = runtime.analyze(
@@ -599,12 +860,14 @@ def test_extra_stdout_during_active_request_fails_current_run_with_protocol_erro
         request_id="req-1",
         request_payload=_request_payload(
             "req-1",
-            behavior="extra_stdout_during_active_request",
+            behavior="extra_stdout_after_gate",
+            extra_stdout_release_file=str(release_file),
         ),
         artifacts_dir=str(tmp_path / "artifacts"),
         timeout_ms=1000,
     )
 
+    assert success_commit_opened.is_set()
     assert result["module_status"] == "protocol_error"
     assert "unexpected extra stdout" in result["error_summary"]
     assert runtime.has_cached_process("tc-1") is False
