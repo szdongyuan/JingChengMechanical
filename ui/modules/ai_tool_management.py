@@ -109,7 +109,7 @@ class AiToolManagementModule(QWidget):
         form_lay.addRow("入口命令", self.ed_entrypoint)
 
         self.spin_timeout = QSpinBox()
-        self.spin_timeout.setRange(0, 600000)
+        self.spin_timeout.setRange(0, 2_147_483_647)
         self.spin_timeout.setSingleStep(1000)
         self.spin_timeout.setSuffix(" ms")
         self.spin_timeout.setValue(30000)

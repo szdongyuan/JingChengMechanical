@@ -176,6 +176,31 @@ def test_selecting_row_populates_editor_and_runtime_helper_text(qapp):
     assert "execution_mode = oneshot_process" in module.runtime_helper.text()
 
 
+def test_large_timeout_value_loads_and_saves_without_clamping(qapp):
+    large_timeout_ms = 900001
+    module, service, bus = _make_module(
+        toolchains=[
+            _toolchain(
+                "motor-ai",
+                default_timeout_ms=large_timeout_ms,
+            )
+        ]
+    )
+    _show(module, qapp)
+
+    module._select_toolchain("motor-ai")
+    qapp.processEvents()
+
+    assert module.spin_timeout.value() == large_timeout_ms
+
+    module.btn_save.click()
+
+    saved_original_id, saved = service.saved_requests[-1]
+    assert saved_original_id == "motor-ai"
+    assert saved["default_timeout_ms"] == large_timeout_ms
+    assert bus.ai_toolchains_changed.emissions == [((), {})]
+
+
 def test_save_new_toolchain_emits_registry_refresh(qapp):
     module, service, bus = _make_module(toolchains=[])
     _show(module, qapp)
