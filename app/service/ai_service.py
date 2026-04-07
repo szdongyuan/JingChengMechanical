@@ -7,7 +7,6 @@ and UI ViewModel adaptation.
 from __future__ import annotations
 
 import json
-import math
 import os
 import shlex
 import subprocess
@@ -237,7 +236,6 @@ class AiService:
             "timeout_ms": binding.timeout_ms,
             "effective_timeout_ms": effective_timeout,
             "params_json": binding.params_json,
-            "score_threshold": binding.score_threshold,
         }
 
     # ── Binding CRUD (for config UI) ────────────────────────
@@ -259,9 +257,8 @@ class AiService:
                 timeout_ms,
                 analysis_window_offset_ms,
                 params_json,
-                score_threshold,
                 updated_time
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 config_id,
@@ -270,7 +267,6 @@ class AiService:
                 data.get("timeout_ms"),
                 0,
                 data.get("params_json", "{}"),
-                data.get("score_threshold"),
                 now_str(),
             ),
         )
@@ -280,12 +276,7 @@ class AiService:
         """Create or update the AI binding for a test config.
         """
         if "score_threshold" in data:
-            st = data["score_threshold"]
-            if st is not None:
-                if isinstance(st, bool) or not isinstance(st, (int, float)):
-                    raise ValueError("score_threshold must be numeric (int or float, not bool)")
-                if math.isnan(st) or math.isinf(st):
-                    raise ValueError("score_threshold must be finite (not NaN or inf)")
+            raise ValueError("score_threshold has been removed")
 
         database = TestConfigAiBindingTable._meta.database
         with database.atomic():
@@ -297,8 +288,6 @@ class AiService:
                 existing.toolchain_id = data.get("toolchain_id")
                 existing.timeout_ms = data.get("timeout_ms")
                 existing.params_json = data.get("params_json", "{}")
-                if "score_threshold" in data:
-                    existing.score_threshold = data["score_threshold"]
                 from consts.time_consts import now_str
                 existing.updated_time = now_str()
                 existing.save()
@@ -312,7 +301,6 @@ class AiService:
                     toolchain=data.get("toolchain_id"),
                     timeout_ms=data.get("timeout_ms"),
                     params_json=data.get("params_json", "{}"),
-                    score_threshold=data.get("score_threshold"),
                 )
                 return row.binding_id
 

@@ -1,8 +1,6 @@
 """Tests for AiService — toolchain registry, binding resolution, binding CRUD."""
 from __future__ import annotations
 
-import math
-
 import pytest
 
 from model.ai_execution_table import AiExecutionTable
@@ -259,7 +257,6 @@ class TestToolchainRegistryCrud:
             enabled=True,
             timeout_ms=1234,
             params_json='{"a": 1}',
-            score_threshold=0.8,
             updated_time="binding-before-1",
         )
         second_binding = AiBindingTable.create(
@@ -268,7 +265,6 @@ class TestToolchainRegistryCrud:
             enabled=False,
             timeout_ms=4321,
             params_json='{"b": 2}',
-            score_threshold=None,
             updated_time="binding-before-2",
         )
         AiExecutionTable.create(
@@ -301,14 +297,12 @@ class TestToolchainRegistryCrud:
         assert rebound_first.toolchain_id == "motor-ai-v2"
         assert rebound_first.timeout_ms == 1234
         assert rebound_first.params_json == '{"a": 1}'
-        assert rebound_first.score_threshold == 0.8
         assert rebound_first.updated_time != "binding-before-1"
         assert rebound_second.binding_id == second_binding.binding_id
         assert rebound_second.config_id == second.config_id
         assert rebound_second.toolchain_id == "motor-ai-v2"
         assert rebound_second.timeout_ms == 4321
         assert rebound_second.params_json == '{"b": 2}'
-        assert rebound_second.score_threshold is None
         assert rebound_second.updated_time != "binding-before-2"
         assert AiExecutionTable.get_by_id("req-1").toolchain_id == "motor-ai"
 
@@ -321,7 +315,6 @@ class TestToolchainRegistryCrud:
             enabled=True,
             timeout_ms=1234,
             params_json='{"a": 1}',
-            score_threshold=0.8,
         )
 
         def _raise_after_partial_rewrite(old_id, new_id):
@@ -360,7 +353,6 @@ class TestToolchainRegistryCrud:
             enabled=True,
             timeout_ms=1234,
             params_json='{"a": 1}',
-            score_threshold=0.8,
             updated_time="delete-before-1",
         )
         second_binding = AiBindingTable.create(
@@ -369,7 +361,6 @@ class TestToolchainRegistryCrud:
             enabled=False,
             timeout_ms=4321,
             params_json='{"b": 2}',
-            score_threshold=None,
             updated_time="delete-before-2",
         )
         AiExecutionTable.create(
@@ -392,7 +383,6 @@ class TestToolchainRegistryCrud:
         assert cleared_first.toolchain_id is None
         assert cleared_first.timeout_ms == 1234
         assert cleared_first.params_json == '{"a": 1}'
-        assert cleared_first.score_threshold == 0.8
         assert cleared_first.updated_time != "delete-before-1"
         assert cleared_second.binding_id == second_binding.binding_id
         assert cleared_second.config_id == second.config_id
@@ -400,7 +390,6 @@ class TestToolchainRegistryCrud:
         assert cleared_second.toolchain_id is None
         assert cleared_second.timeout_ms == 4321
         assert cleared_second.params_json == '{"b": 2}'
-        assert cleared_second.score_threshold is None
         assert cleared_second.updated_time != "delete-before-2"
         assert AiExecutionTable.get_by_id("req-2").toolchain_id == "motor-ai"
 
@@ -413,7 +402,6 @@ class TestToolchainRegistryCrud:
             enabled=True,
             timeout_ms=1234,
             params_json='{"a": 1}',
-            score_threshold=0.8,
         )
 
         def _raise_after_partial_clear(toolchain_id):
@@ -448,7 +436,6 @@ class TestToolchainRegistryCrud:
             enabled=True,
             timeout_ms=1234,
             params_json='{"a": 1}',
-            score_threshold=0.8,
         )
 
         def _raise_before_delete(toolchain_id):
@@ -503,19 +490,15 @@ class TestBindingResolver:
         assert binding["timeout_ms"] is None
         assert binding["effective_timeout_ms"] == 30000
 
-    def test_resolve_binding_includes_score_threshold(self, ai_service, config, toolchain):
-        AiBindingTable.create(
-            config=config, toolchain=toolchain, enabled=True, score_threshold=0.8
-        )
-        binding = ai_service.resolve_binding(config.config_id)
-        assert binding["score_threshold"] == 0.8
-
-    def test_resolve_binding_score_threshold_defaults_none(self, ai_service, config, toolchain):
+    def test_resolve_binding_does_not_include_score_threshold(
+        self, ai_service, config, toolchain
+    ):
         AiBindingTable.create(
             config=config, toolchain=toolchain, enabled=True
         )
+
         binding = ai_service.resolve_binding(config.config_id)
-        assert binding["score_threshold"] is None
+        assert "score_threshold" not in binding
 
     def test_resolve_binding_with_null_toolchain(self, ai_service):
         """Binding with no toolchain should still be resolvable."""
@@ -678,85 +661,11 @@ class TestBindingCrud:
             })
 
 
-class TestScoreThresholdCrud:
-    """score_threshold validation and persistence in save_binding()."""
-
-    def test_save_binding_round_trip_with_score_threshold(self, ai_service, config, toolchain):
-        ai_service.save_binding(config.config_id, {
-            "enabled": True,
-            "toolchain_id": "motor-ai",
-            "score_threshold": 0.8,
-        })
-        binding = ai_service.resolve_binding(config.config_id)
-        assert binding["score_threshold"] == 0.8
-
-    def test_save_binding_updates_existing_threshold(self, ai_service, config, toolchain):
-        ai_service.save_binding(config.config_id, {
-            "enabled": True,
-            "toolchain_id": "motor-ai",
-            "score_threshold": 0.8,
-        })
-        ai_service.save_binding(config.config_id, {
-            "enabled": True,
-            "toolchain_id": "motor-ai",
-            "score_threshold": 0.5,
-        })
-        binding = ai_service.resolve_binding(config.config_id)
-        assert binding["score_threshold"] == 0.5
-
-    def test_save_binding_absent_key_preserves_existing_threshold(self, ai_service, config, toolchain):
-        ai_service.save_binding(config.config_id, {
-            "enabled": True,
-            "toolchain_id": "motor-ai",
-            "score_threshold": 0.8,
-        })
-        ai_service.save_binding(config.config_id, {
-            "enabled": True,
-            "toolchain_id": "motor-ai",
-        })
-        binding = ai_service.resolve_binding(config.config_id)
-        assert binding["score_threshold"] == 0.8
-
-    def test_save_binding_explicit_none_clears_threshold(self, ai_service, config, toolchain):
-        ai_service.save_binding(config.config_id, {
-            "enabled": True,
-            "toolchain_id": "motor-ai",
-            "score_threshold": 0.8,
-        })
-        ai_service.save_binding(config.config_id, {
-            "enabled": True,
-            "toolchain_id": "motor-ai",
-            "score_threshold": None,
-        })
-        binding = ai_service.resolve_binding(config.config_id)
-        assert binding["score_threshold"] is None
-
-    def test_save_binding_rejects_bool_threshold(self, ai_service, config, toolchain):
+    def test_save_binding_rejects_removed_score_threshold(
+        self, ai_service, config
+    ):
         with pytest.raises(ValueError, match="score_threshold"):
             ai_service.save_binding(config.config_id, {
                 "enabled": True,
-                "score_threshold": True,
-            })
-
-    def test_save_binding_rejects_string_threshold(self, ai_service, config, toolchain):
-        with pytest.raises(ValueError, match="score_threshold"):
-            ai_service.save_binding(config.config_id, {
-                "enabled": True,
-                "score_threshold": "0.8",
-            })
-
-    def test_save_binding_rejects_nan_threshold(self, ai_service, config, toolchain):
-        nan_value = math.nan
-        with pytest.raises(ValueError, match="score_threshold"):
-            ai_service.save_binding(config.config_id, {
-                "enabled": True,
-                "score_threshold": nan_value,
-            })
-
-    def test_save_binding_rejects_inf_threshold(self, ai_service, config, toolchain):
-        inf_value = math.inf
-        with pytest.raises(ValueError, match="score_threshold"):
-            ai_service.save_binding(config.config_id, {
-                "enabled": True,
-                "score_threshold": inf_value,
+                "score_threshold": 0.5,
             })
