@@ -17,6 +17,10 @@ _EXCERPT_LIMIT = 2000
 _SHUTDOWN_GRACE_SECONDS = 2.0
 _IDLE_STDERR_SETTLE_SECONDS = 0.05
 _IDLE_STDERR_SETTLE_POLL_SECONDS = 0.005
+_STARTUP_STDERR_SETTLE_SECONDS = 0.15
+_STARTUP_STDERR_SETTLE_QUIET_SECONDS = 0.02
+_STARTUP_STDERR_SETTLE_POLL_SECONDS = 0.005
+_STARTUP_STDERR_MIN_REQUEST_BUDGET_SECONDS = 0.05
 _POST_RESPONSE_STDOUT_SETTLE_SECONDS = 0.02
 _POST_RESPONSE_STDOUT_SETTLE_POLL_SECONDS = 0.005
 _TZ8 = timezone(timedelta(hours=8))
@@ -73,6 +77,7 @@ class _ResidentProcess:
     stderr_buffer_char_count: int = 0
     request_active: bool = False
     request_pending_send: bool = False
+    request_send_started: bool = False
     request_write_flushed: bool = False
     idle_stdout_invalidated: bool = False
     idle_stderr_invalidated: bool = False
@@ -111,6 +116,7 @@ class _ResidentProcess:
             if self.idle_stdout_invalidated or self.idle_stderr_invalidated:
                 return False
             self.request_pending_send = True
+            self.request_send_started = False
             self.request_write_flushed = False
             self.request_active = False
             self.active_stdout_line_count = 0
@@ -125,11 +131,24 @@ class _ResidentProcess:
         with self.state_lock:
             return (
                 self.request_pending_send
+                and not self.request_send_started
                 and not self.request_write_flushed
                 and not self.request_active
                 and not self.idle_stdout_invalidated
                 and not self.idle_stderr_invalidated
             )
+
+    def mark_request_send_started(self) -> bool:
+        with self.state_lock:
+            if (
+                not self.request_pending_send
+                or self.request_active
+                or self.idle_stdout_invalidated
+                or self.idle_stderr_invalidated
+            ):
+                return False
+            self.request_send_started = True
+        return True
 
     def mark_request_flushed(self) -> None:
         with self.state_lock:
@@ -139,6 +158,7 @@ class _ResidentProcess:
         with self.state_lock:
             if (
                 not self.request_pending_send
+                or not self.request_send_started
                 or self.request_active
                 or self.idle_stdout_invalidated
                 or self.idle_stderr_invalidated
@@ -153,6 +173,7 @@ class _ResidentProcess:
                     )
                 self.pending_stderr_start_position = None
             self.request_pending_send = False
+            self.request_send_started = False
             self.request_write_flushed = False
             self.request_active = True
         return True
@@ -160,6 +181,7 @@ class _ResidentProcess:
     def cancel_request(self) -> None:
         with self.state_lock:
             self.request_pending_send = False
+            self.request_send_started = False
             self.request_write_flushed = False
             self.request_active = False
             self.active_stdout_line_count = 0
@@ -172,6 +194,7 @@ class _ResidentProcess:
     def finish_request(self) -> tuple[str | None, str]:
         with self.state_lock:
             self.request_pending_send = False
+            self.request_send_started = False
             self.request_write_flushed = False
             self.request_active = False
             self.completed_request_count += 1
@@ -187,9 +210,7 @@ class _ResidentProcess:
 
     def route_stdout_line(self, line: str) -> None:
         with self.state_lock:
-            active = self.request_active or (
-                self.request_pending_send and self.request_write_flushed
-            )
+            active = self.request_active or self.request_send_started
             if not active:
                 self.idle_stdout_invalidated = True
                 should_queue = False
@@ -212,6 +233,7 @@ class _ResidentProcess:
         with self.state_lock:
             return (
                 self.request_pending_send
+                or self.request_send_started
                 or self.idle_stdout_invalidated
                 or self.idle_stderr_invalidated
             )
@@ -265,6 +287,7 @@ class _ResidentProcess:
         mark_idle_stderr = False
         with self.state_lock:
             request_pending_send = self.request_pending_send
+            request_send_started = self.request_send_started
             request_write_flushed = self.request_write_flushed
             completed_request_count = self.completed_request_count
         with self.stderr_lock:
@@ -273,7 +296,9 @@ class _ResidentProcess:
             self.stderr_buffer_char_count += len(chunk)
             active_start = self.active_stderr_start_position
             if active_start is None:
-                if request_pending_send and request_write_flushed:
+                if request_send_started or (
+                    request_pending_send and request_write_flushed
+                ):
                     active_start = self.pending_stderr_start_position
                 elif request_pending_send or completed_request_count > 0:
                     mark_idle_stderr = True
@@ -375,7 +400,21 @@ class ResidentToolchainRuntime:
                         stderr_excerpt="",
                         process_instance_id=process_instance_id,
                     )
-                cached_process, _ = self._acquire_process(toolchain_id, entrypoint)
+                try:
+                    cached_process, _ = self._acquire_process(
+                        toolchain_id,
+                        entrypoint,
+                        deadline=deadline,
+                    )
+                except TimeoutError:
+                    return self._build_result(
+                        status="timeout",
+                        started_at=started_at,
+                        started_mono=started_mono,
+                        error_summary="Process timed out",
+                        stderr_excerpt="",
+                        process_instance_id=process_instance_id,
+                    )
                 process_instance_id = cached_process.instance_id
                 if cached_process.begin_request():
                     try:
@@ -651,7 +690,11 @@ class ResidentToolchainRuntime:
         return lease
 
     def _acquire_process(
-        self, toolchain_id: str, entrypoint: str
+        self,
+        toolchain_id: str,
+        entrypoint: str,
+        *,
+        deadline: float | None = None,
     ) -> tuple[_ResidentProcess, bool]:
         stale_process = None
         with self._cache_lock:
@@ -665,9 +708,16 @@ class ResidentToolchainRuntime:
                 return cached_process, False
 
         if stale_process is not None:
-            self._stop_process(stale_process)
+            self._stop_process(stale_process, deadline=deadline)
+            if deadline is not None:
+                self._remaining_timeout(deadline)
 
         created = self._start_process(toolchain_id, entrypoint)
+        try:
+            self._settle_startup_stderr(created, deadline=deadline)
+        except Exception:
+            self._stop_process(created, deadline=deadline)
+            raise
         with self._cache_lock:
             self._processes[toolchain_id] = created
         return created, True
@@ -738,6 +788,8 @@ class ResidentToolchainRuntime:
             raise BrokenPipeError("Resident process stdin is unavailable")
         if not cached_process.ready_to_send():
             raise _RetryablePreSendInvalidationError()
+        if not cached_process.mark_request_send_started():
+            raise _RetryablePreSendInvalidationError()
         payload = {
             "message_type": "analyze",
             "request_id": request_id,
@@ -790,6 +842,59 @@ class ResidentToolchainRuntime:
         if saw_post_response_growth:
             cached_process.mark_idle_stderr_invalidated()
         return cached_process.current_stderr_excerpt()
+
+    def _settle_startup_stderr(
+        self,
+        cached_process: _ResidentProcess,
+        *,
+        deadline: float | None,
+    ) -> None:
+        now = time.monotonic()
+        if deadline is not None and deadline <= now:
+            raise TimeoutError("Timed out waiting for resident response")
+        wait_for_growth_seconds = _STARTUP_STDERR_SETTLE_SECONDS
+        if deadline is not None:
+            remaining = deadline - now
+            wait_for_growth_seconds = min(
+                wait_for_growth_seconds,
+                max(0.0, remaining - _STARTUP_STDERR_MIN_REQUEST_BUDGET_SECONDS),
+            )
+        if wait_for_growth_seconds <= 0:
+            return
+        wait_for_growth_deadline = now + wait_for_growth_seconds
+
+        last_seen = cached_process.stderr_position()
+        observed_growth = False
+        quiet_deadline = now + _STARTUP_STDERR_SETTLE_QUIET_SECONDS
+        while True:
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                raise TimeoutError("Timed out waiting for resident response")
+            if observed_growth:
+                if now >= quiet_deadline:
+                    return
+                next_deadline = quiet_deadline
+            else:
+                if now >= wait_for_growth_deadline:
+                    return
+                next_deadline = wait_for_growth_deadline
+            if deadline is not None:
+                next_deadline = min(next_deadline, deadline)
+            if next_deadline <= now:
+                return
+            time.sleep(
+                min(
+                    _STARTUP_STDERR_SETTLE_POLL_SECONDS,
+                    next_deadline - now,
+                )
+            )
+            current = cached_process.stderr_position()
+            if current != last_seen:
+                observed_growth = True
+                last_seen = current
+                quiet_deadline = (
+                    time.monotonic() + _STARTUP_STDERR_SETTLE_QUIET_SECONDS
+                )
 
     def _capture_active_stdout_violation(self, cached_process: _ResidentProcess) -> None:
         _, violation = cached_process.active_stdout_state()

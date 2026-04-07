@@ -540,7 +540,7 @@ def test_startup_stderr_before_first_request_does_not_discard_or_leak_into_run(
     entrypoint = _entrypoint(script_path)
     startup_once_file = tmp_path / "startup-stderr-once.txt"
     startup_text = "startup-banner\n"
-    original_acquire_process = ai_resident_runtime.ResidentToolchainRuntime._acquire_process
+    original_start_process = ai_resident_runtime.ResidentToolchainRuntime._start_process
     launch_count = 0
 
     monkeypatch.setenv("RESIDENT_RUNTIME_TEST_STARTUP_STDERR", startup_text)
@@ -549,25 +549,15 @@ def test_startup_stderr_before_first_request_does_not_discard_or_leak_into_run(
         str(startup_once_file),
     )
 
-    def wait_for_startup_stderr(self, toolchain_id: str, entrypoint: str):
+    def count_starts(self, toolchain_id: str, entrypoint: str):
         nonlocal launch_count
-        cached_process, created = original_acquire_process(self, toolchain_id, entrypoint)
-        if created:
-            launch_count += 1
-            if launch_count == 1:
-                deadline = time.monotonic() + 1.0
-                expected_bytes = len(startup_text.encode("utf-8"))
-                while (
-                    cached_process.stderr_position() < expected_bytes
-                    and time.monotonic() < deadline
-                ):
-                    time.sleep(0.005)
-        return cached_process, created
+        launch_count += 1
+        return original_start_process(self, toolchain_id, entrypoint)
 
     monkeypatch.setattr(
         ai_resident_runtime.ResidentToolchainRuntime,
-        "_acquire_process",
-        wait_for_startup_stderr,
+        "_start_process",
+        count_starts,
     )
 
     result = runtime.analyze(
@@ -576,12 +566,57 @@ def test_startup_stderr_before_first_request_does_not_discard_or_leak_into_run(
         request_id="req-1",
         request_payload=_request_payload("req-1"),
         artifacts_dir=str(tmp_path / "artifacts"),
-        timeout_ms=200,
+        timeout_ms=2000,
     )
+
+    _wait_for_file(startup_once_file)
 
     assert result["module_status"] == "success"
     assert result["stderr_excerpt"] == ""
     assert launch_count == 1
+
+
+def test_immediate_response_during_send_window_is_not_classified_as_idle_output(
+    tmp_path: Path, runtime, monkeypatch
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    entrypoint = _entrypoint(script_path)
+    original_mark_request_flushed = ai_resident_runtime._ResidentProcess.mark_request_flushed
+    original_start_process = ai_resident_runtime.ResidentToolchainRuntime._start_process
+    start_count = 0
+
+    def delayed_mark_request_flushed(self) -> None:
+        time.sleep(0.2)
+        return original_mark_request_flushed(self)
+
+    def count_starts(self, toolchain_id: str, entrypoint: str):
+        nonlocal start_count
+        start_count += 1
+        return original_start_process(self, toolchain_id, entrypoint)
+
+    monkeypatch.setattr(
+        ai_resident_runtime._ResidentProcess,
+        "mark_request_flushed",
+        delayed_mark_request_flushed,
+    )
+    monkeypatch.setattr(
+        ai_resident_runtime.ResidentToolchainRuntime,
+        "_start_process",
+        count_starts,
+    )
+
+    result = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-1",
+        request_payload=_request_payload("req-1"),
+        artifacts_dir=str(tmp_path / "artifacts"),
+        timeout_ms=1000,
+    )
+
+    assert result["module_status"] == "success"
+    assert result["response_payload"]["request_id"] == "req-1"
+    assert start_count == 1
 
 
 def test_startup_retry_loop_respects_request_deadline(tmp_path: Path, runtime, monkeypatch):
@@ -635,6 +670,45 @@ def test_startup_retry_loop_respects_request_deadline(tmp_path: Path, runtime, m
     assert result["module_status"] == "timeout"
     assert result["error_summary"] == "Process timed out"
     assert discard_calls == 1
+
+
+def test_stale_process_cleanup_before_restart_honors_active_request_deadline(
+    tmp_path: Path, runtime
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    entrypoint = _entrypoint(script_path, "ignore-shutdown")
+
+    first = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-1",
+        request_payload=_request_payload(
+            "req-1",
+            behavior="extra_stdout_after_success",
+            extra_stdout_delay_s=0.05,
+        ),
+        artifacts_dir=str(tmp_path / "artifacts-1"),
+        timeout_ms=1000,
+    )
+
+    time.sleep(0.2)
+
+    started = time.monotonic()
+    second = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-2",
+        request_payload=_request_payload("req-2"),
+        artifacts_dir=str(tmp_path / "artifacts-2"),
+        timeout_ms=100,
+    )
+    elapsed = time.monotonic() - started
+
+    assert first["module_status"] == "success"
+    assert second["module_status"] == "timeout"
+    assert second["error_summary"] == "Process timed out"
+    assert elapsed < 1.0
+    assert runtime.has_cached_process("tc-1") is False
 
 
 def test_idle_extra_stdout_invalidates_cache_before_next_reuse(
@@ -731,9 +805,14 @@ def test_idle_extra_stdout_arriving_between_reuse_and_begin_request_discards_bef
     reuse_gap_opened = threading.Event()
     second_request_started = False
 
-    def delayed_reuse(self, toolchain_id: str, entrypoint: str):
+    def delayed_reuse(self, toolchain_id: str, entrypoint: str, **kwargs):
         nonlocal second_request_started
-        cached_process, created = original_acquire_process(self, toolchain_id, entrypoint)
+        cached_process, created = original_acquire_process(
+            self,
+            toolchain_id,
+            entrypoint,
+            **kwargs,
+        )
         if not created and not second_request_started:
             second_request_started = True
             reuse_gap_opened.set()
