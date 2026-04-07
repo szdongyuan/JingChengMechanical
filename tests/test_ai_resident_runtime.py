@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+import app.service.ai_resident_runtime as ai_resident_runtime
 from app.service.ai_resident_runtime import ResidentToolchainRuntime
 
 
@@ -149,6 +150,20 @@ def handle_analyze(message: dict) -> None:
         )
         time.sleep(float(params.get("extra_stdout_delay_s", 0.05)))
         emit_text("idle stdout noise\\n")
+        return
+
+    if behavior == "extra_stdout_during_active_request":
+        emit_text(
+            json.dumps(
+                {
+                    "message_type": "result",
+                    "request_id": request_id,
+                    "response": build_response(request),
+                }
+            )
+            + "\\n"
+            + "unexpected extra stdout\\n"
+        )
         return
 
     emit_message(
@@ -511,6 +526,119 @@ def test_stderr_capture_is_per_run_truncated_and_buffered(
     assert first["stderr_excerpt"] == "A" * 2000
     assert second["stderr_excerpt"] == "second-run-stderr"
     assert runtime._processes["tc-1"].stderr_buffer_char_count <= 64 * 1024
+
+
+def test_stderr_buffer_caps_multibyte_utf8_bytes(tmp_path: Path, runtime):
+    script_path = _write_fake_resident_script(tmp_path)
+    entrypoint = _entrypoint(script_path)
+    stderr_text = "界" * 30000
+
+    result = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-1",
+        request_payload=_request_payload(
+            "req-1",
+            stderr_text=stderr_text,
+        ),
+        artifacts_dir=str(tmp_path / "artifacts"),
+        timeout_ms=2000,
+    )
+
+    cached_process = runtime._processes["tc-1"]
+
+    assert result["module_status"] == "success"
+    assert cached_process.stderr_buffer_byte_count <= 64 * 1024
+    assert len(cached_process.stderr_since(0).encode("utf-8")) <= 64 * 1024
+
+
+def test_stderr_excerpt_keeps_first_2000_chars_even_after_buffer_eviction(
+    tmp_path: Path, runtime
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    entrypoint = _entrypoint(script_path)
+    stderr_text = "".join(f"{index:05d}|" for index in range(15000))
+
+    result = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-1",
+        request_payload=_request_payload(
+            "req-1",
+            stderr_text=stderr_text,
+        ),
+        artifacts_dir=str(tmp_path / "artifacts"),
+        timeout_ms=2000,
+    )
+
+    assert result["module_status"] == "success"
+    assert result["stderr_excerpt"] == stderr_text[:2000]
+
+
+def test_extra_stdout_during_active_request_fails_current_run_with_protocol_error(
+    tmp_path: Path, runtime, monkeypatch
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    entrypoint = _entrypoint(script_path)
+    original_wait = ai_resident_runtime._ResidentProcess.wait_for_stdout_item
+
+    def delayed_wait(self, timeout_s: float):
+        item = original_wait(self, timeout_s)
+        time.sleep(0.05)
+        return item
+
+    monkeypatch.setattr(
+        ai_resident_runtime._ResidentProcess,
+        "wait_for_stdout_item",
+        delayed_wait,
+    )
+
+    result = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-1",
+        request_payload=_request_payload(
+            "req-1",
+            behavior="extra_stdout_during_active_request",
+        ),
+        artifacts_dir=str(tmp_path / "artifacts"),
+        timeout_ms=1000,
+    )
+
+    assert result["module_status"] == "protocol_error"
+    assert "unexpected extra stdout" in result["error_summary"]
+    assert runtime.has_cached_process("tc-1") is False
+
+
+def test_mutation_lease_blocks_analyze_until_mutation_finishes(
+    tmp_path: Path, runtime
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    entrypoint = _entrypoint(script_path)
+
+    with runtime.hold_mutation_lease("tc-1"):
+        blocked = runtime.analyze(
+            toolchain_id="tc-1",
+            entrypoint=entrypoint,
+            request_id="req-blocked",
+            request_payload=_request_payload("req-blocked"),
+            artifacts_dir=str(tmp_path / "artifacts-blocked"),
+            timeout_ms=1000,
+        )
+
+        assert blocked["module_status"] == "process_error"
+        assert blocked["error_summary"] == "Resident toolchain is busy"
+
+    allowed = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-allowed",
+        request_payload=_request_payload("req-allowed"),
+        artifacts_dir=str(tmp_path / "artifacts-allowed"),
+        timeout_ms=1000,
+    )
+
+    assert allowed["module_status"] == "success"
 
 
 def test_shutdown_all_sends_best_effort_shutdown_and_forces_terminate_after_grace_period(
