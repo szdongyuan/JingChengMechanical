@@ -357,13 +357,25 @@ class AiToolManagementModule(QWidget):
 
     def _collect_payload(self) -> dict:
         return {
-            "toolchain_id": self.ed_toolchain_id.text().strip(),
-            "display_name": self.ed_display_name.text().strip(),
-            "version": self.ed_version.text().strip(),
-            "entrypoint": self.ed_entrypoint.toPlainText().strip(),
+            "toolchain_id": self.ed_toolchain_id.text(),
+            "display_name": self.ed_display_name.text(),
+            "version": self.ed_version.text(),
+            "entrypoint": self.ed_entrypoint.toPlainText(),
             "default_timeout_ms": self.spin_timeout.value(),
             "enabled": self.chk_enabled.isChecked(),
-            "description": self.txt_description.toPlainText().strip(),
+            "description": self.txt_description.toPlainText(),
+        }
+
+    def _collect_save_payload(self) -> dict:
+        payload = self._collect_payload()
+        return {
+            "toolchain_id": payload["toolchain_id"].strip(),
+            "display_name": payload["display_name"].strip(),
+            "version": payload["version"].strip(),
+            "entrypoint": payload["entrypoint"].strip(),
+            "default_timeout_ms": payload["default_timeout_ms"],
+            "enabled": payload["enabled"],
+            "description": payload["description"].strip(),
         }
 
     def _validate_payload(self, payload: dict):
@@ -383,7 +395,8 @@ class AiToolManagementModule(QWidget):
         self._save_current_editor()
 
     def _save_current_editor(self) -> bool:
-        payload = self._collect_payload()
+        editor_snapshot = self._collect_payload()
+        payload = self._collect_save_payload()
         try:
             self._validate_payload(payload)
             saved_toolchain_id = self.services.ai_service.save_toolchain(
@@ -398,7 +411,7 @@ class AiToolManagementModule(QWidget):
             return False
 
         self._current_toolchain_id = saved_toolchain_id
-        self._editor_snapshot = dict(payload)
+        self._editor_snapshot = editor_snapshot
         self._is_new_draft = False
         self._refresh_list(selected_toolchain_id=saved_toolchain_id)
         self._emit_ai_toolchains_changed()

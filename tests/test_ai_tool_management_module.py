@@ -534,6 +534,34 @@ def test_confirm_leave_returns_false_when_unsaved_prompt_cancels(qapp, monkeypat
     assert module._current_toolchain_id == "motor-ai"
 
 
+def test_confirm_leave_whitespace_only_edit_still_prompts_unsaved_changes(
+    qapp,
+    monkeypatch,
+):
+    module, _service, _bus = _make_module(
+        toolchains=[_toolchain("motor-ai", display_name="Motor AI")]
+    )
+    _show(module, qapp)
+
+    module._select_toolchain("motor-ai")
+    qapp.processEvents()
+    module.ed_display_name.setText("Motor AI   ")
+    qapp.processEvents()
+    actions = []
+    monkeypatch.setattr(
+        module,
+        "_prompt_unsaved_changes",
+        lambda action: actions.append(action) or "cancel",
+    )
+
+    result = module.confirm_leave()
+
+    assert result is False
+    assert actions == ["leave"]
+    assert module.ed_display_name.text() == "Motor AI   "
+    assert module._current_toolchain_id == "motor-ai"
+
+
 def test_delete_confirmation_dialog_includes_identity_binding_names_count_and_warning(
     qapp,
     monkeypatch,
