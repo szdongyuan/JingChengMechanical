@@ -65,6 +65,8 @@ class MainWindow(QMainWindow):
         self.services = services
         self.current_user_name = None  # current_user_name作为是否已登录的唯一判断
         self.current_user_role = None
+        self._applied_user_name = None
+        self._applied_user_role = None
         self.login_window = None
         self.change_password_window = None
         self.add_user_window = None
@@ -211,8 +213,14 @@ class MainWindow(QMainWindow):
         return topbar
 
     def set_role(self):
+        role_applied = self._ensure_role_compatible_main_tab(self.current_user_role)
+        if not role_applied:
+            self.current_user_name = self._applied_user_name
+            self.current_user_role = self._applied_user_role
+            self._ensure_role_compatible_main_tab(self.current_user_role)
+
         role = self.current_user_role
-        perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["操作员"])
+        perms = self._role_permissions(role)
         allowed_tabs = perms["tabs"]
         allowed_actions = perms["actions"]
         for name, btn in getattr(self, "top_button_dict", {}).items():
@@ -238,12 +246,12 @@ class MainWindow(QMainWindow):
             if stop_button is not None:
                 stop_button.setEnabled(bool(self.current_user_name))
 
-        if hasattr(self, "tab") and "测试" in getattr(self, "top_button_dict", {}):
-            current_name = self.tab_names[self.tab.currentIndex()]
-            current_btn = self.top_button_dict.get(current_name)
-            if current_btn and not current_btn.isEnabled():
-                self.tab.setCurrentIndex(0)
-                self.top_button_dict["测试"].setChecked(True)
+        if hasattr(self, "tab"):
+            self._sync_topbar_selection(self.tab.currentIndex())
+
+        self._applied_user_name = self.current_user_name
+        self._applied_user_role = self.current_user_role
+        return role_applied
 
     def build_test_page(self) -> QWidget:
         page = QWidget()
@@ -467,6 +475,9 @@ class MainWindow(QMainWindow):
         if index == current_index:
             self._sync_topbar_selection(index)
             return
+        if not self._can_activate_main_tab(index):
+            self._sync_topbar_selection(current_index)
+            return
         if not self._can_leave_main_tab(current_index):
             self._sync_topbar_selection(current_index)
             return
@@ -484,26 +495,73 @@ class MainWindow(QMainWindow):
 
         if self._reverting_main_tab_change:
             self._reverting_main_tab_change = False
-        elif (
-            index != previous_index
-            and index != allowed_target
-            and not self._can_leave_main_tab(previous_index)
-        ):
-            self._reverting_main_tab_change = True
-            self.tab.setCurrentIndex(previous_index)
-            self._sync_topbar_selection(previous_index)
-            return
+        elif index != previous_index:
+            if not self._can_activate_main_tab(index):
+                self._revert_main_tab_change(previous_index)
+                return
+            if index != allowed_target and not self._can_leave_main_tab(previous_index):
+                self._revert_main_tab_change(previous_index)
+                return
 
+        self._finalize_main_tab_change(index)
+
+    def _finalize_main_tab_change(self, index: int) -> None:
         self._current_main_tab_index = index
         self._sync_topbar_selection(index)
         if index == self._TEST_PAGE_INDEX:
             self._refresh_analysis_display_modules()
+
+    def _revert_main_tab_change(self, previous_index: int) -> None:
+        self._reverting_main_tab_change = True
+        self.tab.setCurrentIndex(previous_index)
+        self._sync_topbar_selection(previous_index)
 
     def _sync_topbar_selection(self, index: int) -> None:
         for button_index, name in enumerate(getattr(self, "tab_names", [])):
             button = self.top_button_dict.get(name)
             if button is not None:
                 button.setChecked(button_index == index)
+
+    def _role_permissions(self, role):
+        return ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["操作员"])
+
+    def _can_activate_main_tab(self, index: int | None, *, role=None) -> bool:
+        if index is None or index < 0 or index >= len(getattr(self, "tab_names", [])):
+            return False
+
+        tab_name = self.tab_names[index]
+        allowed_tabs = self._role_permissions(self.current_user_role if role is None else role)["tabs"]
+        return tab_name in allowed_tabs
+
+    def _ensure_role_compatible_main_tab(self, role) -> bool:
+        if not hasattr(self, "tab"):
+            return True
+
+        current_index = self.tab.currentIndex()
+        if self._can_activate_main_tab(current_index, role=role):
+            return True
+
+        target_index = self._first_allowed_main_tab_index(role)
+        if target_index is None:
+            return False
+        if target_index == current_index:
+            return True
+        if not self._can_leave_main_tab(current_index):
+            return False
+
+        self._pending_guarded_tab_index = target_index
+        self.tab.setCurrentIndex(target_index)
+        if self.tab.currentIndex() != target_index:
+            self._pending_guarded_tab_index = None
+            return False
+        return self._can_activate_main_tab(target_index, role=role)
+
+    def _first_allowed_main_tab_index(self, role) -> int | None:
+        allowed_tabs = self._role_permissions(role)["tabs"]
+        for index, name in enumerate(getattr(self, "tab_names", [])):
+            if name in allowed_tabs:
+                return index
+        return None
 
     def _can_leave_main_tab(self, index: int | None) -> bool:
         if index != self._ai_tool_management_tab_index():
