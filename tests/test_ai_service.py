@@ -230,6 +230,26 @@ class TestToolchainRegistryCrud:
         assert row.entrypoint == "python updated.py"
         assert row.description == "updated description"
 
+    def test_save_toolchain_update_preserves_existing_execution_mode_when_omitted(
+        self, ai_service, toolchain
+    ):
+        toolchain.execution_mode = "oneshot_process"
+        toolchain.save()
+
+        ai_service.save_toolchain(
+            "motor-ai",
+            _toolchain_payload(
+                display_name="Updated Motor AI",
+                version="2.0",
+                entrypoint="python motor_ai_v2.py",
+                default_timeout_ms=45000,
+            ),
+        )
+
+        row = AiToolchainTable.get_by_id("motor-ai")
+
+        assert row.execution_mode == "oneshot_process"
+
     @pytest.mark.parametrize("toolchain_id", ["", "   "])
     def test_save_toolchain_rejects_empty_toolchain_id(self, ai_service, toolchain_id):
         with pytest.raises(ValueError, match="toolchain_id"):

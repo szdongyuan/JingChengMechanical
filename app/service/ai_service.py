@@ -133,9 +133,15 @@ class AiService:
     def _normalize_toolchain_payload(
         self, original_toolchain_id: str | None, data: dict
     ) -> dict:
-        execution_mode = data.get("execution_mode")
-        if execution_mode is None:
+        if "execution_mode" in data:
+            execution_mode = data["execution_mode"]
+        elif original_toolchain_id is None:
             execution_mode = _DEFAULT_EXECUTION_MODE
+        else:
+            existing = self.get_toolchain(original_toolchain_id)
+            if existing is None:
+                raise ValueError("toolchain_id not found")
+            execution_mode = existing.execution_mode
         if not isinstance(execution_mode, str):
             raise ValueError("execution_mode must be a string")
         execution_mode = execution_mode.strip()
