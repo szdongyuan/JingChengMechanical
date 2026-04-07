@@ -295,7 +295,8 @@ class AiToolManagementModule(QWidget):
             ai_toolchains_changed.emit()
 
     def _update_action_state(self):
-        self.btn_delete.setEnabled(self.toolchain_list.currentItem() is not None)
+        # Delete remains deferred until Task 4 adds the actual mediation flow.
+        self.btn_delete.setEnabled(False)
 
     def confirm_leave(self) -> bool:
         return True

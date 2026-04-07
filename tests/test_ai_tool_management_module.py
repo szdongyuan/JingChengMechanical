@@ -257,6 +257,17 @@ def test_edit_save_updates_existing_row_without_creating_duplicate(qapp):
     assert module.toolchain_list.item(0).text().endswith("[禁用]")
 
 
+def test_delete_button_remains_disabled_when_row_is_selected(qapp):
+    module, _service, _bus = _make_module(toolchains=[_toolchain("motor-ai")])
+    _show(module, qapp)
+
+    module._select_toolchain("motor-ai")
+    qapp.processEvents()
+
+    assert module.toolchain_list.currentItem() is not None
+    assert module.btn_delete.isEnabled() is False
+
+
 def test_delete_button_is_disabled_for_new_draft_without_selection(qapp):
     module, _service, _bus = _make_module(toolchains=[_toolchain("motor-ai")])
     _show(module, qapp)
