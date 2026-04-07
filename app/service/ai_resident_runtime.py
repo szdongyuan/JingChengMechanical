@@ -15,8 +15,8 @@ from itertools import count
 _STDERR_BUFFER_LIMIT = 64 * 1024
 _EXCERPT_LIMIT = 2000
 _SHUTDOWN_GRACE_SECONDS = 2.0
-_IDLE_STDERR_SETTLE_SECONDS = 0.05
-_IDLE_STDERR_SETTLE_POLL_SECONDS = 0.005
+_POST_REQUEST_REUSE_FENCE_SECONDS = 0.25
+_POST_REQUEST_REUSE_FENCE_POLL_SECONDS = 0.005
 _STARTUP_STDERR_SETTLE_SECONDS = 0.15
 _STARTUP_STDERR_SETTLE_QUIET_SECONDS = 0.02
 _STARTUP_STDERR_SETTLE_POLL_SECONDS = 0.005
@@ -98,6 +98,7 @@ class _ResidentProcess:
     active_stderr_start_position: int | None = None
     active_stderr_excerpt: str = ""
     completed_request_count: int = 0
+    post_request_reuse_fence_deadline: float | None = None
 
     def push_stdout_item(self, item: object) -> None:
         with self.stdout_condition:
@@ -132,6 +133,7 @@ class _ResidentProcess:
             self.request_active = False
             self.active_stdout_line_count = 0
             self.active_stdout_protocol_error = None
+            self.post_request_reuse_fence_deadline = None
         with self.stderr_lock:
             self.pending_stderr_start_position = self.stderr_total_bytes
             self.active_stderr_start_position = None
@@ -246,6 +248,9 @@ class _ResidentProcess:
             self.request_write_flushed = False
             self.request_active = False
             self.completed_request_count += 1
+            self.post_request_reuse_fence_deadline = (
+                time.monotonic() + _POST_REQUEST_REUSE_FENCE_SECONDS
+            )
             violation = self.active_stdout_protocol_error
             self.active_stdout_line_count = 0
             self.active_stdout_protocol_error = None
@@ -299,18 +304,23 @@ class _ResidentProcess:
             if self.completed_request_count <= 0:
                 return False
             if self.idle_stdout_invalidated or self.idle_stderr_invalidated:
-                return self.idle_stderr_invalidated
-        baseline = self.stderr_position()
-        deadline = time.monotonic() + _IDLE_STDERR_SETTLE_SECONDS
+                return True
+            deadline = self.post_request_reuse_fence_deadline
+        if deadline is None:
+            return False
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
+                with self.state_lock:
+                    if self.idle_stdout_invalidated or self.idle_stderr_invalidated:
+                        return True
+                    if self.post_request_reuse_fence_deadline == deadline:
+                        self.post_request_reuse_fence_deadline = None
                 return False
-            time.sleep(min(_IDLE_STDERR_SETTLE_POLL_SECONDS, remaining))
-            current = self.stderr_position()
-            if current != baseline:
-                self.mark_idle_stderr_invalidated()
-                return True
+            time.sleep(min(_POST_REQUEST_REUSE_FENCE_POLL_SECONDS, remaining))
+            with self.state_lock:
+                if self.idle_stdout_invalidated or self.idle_stderr_invalidated:
+                    return True
 
     def stderr_position(self) -> int:
         with self.stderr_lock:

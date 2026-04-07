@@ -883,6 +883,53 @@ def test_idle_extra_stdout_invalidates_cache_before_next_reuse(
     assert second["process_instance_id"] != first["process_instance_id"]
 
 
+def test_immediate_second_request_does_not_reuse_process_before_late_idle_stdout(
+    tmp_path: Path, runtime
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    entrypoint = _entrypoint(script_path)
+    started_file = tmp_path / "req-2-started.txt"
+    release_file = tmp_path / "req-2-release.txt"
+
+    first = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-1",
+        request_payload=_request_payload(
+            "req-1",
+            behavior="extra_stdout_after_success",
+            extra_stdout_delay_s=0.2,
+        ),
+        artifacts_dir=str(tmp_path / "artifacts-1"),
+        timeout_ms=1500,
+    )
+
+    def release_second_request() -> None:
+        time.sleep(0.35)
+        release_file.write_text("release", encoding="utf-8")
+
+    releaser = threading.Thread(target=release_second_request)
+    releaser.start()
+    second = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-2",
+        request_payload=_request_payload(
+            "req-2",
+            behavior="block",
+            started_file=str(started_file),
+            release_file=str(release_file),
+        ),
+        artifacts_dir=str(tmp_path / "artifacts-2"),
+        timeout_ms=1500,
+    )
+    releaser.join(timeout=5)
+
+    assert first["module_status"] == "success"
+    assert second["module_status"] == "success"
+    assert second["process_instance_id"] != first["process_instance_id"]
+
+
 def test_idle_stdout_arriving_between_begin_request_and_request_write_discards_before_send(
     tmp_path: Path, runtime, monkeypatch
 ):
@@ -1116,6 +1163,58 @@ def test_natural_late_stderr_from_previous_request_does_not_leak_into_next_run_e
     assert second["module_status"] == "success"
     assert second["stderr_excerpt"] == "SECOND|"
     assert "FIRST|" not in second["stderr_excerpt"]
+
+
+def test_immediate_second_request_uses_fresh_process_before_late_idle_stderr(
+    tmp_path: Path, runtime
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    entrypoint = _entrypoint(script_path)
+    started_file = tmp_path / "req-2-started.txt"
+    release_file = tmp_path / "req-2-release.txt"
+    late_stderr_text = "FIRST-LATE|"
+
+    first = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-1",
+        request_payload=_request_payload(
+            "req-1",
+            behavior="stderr_after_success",
+            late_stderr_delay_s=0.2,
+            late_stderr_text=late_stderr_text,
+        ),
+        artifacts_dir=str(tmp_path / "artifacts-1"),
+        timeout_ms=1500,
+    )
+
+    def release_second_request() -> None:
+        time.sleep(0.35)
+        release_file.write_text("release", encoding="utf-8")
+
+    releaser = threading.Thread(target=release_second_request)
+    releaser.start()
+    second = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-2",
+        request_payload=_request_payload(
+            "req-2",
+            behavior="block",
+            started_file=str(started_file),
+            release_file=str(release_file),
+            stderr_text="SECOND|",
+        ),
+        artifacts_dir=str(tmp_path / "artifacts-2"),
+        timeout_ms=1500,
+    )
+    releaser.join(timeout=5)
+
+    assert first["module_status"] == "success"
+    assert second["module_status"] == "success"
+    assert second["stderr_excerpt"] == "SECOND|"
+    assert late_stderr_text not in second["stderr_excerpt"]
+    assert second["process_instance_id"] != first["process_instance_id"]
 
 
 def test_stale_idle_stderr_backlog_does_not_leak_into_next_run_excerpt(
