@@ -715,7 +715,6 @@ def test_delete_clears_bindings_and_emits_ai_toolchains_changed(qapp, monkeypatc
                     "enabled": True,
                     "timeout_ms": 3000,
                     "params_json": '{"mode":"a"}',
-                    "score_threshold": 0.8,
                 },
                 {
                     "config_id": 2,
@@ -724,7 +723,6 @@ def test_delete_clears_bindings_and_emits_ai_toolchains_changed(qapp, monkeypatc
                     "enabled": False,
                     "timeout_ms": 4000,
                     "params_json": '{"mode":"b"}',
-                    "score_threshold": None,
                 },
             ]
         },
@@ -747,7 +745,6 @@ def test_delete_clears_bindings_and_emits_ai_toolchains_changed(qapp, monkeypatc
             "enabled": False,
             "timeout_ms": 3000,
             "params_json": '{"mode":"a"}',
-            "score_threshold": 0.8,
         },
         {
             "config_id": 2,
@@ -756,7 +753,6 @@ def test_delete_clears_bindings_and_emits_ai_toolchains_changed(qapp, monkeypatc
             "enabled": False,
             "timeout_ms": 4000,
             "params_json": '{"mode":"b"}',
-            "score_threshold": None,
         },
     ]
     assert bus.ai_toolchains_changed.emissions == [((), {})]
