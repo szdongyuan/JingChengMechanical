@@ -11,6 +11,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.modules.setdefault("cv2", SimpleNamespace())
 
+from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
 from app.service.analysis.frames import StftFrame
@@ -58,6 +59,19 @@ class _StubModule(QWidget):
     def __init__(self, services=None):
         super().__init__()
         self.services = services
+
+
+def _make_guarded_ai_tool_management_module(confirm_leave_result: bool):
+    class _GuardedAiToolManagementModule(_StubModule):
+        def __init__(self, services=None):
+            super().__init__(services)
+            self.confirm_leave_calls = 0
+
+        def confirm_leave(self) -> bool:
+            self.confirm_leave_calls += 1
+            return confirm_leave_result
+
+    return _GuardedAiToolManagementModule
 
 
 class _ChannelProbeModule(_StubModule):
@@ -123,6 +137,7 @@ def _patch_non_target_modules(monkeypatch, *, use_real_control: bool = False):
         "HardwareModule",
         "InputCalibrationModule",
         "ConfigModule",
+        "AiToolManagementModule",
         "ChannelSelectModule",
     ]
     if not use_real_control:
@@ -160,8 +175,16 @@ def _make_window(
     initial_state: FactoryControllerState | None = None,
     initial_review_payload: FactoryReviewPayload | None = None,
     use_real_control: bool = False,
+    ai_tool_management_cls: type[QWidget] | None = None,
 ):
     _patch_non_target_modules(monkeypatch, use_real_control=use_real_control)
+    if ai_tool_management_cls is not None:
+        monkeypatch.setattr(
+            main_window_mod,
+            "AiToolManagementModule",
+            ai_tool_management_cls,
+            raising=False,
+        )
     services = _make_services(
         initial_state=initial_state,
         initial_review_payload=initial_review_payload,
@@ -302,6 +325,88 @@ def test_show_login_window_cancel_reenables_main_window_before_closing_initial_l
 
     assert enabled_state_when_close_called == [True]
     assert window.isEnabled() is True
+
+
+def test_main_window_includes_ai_tool_management_tab_in_topbar(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    assert window.tab_names == ["测试", "数据管理", "配置", "AI工具管理", "硬件"]
+    assert list(window.top_button_dict) == ["测试", "数据管理", "配置", "AI工具管理", "硬件"]
+
+
+def test_engineer_role_can_access_ai_tool_management_tab(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    window.current_user_role = "工程师"
+    window.set_role()
+
+    assert window.top_button_dict["AI工具管理"].isEnabled() is True
+
+
+def test_admin_role_can_access_ai_tool_management_tab(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    window.current_user_role = "管理员"
+    window.set_role()
+
+    assert window.top_button_dict["AI工具管理"].isEnabled() is True
+
+
+def test_operator_role_cannot_access_ai_tool_management_tab(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    window.current_user_role = "操作员"
+    window.set_role()
+
+    assert window.top_button_dict["AI工具管理"].isEnabled() is False
+
+
+def test_switching_away_from_ai_tool_management_is_blocked_when_confirm_leave_rejects(
+    qapp,
+    monkeypatch,
+):
+    window, _ = _make_window(
+        monkeypatch,
+        ai_tool_management_cls=_make_guarded_ai_tool_management_module(False),
+    )
+    _show(window, qapp)
+
+    window.current_user_role = "管理员"
+    window.set_role()
+
+    ai_index = window.tab_names.index("AI工具管理")
+    window.top_button_dict["AI工具管理"].click()
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == ai_index
+
+    window.top_button_dict["硬件"].click()
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == ai_index
+    assert window.ai_tool_management_module.confirm_leave_calls == 1
+
+
+def test_closing_main_window_is_blocked_when_ai_tool_management_rejects_leave(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        ai_tool_management_cls=_make_guarded_ai_tool_management_module(False),
+    )
+    _show(window, qapp)
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+
+    assert close_event.isAccepted() is False
+    services.db.close.assert_not_called()
+    assert window.ai_tool_management_module.confirm_leave_calls == 1
 
 
 def _armed_state(

@@ -31,6 +31,7 @@ from ui.modules.hardware import HardwareModule
 from ui.modules.data_management import DataManagementModule
 from ui.modules.input_calibration import InputCalibrationModule
 from ui.modules.config import ConfigModule
+from ui.modules.ai_tool_management import AiToolManagementModule
 from ui.modules.channel_select import ChannelSelectModule
 from ui.modules.login import LoginWindow
 from ui.modules.change_password import ChangePasswordWindow
@@ -39,11 +40,11 @@ from ui.modules.delete_user import DeleteUserWindow
 
 ROLE_PERMISSIONS = {
     "管理员": {
-        "tabs": {"测试", "数据管理", "配置", "硬件"},
+        "tabs": {"测试", "数据管理", "配置", "AI工具管理", "硬件"},
         "actions": {"切换用户", "添加用户", "删除用户", "修改密码"},
     },
     "工程师": {
-        "tabs": {"测试", "配置", "硬件"},
+        "tabs": {"测试", "配置", "AI工具管理", "硬件"},
         "actions": {"切换用户", "修改密码"},
     },
     "操作员": {
@@ -73,6 +74,9 @@ class MainWindow(QMainWindow):
         self._factory_state = getattr(factory_mode, "state", FactoryControllerState())
         self._review_payload = getattr(factory_mode, "review_payload", FactoryReviewPayload())
         self.display_channel_by_config_id: dict[int, int] = {}
+        self._current_main_tab_index = self._TEST_PAGE_INDEX
+        self._pending_guarded_tab_index: int | None = None
+        self._reverting_main_tab_change = False
 
         self.setWindowTitle("精成电机")
         self.setStyleSheet(APP_QSS)
@@ -92,10 +96,11 @@ class MainWindow(QMainWindow):
 
         self._connect_bus_signals()
 
-        # 页面：测试/数据管理/配置/硬件
+        # 页面：测试/数据管理/配置/AI工具管理/硬件
         self.tab.addWidget(self.build_test_page())
         self.tab.addWidget(self.build_data_page())
         self.tab.addWidget(self.build_config_page())
+        self.tab.addWidget(self.build_ai_tool_management_page())
         self.tab.addWidget(self.build_hardware_page())
         self.tab.currentChanged.connect(self._on_main_tab_changed)
 
@@ -170,13 +175,12 @@ class MainWindow(QMainWindow):
             group.addButton(b)
             lay.addWidget(b)
             return b
-        self.tab_names = ["测试", "数据管理", "配置", "硬件"]
+        self.tab_names = ["测试", "数据管理", "配置", "AI工具管理", "硬件"]
         for i, name in enumerate(self.tab_names):
             b = add_tab(name, checked=(i == 0))
             self.top_button_dict[name] = b
             group.setId(b, i)
-        # 把group中的按钮一起绑定页面设置
-        group.idClicked.connect(self.tab.setCurrentIndex)
+        group.idClicked.connect(self._on_topbar_tab_clicked)
 
         self.user_btn = QToolButton()
         self.user_btn.setText("用户")
@@ -344,6 +348,16 @@ class MainWindow(QMainWindow):
         lay.addWidget(Card("测试配置管理", self.config_module), 1)
         return page
 
+    def build_ai_tool_management_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self.ai_tool_management_module = AiToolManagementModule(self.services)
+        lay.addWidget(Card("AI工具管理", self.ai_tool_management_module), 1)
+        return page
+
     def build_hardware_page(self) -> QWidget:
         """
         左侧：设备选择/保存
@@ -448,9 +462,67 @@ class MainWindow(QMainWindow):
         self._review_payload = FactoryReviewPayload()
         self._sync_analysis_toolbar()
 
+    def _on_topbar_tab_clicked(self, index: int) -> None:
+        current_index = self.tab.currentIndex()
+        if index == current_index:
+            self._sync_topbar_selection(index)
+            return
+        if not self._can_leave_main_tab(current_index):
+            self._sync_topbar_selection(current_index)
+            return
+
+        self._pending_guarded_tab_index = index
+        self.tab.setCurrentIndex(index)
+        if self.tab.currentIndex() == current_index:
+            self._pending_guarded_tab_index = None
+            self._sync_topbar_selection(current_index)
+
     def _on_main_tab_changed(self, index: int) -> None:
+        previous_index = self._current_main_tab_index
+        allowed_target = self._pending_guarded_tab_index
+        self._pending_guarded_tab_index = None
+
+        if self._reverting_main_tab_change:
+            self._reverting_main_tab_change = False
+        elif (
+            index != previous_index
+            and index != allowed_target
+            and not self._can_leave_main_tab(previous_index)
+        ):
+            self._reverting_main_tab_change = True
+            self.tab.setCurrentIndex(previous_index)
+            self._sync_topbar_selection(previous_index)
+            return
+
+        self._current_main_tab_index = index
+        self._sync_topbar_selection(index)
         if index == self._TEST_PAGE_INDEX:
             self._refresh_analysis_display_modules()
+
+    def _sync_topbar_selection(self, index: int) -> None:
+        for button_index, name in enumerate(getattr(self, "tab_names", [])):
+            button = self.top_button_dict.get(name)
+            if button is not None:
+                button.setChecked(button_index == index)
+
+    def _can_leave_main_tab(self, index: int | None) -> bool:
+        if index != self._ai_tool_management_tab_index():
+            return True
+
+        confirm_leave = getattr(
+            getattr(self, "ai_tool_management_module", None),
+            "confirm_leave",
+            None,
+        )
+        if callable(confirm_leave):
+            return bool(confirm_leave())
+        return True
+
+    def _ai_tool_management_tab_index(self) -> int | None:
+        try:
+            return self.tab_names.index("AI工具管理")
+        except ValueError:
+            return None
 
     def _on_analysis_channel_changed(self, channel_index: int) -> None:
         self._sync_selected_display_channel(channel_index, refresh_modules=False)
@@ -592,6 +664,9 @@ class MainWindow(QMainWindow):
         return f"配置 {config_id} / CH{channel_index + 1}"
 
     def closeEvent(self, event: QCloseEvent):
+        if not self._can_leave_main_tab(self._ai_tool_management_tab_index()):
+            event.ignore()
+            return
         self.services.bus.log.emit("[App] 关闭程序")
         try:
             self.services.db.close()
