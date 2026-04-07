@@ -33,6 +33,7 @@ class _AiServiceStub:
         *,
         toolchains: list[dict] | None = None,
         bindings_by_toolchain: dict[str, list[dict]] | None = None,
+        list_bindings_error: Exception | None = None,
         save_error: Exception | None = None,
         delete_error: Exception | None = None,
     ):
@@ -41,6 +42,7 @@ class _AiServiceStub:
             toolchain_id: [dict(binding) for binding in bindings]
             for toolchain_id, bindings in (bindings_by_toolchain or {}).items()
         }
+        self.list_bindings_error = list_bindings_error
         self.save_error = save_error
         self.delete_error = delete_error
         self.saved_requests: list[tuple[str | None, dict]] = []
@@ -68,6 +70,8 @@ class _AiServiceStub:
 
     def list_toolchain_bindings(self, toolchain_id: str) -> list[dict]:
         self.list_binding_requests.append(toolchain_id)
+        if self.list_bindings_error is not None:
+            raise self.list_bindings_error
         return [
             dict(binding)
             for binding in self.bindings_by_toolchain.get(toolchain_id, [])
@@ -122,6 +126,7 @@ def _make_module(
     *,
     toolchains: list[dict] | None = None,
     bindings_by_toolchain: dict[str, list[dict]] | None = None,
+    list_bindings_error: Exception | None = None,
     save_error: Exception | None = None,
     delete_error: Exception | None = None,
 ):
@@ -132,6 +137,7 @@ def _make_module(
     service = _AiServiceStub(
         toolchains=toolchains,
         bindings_by_toolchain=bindings_by_toolchain,
+        list_bindings_error=list_bindings_error,
         save_error=save_error,
         delete_error=delete_error,
     )
@@ -338,6 +344,56 @@ def test_edit_save_updates_existing_row_without_creating_duplicate(qapp):
     assert service.toolchains[0]["display_name"] == "Motor AI V2"
     assert bus.ai_toolchains_changed.emissions == [((), {})]
     assert module.toolchain_list.item(0).text().endswith("[禁用]")
+
+
+def test_save_normalizes_editor_snapshot_and_discard_restores_persisted_row(
+    qapp,
+    monkeypatch,
+):
+    module, service, _bus = _make_module(
+        toolchains=[
+            _toolchain(
+                "motor-ai",
+                display_name="Motor AI",
+                entrypoint="python motor_ai.py",
+                description="saved description",
+            )
+        ]
+    )
+    _show(module, qapp)
+
+    module._select_toolchain("motor-ai")
+    qapp.processEvents()
+
+    module.ed_display_name.setText("Motor AI   ")
+    module.ed_entrypoint.setPlainText("python motor_ai.py   ")
+    module.txt_description.setPlainText("saved description   ")
+    qapp.processEvents()
+
+    assert module._is_dirty() is True
+
+    module.btn_save.click()
+    qapp.processEvents()
+
+    assert service.saved_requests[-1][1]["display_name"] == "Motor AI"
+    assert service.saved_requests[-1][1]["entrypoint"] == "python motor_ai.py"
+    assert service.saved_requests[-1][1]["description"] == "saved description"
+    assert module.ed_display_name.text() == "Motor AI"
+    assert module.ed_entrypoint.toPlainText() == "python motor_ai.py"
+    assert module.txt_description.toPlainText() == "saved description"
+    assert module._editor_snapshot["display_name"] == "Motor AI"
+    assert module._editor_snapshot["entrypoint"] == "python motor_ai.py"
+    assert module._editor_snapshot["description"] == "saved description"
+
+    module.ed_version.setText("2.0")
+    qapp.processEvents()
+    monkeypatch.setattr(module, "_prompt_unsaved_changes", lambda action: "discard")
+
+    assert module.confirm_leave() is True
+    assert module.ed_display_name.text() == "Motor AI"
+    assert module.ed_entrypoint.toPlainText() == "python motor_ai.py"
+    assert module.ed_version.text() == "1.0"
+    assert module.txt_description.toPlainText() == "saved description"
 
 
 def test_edit_enabled_persists_false_then_true_and_emits_refresh(qapp):
@@ -605,6 +661,39 @@ def test_delete_confirmation_dialog_includes_identity_binding_names_count_and_wa
     assert "Cfg Beta" in text
     assert "解除绑定" in text
     assert service.deleted_toolchain_ids == []
+
+
+def test_delete_binding_lookup_failure_shows_warning_and_keeps_state(
+    qapp,
+    monkeypatch,
+):
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.ai_tool_management.QMessageBox.warning",
+        lambda *args: warnings.append(args[1:3]),
+    )
+    module, service, _bus = _make_module(
+        toolchains=[
+            _toolchain("motor-ai", display_name="Motor AI"),
+            _toolchain("other-ai", display_name="Other AI"),
+        ],
+        list_bindings_error=RuntimeError("无法加载工具链绑定"),
+    )
+    _show(module, qapp)
+
+    module._select_toolchain("motor-ai")
+    qapp.processEvents()
+
+    module.btn_delete.click()
+    qapp.processEvents()
+
+    assert service.list_binding_requests == ["motor-ai"]
+    assert warnings == [("删除失败", "无法加载工具链绑定")]
+    assert service.deleted_toolchain_ids == []
+    assert module._current_toolchain_id == "motor-ai"
+    assert _current_toolchain_item_id(module) == "motor-ai"
+    assert module.ed_display_name.text() == "Motor AI"
+    assert module.toolchain_list.count() == 2
 
 
 def test_delete_clears_bindings_and_emits_ai_toolchains_changed(qapp, monkeypatch):

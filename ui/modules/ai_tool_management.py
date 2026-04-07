@@ -340,8 +340,13 @@ class AiToolManagementModule(QWidget):
         row = self._toolchain_rows.get(toolchain_id)
         if row is None:
             return
-        bindings = self.services.ai_service.list_toolchain_bindings(toolchain_id)
-        if not self._confirm_delete(row, bindings):
+        try:
+            bindings = self.services.ai_service.list_toolchain_bindings(toolchain_id)
+            should_delete = self._confirm_delete(row, bindings)
+        except Exception as exc:
+            QMessageBox.warning(self, "删除失败", str(exc))
+            return
+        if not should_delete:
             return
         try:
             self.services.ai_service.delete_toolchain(toolchain_id)
@@ -395,7 +400,6 @@ class AiToolManagementModule(QWidget):
         self._save_current_editor()
 
     def _save_current_editor(self) -> bool:
-        editor_snapshot = self._collect_payload()
         payload = self._collect_save_payload()
         try:
             self._validate_payload(payload)
@@ -411,9 +415,15 @@ class AiToolManagementModule(QWidget):
             return False
 
         self._current_toolchain_id = saved_toolchain_id
-        self._editor_snapshot = editor_snapshot
         self._is_new_draft = False
         self._refresh_list(selected_toolchain_id=saved_toolchain_id)
+        persisted_row = self._toolchain_rows.get(saved_toolchain_id)
+        if persisted_row is not None:
+            self._load_toolchain(persisted_row)
+        else:
+            normalized_payload = self._normalize_editor_payload(payload)
+            self._editor_snapshot = normalized_payload
+            self._set_editor_payload(normalized_payload)
         self._emit_ai_toolchains_changed()
         return True
 
