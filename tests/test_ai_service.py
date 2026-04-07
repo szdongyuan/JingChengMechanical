@@ -118,7 +118,7 @@ class TestToolchainRegistry:
 
 
 class TestToolchainRegistryCrud:
-    def test_save_toolchain_creates_new_row_and_forces_supported_runtime_fields(
+    def test_save_toolchain_defaults_execution_mode_to_resident_process(
         self, ai_service
     ):
         ai_service.save_toolchain(
@@ -127,7 +127,6 @@ class TestToolchainRegistryCrud:
                 toolchain_id="new-ai",
                 display_name="New AI",
                 protocol_version=999,
-                execution_mode="streaming",
             ),
         )
 
@@ -135,7 +134,30 @@ class TestToolchainRegistryCrud:
 
         assert row.display_name == "New AI"
         assert row.protocol_version == 1
-        assert row.execution_mode == "oneshot_process"
+        assert row.execution_mode == "resident_process"
+
+    @pytest.mark.parametrize(
+        "toolchain_id, execution_mode",
+        [
+            ("resident-ai", "resident_process"),
+            ("oneshot-ai", "oneshot_process"),
+        ],
+    )
+    def test_save_toolchain_accepts_supported_execution_modes(
+        self, ai_service, toolchain_id, execution_mode
+    ):
+        ai_service.save_toolchain(
+            None,
+            _toolchain_payload(
+                toolchain_id=toolchain_id,
+                execution_mode=execution_mode,
+            ),
+        )
+
+        row = AiToolchainTable.get_by_id(toolchain_id)
+
+        assert row.protocol_version == 1
+        assert row.execution_mode == execution_mode
 
     def test_save_toolchain_create_trims_persisted_string_fields(self, ai_service):
         ai_service.save_toolchain(
@@ -156,8 +178,11 @@ class TestToolchainRegistryCrud:
         assert row.entrypoint == "python trimmed.py"
         assert row.description == "trimmed description"
 
-    def test_save_toolchain_updates_existing_row_and_forces_supported_runtime_fields(
-        self, ai_service, toolchain
+    @pytest.mark.parametrize(
+        "execution_mode", ["resident_process", "oneshot_process"]
+    )
+    def test_save_toolchain_updates_existing_row_preserves_supported_execution_mode(
+        self, ai_service, toolchain, execution_mode
     ):
         toolchain.protocol_version = 9
         toolchain.execution_mode = "daemon"
@@ -171,7 +196,7 @@ class TestToolchainRegistryCrud:
                 entrypoint="python motor_ai_v2.py",
                 default_timeout_ms=45000,
                 protocol_version=999,
-                execution_mode="streaming",
+                execution_mode=execution_mode,
             ),
         )
 
@@ -182,7 +207,7 @@ class TestToolchainRegistryCrud:
         assert row.entrypoint == "python motor_ai_v2.py"
         assert row.default_timeout_ms == 45000
         assert row.protocol_version == 1
-        assert row.execution_mode == "oneshot_process"
+        assert row.execution_mode == execution_mode
 
     def test_save_toolchain_update_trims_persisted_string_fields(
         self, ai_service, toolchain
@@ -218,6 +243,13 @@ class TestToolchainRegistryCrud:
             ai_service.save_toolchain(
                 None,
                 _toolchain_payload(toolchain_id=" motor-ai "),
+            )
+
+    def test_save_toolchain_rejects_unsupported_execution_mode(self, ai_service):
+        with pytest.raises(ValueError, match="execution_mode"):
+            ai_service.save_toolchain(
+                None,
+                _toolchain_payload(execution_mode="daemon"),
             )
 
     @pytest.mark.parametrize(

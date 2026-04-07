@@ -143,6 +143,50 @@ def test_connect_bootstraps_full_runtime_schema_and_default_rows(monkeypatch):
         assert login_user is not None
 
 
+def test_connect_bootstraps_execution_mode_default_to_resident_process(monkeypatch):
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
+        svc.connect()
+
+        toolchain_columns = _table_columns(tmp_db, "ai_toolchain_table")
+
+        assert toolchain_columns["execution_mode"][4] == "'resident_process'"
+        tmp_db.execute_sql(
+            """
+            INSERT INTO ai_toolchain_table (
+                toolchain_id,
+                display_name,
+                version,
+                entrypoint,
+                protocol_version,
+                default_timeout_ms,
+                enabled,
+                description,
+                created_time,
+                updated_time
+            ) VALUES (
+                'bootstrapped-toolchain',
+                'Bootstrapped Toolchain',
+                '',
+                'python bootstrapped.py',
+                1,
+                30000,
+                1,
+                '',
+                '',
+                ''
+            )
+            """
+        )
+
+        assert tmp_db.execute_sql(
+            """
+            SELECT execution_mode
+            FROM ai_toolchain_table
+            WHERE toolchain_id = 'bootstrapped-toolchain'
+            """
+        ).fetchone() == ("resident_process",)
+
+
 def test_connect_bootstraps_ai_binding_table_without_score_threshold(monkeypatch):
     with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
         svc.connect()
@@ -577,7 +621,9 @@ def test_connect_removes_score_threshold_from_legacy_ai_binding_table(monkeypatc
         ) in _index_definitions(tmp_db, "test_config_ai_binding_table")
 
 
-def test_connect_migrates_legacy_ai_runtime_tables(monkeypatch):
+def test_connect_migrates_missing_execution_mode_column_to_resident_process(
+    monkeypatch,
+):
     with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
         tmp_db.connect()
         tmp_db.execute_sql(
@@ -703,13 +749,14 @@ def test_connect_migrates_legacy_ai_runtime_tables(monkeypatch):
             "description",
             "legacy_source",
         } <= set(toolchain_columns)
+        assert toolchain_columns["execution_mode"][4] == "'resident_process'"
         assert tmp_db.execute_sql(
             """
             SELECT protocol_version, execution_mode, description, legacy_source
             FROM ai_toolchain_table
             WHERE toolchain_id = 'legacy-toolchain'
             """
-        ).fetchone() == (1, "oneshot_process", "", "keep")
+        ).fetchone() == (1, "resident_process", "", "keep")
 
         execution_columns = _table_columns(tmp_db, "ai_execution_table")
         assert {
@@ -745,3 +792,66 @@ def test_connect_migrates_legacy_ai_runtime_tables(monkeypatch):
             WHERE request_id = 'req-1'
             """
         ).fetchone() == (1, 0, 0, 0, 0, 0, 0, None, None, None, "keep")
+
+
+def test_connect_does_not_rewrite_existing_supported_execution_modes(monkeypatch):
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
+        tmp_db.connect()
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE ai_toolchain_table (
+                toolchain_id TEXT PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                version TEXT NOT NULL DEFAULT '',
+                entrypoint TEXT NOT NULL,
+                protocol_version INTEGER NOT NULL DEFAULT 1,
+                execution_mode TEXT NOT NULL DEFAULT 'oneshot_process',
+                default_timeout_ms INTEGER NOT NULL DEFAULT 30000,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                created_time TEXT NOT NULL DEFAULT '',
+                updated_time TEXT NOT NULL DEFAULT '',
+                legacy_source TEXT DEFAULT ''
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO ai_toolchain_table (
+                toolchain_id,
+                display_name,
+                version,
+                entrypoint,
+                protocol_version,
+                execution_mode,
+                default_timeout_ms,
+                enabled,
+                created_time,
+                updated_time,
+                legacy_source
+            ) VALUES (
+                'existing-toolchain',
+                'Existing Toolchain',
+                '1.0.0',
+                'python existing.py',
+                1,
+                'oneshot_process',
+                30000,
+                1,
+                '',
+                '',
+                'keep'
+            )
+            """
+        )
+
+        svc.connect()
+
+        columns = _table_columns(tmp_db, "ai_toolchain_table")
+        assert "description" in columns
+        assert tmp_db.execute_sql(
+            """
+            SELECT execution_mode, description, legacy_source
+            FROM ai_toolchain_table
+            WHERE toolchain_id = 'existing-toolchain'
+            """
+        ).fetchone() == ("oneshot_process", "", "keep")

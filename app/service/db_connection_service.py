@@ -86,7 +86,7 @@ class DbConnectionService:
             "ai_toolchain_table",
             [
                 ("protocol_version", "INTEGER NOT NULL DEFAULT 1"),
-                ("execution_mode", "TEXT NOT NULL DEFAULT 'oneshot_process'"),
+                ("execution_mode", "TEXT NOT NULL DEFAULT 'resident_process'"),
                 ("description", "TEXT NOT NULL DEFAULT ''"),
             ],
         )

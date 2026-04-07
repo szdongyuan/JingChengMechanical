@@ -24,7 +24,11 @@ from model.ai_execution_table import AiExecutionTable
 from model.test_config_table import TestConfigTable
 
 _SUPPORTED_PROTOCOL_VERSION = 1
-_SUPPORTED_EXECUTION_MODE = "oneshot_process"
+_DEFAULT_EXECUTION_MODE = "resident_process"
+_SUPPORTED_EXECUTION_MODES = {
+    "resident_process",
+    "oneshot_process",
+}
 
 _TZ8 = timezone(timedelta(hours=8))
 
@@ -129,6 +133,15 @@ class AiService:
     def _normalize_toolchain_payload(
         self, original_toolchain_id: str | None, data: dict
     ) -> dict:
+        execution_mode = data.get("execution_mode")
+        if execution_mode is None:
+            execution_mode = _DEFAULT_EXECUTION_MODE
+        if not isinstance(execution_mode, str):
+            raise ValueError("execution_mode must be a string")
+        execution_mode = execution_mode.strip()
+        if execution_mode not in _SUPPORTED_EXECUTION_MODES:
+            raise ValueError("execution_mode must be one of resident_process or oneshot_process")
+
         normalized = {
             "toolchain_id": self._normalize_toolchain_text(
                 data.get("toolchain_id"), "toolchain_id", allow_empty=False
@@ -147,7 +160,7 @@ class AiService:
             ),
             "enabled": bool(data.get("enabled", True)),
             "protocol_version": _SUPPORTED_PROTOCOL_VERSION,
-            "execution_mode": _SUPPORTED_EXECUTION_MODE,
+            "execution_mode": execution_mode,
         }
 
         timeout_ms = data.get("default_timeout_ms")
@@ -221,7 +234,7 @@ class AiService:
                 existing.enabled = normalized["enabled"]
                 existing.description = normalized["description"]
                 existing.protocol_version = _SUPPORTED_PROTOCOL_VERSION
-                existing.execution_mode = _SUPPORTED_EXECUTION_MODE
+                existing.execution_mode = normalized["execution_mode"]
                 existing.updated_time = timestamp
                 existing.save()
                 return existing.toolchain_id
