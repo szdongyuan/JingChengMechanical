@@ -50,6 +50,16 @@ def test_analysis_signals_exist():
         assert hasattr(EventBus, name), f"Missing signal: {name}"
 
 
+def test_event_bus_exposes_ai_toolchains_changed_signal():
+    bus = EventBus()
+    received = []
+
+    bus.ai_toolchains_changed.connect(lambda: received.append("fired"))
+    bus.ai_toolchains_changed.emit()
+
+    assert received == ["fired"]
+
+
 def test_analysis_frame_signals_include_run_id_contract():
     expected_argument_types = ("int", "QString", "int", "PyQt_PyObject")
 

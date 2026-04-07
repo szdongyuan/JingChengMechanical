@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QWheelEvent
 from PyQt6.QtWidgets import (
@@ -105,6 +107,8 @@ class ConfigModule(QWidget):
         self._current_config_id: int | None = None
         self._skip_reload = False
         self._golden_editor_state: dict[int, dict] = {}
+        self._ai_binding_dirty = False
+        self._suspend_ai_binding_dirty_tracking = False
 
         self._init_ui()
         self._connect_signals()
@@ -362,7 +366,18 @@ class ConfigModule(QWidget):
         self.spin_analysis.valueChanged.connect(
             lambda _value: self._refresh_all_golden_sections()
         )
+        self.chk_ai_enabled.toggled.connect(self._mark_ai_binding_dirty)
+        self.combo_ai_toolchain.currentIndexChanged.connect(self._mark_ai_binding_dirty)
+        self.spin_ai_timeout.valueChanged.connect(self._mark_ai_binding_dirty)
+        self.txt_ai_params.textChanged.connect(self._mark_ai_binding_dirty)
         self.services.bus.refresh_channels.connect(self._on_hardware_changed)
+        ai_toolchains_changed = getattr(
+            self.services.bus,
+            "ai_toolchains_changed",
+            None,
+        )
+        if ai_toolchains_changed is not None:
+            ai_toolchains_changed.connect(self._on_ai_toolchains_changed)
 
     def _populate_devices(self):
         """Populate input/output device combos from hss_service."""
@@ -1220,6 +1235,20 @@ class ConfigModule(QWidget):
         for c in cols:
             table.removeColumn(c)
 
+    @contextmanager
+    def _suspend_ai_binding_dirty_updates(self):
+        previous = self._suspend_ai_binding_dirty_tracking
+        self._suspend_ai_binding_dirty_tracking = True
+        try:
+            yield
+        finally:
+            self._suspend_ai_binding_dirty_tracking = previous
+
+    def _mark_ai_binding_dirty(self, *_args):
+        if self._suspend_ai_binding_dirty_tracking:
+            return
+        self._ai_binding_dirty = True
+
     def _refresh_ai_toolchains(self, bound_toolchain_id: str | None = None):
         """Populate the AI toolchain combobox from enabled toolchains.
 
@@ -1245,23 +1274,54 @@ class ConfigModule(QWidget):
                 label = f"{bound_toolchain_id} [已删除]"
             self.combo_ai_toolchain.addItem(label, bound_toolchain_id)
 
+    def _refresh_ai_toolchains_preserving_local_state(self):
+        current_toolchain_id = self.combo_ai_toolchain.currentData()
+        was_dirty = self._ai_binding_dirty
+        with self._suspend_ai_binding_dirty_updates():
+            self._refresh_ai_toolchains(current_toolchain_id)
+            idx = self.combo_ai_toolchain.findData(current_toolchain_id)
+            self.combo_ai_toolchain.setCurrentIndex(idx if idx >= 0 else 0)
+        self._ai_binding_dirty = was_dirty
+
     def _populate_ai_binding(self, config_id: int):
         """Load AI binding for config_id into the UI card."""
         binding = self.services.ai_service.resolve_binding(config_id)
         bound_tc_id = binding["toolchain_id"] if binding else None
-        self._refresh_ai_toolchains(bound_tc_id)
-        if binding is None:
-            self.chk_ai_enabled.setChecked(False)
-            self.combo_ai_toolchain.setCurrentIndex(0)
-            self.spin_ai_timeout.setValue(0)
-            self.txt_ai_params.setPlainText("{}")
-            return
+        with self._suspend_ai_binding_dirty_updates():
+            self._refresh_ai_toolchains(bound_tc_id)
+            if binding is None:
+                self.chk_ai_enabled.setChecked(False)
+                self.combo_ai_toolchain.setCurrentIndex(0)
+                self.spin_ai_timeout.setValue(0)
+                self.txt_ai_params.setPlainText("{}")
+            else:
+                self.chk_ai_enabled.setChecked(binding["enabled"])
+                idx = self.combo_ai_toolchain.findData(binding["toolchain_id"])
+                self.combo_ai_toolchain.setCurrentIndex(idx if idx >= 0 else 0)
+                self.spin_ai_timeout.setValue(binding["timeout_ms"] or 0)
+                self.txt_ai_params.setPlainText(binding["params_json"])
+        self._ai_binding_dirty = False
 
-        self.chk_ai_enabled.setChecked(binding["enabled"])
-        idx = self.combo_ai_toolchain.findData(binding["toolchain_id"])
-        self.combo_ai_toolchain.setCurrentIndex(idx if idx >= 0 else 0)
-        self.spin_ai_timeout.setValue(binding["timeout_ms"] or 0)
-        self.txt_ai_params.setPlainText(binding["params_json"])
+    def _on_ai_toolchains_changed(self):
+        if self._current_config_id is None:
+            return
+        if self._ai_binding_dirty:
+            self._refresh_ai_toolchains_preserving_local_state()
+            return
+        self._populate_ai_binding(self._current_config_id)
+
+    def _validate_ai_binding_selection(self, ai_data: dict) -> None:
+        if not ai_data["enabled"]:
+            return
+        tc_id = ai_data.get("toolchain_id")
+        if tc_id is None:
+            raise ValueError("请选择 AI 工具链")
+        valid_ids = {
+            tc["toolchain_id"]
+            for tc in self.services.ai_service.list_enabled_toolchains()
+        }
+        if tc_id not in valid_ids:
+            raise ValueError("AI 工具链不可用，请重新选择或清空绑定")
 
     def _populate_hardware_card(self, data: dict):
         """Load saved device/trigger/channel selections into hardware card widgets."""
@@ -1606,6 +1666,14 @@ class ConfigModule(QWidget):
                 self._finalize_failed_save(
                     message_title="AI 配置错误",
                     message_text=f"参数(JSON) 格式无效：{e}",
+                )
+                return
+            try:
+                self._validate_ai_binding_selection(ai_data)
+            except ValueError as e:
+                self._finalize_failed_save(
+                    message_title="AI 配置错误",
+                    message_text=str(e),
                 )
                 return
 

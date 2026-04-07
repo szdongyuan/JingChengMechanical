@@ -181,6 +181,7 @@ class EventBus(QObject):
 
     # 配置变化（供外部模块监听，如工单模块刷新可选配置列表）
     config_changed = pyqtSignal()
+    ai_toolchains_changed = pyqtSignal()
 
     # ── Analysis kernel real-time signals ──
     # Real-time analysis frames (~20 Hz per channel)

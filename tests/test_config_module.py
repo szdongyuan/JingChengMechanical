@@ -169,15 +169,22 @@ class _AiServiceStub:
     def __init__(self, binding: dict | None = None):
         self._binding = binding
         self.saved_bindings = []
+        self.enabled_toolchains = [
+            {"toolchain_id": "tc-1", "display_name": "Toolchain", "version": "1"}
+        ]
+        self.toolchains = {}
 
     def list_enabled_toolchains(self):
-        return [{"toolchain_id": "tc-1", "display_name": "Toolchain", "version": "1"}]
+        return list(self.enabled_toolchains)
 
     def resolve_binding(self, _config_id: int):
         return self._binding
 
     def get_toolchain(self, toolchain_id: str):
-        return SimpleNamespace(display_name=toolchain_id, version="1")
+        return self.toolchains.get(
+            toolchain_id,
+            SimpleNamespace(display_name=toolchain_id, version="1"),
+        )
 
     def save_binding(self, config_id: int, data: dict):
         self.saved_bindings.append((config_id, dict(data)))
@@ -245,6 +252,7 @@ def _make_module(
     services_bus = bus or SimpleNamespace(
         refresh_channels=_SignalStub(),
         status=_SignalStub(),
+        ai_toolchains_changed=_SignalStub(),
     )
     services = SimpleNamespace(
         config_service=config_service or _ConfigServiceStub(),
@@ -544,6 +552,207 @@ def test_on_save_keeps_main_config_analysis_offset_out_of_ai_binding_payload(
             },
         )
     ]
+
+
+def test_ai_toolchains_changed_refreshes_clean_binding_editor(qapp):
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        ai_toolchains_changed=_SignalStub(),
+    )
+    ai_service = _AiServiceStub(
+        binding={
+            "enabled": True,
+            "toolchain_id": "tc-1",
+            "timeout_ms": 1000,
+            "params_json": '{"mode": "v1"}',
+        }
+    )
+    ai_service.enabled_toolchains = [
+        {"toolchain_id": "tc-1", "display_name": "Toolchain 1", "version": "1"},
+    ]
+    module = _make_module(ai_service=ai_service, bus=bus)
+    module._current_config_id = 1
+    ai_service._binding = {
+        "enabled": True,
+        "toolchain_id": "tc-2",
+        "timeout_ms": 2000,
+        "params_json": '{"mode": "v2"}',
+    }
+    ai_service.enabled_toolchains = [
+        {"toolchain_id": "tc-2", "display_name": "Toolchain 2", "version": "2"},
+    ]
+
+    bus.ai_toolchains_changed.emit()
+
+    assert module.combo_ai_toolchain.currentData() == "tc-2"
+    assert module.spin_ai_timeout.value() == 2000
+    assert module.txt_ai_params.toPlainText() == '{"mode": "v2"}'
+
+
+def test_ai_toolchains_changed_preserves_dirty_local_ai_edits(qapp):
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        ai_toolchains_changed=_SignalStub(),
+    )
+    ai_service = _AiServiceStub(
+        binding={
+            "enabled": True,
+            "toolchain_id": "tc-1",
+            "timeout_ms": 1000,
+            "params_json": '{"mode": "server"}',
+        }
+    )
+    ai_service.enabled_toolchains = [
+        {"toolchain_id": "tc-1", "display_name": "Toolchain 1", "version": "1"},
+        {
+            "toolchain_id": "tc-local",
+            "display_name": "Toolchain Local",
+            "version": "9",
+        },
+    ]
+    module = _make_module(ai_service=ai_service, bus=bus)
+    module._current_config_id = 1
+    module._populate_ai_binding(1)
+    module.chk_ai_enabled.setChecked(True)
+    module.combo_ai_toolchain.setCurrentIndex(
+        module.combo_ai_toolchain.findData("tc-local")
+    )
+    module.spin_ai_timeout.setValue(9000)
+    module.txt_ai_params.setPlainText('{"mode": "local"}')
+    ai_service._binding = {
+        "enabled": True,
+        "toolchain_id": "tc-2",
+        "timeout_ms": 2000,
+        "params_json": '{"mode": "server-v2"}',
+    }
+    ai_service.enabled_toolchains = [
+        {
+            "toolchain_id": "tc-local",
+            "display_name": "Toolchain Local",
+            "version": "9",
+        },
+        {"toolchain_id": "tc-2", "display_name": "Toolchain 2", "version": "2"},
+    ]
+
+    bus.ai_toolchains_changed.emit()
+
+    assert module.combo_ai_toolchain.currentData() == "tc-local"
+    assert module.spin_ai_timeout.value() == 9000
+    assert module.txt_ai_params.toPlainText() == '{"mode": "local"}'
+
+
+def test_unavailable_toolchain_loaded_binding_injects_unavailable_toolchain_option(qapp):
+    ai_service = _AiServiceStub(
+        binding={
+            "enabled": True,
+            "toolchain_id": "disabled-tc",
+            "timeout_ms": 1000,
+            "params_json": '{"mode": "v1"}',
+        }
+    )
+    ai_service.enabled_toolchains = []
+    ai_service.toolchains["disabled-tc"] = SimpleNamespace(
+        display_name="Disabled Toolchain",
+        version="2",
+    )
+    module = _make_module(ai_service=ai_service)
+
+    module._populate_ai_binding(1)
+
+    assert module.combo_ai_toolchain.currentData() == "disabled-tc"
+    assert module.combo_ai_toolchain.itemText(1) == "Disabled Toolchain (v2) [不可用]"
+
+
+def test_save_rejects_dirty_stale_toolchain_selection(qapp, monkeypatch):
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args[1:3]),
+    )
+
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        ai_toolchains_changed=_SignalStub(),
+    )
+    config_service = _ConfigServiceStub()
+    ai_service = _AiServiceStub()
+    ai_service.enabled_toolchains = []
+    module = _make_module(
+        config_service=config_service,
+        ai_service=ai_service,
+        bus=bus,
+    )
+    module._current_config_id = 1
+    module.chk_ai_enabled.setChecked(True)
+    module.combo_ai_toolchain.addItem("Ghost", "gone")
+    module.combo_ai_toolchain.setCurrentIndex(module.combo_ai_toolchain.count() - 1)
+
+    module._on_save()
+
+    assert warnings == [("AI 配置错误", "AI 工具链不可用，请重新选择或清空绑定")]
+    assert config_service.begin_calls == 0
+    assert ai_service.saved_bindings == []
+
+
+def test_ai_toolchains_changed_keeps_dirty_renamed_stale_toolchain_until_save(
+    qapp,
+    monkeypatch,
+):
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args[1:3]),
+    )
+
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        ai_toolchains_changed=_SignalStub(),
+    )
+    config_service = _ConfigServiceStub()
+    ai_service = _AiServiceStub(
+        binding={
+            "enabled": True,
+            "toolchain_id": "tc-old",
+            "timeout_ms": 1000,
+            "params_json": '{"mode": "v1"}',
+        }
+    )
+    ai_service.enabled_toolchains = [
+        {"toolchain_id": "tc-old", "display_name": "Toolchain Old", "version": "1"},
+    ]
+    module = _make_module(
+        config_service=config_service,
+        ai_service=ai_service,
+        bus=bus,
+    )
+    module._current_config_id = 1
+    module._populate_ai_binding(1)
+    module.txt_ai_params.setPlainText('{"mode": "draft"}')
+    ai_service._binding = {
+        "enabled": True,
+        "toolchain_id": "tc-new",
+        "timeout_ms": 2000,
+        "params_json": '{"mode": "v2"}',
+    }
+    ai_service.enabled_toolchains = [
+        {"toolchain_id": "tc-new", "display_name": "Toolchain New", "version": "2"},
+    ]
+    ai_service.toolchains["tc-old"] = None
+
+    bus.ai_toolchains_changed.emit()
+
+    assert module.combo_ai_toolchain.currentData() == "tc-old"
+    assert module.txt_ai_params.toPlainText() == '{"mode": "draft"}'
+
+    module._on_save()
+
+    assert warnings == [("AI 配置错误", "AI 工具链不可用，请重新选择或清空绑定")]
+    assert config_service.begin_calls == 0
+    assert ai_service.saved_bindings == []
 
 
 def test_on_save_preserves_selected_channel_and_collapsed_sections_and_shows_success(
