@@ -23,6 +23,14 @@ _TZ8 = timezone(timedelta(hours=8))
 _STDOUT_EOF = object()
 
 
+class _RetryablePreSendInvalidationError(Exception):
+    pass
+
+
+class _PreSendInvalidationError(Exception):
+    pass
+
+
 def _now_iso() -> str:
     return datetime.now(_TZ8).isoformat()
 
@@ -64,10 +72,13 @@ class _ResidentProcess:
     stderr_buffer_byte_count: int = 0
     stderr_buffer_char_count: int = 0
     request_active: bool = False
+    request_pending_send: bool = False
+    request_write_flushed: bool = False
     idle_stdout_invalidated: bool = False
     idle_stderr_invalidated: bool = False
     active_stdout_line_count: int = 0
     active_stdout_protocol_error: str | None = None
+    pending_stderr_start_position: int | None = None
     active_stderr_start_position: int | None = None
     active_stderr_excerpt: str = ""
     completed_request_count: int = 0
@@ -95,18 +106,73 @@ class _ResidentProcess:
         if self._settle_idle_stderr_before_reuse():
             return False
         with self.state_lock:
+            if self.request_active or self.request_pending_send:
+                return False
             if self.idle_stdout_invalidated or self.idle_stderr_invalidated:
                 return False
-            self.request_active = True
+            self.request_pending_send = True
+            self.request_write_flushed = False
+            self.request_active = False
             self.active_stdout_line_count = 0
             self.active_stdout_protocol_error = None
         with self.stderr_lock:
-            self.active_stderr_start_position = self.stderr_total_bytes
+            self.pending_stderr_start_position = self.stderr_total_bytes
+            self.active_stderr_start_position = None
             self.active_stderr_excerpt = ""
         return True
 
+    def ready_to_send(self) -> bool:
+        with self.state_lock:
+            return (
+                self.request_pending_send
+                and not self.request_write_flushed
+                and not self.request_active
+                and not self.idle_stdout_invalidated
+                and not self.idle_stderr_invalidated
+            )
+
+    def mark_request_flushed(self) -> None:
+        with self.state_lock:
+            self.request_write_flushed = self.request_pending_send
+
+    def activate_request(self) -> bool:
+        with self.state_lock:
+            if (
+                not self.request_pending_send
+                or self.request_active
+                or self.idle_stdout_invalidated
+                or self.idle_stderr_invalidated
+            ):
+                return False
+            with self.stderr_lock:
+                if self.pending_stderr_start_position is None:
+                    self.active_stderr_start_position = self.stderr_total_bytes
+                else:
+                    self.active_stderr_start_position = (
+                        self.pending_stderr_start_position
+                    )
+                self.pending_stderr_start_position = None
+            self.request_pending_send = False
+            self.request_write_flushed = False
+            self.request_active = True
+        return True
+
+    def cancel_request(self) -> None:
+        with self.state_lock:
+            self.request_pending_send = False
+            self.request_write_flushed = False
+            self.request_active = False
+            self.active_stdout_line_count = 0
+            self.active_stdout_protocol_error = None
+        with self.stderr_lock:
+            self.pending_stderr_start_position = None
+            self.active_stderr_start_position = None
+            self.active_stderr_excerpt = ""
+
     def finish_request(self) -> tuple[str | None, str]:
         with self.state_lock:
+            self.request_pending_send = False
+            self.request_write_flushed = False
             self.request_active = False
             self.completed_request_count += 1
             violation = self.active_stdout_protocol_error
@@ -114,13 +180,16 @@ class _ResidentProcess:
             self.active_stdout_protocol_error = None
         with self.stderr_lock:
             excerpt = self.active_stderr_excerpt
+            self.pending_stderr_start_position = None
             self.active_stderr_start_position = None
             self.active_stderr_excerpt = ""
         return violation, excerpt
 
     def route_stdout_line(self, line: str) -> None:
         with self.state_lock:
-            active = self.request_active
+            active = self.request_active or (
+                self.request_pending_send and self.request_write_flushed
+            )
             if not active:
                 self.idle_stdout_invalidated = True
                 should_queue = False
@@ -141,7 +210,11 @@ class _ResidentProcess:
         if self.has_pending_stdout():
             return True
         with self.state_lock:
-            return self.idle_stdout_invalidated or self.idle_stderr_invalidated
+            return (
+                self.request_pending_send
+                or self.idle_stdout_invalidated
+                or self.idle_stderr_invalidated
+            )
 
     def active_stdout_state(self) -> tuple[int, str | None]:
         with self.state_lock:
@@ -190,13 +263,20 @@ class _ResidentProcess:
         if chunk_bytes <= 0:
             return
         mark_idle_stderr = False
+        with self.state_lock:
+            request_pending_send = self.request_pending_send
+            request_write_flushed = self.request_write_flushed
+            completed_request_count = self.completed_request_count
         with self.stderr_lock:
             self.stderr_chunks.append((start_position, chunk, chunk_bytes))
             self.stderr_buffer_byte_count += chunk_bytes
             self.stderr_buffer_char_count += len(chunk)
             active_start = self.active_stderr_start_position
             if active_start is None:
-                mark_idle_stderr = True
+                if request_pending_send and request_write_flushed:
+                    active_start = self.pending_stderr_start_position
+                elif request_pending_send or completed_request_count > 0:
+                    mark_idle_stderr = True
             if (
                 active_start is not None
                 and len(self.active_stderr_excerpt) < _EXCERPT_LIMIT
@@ -272,30 +352,107 @@ class ResidentToolchainRuntime:
             )
 
         cached_process: _ResidentProcess | None = None
+        process_instance_id: int | None = None
         request_started = False
         request_finished = False
         try:
             deadline = started_mono + (timeout_ms / 1000.0)
             while True:
+                try:
+                    self._remaining_timeout(deadline)
+                except TimeoutError:
+                    if cached_process is not None:
+                        self._discard_cached_process(
+                            toolchain_id,
+                            cached_process,
+                            deadline=deadline,
+                        )
+                    return self._build_result(
+                        status="timeout",
+                        started_at=started_at,
+                        started_mono=started_mono,
+                        error_summary="Process timed out",
+                        stderr_excerpt="",
+                        process_instance_id=process_instance_id,
+                    )
                 cached_process, _ = self._acquire_process(toolchain_id, entrypoint)
+                process_instance_id = cached_process.instance_id
                 if cached_process.begin_request():
-                    break
-                self._discard_cached_process(toolchain_id, cached_process)
-            request_started = True
-            try:
-                self._send_request(
-                    cached_process=cached_process,
-                    request_id=request_id,
-                    request_payload=request_payload,
-                    artifacts_dir=artifacts_dir,
+                    try:
+                        self._remaining_timeout(deadline)
+                        self._send_request(
+                            cached_process=cached_process,
+                            request_id=request_id,
+                            request_payload=request_payload,
+                            artifacts_dir=artifacts_dir,
+                        )
+                        request_started = True
+                        break
+                    except (
+                        _RetryablePreSendInvalidationError,
+                        _PreSendInvalidationError,
+                    ):
+                        cached_process.cancel_request()
+                        self._discard_cached_process(
+                            toolchain_id,
+                            cached_process,
+                            deadline=deadline,
+                        )
+                        cached_process = None
+                        process_instance_id = None
+                        continue
+                    except TimeoutError:
+                        cached_process.cancel_request()
+                        self._discard_cached_process(
+                            toolchain_id,
+                            cached_process,
+                            deadline=deadline,
+                        )
+                        return self._build_result(
+                            status="timeout",
+                            started_at=started_at,
+                            started_mono=started_mono,
+                            error_summary="Process timed out",
+                            stderr_excerpt="",
+                            process_instance_id=process_instance_id,
+                        )
+                    except (BrokenPipeError, OSError, ValueError) as exc:
+                        cached_process.cancel_request()
+                        self._discard_cached_process(
+                            toolchain_id,
+                            cached_process,
+                            deadline=deadline,
+                        )
+                        return self._build_result(
+                            status="process_error",
+                            started_at=started_at,
+                            started_mono=started_mono,
+                            error_summary=str(exc)[:_EXCERPT_LIMIT],
+                            stderr_excerpt="",
+                            process_instance_id=process_instance_id,
+                        )
+                self._discard_cached_process(
+                    toolchain_id,
+                    cached_process,
+                    deadline=deadline,
                 )
+                cached_process = None
+            try:
                 response_line = cached_process.wait_for_stdout_item(
                     self._remaining_timeout(deadline)
                 )
             except TimeoutError:
-                _, stderr_excerpt = self._complete_request(cached_process)
-                request_finished = True
-                self._discard_cached_process(toolchain_id, cached_process)
+                if request_started:
+                    _, stderr_excerpt = self._complete_request(cached_process)
+                    request_finished = True
+                else:
+                    cached_process.cancel_request()
+                    stderr_excerpt = ""
+                self._discard_cached_process(
+                    toolchain_id,
+                    cached_process,
+                    deadline=deadline,
+                )
                 return self._build_result(
                     status="timeout",
                     started_at=started_at,
@@ -305,9 +462,17 @@ class ResidentToolchainRuntime:
                     process_instance_id=cached_process.instance_id,
                 )
             except (BrokenPipeError, OSError, ValueError) as exc:
-                _, stderr_excerpt = self._complete_request(cached_process)
-                request_finished = True
-                self._discard_cached_process(toolchain_id, cached_process)
+                if request_started:
+                    _, stderr_excerpt = self._complete_request(cached_process)
+                    request_finished = True
+                else:
+                    cached_process.cancel_request()
+                    stderr_excerpt = ""
+                self._discard_cached_process(
+                    toolchain_id,
+                    cached_process,
+                    deadline=deadline,
+                )
                 return self._build_result(
                     status="process_error",
                     started_at=started_at,
@@ -420,9 +585,16 @@ class ResidentToolchainRuntime:
             if cached_process is not None:
                 if request_started and not request_finished:
                     _, stderr_excerpt = self._complete_request(cached_process)
+                elif not request_started:
+                    cached_process.cancel_request()
+                    stderr_excerpt = ""
                 else:
                     stderr_excerpt = ""
-                self._discard_cached_process(toolchain_id, cached_process)
+                self._discard_cached_process(
+                    toolchain_id,
+                    cached_process,
+                    deadline=deadline if "deadline" in locals() else None,
+                )
                 process_instance_id = cached_process.instance_id
             else:
                 stderr_excerpt = ""
@@ -564,6 +736,8 @@ class ResidentToolchainRuntime:
         stdin = cached_process.process.stdin
         if stdin is None:
             raise BrokenPipeError("Resident process stdin is unavailable")
+        if not cached_process.ready_to_send():
+            raise _RetryablePreSendInvalidationError()
         payload = {
             "message_type": "analyze",
             "request_id": request_id,
@@ -572,6 +746,9 @@ class ResidentToolchainRuntime:
         }
         stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
         stdin.flush()
+        cached_process.mark_request_flushed()
+        if not cached_process.activate_request():
+            raise _PreSendInvalidationError()
 
     @staticmethod
     def _parse_response_line(line: object) -> dict:
@@ -643,19 +820,56 @@ class ResidentToolchainRuntime:
         return "Resident emitted unexpected extra stdout during active request"
 
     def _discard_cached_process(
-        self, toolchain_id: str, cached_process: _ResidentProcess
+        self,
+        toolchain_id: str,
+        cached_process: _ResidentProcess,
+        *,
+        deadline: float | None = None,
     ) -> None:
         with self._cache_lock:
             current = self._processes.get(toolchain_id)
             if current is cached_process:
                 self._processes.pop(toolchain_id, None)
-        self._stop_process(cached_process)
+        self._stop_process(cached_process, deadline=deadline)
 
     def _pop_cached_process(self, toolchain_id: str) -> _ResidentProcess | None:
         with self._cache_lock:
             return self._processes.pop(toolchain_id, None)
 
-    def _stop_process(self, cached_process: _ResidentProcess) -> None:
+    @staticmethod
+    def _bounded_wait_timeout(limit_s: float, deadline: float | None) -> float | None:
+        if deadline is None:
+            return limit_s
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        return min(limit_s, remaining)
+
+    @classmethod
+    def _wait_for_process_exit(
+        cls,
+        process: subprocess.Popen[str],
+        *,
+        limit_s: float,
+        deadline: float | None,
+    ) -> bool:
+        if process.poll() is not None:
+            return True
+        wait_timeout = cls._bounded_wait_timeout(limit_s, deadline)
+        if wait_timeout is None:
+            return False
+        try:
+            process.wait(timeout=wait_timeout)
+            return True
+        except subprocess.TimeoutExpired:
+            return False
+
+    def _stop_process(
+        self,
+        cached_process: _ResidentProcess,
+        *,
+        deadline: float | None = None,
+    ) -> None:
         process = cached_process.process
         stdin = process.stdin
         if process.poll() is None and stdin is not None and not stdin.closed:
@@ -665,24 +879,29 @@ class ResidentToolchainRuntime:
             except Exception:
                 pass
 
-        try:
-            process.wait(timeout=_SHUTDOWN_GRACE_SECONDS)
-        except subprocess.TimeoutExpired:
+        if not self._wait_for_process_exit(
+            process,
+            limit_s=_SHUTDOWN_GRACE_SECONDS,
+            deadline=deadline,
+        ):
             try:
                 process.terminate()
             except Exception:
                 pass
-            try:
-                process.wait(timeout=1.0)
-            except subprocess.TimeoutExpired:
+            if not self._wait_for_process_exit(
+                process,
+                limit_s=1.0,
+                deadline=deadline,
+            ):
                 try:
                     process.kill()
                 except Exception:
                     pass
-                try:
-                    process.wait(timeout=1.0)
-                except Exception:
-                    pass
+                self._wait_for_process_exit(
+                    process,
+                    limit_s=1.0,
+                    deadline=deadline,
+                )
 
         for stream in (process.stdin, process.stdout, process.stderr):
             try:
