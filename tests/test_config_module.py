@@ -643,6 +643,55 @@ def test_ai_toolchains_changed_preserves_dirty_local_ai_edits(qapp):
     assert module.txt_ai_params.toPlainText() == '{"mode": "local"}'
 
 
+def test_ai_toolchains_changed_reloads_after_local_ai_edits_revert_to_clean_state(qapp):
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        ai_toolchains_changed=_SignalStub(),
+    )
+    ai_service = _AiServiceStub(
+        binding={
+            "enabled": True,
+            "toolchain_id": "tc-1",
+            "timeout_ms": 1000,
+            "params_json": '{"mode": "v1"}',
+        }
+    )
+    ai_service.enabled_toolchains = [
+        {"toolchain_id": "tc-1", "display_name": "Toolchain 1", "version": "1"},
+        {"toolchain_id": "tc-local", "display_name": "Toolchain Local", "version": "9"},
+    ]
+    module = _make_module(ai_service=ai_service, bus=bus)
+    module._current_config_id = 1
+    module._populate_ai_binding(1)
+
+    module.combo_ai_toolchain.setCurrentIndex(
+        module.combo_ai_toolchain.findData("tc-local")
+    )
+    module.spin_ai_timeout.setValue(9000)
+    module.txt_ai_params.setPlainText('{"mode": "local"}')
+
+    module.combo_ai_toolchain.setCurrentIndex(module.combo_ai_toolchain.findData("tc-1"))
+    module.spin_ai_timeout.setValue(1000)
+    module.txt_ai_params.setPlainText('{"mode": "v1"}')
+
+    ai_service._binding = {
+        "enabled": True,
+        "toolchain_id": "tc-2",
+        "timeout_ms": 2000,
+        "params_json": '{"mode": "v2"}',
+    }
+    ai_service.enabled_toolchains = [
+        {"toolchain_id": "tc-2", "display_name": "Toolchain 2", "version": "2"},
+    ]
+
+    bus.ai_toolchains_changed.emit()
+
+    assert module.combo_ai_toolchain.currentData() == "tc-2"
+    assert module.spin_ai_timeout.value() == 2000
+    assert module.txt_ai_params.toPlainText() == '{"mode": "v2"}'
+
+
 def test_unavailable_toolchain_loaded_binding_injects_unavailable_toolchain_option(qapp):
     ai_service = _AiServiceStub(
         binding={

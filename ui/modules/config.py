@@ -108,6 +108,7 @@ class ConfigModule(QWidget):
         self._skip_reload = False
         self._golden_editor_state: dict[int, dict] = {}
         self._ai_binding_dirty = False
+        self._loaded_ai_binding_state = self._normalize_ai_binding(None)
         self._suspend_ai_binding_dirty_tracking = False
 
         self._init_ui()
@@ -1247,7 +1248,31 @@ class ConfigModule(QWidget):
     def _mark_ai_binding_dirty(self, *_args):
         if self._suspend_ai_binding_dirty_tracking:
             return
-        self._ai_binding_dirty = True
+        self._ai_binding_dirty = (
+            self._capture_ai_binding_editor_state() != self._loaded_ai_binding_state
+        )
+
+    @staticmethod
+    def _normalize_ai_binding(binding: dict | None) -> dict:
+        binding = binding or {}
+        toolchain_id = binding.get("toolchain_id")
+        timeout_ms = binding.get("timeout_ms")
+        params_json = binding.get("params_json")
+        if toolchain_id == "":
+            toolchain_id = None
+        if not isinstance(timeout_ms, int) or timeout_ms <= 0:
+            timeout_ms = None
+        if not isinstance(params_json, str):
+            params_json = ""
+        return {
+            "enabled": bool(binding.get("enabled", False)),
+            "toolchain_id": toolchain_id,
+            "timeout_ms": timeout_ms,
+            "params_json": params_json.strip() or "{}",
+        }
+
+    def _capture_ai_binding_editor_state(self) -> dict:
+        return self._normalize_ai_binding(self._collect_ai_binding())
 
     def _refresh_ai_toolchains(self, bound_toolchain_id: str | None = None):
         """Populate the AI toolchain combobox from enabled toolchains.
@@ -1276,30 +1301,26 @@ class ConfigModule(QWidget):
 
     def _refresh_ai_toolchains_preserving_local_state(self):
         current_toolchain_id = self.combo_ai_toolchain.currentData()
-        was_dirty = self._ai_binding_dirty
         with self._suspend_ai_binding_dirty_updates():
             self._refresh_ai_toolchains(current_toolchain_id)
             idx = self.combo_ai_toolchain.findData(current_toolchain_id)
             self.combo_ai_toolchain.setCurrentIndex(idx if idx >= 0 else 0)
-        self._ai_binding_dirty = was_dirty
+        self._mark_ai_binding_dirty()
 
     def _populate_ai_binding(self, config_id: int):
         """Load AI binding for config_id into the UI card."""
-        binding = self.services.ai_service.resolve_binding(config_id)
-        bound_tc_id = binding["toolchain_id"] if binding else None
+        binding = self._normalize_ai_binding(
+            self.services.ai_service.resolve_binding(config_id)
+        )
+        bound_tc_id = binding["toolchain_id"]
         with self._suspend_ai_binding_dirty_updates():
             self._refresh_ai_toolchains(bound_tc_id)
-            if binding is None:
-                self.chk_ai_enabled.setChecked(False)
-                self.combo_ai_toolchain.setCurrentIndex(0)
-                self.spin_ai_timeout.setValue(0)
-                self.txt_ai_params.setPlainText("{}")
-            else:
-                self.chk_ai_enabled.setChecked(binding["enabled"])
-                idx = self.combo_ai_toolchain.findData(binding["toolchain_id"])
-                self.combo_ai_toolchain.setCurrentIndex(idx if idx >= 0 else 0)
-                self.spin_ai_timeout.setValue(binding["timeout_ms"] or 0)
-                self.txt_ai_params.setPlainText(binding["params_json"])
+            self.chk_ai_enabled.setChecked(binding["enabled"])
+            idx = self.combo_ai_toolchain.findData(binding["toolchain_id"])
+            self.combo_ai_toolchain.setCurrentIndex(idx if idx >= 0 else 0)
+            self.spin_ai_timeout.setValue(binding["timeout_ms"] or 0)
+            self.txt_ai_params.setPlainText(binding["params_json"])
+        self._loaded_ai_binding_state = binding
         self._ai_binding_dirty = False
 
     def _on_ai_toolchains_changed(self):
