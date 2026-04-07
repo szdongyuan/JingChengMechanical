@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
@@ -450,6 +451,32 @@ def test_launches_entrypoint_exactly_as_stored_without_extra_flags(
     assert ai_result["env_value"] == "inherited-value"
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows-specific entrypoint parsing")
+def test_windows_entrypoint_preserves_embedded_quotes_and_trailing_backslashes(
+    tmp_path: Path, runtime
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    expected_args = ["launch-introspect", 'quote"inside', "trail\\"]
+    entrypoint = subprocess.list2cmdline(
+        [sys.executable, "-u", str(script_path), *expected_args]
+    )
+
+    result = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-1",
+        request_payload=_request_payload(
+            "req-1",
+            include_launch_details=True,
+        ),
+        artifacts_dir=str(tmp_path / "artifacts"),
+        timeout_ms=1000,
+    )
+
+    assert result["module_status"] == "success"
+    assert result["response_payload"]["ai_result"]["argv"] == expected_args
+
+
 def test_malformed_json_line_returns_protocol_error_and_discards_cache(
     tmp_path: Path, runtime
 ):
@@ -487,6 +514,37 @@ def test_unexpected_message_type_returns_protocol_error_and_discards_cache(
 
     assert result["module_status"] == "protocol_error"
     assert "message_type" in result["error_summary"]
+    assert runtime.has_cached_process("tc-1") is False
+
+
+@pytest.mark.parametrize(
+    ("behavior", "error_fragment"),
+    [
+        ("unexpected_type", "message_type"),
+        ("extra_stdout_during_active_request", "unexpected extra stdout"),
+    ],
+)
+def test_post_response_discard_honors_request_deadline_and_duration(
+    tmp_path: Path, runtime, behavior: str, error_fragment: str
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    entrypoint = _entrypoint(script_path, "ignore-shutdown")
+
+    started = time.monotonic()
+    result = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-1",
+        request_payload=_request_payload("req-1", behavior=behavior),
+        artifacts_dir=str(tmp_path / "artifacts"),
+        timeout_ms=100,
+    )
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+
+    assert result["module_status"] == "protocol_error"
+    assert error_fragment in result["error_summary"]
+    assert elapsed_ms < 1000
+    assert abs(result["duration_ms"] - elapsed_ms) < 300
     assert runtime.has_cached_process("tc-1") is False
 
 

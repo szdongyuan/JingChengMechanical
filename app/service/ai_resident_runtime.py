@@ -41,14 +41,25 @@ def _now_iso() -> str:
 
 def _split_entrypoint(entrypoint: str) -> list[str]:
     if os.name == "nt":
-        parts = shlex.split(entrypoint, posix=False)
-        cleaned: list[str] = []
-        for part in parts:
-            if len(part) >= 2 and part[0] == part[-1] and part[0] in {"'", '"'}:
-                cleaned.append(part[1:-1])
-            else:
-                cleaned.append(part)
-        return cleaned
+        if not entrypoint.strip():
+            return []
+        import ctypes
+        from ctypes import wintypes
+
+        command_line_to_argv = ctypes.windll.shell32.CommandLineToArgvW
+        command_line_to_argv.argtypes = [
+            wintypes.LPCWSTR,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        command_line_to_argv.restype = ctypes.POINTER(wintypes.LPWSTR)
+        argc = ctypes.c_int()
+        argv_ptr = command_line_to_argv(entrypoint, ctypes.byref(argc))
+        if not argv_ptr:
+            raise ctypes.WinError()
+        try:
+            return [argv_ptr[index] for index in range(argc.value)]
+        finally:
+            ctypes.windll.kernel32.LocalFree(argv_ptr)
     return shlex.split(entrypoint)
 
 
@@ -608,7 +619,11 @@ class ResidentToolchainRuntime:
             request_finished = True
             result["stderr_excerpt"] = stderr_excerpt
             if active_stdout_error is not None:
-                self._discard_cached_process(toolchain_id, cached_process)
+                self._discard_cached_process(
+                    toolchain_id,
+                    cached_process,
+                    deadline=deadline,
+                )
                 return self._build_result(
                     status="protocol_error",
                     started_at=started_at,
@@ -618,7 +633,13 @@ class ResidentToolchainRuntime:
                     process_instance_id=cached_process.instance_id,
                 )
             if discard_after_completion:
-                self._discard_cached_process(toolchain_id, cached_process)
+                self._discard_cached_process(
+                    toolchain_id,
+                    cached_process,
+                    deadline=deadline,
+                )
+            result["finished_at"] = _now_iso()
+            result["duration_ms"] = int((time.monotonic() - started_mono) * 1000)
             return result
         except Exception as exc:
             if cached_process is not None:
