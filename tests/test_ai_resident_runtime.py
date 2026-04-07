@@ -627,6 +627,60 @@ def test_immediate_reuse_fence_timeout_stays_within_request_budget(
     assert runtime.has_cached_process("tc-1") is False
 
 
+def test_clipped_reuse_fence_timeout_does_not_capture_previous_late_stderr(
+    tmp_path: Path, runtime, monkeypatch
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    entrypoint = _entrypoint(script_path)
+    original_begin_request = ai_resident_runtime._ResidentProcess.begin_request
+    successful_begin_requests = 0
+
+    def delay_second_started_begin_request(self, **kwargs) -> bool:
+        nonlocal successful_begin_requests
+        started = original_begin_request(self, **kwargs)
+        if started:
+            successful_begin_requests += 1
+            if successful_begin_requests == 2:
+                time.sleep(0.25)
+        return started
+
+    monkeypatch.setattr(
+        ai_resident_runtime._ResidentProcess,
+        "begin_request",
+        delay_second_started_begin_request,
+    )
+
+    first = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-1",
+        request_payload=_request_payload(
+            "req-1",
+            behavior="stderr_after_success",
+            late_stderr_delay_s=0.2,
+            late_stderr_text="FIRST-LATE|",
+        ),
+        artifacts_dir=str(tmp_path / "artifacts-1"),
+        timeout_ms=1500,
+    )
+
+    second = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        request_id="req-2",
+        request_payload=_request_payload("req-2"),
+        artifacts_dir=str(tmp_path / "artifacts-2"),
+        timeout_ms=20,
+    )
+
+    assert first["module_status"] == "success"
+    assert second["module_status"] == "timeout"
+    assert second["error_summary"] == "Process timed out"
+    assert second["stderr_excerpt"] == ""
+    assert second["process_instance_id"] == first["process_instance_id"]
+    assert runtime.has_cached_process("tc-1") is False
+
+
 def test_timeout_does_not_materially_overrun_request_deadline(
     tmp_path: Path, runtime, monkeypatch
 ):

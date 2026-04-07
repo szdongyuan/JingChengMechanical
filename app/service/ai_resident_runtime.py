@@ -321,14 +321,16 @@ class _ResidentProcess:
                 with self.state_lock:
                     if self.idle_stdout_invalidated or self.idle_stderr_invalidated:
                         return True
+                    if self.post_request_reuse_fence_deadline != fence_deadline:
+                        return False
                     if (
-                        self.post_request_reuse_fence_deadline == fence_deadline
-                        and (
-                            request_deadline is None
-                            or fence_deadline <= request_deadline
-                        )
+                        request_deadline is not None
+                        and fence_deadline > request_deadline
                     ):
-                        self.post_request_reuse_fence_deadline = None
+                        raise TimeoutError(
+                            "Timed out waiting for resident reuse fence"
+                        )
+                    self.post_request_reuse_fence_deadline = None
                 return False
             time.sleep(min(_POST_REQUEST_REUSE_FENCE_POLL_SECONDS, remaining))
             with self.state_lock:
@@ -487,7 +489,25 @@ class ResidentToolchainRuntime:
                         process_instance_id=process_instance_id,
                     )
                 process_instance_id = cached_process.instance_id
-                if cached_process.begin_request(request_deadline=deadline):
+                try:
+                    begin_request_started = cached_process.begin_request(
+                        request_deadline=deadline
+                    )
+                except TimeoutError:
+                    self._discard_cached_process(
+                        toolchain_id,
+                        cached_process,
+                        deadline=deadline,
+                    )
+                    return self._build_result(
+                        status="timeout",
+                        started_at=started_at,
+                        started_mono=started_mono,
+                        error_summary="Process timed out",
+                        stderr_excerpt="",
+                        process_instance_id=process_instance_id,
+                    )
+                if begin_request_started:
                     try:
                         self._remaining_timeout(deadline)
                         self._send_request(
