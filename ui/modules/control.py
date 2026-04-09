@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from PyQt6.QtWidgets import (
     QHBoxLayout,
-    QLabel,
     QMessageBox,
     QPushButton,
     QVBoxLayout,
@@ -27,26 +26,26 @@ class ControlModule(QWidget):
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(10)
+        lay.setSpacing(8)
 
         row1 = QHBoxLayout()
         self.btn_start = QPushButton("▷ 自动开始")
         self.btn_start.setObjectName("Primary")
+        self.btn_start.setMinimumHeight(36)
         self.btn_stop = QPushButton("□ 停止测试")
         self.btn_stop.setObjectName("Danger")
+        self.btn_stop.setMinimumHeight(36)
         row1.addWidget(self.btn_start)
         row1.addWidget(self.btn_stop)
         lay.addLayout(row1)
 
-        self.lbl_start_reason = QLabel()
-        self.lbl_start_reason.setWordWrap(True)
-        lay.addWidget(self.lbl_start_reason)
-
         row2 = QHBoxLayout()
         self.btn_pass = QPushButton("√ 手工合格")
         self.btn_pass.setObjectName("Success")
+        self.btn_pass.setMinimumHeight(36)
         self.btn_fail = QPushButton("× 手工不合格")
         self.btn_fail.setObjectName("Fail")
+        self.btn_fail.setMinimumHeight(36)
         row2.addWidget(self.btn_pass)
         row2.addWidget(self.btn_fail)
         lay.addLayout(row2)
@@ -96,9 +95,7 @@ class ControlModule(QWidget):
             stop_active_run()
 
     def _sync_start_state(self) -> None:
-        reason = self._effective_start_reason()
         self.btn_start.setEnabled(not self._start_click_disabled())
-        self.lbl_start_reason.setText(reason)
 
     def _start_disabled_reason(self) -> str | None:
         if not self._start_click_disabled():
@@ -118,12 +115,6 @@ class ControlModule(QWidget):
         if self._factory_state.start_ready:
             return None
         return self._factory_state.start_ready_reason
-
-    def _effective_start_reason(self) -> str:
-        idle_blocking_reason = self._current_idle_blocking_reason()
-        if idle_blocking_reason:
-            return idle_blocking_reason
-        return self._factory_state.start_ready_reason or ""
 
     def _sync_blocked_start_dialog(self) -> None:
         if self._blocked_start_dialog is None:
