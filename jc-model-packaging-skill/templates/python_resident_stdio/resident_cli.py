@@ -39,7 +39,7 @@ def configure_utf8_stdio() -> None:
 
 def emit_json_line(payload: dict[str, Any]) -> None:
     try:
-        encoded = json.dumps(payload, ensure_ascii=False)
+        encoded = json.dumps(payload, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise ProtocolSerializationError(
             f"Protocol output is not JSON serializable: {exc}"
@@ -169,12 +169,15 @@ def initialize_runtime() -> None:
     try:
         _MODEL_HANDLE = preload_model()
         _ACTIVE_PROCESS_CACHE = get_process_cache()
-        _RUNTIME_INITIALIZED = True
     except Exception as exc:
-        reset_runtime_state()
+        # Preserve any partially initialized runtime state until fatal cleanup
+        # runs so shutdown hooks can still release handles or caches that were
+        # created before initialization failed.
+        _RUNTIME_INITIALIZED = False
         raise ResidentFatalError(
             f"Fatal resident runtime initialization failure: {exc}"
         ) from exc
+    _RUNTIME_INITIALIZED = True
 
 
 def load_analyze_envelope(envelope: Any) -> tuple[str, dict[str, Any], str]:

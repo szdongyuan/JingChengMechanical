@@ -939,6 +939,98 @@ def test_resident_main_emits_request_scoped_error_when_result_payload_is_not_jso
     ]
 
 
+def test_resident_main_emits_request_scoped_error_when_result_payload_contains_non_finite_float(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+    first_envelope = _resident_analyze_envelope(tmp_path, request_id="req_bad")
+    second_envelope = _resident_analyze_envelope(tmp_path, request_id="req_ok")
+
+    monkeypatch.setattr(module, "preload_model", lambda: "model")
+    monkeypatch.setattr(module, "get_process_cache", lambda: {})
+    monkeypatch.setattr(
+        module,
+        "preprocess_from_request",
+        lambda request_payload, selected_segment, cache: {"ok": True},
+    )
+    monkeypatch.setattr(
+        module,
+        "run_model",
+        lambda model_handle, preprocessed, cache: {"ok": True},
+    )
+
+    def build_result_envelope(request_id, inference_output, artifacts, artifacts_dir):
+        _ = (inference_output, artifacts, artifacts_dir)
+        if request_id == "req_bad":
+            return {
+                "message_type": "result",
+                "request_id": request_id,
+                "response": {
+                    "protocol_version": 1,
+                    "request_id": request_id,
+                    "toolchain_name": "Toolchain",
+                    "toolchain_version": "1.0.0",
+                    "ai_result": {
+                        "ai_label": "PASS",
+                        "score": float("nan"),
+                        "extra": {},
+                    },
+                },
+            }
+        return {
+            "message_type": "result",
+            "request_id": request_id,
+            "response": {
+                "protocol_version": 1,
+                "request_id": request_id,
+                "toolchain_name": "Toolchain",
+                "toolchain_version": "1.0.0",
+                "ai_result": {
+                    "ai_label": "PASS",
+                    "extra": {},
+                },
+            },
+        }
+
+    monkeypatch.setattr(module, "write_artifacts", lambda artifacts_dir, inference_output, cache: [])
+    monkeypatch.setattr(module, "build_result_envelope", build_result_envelope)
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl(first_envelope, second_envelope, {"message_type": "shutdown"}),
+    )
+
+    assert exit_code == 0
+    assert stderr_text == ""
+    lines = [json.loads(line) for line in stdout_text.strip().splitlines()]
+    assert lines == [
+        {
+            "message_type": "error",
+            "request_id": "req_bad",
+            "error": (
+                "Request failed: Protocol output is not JSON serializable: "
+                "Out of range float values are not JSON compliant: nan"
+            ),
+        },
+        {
+            "message_type": "result",
+            "request_id": "req_ok",
+            "response": {
+                "protocol_version": 1,
+                "request_id": "req_ok",
+                "toolchain_name": "Toolchain",
+                "toolchain_version": "1.0.0",
+                "ai_result": {
+                    "ai_label": "PASS",
+                    "extra": {},
+                },
+            },
+        },
+    ]
+
+
 def test_resident_main_falls_back_to_fatal_exit_when_serialization_error_envelope_cannot_be_emitted(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -991,6 +1083,48 @@ def test_resident_main_falls_back_to_fatal_exit_when_serialization_error_envelop
     assert (
         stderr_text
         == "Fatal resident protocol failure: Protocol output is not JSON serializable: Object of type object is not JSON serializable\n"
+    )
+    assert shutdown_calls == ["shutdown"]
+
+
+def test_resident_main_falls_back_to_fatal_exit_when_error_envelope_contains_non_finite_float(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+    envelope = _resident_analyze_envelope(tmp_path, request_id="req_bad")
+    shutdown_calls: list[str] = []
+
+    monkeypatch.setattr(module, "preload_model", lambda: "model")
+    monkeypatch.setattr(module, "get_process_cache", lambda: {})
+
+    def preprocess_from_request(request_payload, selected_segment, cache):
+        _ = (request_payload, selected_segment, cache)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(module, "preprocess_from_request", preprocess_from_request)
+    monkeypatch.setattr(
+        module,
+        "build_error_envelope",
+        lambda request_id, error_message: {
+            "message_type": "error",
+            "request_id": request_id,
+            "error": float("inf"),
+        },
+    )
+    monkeypatch.setattr(module, "shutdown_runtime", lambda: shutdown_calls.append("shutdown"))
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl(envelope),
+    )
+
+    assert exit_code == 1
+    assert stdout_text == ""
+    assert (
+        stderr_text
+        == "Fatal resident protocol failure: Protocol output is not JSON serializable: Out of range float values are not JSON compliant: inf\n"
     )
     assert shutdown_calls == ["shutdown"]
 
@@ -1107,6 +1241,48 @@ def test_resident_main_treats_preload_model_failure_as_fatal(
         == "Fatal resident runtime initialization failure: preload failed\n"
     )
     assert shutdown_calls == ["shutdown"]
+
+
+def test_resident_main_preserves_partial_runtime_state_for_shutdown_cleanup_then_resets_globals(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+    envelope = _resident_analyze_envelope(tmp_path)
+    cleanup_state: dict[str, object] = {}
+
+    monkeypatch.setattr(module, "preload_model", lambda: "model")
+
+    def fail_get_process_cache():
+        module._ACTIVE_PROCESS_CACHE = {"cache_key": "cache_value"}
+        raise RuntimeError("cache warmup failed")
+
+    def shutdown_runtime():
+        cleanup_state["model_handle"] = module._MODEL_HANDLE
+        cleanup_state["active_cache"] = dict(module._ACTIVE_PROCESS_CACHE)
+
+    monkeypatch.setattr(module, "get_process_cache", fail_get_process_cache)
+    monkeypatch.setattr(module, "shutdown_runtime", shutdown_runtime)
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl(envelope),
+    )
+
+    assert exit_code == 1
+    assert stdout_text == ""
+    assert (
+        stderr_text
+        == "Fatal resident runtime initialization failure: cache warmup failed\n"
+    )
+    assert cleanup_state == {
+        "model_handle": "model",
+        "active_cache": {"cache_key": "cache_value"},
+    }
+    assert module._MODEL_HANDLE is None
+    assert module._ACTIVE_PROCESS_CACHE == module._PROCESS_CACHE == {}
+    assert module._RUNTIME_INITIALIZED is False
 
 
 def test_resident_main_preserves_original_fatal_reason_when_shutdown_cleanup_fails(
