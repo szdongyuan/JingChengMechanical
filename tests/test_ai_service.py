@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import os
+from contextlib import contextmanager
 
 import pytest
 
@@ -535,12 +537,14 @@ class TestToolchainRegistryCrud:
         toolchain.execution_mode = "resident_process"
         toolchain.save()
 
+        @contextmanager
         def _raise_busy(_toolchain_id):
             raise ValueError("Resident toolchain is busy")
+            yield
 
         monkeypatch.setattr(
             ai_service._resident_runtime,
-            "ensure_mutation_allowed",
+            "hold_mutation_lease",
             _raise_busy,
         )
 
@@ -555,22 +559,30 @@ class TestToolchainRegistryCrud:
 
         assert AiToolchainTable.get_by_id("motor-ai").display_name == "Motor AI"
 
-    def test_save_toolchain_update_invalidates_resident_cache_after_success(
+    def test_save_toolchain_update_holds_resident_lease_through_invalidate(
         self, ai_service, toolchain, monkeypatch
     ):
         toolchain.execution_mode = "resident_process"
         toolchain.save()
         calls = []
+        lease_state = {"held": False}
 
-        monkeypatch.setattr(
-            ai_service._resident_runtime,
-            "ensure_mutation_allowed",
-            lambda toolchain_id: calls.append(("ensure", toolchain_id)),
-        )
+        @contextmanager
+        def _hold(toolchain_id):
+            calls.append(("lease_enter", toolchain_id))
+            lease_state["held"] = True
+            try:
+                yield
+            finally:
+                lease_state["held"] = False
+                calls.append(("lease_exit", toolchain_id))
+
+        monkeypatch.setattr(ai_service._resident_runtime, "hold_mutation_lease", _hold)
 
         def _invalidate(toolchain_id):
             row = AiToolchainTable.get_by_id("motor-ai")
             assert row.entrypoint == "python motor_ai_v2.py"
+            assert lease_state["held"] is True
             calls.append(("invalidate", toolchain_id))
 
         monkeypatch.setattr(ai_service._resident_runtime, "invalidate", _invalidate)
@@ -584,11 +596,12 @@ class TestToolchainRegistryCrud:
         )
 
         assert calls == [
-            ("ensure", "motor-ai"),
+            ("lease_enter", "motor-ai"),
             ("invalidate", "motor-ai"),
+            ("lease_exit", "motor-ai"),
         ]
 
-    def test_save_toolchain_rename_uses_old_resident_lease_and_invalidates_old_cache_after_success(
+    def test_save_toolchain_rename_holds_old_resident_lease_through_invalidate(
         self, ai_service, config, toolchain, monkeypatch
     ):
         toolchain.execution_mode = "resident_process"
@@ -601,18 +614,26 @@ class TestToolchainRegistryCrud:
             params_json="{}",
         )
         calls = []
+        lease_state = {"held": False}
 
-        monkeypatch.setattr(
-            ai_service._resident_runtime,
-            "ensure_mutation_allowed",
-            lambda toolchain_id: calls.append(("ensure", toolchain_id)),
-        )
+        @contextmanager
+        def _hold(toolchain_id):
+            calls.append(("lease_enter", toolchain_id))
+            lease_state["held"] = True
+            try:
+                yield
+            finally:
+                lease_state["held"] = False
+                calls.append(("lease_exit", toolchain_id))
+
+        monkeypatch.setattr(ai_service._resident_runtime, "hold_mutation_lease", _hold)
 
         def _invalidate(toolchain_id):
             assert ai_service.get_toolchain("motor-ai") is None
             assert ai_service.get_toolchain("motor-ai-v2") is not None
             rebound = AiBindingTable.get(AiBindingTable.config == config.config_id)
             assert rebound.toolchain_id == "motor-ai-v2"
+            assert lease_state["held"] is True
             calls.append(("invalidate", toolchain_id))
 
         monkeypatch.setattr(ai_service._resident_runtime, "invalidate", _invalidate)
@@ -627,8 +648,9 @@ class TestToolchainRegistryCrud:
 
         assert result == "motor-ai-v2"
         assert calls == [
-            ("ensure", "motor-ai"),
+            ("lease_enter", "motor-ai"),
             ("invalidate", "motor-ai"),
+            ("lease_exit", "motor-ai"),
         ]
 
     def test_save_toolchain_rename_propagates_busy_error_without_mutation(
@@ -645,12 +667,14 @@ class TestToolchainRegistryCrud:
         )
         invalidations = []
 
+        @contextmanager
         def _raise_busy(_toolchain_id):
             raise ValueError("Resident toolchain is busy")
+            yield
 
         monkeypatch.setattr(
             ai_service._resident_runtime,
-            "ensure_mutation_allowed",
+            "hold_mutation_lease",
             _raise_busy,
         )
         monkeypatch.setattr(
@@ -674,7 +698,7 @@ class TestToolchainRegistryCrud:
         assert rebound.toolchain_id == "motor-ai"
         assert invalidations == []
 
-    def test_delete_toolchain_checks_resident_lease_and_invalidates_after_success(
+    def test_delete_toolchain_holds_resident_lease_through_invalidate_after_success(
         self, ai_service, config, toolchain, monkeypatch
     ):
         toolchain.execution_mode = "resident_process"
@@ -687,17 +711,25 @@ class TestToolchainRegistryCrud:
             params_json="{}",
         )
         calls = []
+        lease_state = {"held": False}
 
-        monkeypatch.setattr(
-            ai_service._resident_runtime,
-            "ensure_mutation_allowed",
-            lambda toolchain_id: calls.append(("ensure", toolchain_id)),
-        )
+        @contextmanager
+        def _hold(toolchain_id):
+            calls.append(("lease_enter", toolchain_id))
+            lease_state["held"] = True
+            try:
+                yield
+            finally:
+                lease_state["held"] = False
+                calls.append(("lease_exit", toolchain_id))
+
+        monkeypatch.setattr(ai_service._resident_runtime, "hold_mutation_lease", _hold)
 
         def _invalidate(toolchain_id):
             assert ai_service.get_toolchain("motor-ai") is None
             binding = AiBindingTable.get(AiBindingTable.config == config.config_id)
             assert binding.toolchain_id is None
+            assert lease_state["held"] is True
             calls.append(("invalidate", toolchain_id))
 
         monkeypatch.setattr(ai_service._resident_runtime, "invalidate", _invalidate)
@@ -705,8 +737,9 @@ class TestToolchainRegistryCrud:
         ai_service.delete_toolchain("motor-ai")
 
         assert calls == [
-            ("ensure", "motor-ai"),
+            ("lease_enter", "motor-ai"),
             ("invalidate", "motor-ai"),
+            ("lease_exit", "motor-ai"),
         ]
 
     def test_delete_toolchain_busy_error_does_not_mutate_or_invalidate(
@@ -723,12 +756,14 @@ class TestToolchainRegistryCrud:
         )
         invalidations = []
 
+        @contextmanager
         def _raise_busy(_toolchain_id):
             raise ValueError("Resident toolchain is busy")
+            yield
 
         monkeypatch.setattr(
             ai_service._resident_runtime,
-            "ensure_mutation_allowed",
+            "hold_mutation_lease",
             _raise_busy,
         )
         monkeypatch.setattr(
@@ -760,11 +795,15 @@ class TestToolchainRegistryCrud:
         )
         calls = []
 
-        monkeypatch.setattr(
-            ai_service._resident_runtime,
-            "ensure_mutation_allowed",
-            lambda toolchain_id: calls.append(("ensure", toolchain_id)),
-        )
+        @contextmanager
+        def _hold(toolchain_id):
+            calls.append(("lease_enter", toolchain_id))
+            try:
+                yield
+            finally:
+                calls.append(("lease_exit", toolchain_id))
+
+        monkeypatch.setattr(ai_service._resident_runtime, "hold_mutation_lease", _hold)
         monkeypatch.setattr(
             ai_service._resident_runtime,
             "invalidate",
@@ -788,7 +827,10 @@ class TestToolchainRegistryCrud:
         binding = AiBindingTable.get(AiBindingTable.config == config.config_id)
         assert binding.enabled is True
         assert binding.toolchain_id == "motor-ai"
-        assert calls == [("ensure", "motor-ai")]
+        assert calls == [
+            ("lease_enter", "motor-ai"),
+            ("lease_exit", "motor-ai"),
+        ]
 
 
 class TestRunAiAnalysisRouting:
@@ -924,6 +966,62 @@ class TestRunAiAnalysisRouting:
         assert result["module_status"] == "success"
         assert execute_calls[0]["request_json_path"] == result["request_json_path"]
         assert execute_calls[0]["response_json_path"] == result["response_json_path"]
+
+    def test_run_ai_analysis_resident_invalid_logical_payload_does_not_persist_response_json(
+        self, ai_service, config, toolchain, tmp_path, monkeypatch
+    ):
+        toolchain.execution_mode = "resident_process"
+        toolchain.save()
+        AiBindingTable.create(
+            config=config,
+            toolchain=toolchain,
+            enabled=True,
+            params_json="{}",
+        )
+        segments = _analysis_segments(tmp_path)
+
+        def _analyze(**kwargs):
+            return {
+                "module_status": "success",
+                "started_at": "2026-04-09T00:00:00+08:00",
+                "finished_at": "2026-04-09T00:00:01+08:00",
+                "duration_ms": 15,
+                "error_summary": None,
+                "response_payload": {
+                    "protocol_version": 1,
+                    "request_id": kwargs["request_id"],
+                    "toolchain_name": "Resident Toolchain",
+                    "toolchain_version": "1.0",
+                    "ai_result": {
+                        "ai_label": "PASS",
+                        "score": "bad-score",
+                        "artifacts": [],
+                    },
+                },
+                "stdout_excerpt": None,
+                "stderr_excerpt": "resident stderr",
+                "process_instance_id": 7,
+            }
+
+        monkeypatch.setattr(ai_service._resident_runtime, "analyze", _analyze)
+        monkeypatch.setattr(
+            ai_service,
+            "execute_toolchain",
+            lambda **kwargs: pytest.fail("oneshot path should not run"),
+        )
+
+        result = ai_service.run_ai_analysis(
+            config_id=config.config_id,
+            test_run_id="run_resident_invalid_payload",
+            segments=segments,
+            context={"config_id": config.config_id},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+
+        assert result["module_status"] == "invalid_output"
+        assert result["error_summary"] == "ai_result.score must be numeric (not bool)"
+        assert os.path.isfile(result["request_json_path"])
+        assert os.path.exists(result["response_json_path"]) is False
 
 
 class TestBindingResolver:

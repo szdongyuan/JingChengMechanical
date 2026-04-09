@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
 from peewee import DoesNotExist
@@ -237,49 +238,54 @@ class AiService:
             if existing is None:
                 raise ValueError("toolchain_id not found")
             if self._is_resident_toolchain(existing):
-                self._resident_runtime.ensure_mutation_allowed(original_toolchain_id)
                 resident_mutation_toolchain_id = original_toolchain_id
-        normalized = self._normalize_toolchain_payload(original_toolchain_id, data)
-        timestamp = now_str()
+        mutation_lease = (
+            self._resident_runtime.hold_mutation_lease(resident_mutation_toolchain_id)
+            if resident_mutation_toolchain_id is not None
+            else nullcontext()
+        )
+        with mutation_lease:
+            normalized = self._normalize_toolchain_payload(original_toolchain_id, data)
+            timestamp = now_str()
 
-        with database.atomic():
-            if original_toolchain_id is None:
-                row = AiToolchainTable.create(
-                    **normalized,
-                    created_time=timestamp,
-                    updated_time=timestamp,
-                )
-                return row.toolchain_id
+            with database.atomic():
+                if original_toolchain_id is None:
+                    row = AiToolchainTable.create(
+                        **normalized,
+                        created_time=timestamp,
+                        updated_time=timestamp,
+                    )
+                    return row.toolchain_id
 
-            assert existing is not None
+                assert existing is not None
 
-            if normalized["toolchain_id"] == original_toolchain_id:
-                existing.display_name = normalized["display_name"]
-                existing.version = normalized["version"]
-                existing.entrypoint = normalized["entrypoint"]
-                existing.default_timeout_ms = normalized["default_timeout_ms"]
-                existing.enabled = normalized["enabled"]
-                existing.description = normalized["description"]
-                existing.protocol_version = _SUPPORTED_PROTOCOL_VERSION
-                existing.execution_mode = normalized["execution_mode"]
-                existing.updated_time = timestamp
-                existing.save()
-                if resident_mutation_toolchain_id is not None:
-                    self._resident_runtime.invalidate(resident_mutation_toolchain_id)
-                return existing.toolchain_id
+                if normalized["toolchain_id"] == original_toolchain_id:
+                    existing.display_name = normalized["display_name"]
+                    existing.version = normalized["version"]
+                    existing.entrypoint = normalized["entrypoint"]
+                    existing.default_timeout_ms = normalized["default_timeout_ms"]
+                    existing.enabled = normalized["enabled"]
+                    existing.description = normalized["description"]
+                    existing.protocol_version = _SUPPORTED_PROTOCOL_VERSION
+                    existing.execution_mode = normalized["execution_mode"]
+                    existing.updated_time = timestamp
+                    existing.save()
+                    saved_toolchain_id = existing.toolchain_id
+                else:
+                    AiToolchainTable.create(
+                        **normalized,
+                        created_time=existing.created_time,
+                        updated_time=timestamp,
+                    )
+                    self._rewrite_toolchain_binding_ids(
+                        original_toolchain_id, normalized["toolchain_id"]
+                    )
+                    self._delete_toolchain_row(original_toolchain_id)
+                    saved_toolchain_id = normalized["toolchain_id"]
 
-            AiToolchainTable.create(
-                **normalized,
-                created_time=existing.created_time,
-                updated_time=timestamp,
-            )
-            self._rewrite_toolchain_binding_ids(
-                original_toolchain_id, normalized["toolchain_id"]
-            )
-            self._delete_toolchain_row(original_toolchain_id)
             if resident_mutation_toolchain_id is not None:
                 self._resident_runtime.invalidate(resident_mutation_toolchain_id)
-            return normalized["toolchain_id"]
+            return saved_toolchain_id
 
     def delete_toolchain(self, toolchain_id: str):
         database = AiToolchainTable._meta.database
@@ -287,14 +293,18 @@ class AiService:
         if existing is None:
             raise ValueError("toolchain_id not found")
         should_invalidate_resident = self._is_resident_toolchain(existing)
-        if should_invalidate_resident:
-            self._resident_runtime.ensure_mutation_allowed(toolchain_id)
+        mutation_lease = (
+            self._resident_runtime.hold_mutation_lease(toolchain_id)
+            if should_invalidate_resident
+            else nullcontext()
+        )
 
-        with database.atomic():
-            self._clear_toolchain_bindings(toolchain_id)
-            self._delete_toolchain_row(toolchain_id)
-        if should_invalidate_resident:
-            self._resident_runtime.invalidate(toolchain_id)
+        with mutation_lease:
+            with database.atomic():
+                self._clear_toolchain_bindings(toolchain_id)
+                self._delete_toolchain_row(toolchain_id)
+            if should_invalidate_resident:
+                self._resident_runtime.invalidate(toolchain_id)
 
     # ── Binding Resolver ────────────────────────────────────
 
@@ -545,19 +555,7 @@ class AiService:
 
     # ── Result Validator ────────────────────────────────────
 
-    def validate_response(
-        self, response_json_path: str, request_id: str
-    ) -> dict:
-        """Validate response.json. Returns dict with 'status' and optional 'ai_result'."""
-        if not os.path.isfile(response_json_path):
-            return {"status": "protocol_error", "error": "response.json not found"}
-
-        try:
-            with open(response_json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            return {"status": "invalid_output", "error": f"Invalid JSON: {e}"}
-
+    def _validate_response_payload(self, data: object, request_id: str) -> dict:
         if not isinstance(data, dict):
             return {"status": "invalid_output", "error": "Root must be a JSON object"}
 
@@ -628,6 +626,21 @@ class AiService:
             "toolchain_version": data.get("toolchain_version"),
         }
 
+    def validate_response(
+        self, response_json_path: str, request_id: str
+    ) -> dict:
+        """Validate response.json. Returns dict with 'status' and optional 'ai_result'."""
+        if not os.path.isfile(response_json_path):
+            return {"status": "protocol_error", "error": "response.json not found"}
+
+        try:
+            with open(response_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            return {"status": "invalid_output", "error": f"Invalid JSON: {e}"}
+
+        return self._validate_response_payload(data, request_id)
+
     # ── Persistence ─────────────────────────────────────────
 
     def save_execution(self, envelope: dict) -> AiExecutionTable:
@@ -691,15 +704,19 @@ class AiService:
             validation = None
             module_status = resident_result["module_status"]
             if module_status == "success":
-                with open(response_json_path, "w", encoding="utf-8") as f:
-                    json.dump(
-                        resident_result["response_payload"],
-                        f,
-                        ensure_ascii=False,
-                        indent=2,
-                    )
-                validation = self.validate_response(response_json_path, request_id)
+                validation = self._validate_response_payload(
+                    resident_result["response_payload"],
+                    request_id,
+                )
                 module_status = validation["status"]
+                if module_status == "success":
+                    with open(response_json_path, "w", encoding="utf-8") as f:
+                        json.dump(
+                            validation["raw_response"],
+                            f,
+                            ensure_ascii=False,
+                            indent=2,
+                        )
             return exec_result, validation, module_status
 
         if toolchain.execution_mode != "oneshot_process":
