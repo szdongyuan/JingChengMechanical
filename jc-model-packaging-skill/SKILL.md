@@ -40,6 +40,12 @@ Default recommendation when no better domain rule exists:
 - trim if longer
 - zero-pad if shorter
 
+If the event may appear anywhere in a long recording, use sliding-window segmentation
+with a defined aggregation rule. Do not leave the aggregation
+rule implicit. State whether the final decision uses max score across windows,
+mean score across windows, majority vote, any-positive-above-threshold, or
+another explicit rule.
+
 ## Non-Negotiable Rules
 
 - Do not inspect any source repository.
@@ -182,12 +188,24 @@ Before claiming success, verify the chosen runtime shape:
   and compare the result against `templates/smoke_test/response.success.json`.
 - Resident packaging: replay `templates/smoke_test/resident_input.jsonl` and
   compare success and failure envelopes against the resident smoke fixtures.
+- Resident packaging: run a resident warm-path verification by sending
+  repeated `analyze` requests through the same process before shutdown.
 - Windows `.exe` packaging: build the requested mode and verify the generated
   deliverable still follows the same protocol.
 - Validate that every declared artifact exists, is readable, and uses a
   relative traversal-safe `relative_path`.
 - Confirm that fatal one-shot failures stay on `stderr` as human-readable
   non-protocol text.
+
+## Final Report Checklist
+
+Your final report must include:
+
+- the chosen mode
+- why it was chosen
+- the duration policy
+- the generated files
+- how verification was run
 
 ## Packaging Workflow
 

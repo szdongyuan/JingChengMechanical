@@ -199,6 +199,23 @@ def test_skill_guidance_recommends_resident_mode_for_expensive_imports_and_reuse
     assert "repeated requests" in skill_text
 
 
+def test_skill_guidance_recommends_sliding_window_segmentation_for_event_anywhere_audio():
+    skill_text = _read_text(ROOT / "SKILL.md").lower()
+    assert "event may appear anywhere in a long recording" in skill_text
+    assert "sliding-window segmentation" in skill_text or "sliding window segmentation" in skill_text
+    assert "aggregation rule" in skill_text
+
+
+def test_skill_guidance_includes_final_report_checklist():
+    skill_text = _read_text(ROOT / "SKILL.md").lower()
+    assert "final report checklist" in skill_text
+    assert "chosen mode" in skill_text
+    assert "why it was chosen" in skill_text
+    assert "duration policy" in skill_text
+    assert "generated files" in skill_text
+    assert "how verification was run" in skill_text
+
+
 def test_metadata_templates_capture_duration_contract_and_packaging_choices():
     metadata_readme = _read_text(ROOT / "templates" / "metadata" / "README.md").lower()
     contract_template = _read_text(
@@ -719,6 +736,13 @@ def test_smoke_examples_lock_protocol_and_artifact_rules():
     assert "non-protocol" in smoke_readme
     assert stderr_text.startswith("Fatal")
     assert not stderr_text.startswith("{")
+
+
+def test_smoke_readme_requires_resident_warm_path_verification_on_the_same_process():
+    smoke_readme = _read_text(ROOT / "templates" / "smoke_test" / "README.md").lower()
+    assert "warm-path" in smoke_readme or "warm path" in smoke_readme
+    assert "same process" in smoke_readme
+    assert "repeated analyze" in smoke_readme
 
 
 def test_skill_contains_no_repo_dependent_instructions():
