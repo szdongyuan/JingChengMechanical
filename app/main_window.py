@@ -732,6 +732,9 @@ class MainWindow(QMainWindow):
         self.services.bus.log.emit("[App] 关闭程序")
         try:
             self.services.shutdown()
+        except Exception:
+            pass
+        try:
             stop_camera = getattr(getattr(self, "video", None), "stop_camera", None)
             if callable(stop_camera):
                 stop_camera()

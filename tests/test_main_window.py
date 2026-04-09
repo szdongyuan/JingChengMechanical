@@ -565,6 +565,23 @@ def test_closing_main_window_swallows_camera_cleanup_errors_after_shared_shutdow
     window.video.stop_camera.assert_called_once_with()
 
 
+def test_closing_main_window_still_stops_camera_when_shared_shutdown_raises(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(monkeypatch)
+    _show(window, qapp)
+    services.shutdown.side_effect = RuntimeError("shutdown failed")
+    window.video.stop_camera = MagicMock()
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+
+    services.shutdown.assert_called_once_with()
+    services.db.close.assert_not_called()
+    window.video.stop_camera.assert_called_once_with()
+
+
 def _armed_state(
     *,
     selected_config_ids: tuple[int, ...] = (101, 202),
