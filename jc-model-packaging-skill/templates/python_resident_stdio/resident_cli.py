@@ -57,6 +57,16 @@ def emit_protocol_line(payload: dict[str, Any]) -> None:
         ) from exc
 
 
+def reject_non_standard_constant(constant_name: str) -> None:
+    raise ProtocolError(
+        f"Inbound JSON must not use non-standard constant: {constant_name}."
+    )
+
+
+def load_protocol_line(line: str) -> Any:
+    return json.loads(line, parse_constant=reject_non_standard_constant)
+
+
 def log_stderr(message: str) -> None:
     print(message, file=sys.stderr, flush=True)
 
@@ -376,7 +386,7 @@ def main() -> int:
     configure_utf8_stdio()
     try:
         for line in sys.stdin:
-            envelope = json.loads(line)
+            envelope = load_protocol_line(line)
             if not isinstance(envelope, dict):
                 raise ProtocolError("Inbound message must be a JSON object.")
 

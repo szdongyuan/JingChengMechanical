@@ -581,8 +581,10 @@ def test_resident_template_mentions_required_hooks():
         "def handle_analyze(request_id: str, request_payload: dict, artifacts_dir: str) -> dict:"
         in text
     )
+    assert "def load_protocol_line(line: str) -> Any:" in text
     assert "for line in sys.stdin" in text
-    assert "json.loads(line)" in text
+    assert "load_protocol_line(line)" in text
+    assert "parse_constant=reject_non_standard_constant" in text
     assert "preload_model" in text
     assert "cache" in text.lower()
     assert "error" in text.lower()
@@ -619,6 +621,36 @@ def test_resident_main_exits_non_zero_for_malformed_protocol_envelope(
     assert exit_code == 1
     assert stdout_text == ""
     assert "Malformed resident protocol message: analyze requires object request." in stderr_text
+
+
+@pytest.mark.parametrize(
+    ("non_finite_value", "constant_name"),
+    [
+        (float("nan"), "NaN"),
+        (float("inf"), "Infinity"),
+        (float("-inf"), "-Infinity"),
+    ],
+)
+def test_resident_main_exits_non_zero_for_inbound_non_standard_json_constants(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    non_finite_value: float,
+    constant_name: str,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+    envelope = _resident_analyze_envelope(tmp_path)
+    envelope["request"]["context"]["bad_value"] = non_finite_value
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl(envelope),
+    )
+
+    assert exit_code == 1
+    assert stdout_text == ""
+    assert "Malformed resident protocol message:" in stderr_text
+    assert constant_name in stderr_text
 
 
 def test_resident_main_shutdown_emits_no_stdout(monkeypatch: pytest.MonkeyPatch):
