@@ -1,6 +1,8 @@
 """Tests for AiService — toolchain registry, binding resolution, binding CRUD."""
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from model.ai_execution_table import AiExecutionTable
@@ -43,9 +45,28 @@ def _toolchain_payload(**overrides):
     return payload
 
 
+def _analysis_segments(tmp_path):
+    audio_path = tmp_path / "segment.wav"
+    audio_path.write_bytes(b"\x00" * 64)
+    return [{
+        "segment_id": "seg-1",
+        "role": "device_1",
+        "audio_path": str(audio_path),
+        "channels": [1],
+        "duration_ms": 1000,
+        "sample_rate": 48000,
+        "metadata": {},
+    }]
+
+
 @pytest.fixture
 def ai_service():
-    return AiService()
+    service = AiService()
+    try:
+        yield service
+    finally:
+        if hasattr(service, "_resident_runtime"):
+            service._resident_runtime.shutdown_all()
 
 
 @pytest.fixture
@@ -507,6 +528,402 @@ class TestToolchainRegistryCrud:
         binding = AiBindingTable.get(AiBindingTable.config == config.config_id)
         assert binding.enabled is True
         assert binding.toolchain_id == "motor-ai"
+
+    def test_save_toolchain_rejects_mutation_while_resident_request_in_flight(
+        self, ai_service, toolchain, monkeypatch
+    ):
+        toolchain.execution_mode = "resident_process"
+        toolchain.save()
+
+        def _raise_busy(_toolchain_id):
+            raise ValueError("Resident toolchain is busy")
+
+        monkeypatch.setattr(
+            ai_service._resident_runtime,
+            "ensure_mutation_allowed",
+            _raise_busy,
+        )
+
+        with pytest.raises(ValueError, match="busy"):
+            ai_service.save_toolchain(
+                "motor-ai",
+                _toolchain_payload(
+                    display_name="Busy Update",
+                    execution_mode="resident_process",
+                ),
+            )
+
+        assert AiToolchainTable.get_by_id("motor-ai").display_name == "Motor AI"
+
+    def test_save_toolchain_update_invalidates_resident_cache_after_success(
+        self, ai_service, toolchain, monkeypatch
+    ):
+        toolchain.execution_mode = "resident_process"
+        toolchain.save()
+        calls = []
+
+        monkeypatch.setattr(
+            ai_service._resident_runtime,
+            "ensure_mutation_allowed",
+            lambda toolchain_id: calls.append(("ensure", toolchain_id)),
+        )
+
+        def _invalidate(toolchain_id):
+            row = AiToolchainTable.get_by_id("motor-ai")
+            assert row.entrypoint == "python motor_ai_v2.py"
+            calls.append(("invalidate", toolchain_id))
+
+        monkeypatch.setattr(ai_service._resident_runtime, "invalidate", _invalidate)
+
+        ai_service.save_toolchain(
+            "motor-ai",
+            _toolchain_payload(
+                entrypoint="python motor_ai_v2.py",
+                execution_mode="resident_process",
+            ),
+        )
+
+        assert calls == [
+            ("ensure", "motor-ai"),
+            ("invalidate", "motor-ai"),
+        ]
+
+    def test_save_toolchain_rename_uses_old_resident_lease_and_invalidates_old_cache_after_success(
+        self, ai_service, config, toolchain, monkeypatch
+    ):
+        toolchain.execution_mode = "resident_process"
+        toolchain.save()
+        AiBindingTable.create(
+            config=config,
+            toolchain=toolchain,
+            enabled=True,
+            timeout_ms=1234,
+            params_json="{}",
+        )
+        calls = []
+
+        monkeypatch.setattr(
+            ai_service._resident_runtime,
+            "ensure_mutation_allowed",
+            lambda toolchain_id: calls.append(("ensure", toolchain_id)),
+        )
+
+        def _invalidate(toolchain_id):
+            assert ai_service.get_toolchain("motor-ai") is None
+            assert ai_service.get_toolchain("motor-ai-v2") is not None
+            rebound = AiBindingTable.get(AiBindingTable.config == config.config_id)
+            assert rebound.toolchain_id == "motor-ai-v2"
+            calls.append(("invalidate", toolchain_id))
+
+        monkeypatch.setattr(ai_service._resident_runtime, "invalidate", _invalidate)
+
+        result = ai_service.save_toolchain(
+            "motor-ai",
+            _toolchain_payload(
+                toolchain_id="motor-ai-v2",
+                execution_mode="resident_process",
+            ),
+        )
+
+        assert result == "motor-ai-v2"
+        assert calls == [
+            ("ensure", "motor-ai"),
+            ("invalidate", "motor-ai"),
+        ]
+
+    def test_save_toolchain_rename_propagates_busy_error_without_mutation(
+        self, ai_service, config, toolchain, monkeypatch
+    ):
+        toolchain.execution_mode = "resident_process"
+        toolchain.save()
+        AiBindingTable.create(
+            config=config,
+            toolchain=toolchain,
+            enabled=True,
+            timeout_ms=1234,
+            params_json="{}",
+        )
+        invalidations = []
+
+        def _raise_busy(_toolchain_id):
+            raise ValueError("Resident toolchain is busy")
+
+        monkeypatch.setattr(
+            ai_service._resident_runtime,
+            "ensure_mutation_allowed",
+            _raise_busy,
+        )
+        monkeypatch.setattr(
+            ai_service._resident_runtime,
+            "invalidate",
+            lambda toolchain_id: invalidations.append(toolchain_id),
+        )
+
+        with pytest.raises(ValueError, match="busy"):
+            ai_service.save_toolchain(
+                "motor-ai",
+                _toolchain_payload(
+                    toolchain_id="motor-ai-v2",
+                    execution_mode="resident_process",
+                ),
+            )
+
+        assert ai_service.get_toolchain("motor-ai") is not None
+        assert ai_service.get_toolchain("motor-ai-v2") is None
+        rebound = AiBindingTable.get(AiBindingTable.config == config.config_id)
+        assert rebound.toolchain_id == "motor-ai"
+        assert invalidations == []
+
+    def test_delete_toolchain_checks_resident_lease_and_invalidates_after_success(
+        self, ai_service, config, toolchain, monkeypatch
+    ):
+        toolchain.execution_mode = "resident_process"
+        toolchain.save()
+        AiBindingTable.create(
+            config=config,
+            toolchain=toolchain,
+            enabled=True,
+            timeout_ms=1234,
+            params_json="{}",
+        )
+        calls = []
+
+        monkeypatch.setattr(
+            ai_service._resident_runtime,
+            "ensure_mutation_allowed",
+            lambda toolchain_id: calls.append(("ensure", toolchain_id)),
+        )
+
+        def _invalidate(toolchain_id):
+            assert ai_service.get_toolchain("motor-ai") is None
+            binding = AiBindingTable.get(AiBindingTable.config == config.config_id)
+            assert binding.toolchain_id is None
+            calls.append(("invalidate", toolchain_id))
+
+        monkeypatch.setattr(ai_service._resident_runtime, "invalidate", _invalidate)
+
+        ai_service.delete_toolchain("motor-ai")
+
+        assert calls == [
+            ("ensure", "motor-ai"),
+            ("invalidate", "motor-ai"),
+        ]
+
+    def test_delete_toolchain_busy_error_does_not_mutate_or_invalidate(
+        self, ai_service, config, toolchain, monkeypatch
+    ):
+        toolchain.execution_mode = "resident_process"
+        toolchain.save()
+        AiBindingTable.create(
+            config=config,
+            toolchain=toolchain,
+            enabled=True,
+            timeout_ms=1234,
+            params_json="{}",
+        )
+        invalidations = []
+
+        def _raise_busy(_toolchain_id):
+            raise ValueError("Resident toolchain is busy")
+
+        monkeypatch.setattr(
+            ai_service._resident_runtime,
+            "ensure_mutation_allowed",
+            _raise_busy,
+        )
+        monkeypatch.setattr(
+            ai_service._resident_runtime,
+            "invalidate",
+            lambda toolchain_id: invalidations.append(toolchain_id),
+        )
+
+        with pytest.raises(ValueError, match="busy"):
+            ai_service.delete_toolchain("motor-ai")
+
+        assert ai_service.get_toolchain("motor-ai") is not None
+        binding = AiBindingTable.get(AiBindingTable.config == config.config_id)
+        assert binding.enabled is True
+        assert binding.toolchain_id == "motor-ai"
+        assert invalidations == []
+
+    def test_delete_toolchain_does_not_invalidate_resident_cache_when_delete_fails(
+        self, ai_service, config, toolchain, monkeypatch
+    ):
+        toolchain.execution_mode = "resident_process"
+        toolchain.save()
+        AiBindingTable.create(
+            config=config,
+            toolchain=toolchain,
+            enabled=True,
+            timeout_ms=1234,
+            params_json="{}",
+        )
+        calls = []
+
+        monkeypatch.setattr(
+            ai_service._resident_runtime,
+            "ensure_mutation_allowed",
+            lambda toolchain_id: calls.append(("ensure", toolchain_id)),
+        )
+        monkeypatch.setattr(
+            ai_service._resident_runtime,
+            "invalidate",
+            lambda toolchain_id: calls.append(("invalidate", toolchain_id)),
+        )
+
+        def _raise_before_delete(_toolchain_id):
+            raise RuntimeError("boom during delete")
+
+        monkeypatch.setattr(
+            ai_service,
+            "_delete_toolchain_row",
+            _raise_before_delete,
+            raising=False,
+        )
+
+        with pytest.raises(RuntimeError, match="boom during delete"):
+            ai_service.delete_toolchain("motor-ai")
+
+        assert ai_service.get_toolchain("motor-ai") is not None
+        binding = AiBindingTable.get(AiBindingTable.config == config.config_id)
+        assert binding.enabled is True
+        assert binding.toolchain_id == "motor-ai"
+        assert calls == [("ensure", "motor-ai")]
+
+
+class TestRunAiAnalysisRouting:
+    def test_run_ai_analysis_routes_resident_process_through_runtime(
+        self, ai_service, config, toolchain, tmp_path, monkeypatch
+    ):
+        toolchain.execution_mode = "resident_process"
+        toolchain.save()
+        AiBindingTable.create(
+            config=config,
+            toolchain=toolchain,
+            enabled=True,
+            params_json='{"resident": true}',
+        )
+        segments = _analysis_segments(tmp_path)
+        resident_calls = []
+
+        def _analyze(**kwargs):
+            resident_calls.append(kwargs)
+            return {
+                "module_status": "success",
+                "started_at": "2026-04-09T00:00:00+08:00",
+                "finished_at": "2026-04-09T00:00:01+08:00",
+                "duration_ms": 15,
+                "error_summary": None,
+                "response_payload": {
+                    "protocol_version": 1,
+                    "request_id": kwargs["request_id"],
+                    "toolchain_name": "Resident Toolchain",
+                    "toolchain_version": "1.0",
+                    "ai_result": {
+                        "ai_label": "PASS",
+                        "artifacts": [],
+                        "extra": {"transport": "resident"},
+                    },
+                },
+                "stdout_excerpt": None,
+                "stderr_excerpt": "resident stderr",
+                "process_instance_id": 7,
+            }
+
+        monkeypatch.setattr(ai_service._resident_runtime, "analyze", _analyze)
+        monkeypatch.setattr(
+            ai_service,
+            "execute_toolchain",
+            lambda **kwargs: pytest.fail("oneshot path should not run"),
+        )
+
+        result = ai_service.run_ai_analysis(
+            config_id=config.config_id,
+            test_run_id="run_resident_route",
+            segments=segments,
+            context={"config_id": config.config_id},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+
+        assert result["module_status"] == "success"
+        assert resident_calls[0]["toolchain_id"] == "motor-ai"
+        assert resident_calls[0]["request_id"] == result["request_id"]
+        assert resident_calls[0]["request_payload"]["toolchain_id"] == "motor-ai"
+        assert resident_calls[0]["artifacts_dir"] == result["artifacts_dir"]
+
+    def test_run_ai_analysis_routes_oneshot_process_through_execute_toolchain(
+        self, ai_service, config, toolchain, tmp_path, monkeypatch
+    ):
+        toolchain.execution_mode = "oneshot_process"
+        toolchain.save()
+        AiBindingTable.create(
+            config=config,
+            toolchain=toolchain,
+            enabled=True,
+            params_json="{}",
+        )
+        segments = _analysis_segments(tmp_path)
+        execute_calls = []
+
+        monkeypatch.setattr(
+            ai_service._resident_runtime,
+            "analyze",
+            lambda **kwargs: pytest.fail("resident runtime should not run"),
+        )
+
+        def _execute(
+            *,
+            entrypoint: str,
+            request_json_path: str,
+            response_json_path: str,
+            artifacts_dir: str,
+            timeout_ms: int,
+        ):
+            execute_calls.append(
+                {
+                    "entrypoint": entrypoint,
+                    "request_json_path": request_json_path,
+                    "response_json_path": response_json_path,
+                    "artifacts_dir": artifacts_dir,
+                    "timeout_ms": timeout_ms,
+                }
+            )
+            with open(request_json_path, "r", encoding="utf-8") as f:
+                request_payload = json.load(f)
+            response_payload = {
+                "protocol_version": 1,
+                "request_id": request_payload["request_id"],
+                "toolchain_name": "Oneshot Toolchain",
+                "toolchain_version": "1.0",
+                "ai_result": {
+                    "ai_label": "PASS",
+                    "artifacts": [],
+                },
+            }
+            with open(response_json_path, "w", encoding="utf-8") as f:
+                json.dump(response_payload, f, ensure_ascii=False, indent=2)
+            return {
+                "started_at": "2026-04-09T00:00:00+08:00",
+                "finished_at": "2026-04-09T00:00:01+08:00",
+                "duration_ms": 12,
+                "exit_code": 0,
+                "stdout_excerpt": "",
+                "stderr_excerpt": "",
+            }
+
+        monkeypatch.setattr(ai_service, "execute_toolchain", _execute)
+
+        result = ai_service.run_ai_analysis(
+            config_id=config.config_id,
+            test_run_id="run_oneshot_route",
+            segments=segments,
+            context={"config_id": config.config_id},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+
+        assert result["module_status"] == "success"
+        assert execute_calls[0]["request_json_path"] == result["request_json_path"]
+        assert execute_calls[0]["response_json_path"] == result["response_json_path"]
 
 
 class TestBindingResolver:
