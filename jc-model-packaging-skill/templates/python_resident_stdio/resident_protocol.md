@@ -117,12 +117,18 @@ envelope:
 - `stderr` is human-readable only and is not a protocol channel.
 - Malformed inbound JSON or malformed protocol envelopes are logged to `stderr`
   and terminate the process non-zero.
+- `preload_model()` and any other process-global runtime initialization failure are
+  fatal: log to `stderr`, attempt cleanup, exit non-zero, and emit no `error` envelope.
 - A valid request-scoped analyze failure emits exactly one `error` envelope tied
-  to the stable outer `request_id`.
+  to the stable outer `request_id`, but only after process-global runtime
+  initialization has succeeded.
 - After a valid request-scoped `error` envelope, the default resident template
   behavior is to remain alive and continue accepting later `analyze` messages.
 - An external host may still choose to discard the process after observing a
   request-scoped `error` envelope.
+- Cleanup on fatal exit, `shutdown`, and `stdin` EOF should be guarded so a
+  cleanup failure is reported on `stderr` and returns non-zero instead of
+  escaping as a raw exception.
 
 ## Artifact Rules
 

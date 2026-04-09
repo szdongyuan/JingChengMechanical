@@ -8,6 +8,7 @@ from typing import Any
 
 _MODEL_HANDLE: Any | None = None
 _PROCESS_CACHE: dict[str, Any] = {}
+_ACTIVE_PROCESS_CACHE: dict[str, Any] = _PROCESS_CACHE
 
 
 class ProtocolError(ValueError):
@@ -16,6 +17,10 @@ class ProtocolError(ValueError):
 
 class ProtocolTransportError(RuntimeError):
     """Raised when a protocol message cannot be emitted over stdout."""
+
+
+class ResidentFatalError(RuntimeError):
+    """Raised when the resident process must exit instead of emitting an error envelope."""
 
 
 def configure_utf8_stdio() -> None:
@@ -144,6 +149,17 @@ def get_process_cache() -> dict[str, Any]:
     # Keep request-safe warm-path data here if repeated analyze calls benefit
     # from in-process caching.
     return _PROCESS_CACHE
+
+
+def initialize_runtime() -> None:
+    global _MODEL_HANDLE, _ACTIVE_PROCESS_CACHE
+    try:
+        _MODEL_HANDLE = preload_model()
+        _ACTIVE_PROCESS_CACHE = get_process_cache()
+    except Exception as exc:
+        raise ResidentFatalError(
+            f"Fatal resident runtime initialization failure: {exc}"
+        ) from exc
 
 
 def load_analyze_envelope(envelope: Any) -> tuple[str, dict[str, Any], str]:
@@ -281,8 +297,12 @@ def build_error_envelope(request_id: str, error_message: str) -> dict[str, str]:
 
 
 def handle_analyze(request_id: str, request_payload: dict, artifacts_dir: str) -> dict:
-    model_handle = preload_model()
-    cache = get_process_cache()
+    model_handle = _MODEL_HANDLE
+    cache = _ACTIVE_PROCESS_CACHE
+    if model_handle is None:
+        raise ResidentFatalError(
+            "Fatal resident runtime initialization failure: model handle is unavailable."
+        )
     selected_segment = select_segment(request_payload)
     preprocessed = preprocess_from_request(request_payload, selected_segment, cache)
     inference_output = run_model(model_handle, preprocessed, cache)
@@ -298,9 +318,18 @@ def shutdown_runtime() -> None:
     _MODEL_HANDLE = None
 
 
+def shutdown_runtime_safely(context: str) -> bool:
+    try:
+        shutdown_runtime()
+    except Exception as exc:
+        log_stderr(f"Resident runtime cleanup failed during {context}: {exc}")
+        return False
+    return True
+
+
 def fatal_exit(message: str) -> int:
     log_stderr(message)
-    shutdown_runtime()
+    shutdown_runtime_safely("fatal exit")
     return 1
 
 
@@ -316,13 +345,15 @@ def main() -> int:
             require_string(message_type, "message_type is required and must be a string.")
 
             if message_type == "shutdown":
-                shutdown_runtime()
-                return 0
+                return 0 if shutdown_runtime_safely("shutdown") else 1
 
             request_id, request_payload, artifacts_dir = load_analyze_envelope(envelope)
 
             try:
+                initialize_runtime()
                 payload = handle_analyze(request_id, request_payload, artifacts_dir)
+            except ResidentFatalError as exc:
+                return fatal_exit(str(exc))
             except Exception as exc:
                 # The default template stays alive after one request-scoped
                 # error envelope so later analyze messages can continue. An
@@ -334,8 +365,7 @@ def main() -> int:
             except ProtocolTransportError as exc:
                 return fatal_exit(f"Fatal resident protocol failure: {exc}")
 
-        shutdown_runtime()
-        return 0
+        return 0 if shutdown_runtime_safely("stdin EOF") else 1
     except json.JSONDecodeError as exc:
         return fatal_exit(f"Malformed resident protocol message: {exc}")
     except ProtocolError as exc:

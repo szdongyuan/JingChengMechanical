@@ -11,11 +11,18 @@ stay in memory, and the host will send repeated requests to the same process.
 - Keep `stderr` human-readable only.
 - Treat malformed inbound JSON or malformed protocol envelopes as fatal:
   log to `stderr` and exit non-zero.
-- Treat valid request-scoped analyze failures as non-fatal by emitting one
-  `error` envelope and continuing to accept later `analyze` messages in the
-  default template. An external host may still choose to discard the process.
+- Treat `preload_model()` and any other process-global runtime initialization
+  failure as fatal: log to `stderr`, exit non-zero, and emit no `error`
+  envelope.
+- Treat valid request-scoped analyze failures after runtime initialization
+  succeeds as non-fatal by emitting one `error` envelope and continuing to
+  accept later `analyze` messages in the default template. An external host may
+  still choose to discard the process.
 - Exit cleanly on `{"message_type": "shutdown"}` without writing a `stdout`
   response line.
+- Guard cleanup on fatal exit, `shutdown`, and `stdin` EOF so cleanup failures
+  are logged to `stderr` and return non-zero instead of escaping as raw
+  exceptions.
 
 ## Adaptation Order
 

@@ -558,6 +558,9 @@ def test_resident_contract_locks_request_matching_and_error_lifecycle():
     assert "request.segments[0]" in text
     assert "stderr" in lowered
     assert "non-zero" in lowered
+    assert "preload_model" in text
+    assert "process-global runtime initialization" in lowered
+    assert "no `error` envelope" in text or "no error envelope" in lowered
     assert "continue accepting later `analyze` messages" in text
     assert "external host may still choose to discard the process" in lowered
     assert "no extra stdout" in lowered or "no unsolicited stdout" in lowered
@@ -598,6 +601,8 @@ def test_resident_readme_mentions_utf8_jsonl_transport():
     assert "utf-8" in text
     assert "json lines" in text or "jsonl" in text
     assert "stdin" in text and "stdout" in text
+    assert "preload" in text
+    assert "fatal" in text
 
 
 def test_resident_main_exits_non_zero_for_malformed_protocol_envelope(
@@ -874,3 +879,104 @@ def test_resident_main_treats_stdout_failure_during_error_emission_as_fatal(
     assert "Fatal resident protocol failure:" in stderr_text
     assert "stdout transport failed during error emission" in stderr_text
     assert shutdown_calls == ["shutdown"]
+
+
+def test_resident_main_treats_preload_model_failure_as_fatal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+    envelope = _resident_analyze_envelope(tmp_path)
+    shutdown_calls: list[str] = []
+
+    def fail_preload():
+        raise RuntimeError("preload failed")
+
+    monkeypatch.setattr(module, "preload_model", fail_preload)
+    monkeypatch.setattr(module, "shutdown_runtime", lambda: shutdown_calls.append("shutdown"))
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl(envelope),
+    )
+
+    assert exit_code == 1
+    assert stdout_text == ""
+    assert (
+        stderr_text
+        == "Fatal resident runtime initialization failure: preload failed\n"
+    )
+    assert shutdown_calls == ["shutdown"]
+
+
+def test_resident_main_preserves_original_fatal_reason_when_shutdown_cleanup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+    envelope = _resident_analyze_envelope(tmp_path)
+
+    def fail_preload():
+        raise RuntimeError("preload failed")
+
+    def fail_shutdown():
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(module, "preload_model", fail_preload)
+    monkeypatch.setattr(module, "shutdown_runtime", fail_shutdown)
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl(envelope),
+    )
+
+    assert exit_code == 1
+    assert stdout_text == ""
+    assert stderr_text.splitlines() == [
+        "Fatal resident runtime initialization failure: preload failed",
+        "Resident runtime cleanup failed during fatal exit: cleanup failed",
+    ]
+
+
+def test_resident_main_returns_non_zero_when_shutdown_cleanup_fails_on_shutdown_message(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+
+    def fail_shutdown():
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(module, "shutdown_runtime", fail_shutdown)
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl({"message_type": "shutdown"}),
+    )
+
+    assert exit_code == 1
+    assert stdout_text == ""
+    assert stderr_text == "Resident runtime cleanup failed during shutdown: cleanup failed\n"
+
+
+def test_resident_main_returns_non_zero_when_shutdown_cleanup_fails_on_eof(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+
+    def fail_shutdown():
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(module, "shutdown_runtime", fail_shutdown)
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        "",
+    )
+
+    assert exit_code == 1
+    assert stdout_text == ""
+    assert stderr_text == "Resident runtime cleanup failed during stdin EOF: cleanup failed\n"
