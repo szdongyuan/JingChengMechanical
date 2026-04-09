@@ -1,0 +1,44 @@
+{
+  "model_name": "",
+  "model_version": "",
+  "input_modality": "audio",
+  "entrypoint_module": "",
+  "entrypoint_callable": "",
+  "sample_rate_hz": 44100,
+  "channels": 1,
+  "tensor_shape": [
+    "batch",
+    "channel",
+    "samples"
+  ],
+  "target_num_samples": 176400,
+  "duration_policy": "trim_pad",
+  "trim_policy": "tail",
+  "pad_policy": "zero",
+  "variable_length_bounds": {
+    "min_samples": null,
+    "max_samples": null
+  },
+  "windowing": {
+    "enabled": false,
+    "window_size_ms": null,
+    "hop_size_ms": null,
+    "aggregation": null
+  },
+  "preprocessing_owner": "wrapper",
+  "preprocessing_steps": [],
+  "normalization": {
+    "kind": "",
+    "parameters": {}
+  },
+  "output_contract": {
+    "kind": "binary_classification",
+    "score_name": "score",
+    "label_rule": "score >= threshold => PASS"
+  },
+  "weights_packaging": "external_bundle",
+  "delivery_modes": [
+    "one-shot"
+  ],
+  "verification_commands": []
+}
