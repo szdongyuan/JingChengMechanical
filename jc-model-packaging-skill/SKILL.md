@@ -50,7 +50,7 @@ Choose the one-shot template when:
 
 Choose the resident template when:
 
-- imports are expensive
+- imports are expensive or cold imports dominate startup latency
 - the model should stay in memory
 - the host will send repeated requests
 

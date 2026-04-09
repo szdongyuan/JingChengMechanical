@@ -17,10 +17,13 @@ OWNED_REQUIRED_FILES = [
     ROOT / "templates" / "python_oneshot_cli" / "protocol_contract.md",
 ]
 
-LATER_SLICE_FILES = [
+RESIDENT_REQUIRED_FILES = [
     ROOT / "templates" / "python_resident_stdio" / "README.md",
     ROOT / "templates" / "python_resident_stdio" / "resident_cli.py",
     ROOT / "templates" / "python_resident_stdio" / "resident_protocol.md",
+]
+
+LATER_SLICE_FILES = [
     ROOT / "templates" / "pyinstaller_windows" / "README.md",
     ROOT / "templates" / "pyinstaller_windows" / "build.ps1",
     ROOT / "templates" / "pyinstaller_windows" / "toolchain_oneshot.spec",
@@ -85,8 +88,13 @@ def test_skill_package_contains_slice_one_required_files():
     assert missing == []
 
 
+def test_skill_package_contains_slice_two_resident_files():
+    missing = [str(path) for path in RESIDENT_REQUIRED_FILES if not path.is_file()]
+    assert missing == []
+
+
 @pytest.mark.xfail(
-    reason="Resident, Windows packaging, and smoke fixtures land in later slices."
+    reason="Windows packaging and smoke fixtures land in later slices."
 )
 def test_future_skill_package_files_are_added_in_later_slices():
     missing = [str(path) for path in LATER_SLICE_FILES if not path.is_file()]
@@ -120,6 +128,14 @@ def test_skill_guidance_explains_when_to_keep_weights_external_or_embedded():
     skill_text = _read_text(ROOT / "SKILL.md").lower()
     assert "keep weights external when" in skill_text
     assert "embed weights when" in skill_text
+
+
+def test_skill_guidance_recommends_resident_mode_for_expensive_imports_and_reuse():
+    skill_text = _read_text(ROOT / "SKILL.md").lower()
+    assert "choose the resident template when" in skill_text
+    assert "imports are expensive" in skill_text
+    assert "stay in memory" in skill_text
+    assert "repeated requests" in skill_text
 
 
 def test_metadata_templates_capture_duration_contract_and_packaging_choices():
@@ -484,3 +500,41 @@ def test_oneshot_main_surfaces_stale_cleanup_failure(
     assert "Fatal one-shot failure: --request must be an absolute path." in captured.err
     assert "Unable to remove stale response file" in captured.err
     assert response_path.exists()
+
+
+def test_resident_template_mentions_protocol_envelopes():
+    text = _read_text(ROOT / "templates" / "python_resident_stdio" / "resident_protocol.md")
+    assert '"message_type": "analyze"' in text
+    assert '"message_type": "result"' in text
+    assert '"message_type": "error"' in text
+    assert '"message_type": "shutdown"' in text
+    assert '"request_id": "req_20260409_120000_abcd1234"' in text
+    assert '"artifacts_dir": "D:/absolute/path/artifacts"' in text
+
+
+def test_resident_contract_locks_request_matching_and_error_lifecycle():
+    text = _read_text(ROOT / "templates" / "python_resident_stdio" / "resident_protocol.md")
+    lowered = text.lower()
+    assert "request.request_id" in text
+    assert "must equal outer `request_id`" in text or "inner and outer" in lowered
+    assert "artifacts_dir" in text and "absolute path" in lowered
+    assert "request.params.segment_index" in text
+    assert "request.segments[0]" in text
+    assert "stderr" in lowered
+    assert "non-zero" in lowered
+    assert "continue accepting later `analyze` messages" in text
+    assert "no extra stdout" in lowered or "no unsolicited stdout" in lowered
+
+
+def test_resident_template_mentions_required_hooks():
+    text = _read_text(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+    assert (
+        "def handle_analyze(request_id: str, request_payload: dict, artifacts_dir: str) -> dict:"
+        in text
+    )
+    assert "for line in sys.stdin" in text
+    assert "json.loads(line)" in text
+    assert "preload_model" in text
+    assert "cache" in text.lower()
+    assert "error" in text.lower()
+    assert "shutdown" in text.lower()
