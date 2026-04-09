@@ -351,6 +351,7 @@ def _detail_payload(
         "record_duration": 5.0,
         "analysis_duration": 3.0,
         "analysis_window_offset_ms": 250,
+        "allow_incomplete_recording_analysis": False,
         "scan_triggers_test": False,
         "plc_device_key": "plc-a",
         "plc_device_label": "PLC A",
@@ -462,6 +463,32 @@ def test_populate_detail_uses_main_config_analysis_offset_and_plc_fields(qapp):
     assert module.ed_plc_device_label.text() == "PLC A"
 
 
+def test_checkbox_uses_approved_visible_label_for_allow_incomplete_recording_analysis(
+    qapp,
+):
+    module = _make_module()
+
+    assert module.chk_allow_incomplete_recording_analysis.text() == "允许分析不完整录音"
+
+
+def test_populate_detail_loads_allow_incomplete_recording_analysis_checkbox(qapp):
+    module = _make_module()
+    payload = _detail_payload([])
+    payload["allow_incomplete_recording_analysis"] = True
+
+    module._populate_detail(payload)
+
+    assert module.chk_allow_incomplete_recording_analysis.isChecked() is True
+
+
+def test_checkbox_defaults_to_unchecked_for_newly_loaded_config(qapp):
+    module = _make_module()
+
+    module._populate_detail(_detail_payload([]))
+
+    assert module.chk_allow_incomplete_recording_analysis.isChecked() is False
+
+
 def test_collect_data_returns_main_config_analysis_offset_and_plc_fields(qapp):
     module = _make_module()
 
@@ -483,6 +510,7 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_fields(qapp):
     assert data["analysis_window_offset_ms"] == 500
     assert data["plc_device_key"] == "plc-a"
     assert data["plc_device_label"] == "PLC A"
+    assert data["allow_incomplete_recording_analysis"] is False
     assert data["golden_editor_state"] == {}
     assert set(data) == {
         "config_id",
@@ -490,6 +518,7 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_fields(qapp):
         "record_duration",
         "analysis_duration",
         "analysis_window_offset_ms",
+        "allow_incomplete_recording_analysis",
         "scan_triggers_test",
         "plc_device_key",
         "plc_device_label",
@@ -503,6 +532,16 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_fields(qapp):
         "channels",
         "golden_editor_state",
     }
+
+
+def test_collect_data_includes_allow_incomplete_recording_analysis(qapp):
+    module = _make_module()
+    module._current_config_id = 7
+    module.chk_allow_incomplete_recording_analysis.setChecked(True)
+
+    data = module._collect_data()
+
+    assert data["allow_incomplete_recording_analysis"] is True
 
 
 def test_collect_ai_binding_does_not_include_analysis_window_offset(qapp):
@@ -541,6 +580,45 @@ def test_on_save_keeps_main_config_analysis_offset_out_of_ai_binding_payload(
 
     assert warnings == []
     assert config_service.saved_configs[0]["analysis_window_offset_ms"] == 250
+    assert ai_service.saved_bindings == [
+        (
+            7,
+            {
+                "enabled": False,
+                "toolchain_id": None,
+                "timeout_ms": None,
+                "params_json": "{}",
+            },
+        )
+    ]
+
+
+def test_on_save_persists_allow_incomplete_recording_analysis_without_touching_ai_binding(
+    qapp, monkeypatch
+):
+    config_service = _ConfigServiceStub()
+    ai_service = _AiServiceStub()
+    module = _make_module(config_service=config_service, ai_service=ai_service)
+
+    module._current_config_id = 7
+    module.ed_name.setText("Cfg1")
+    module.chk_allow_incomplete_recording_analysis.setChecked(True)
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.information",
+        lambda *args: None,
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: None,
+    )
+
+    module._on_save()
+
+    assert config_service.saved_configs[0]["allow_incomplete_recording_analysis"] is True
     assert ai_service.saved_bindings == [
         (
             7,

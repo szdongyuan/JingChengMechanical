@@ -221,6 +221,11 @@ class ConfigModule(QWidget):
         self.spin_analysis_window_offset.setValue(0)
         gf_lay.addRow("默认分析窗起始偏移(ms)", self.spin_analysis_window_offset)
 
+        self.chk_allow_incomplete_recording_analysis = QCheckBox(
+            "允许分析不完整录音"
+        )
+        gf_lay.addRow(self.chk_allow_incomplete_recording_analysis)
+
         self.chk_scan = QCheckBox("扫码枪直接触发测试")
         gf_lay.addRow("扫码触发", self.chk_scan)
 
@@ -1502,6 +1507,9 @@ class ConfigModule(QWidget):
             "record_duration": self.spin_record.value(),
             "analysis_duration": self.spin_analysis.value(),
             "analysis_window_offset_ms": self.spin_analysis_window_offset.value(),
+            "allow_incomplete_recording_analysis": (
+                self.chk_allow_incomplete_recording_analysis.isChecked()
+            ),
             "scan_triggers_test": self.chk_scan.isChecked(),
             "plc_device_key": self.ed_plc_device_key.text(),
             "plc_device_label": self.ed_plc_device_label.text(),
@@ -1570,6 +1578,9 @@ class ConfigModule(QWidget):
         self.spin_analysis.setValue(data["analysis_duration"])
         self.spin_analysis_window_offset.setValue(
             data.get("analysis_window_offset_ms", 0)
+        )
+        self.chk_allow_incomplete_recording_analysis.setChecked(
+            bool(data.get("allow_incomplete_recording_analysis", False))
         )
         self.chk_scan.setChecked(data["scan_triggers_test"])
 
