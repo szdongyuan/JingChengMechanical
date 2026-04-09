@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import app.service.ai_service as ai_service_module
 from model.ai_execution_table import AiExecutionTable
 from model.test_config_table import TestConfigTable as ConfigTable
 from model.ai_toolchain_table import AiToolchainTable
@@ -1032,6 +1033,103 @@ class TestRunAiAnalysisRouting:
         assert result["error_summary"] == "ai_result.score must be numeric (not bool)"
         assert os.path.isfile(result["request_json_path"])
         assert os.path.exists(result["response_json_path"]) is False
+
+    def test_run_ai_analysis_resident_response_json_persistence_failure_returns_failed_envelope_and_saves_execution(
+        self, ai_service, config, toolchain, tmp_path, monkeypatch
+    ):
+        toolchain.execution_mode = "resident_process"
+        toolchain.save()
+        AiBindingTable.create(
+            config=config,
+            toolchain=toolchain,
+            enabled=True,
+            params_json="{}",
+        )
+        AiExecutionTable.create(
+            request_id="req_previous_success",
+            test_run_id="run_resident_persist_fail",
+            config_id=config.config_id,
+            toolchain_id=toolchain.toolchain_id,
+            module_status="success",
+            error_summary=None,
+            is_current_effective=True,
+        )
+        segments = _analysis_segments(tmp_path)
+        fixed_request_id = "req_resident_persist_fail"
+        ai_runs_dir = tmp_path / "ai_runs"
+        expected_response_path = os.path.join(
+            str(ai_runs_dir),
+            fixed_request_id,
+            "response.json",
+        )
+        real_json_dump = json.dump
+
+        def _analyze(**kwargs):
+            return {
+                "module_status": "success",
+                "started_at": "2026-04-09T00:00:00+08:00",
+                "finished_at": "2026-04-09T00:00:01+08:00",
+                "duration_ms": 15,
+                "error_summary": None,
+                "response_payload": {
+                    "protocol_version": 1,
+                    "request_id": kwargs["request_id"],
+                    "toolchain_name": "Resident Toolchain",
+                    "toolchain_version": "1.0",
+                    "ai_result": {
+                        "ai_label": "PASS",
+                        "artifacts": [],
+                    },
+                },
+                "stdout_excerpt": None,
+                "stderr_excerpt": "resident stderr",
+                "process_instance_id": 7,
+            }
+
+        def _dump(data, fp, *args, **kwargs):
+            if getattr(fp, "name", None) == expected_response_path:
+                fp.write("{")
+                fp.flush()
+                raise OSError("disk full while writing response.json")
+            return real_json_dump(data, fp, *args, **kwargs)
+
+        monkeypatch.setattr(ai_service_module, "_gen_request_id", lambda: fixed_request_id)
+        monkeypatch.setattr(ai_service._resident_runtime, "analyze", _analyze)
+        monkeypatch.setattr(
+            ai_service,
+            "execute_toolchain",
+            lambda **kwargs: pytest.fail("oneshot path should not run"),
+        )
+        monkeypatch.setattr(ai_service_module.json, "dump", _dump)
+
+        result = ai_service.run_ai_analysis(
+            config_id=config.config_id,
+            test_run_id="run_resident_persist_fail",
+            segments=segments,
+            context={"config_id": config.config_id},
+            ai_runs_dir=str(ai_runs_dir),
+        )
+
+        assert result["request_id"] == fixed_request_id
+        assert result["module_status"] == "process_error"
+        assert result["error_summary"] == (
+            "Failed to persist response.json: "
+            "disk full while writing response.json"
+        )
+        assert os.path.isfile(result["request_json_path"])
+        assert os.path.exists(result["response_json_path"]) is False
+
+        saved = AiExecutionTable.get_by_id(fixed_request_id)
+        assert saved.module_status == "process_error"
+        assert saved.error_summary == result["error_summary"]
+        assert saved.is_current_effective is False
+
+        previous = AiExecutionTable.get_by_id("req_previous_success")
+        assert previous.is_current_effective is False
+
+        vm = ai_service.get_ai_view_model("run_resident_persist_fail")
+        assert vm["display_status"] == "process_error"
+        assert vm["error_summary"] == result["error_summary"]
 
 
 class TestBindingResolver:

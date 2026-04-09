@@ -713,12 +713,24 @@ class AiService:
                 )
                 module_status = validation["status"]
                 if module_status == "success":
-                    with open(response_json_path, "w", encoding="utf-8") as f:
-                        json.dump(
-                            validation["raw_response"],
-                            f,
-                            ensure_ascii=False,
-                            indent=2,
+                    try:
+                        with open(response_json_path, "w", encoding="utf-8") as f:
+                            json.dump(
+                                validation["raw_response"],
+                                f,
+                                ensure_ascii=False,
+                                indent=2,
+                            )
+                    except OSError as e:
+                        if os.path.exists(response_json_path):
+                            try:
+                                os.remove(response_json_path)
+                            except OSError:
+                                pass
+                        validation = None
+                        module_status = "process_error"
+                        exec_result["error_summary"] = (
+                            f"Failed to persist response.json: {e}"
                         )
             return exec_result, validation, module_status
 
