@@ -268,7 +268,6 @@ def _workorder_rendered_text(module: WorkOrderModule) -> str:
             module.lbl_persistence_notice.text(),
             module.lbl_selection_status.text(),
             module.lbl_phase_summary.text(),
-            module.lbl_trigger_summary.text(),
             summary_label.text() if summary_label is not None else "",
         )
     )
@@ -525,30 +524,20 @@ def test_workorder_phase_summary_renders_all_known_chinese_labels(
     assert module.lbl_phase_summary.text() == expected_text
 
 
-@pytest.mark.parametrize(
-    ("trigger_source", "expected_text"),
-    [
-        ("manual", "最近触发方式：手动"),
-        ("plc", "最近触发方式：PLC"),
-        ("scan", "最近触发方式：扫码"),
-        (None, "最近触发方式：-"),
-        ("", "最近触发方式：-"),
-    ],
-)
-def test_workorder_trigger_summary_renders_all_known_chinese_labels_and_dash_fallback(
-    qapp, trigger_source, expected_text
-):
+def test_workorder_module_only_renders_phase_summary_without_trigger_summary_row(qapp):
     module, services = _make_module()
 
     services.bus.factory_state_changed.emit(
         FactoryControllerState(
             selected_config_ids=(101,),
             run_phase="armed",
-            trigger_source=trigger_source,
+            trigger_source="manual",
         )
     )
 
-    assert module.lbl_trigger_summary.text() == expected_text
+    assert hasattr(module, "lbl_trigger_summary") is False
+    assert "最近触发方式" not in _workorder_rendered_text(module)
+    assert module.lbl_phase_summary.text() == "当前阶段：待启动"
 
 
 def test_workorder_summary_preserves_unknown_non_empty_values(qapp):
@@ -563,7 +552,7 @@ def test_workorder_summary_preserves_unknown_non_empty_values(qapp):
     )
 
     assert module.lbl_phase_summary.text() == "当前阶段：future_phase"
-    assert module.lbl_trigger_summary.text() == "最近触发方式：custom_trigger"
+    assert "最近触发方式" not in _workorder_rendered_text(module)
 
 
 @pytest.mark.parametrize(

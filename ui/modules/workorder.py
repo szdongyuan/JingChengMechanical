@@ -18,11 +18,6 @@ class WorkOrderModule(QWidget):
         "reviewing": "等待复核",
         "reanalyzing": "重新分析中",
     }
-    _TRIGGER_LABELS = {
-        "manual": "手动",
-        "plc": "PLC",
-        "scan": "扫码",
-    }
 
     def __init__(self, services):
         super().__init__()
@@ -53,8 +48,6 @@ class WorkOrderModule(QWidget):
         self.lbl_selection_status.setVisible(False)
         self.lbl_phase_summary = QLabel()
         self.lbl_phase_summary.setWordWrap(True)
-        self.lbl_trigger_summary = QLabel()
-        self.lbl_trigger_summary.setWordWrap(True)
 
         self.form_layout = QFormLayout()
         self.form_layout.addRow("条码 SN", self.ed_sn)
@@ -72,7 +65,6 @@ class WorkOrderModule(QWidget):
         layout.addWidget(self.lbl_persistence_notice)
         layout.addWidget(self.lbl_selection_status)
         layout.addWidget(self.lbl_phase_summary)
-        layout.addWidget(self.lbl_trigger_summary)
 
         self.ed_sn.textChanged.connect(lambda _text: self._publish_workorder())
         self.ed_model.textChanged.connect(lambda _text: self._publish_workorder())
@@ -249,18 +241,11 @@ class WorkOrderModule(QWidget):
 
     def _update_phase_trigger_summary(self) -> None:
         display_phase = self._display_phase(self._factory_state.run_phase)
-        display_trigger = self._display_trigger(self._factory_state.trigger_source)
         self.lbl_phase_summary.setText(f"当前阶段：{display_phase}")
-        self.lbl_trigger_summary.setText(f"最近触发方式：{display_trigger}")
 
     def _display_phase(self, run_phase: str | None) -> str:
         phase = run_phase or "not_ready"
         return self._PHASE_LABELS.get(phase, phase)
-
-    def _display_trigger(self, trigger_source: str | None) -> str:
-        if not trigger_source:
-            return "-"
-        return self._TRIGGER_LABELS.get(trigger_source, trigger_source)
 
     def _publish_workorder(self, *, force: bool = False, log: bool = False) -> None:
         payload = self.value()
