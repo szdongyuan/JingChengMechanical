@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 from contextlib import contextmanager
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -12,6 +13,15 @@ from model.test_config_table import TestConfigTable as ConfigTable
 from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable as AiBindingTable
 from app.service.ai_service import AiService
+
+
+def test_ai_service_shutdown_delegates_to_resident_runtime():
+    resident_runtime = MagicMock()
+    service = AiService(resident_runtime=resident_runtime)
+
+    service.shutdown()
+
+    resident_runtime.shutdown_all.assert_called_once_with()
 
 
 def _recreate_legacy_ai_binding_table(db):

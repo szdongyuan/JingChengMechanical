@@ -731,7 +731,7 @@ class MainWindow(QMainWindow):
             return
         self.services.bus.log.emit("[App] 关闭程序")
         try:
-            self.services.db.close()
+            self.services.shutdown()
             stop_camera = getattr(getattr(self, "video", None), "stop_camera", None)
             if callable(stop_camera):
                 stop_camera()

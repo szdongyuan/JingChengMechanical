@@ -152,6 +152,7 @@ def _make_services(
     initial_review_payload: FactoryReviewPayload | None = None,
 ):
     bus = _BusStub()
+    shutdown = MagicMock()
     factory_mode = SimpleNamespace(
         state=initial_state or FactoryControllerState(),
         review_payload=initial_review_payload or FactoryReviewPayload(),
@@ -161,6 +162,7 @@ def _make_services(
     )
     return SimpleNamespace(
         bus=bus,
+        shutdown=shutdown,
         db=SimpleNamespace(close=MagicMock()),
         config_service=SimpleNamespace(
             load_config=MagicMock(return_value={"selected_channels": []})
@@ -526,8 +528,41 @@ def test_closing_main_window_is_blocked_when_ai_tool_management_rejects_leave(
     window.closeEvent(close_event)
 
     assert close_event.isAccepted() is False
+    services.shutdown.assert_not_called()
     services.db.close.assert_not_called()
     assert window.ai_tool_management_module.confirm_leave_calls == 1
+
+
+def test_closing_main_window_uses_shared_shutdown_boundary_and_stops_camera(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(monkeypatch)
+    _show(window, qapp)
+    window.video.stop_camera = MagicMock()
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+
+    services.shutdown.assert_called_once_with()
+    services.db.close.assert_not_called()
+    window.video.stop_camera.assert_called_once_with()
+
+
+def test_closing_main_window_swallows_camera_cleanup_errors_after_shared_shutdown(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(monkeypatch)
+    _show(window, qapp)
+    window.video.stop_camera = MagicMock(side_effect=RuntimeError("camera cleanup failed"))
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+
+    services.shutdown.assert_called_once_with()
+    services.db.close.assert_not_called()
+    window.video.stop_camera.assert_called_once_with()
 
 
 def _armed_state(

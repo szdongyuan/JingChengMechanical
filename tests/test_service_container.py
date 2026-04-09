@@ -315,3 +315,22 @@ def test_service_container_exposes_factory_selection_settings(monkeypatch):
     services = mod.ServiceContainer()
 
     assert isinstance(services.factory_selection_settings, FactorySelectionSettings)
+
+
+def test_service_container_shutdown_stops_ai_before_closing_db(monkeypatch):
+    calls = []
+    ai_service = MagicMock()
+    ai_service.shutdown.side_effect = lambda: calls.append("ai_shutdown")
+    db_service = MagicMock()
+    db_service.close.side_effect = lambda: calls.append("db_close")
+    monkeypatch.setattr(mod, "DbConnectionService", MagicMock(return_value=db_service))
+    monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "InputCalibrationService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "ConfigService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "AiService", MagicMock(return_value=ai_service))
+
+    services = mod.ServiceContainer()
+
+    services.shutdown()
+
+    assert calls == ["ai_shutdown", "db_close"]

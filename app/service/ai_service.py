@@ -88,6 +88,9 @@ class AiService:
     ) -> None:
         self._resident_runtime = resident_runtime or ResidentToolchainRuntime()
 
+    def shutdown(self) -> None:
+        self._resident_runtime.shutdown_all()
+
     @staticmethod
     def _is_resident_toolchain(toolchain: AiToolchainTable | None) -> bool:
         return bool(
