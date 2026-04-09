@@ -243,5 +243,7 @@ class ServiceContainer:
         self.factory_mode = FactoryModeController(self.bus, self)
 
     def shutdown(self) -> None:
-        self.ai_service.shutdown()
-        self.db.close()
+        try:
+            self.ai_service.shutdown()
+        finally:
+            self.db.close()

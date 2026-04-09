@@ -7,6 +7,8 @@ import importlib.util
 import inspect
 from unittest.mock import MagicMock
 
+import pytest
+
 import app.services_container as mod
 from app.service.factory_selection_settings import FactorySelectionSettings
 from app.service.analysis.test_manager import TestManager
@@ -332,5 +334,31 @@ def test_service_container_shutdown_stops_ai_before_closing_db(monkeypatch):
     services = mod.ServiceContainer()
 
     services.shutdown()
+
+    assert calls == ["ai_shutdown", "db_close"]
+
+
+def test_service_container_shutdown_closes_db_when_ai_shutdown_raises(monkeypatch):
+    calls = []
+    shutdown_error = RuntimeError("resident cleanup failed")
+    ai_service = MagicMock()
+
+    def fail_ai_shutdown():
+        calls.append("ai_shutdown")
+        raise shutdown_error
+
+    ai_service.shutdown.side_effect = fail_ai_shutdown
+    db_service = MagicMock()
+    db_service.close.side_effect = lambda: calls.append("db_close")
+    monkeypatch.setattr(mod, "DbConnectionService", MagicMock(return_value=db_service))
+    monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "InputCalibrationService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "ConfigService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "AiService", MagicMock(return_value=ai_service))
+
+    services = mod.ServiceContainer()
+
+    with pytest.raises(RuntimeError, match="resident cleanup failed"):
+        services.shutdown()
 
     assert calls == ["ai_shutdown", "db_close"]
