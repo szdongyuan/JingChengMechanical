@@ -466,6 +466,7 @@ def test_connect_migrates_legacy_config_tables_and_preserves_extra_columns(
             golden_sample_service=SimpleNamespace(),
         ).load_config(1)
         assert loaded["analysis_window_offset_ms"] == 0
+        assert loaded["allow_incomplete_recording_analysis"] is False
         assert loaded["plc_device_key"] is None
         assert loaded["plc_device_label"] is None
         assert loaded["selected_channels"] == [0]
@@ -500,6 +501,31 @@ def test_connect_migrates_legacy_config_tables_and_preserves_extra_columns(
                 "oct_show_golden_overlay": False,
             }
         ]
+
+
+def test_connect_migrates_allow_incomplete_recording_analysis_column(monkeypatch):
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
+        tmp_db.connect()
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE test_config_table (
+                config_id INTEGER PRIMARY KEY,
+                config_name TEXT NOT NULL UNIQUE,
+                record_duration REAL NOT NULL DEFAULT 5.0,
+                analysis_duration REAL NOT NULL DEFAULT 3.0,
+                scan_triggers_test INTEGER NOT NULL DEFAULT 0,
+                created_time TEXT NOT NULL DEFAULT '',
+                updated_time TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+
+        svc.connect()
+
+        columns = _table_columns(tmp_db, "test_config_table")
+
+        assert "allow_incomplete_recording_analysis" in columns
+        assert columns["allow_incomplete_recording_analysis"][4] == "0"
 
 
 def test_connect_removes_score_threshold_from_legacy_ai_binding_table(monkeypatch):

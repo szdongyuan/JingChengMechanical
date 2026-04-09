@@ -123,6 +123,9 @@ class ConfigService:
             "record_duration": cfg.record_duration,
             "analysis_duration": cfg.analysis_duration,
             "analysis_window_offset_ms": cfg.analysis_window_offset_ms,
+            "allow_incomplete_recording_analysis": bool(
+                getattr(cfg, "allow_incomplete_recording_analysis", False)
+            ),
             "scan_triggers_test": bool(cfg.scan_triggers_test),
             "plc_device_key": self._normalize_optional_text(cfg.plc_device_key),
             "plc_device_label": self._normalize_optional_text(cfg.plc_device_label),
@@ -270,6 +273,9 @@ class ConfigService:
                     record_duration=data["record_duration"],
                     analysis_duration=data["analysis_duration"],
                     analysis_window_offset_ms=analysis_window_offset_ms,
+                    allow_incomplete_recording_analysis=bool(
+                        data.get("allow_incomplete_recording_analysis", False)
+                    ),
                     scan_triggers_test=data["scan_triggers_test"],
                     plc_device_key=self._normalize_optional_text(
                         data.get("plc_device_key")
@@ -379,6 +385,10 @@ class ConfigService:
 
         if not isinstance(data.get("scan_triggers_test"), bool):
             errors.append("扫码触发必须为布尔值")
+        if not isinstance(
+            data.get("allow_incomplete_recording_analysis", False), bool
+        ):
+            errors.append("允许分析不完整录音必须为布尔值")
 
         errors.extend(self.validate_factory_runtime(data))
 

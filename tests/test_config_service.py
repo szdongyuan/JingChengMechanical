@@ -206,6 +206,7 @@ def test_load_config_returns_hardware_fields_with_cleaned_trigger_model():
         "record_duration",
         "analysis_duration",
         "analysis_window_offset_ms",
+        "allow_incomplete_recording_analysis",
         "scan_triggers_test",
         "plc_device_key",
         "plc_device_label",
@@ -224,6 +225,7 @@ def test_load_config_returns_hardware_fields_with_cleaned_trigger_model():
     assert result["output_device_name"] == "Speaker 1"
     assert result["output_device_hostapi"] == "WASAPI"
     assert result["output_device_samplerate"] == 44100
+    assert result["allow_incomplete_recording_analysis"] is False
     assert result["selected_channels"] == [0, 2]
 
 
@@ -244,6 +246,7 @@ def test_load_config_returns_plc_binding_and_analysis_offset_fields():
         "record_duration",
         "analysis_duration",
         "analysis_window_offset_ms",
+        "allow_incomplete_recording_analysis",
         "scan_triggers_test",
         "plc_device_key",
         "plc_device_label",
@@ -259,6 +262,7 @@ def test_load_config_returns_plc_binding_and_analysis_offset_fields():
     assert result["plc_device_key"] == "plc-a"
     assert result["plc_device_label"] == "PLC A"
     assert result["analysis_window_offset_ms"] == 250
+    assert result["allow_incomplete_recording_analysis"] is False
 
 
 def test_save_config_persists_hardware_fields():
@@ -292,6 +296,7 @@ def test_save_config_persists_hardware_fields():
         "record_duration",
         "analysis_duration",
         "analysis_window_offset_ms",
+        "allow_incomplete_recording_analysis",
         "scan_triggers_test",
         "plc_device_key",
         "plc_device_label",
@@ -310,6 +315,7 @@ def test_save_config_persists_hardware_fields():
     assert loaded["output_device_name"] == "Speaker 1"
     assert loaded["output_device_hostapi"] == "WASAPI"
     assert loaded["output_device_samplerate"] == 44100
+    assert loaded["allow_incomplete_recording_analysis"] is False
     assert loaded["selected_channels"] == [0, 2]
     assert row.plc_device_key is None
     assert row.plc_device_label is None
@@ -459,6 +465,25 @@ def test_save_config_keeps_existing_ai_binding_row_while_offset_stays_config_own
     assert updated.timeout_ms == 1200
     assert updated.params_json == '{"legacy": true}'
     assert not hasattr(updated, "analysis_window_offset_ms")
+
+
+def test_save_and_load_config_round_trips_allow_incomplete_recording_analysis():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    payload = _config_payload(
+        config_id,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    payload["allow_incomplete_recording_analysis"] = True
+
+    svc.save_config(payload)
+
+    loaded = svc.load_config(config_id)
+    row = ConfigTable.get_by_id(config_id)
+
+    assert loaded["allow_incomplete_recording_analysis"] is True
+    assert row.allow_incomplete_recording_analysis is True
 
 
 def test_legacy_fallback_infers_selected_channels():
@@ -672,6 +697,24 @@ def test_validate_rejects_negative_analysis_window_offset():
     )
 
     assert any("偏移" in err for err in errors)
+
+
+def test_validate_rejects_non_boolean_allow_incomplete_recording_analysis():
+    svc = _service()
+
+    errors = svc.validate(
+        {
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "allow_incomplete_recording_analysis": "yes",
+            "scan_triggers_test": False,
+            "selected_channels": [],
+            "channels": [],
+        }
+    )
+
+    assert any("允许分析不完整录音" in err for err in errors)
 
 
 def test_validate_factory_runtime_rejects_analysis_window_offset_plus_duration_beyond_record_duration():

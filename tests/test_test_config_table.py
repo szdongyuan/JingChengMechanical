@@ -23,6 +23,7 @@ def test_model_defines_trigger_cleanup_fields_with_defaults():
         "plc_device_key",
         "plc_device_label",
         "analysis_window_offset_ms",
+        "allow_incomplete_recording_analysis",
     }
 
     config = ConfigTable.create(config_name="Trigger Cleanup Defaults")
@@ -32,3 +33,11 @@ def test_model_defines_trigger_cleanup_fields_with_defaults():
     assert config.plc_device_key is None
     assert config.plc_device_label is None
     assert config.analysis_window_offset_ms == 0
+
+
+def test_model_defines_allow_incomplete_recording_analysis_with_false_default():
+    assert "allow_incomplete_recording_analysis" in ConfigTable._meta.fields
+
+    config = ConfigTable.create(config_name="Incomplete Stop Defaults")
+
+    assert config.allow_incomplete_recording_analysis is False

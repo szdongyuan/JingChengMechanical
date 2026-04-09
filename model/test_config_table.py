@@ -9,6 +9,7 @@ class TestConfigTable(BaseModel):
     config_name = TextField(unique=True)
     record_duration = FloatField(default=5.0)
     analysis_duration = FloatField(default=3.0)
+    allow_incomplete_recording_analysis = BooleanField(default=False)
     scan_triggers_test = BooleanField(default=False)
     plc_device_key = TextField(null=True, default=None)
     plc_device_label = TextField(null=True, default=None)

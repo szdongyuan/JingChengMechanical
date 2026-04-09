@@ -58,6 +58,7 @@ class DbConnectionService:
                 ("plc_device_key", "TEXT"),
                 ("plc_device_label", "TEXT"),
                 ("analysis_window_offset_ms", "INTEGER NOT NULL DEFAULT 0"),
+                ("allow_incomplete_recording_analysis", "INTEGER NOT NULL DEFAULT 0"),
             ],
         )
         self._ensure_columns(
