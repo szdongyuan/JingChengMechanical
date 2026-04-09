@@ -71,8 +71,17 @@ def validate_segment(segment: Any, index: int) -> None:
         raise ValueError(f"{segment_prefix}.metadata must be an object.")
 
 
+def reject_non_standard_constant(constant_name: str) -> None:
+    raise ValueError(
+        f"Inbound JSON must not use non-standard constant: {constant_name}."
+    )
+
+
 def load_request(path: str) -> dict[str, Any]:
-    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    payload = json.loads(
+        Path(path).read_text(encoding="utf-8"),
+        parse_constant=reject_non_standard_constant,
+    )
     if not isinstance(payload, dict):
         raise ValueError("Request payload must be a JSON object.")
     require_integer(payload.get("protocol_version"), "protocol_version must equal 1.")
@@ -215,7 +224,10 @@ def build_success_response(
 
 
 def write_response(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, indent=2, allow_nan=False),
+        encoding="utf-8",
+    )
 
 
 def cleanup_stale_response(path: Path) -> None:

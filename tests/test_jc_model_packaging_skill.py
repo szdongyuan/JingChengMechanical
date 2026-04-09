@@ -419,6 +419,32 @@ def test_load_request_rejects_boolean_protocol_version(tmp_path: Path):
         module.load_request(str(request_path))
 
 
+@pytest.mark.parametrize("constant_name", ["NaN", "Infinity", "-Infinity"])
+def test_load_request_rejects_non_standard_json_constants(
+    tmp_path: Path, constant_name: str
+):
+    module = _load_module(ROOT / "templates" / "python_oneshot_cli" / "toolchain_cli.py")
+    request_path = tmp_path / "request.json"
+    request_path.write_text(
+        (
+            '{"protocol_version": 1, "request_id": "req_123", "test_run_id": "run_123", '
+            '"toolchain_id": "toolchain_123", "segments": [{"segment_id": "segment_0", '
+            '"role": "device_1", "audio_path": "'
+            + str(tmp_path / "input.wav").replace("\\", "/")
+            + '", "channels": [0], "duration_ms": 4000, "sample_rate": 44100, "metadata": {}}], '
+            f'"context": {{"bad_value": {constant_name}}}, "params": {{}}, "window_info": {{}}}}'
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError) as excinfo:
+        module.load_request(str(request_path))
+
+    assert str(excinfo.value) == (
+        f"Inbound JSON must not use non-standard constant: {constant_name}."
+    )
+
+
 @pytest.mark.parametrize("segment_index", [True, False, -1, "1", 5, None])
 def test_select_segment_falls_back_to_first_segment_for_invalid_index_values(
     tmp_path: Path, segment_index: object
@@ -582,6 +608,108 @@ def test_oneshot_main_surfaces_stale_cleanup_failure(
     assert "Fatal one-shot failure: --request must be an absolute path." in captured.err
     assert "Unable to remove stale response file" in captured.err
     assert response_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("response_payload", "expected_error"),
+    [
+        (
+            {
+                "protocol_version": 1,
+                "request_id": "req_123",
+                "toolchain_name": "Toolchain",
+                "toolchain_version": "1.0.0",
+                "ai_result": {
+                    "ai_label": "PASS",
+                    "score": float("nan"),
+                    "extra": {},
+                },
+            },
+            "Out of range float values are not JSON compliant",
+        ),
+        (
+            {
+                "protocol_version": 1,
+                "request_id": "req_123",
+                "toolchain_name": "Toolchain",
+                "toolchain_version": "1.0.0",
+                "ai_result": {
+                    "ai_label": "PASS",
+                    "score": float("inf"),
+                    "extra": {},
+                },
+            },
+            "Out of range float values are not JSON compliant",
+        ),
+        (
+            {
+                "protocol_version": 1,
+                "request_id": "req_123",
+                "toolchain_name": "Toolchain",
+                "toolchain_version": "1.0.0",
+                "ai_result": {
+                    "ai_label": "PASS",
+                    "score": float("-inf"),
+                    "extra": {},
+                },
+            },
+            "Out of range float values are not JSON compliant",
+        ),
+        (
+            {
+                "protocol_version": 1,
+                "request_id": "req_123",
+                "toolchain_name": "Toolchain",
+                "toolchain_version": "1.0.0",
+                "ai_result": {
+                    "ai_label": "PASS",
+                    "extra": {"raw": object()},
+                },
+            },
+            "Object of type object is not JSON serializable",
+        ),
+    ],
+)
+def test_oneshot_main_routes_non_finite_or_non_serializable_success_payload_through_fatal_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    response_payload: dict[str, object],
+    expected_error: str,
+):
+    module = _load_module(ROOT / "templates" / "python_oneshot_cli" / "toolchain_cli.py")
+    request_payload = _valid_request_payload(str(tmp_path / "input.wav"))
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request_payload), encoding="utf-8")
+    response_path = tmp_path / "response.json"
+    response_path.write_text("stale", encoding="utf-8")
+
+    monkeypatch.setattr(module, "preprocess_from_request", lambda request: {"ok": True})
+    monkeypatch.setattr(module, "run_model", lambda preprocessed: {"ok": True})
+    monkeypatch.setattr(module, "write_artifacts", lambda artifacts_dir, inference_output: [])
+    monkeypatch.setattr(
+        module,
+        "build_success_response",
+        lambda request_payload, inference_output, artifacts, artifacts_dir=None: response_payload,
+    )
+
+    exit_code = module.main(
+        [
+            "--request",
+            str(request_path),
+            "--response",
+            str(response_path),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.out == ""
+    assert "Fatal one-shot failure:" in captured.err
+    assert expected_error in captured.err
+    assert not response_path.exists()
 
 
 def test_resident_template_mentions_protocol_envelopes():
