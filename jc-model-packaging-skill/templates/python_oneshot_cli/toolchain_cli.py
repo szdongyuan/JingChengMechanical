@@ -26,6 +26,50 @@ def ensure_absolute_path(path_value: str, flag_name: str) -> Path:
     return path
 
 
+def require_string(value: Any, error_message: str) -> None:
+    if not isinstance(value, str):
+        raise ValueError(error_message)
+
+
+def require_integer(value: Any, error_message: str) -> None:
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(error_message)
+
+
+def validate_segment(segment: Any, index: int) -> None:
+    segment_prefix = f"segments[{index}]"
+    if not isinstance(segment, dict):
+        raise ValueError(f"{segment_prefix} must be a JSON object.")
+
+    require_string(
+        segment.get("segment_id"),
+        f"{segment_prefix}.segment_id must be a string.",
+    )
+    require_string(
+        segment.get("role"),
+        f"{segment_prefix}.role must be a string.",
+    )
+
+    audio_path = segment.get("audio_path")
+    if not isinstance(audio_path, str) or not Path(audio_path).is_absolute():
+        raise ValueError(f"{segment_prefix}.audio_path must be an absolute path.")
+
+    if not isinstance(segment.get("channels"), list):
+        raise ValueError(f"{segment_prefix}.channels must be a list.")
+
+    require_integer(
+        segment.get("duration_ms"),
+        f"{segment_prefix}.duration_ms must be an integer.",
+    )
+    require_integer(
+        segment.get("sample_rate"),
+        f"{segment_prefix}.sample_rate must be an integer.",
+    )
+
+    if not isinstance(segment.get("metadata"), dict):
+        raise ValueError(f"{segment_prefix}.metadata must be an object.")
+
+
 def load_request(path: str) -> dict[str, Any]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
@@ -38,6 +82,8 @@ def load_request(path: str) -> dict[str, Any]:
     segments = payload.get("segments")
     if not isinstance(segments, list) or not segments:
         raise ValueError("segments must be a non-empty list.")
+    for index, segment in enumerate(segments):
+        validate_segment(segment, index)
     if not isinstance(payload.get("context"), dict):
         raise ValueError("context must be an object.")
     if not isinstance(payload.get("params"), dict):
@@ -137,8 +183,11 @@ def write_response(path: Path, payload: dict[str, Any]) -> None:
 
 
 def cleanup_stale_response(path: Path) -> None:
-    if path.exists():
-        path.unlink()
+    try:
+        if path.is_file():
+            path.unlink()
+    except OSError:
+        pass
 
 
 def main(argv: list[str] | None = None) -> int:

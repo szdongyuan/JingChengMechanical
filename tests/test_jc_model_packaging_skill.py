@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -256,6 +257,57 @@ def test_oneshot_main_routes_invalid_cli_paths_through_fatal_handler(
     assert captured.out == ""
     if flag_name != "--response":
         assert not response_path.exists()
+
+
+def test_oneshot_main_preserves_original_fatal_error_when_response_is_an_existing_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    module = _load_module(ROOT / "templates" / "python_oneshot_cli" / "toolchain_cli.py")
+    response_dir = tmp_path / "response-dir"
+    response_dir.mkdir()
+
+    exit_code = module.main(
+        [
+            "--request",
+            "relative-request.json",
+            "--response",
+            str(response_dir),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert captured.out == ""
+    assert captured.err == "Fatal one-shot failure: --request must be an absolute path.\n"
+    assert response_dir.is_dir()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value", "expected_message"),
+    [
+        ("segment_id", 123, "segments[0].segment_id must be a string."),
+        ("role", 123, "segments[0].role must be a string."),
+        ("channels", "0", "segments[0].channels must be a list."),
+        ("duration_ms", "4000", "segments[0].duration_ms must be an integer."),
+        ("sample_rate", 44100.0, "segments[0].sample_rate must be an integer."),
+        ("metadata", [], "segments[0].metadata must be an object."),
+    ],
+)
+def test_load_request_rejects_invalid_segment_schema_fields(
+    tmp_path: Path, field_name: str, invalid_value: object, expected_message: str
+):
+    module = _load_module(ROOT / "templates" / "python_oneshot_cli" / "toolchain_cli.py")
+    request_payload = _valid_request_payload(str(tmp_path / "input.wav"))
+    request_payload["segments"][0][field_name] = invalid_value
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request_payload), encoding="utf-8")
+
+    with pytest.raises(ValueError) as excinfo:
+        module.load_request(str(request_path))
+
+    assert str(excinfo.value) == expected_message
 
 
 @pytest.mark.parametrize("segment_index", [True, False, -1, "1", 5, None])
