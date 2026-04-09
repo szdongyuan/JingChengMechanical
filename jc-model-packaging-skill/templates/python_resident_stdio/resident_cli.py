@@ -160,7 +160,7 @@ def validate_declared_artifacts(
 def preload_model() -> Any:
     global _MODEL_HANDLE
     if _MODEL_HANDLE is None:
-        # Replace this hook with the real model/runtime preload step so later
+        # Replace this hook with the real runtime preload step so later
         # analyze requests can reuse imports, weights, and device state.
         _MODEL_HANDLE = object()
     return _MODEL_HANDLE

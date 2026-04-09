@@ -2,6 +2,20 @@
 
 Complete every item before generating deliverables.
 
+## Decision Matrix
+
+| Decision | Prefer this when | Tradeoff |
+| --- | --- | --- |
+| `one-shot` | file replay, manual debugging, and isolated runs matter most | startup cost is paid on every run |
+| `resident` | imports are expensive, repeated requests are expected, and memory reuse matters | protocol handling is more complex |
+| plain Python | target machines already have Python and fast iteration matters most | the runtime must be managed separately |
+| Windows `.exe` | Python availability is uncertain and deployment simplicity matters more than size | builds are heavier and rebuilds are slower |
+| `onedir` | practical default for ML payloads with sidecar weights or assets | ships as a directory instead of one file |
+| `onefile` | optional when single-file delivery matters more than startup time | unpack startup cost is higher |
+
+Windows `.exe` is a delivery format, not a protocol. One-shot and resident can
+both remain plain Python or both ship as Windows `.exe`.
+
 - [ ] Choose `one-shot` or `resident`.
 - [ ] State why the chosen runtime shape fits the host.
 - [ ] Decide whether weights stay `external` or are `embedded`.

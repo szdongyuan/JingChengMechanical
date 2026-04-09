@@ -7,6 +7,15 @@ import pytest
 
 
 ROOT = Path("jc-model-packaging-skill")
+TEXT_FILE_SUFFIXES = {".md", ".py", ".ps1", ".spec", ".json", ".jsonl", ".txt"}
+FORBIDDEN_REPO_TOKENS = [
+    "docs/double-sdd",
+    "app/",
+    "ui/",
+    "model/",
+    "consts/",
+    "jingchengmechanical",
+]
 
 OWNED_REQUIRED_FILES = [
     ROOT / "SKILL.md",
@@ -39,9 +48,19 @@ LATER_SLICE_FILES = [
     ROOT / "templates" / "smoke_test" / "resident_output.error.jsonl",
 ]
 
+ALL_REQUIRED_FILES = [*OWNED_REQUIRED_FILES, *RESIDENT_REQUIRED_FILES, *LATER_SLICE_FILES]
+
 
 def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def _read_json(path: Path) -> dict:
+    return json.loads(_read_text(path))
+
+
+def _read_jsonl(path: Path) -> list[dict]:
+    return [json.loads(line) for line in _read_text(path).splitlines() if line.strip()]
 
 
 def _load_module(path: Path):
@@ -117,45 +136,53 @@ def _run_resident_main(
     return exit_code, stdout.getvalue(), stderr.getvalue()
 
 
-def test_skill_package_contains_slice_one_required_files():
-    missing = [str(path) for path in OWNED_REQUIRED_FILES if not path.is_file()]
+def test_skill_package_contains_all_required_files():
+    missing = [str(path) for path in ALL_REQUIRED_FILES if not path.is_file()]
     assert missing == []
 
 
-def test_skill_package_contains_slice_two_resident_files():
-    missing = [str(path) for path in RESIDENT_REQUIRED_FILES if not path.is_file()]
-    assert missing == []
-
-
-@pytest.mark.xfail(
-    reason="Windows packaging and smoke fixtures land in later slices."
-)
-def test_future_skill_package_files_are_added_in_later_slices():
-    missing = [str(path) for path in LATER_SLICE_FILES if not path.is_file()]
-    assert missing == []
-
-
-def test_owned_skill_pack_text_is_self_contained_and_mentions_required_modes():
-    text_files = [path for path in OWNED_REQUIRED_FILES if path.suffix in {".md", ".py", ".json"}]
+def test_skill_pack_text_is_self_contained_and_mentions_required_modes():
+    text_files = [path for path in ROOT.rglob("*") if path.is_file() and path.suffix in TEXT_FILE_SUFFIXES]
     combined = "\n".join(_read_text(path) for path in text_files).lower()
     assert "one-shot" in combined
     assert "resident" in combined
     assert "duration" in combined
-    forbidden = ["docs/double-sdd", "app/", "ui/", "jingchengmechanical"]
-    assert all(token not in combined for token in forbidden)
+    assert ".exe" in combined
+    assert all(token not in combined for token in FORBIDDEN_REPO_TOKENS)
 
 
 def test_skill_guidance_locks_decisions_and_contract_rules():
     skill_text = _read_text(ROOT / "SKILL.md")
+    lowered = skill_text.lower()
     assert "--request" in skill_text
     assert "--response" in skill_text
     assert "--artifacts-dir" in skill_text
-    assert "one-shot" in skill_text.lower()
-    assert "resident" in skill_text.lower()
-    assert "duration mismatch" in skill_text.lower()
+    assert '"message_type": "analyze"' in skill_text
+    assert '"message_type": "result"' in skill_text
+    assert '"message_type": "error"' in skill_text
+    assert "one-shot" in lowered
+    assert "resident" in lowered
+    assert "duration mismatch" in lowered
     assert "segment_index" in skill_text
     assert "segments[0]" in skill_text
     assert "relative_path" in skill_text
+    assert "verify the wrapper before claiming success" in lowered
+
+
+def test_skill_guidance_stays_agent_facing_and_includes_decision_matrix():
+    skill_text = _read_text(ROOT / "SKILL.md")
+    lowered = skill_text.lower()
+    assert "do not inspect any source repository" in lowered
+    assert "use the embedded contract" in lowered or "this package is the contract" in lowered
+    assert "plain python" in lowered
+    assert "windows `.exe`" in skill_text.lower() or "windows `.exe`" in skill_text
+    assert "tensor shape" in lowered
+    assert "normalization" in lowered
+    assert "output interpretation" in lowered
+    assert "decision matrix" in lowered
+    assert "delivery format, not a protocol" in lowered
+    assert "onedir" in lowered
+    assert "onefile" in lowered
 
 
 def test_skill_guidance_explains_when_to_keep_weights_external_or_embedded():
@@ -199,6 +226,10 @@ def test_metadata_templates_capture_duration_contract_and_packaging_choices():
     assert "variable-length" in checklist
     assert "external" in checklist
     assert "embed" in checklist
+    assert "decision matrix" in checklist
+    assert "onedir" in checklist
+    assert "onefile" in checklist
+    assert "delivery format" in checklist
 
 
 def test_oneshot_template_mentions_required_cli_flags_and_hooks():
@@ -605,6 +636,96 @@ def test_resident_readme_mentions_utf8_jsonl_transport():
     assert "stdin" in text and "stdout" in text
     assert "preload" in text
     assert "fatal" in text
+
+
+def test_windows_packaging_templates_explain_delivery_tradeoffs():
+    readme = _read_text(ROOT / "templates" / "pyinstaller_windows" / "README.md")
+    build_script = _read_text(ROOT / "templates" / "pyinstaller_windows" / "build.ps1")
+    oneshot_spec = _read_text(ROOT / "templates" / "pyinstaller_windows" / "toolchain_oneshot.spec")
+    resident_spec = _read_text(ROOT / "templates" / "pyinstaller_windows" / "toolchain_resident.spec")
+    lowered = readme.lower()
+
+    assert "onedir" in lowered
+    assert "practical default" in lowered
+    assert "onefile" in lowered
+    assert "startup time" in lowered or "startup latency" in lowered
+    assert ".exe" in readme
+    assert "delivery format" in lowered
+    assert "not a protocol" in lowered
+    assert "one-shot" in lowered
+    assert "resident" in lowered
+
+    build_lowered = build_script.lower()
+    assert "pyinstaller .\\toolchain_oneshot.spec" in build_lowered
+    assert "pyinstaller .\\toolchain_resident.spec" in build_lowered
+    assert "model files" in build_lowered
+    assert "non-python assets" in build_lowered
+    assert "onedir" in build_lowered
+    assert "onefile" in build_lowered
+
+    assert "toolchain_cli.py" in oneshot_spec
+    assert "one-shot" in oneshot_spec.lower()
+    assert "resident_cli.py" in resident_spec
+    assert "resident" in resident_spec.lower()
+
+
+def test_smoke_examples_cover_success_and_failure_paths():
+    root = ROOT / "templates" / "smoke_test"
+    required = [
+        root / "README.md",
+        root / "request.json",
+        root / "response.success.json",
+        root / "stderr.error.txt",
+        root / "resident_input.jsonl",
+        root / "resident_shutdown_input.jsonl",
+        root / "resident_output.success.jsonl",
+        root / "resident_output.error.jsonl",
+    ]
+    missing = [str(path) for path in required if not path.is_file()]
+    assert missing == []
+
+
+def test_smoke_examples_lock_protocol_and_artifact_rules():
+    root = ROOT / "templates" / "smoke_test"
+    request_payload = _read_json(root / "request.json")
+    success_payload = _read_json(root / "response.success.json")
+    resident_input = _read_jsonl(root / "resident_input.jsonl")
+    resident_shutdown = _read_jsonl(root / "resident_shutdown_input.jsonl")
+    resident_success = _read_jsonl(root / "resident_output.success.jsonl")
+    resident_error = _read_jsonl(root / "resident_output.error.jsonl")
+    smoke_readme = _read_text(root / "README.md").lower()
+    stderr_text = _read_text(root / "stderr.error.txt").strip()
+
+    assert request_payload["protocol_version"] == 1
+    assert request_payload["segments"][0]["audio_path"] == "D:/absolute/path/input.wav"
+    assert success_payload["ai_result"]["artifacts"][0]["relative_path"] == "report.json"
+    assert ".." not in success_payload["ai_result"]["artifacts"][0]["relative_path"]
+    assert resident_input[0]["message_type"] == "analyze"
+    assert resident_shutdown == [{"message_type": "shutdown"}]
+    assert resident_success[0]["message_type"] == "result"
+    assert resident_success[0]["response"]["ai_result"]["artifacts"][0]["relative_path"] == "report.json"
+    assert resident_error[0]["message_type"] == "error"
+    assert "artifact exists" in smoke_readme or "every listed artifact exists" in smoke_readme
+    assert "relative" in smoke_readme
+    assert "traversal-safe" in smoke_readme or "must not contain `..`" in smoke_readme
+    assert "stderr" in smoke_readme
+    assert "non-protocol" in smoke_readme
+    assert stderr_text.startswith("Fatal")
+    assert not stderr_text.startswith("{")
+
+
+def test_skill_contains_no_repo_dependent_instructions():
+    text_files = [path for path in ROOT.rglob("*") if path.is_file() and path.suffix in TEXT_FILE_SUFFIXES]
+    for path in text_files:
+        text = _read_text(path).lower()
+        assert all(token not in text for token in FORBIDDEN_REPO_TOKENS), str(path)
+
+
+def test_skill_pack_contains_no_repo_relative_markdown_links():
+    forbidden = ["(/", "](docs/", "](app/", "](ui/", "](model/", "](consts/"]
+    for path in ROOT.rglob("*.md"):
+        text = _read_text(path)
+        assert all(token not in text for token in forbidden), str(path)
 
 
 def test_resident_main_exits_non_zero_for_malformed_protocol_envelope(

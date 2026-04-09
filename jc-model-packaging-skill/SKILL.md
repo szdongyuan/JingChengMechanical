@@ -3,9 +3,9 @@
 ## Purpose
 
 Package an existing inference implementation into a host-usable tool by using
-only this skill pack plus the model/runtime inputs you were given. Do not
-inspect any source repository or external project docs. This package is the
-contract.
+only this skill pack plus the explicit model information you were given. Do not
+inspect any source repository or external project docs. Use the embedded
+contract in this pack. This package is the contract.
 
 ## Supported Outputs
 
@@ -40,6 +40,18 @@ Default recommendation when no better domain rule exists:
 - trim if longer
 - zero-pad if shorter
 
+## Non-Negotiable Rules
+
+- Do not inspect any source repository.
+- Use the embedded contract and templates from this pack.
+- Resolve sample rate, channels, tensor shape, normalization, and output interpretation before coding.
+- Declare the duration policy before packaging.
+- Choose one-shot or resident intentionally.
+- Decide whether plain Python is enough or Windows `.exe` packaging is
+  warranted.
+- Verify the wrapper before claiming success.
+- Keep imports, asset references, and Markdown links portable.
+
 ## Runtime Shape Decision
 
 Choose the one-shot template when:
@@ -57,6 +69,24 @@ Choose the resident template when:
 The resident path uses stdio JSONL envelopes with `message_type` values such as
 `"analyze"`, `"result"`, `"error"`, and `"shutdown"`. Expand that contract only
 from this package, not from external repository source.
+
+## Packaging Decision Matrix
+
+Use this matrix before you adapt any template:
+
+| Choice | Prefer it when | Avoid it when |
+| --- | --- | --- |
+| One-shot Python | file replay matters, startup latency is acceptable, manual debugging is the priority | repeated requests are common and cold imports dominate runtime |
+| Resident Python | imports are expensive, the process should stay in memory, repeated requests are expected | simple file replay and isolated one-off runs are more important |
+| One-shot Windows `.exe` | Python availability is uncertain and file replay is still the best operational shape | package size and unpack startup cost matter more than delivery simplicity |
+| Resident Windows `.exe` | Python availability is uncertain and a warm resident process is still the best runtime shape | the target can already run Python and extra packaging cost is not justified |
+
+`.exe` is a delivery format, not a protocol. One-shot and resident can both
+remain plain Python or both be packaged as Windows `.exe`.
+
+For Windows packaging, prefer `onedir` as the practical default for ML
+payloads. `onefile` is optional and may cost startup time because the bundle
+must unpack before your code runs.
 
 ## Weights Packaging Decision
 
@@ -108,6 +138,56 @@ Rules:
 Use the detailed one-shot contract in
 `templates/python_oneshot_cli/protocol_contract.md` and adapt the template in
 `templates/python_oneshot_cli/toolchain_cli.py`.
+
+## Resident Contract Summary
+
+The resident wrapper must use UTF-8 JSON Lines over `stdin` and `stdout`.
+
+Rules:
+
+- Handle inbound `"message_type": "analyze"` envelopes that contain a matching
+  outer `request_id`, inner `request`, and absolute `artifacts_dir`.
+- Use `request.params.segment_index` when it is valid. Otherwise fall back to
+  `request.segments[0]`.
+- Emit success as `"message_type": "result"`.
+- Emit request-scoped failures as `"message_type": "error"`.
+- Treat malformed protocol input as fatal: log to `stderr`, exit non-zero, and
+  do not emit extra stdout text.
+- Treat `"message_type": "shutdown"` as a clean stop with no stdout output.
+- Report artifacts only through safe `relative_path` values that stay under the
+  supplied artifacts directory.
+
+Use the detailed resident contract in
+`templates/python_resident_stdio/resident_protocol.md` and adapt the template
+in `templates/python_resident_stdio/resident_cli.py`.
+
+## Windows Packaging Notes
+
+Use `templates/pyinstaller_windows/README.md`,
+`templates/pyinstaller_windows/build.ps1`,
+`templates/pyinstaller_windows/toolchain_oneshot.spec`, and
+`templates/pyinstaller_windows/toolchain_resident.spec` when a Windows `.exe`
+delivery is actually required.
+
+- Package the one-shot entrypoint for file-oriented replay workflows.
+- Package the resident entrypoint for repeated analyze requests.
+- Keep weight files external when they are large or swapped independently.
+- Bundle weight files only when a single distributable is required.
+
+## Verification Requirements
+
+Before claiming success, verify the chosen runtime shape:
+
+- One-shot packaging: run a smoke replay with `templates/smoke_test/request.json`
+  and compare the result against `templates/smoke_test/response.success.json`.
+- Resident packaging: replay `templates/smoke_test/resident_input.jsonl` and
+  compare success and failure envelopes against the resident smoke fixtures.
+- Windows `.exe` packaging: build the requested mode and verify the generated
+  deliverable still follows the same protocol.
+- Validate that every declared artifact exists, is readable, and uses a
+  relative traversal-safe `relative_path`.
+- Confirm that fatal one-shot failures stay on `stderr` as human-readable
+  non-protocol text.
 
 ## Packaging Workflow
 
