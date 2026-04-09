@@ -507,6 +507,7 @@ def test_workorder_restore_keeps_sn_and_model_empty(qapp):
         ("analyzing", "当前阶段：分析中"),
         ("reviewing", "当前阶段：等待复核"),
         ("reanalyzing", "当前阶段：重新分析中"),
+        ("stopped", "当前阶段：已停止"),
     ],
 )
 def test_workorder_phase_summary_renders_all_known_chinese_labels(
@@ -576,3 +577,13 @@ def test_workorder_locks_checklist_during_busy_or_pending_start_states(qapp, sta
     services.bus.factory_state_changed.emit(state)
 
     assert module.config_selector.is_locked() is True
+
+
+def test_workorder_keeps_config_selector_unlocked_in_stopped_state(qapp):
+    module, services = _make_module(saved_selected_ids=(101,))
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(selected_config_ids=(101,), run_phase="stopped")
+    )
+
+    assert module.config_selector.is_locked() is False

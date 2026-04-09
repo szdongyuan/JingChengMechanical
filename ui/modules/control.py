@@ -14,6 +14,7 @@ from app.services_container import FactoryControllerState
 class ControlModule(QWidget):
     module_id = "control"
     _BUSY_RUN_PHASES = frozenset({"running", "analyzing", "reanalyzing"})
+    _STOP_ENABLED_PHASES = frozenset({"running", "analyzing"})
     _REVIEW_CLEANUP_BUSY_REASON = "当前测试运行中"
     _PENDING_START_REASON = "启动请求处理中"
 
@@ -96,6 +97,7 @@ class ControlModule(QWidget):
 
     def _sync_start_state(self) -> None:
         self.btn_start.setEnabled(not self._start_click_disabled())
+        self.btn_stop.setEnabled(self._factory_state.run_phase in self._STOP_ENABLED_PHASES)
 
     def _start_disabled_reason(self) -> str | None:
         if not self._start_click_disabled():

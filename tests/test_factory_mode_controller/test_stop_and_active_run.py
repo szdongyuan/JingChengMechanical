@@ -16,6 +16,23 @@ from ._support import (
 )
 
 
+def _make_stopped_payload(
+    *,
+    config_id: int = 101,
+    run_id: str | None = None,
+    trigger_source: str = "manual",
+):
+    stopped_payload_cls = getattr(services_mod, "FactoryRuntimeStoppedPayload", None)
+
+    assert stopped_payload_cls is not None, "FactoryRuntimeStoppedPayload is missing"
+
+    return stopped_payload_cls(
+        config_id=config_id,
+        run_id=run_id or _run_id_for(config_id),
+        trigger_source=trigger_source,
+    )
+
+
 @pytest.mark.parametrize("phase", ["running", "analyzing", "reanalyzing"])
 def test_factory_mode_controller_blocks_new_starts_during_active_or_reanalysis_phase(phase):
     controller_mod = _load_factory_mode_controller_module()
@@ -88,6 +105,68 @@ def test_factory_mode_controller_keeps_start_ready_false_during_blocking_analysi
     assert controller.state.run_phase == phase
     assert controller.state.start_ready is False
     assert controller.state.start_ready_reason == expected_reason
+
+
+def test_factory_mode_controller_consumes_runtime_stopped_without_display_reset():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        run_id="run-1",
+        trigger_source="manual",
+    )
+    prior_review = _make_review_payload(
+        displayed_config_id=101,
+        run_id="older-run",
+        trigger_source="manual",
+    )
+    controller._review_payload = prior_review
+    reset_reasons.clear()
+    reviews.clear()
+
+    controller.handle_runtime_stopped(
+        _make_stopped_payload(config_id=101, run_id="run-1", trigger_source="manual")
+    )
+
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "stopped"
+    assert controller.state.trigger_source == "manual"
+    assert controller.state.start_ready is True
+    assert controller.state.start_ready_reason is None
+    assert controller.review_payload == prior_review
+    assert reset_reasons == []
+    assert reviews == []
+
+
+def test_factory_mode_controller_consumes_factory_runtime_stopped_bus_signal():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        run_id="run-1",
+        trigger_source="manual",
+    )
+
+    bus.factory_runtime_stopped.emit(
+        _make_stopped_payload(config_id=101, run_id="run-1", trigger_source="manual")
+    )
+
+    assert controller.state.run_phase == "stopped"
 
 
 @pytest.mark.parametrize("phase", ["running", "analyzing", "reanalyzing"])
@@ -198,7 +277,9 @@ def test_factory_mode_controller_clear_calls_ignore_active_analysis_and_preserve
 
 
 @pytest.mark.parametrize("phase", ["running", "analyzing"])
-def test_factory_mode_controller_stop_clears_active_state_and_display_ownership(phase):
+def test_factory_mode_controller_stop_active_run_waits_for_backend_signal_before_clearing_state(
+    phase,
+):
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()
     reset_reasons: list[str] = []
@@ -220,12 +301,12 @@ def test_factory_mode_controller_stop_clears_active_state_and_display_ownership(
     assert stopped is True
     services.test.stop_active_run.assert_called_once_with(config_id=101)
     assert controller.review_payload == services_mod.FactoryReviewPayload()
-    assert controller.state.active_config_id is None
-    assert controller.state.displayed_config_id is None
-    assert controller.state.run_phase == "armed"
-    assert controller.state.trigger_source is None
-    assert reset_reasons == ["active_run_stopped"]
-    assert reviews == [services_mod.FactoryReviewPayload()]
+    assert controller.state.active_config_id == 101
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == phase
+    assert controller.state.trigger_source == "manual"
+    assert reset_reasons == []
+    assert reviews == []
 
 
 @pytest.mark.parametrize("phase", ["running", "analyzing"])

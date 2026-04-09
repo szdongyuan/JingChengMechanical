@@ -29,7 +29,7 @@ class FactoryControllerState:
         "analyzing": "当前测试分析中",
         "reanalyzing": "当前正在重新分析",
     }
-    _START_READY_SELECTION_PHASES = frozenset({"idle", "armed", "reviewing"})
+    _START_READY_SELECTION_PHASES = frozenset({"idle", "armed", "reviewing", "stopped"})
 
     def __post_init__(self):
         selection_ready = self.selection_ready
@@ -157,6 +157,13 @@ class FactoryRuntimeAbortPayload:
     error_message: str | None = None
 
 
+@dataclass(frozen=True)
+class FactoryRuntimeStoppedPayload:
+    config_id: int
+    run_id: str
+    trigger_source: str
+
+
 class EventBus(QObject):
     """
     模块间通信的“信号总线”。
@@ -206,6 +213,7 @@ class EventBus(QObject):
     factory_runtime_auto_analysis_no_result = pyqtSignal(object)  # FactoryReviewPayload
     factory_runtime_auto_analysis_error = pyqtSignal(object)      # FactoryReviewPayload
     factory_runtime_auto_analysis_cleanup_settled = pyqtSignal(object)  # FactoryRuntimeConfigPayload
+    factory_runtime_stopped = pyqtSignal(object)                  # FactoryRuntimeStoppedPayload
     factory_runtime_aborted = pyqtSignal(object)                  # FactoryRuntimeAbortPayload
     factory_runtime_reanalysis_completed = pyqtSignal(object)     # FactoryReviewPayload
     factory_state_changed = pyqtSignal(object)              # FactoryControllerState

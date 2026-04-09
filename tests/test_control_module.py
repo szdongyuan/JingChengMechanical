@@ -350,6 +350,30 @@ def test_start_button_is_disabled_for_controller_owned_busy_reason_in_armed_stat
     services.factory_mode.start_manual.assert_not_called()
 
 
+def test_control_start_button_remains_enabled_in_stopped_state(qapp):
+    module, _ = _make_module(
+        initial_state=FactoryControllerState(
+            selected_config_ids=(101,),
+            run_phase="stopped",
+            selection_ready=True,
+            start_ready=True,
+        )
+    )
+
+    assert module.btn_start.isEnabled() is True
+
+
+def test_control_stop_button_is_disabled_in_stopped_state(qapp):
+    module, _ = _make_module(
+        initial_state=FactoryControllerState(
+            selected_config_ids=(101,),
+            run_phase="stopped",
+        )
+    )
+
+    assert module.btn_stop.isEnabled() is False
+
+
 def test_blocked_start_signal_opens_and_updates_single_modal(qapp, monkeypatch):
     module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
 

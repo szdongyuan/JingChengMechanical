@@ -12,6 +12,7 @@ from app.services_container import (
     FactoryReviewPayload,
     FactoryRuntimeConfigPayload,
     FactoryRuntimeStartPayload,
+    FactoryRuntimeStoppedPayload,
     FactoryScanIngressPayload,
     FactoryStartBlockedPayload,
 )
@@ -340,6 +341,27 @@ class FactoryModeController(QObject):
     def handle_runtime_auto_analysis_error(self, payload: FactoryReviewPayload) -> None:
         self.handle_runtime_no_result(payload)
 
+    def handle_runtime_stopped(self, payload: FactoryRuntimeStoppedPayload) -> None:
+        if not self._owns_runtime_payload(
+            config_id=payload.config_id,
+            run_id=payload.run_id,
+            allowed_phases=self._ACTIVE_RUN_PHASES,
+        ):
+            return
+
+        self._owned_runtime_config_id = None
+        self._owned_runtime_run_id = None
+        self._state = self._state_with_readiness(
+            replace(
+                self._state,
+                active_config_id=None,
+                displayed_config_id=payload.config_id,
+                run_phase="stopped",
+                trigger_source=payload.trigger_source,
+            )
+        )
+        self._emit_state()
+
     def handle_runtime_aborted(self, payload) -> None:
         if not self._owns_runtime_payload(
             config_id=payload.config_id,
@@ -462,8 +484,6 @@ class FactoryModeController(QObject):
         except Exception:
             stopped = False
 
-        if stopped:
-            self._reset_review_context("active_run_stopped")
         return stopped
 
     def clear_for_next_run(self, reason: str = "next_run_accepted") -> None:
@@ -491,6 +511,7 @@ class FactoryModeController(QObject):
             self.bus.factory_runtime_auto_analysis_cleanup_settled.connect(
                 self.handle_runtime_auto_analysis_cleanup_settled
             )
+        self.bus.factory_runtime_stopped.connect(self.handle_runtime_stopped)
         self.bus.factory_runtime_aborted.connect(self.handle_runtime_aborted)
         self.bus.factory_runtime_reanalysis_completed.connect(
             self.handle_runtime_reanalysis_completed
@@ -680,7 +701,7 @@ class FactoryModeController(QObject):
             return False, "当前测试运行中"
         if not selection_ready:
             return False, selection_ready_reason
-        if state.run_phase not in {"armed", "reviewing"}:
+        if state.run_phase not in {"armed", "reviewing", "stopped"}:
             return False, "工厂模式未就绪"
         return True, None
 
@@ -735,7 +756,7 @@ class FactoryModeController(QObject):
         return (
             self._review_payload != FactoryReviewPayload()
             or self._state.displayed_config_id is not None
-            or self._state.run_phase in {"reviewing", "reanalyzing"}
+            or self._state.run_phase in {"reviewing", "reanalyzing", "stopped"}
         )
 
     @staticmethod

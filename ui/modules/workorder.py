@@ -17,6 +17,7 @@ class WorkOrderModule(QWidget):
         "analyzing": "分析中",
         "reviewing": "等待复核",
         "reanalyzing": "重新分析中",
+        "stopped": "已停止",
     }
 
     def __init__(self, services):

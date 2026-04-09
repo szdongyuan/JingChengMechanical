@@ -90,6 +90,7 @@ def test_factory_mode_signals_exist():
         "factory_runtime_auto_analysis_no_result",
         "factory_runtime_auto_analysis_error",
         "factory_runtime_auto_analysis_cleanup_settled",
+        "factory_runtime_stopped",
         "factory_runtime_aborted",
         "factory_runtime_reanalysis_completed",
         "factory_state_changed",
@@ -147,6 +148,28 @@ def test_factory_runtime_payload_contract_includes_run_id():
     assert abort_payload.run_id == "run-101-1"
 
 
+def test_factory_runtime_stopped_payload_contract_is_explicit():
+    stopped_payload_cls = getattr(mod, "FactoryRuntimeStoppedPayload", None)
+
+    assert stopped_payload_cls is not None, "FactoryRuntimeStoppedPayload is missing"
+    assert is_dataclass(stopped_payload_cls)
+    assert [field.name for field in fields(stopped_payload_cls)] == [
+        "config_id",
+        "run_id",
+        "trigger_source",
+    ]
+
+    payload = stopped_payload_cls(
+        config_id=101,
+        run_id="run-101-1",
+        trigger_source="manual",
+    )
+
+    assert payload.config_id == 101
+    assert payload.run_id == "run-101-1"
+    assert payload.trigger_source == "manual"
+
+
 def test_factory_controller_state_contract_exposes_only_spec_fields():
     state_cls = getattr(mod, "FactoryControllerState", None)
 
@@ -173,6 +196,7 @@ def test_factory_controller_state_derives_readiness_from_ordered_selection_witho
         run_phase="not_ready",
     )
     reviewing_state = mod.FactoryControllerState(selected_config_ids=(101, 202), run_phase="reviewing")
+    stopped_state = mod.FactoryControllerState(selected_config_ids=(101,), run_phase="stopped")
     busy_state = mod.FactoryControllerState(selected_config_ids=(101,), run_phase="running")
 
     assert ready_state.selection_ready is True
@@ -193,6 +217,10 @@ def test_factory_controller_state_derives_readiness_from_ordered_selection_witho
     assert reviewing_state.selection_ready is True
     assert reviewing_state.start_ready is True
     assert reviewing_state.start_ready_reason is None
+
+    assert stopped_state.selection_ready is True
+    assert stopped_state.start_ready is True
+    assert stopped_state.start_ready_reason is None
 
     assert busy_state.selection_ready is True
     assert busy_state.start_ready is False

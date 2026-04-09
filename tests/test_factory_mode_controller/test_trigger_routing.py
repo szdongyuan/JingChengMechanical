@@ -20,6 +20,23 @@ from ._support import (
 )
 
 
+def _make_stopped_payload(
+    *,
+    config_id: int = 101,
+    run_id: str | None = None,
+    trigger_source: str = "manual",
+):
+    stopped_payload_cls = getattr(services_mod, "FactoryRuntimeStoppedPayload", None)
+
+    assert stopped_payload_cls is not None, "FactoryRuntimeStoppedPayload is missing"
+
+    return stopped_payload_cls(
+        config_id=config_id,
+        run_id=run_id or _run_id_for(config_id),
+        trigger_source=trigger_source,
+    )
+
+
 def test_factory_mode_controller_tracks_explicit_plc_ingress_and_display_reset():
     controller_mod = _load_factory_mode_controller_module()
     plc_payload_cls = getattr(services_mod, "FactoryPlcIngressPayload", None)
@@ -124,6 +141,64 @@ def test_factory_mode_controller_routes_scan_events(configs, expected_config_id)
     assert controller.state.active_config_id == expected_config_id
     assert controller.state.run_phase == "running"
     assert controller.state.trigger_source == "scan"
+
+
+@pytest.mark.parametrize(
+    ("trigger_kind", "expected_config_id"),
+    [
+        ("plc", 202),
+        ("scan", 202),
+    ],
+)
+def test_factory_mode_controller_routes_external_triggers_from_stopped_state(
+    trigger_kind,
+    expected_config_id,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    services = _make_services(
+        (
+            _make_config(101, plc_device_key="plc-a", scan_triggers_test=False),
+            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
+        )
+    )
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        run_id="run-1",
+        trigger_source="manual",
+    )
+    controller.handle_runtime_stopped(
+        _make_stopped_payload(config_id=101, run_id="run-1", trigger_source="manual")
+    )
+    reset_reasons.clear()
+    _accept_start(services)
+
+    if trigger_kind == "plc":
+        accepted = controller.handle_plc_event(
+            services_mod.FactoryPlcIngressPayload(plc_device_key="plc-b")
+        )
+    else:
+        accepted = controller.handle_scan_event(
+            services_mod.FactoryScanIngressPayload(scan_text="SN-1")
+        )
+
+    assert accepted is True
+    _assert_start_called_with(
+        services,
+        {"config_id": expected_config_id},
+        expected_trigger_source=trigger_kind,
+    )
+    assert controller.state.active_config_id == expected_config_id
+    assert controller.state.displayed_config_id == expected_config_id
+    assert controller.state.run_phase == "running"
+    assert controller.state.trigger_source == trigger_kind
+    assert reset_reasons == ["next_run_accepted"]
 
 
 def test_blocked_plc_and_scan_start_emit_factory_start_blocked_while_idle():

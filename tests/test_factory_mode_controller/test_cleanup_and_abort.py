@@ -34,6 +34,23 @@ def qapp():
     return app
 
 
+def _make_stopped_payload(
+    *,
+    config_id: int = 101,
+    run_id: str | None = None,
+    trigger_source: str = "manual",
+):
+    stopped_payload_cls = getattr(services_mod, "FactoryRuntimeStoppedPayload", None)
+
+    assert stopped_payload_cls is not None, "FactoryRuntimeStoppedPayload is missing"
+
+    return stopped_payload_cls(
+        config_id=config_id,
+        run_id=run_id or _run_id_for(config_id),
+        trigger_source=trigger_source,
+    )
+
+
 @pytest.mark.parametrize(
     ("signal_name", "payload_kwargs"),
     [
@@ -125,11 +142,24 @@ def test_factory_mode_controller_ignores_out_of_band_auto_analysis_failure_paylo
     controller = controller_mod.FactoryModeController(bus, services)
     controller.set_selection((101, 202))
     controller.start_manual()
+    run_id = _run_id_for(101)
 
     if reset_kind == "stop":
-        controller.handle_runtime_analyzing(_make_runtime_config_payload(config_id=101))
+        controller.handle_runtime_analyzing(
+            _make_runtime_config_payload(config_id=101, run_id=run_id)
+        )
         reviews.clear()
         assert controller.stop_active_run() is True
+        bus.factory_runtime_stopped.emit(
+            _make_stopped_payload(
+                config_id=101,
+                run_id=run_id,
+                trigger_source="manual",
+            )
+        )
+        expected_displayed_config_id = 101
+        expected_phase = "stopped"
+        expected_trigger_source = "manual"
     else:
         reviews.clear()
         bus.factory_runtime_aborted.emit(
@@ -139,6 +169,9 @@ def test_factory_mode_controller_ignores_out_of_band_auto_analysis_failure_paylo
                 error_message="monitor disconnected",
             )
         )
+        expected_displayed_config_id = None
+        expected_phase = "armed"
+        expected_trigger_source = None
 
     reviews.clear()
 
@@ -146,9 +179,45 @@ def test_factory_mode_controller_ignores_out_of_band_auto_analysis_failure_paylo
 
     assert controller.review_payload == services_mod.FactoryReviewPayload()
     assert controller.state.active_config_id is None
-    assert controller.state.displayed_config_id is None
-    assert controller.state.run_phase == "armed"
-    assert controller.state.trigger_source is None
+    assert controller.state.displayed_config_id == expected_displayed_config_id
+    assert controller.state.run_phase == expected_phase
+    assert controller.state.trigger_source == expected_trigger_source
+    assert reviews == []
+
+
+def test_factory_mode_controller_ignores_late_auto_analysis_completion_after_runtime_stopped():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reviews: list[object] = []
+    bus.factory_review_changed.connect(reviews.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        run_id="run-1",
+        trigger_source="manual",
+    )
+    controller.handle_runtime_analyzing(
+        _make_runtime_config_payload(config_id=101, run_id="run-1")
+    )
+    controller.handle_runtime_stopped(
+        _make_stopped_payload(config_id=101, run_id="run-1", trigger_source="manual")
+    )
+    reviews.clear()
+
+    bus.factory_runtime_auto_analysis_succeeded.emit(
+        _make_review_payload(
+            displayed_config_id=101,
+            run_id="run-1",
+            trigger_source="manual",
+        )
+    )
+
+    assert controller.state.run_phase == "stopped"
+    assert controller.review_payload == services_mod.FactoryReviewPayload()
     assert reviews == []
 
 
@@ -664,7 +733,7 @@ def test_factory_mode_controller_direct_backend_stop_unwinds_real_manager_run(
     assert recorder_cls.instances[0].wait_calls == [3000]
 
 
-def test_factory_mode_controller_stop_active_run_remains_clean_when_partial_save_fails(
+def test_factory_mode_controller_stop_active_run_waits_for_backend_signal_when_manager_has_not_emitted_one(
     monkeypatch,
 ):
     controller, services, reset_reasons, reviews, _, recorder_cls = (
@@ -686,11 +755,11 @@ def test_factory_mode_controller_stop_active_run_remains_clean_when_partial_save
 
     assert stopped is True
     assert services.test.is_running(config_id=101) is False
-    assert controller.state.active_config_id is None
-    assert controller.state.displayed_config_id is None
-    assert controller.state.run_phase == "armed"
-    assert controller.state.trigger_source is None
-    assert reset_reasons == ["active_run_stopped"]
-    assert reviews == [services_mod.FactoryReviewPayload()]
+    assert controller.state.active_config_id == 101
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "running"
+    assert controller.state.trigger_source == "manual"
+    assert reset_reasons == []
+    assert reviews == []
     assert recorder_cls.instances[0].stop_calls == 1
     assert recorder_cls.instances[0].wait_calls == [3000]
