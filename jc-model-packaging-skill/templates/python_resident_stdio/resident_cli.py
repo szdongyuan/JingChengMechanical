@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
@@ -14,8 +14,17 @@ class ProtocolError(ValueError):
     """Raised when an inbound resident protocol message is malformed."""
 
 
+def configure_utf8_stdio() -> None:
+    # Resident transport is fixed: UTF-8 JSONL over stdin/stdout, with stderr
+    # reserved for human-readable diagnostics.
+    for stream in (sys.stdin, sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(encoding="utf-8")
+
+
 def emit_json_line(payload: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(payload) + "\n")
+    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
     sys.stdout.flush()
 
 
@@ -59,6 +68,54 @@ def ensure_absolute_path(path_value: Any, field_name: str) -> str:
     if not Path(path_value).is_absolute():
         raise ProtocolError(f"{field_name} must be an absolute path.")
     return path_value
+
+
+def validate_artifact_relative_path(relative_path: Any) -> Path:
+    if not isinstance(relative_path, str) or not relative_path.strip():
+        raise ValueError("Artifact relative_path must be a non-empty string.")
+    artifact_path = Path(relative_path)
+    windows_path = PureWindowsPath(relative_path)
+    if artifact_path.is_absolute() or windows_path.anchor:
+        raise ValueError("Artifact relative_path must stay relative.")
+    if ".." in artifact_path.parts or ".." in windows_path.parts:
+        raise ValueError("Artifact relative_path must not traverse upward.")
+    return artifact_path
+
+
+def validate_artifact(artifact: Any) -> Path:
+    if not isinstance(artifact, dict):
+        raise ValueError("Artifact entries must be JSON objects.")
+    artifact_type = artifact.get("type")
+    if not isinstance(artifact_type, str) or not artifact_type.strip():
+        raise ValueError("Artifact type must be a non-empty string.")
+    return validate_artifact_relative_path(artifact.get("relative_path"))
+
+
+def validate_declared_artifacts(
+    artifacts_dir: Path,
+    artifacts: list[dict[str, Any]],
+) -> None:
+    artifacts_root = artifacts_dir.resolve()
+    missing_or_unreadable_message = (
+        "Artifact relative_path must reference an existing readable file under artifacts_dir."
+    )
+    for artifact in artifacts:
+        relative_path = validate_artifact(artifact)
+        try:
+            resolved_artifact_path = (artifacts_root / relative_path).resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise ValueError(missing_or_unreadable_message) from exc
+        try:
+            resolved_artifact_path.relative_to(artifacts_root)
+        except ValueError as exc:
+            raise ValueError("Artifact relative_path must resolve under artifacts_dir.") from exc
+        if not resolved_artifact_path.is_file():
+            raise ValueError(missing_or_unreadable_message)
+        try:
+            with resolved_artifact_path.open("rb"):
+                pass
+        except OSError as exc:
+            raise ValueError(missing_or_unreadable_message) from exc
 
 
 def preload_model() -> Any:
@@ -167,6 +224,9 @@ def write_artifacts(
 ) -> list[dict[str, str]]:
     Path(artifacts_dir).mkdir(parents=True, exist_ok=True)
     # Replace this placeholder with real artifact creation under artifacts_dir.
+    # Every emitted artifact entry must use a non-empty descriptive type such as
+    # report_json, spectrogram_npy, image_png, or audio_wav.
+    # Every relative_path must be non-empty, relative, free of "..", and must never reference files outside the supplied artifacts directory.
     _ = (inference_output, cache)
     return []
 
@@ -175,7 +235,11 @@ def build_result_envelope(
     request_id: str,
     inference_output: Any,
     artifacts: list[dict[str, str]],
+    artifacts_dir: str,
 ) -> dict[str, Any]:
+    # Emit success only after every declared artifact already exists, is
+    # readable under artifacts_dir, and stays within the supplied directory.
+    validate_declared_artifacts(Path(artifacts_dir), artifacts)
     _ = inference_output
     return {
         "message_type": "result",
@@ -210,7 +274,7 @@ def handle_analyze(request_id: str, request_payload: dict, artifacts_dir: str) -
     preprocessed = preprocess_from_request(request_payload, selected_segment, cache)
     inference_output = run_model(model_handle, preprocessed, cache)
     artifacts = write_artifacts(artifacts_dir, inference_output, cache)
-    return build_result_envelope(request_id, inference_output, artifacts)
+    return build_result_envelope(request_id, inference_output, artifacts, artifacts_dir)
 
 
 def shutdown_runtime() -> None:
@@ -222,6 +286,7 @@ def shutdown_runtime() -> None:
 
 
 def main() -> int:
+    configure_utf8_stdio()
     try:
         for line in sys.stdin:
             envelope = json.loads(line)
@@ -240,6 +305,9 @@ def main() -> int:
             try:
                 emit_json_line(handle_analyze(request_id, request_payload, artifacts_dir))
             except Exception as exc:
+                # The default template stays alive after one request-scoped
+                # error envelope so later analyze messages can continue. An
+                # external host may still choose to discard this process.
                 emit_json_line(build_error_envelope(request_id, f"Request failed: {exc}"))
 
         shutdown_runtime()

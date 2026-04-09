@@ -1,8 +1,9 @@
 # Resident Stdio Protocol Contract
 
-This resident packaging mode uses JSON Lines over `stdin` and `stdout`. Each
-inbound line must be one JSON object. Emit no extra stdout text beyond protocol
-JSON lines. `stderr` is reserved for human-readable diagnostics only.
+This resident packaging mode uses UTF-8 JSON Lines over `stdin` and `stdout`.
+Each inbound line must be one UTF-8 JSON object. Emit no extra stdout text
+beyond protocol JSON lines. `stderr` is reserved for human-readable diagnostics
+only.
 
 ## Required Inbound Envelopes
 
@@ -120,11 +121,32 @@ envelope:
   to the stable outer `request_id`.
 - After a valid request-scoped `error` envelope, the default resident template
   behavior is to remain alive and continue accepting later `analyze` messages.
+- An external host may still choose to discard the process after observing a
+  request-scoped `error` envelope.
 
 ## Artifact Rules
 
 - The host provides `artifacts_dir` per request.
 - Artifacts live under the host-provided absolute `artifacts_dir`.
 - Success responses report artifacts in `response.ai_result.artifacts`.
-- Each `relative_path` must stay relative to `artifacts_dir`.
+- Each artifact object must look like:
+
+```json
+{
+  "type": "report_json",
+  "relative_path": "report.json"
+}
+```
+
+- `type` must be a non-empty string.
 - Artifact `type` is descriptive metadata, not a host-parsed enum.
+- Example artifact types include `report_json`, `spectrogram_npy`,
+  `image_png`, and `audio_wav`.
+- `relative_path` must be a non-empty string.
+- Each `relative_path` must stay relative to `artifacts_dir`.
+- `relative_path` must not be absolute or otherwise anchored.
+- `relative_path` must not contain `..`.
+- Every listed artifact must already exist under the supplied artifacts directory
+  when a success response is emitted.
+- Every listed artifact must be readable by the host at response time.
+- Artifacts must never reference files outside the supplied artifacts directory.

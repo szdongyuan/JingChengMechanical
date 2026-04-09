@@ -1,4 +1,5 @@
 import importlib.util
+import io
 import json
 from pathlib import Path
 
@@ -81,6 +82,36 @@ def _valid_request_payload(audio_path: str) -> dict:
         "params": {},
         "window_info": {},
     }
+
+
+def _resident_analyze_envelope(tmp_path: Path, request_id: str = "req_123") -> dict:
+    request_payload = _valid_request_payload(str(tmp_path / "input.wav"))
+    request_payload["request_id"] = request_id
+    return {
+        "message_type": "analyze",
+        "request_id": request_id,
+        "request": request_payload,
+        "artifacts_dir": str(tmp_path / "artifacts"),
+    }
+
+
+def _resident_jsonl(*payloads: dict) -> str:
+    return "".join(json.dumps(payload) + "\n" for payload in payloads)
+
+
+def _run_resident_main(
+    module,
+    monkeypatch: pytest.MonkeyPatch,
+    stdin_text: str,
+) -> tuple[int, str, str]:
+    stdin = io.StringIO(stdin_text)
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    monkeypatch.setattr(module.sys, "stdin", stdin)
+    monkeypatch.setattr(module.sys, "stdout", stdout)
+    monkeypatch.setattr(module.sys, "stderr", stderr)
+    exit_code = module.main()
+    return exit_code, stdout.getvalue(), stderr.getvalue()
 
 
 def test_skill_package_contains_slice_one_required_files():
@@ -515,6 +546,8 @@ def test_resident_template_mentions_protocol_envelopes():
 def test_resident_contract_locks_request_matching_and_error_lifecycle():
     text = _read_text(ROOT / "templates" / "python_resident_stdio" / "resident_protocol.md")
     lowered = text.lower()
+    assert "utf-8" in lowered
+    assert "stdin" in lowered and "stdout" in lowered
     assert "request.request_id" in text
     assert "must equal outer `request_id`" in text or "inner and outer" in lowered
     assert "artifacts_dir" in text and "absolute path" in lowered
@@ -523,7 +556,17 @@ def test_resident_contract_locks_request_matching_and_error_lifecycle():
     assert "stderr" in lowered
     assert "non-zero" in lowered
     assert "continue accepting later `analyze` messages" in text
+    assert "external host may still choose to discard the process" in lowered
     assert "no extra stdout" in lowered or "no unsolicited stdout" in lowered
+    assert "type` must be a non-empty string" in text
+    assert "relative_path` must be a non-empty string" in text
+    assert "report_json" in text
+    assert "spectrogram_npy" in text
+    assert "image_png" in text
+    assert "audio_wav" in text
+    assert "must not contain `..`" in text
+    assert "must already exist under the supplied artifacts directory" in lowered
+    assert "must never reference files outside the supplied artifacts directory" in lowered
 
 
 def test_resident_template_mentions_required_hooks():
@@ -538,3 +581,208 @@ def test_resident_template_mentions_required_hooks():
     assert "cache" in text.lower()
     assert "error" in text.lower()
     assert "shutdown" in text.lower()
+    assert "utf-8" in text.lower()
+    assert "report_json" in text
+    assert "spectrogram_npy" in text
+    assert "image_png" in text
+    assert "audio_wav" in text
+    assert "relative_path" in text
+    assert "must never reference files outside the supplied artifacts directory" in text.lower()
+
+
+def test_resident_readme_mentions_utf8_jsonl_transport():
+    text = _read_text(ROOT / "templates" / "python_resident_stdio" / "README.md").lower()
+    assert "utf-8" in text
+    assert "json lines" in text or "jsonl" in text
+    assert "stdin" in text and "stdout" in text
+
+
+def test_resident_main_exits_non_zero_for_malformed_protocol_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl({"message_type": "analyze", "request_id": "req_123"}),
+    )
+
+    assert exit_code == 1
+    assert stdout_text == ""
+    assert "Malformed resident protocol message: analyze requires object request." in stderr_text
+
+
+def test_resident_main_shutdown_emits_no_stdout(monkeypatch: pytest.MonkeyPatch):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl({"message_type": "shutdown"}),
+    )
+
+    assert exit_code == 0
+    assert stdout_text == ""
+    assert stderr_text == ""
+
+
+def test_resident_main_rejects_mismatched_inner_and_outer_request_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+    envelope = _resident_analyze_envelope(tmp_path, request_id="req_outer")
+    envelope["request"]["request_id"] = "req_inner"
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl(envelope),
+    )
+
+    assert exit_code == 1
+    assert stdout_text == ""
+    assert "request.request_id must equal outer request_id." in stderr_text
+
+
+def test_resident_main_falls_back_to_first_segment_for_invalid_segment_index(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+    envelope = _resident_analyze_envelope(tmp_path)
+    envelope["request"]["params"]["segment_index"] = 99
+    selected_segment_ids: list[str] = []
+
+    monkeypatch.setattr(module, "preload_model", lambda: "model")
+    monkeypatch.setattr(module, "get_process_cache", lambda: {})
+
+    def preprocess_from_request(request_payload, selected_segment, cache):
+        _ = (request_payload, cache)
+        selected_segment_ids.append(selected_segment["segment_id"])
+        return {"selected_segment_id": selected_segment["segment_id"]}
+
+    def run_model(model_handle, preprocessed, cache):
+        _ = (model_handle, cache)
+        return preprocessed
+
+    def write_artifacts(artifacts_dir, inference_output, cache):
+        _ = (inference_output, cache)
+        report_path = Path(artifacts_dir) / "report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("{}", encoding="utf-8")
+        return [{"type": "report_json", "relative_path": "report.json"}]
+
+    monkeypatch.setattr(module, "preprocess_from_request", preprocess_from_request)
+    monkeypatch.setattr(module, "run_model", run_model)
+    monkeypatch.setattr(module, "write_artifacts", write_artifacts)
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl(envelope, {"message_type": "shutdown"}),
+    )
+
+    assert exit_code == 0
+    assert stderr_text == ""
+    assert selected_segment_ids == ["segment_0"]
+    assert json.loads(stdout_text)["message_type"] == "result"
+
+
+def test_resident_main_continues_after_request_scoped_error_envelope(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+    first_envelope = _resident_analyze_envelope(tmp_path, request_id="req_fail")
+    second_envelope = _resident_analyze_envelope(tmp_path, request_id="req_ok")
+    call_count = {"count": 0}
+
+    monkeypatch.setattr(module, "preload_model", lambda: "model")
+    monkeypatch.setattr(module, "get_process_cache", lambda: {})
+
+    def preprocess_from_request(request_payload, selected_segment, cache):
+        _ = (request_payload, selected_segment, cache)
+        call_count["count"] += 1
+        if call_count["count"] == 1:
+            raise RuntimeError("boom")
+        return {"ok": True}
+
+    def run_model(model_handle, preprocessed, cache):
+        _ = (model_handle, cache)
+        return preprocessed
+
+    def write_artifacts(artifacts_dir, inference_output, cache):
+        _ = (inference_output, cache)
+        report_path = Path(artifacts_dir) / "report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("{}", encoding="utf-8")
+        return [{"type": "report_json", "relative_path": "report.json"}]
+
+    monkeypatch.setattr(module, "preprocess_from_request", preprocess_from_request)
+    monkeypatch.setattr(module, "run_model", run_model)
+    monkeypatch.setattr(module, "write_artifacts", write_artifacts)
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl(first_envelope, second_envelope, {"message_type": "shutdown"}),
+    )
+
+    assert exit_code == 0
+    assert stderr_text == ""
+    lines = stdout_text.strip().splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0]) == {
+        "message_type": "error",
+        "request_id": "req_fail",
+        "error": "Request failed: boom",
+    }
+    assert json.loads(lines[1])["request_id"] == "req_ok"
+    assert json.loads(lines[1])["message_type"] == "result"
+
+
+def test_resident_main_emits_error_envelope_when_declared_artifact_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+    envelope = _resident_analyze_envelope(tmp_path)
+
+    monkeypatch.setattr(module, "preload_model", lambda: "model")
+    monkeypatch.setattr(module, "get_process_cache", lambda: {})
+    monkeypatch.setattr(
+        module,
+        "preprocess_from_request",
+        lambda request_payload, selected_segment, cache: {"ok": True},
+    )
+    monkeypatch.setattr(
+        module,
+        "run_model",
+        lambda model_handle, preprocessed, cache: {"ok": True},
+    )
+    monkeypatch.setattr(
+        module,
+        "write_artifacts",
+        lambda artifacts_dir, inference_output, cache: [
+            {"type": "report_json", "relative_path": "missing/report.json"}
+        ],
+    )
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl(envelope, {"message_type": "shutdown"}),
+    )
+
+    assert exit_code == 0
+    assert stderr_text == ""
+    assert json.loads(stdout_text) == {
+        "message_type": "error",
+        "request_id": "req_123",
+        "error": (
+            "Request failed: Artifact relative_path must reference an existing readable "
+            "file under artifacts_dir."
+        ),
+    }
