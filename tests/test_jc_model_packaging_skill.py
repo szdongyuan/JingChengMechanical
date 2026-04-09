@@ -344,3 +344,55 @@ def test_build_success_response_rejects_invalid_artifact_metadata(
             inference_output={"raw_score": 0.42},
             artifacts=[artifact],
         )
+
+
+@pytest.mark.parametrize("relative_path", ["C:report.json", "/report.json", "\\report.json"])
+def test_build_success_response_rejects_windows_anchored_artifact_paths(
+    tmp_path: Path, relative_path: str
+):
+    module = _load_module(ROOT / "templates" / "python_oneshot_cli" / "toolchain_cli.py")
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir()
+
+    with pytest.raises(ValueError, match="Artifact relative_path must stay relative."):
+        module.build_success_response(
+            request_payload={"request_id": "req_123"},
+            inference_output={"raw_score": 0.42},
+            artifacts=[{"type": "report_json", "relative_path": relative_path}],
+            artifacts_dir=artifacts_dir,
+        )
+
+
+def test_build_success_response_rejects_missing_declared_artifact(tmp_path: Path):
+    module = _load_module(ROOT / "templates" / "python_oneshot_cli" / "toolchain_cli.py")
+    artifacts_dir = tmp_path / "artifacts"
+    artifacts_dir.mkdir()
+
+    with pytest.raises(
+        ValueError,
+        match="Artifact relative_path must reference an existing readable file under artifacts_dir.",
+    ):
+        module.build_success_response(
+            request_payload={"request_id": "req_123"},
+            inference_output={"raw_score": 0.42},
+            artifacts=[{"type": "report_json", "relative_path": "reports/report.json"}],
+            artifacts_dir=artifacts_dir,
+        )
+
+
+def test_build_success_response_rejects_declared_artifact_directory(tmp_path: Path):
+    module = _load_module(ROOT / "templates" / "python_oneshot_cli" / "toolchain_cli.py")
+    artifacts_dir = tmp_path / "artifacts"
+    artifact_dir = artifacts_dir / "reports"
+    artifact_dir.mkdir(parents=True)
+
+    with pytest.raises(
+        ValueError,
+        match="Artifact relative_path must reference an existing readable file under artifacts_dir.",
+    ):
+        module.build_success_response(
+            request_payload={"request_id": "req_123"},
+            inference_output={"raw_score": 0.42},
+            artifacts=[{"type": "report_json", "relative_path": "reports"}],
+            artifacts_dir=artifacts_dir,
+        )

@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 
@@ -125,23 +125,52 @@ def run_model(preprocessed: Any) -> Any:
     raise NotImplementedError("Implement the model inference call.")
 
 
-def validate_artifact_relative_path(relative_path: str) -> None:
+def validate_artifact_relative_path(relative_path: str) -> Path:
     if not isinstance(relative_path, str) or not relative_path.strip():
         raise ValueError("Artifact relative_path must be a non-empty string.")
     artifact_path = Path(relative_path)
-    if artifact_path.is_absolute():
+    windows_path = PureWindowsPath(relative_path)
+    if artifact_path.is_absolute() or windows_path.anchor:
         raise ValueError("Artifact relative_path must stay relative.")
-    if ".." in artifact_path.parts:
+    if ".." in artifact_path.parts or ".." in windows_path.parts:
         raise ValueError("Artifact relative_path must not traverse upward.")
+    return artifact_path
 
 
-def validate_artifact(artifact: dict[str, Any]) -> None:
+def validate_artifact(artifact: dict[str, Any]) -> Path:
     if not isinstance(artifact, dict):
         raise ValueError("Artifact entries must be JSON objects.")
     artifact_type = artifact.get("type")
     if not isinstance(artifact_type, str) or not artifact_type.strip():
         raise ValueError("Artifact type must be a non-empty string.")
-    validate_artifact_relative_path(artifact.get("relative_path"))
+    return validate_artifact_relative_path(artifact.get("relative_path"))
+
+
+def validate_declared_artifacts(
+    artifacts_dir: Path,
+    artifacts: list[dict[str, Any]],
+) -> None:
+    artifacts_root = artifacts_dir.resolve()
+    missing_or_unreadable_message = (
+        "Artifact relative_path must reference an existing readable file under artifacts_dir."
+    )
+    for artifact in artifacts:
+        relative_path = validate_artifact(artifact)
+        try:
+            resolved_artifact_path = (artifacts_root / relative_path).resolve(strict=True)
+        except FileNotFoundError as exc:
+            raise ValueError(missing_or_unreadable_message) from exc
+        try:
+            resolved_artifact_path.relative_to(artifacts_root)
+        except ValueError as exc:
+            raise ValueError("Artifact relative_path must resolve under artifacts_dir.") from exc
+        if not resolved_artifact_path.is_file():
+            raise ValueError(missing_or_unreadable_message)
+        try:
+            with resolved_artifact_path.open("rb"):
+                pass
+        except OSError as exc:
+            raise ValueError(missing_or_unreadable_message) from exc
 
 
 def write_artifacts(artifacts_dir: str, inference_output: Any) -> list[dict[str, str]]:
@@ -156,9 +185,13 @@ def build_success_response(
     request_payload: dict[str, Any],
     inference_output: Any,
     artifacts: list[dict[str, str]],
+    artifacts_dir: str | Path | None = None,
 ) -> dict[str, Any]:
-    for artifact in artifacts:
-        validate_artifact(artifact)
+    if artifacts_dir is None:
+        for artifact in artifacts:
+            validate_artifact(artifact)
+    else:
+        validate_declared_artifacts(Path(artifacts_dir), artifacts)
     ai_result: dict[str, Any] = {
         "ai_label": "PASS",
         "summary": "Replace with a host-meaningful summary.",
@@ -203,7 +236,12 @@ def main(argv: list[str] | None = None) -> int:
         preprocessed = preprocess_from_request(request_payload)
         inference_output = run_model(preprocessed)
         artifacts = write_artifacts(str(artifacts_dir), inference_output)
-        response_payload = build_success_response(request_payload, inference_output, artifacts)
+        response_payload = build_success_response(
+            request_payload,
+            inference_output,
+            artifacts,
+            artifacts_dir=artifacts_dir,
+        )
         write_response(response_path, response_payload)
         return 0
     except Exception as exc:
