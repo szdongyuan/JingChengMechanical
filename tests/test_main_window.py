@@ -230,7 +230,7 @@ def test_main_window_login_refreshes_control_owned_start_button_state_without_en
     qapp.processEvents()
 
     assert window.control.btn_start.isEnabled() is False
-    assert window.control.lbl_start_reason.text() == "当前测试运行中"
+    assert hasattr(window.control, "lbl_start_reason") is False
     assert window.control.btn_stop.isEnabled() is True
 
 

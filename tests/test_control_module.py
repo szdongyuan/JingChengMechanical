@@ -234,6 +234,20 @@ def _make_module_with_message_box_spy(
     return module, services, recorder
 
 
+def test_control_panel_renders_only_two_button_rows_with_updated_spacing_and_button_heights(
+    qapp,
+):
+    module, _ = _make_module()
+
+    assert hasattr(module, "lbl_start_reason") is False
+    assert module.layout().count() == 2
+    assert module.layout().spacing() == 8
+    assert module.btn_start.minimumHeight() == 36
+    assert module.btn_stop.minimumHeight() == 36
+    assert module.btn_pass.minimumHeight() == 36
+    assert module.btn_fail.minimumHeight() == 36
+
+
 def test_start_uses_live_workorder_payload_from_current_workorder_module(qapp):
     workorder_module, control_module, services = _make_shared_modules()
 
@@ -254,23 +268,22 @@ def test_start_uses_live_workorder_payload_from_current_workorder_module(qapp):
 
 
 @pytest.mark.parametrize(
-    ("state", "reason"),
+    "state",
     [
-        (_idle_blocked_state("配置已失效"), "配置已失效"),
-        (_idle_blocked_state("配置加载失败"), "配置加载失败"),
-        (_idle_blocked_state("请至少启用一个配置", selected_config_ids=()), "请至少启用一个配置"),
-        (_idle_blocked_state("analysis window invalid"), "analysis window invalid"),
+        _idle_blocked_state("配置已失效"),
+        _idle_blocked_state("配置加载失败"),
+        _idle_blocked_state("请至少启用一个配置", selected_config_ids=()),
+        _idle_blocked_state("analysis window invalid"),
     ],
 )
 def test_start_button_stays_enabled_for_idle_blocking_reasons_and_click_attempts_manual_start(
     qapp,
     state,
-    reason,
 ):
     module, services = _make_module(initial_state=state)
 
     assert module.btn_start.isEnabled() is True
-    assert module.lbl_start_reason.text() == reason
+    assert hasattr(module, "lbl_start_reason") is False
 
     module.btn_start.click()
 
@@ -278,28 +291,25 @@ def test_start_button_stays_enabled_for_idle_blocking_reasons_and_click_attempts
 
 
 @pytest.mark.parametrize(
-    ("state", "reason"),
+    "state",
     [
-        (FactoryControllerState(selected_config_ids=(101,), run_phase="running"), "当前测试运行中"),
-        (FactoryControllerState(selected_config_ids=(101,), run_phase="analyzing"), "当前测试分析中"),
-        (FactoryControllerState(selected_config_ids=(101,), run_phase="reanalyzing"), "当前正在重新分析"),
-        (
-            FactoryControllerState(
-                selected_config_ids=(101,),
-                run_phase="armed",
-                selection_ready=True,
-                start_ready=False,
-                start_ready_reason="启动请求处理中",
-            ),
-            "启动请求处理中",
+        FactoryControllerState(selected_config_ids=(101,), run_phase="running"),
+        FactoryControllerState(selected_config_ids=(101,), run_phase="analyzing"),
+        FactoryControllerState(selected_config_ids=(101,), run_phase="reanalyzing"),
+        FactoryControllerState(
+            selected_config_ids=(101,),
+            run_phase="armed",
+            selection_ready=True,
+            start_ready=False,
+            start_ready_reason="启动请求处理中",
         ),
     ],
 )
-def test_start_button_is_disabled_only_for_busy_or_pending_states(qapp, state, reason):
+def test_start_button_is_disabled_only_for_busy_or_pending_states(qapp, state):
     module, _ = _make_module(initial_state=state)
 
     assert module.btn_start.isEnabled() is False
-    assert module.lbl_start_reason.text() == reason
+    assert hasattr(module, "lbl_start_reason") is False
 
 
 def test_start_button_is_disabled_for_review_cleanup_busy_state(qapp):
@@ -314,7 +324,7 @@ def test_start_button_is_disabled_for_review_cleanup_busy_state(qapp):
     )
 
     assert module.btn_start.isEnabled() is False
-    assert module.lbl_start_reason.text() == "当前测试运行中"
+    assert hasattr(module, "lbl_start_reason") is False
 
     module.btn_start.click()
 
@@ -333,7 +343,7 @@ def test_start_button_is_disabled_for_controller_owned_busy_reason_in_armed_stat
     )
 
     assert module.btn_start.isEnabled() is False
-    assert module.lbl_start_reason.text() == "当前测试运行中"
+    assert hasattr(module, "lbl_start_reason") is False
 
     module.btn_start.click()
 
@@ -355,10 +365,13 @@ def test_blocked_start_signal_opens_and_updates_single_modal(qapp, monkeypatch):
     assert recorder.open_count == 1
     assert recorder.latest_text == "配置加载失败"
     assert recorder.latest_title == "自动开始已阻止"
-    assert module.lbl_start_reason.text() == "配置加载失败"
+    assert hasattr(module, "lbl_start_reason") is False
 
 
-def test_blocked_start_signal_does_not_override_inline_reason_without_state_change(qapp, monkeypatch):
+def test_blocked_start_signal_does_not_require_inline_reason_without_state_change(
+    qapp,
+    monkeypatch,
+):
     module, services, recorder = _make_module_with_message_box_spy(
         monkeypatch,
         initial_state=FactoryControllerState(
@@ -375,7 +388,7 @@ def test_blocked_start_signal_does_not_override_inline_reason_without_state_chan
 
     assert recorder.open_count == 1
     assert recorder.latest_text == "请至少启用一个配置"
-    assert module.lbl_start_reason.text() == ""
+    assert hasattr(module, "lbl_start_reason") is False
 
 
 def test_blocked_modal_closes_after_reason_clears(qapp, monkeypatch):
@@ -411,7 +424,7 @@ def test_open_blocked_modal_updates_when_background_state_refresh_changes_reason
 
     assert recorder.open_count == 1
     assert recorder.latest_text == "配置加载失败"
-    assert module.lbl_start_reason.text() == "配置加载失败"
+    assert hasattr(module, "lbl_start_reason") is False
 
 
 @pytest.mark.parametrize("trigger_source", ["plc", "scan"])
