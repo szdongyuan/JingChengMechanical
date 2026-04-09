@@ -656,8 +656,15 @@ def test_windows_packaging_templates_explain_delivery_tradeoffs():
     assert "resident" in lowered
 
     build_lowered = build_script.lower()
-    assert "pyinstaller .\\toolchain_oneshot.spec" in build_lowered
-    assert "pyinstaller .\\toolchain_resident.spec" in build_lowered
+    assert "push-location -literalpath $psscriptroot" in build_lowered
+    assert 'pyinstaller (join-path -path $psscriptroot -childpath "toolchain_oneshot.spec")' in build_lowered
+    assert 'pyinstaller (join-path -path $psscriptroot -childpath "toolchain_resident.spec")' in build_lowered
+    assert "pyinstaller .\\toolchain_oneshot.spec" not in build_lowered
+    assert "pyinstaller .\\toolchain_resident.spec" not in build_lowered
+    assert 'copy-item -literalpath (join-path -path $psscriptroot -childpath "weights")' in build_lowered
+    assert 'copy-item -literalpath (join-path -path $psscriptroot -childpath "assets")' in build_lowered
+    assert '(join-path -path $psscriptroot -childpath "dist\\toolchain-oneshot\\weights")' in build_lowered
+    assert '(join-path -path $psscriptroot -childpath "dist\\toolchain-resident\\weights")' in build_lowered
     assert "model files" in build_lowered
     assert "non-python assets" in build_lowered
     assert "onedir" in build_lowered

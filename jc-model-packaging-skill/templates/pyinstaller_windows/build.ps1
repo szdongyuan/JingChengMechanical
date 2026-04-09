@@ -12,16 +12,22 @@ $ErrorActionPreference = "Stop"
 # If you keep model files external, copy them into the built output after the
 # PyInstaller step for the matching runtime shape.
 
-if ($BuildOneShot) {
-    pyinstaller .\toolchain_oneshot.spec
-}
+Push-Location -LiteralPath $PSScriptRoot
+try {
+    if ($BuildOneShot) {
+        pyinstaller (Join-Path -Path $PSScriptRoot -ChildPath "toolchain_oneshot.spec")
+    }
 
-if ($BuildResident) {
-    pyinstaller .\toolchain_resident.spec
+    if ($BuildResident) {
+        pyinstaller (Join-Path -Path $PSScriptRoot -ChildPath "toolchain_resident.spec")
+    }
+}
+finally {
+    Pop-Location
 }
 
 # Example copy steps when files stay external:
-# Copy-Item -LiteralPath .\weights -Destination .\dist\toolchain-oneshot\weights -Recurse -Force
-# Copy-Item -LiteralPath .\assets -Destination .\dist\toolchain-oneshot\assets -Recurse -Force
-# Copy-Item -LiteralPath .\weights -Destination .\dist\toolchain-resident\weights -Recurse -Force
-# Copy-Item -LiteralPath .\assets -Destination .\dist\toolchain-resident\assets -Recurse -Force
+# Copy-Item -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath "weights") -Destination (Join-Path -Path $PSScriptRoot -ChildPath "dist\toolchain-oneshot\weights") -Recurse -Force
+# Copy-Item -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath "assets") -Destination (Join-Path -Path $PSScriptRoot -ChildPath "dist\toolchain-oneshot\assets") -Recurse -Force
+# Copy-Item -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath "weights") -Destination (Join-Path -Path $PSScriptRoot -ChildPath "dist\toolchain-resident\weights") -Recurse -Force
+# Copy-Item -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath "assets") -Destination (Join-Path -Path $PSScriptRoot -ChildPath "dist\toolchain-resident\assets") -Recurse -Force
