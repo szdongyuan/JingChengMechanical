@@ -9,6 +9,7 @@ from typing import Any
 _MODEL_HANDLE: Any | None = None
 _PROCESS_CACHE: dict[str, Any] = {}
 _ACTIVE_PROCESS_CACHE: dict[str, Any] = _PROCESS_CACHE
+_RUNTIME_INITIALIZED = False
 
 
 class ProtocolError(ValueError):
@@ -17,6 +18,10 @@ class ProtocolError(ValueError):
 
 class ProtocolTransportError(RuntimeError):
     """Raised when a protocol message cannot be emitted over stdout."""
+
+
+class ProtocolSerializationError(RuntimeError):
+    """Raised when a protocol message cannot be JSON serialized."""
 
 
 class ResidentFatalError(RuntimeError):
@@ -33,7 +38,13 @@ def configure_utf8_stdio() -> None:
 
 
 def emit_json_line(payload: dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False)
+    except (TypeError, ValueError) as exc:
+        raise ProtocolSerializationError(
+            f"Protocol output is not JSON serializable: {exc}"
+        ) from exc
+    sys.stdout.write(encoded + "\n")
     sys.stdout.flush()
 
 
@@ -152,11 +163,15 @@ def get_process_cache() -> dict[str, Any]:
 
 
 def initialize_runtime() -> None:
-    global _MODEL_HANDLE, _ACTIVE_PROCESS_CACHE
+    global _MODEL_HANDLE, _ACTIVE_PROCESS_CACHE, _RUNTIME_INITIALIZED
+    if _RUNTIME_INITIALIZED:
+        return
     try:
         _MODEL_HANDLE = preload_model()
         _ACTIVE_PROCESS_CACHE = get_process_cache()
+        _RUNTIME_INITIALIZED = True
     except Exception as exc:
+        reset_runtime_state()
         raise ResidentFatalError(
             f"Fatal resident runtime initialization failure: {exc}"
         ) from exc
@@ -296,6 +311,17 @@ def build_error_envelope(request_id: str, error_message: str) -> dict[str, str]:
     }
 
 
+def emit_request_payload(request_id: str, payload: dict[str, Any]) -> None:
+    try:
+        emit_protocol_line(payload)
+    except ProtocolSerializationError as exc:
+        error_payload = build_error_envelope(request_id, f"Request failed: {exc}")
+        try:
+            emit_protocol_line(error_payload)
+        except ProtocolSerializationError:
+            raise exc
+
+
 def handle_analyze(request_id: str, request_payload: dict, artifacts_dir: str) -> dict:
     model_handle = _MODEL_HANDLE
     cache = _ACTIVE_PROCESS_CACHE
@@ -311,11 +337,19 @@ def handle_analyze(request_id: str, request_payload: dict, artifacts_dir: str) -
 
 
 def shutdown_runtime() -> None:
-    global _MODEL_HANDLE
-    _PROCESS_CACHE.clear()
     # Replace this hook with any runtime-specific cleanup, such as closing a
     # device session or releasing framework resources.
+    return None
+
+
+def reset_runtime_state() -> None:
+    global _MODEL_HANDLE, _ACTIVE_PROCESS_CACHE, _RUNTIME_INITIALIZED
+    if _ACTIVE_PROCESS_CACHE is not _PROCESS_CACHE:
+        _ACTIVE_PROCESS_CACHE.clear()
+    _PROCESS_CACHE.clear()
+    _ACTIVE_PROCESS_CACHE = _PROCESS_CACHE
     _MODEL_HANDLE = None
+    _RUNTIME_INITIALIZED = False
 
 
 def shutdown_runtime_safely(context: str) -> bool:
@@ -324,6 +358,8 @@ def shutdown_runtime_safely(context: str) -> bool:
     except Exception as exc:
         log_stderr(f"Resident runtime cleanup failed during {context}: {exc}")
         return False
+    finally:
+        reset_runtime_state()
     return True
 
 
@@ -361,7 +397,9 @@ def main() -> int:
                 payload = build_error_envelope(request_id, f"Request failed: {exc}")
 
             try:
-                emit_protocol_line(payload)
+                emit_request_payload(request_id, payload)
+            except ProtocolSerializationError as exc:
+                return fatal_exit(f"Fatal resident protocol failure: {exc}")
             except ProtocolTransportError as exc:
                 return fatal_exit(f"Fatal resident protocol failure: {exc}")
 

@@ -751,6 +751,61 @@ def test_resident_main_continues_after_request_scoped_error_envelope(
     assert json.loads(lines[1])["message_type"] == "result"
 
 
+def test_resident_main_initializes_runtime_once_per_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+    first_envelope = _resident_analyze_envelope(tmp_path, request_id="req_one")
+    second_envelope = _resident_analyze_envelope(tmp_path, request_id="req_two")
+    preload_calls = {"count": 0}
+    cache_calls = {"count": 0}
+    cache = {"hits": 0}
+
+    def preload_model():
+        preload_calls["count"] += 1
+        return "model"
+
+    def get_process_cache():
+        cache_calls["count"] += 1
+        return cache
+
+    def preprocess_from_request(request_payload, selected_segment, active_cache):
+        _ = (request_payload, selected_segment)
+        active_cache["hits"] += 1
+        return {"hits": active_cache["hits"]}
+
+    def run_model(model_handle, preprocessed, active_cache):
+        _ = (model_handle, active_cache)
+        return preprocessed
+
+    def write_artifacts(artifacts_dir, inference_output, active_cache):
+        _ = (inference_output, active_cache)
+        report_path = Path(artifacts_dir) / "report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("{}", encoding="utf-8")
+        return [{"type": "report_json", "relative_path": "report.json"}]
+
+    monkeypatch.setattr(module, "preload_model", preload_model)
+    monkeypatch.setattr(module, "get_process_cache", get_process_cache)
+    monkeypatch.setattr(module, "preprocess_from_request", preprocess_from_request)
+    monkeypatch.setattr(module, "run_model", run_model)
+    monkeypatch.setattr(module, "write_artifacts", write_artifacts)
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl(first_envelope, second_envelope, {"message_type": "shutdown"}),
+    )
+
+    assert exit_code == 0
+    assert stderr_text == ""
+    assert preload_calls["count"] == 1
+    assert cache_calls["count"] == 1
+    lines = [json.loads(line) for line in stdout_text.strip().splitlines()]
+    assert [line["request_id"] for line in lines] == ["req_one", "req_two"]
+
+
 def test_resident_main_emits_error_envelope_when_declared_artifact_is_missing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -794,6 +849,150 @@ def test_resident_main_emits_error_envelope_when_declared_artifact_is_missing(
             "file under artifacts_dir."
         ),
     }
+
+
+def test_resident_main_emits_request_scoped_error_when_result_payload_is_not_json_serializable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+    first_envelope = _resident_analyze_envelope(tmp_path, request_id="req_bad")
+    second_envelope = _resident_analyze_envelope(tmp_path, request_id="req_ok")
+
+    monkeypatch.setattr(module, "preload_model", lambda: "model")
+    monkeypatch.setattr(module, "get_process_cache", lambda: {})
+    monkeypatch.setattr(
+        module,
+        "preprocess_from_request",
+        lambda request_payload, selected_segment, cache: {"ok": True},
+    )
+    monkeypatch.setattr(
+        module,
+        "run_model",
+        lambda model_handle, preprocessed, cache: {"ok": True},
+    )
+
+    def build_result_envelope(request_id, inference_output, artifacts, artifacts_dir):
+        _ = (inference_output, artifacts, artifacts_dir)
+        if request_id == "req_bad":
+            return {
+                "message_type": "result",
+                "request_id": request_id,
+                "response": {
+                    "protocol_version": 1,
+                    "request_id": request_id,
+                    "toolchain_name": "Toolchain",
+                    "toolchain_version": "1.0.0",
+                    "ai_result": {
+                        "ai_label": "PASS",
+                        "extra": {"raw": object()},
+                    },
+                },
+            }
+        return {
+            "message_type": "result",
+            "request_id": request_id,
+            "response": {
+                "protocol_version": 1,
+                "request_id": request_id,
+                "toolchain_name": "Toolchain",
+                "toolchain_version": "1.0.0",
+                "ai_result": {
+                    "ai_label": "PASS",
+                    "extra": {},
+                },
+            },
+        }
+
+    monkeypatch.setattr(module, "write_artifacts", lambda artifacts_dir, inference_output, cache: [])
+    monkeypatch.setattr(module, "build_result_envelope", build_result_envelope)
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl(first_envelope, second_envelope, {"message_type": "shutdown"}),
+    )
+
+    assert exit_code == 0
+    assert stderr_text == ""
+    lines = [json.loads(line) for line in stdout_text.strip().splitlines()]
+    assert lines == [
+        {
+            "message_type": "error",
+            "request_id": "req_bad",
+            "error": "Request failed: Protocol output is not JSON serializable: Object of type object is not JSON serializable",
+        },
+        {
+            "message_type": "result",
+            "request_id": "req_ok",
+            "response": {
+                "protocol_version": 1,
+                "request_id": "req_ok",
+                "toolchain_name": "Toolchain",
+                "toolchain_version": "1.0.0",
+                "ai_result": {
+                    "ai_label": "PASS",
+                    "extra": {},
+                },
+            },
+        },
+    ]
+
+
+def test_resident_main_falls_back_to_fatal_exit_when_serialization_error_envelope_cannot_be_emitted(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+    envelope = _resident_analyze_envelope(tmp_path, request_id="req_bad")
+    shutdown_calls: list[str] = []
+
+    monkeypatch.setattr(module, "preload_model", lambda: "model")
+    monkeypatch.setattr(module, "get_process_cache", lambda: {})
+    monkeypatch.setattr(
+        module,
+        "preprocess_from_request",
+        lambda request_payload, selected_segment, cache: {"ok": True},
+    )
+    monkeypatch.setattr(
+        module,
+        "run_model",
+        lambda model_handle, preprocessed, cache: {"ok": True},
+    )
+    monkeypatch.setattr(module, "write_artifacts", lambda artifacts_dir, inference_output, cache: [])
+    monkeypatch.setattr(
+        module,
+        "build_result_envelope",
+        lambda request_id, inference_output, artifacts, artifacts_dir: {
+            "message_type": "result",
+            "request_id": request_id,
+            "response": {"ai_result": {"extra": {"raw": object()}}},
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "build_error_envelope",
+        lambda request_id, error_message: {
+            "message_type": "error",
+            "request_id": request_id,
+            "error": object(),
+        },
+    )
+    monkeypatch.setattr(module, "shutdown_runtime", lambda: shutdown_calls.append("shutdown"))
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl(envelope),
+    )
+
+    assert exit_code == 1
+    assert stdout_text == ""
+    assert (
+        stderr_text
+        == "Fatal resident protocol failure: Protocol output is not JSON serializable: Object of type object is not JSON serializable\n"
+    )
+    assert shutdown_calls == ["shutdown"]
 
 
 def test_resident_main_treats_stdout_failure_during_result_emission_as_fatal(
