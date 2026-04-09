@@ -310,6 +310,17 @@ def test_load_request_rejects_invalid_segment_schema_fields(
     assert str(excinfo.value) == expected_message
 
 
+def test_load_request_rejects_boolean_protocol_version(tmp_path: Path):
+    module = _load_module(ROOT / "templates" / "python_oneshot_cli" / "toolchain_cli.py")
+    request_payload = _valid_request_payload(str(tmp_path / "input.wav"))
+    request_payload["protocol_version"] = True
+    request_path = tmp_path / "request.json"
+    request_path.write_text(json.dumps(request_payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="protocol_version must equal 1."):
+        module.load_request(str(request_path))
+
+
 @pytest.mark.parametrize("segment_index", [True, False, -1, "1", 5, None])
 def test_select_segment_falls_back_to_first_segment_for_invalid_index_values(
     tmp_path: Path, segment_index: object
@@ -396,3 +407,80 @@ def test_build_success_response_rejects_declared_artifact_directory(tmp_path: Pa
             artifacts=[{"type": "report_json", "relative_path": "reports"}],
             artifacts_dir=artifacts_dir,
         )
+
+
+def test_build_success_response_default_payload_stays_json_safe(tmp_path: Path):
+    module = _load_module(ROOT / "templates" / "python_oneshot_cli" / "toolchain_cli.py")
+    response = module.build_success_response(
+        request_payload={"request_id": "req_123"},
+        inference_output=object(),
+        artifacts=[],
+    )
+    response_path = tmp_path / "response.json"
+
+    module.write_response(response_path, response)
+
+    written = json.loads(response_path.read_text(encoding="utf-8"))
+    assert written["ai_result"]["extra"] == {}
+
+
+def test_cleanup_stale_response_retries_after_read_only_unlink_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    module = _load_module(ROOT / "templates" / "python_oneshot_cli" / "toolchain_cli.py")
+    response_path = tmp_path / "response.json"
+    response_path.write_text("stale", encoding="utf-8")
+    original_unlink = module.Path.unlink
+    unlink_calls: list[Path] = []
+    chmod_calls: list[tuple[Path, int]] = []
+
+    def flaky_unlink(self: Path, *args, **kwargs):
+        unlink_calls.append(self)
+        if self == response_path and len(unlink_calls) == 1:
+            raise PermissionError("read-only")
+        return original_unlink(self, *args, **kwargs)
+
+    def tracking_chmod(self: Path, mode: int):
+        chmod_calls.append((self, mode))
+
+    monkeypatch.setattr(module.Path, "unlink", flaky_unlink)
+    monkeypatch.setattr(module.Path, "chmod", tracking_chmod)
+
+    module.cleanup_stale_response(response_path)
+
+    assert len(unlink_calls) == 2
+    assert len(chmod_calls) == 1
+    assert chmod_calls[0][0] == response_path
+    assert not response_path.exists()
+
+
+def test_oneshot_main_surfaces_stale_cleanup_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+):
+    module = _load_module(ROOT / "templates" / "python_oneshot_cli" / "toolchain_cli.py")
+    response_path = tmp_path / "response.json"
+    response_path.write_text("stale", encoding="utf-8")
+
+    def fail_cleanup(path: Path) -> None:
+        raise RuntimeError(f"Unable to remove stale response file at {path}.")
+
+    monkeypatch.setattr(module, "cleanup_stale_response", fail_cleanup)
+
+    exit_code = module.main(
+        [
+            "--request",
+            "relative-request.json",
+            "--response",
+            str(response_path),
+            "--artifacts-dir",
+            str(tmp_path / "artifacts"),
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Fatal one-shot failure: --request must be an absolute path." in captured.err
+    assert "Unable to remove stale response file" in captured.err
+    assert response_path.exists()

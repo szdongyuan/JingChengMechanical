@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import stat
 import sys
 from pathlib import Path, PureWindowsPath
 from typing import Any
@@ -74,6 +75,7 @@ def load_request(path: str) -> dict[str, Any]:
     payload = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError("Request payload must be a JSON object.")
+    require_integer(payload.get("protocol_version"), "protocol_version must equal 1.")
     if payload.get("protocol_version") != 1:
         raise ValueError("protocol_version must equal 1.")
     for key in ("request_id", "test_run_id", "toolchain_id"):
@@ -192,13 +194,14 @@ def build_success_response(
             validate_artifact(artifact)
     else:
         validate_declared_artifacts(Path(artifacts_dir), artifacts)
+    # Keep the default template JSON-safe. Only add raw inference output after
+    # converting it to JSON-safe types that the host contract explicitly allows.
+    _ = inference_output
     ai_result: dict[str, Any] = {
         "ai_label": "PASS",
         "summary": "Replace with a host-meaningful summary.",
         "artifacts": artifacts,
-        "extra": {
-            "raw_output": inference_output,
-        },
+        "extra": {},
     }
     # Only add score/confidence when you have real numeric values to emit.
     result = {
@@ -216,11 +219,21 @@ def write_response(path: Path, payload: dict[str, Any]) -> None:
 
 
 def cleanup_stale_response(path: Path) -> None:
+    if not path.is_file():
+        return
     try:
-        if path.is_file():
-            path.unlink()
-    except OSError:
-        pass
+        path.unlink()
+        return
+    except PermissionError:
+        # Windows commonly blocks deletion of read-only files until the write
+        # bit is restored, so retry once after making the file writable.
+        path.chmod(path.stat().st_mode | stat.S_IWRITE)
+    except OSError as exc:
+        raise RuntimeError(f"Unable to remove stale response file at {path}: {exc}") from exc
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise RuntimeError(f"Unable to remove stale response file at {path}: {exc}") from exc
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -245,10 +258,17 @@ def main(argv: list[str] | None = None) -> int:
         write_response(response_path, response_payload)
         return 0
     except Exception as exc:
+        cleanup_error: Exception | None = None
         if response_path is not None:
-            cleanup_stale_response(response_path)
+            try:
+                cleanup_stale_response(response_path)
+            except Exception as cleanup_exc:
+                cleanup_error = cleanup_exc
         # Fatal exception path: print to stderr and exit 1.
-        print(f"Fatal one-shot failure: {exc}", file=sys.stderr)
+        message = f"Fatal one-shot failure: {exc}"
+        if cleanup_error is not None:
+            message = f"{message} Cleanup failure: {cleanup_error}"
+        print(message, file=sys.stderr)
         return 1
 
 
