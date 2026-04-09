@@ -103,10 +103,13 @@ def _run_resident_main(
     module,
     monkeypatch: pytest.MonkeyPatch,
     stdin_text: str,
+    *,
+    stdout: io.TextIOBase | None = None,
+    stderr: io.TextIOBase | None = None,
 ) -> tuple[int, str, str]:
     stdin = io.StringIO(stdin_text)
-    stdout = io.StringIO()
-    stderr = io.StringIO()
+    stdout = stdout or io.StringIO()
+    stderr = stderr or io.StringIO()
     monkeypatch.setattr(module.sys, "stdin", stdin)
     monkeypatch.setattr(module.sys, "stdout", stdout)
     monkeypatch.setattr(module.sys, "stderr", stderr)
@@ -786,3 +789,88 @@ def test_resident_main_emits_error_envelope_when_declared_artifact_is_missing(
             "file under artifacts_dir."
         ),
     }
+
+
+def test_resident_main_treats_stdout_failure_during_result_emission_as_fatal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+    envelope = _resident_analyze_envelope(tmp_path)
+    shutdown_calls: list[str] = []
+
+    class BrokenStdout(io.StringIO):
+        def write(self, text: str) -> int:
+            raise BrokenPipeError("stdout transport failed during result emission")
+
+    monkeypatch.setattr(module, "preload_model", lambda: "model")
+    monkeypatch.setattr(module, "get_process_cache", lambda: {})
+    monkeypatch.setattr(
+        module,
+        "preprocess_from_request",
+        lambda request_payload, selected_segment, cache: {"ok": True},
+    )
+    monkeypatch.setattr(
+        module,
+        "run_model",
+        lambda model_handle, preprocessed, cache: {"ok": True},
+    )
+
+    def write_artifacts(artifacts_dir, inference_output, cache):
+        _ = (inference_output, cache)
+        report_path = Path(artifacts_dir) / "report.json"
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        report_path.write_text("{}", encoding="utf-8")
+        return [{"type": "report_json", "relative_path": "report.json"}]
+
+    monkeypatch.setattr(module, "write_artifacts", write_artifacts)
+    monkeypatch.setattr(module, "shutdown_runtime", lambda: shutdown_calls.append("shutdown"))
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl(envelope),
+        stdout=BrokenStdout(),
+    )
+
+    assert exit_code == 1
+    assert stdout_text == ""
+    assert "Fatal resident protocol failure:" in stderr_text
+    assert "stdout transport failed during result emission" in stderr_text
+    assert shutdown_calls == ["shutdown"]
+
+
+def test_resident_main_treats_stdout_failure_during_error_emission_as_fatal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    module = _load_module(ROOT / "templates" / "python_resident_stdio" / "resident_cli.py")
+    envelope = _resident_analyze_envelope(tmp_path)
+    shutdown_calls: list[str] = []
+
+    class BrokenStdout(io.StringIO):
+        def write(self, text: str) -> int:
+            raise BrokenPipeError("stdout transport failed during error emission")
+
+    monkeypatch.setattr(module, "preload_model", lambda: "model")
+    monkeypatch.setattr(module, "get_process_cache", lambda: {})
+
+    def preprocess_from_request(request_payload, selected_segment, cache):
+        _ = (request_payload, selected_segment, cache)
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(module, "preprocess_from_request", preprocess_from_request)
+    monkeypatch.setattr(module, "shutdown_runtime", lambda: shutdown_calls.append("shutdown"))
+
+    exit_code, stdout_text, stderr_text = _run_resident_main(
+        module,
+        monkeypatch,
+        _resident_jsonl(envelope),
+        stdout=BrokenStdout(),
+    )
+
+    assert exit_code == 1
+    assert stdout_text == ""
+    assert "Fatal resident protocol failure:" in stderr_text
+    assert "stdout transport failed during error emission" in stderr_text
+    assert shutdown_calls == ["shutdown"]

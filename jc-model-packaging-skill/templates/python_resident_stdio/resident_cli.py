@@ -14,6 +14,10 @@ class ProtocolError(ValueError):
     """Raised when an inbound resident protocol message is malformed."""
 
 
+class ProtocolTransportError(RuntimeError):
+    """Raised when a protocol message cannot be emitted over stdout."""
+
+
 def configure_utf8_stdio() -> None:
     # Resident transport is fixed: UTF-8 JSONL over stdin/stdout, with stderr
     # reserved for human-readable diagnostics.
@@ -26,6 +30,15 @@ def configure_utf8_stdio() -> None:
 def emit_json_line(payload: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(payload, ensure_ascii=False) + "\n")
     sys.stdout.flush()
+
+
+def emit_protocol_line(payload: dict[str, Any]) -> None:
+    try:
+        emit_json_line(payload)
+    except (BrokenPipeError, OSError) as exc:
+        raise ProtocolTransportError(
+            f"Unable to write protocol output to stdout: {exc}"
+        ) from exc
 
 
 def log_stderr(message: str) -> None:
@@ -285,6 +298,12 @@ def shutdown_runtime() -> None:
     _MODEL_HANDLE = None
 
 
+def fatal_exit(message: str) -> int:
+    log_stderr(message)
+    shutdown_runtime()
+    return 1
+
+
 def main() -> int:
     configure_utf8_stdio()
     try:
@@ -303,21 +322,24 @@ def main() -> int:
             request_id, request_payload, artifacts_dir = load_analyze_envelope(envelope)
 
             try:
-                emit_json_line(handle_analyze(request_id, request_payload, artifacts_dir))
+                payload = handle_analyze(request_id, request_payload, artifacts_dir)
             except Exception as exc:
                 # The default template stays alive after one request-scoped
                 # error envelope so later analyze messages can continue. An
                 # external host may still choose to discard this process.
-                emit_json_line(build_error_envelope(request_id, f"Request failed: {exc}"))
+                payload = build_error_envelope(request_id, f"Request failed: {exc}")
+
+            try:
+                emit_protocol_line(payload)
+            except ProtocolTransportError as exc:
+                return fatal_exit(f"Fatal resident protocol failure: {exc}")
 
         shutdown_runtime()
         return 0
     except json.JSONDecodeError as exc:
-        log_stderr(f"Malformed resident protocol message: {exc}")
-        return 1
+        return fatal_exit(f"Malformed resident protocol message: {exc}")
     except ProtocolError as exc:
-        log_stderr(f"Malformed resident protocol message: {exc}")
-        return 1
+        return fatal_exit(f"Malformed resident protocol message: {exc}")
 
 
 if __name__ == "__main__":
