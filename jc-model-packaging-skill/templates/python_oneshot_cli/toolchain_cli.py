@@ -50,7 +50,11 @@ def load_request(path: str) -> dict[str, Any]:
 def select_segment(request_payload: dict[str, Any]) -> dict[str, Any]:
     segments = request_payload["segments"]
     segment_index = request_payload["params"].get("segment_index")
-    if isinstance(segment_index, int) and 0 <= segment_index < len(segments):
+    if (
+        isinstance(segment_index, int)
+        and not isinstance(segment_index, bool)
+        and 0 <= segment_index < len(segments)
+    ):
         selected = segments[segment_index]
     else:
         selected = segments[0]
@@ -76,11 +80,22 @@ def run_model(preprocessed: Any) -> Any:
 
 
 def validate_artifact_relative_path(relative_path: str) -> None:
+    if not isinstance(relative_path, str) or not relative_path.strip():
+        raise ValueError("Artifact relative_path must be a non-empty string.")
     artifact_path = Path(relative_path)
     if artifact_path.is_absolute():
         raise ValueError("Artifact relative_path must stay relative.")
     if ".." in artifact_path.parts:
         raise ValueError("Artifact relative_path must not traverse upward.")
+
+
+def validate_artifact(artifact: dict[str, Any]) -> None:
+    if not isinstance(artifact, dict):
+        raise ValueError("Artifact entries must be JSON objects.")
+    artifact_type = artifact.get("type")
+    if not isinstance(artifact_type, str) or not artifact_type.strip():
+        raise ValueError("Artifact type must be a non-empty string.")
+    validate_artifact_relative_path(artifact.get("relative_path"))
 
 
 def write_artifacts(artifacts_dir: str, inference_output: Any) -> list[dict[str, str]]:
@@ -97,7 +112,7 @@ def build_success_response(
     artifacts: list[dict[str, str]],
 ) -> dict[str, Any]:
     for artifact in artifacts:
-        validate_artifact_relative_path(artifact["relative_path"])
+        validate_artifact(artifact)
     ai_result: dict[str, Any] = {
         "ai_label": "PASS",
         "summary": "Replace with a host-meaningful summary.",
@@ -128,11 +143,12 @@ def cleanup_stale_response(path: Path) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    request_path = ensure_absolute_path(args.request, "--request")
-    response_path = ensure_absolute_path(args.response, "--response")
-    artifacts_dir = ensure_absolute_path(args.artifacts_dir, "--artifacts-dir")
+    response_path: Path | None = None
 
     try:
+        response_path = ensure_absolute_path(args.response, "--response")
+        request_path = ensure_absolute_path(args.request, "--request")
+        artifacts_dir = ensure_absolute_path(args.artifacts_dir, "--artifacts-dir")
         artifacts_dir.mkdir(parents=True, exist_ok=True)
         request_payload = load_request(str(request_path))
         preprocessed = preprocess_from_request(request_payload)
@@ -142,7 +158,8 @@ def main(argv: list[str] | None = None) -> int:
         write_response(response_path, response_payload)
         return 0
     except Exception as exc:
-        cleanup_stale_response(response_path)
+        if response_path is not None:
+            cleanup_stale_response(response_path)
         # Fatal exception path: print to stderr and exit 1.
         print(f"Fatal one-shot failure: {exc}", file=sys.stderr)
         return 1

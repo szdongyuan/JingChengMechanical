@@ -47,6 +47,38 @@ def _load_module(path: Path):
     return module
 
 
+def _valid_request_payload(audio_path: str) -> dict:
+    return {
+        "protocol_version": 1,
+        "request_id": "req_123",
+        "test_run_id": "run_123",
+        "toolchain_id": "toolchain_123",
+        "segments": [
+            {
+                "segment_id": "segment_0",
+                "role": "device_1",
+                "audio_path": audio_path,
+                "channels": [0],
+                "duration_ms": 4000,
+                "sample_rate": 44100,
+                "metadata": {},
+            },
+            {
+                "segment_id": "segment_1",
+                "role": "device_2",
+                "audio_path": audio_path,
+                "channels": [0],
+                "duration_ms": 4000,
+                "sample_rate": 44100,
+                "metadata": {},
+            },
+        ],
+        "context": {},
+        "params": {},
+        "window_info": {},
+    }
+
+
 def test_skill_package_contains_slice_one_required_files():
     missing = [str(path) for path in OWNED_REQUIRED_FILES if not path.is_file()]
     assert missing == []
@@ -81,6 +113,12 @@ def test_skill_guidance_locks_decisions_and_contract_rules():
     assert "segment_index" in skill_text
     assert "segments[0]" in skill_text
     assert "relative_path" in skill_text
+
+
+def test_skill_guidance_explains_when_to_keep_weights_external_or_embedded():
+    skill_text = _read_text(ROOT / "SKILL.md").lower()
+    assert "keep weights external when" in skill_text
+    assert "embed weights when" in skill_text
 
 
 def test_metadata_templates_capture_duration_contract_and_packaging_choices():
@@ -163,3 +201,94 @@ def test_oneshot_template_omits_optional_numeric_fields_by_default():
     assert response["ai_result"]["ai_label"] == "PASS"
     assert "score" not in response["ai_result"]
     assert "confidence" not in response["ai_result"]
+
+
+@pytest.mark.parametrize(
+    ("flag_name", "invalid_value"),
+    [
+        ("--request", "relative-request.json"),
+        ("--response", "relative-response.json"),
+        ("--artifacts-dir", "relative-artifacts"),
+    ],
+)
+def test_oneshot_main_routes_invalid_cli_paths_through_fatal_handler(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    flag_name: str,
+    invalid_value: str,
+):
+    module = _load_module(ROOT / "templates" / "python_oneshot_cli" / "toolchain_cli.py")
+    request_path = tmp_path / "request.json"
+    request_path.write_text(
+        '{"protocol_version": 1, "request_id": "req_123", "test_run_id": "run_123", '
+        '"toolchain_id": "toolchain_123", "segments": [{"segment_id": "segment_0", '
+        '"role": "device_1", "audio_path": "'
+        + str(tmp_path / "input.wav").replace("\\", "/")
+        + '", "channels": [0], "duration_ms": 4000, "sample_rate": 44100, "metadata": {}}], '
+        '"context": {}, "params": {}, "window_info": {}}',
+        encoding="utf-8",
+    )
+    response_path = tmp_path / "response.json"
+    response_path.write_text("stale", encoding="utf-8")
+    artifacts_dir = tmp_path / "artifacts"
+    args = {
+        "--request": str(request_path),
+        "--response": str(response_path),
+        "--artifacts-dir": str(artifacts_dir),
+    }
+    args[flag_name] = invalid_value
+
+    exit_code = module.main(
+        [
+            "--request",
+            args["--request"],
+            "--response",
+            args["--response"],
+            "--artifacts-dir",
+            args["--artifacts-dir"],
+        ]
+    )
+    captured = capsys.readouterr()
+
+    assert exit_code == 1
+    assert "Fatal one-shot failure:" in captured.err
+    assert flag_name in captured.err
+    assert captured.out == ""
+    if flag_name != "--response":
+        assert not response_path.exists()
+
+
+@pytest.mark.parametrize("segment_index", [True, False, -1, "1", 5, None])
+def test_select_segment_falls_back_to_first_segment_for_invalid_index_values(
+    tmp_path: Path, segment_index: object
+):
+    module = _load_module(ROOT / "templates" / "python_oneshot_cli" / "toolchain_cli.py")
+    audio_path = str(tmp_path / "input.wav")
+    request_payload = _valid_request_payload(audio_path)
+    request_payload["params"]["segment_index"] = segment_index
+
+    selected = module.select_segment(request_payload)
+
+    assert selected["segment_id"] == "segment_0"
+
+
+@pytest.mark.parametrize(
+    ("artifact", "message"),
+    [
+        ({"type": "", "relative_path": "report.json"}, "Artifact type"),
+        ({"type": "   ", "relative_path": "report.json"}, "Artifact type"),
+        ({"type": "report_json", "relative_path": ""}, "Artifact relative_path"),
+        ({"type": "report_json", "relative_path": "   "}, "Artifact relative_path"),
+    ],
+)
+def test_build_success_response_rejects_invalid_artifact_metadata(
+    artifact: dict[str, str], message: str
+):
+    module = _load_module(ROOT / "templates" / "python_oneshot_cli" / "toolchain_cli.py")
+
+    with pytest.raises(ValueError, match=message):
+        module.build_success_response(
+            request_payload={"request_id": "req_123"},
+            inference_output={"raw_score": 0.42},
+            artifacts=[artifact],
+        )

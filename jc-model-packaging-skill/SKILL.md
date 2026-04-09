@@ -58,6 +58,26 @@ The resident path uses stdio JSONL envelopes with `message_type` values such as
 `"analyze"`, `"result"`, `"error"`, and `"shutdown"`. Expand that contract only
 from this package, not from external repository source.
 
+## Weights Packaging Decision
+
+Keep weights external when:
+
+- the model files are large enough that copying or rebuilding them separately is
+  practical
+- operators need to swap or upgrade weights without rebuilding the wrapper
+- weights have separate licensing, storage, or approval constraints
+- the target environment can reliably deploy sidecar files next to the wrapper
+
+Embed weights when:
+
+- the delivery requirement is a single distributable bundle
+- the wrapper and weights must stay version-locked
+- target machines cannot be trusted to place sidecar model files correctly
+- the model payload is small enough that bundling it will not make startup or
+  packaging costs unacceptable
+
+Record the choice in the metadata checklist before you package anything.
+
 ## One-Shot Contract Summary
 
 The one-shot wrapper must expose these CLI flags:
