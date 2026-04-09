@@ -98,21 +98,21 @@ def build_success_response(
 ) -> dict[str, Any]:
     for artifact in artifacts:
         validate_artifact_relative_path(artifact["relative_path"])
+    ai_result: dict[str, Any] = {
+        "ai_label": "PASS",
+        "summary": "Replace with a host-meaningful summary.",
+        "artifacts": artifacts,
+        "extra": {
+            "raw_output": inference_output,
+        },
+    }
+    # Only add score/confidence when you have real numeric values to emit.
     result = {
         "protocol_version": 1,
         "request_id": request_payload["request_id"],
         "toolchain_name": "Replace With Toolchain Name",
         "toolchain_version": "0.0.0",
-        "ai_result": {
-            "ai_label": "PASS",
-            "score": None,
-            "summary": "Replace with a host-meaningful summary.",
-            "confidence": None,
-            "artifacts": artifacts,
-            "extra": {
-                "raw_output": inference_output,
-            },
-        },
+        "ai_result": ai_result,
     }
     return result
 

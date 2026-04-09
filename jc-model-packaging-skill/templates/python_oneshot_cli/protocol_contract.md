@@ -125,6 +125,9 @@ Each artifact must have this shape:
 Artifact rules:
 
 - `type` must be a non-empty string.
+- `type` is descriptive metadata for host and debugging use, not a host-parsed enum.
+- Example artifact types include `report_json`, `spectrogram_npy`,
+  `image_png`, and `audio_wav`.
 - `relative_path` must be a non-empty string.
 - `relative_path` must stay relative, not absolute.
 - `relative_path` must not contain `..`.

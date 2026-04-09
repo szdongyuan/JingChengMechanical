@@ -1,3 +1,4 @@
+import importlib.util
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,14 @@ LATER_SLICE_FILES = [
 
 def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8")
+
+
+def _load_module(path: Path):
+    spec = importlib.util.spec_from_file_location(path.stem, path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_skill_package_contains_slice_one_required_files():
@@ -129,3 +138,28 @@ def test_oneshot_contract_locks_absolute_paths_segment_fallback_and_cleanup():
     assert "relative_path" in text
     assert "stale" in lowered
     assert "fatal" in lowered
+
+
+def test_oneshot_contract_defines_artifact_type_as_descriptive_metadata():
+    text = _read_text(ROOT / "templates" / "python_oneshot_cli" / "protocol_contract.md")
+    lowered = text.lower()
+    assert "descriptive metadata" in lowered
+    assert "not a host-parsed enum" in lowered
+    assert "report_json" in text
+    assert "spectrogram_npy" in text
+    assert "image_png" in text
+    assert "audio_wav" in text
+
+
+def test_oneshot_template_omits_optional_numeric_fields_by_default():
+    module = _load_module(ROOT / "templates" / "python_oneshot_cli" / "toolchain_cli.py")
+    response = module.build_success_response(
+        request_payload={"request_id": "req_123"},
+        inference_output={"raw_score": 0.42},
+        artifacts=[],
+    )
+
+    assert response["request_id"] == "req_123"
+    assert response["ai_result"]["ai_label"] == "PASS"
+    assert "score" not in response["ai_result"]
+    assert "confidence" not in response["ai_result"]
