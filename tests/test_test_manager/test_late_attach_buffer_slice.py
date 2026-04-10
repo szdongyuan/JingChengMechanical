@@ -430,6 +430,57 @@ class TestLateAttachBufferSlice:
         assert 1 not in mgr._completed_sessions
         assert mgr.is_running(config_id=1) is False
 
+    def test_stop_active_run_ineligible_stop_window_suppresses_late_completion_callback(
+        self,
+        monkeypatch,
+    ):
+        partial_buf = np.arange(200, dtype=np.float32).reshape(200, 1)
+        bus, _, mgr, session, _, _, _ = _make_running_factory_manager(
+            monkeypatch,
+            analysis_duration=2.0,
+            analysis_window_offset_ms=1000,
+            allow_incomplete_recording_analysis=False,
+            partial_buf=partial_buf,
+            sample_rate=100.0,
+        )
+        stop_window_entered = Event()
+        release_stop_window = Event()
+        stop_results: list[bool] = []
+        original_capture = mgr._capture_partial_stop_buffer
+        session._run_judgment = MagicMock(
+            side_effect=AssertionError("late completion should be suppressed")
+        )
+
+        def _blocking_capture(config_id, running_session, recorder):
+            stop_window_entered.set()
+            assert release_stop_window.wait(timeout=1)
+            return original_capture(config_id, running_session, recorder)
+
+        monkeypatch.setattr(mgr, "_capture_partial_stop_buffer", _blocking_capture)
+
+        worker = Thread(target=lambda: stop_results.append(mgr.stop_active_run(config_id=1)))
+        worker.start()
+        assert stop_window_entered.wait(timeout=1)
+
+        mgr._on_session_done(1)
+
+        release_stop_window.set()
+        worker.join(timeout=1)
+
+        assert stop_results == [True]
+        bus.factory_runtime_stopped.emit.assert_called_once()
+        bus.factory_runtime_analyzing_entered.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_succeeded.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_no_result.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_error.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_cleanup_settled.emit.assert_not_called()
+        bus.factory_runtime_aborted.emit.assert_not_called()
+        bus.test_finished.emit.assert_not_called()
+        bus.result_changed.emit.assert_not_called()
+        session._run_judgment.assert_not_called()
+        assert 1 not in mgr._completed_sessions
+        assert mgr.is_running(config_id=1) is False
+
     def test_on_error_emits_factory_runtime_aborted_for_active_factory_run(self):
         bus = _mock_bus()
         services = _mock_services(bus)

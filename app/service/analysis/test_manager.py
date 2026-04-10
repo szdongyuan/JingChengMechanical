@@ -38,6 +38,7 @@ class TestManager(QObject):
         self._pending_factory_starts: dict[str, int] = {}
         self._canceled_factory_start_requests: set[str] = set()
         self._analyzing_sessions: set[int] = set()
+        self._accepted_factory_stops: set[int] = set()
 
     def start(self, workorder: dict, *, on_start_accepted=None) -> bool:
         """Start a test for the config_id in the workorder."""
@@ -247,6 +248,10 @@ class TestManager(QObject):
         session = self._sessions.get(config_id)
         if session is None:
             return False
+        if config_id in self._accepted_factory_stops:
+            return True
+
+        self._accepted_factory_stops.add(config_id)
 
         if self._session_is_analyzing(config_id):
             return self._stop_to_stopped(config_id, session)
@@ -403,14 +408,18 @@ class TestManager(QObject):
     def _on_recording_done(self, config_id: int):
         """Called when a recorder fills its buffer."""
         session = self._sessions.get(config_id)
-        if session is None or getattr(session, "_finished", False):
+        if (
+            session is None
+            or getattr(session, "_finished", False)
+            or config_id in self._accepted_factory_stops
+        ):
             return
         session._finished = True
         self._on_session_done(config_id)
 
     def _on_session_done(self, config_id: int):
         session = self._sessions.get(config_id)
-        if session is None:
+        if session is None or config_id in self._accepted_factory_stops:
             return
 
         cleanup_settled_payload = self._make_cleanup_settled_payload(config_id, session)
@@ -659,7 +668,13 @@ class TestManager(QObject):
         try:
             self._stop_factory_runtime_io(config_id, rec=rec, mon=mon)
         except Exception as exc:
-            return self._emit_factory_stop_abort(config_id, session, exc)
+            return self._emit_factory_stop_abort(
+                config_id,
+                session,
+                exc,
+                rec=rec,
+                mon=mon,
+            )
 
         if self._stop_is_analysis_eligible(
             session,
@@ -681,7 +696,13 @@ class TestManager(QObject):
         try:
             self._stop_factory_runtime_io(config_id, rec=rec, mon=mon)
         except Exception as exc:
-            return self._emit_factory_stop_abort(config_id, session, exc)
+            return self._emit_factory_stop_abort(
+                config_id,
+                session,
+                exc,
+                rec=rec,
+                mon=mon,
+            )
         return self._emit_factory_runtime_stopped(config_id, session)
 
     def _capture_partial_stop_buffer(self, config_id: int, session, rec) -> dict[str, object]:
@@ -777,18 +798,20 @@ class TestManager(QObject):
             return True
         finally:
             self._analyzing_sessions.discard(config_id)
+            self._accepted_factory_stops.discard(config_id)
 
     def _stop_factory_runtime_io(self, config_id: int, *, rec, mon) -> None:
-        self._recorders.pop(config_id, None)
-        self._monitors.pop(config_id, None)
         if mon is not None:
             mon.stop()
             mon.wait(1000)
         if rec is not None:
-            self._stop_recorder_if_unused(rec)
+            self._stop_recorder_if_unused(rec, excluding_config_id=config_id)
+        self._recorders.pop(config_id, None)
+        self._monitors.pop(config_id, None)
 
     def _emit_factory_runtime_stopped(self, config_id: int, session) -> bool:
         self._analyzing_sessions.discard(config_id)
+        self._accepted_factory_stops.discard(config_id)
         self._sessions.pop(config_id, None)
         stopped_payload = self._make_factory_runtime_stopped_payload(config_id, session)
         if stopped_payload is not None:
@@ -800,9 +823,14 @@ class TestManager(QObject):
         self._bus.status.emit("Stopped")
         return True
 
-    def _emit_factory_stop_abort(self, config_id: int, session, error: Exception) -> bool:
+    def _emit_factory_stop_abort(self, config_id: int, session, error: Exception, *, rec, mon) -> bool:
         self._analyzing_sessions.discard(config_id)
+        self._accepted_factory_stops.discard(config_id)
         self._sessions.pop(config_id, None)
+        self._recorders.pop(config_id, None)
+        self._monitors.pop(config_id, None)
+        if rec is not None:
+            self._discard_shared_recorder(rec)
         self._bus.log.emit(f"[TestManager] ERROR stopping config={config_id}: {error}")
         self._emit_optional_signal(
             "factory_runtime_aborted",
@@ -1089,14 +1117,20 @@ class TestManager(QObject):
         if monitor is not None:
             self._disconnect(monitor.error_occurred, getattr(session, "_monitor_error_lambda", None))
 
-    def _stop_recorder_if_unused(self, recorder):
-        still_used = any(r is recorder for r in self._recorders.values())
+    def _stop_recorder_if_unused(self, recorder, *, excluding_config_id: int | None = None):
+        still_used = any(
+            cid != excluding_config_id and r is recorder
+            for cid, r in self._recorders.items()
+        )
         if not still_used:
             recorder.stop()
             recorder.wait(3000)
-            for key, shared_rec in list(self._shared_recorders.items()):
-                if shared_rec is recorder:
-                    del self._shared_recorders[key]
+            self._discard_shared_recorder(recorder)
+
+    def _discard_shared_recorder(self, recorder) -> None:
+        for key, shared_rec in list(self._shared_recorders.items()):
+            if shared_rec is recorder:
+                del self._shared_recorders[key]
 
     @staticmethod
     def _device_key(config: dict) -> str:

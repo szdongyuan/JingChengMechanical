@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 from app.service.analysis.test_manager import TestManager
 
 from ._support import (
+    _make_running_factory_manager,
     _mock_bus,
     _mock_services,
 )
@@ -28,3 +29,30 @@ class TestSharedRecorderTeardown:
         shared_rec.stop.assert_not_called()
         mgr._stop_one(2)
         shared_rec.stop.assert_called_once()
+
+    def test_failed_factory_stop_does_not_reuse_stale_shared_recorder_on_next_start(
+        self,
+        monkeypatch,
+    ):
+        bus, _, mgr, _, recorder, _, _ = _make_running_factory_manager(monkeypatch)
+
+        def _explode_stop():
+            recorder.stop_calls += 1
+            recorder._running = False
+            raise RuntimeError("stop exploded")
+
+        recorder.stop = MagicMock(side_effect=_explode_stop)
+
+        stopped = mgr.stop_active_run(config_id=1)
+
+        assert stopped is False
+        bus.factory_runtime_aborted.emit.assert_called_once()
+
+        recorder.start = MagicMock(side_effect=AssertionError("stale recorder reused"))
+
+        restarted = mgr.start({"config_id": 1, "sn": "SN2", "trigger_source": "manual"})
+
+        assert restarted is True
+        assert mgr._recorders[1] is not recorder
+        recorder.start.assert_not_called()
+        assert bus.factory_runtime_aborted.emit.call_count == 1
