@@ -733,7 +733,7 @@ def test_factory_mode_controller_direct_backend_stop_unwinds_real_manager_run(
     assert recorder_cls.instances[0].wait_calls == [3000]
 
 
-def test_factory_mode_controller_stop_active_run_waits_for_backend_signal_when_manager_has_not_emitted_one(
+def test_factory_mode_controller_stop_active_run_consumes_real_manager_stopped_signal(
     monkeypatch,
 ):
     controller, services, reset_reasons, reviews, _, recorder_cls = (
@@ -755,9 +755,9 @@ def test_factory_mode_controller_stop_active_run_waits_for_backend_signal_when_m
 
     assert stopped is True
     assert services.test.is_running(config_id=101) is False
-    assert controller.state.active_config_id == 101
+    assert controller.state.active_config_id is None
     assert controller.state.displayed_config_id == 101
-    assert controller.state.run_phase == "running"
+    assert controller.state.run_phase == "stopped"
     assert controller.state.trigger_source == "manual"
     assert reset_reasons == []
     assert reviews == []

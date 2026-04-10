@@ -237,13 +237,24 @@ class TestManager(QObject):
             if not self._sessions:
                 return False
             for cid in list(self._sessions.keys()):
-                self._stop_one(cid, notify_factory_runtime_abort=False)
+                self._stop_factory_run(cid)
             return True
 
-        if config_id not in self._sessions:
+        return self._stop_factory_run(config_id)
+
+    def _stop_factory_run(self, config_id: int) -> bool:
+        session = self._sessions.get(config_id)
+        if session is None:
             return False
 
         self._stop_one(config_id, notify_factory_runtime_abort=False)
+
+        stopped_payload = self._make_factory_runtime_stopped_payload(config_id, session)
+        if stopped_payload is not None:
+            self._emit_optional_signal(
+                "factory_runtime_stopped",
+                stopped_payload,
+            )
         return True
 
     def _stop_one(
@@ -602,6 +613,20 @@ class TestManager(QObject):
             run_id=self._factory_run_id(session),
             trigger_source=self._factory_trigger_source(session),
             error_message=error_message,
+        )
+
+    def _make_factory_runtime_stopped_payload(self, config_id: int, session):
+        from app.services_container import FactoryRuntimeStoppedPayload
+
+        run_id = self._factory_run_id(session)
+        trigger_source = self._factory_trigger_source(session)
+        if run_id is None or trigger_source is None:
+            return None
+
+        return FactoryRuntimeStoppedPayload(
+            config_id=config_id,
+            run_id=run_id,
+            trigger_source=trigger_source,
         )
 
     @staticmethod

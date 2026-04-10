@@ -212,6 +212,7 @@ def _mock_bus():
         "factory_runtime_auto_analysis_no_result",
         "factory_runtime_auto_analysis_error",
         "factory_runtime_auto_analysis_cleanup_settled",
+        "factory_runtime_stopped",
         "factory_runtime_aborted",
         "factory_runtime_reanalysis_completed",
     ):

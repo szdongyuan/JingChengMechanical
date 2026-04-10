@@ -65,6 +65,56 @@ class TestTestManagerStartStop:
             mgr.stop(False)
             assert mgr.is_running() is False
 
+    def test_stop_active_run_emits_factory_runtime_stopped_after_runtime_release(self, monkeypatch):
+            bus, _, mgr, session, recorder, monitor, partial_buf = _make_running_factory_manager(
+                monkeypatch
+            )
+            emission_states = []
+
+            def _capture(payload):
+                emission_states.append(
+                    {
+                        "payload": payload,
+                        "sessions": dict(mgr._sessions),
+                        "recorders": dict(mgr._recorders),
+                        "monitors": dict(mgr._monitors),
+                        "is_running": mgr.is_running(config_id=1),
+                    }
+                )
+
+            bus.factory_runtime_stopped.emit.side_effect = _capture
+
+            stopped = mgr.stop_active_run(config_id=1)
+
+            assert stopped is True
+            assert mgr.is_running(config_id=1) is False
+            assert mgr._sessions == {}
+            assert mgr._recorders == {}
+            assert mgr._monitors == {}
+            assert mgr._shared_recorders == {}
+            assert recorder.get_buffer_from_calls == [session._attach_snapshot]
+            np.testing.assert_array_equal(session._buffer, partial_buf)
+            assert session._sample_rate == recorder._sample_rate
+            assert len(session.saved_wavs) == 1
+            saved_buf, saved_sample_rate = session.saved_wavs[0]
+            np.testing.assert_array_equal(saved_buf, partial_buf)
+            assert saved_sample_rate == recorder._sample_rate
+            assert recorder.stop_calls == 1
+            assert recorder.wait_calls == [3000]
+            assert monitor.stop_calls == 1
+            assert monitor.wait_calls == [1000]
+            assert len(emission_states) == 1
+            stopped_payload = emission_states[0]["payload"]
+            assert stopped_payload.config_id == 1
+            assert stopped_payload.run_id == session._workorder["factory_run_id"]
+            assert stopped_payload.trigger_source == "manual"
+            assert emission_states[0]["sessions"] == {}
+            assert emission_states[0]["recorders"] == {}
+            assert emission_states[0]["monitors"] == {}
+            assert emission_states[0]["is_running"] is False
+            bus.factory_runtime_aborted.emit.assert_not_called()
+            bus.status.emit.assert_any_call("Stopped")
+
     def test_stop_active_run_remains_cleanup_safe_when_partial_save_wav_fails(self, monkeypatch):
             save_error = RuntimeError("disk full")
             bus, _, mgr, session, recorder, monitor, partial_buf = _make_running_factory_manager(
@@ -91,6 +141,10 @@ class TestTestManagerStartStop:
             assert recorder.wait_calls == [3000]
             assert monitor.stop_calls == 1
             assert monitor.wait_calls == [1000]
+            stopped_payload = bus.factory_runtime_stopped.emit.call_args.args[0]
+            assert stopped_payload.config_id == 1
+            assert stopped_payload.run_id == session._workorder["factory_run_id"]
+            assert stopped_payload.trigger_source == "manual"
             bus.factory_runtime_aborted.emit.assert_not_called()
             assert any(
                 "ERROR saving partial recording for config=1: disk full" in call.args[0]
