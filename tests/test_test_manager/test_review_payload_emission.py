@@ -45,6 +45,53 @@ class TestReviewPayloadEmission:
         assert payload.run_id == session._workorder["factory_run_id"]
         assert payload.trigger_source == "plc"
 
+    def test_stop_after_judgment_returns_suppresses_late_auto_analysis_review_emission(
+        self,
+        monkeypatch,
+    ):
+        partial_buf = np.arange(400, dtype=np.float32).reshape(400, 1)
+        bus, _, mgr, session, _, _, _ = _make_running_factory_manager(
+            monkeypatch,
+            analysis_duration=2.0,
+            analysis_window_offset_ms=1000,
+            allow_incomplete_recording_analysis=True,
+            partial_buf=partial_buf,
+            sample_rate=100.0,
+        )
+        session._run_judgment = MagicMock(
+            return_value=JudgmentResult(
+                overall="合格",
+                limit_pass=True,
+                ai_pass=True,
+                ai_score=0.93,
+                analysis_window=(1.0, 3.0),
+            )
+        )
+        stop_results = []
+        original_build_summary_payload = mgr._build_summary_payload
+
+        def _stop_before_first_review_emit(running_session, *, judgment_payload):
+            stop_results.append(mgr.stop_active_run(config_id=1))
+            return original_build_summary_payload(
+                running_session,
+                judgment_payload=judgment_payload,
+            )
+
+        monkeypatch.setattr(mgr, "_build_summary_payload", _stop_before_first_review_emit)
+
+        mgr._on_session_done(1)
+
+        assert stop_results == [True]
+        bus.factory_runtime_stopped.emit.assert_called_once()
+        bus.test_finished.emit.assert_not_called()
+        bus.result_changed.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_succeeded.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_no_result.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_error.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_cleanup_settled.emit.assert_not_called()
+        assert 1 not in mgr._completed_sessions
+        assert mgr.is_running(config_id=1) is False
+
     def test_on_session_done_emits_summary_and_chart_payload_on_success(self, monkeypatch):
         bus = _mock_bus()
         services = _mock_services(bus)

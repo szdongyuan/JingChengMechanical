@@ -595,7 +595,25 @@ class TestManager(QObject):
             ),
         )
 
-    def _emit_auto_analysis_review(self, config_id: int, session) -> bool:
+    def _auto_analysis_review_still_owned(
+        self,
+        config_id: int,
+        session,
+        *,
+        allow_accepted_stop: bool = False,
+    ) -> bool:
+        return (
+            self._sessions.get(config_id) is session
+            and (allow_accepted_stop or config_id not in self._accepted_factory_stops)
+        )
+
+    def _emit_auto_analysis_review(
+        self,
+        config_id: int,
+        session,
+        *,
+        allow_accepted_stop: bool = False,
+    ) -> bool:
         analysis_error = None
         result = None
         result_dict = None
@@ -605,10 +623,20 @@ class TestManager(QObject):
         except Exception as exc:
             analysis_error = exc
 
-        if self._sessions.get(config_id) is not session:
+        if not self._auto_analysis_review_still_owned(
+            config_id,
+            session,
+            allow_accepted_stop=allow_accepted_stop,
+        ):
             return False
 
         if analysis_error is not None:
+            if not self._auto_analysis_review_still_owned(
+                config_id,
+                session,
+                allow_accepted_stop=allow_accepted_stop,
+            ):
+                return False
             payload = self._emit_no_result(config_id, analysis_error, context="analysis")
             signal_name = (
                 "factory_runtime_auto_analysis_no_result"
@@ -619,6 +647,12 @@ class TestManager(QObject):
                 session,
                 error_message=payload["error_summary"],
             )
+            if not self._auto_analysis_review_still_owned(
+                config_id,
+                session,
+                allow_accepted_stop=allow_accepted_stop,
+            ):
+                return False
             self._emit_optional_signal(
                 signal_name,
                 self._make_factory_review_payload(
@@ -639,11 +673,35 @@ class TestManager(QObject):
                 analysis_window=result_dict.get("analysis_window"),
                 judgment_payload=result_dict,
             )
+            if not self._auto_analysis_review_still_owned(
+                config_id,
+                session,
+                allow_accepted_stop=allow_accepted_stop,
+            ):
+                return False
             self._bus.test_finished.emit(config_id, result_dict)
+            if not self._auto_analysis_review_still_owned(
+                config_id,
+                session,
+                allow_accepted_stop=allow_accepted_stop,
+            ):
+                return False
             self._bus.result_changed.emit(result_dict)
+            if not self._auto_analysis_review_still_owned(
+                config_id,
+                session,
+                allow_accepted_stop=allow_accepted_stop,
+            ):
+                return False
             self._bus.log.emit(
                 f"[TestManager] result: {result.overall} (limit={result.limit_pass})"
             )
+            if not self._auto_analysis_review_still_owned(
+                config_id,
+                session,
+                allow_accepted_stop=allow_accepted_stop,
+            ):
+                return False
             self._emit_optional_signal(
                 "factory_runtime_auto_analysis_succeeded",
                 self._make_factory_review_payload(
@@ -655,6 +713,12 @@ class TestManager(QObject):
                 ),
             )
 
+        if not self._auto_analysis_review_still_owned(
+            config_id,
+            session,
+            allow_accepted_stop=allow_accepted_stop,
+        ):
+            return False
         self._bus.status.emit("Idle")
         return True
 
@@ -783,7 +847,11 @@ class TestManager(QObject):
             log_message=f"[TestManager] stop-triggered analysis for config={config_id}",
         )
         try:
-            if not self._emit_auto_analysis_review(config_id, session):
+            if not self._emit_auto_analysis_review(
+                config_id,
+                session,
+                allow_accepted_stop=True,
+            ):
                 return True
 
             completed_session = self._sessions.pop(config_id, None)
@@ -801,13 +869,27 @@ class TestManager(QObject):
             self._accepted_factory_stops.discard(config_id)
 
     def _stop_factory_runtime_io(self, config_id: int, *, rec, mon) -> None:
-        if mon is not None:
-            mon.stop()
-            mon.wait(1000)
-        if rec is not None:
-            self._stop_recorder_if_unused(rec, excluding_config_id=config_id)
-        self._recorders.pop(config_id, None)
-        self._monitors.pop(config_id, None)
+        cleanup_error = None
+
+        try:
+            if mon is not None:
+                mon.stop()
+                mon.wait(1000)
+        except Exception as exc:
+            cleanup_error = exc
+
+        try:
+            if rec is not None:
+                self._stop_recorder_if_unused(rec, excluding_config_id=config_id)
+        except Exception as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        finally:
+            self._recorders.pop(config_id, None)
+            self._monitors.pop(config_id, None)
+
+        if cleanup_error is not None:
+            raise cleanup_error
 
     def _emit_factory_runtime_stopped(self, config_id: int, session) -> bool:
         self._analyzing_sessions.discard(config_id)
