@@ -498,10 +498,23 @@ class TestManager(QObject):
             raise RuntimeError("analysis result unavailable")
         return asdict(result)
 
-    def _emit_no_result(self, config_id: int, error: Exception | str, *, context: str):
+    def _emit_no_result(
+        self,
+        config_id: int,
+        error: Exception | str,
+        *,
+        context: str,
+        still_owned=None,
+    ):
         payload = self._make_no_result_payload(error)
+        if callable(still_owned) and not still_owned():
+            return None
         self._bus.test_finished.emit(config_id, payload)
+        if callable(still_owned) and not still_owned():
+            return None
         self._bus.result_changed.emit(payload)
+        if callable(still_owned) and not still_owned():
+            return None
         self._bus.log.emit(
             f"[TestManager] no-result {context} for config={config_id}: {payload['error_summary']}"
         )
@@ -631,13 +644,18 @@ class TestManager(QObject):
             return False
 
         if analysis_error is not None:
-            if not self._auto_analysis_review_still_owned(
+            payload = self._emit_no_result(
                 config_id,
-                session,
-                allow_accepted_stop=allow_accepted_stop,
-            ):
+                analysis_error,
+                context="analysis",
+                still_owned=lambda: self._auto_analysis_review_still_owned(
+                    config_id,
+                    session,
+                    allow_accepted_stop=allow_accepted_stop,
+                ),
+            )
+            if payload is None:
                 return False
-            payload = self._emit_no_result(config_id, analysis_error, context="analysis")
             signal_name = (
                 "factory_runtime_auto_analysis_no_result"
                 if self._is_factory_no_result_error(analysis_error)
@@ -911,7 +929,7 @@ class TestManager(QObject):
         self._sessions.pop(config_id, None)
         self._recorders.pop(config_id, None)
         self._monitors.pop(config_id, None)
-        if rec is not None:
+        if rec is not None and not self._recorder_has_live_owner(rec):
             self._discard_shared_recorder(rec)
         self._bus.log.emit(f"[TestManager] ERROR stopping config={config_id}: {error}")
         self._emit_optional_signal(
@@ -1199,12 +1217,22 @@ class TestManager(QObject):
         if monitor is not None:
             self._disconnect(monitor.error_occurred, getattr(session, "_monitor_error_lambda", None))
 
-    def _stop_recorder_if_unused(self, recorder, *, excluding_config_id: int | None = None):
-        still_used = any(
-            cid != excluding_config_id and r is recorder
-            for cid, r in self._recorders.items()
+    def _recorder_has_live_owner(
+        self,
+        recorder,
+        *,
+        excluding_config_id: int | None = None,
+    ) -> bool:
+        return any(
+            cid != excluding_config_id and active_recorder is recorder
+            for cid, active_recorder in self._recorders.items()
         )
-        if not still_used:
+
+    def _stop_recorder_if_unused(self, recorder, *, excluding_config_id: int | None = None):
+        if not self._recorder_has_live_owner(
+            recorder,
+            excluding_config_id=excluding_config_id,
+        ):
             recorder.stop()
             recorder.wait(3000)
             self._discard_shared_recorder(recorder)

@@ -92,3 +92,33 @@ class TestSharedRecorderTeardown:
         assert restarted is True
         assert mgr._recorders[1] is not recorder
         recorder.start.assert_not_called()
+
+    def test_monitor_stop_failure_keeps_shared_recorder_mapping_when_another_owner_is_live(
+        self,
+        monkeypatch,
+    ):
+        bus, _, mgr, _, recorder, monitor, _ = _make_running_factory_manager(monkeypatch)
+        other_session = MagicMock()
+        other_session.config_id = 2
+        mgr._sessions[2] = other_session
+        mgr._recorders[2] = recorder
+
+        def _explode_monitor_stop():
+            monitor.stop_calls += 1
+            raise RuntimeError("monitor stop exploded")
+
+        monitor.stop = MagicMock(side_effect=_explode_monitor_stop)
+
+        stopped = mgr.stop_active_run(config_id=1)
+
+        assert stopped is False
+        bus.factory_runtime_aborted.emit.assert_called_once()
+        assert mgr._sessions == {2: other_session}
+        assert mgr._recorders == {2: recorder}
+        assert mgr._monitors == {}
+        assert mgr._shared_recorders == {
+            "InputMic|InputAPI|44100": recorder,
+        }
+        assert mgr.is_running(config_id=2) is True
+        assert recorder.stop_calls == 0
+        assert recorder.wait_calls == []
