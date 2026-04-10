@@ -10,12 +10,41 @@ from app.service.analysis.test_manager import TestManager
 from ._support import (
     _expected_chart_payload,
     _expected_summary_payload,
+    _make_running_factory_manager,
     _mock_bus,
     _mock_services,
 )
 
 
 class TestReviewPayloadEmission:
+    def test_stop_triggered_auto_analysis_preserves_original_trigger_source(self, monkeypatch):
+        partial_buf = np.arange(400, dtype=np.float32).reshape(400, 1)
+        bus, _, mgr, session, _, _, _ = _make_running_factory_manager(
+            monkeypatch,
+            analysis_duration=2.0,
+            analysis_window_offset_ms=1000,
+            allow_incomplete_recording_analysis=True,
+            trigger_source="plc",
+            partial_buf=partial_buf,
+            sample_rate=100.0,
+        )
+        session._run_judgment = MagicMock(
+            return_value=JudgmentResult(
+                overall="合格",
+                limit_pass=True,
+                ai_pass=True,
+                ai_score=0.93,
+                analysis_window=(1.0, 3.0),
+            )
+        )
+
+        mgr.stop_active_run(config_id=1)
+
+        payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
+        assert payload.displayed_config_id == 1
+        assert payload.run_id == session._workorder["factory_run_id"]
+        assert payload.trigger_source == "plc"
+
     def test_on_session_done_emits_summary_and_chart_payload_on_success(self, monkeypatch):
         bus = _mock_bus()
         services = _mock_services(bus)

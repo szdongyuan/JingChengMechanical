@@ -11,6 +11,7 @@ from ._support import (
     _full_no_result_summary,
     _load_factory_mode_controller_module,
     _make_config,
+    _make_real_manager_factory_context,
     _make_review_payload,
     _make_runtime_config_payload,
     _make_services,
@@ -70,6 +71,46 @@ def test_factory_mode_controller_reanalysis_failure_returns_to_reviewing_without
     )
     assert controller.review_payload.chart_payload is None
     assert controller.review_payload.judgment_payload is None
+
+
+def test_stop_triggered_auto_analysis_success_reaches_controller_reviewing_state(
+    monkeypatch,
+):
+    controller, services, reset_reasons, reviews, _, _ = _make_real_manager_factory_context(
+        monkeypatch
+    )
+    config_map = {
+        101: {
+            **_make_config(101),
+            "allow_incomplete_recording_analysis": True,
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 1000,
+        },
+        202: _make_config(202),
+    }
+    services.config_service.load_config.side_effect = lambda config_id: dict(
+        config_map[config_id]
+    )
+
+    started = controller.start_manual({"sn": "SN-1"})
+
+    assert started is True
+    assert controller.state.run_phase == "running"
+    reset_reasons.clear()
+    reviews.clear()
+
+    stopped = controller.stop_active_run()
+
+    assert stopped is True
+    assert services.test.is_running(config_id=101) is False
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.trigger_source == "manual"
+    assert controller.review_payload.displayed_config_id == 101
+    assert controller.review_payload.trigger_source == "manual"
+    assert reset_reasons == []
+    assert reviews[-1].displayed_config_id == 101
 
 
 def test_begin_reanalysis_clears_summary_payload_and_chart_payload_without_resetting_review_context():

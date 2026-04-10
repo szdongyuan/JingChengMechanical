@@ -28,6 +28,9 @@ class _FakeSession:
         self._workorder = dict(workorder)
         self._buffer = None
         self._sample_rate = None
+        self._audio_file_path = None
+        self._audio_data_id = None
+        self.last_ai_review = None
         self._finished = False
         self._attach_snapshot = None
         self._attach_chunk_index = 0
@@ -47,15 +50,24 @@ class _FakeSession:
         raise AssertionError("not used in this test")
 
     def _save_wav(self, *args, **kwargs):
-        return None
+        self._audio_file_path = "partial.wav"
+        self._audio_data_id = "audio-123"
+        return self._audio_file_path
 
-def _factory_runtime_config(config_id: int = 1) -> dict:
+def _factory_runtime_config(
+    config_id: int = 1,
+    *,
+    analysis_duration: float = 1.0,
+    analysis_window_offset_ms: int = 0,
+    allow_incomplete_recording_analysis: bool = False,
+) -> dict:
     return {
         "config_id": config_id,
         "config_name": "Test",
         "record_duration": 2.0,
-        "analysis_duration": 1.0,
-        "analysis_window_offset_ms": 0,
+        "analysis_duration": analysis_duration,
+        "analysis_window_offset_ms": analysis_window_offset_ms,
+        "allow_incomplete_recording_analysis": allow_incomplete_recording_analysis,
         "selected_channels": [0],
         "channels": [{
             "channel_index": 0,
@@ -81,12 +93,27 @@ def _factory_runtime_config(config_id: int = 1) -> dict:
         "output_device_samplerate": 48000,
     }
 
-def _make_running_factory_manager(monkeypatch, *, save_wav_error: Exception | None = None):
+def _make_running_factory_manager(
+    monkeypatch,
+    *,
+    save_wav_error: Exception | None = None,
+    analysis_duration: float = 1.0,
+    analysis_window_offset_ms: int = 0,
+    allow_incomplete_recording_analysis: bool = False,
+    trigger_source: str = "manual",
+    partial_buf: np.ndarray | None = None,
+    sample_rate: float = 44100.0,
+):
     bus = _mock_bus()
     services = _mock_services(bus)
-    services.config_service.load_config.return_value = _factory_runtime_config()
+    services.config_service.load_config.return_value = _factory_runtime_config(
+        analysis_duration=analysis_duration,
+        analysis_window_offset_ms=analysis_window_offset_ms,
+        allow_incomplete_recording_analysis=allow_incomplete_recording_analysis,
+    )
 
-    partial_buf = np.arange(20, dtype=np.float32).reshape(20, 1)
+    if partial_buf is None:
+        partial_buf = np.arange(20, dtype=np.float32).reshape(20, 1)
 
     class FakeRecorder:
         instances = []
@@ -169,6 +196,9 @@ def _make_running_factory_manager(monkeypatch, *, save_wav_error: Exception | No
             self.saved_wavs.append((buf.copy(), sample_rate))
             if save_wav_error is not None:
                 raise save_wav_error
+            self._audio_file_path = "partial.wav"
+            self._audio_data_id = "audio-123"
+            return self._audio_file_path
 
     monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
     monkeypatch.setattr("app.service.analysis.test_manager.AudioMonitor", FakeMonitor)
@@ -176,13 +206,15 @@ def _make_running_factory_manager(monkeypatch, *, save_wav_error: Exception | No
 
     mgr = TestManager(bus, services)
 
-    started = mgr.start({"config_id": 1, "sn": "SN1", "trigger_source": "manual"})
+    started = mgr.start({"config_id": 1, "sn": "SN1", "trigger_source": trigger_source})
 
     assert started is True
     assert mgr.is_running(config_id=1) is True
     assert len(FakeSession.instances) == 1
     assert len(FakeRecorder.instances) == 1
     assert len(FakeMonitor.instances) == 1
+
+    FakeRecorder.instances[0]._sample_rate = sample_rate
 
     return (
         bus,
