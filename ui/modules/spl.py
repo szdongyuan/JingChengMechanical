@@ -8,7 +8,7 @@ from ui.widgets.analysis_charts import LineChartWidget
 
 class SplModule(QWidget):
     module_id = "spl"
-    _RENDER_PHASES = frozenset({"reviewing"})
+    _RENDER_PHASES = frozenset({"reviewing", "stopped"})
     _BOTTOM_AXIS_LABEL = "Time (s)"
     _LEFT_AXIS_LABEL = "SPL (dB)"
 

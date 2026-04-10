@@ -619,6 +619,19 @@ def _reviewing_state(
     )
 
 
+def _stopped_state(
+    config_id: int,
+    *,
+    selected_config_ids: tuple[int, ...] = (101, 202),
+) -> FactoryControllerState:
+    return FactoryControllerState(
+        selected_config_ids=selected_config_ids,
+        displayed_config_id=config_id,
+        run_phase="stopped",
+        trigger_source="manual",
+    )
+
+
 def _review_payload(config_id: int, *, run_id: str | None = None) -> FactoryReviewPayload:
     return FactoryReviewPayload(
         displayed_config_id=config_id,
@@ -1459,6 +1472,58 @@ def test_main_window_toolbar_selection_immediately_refreshes_committed_chart_mod
     _select_toolbar_channel(window, qapp, 1)
 
     _assert_committed_chart_channel(window, channel_index=1)
+
+
+def test_main_window_analysis_toolbar_remains_visible_in_stopped_phase(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(monkeypatch)
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    try:
+        services.bus.factory_state_changed.emit(_stopped_state(101))
+        qapp.processEvents()
+
+        assert window.analysis_toolbar.isVisible() is True
+        assert _toolbar_channel_options(window) == [0, 1]
+        assert window.analysis_toolbar.current_channel_index() == 0
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_main_window_stopped_state_preserves_review_channel_resolution(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0, 2)),
+    )
+    _show(window, qapp)
+
+    try:
+        services.bus.factory_state_changed.emit(_reviewing_state(101))
+        services.bus.factory_review_changed.emit(
+            _review_payload_with_chart_payload(101, channels=(0, 2))
+        )
+        qapp.processEvents()
+        _select_toolbar_channel(window, qapp, 2)
+
+        services.bus.factory_state_changed.emit(_stopped_state(101))
+        qapp.processEvents()
+
+        assert window.analysis_toolbar.current_channel_index() == 2
+        _assert_committed_chart_channel(window, channel_index=2)
+    finally:
+        window.close()
+        qapp.processEvents()
 
 
 def test_main_window_review_loudness_card_uses_data_focused_y_range(

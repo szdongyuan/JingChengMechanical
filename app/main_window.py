@@ -57,7 +57,7 @@ ROLE_PERMISSIONS = {
 class MainWindow(QMainWindow):
     _TEST_PAGE_INDEX = 0
     _DISPLAY_CHANNEL_PHASES = frozenset(
-        {"running", "analyzing", "reviewing", "reanalyzing"}
+        {"running", "analyzing", "reviewing", "reanalyzing", "stopped"}
     )
 
     def __init__(self, services):
@@ -656,7 +656,7 @@ class MainWindow(QMainWindow):
         if selected_channels:
             return selected_channels
 
-        if self._factory_state.run_phase in {"reviewing", "reanalyzing"}:
+        if self._factory_state.run_phase in {"reviewing", "reanalyzing", "stopped"}:
             return self._chart_payload_channels_for_config(config_id)
 
         return []

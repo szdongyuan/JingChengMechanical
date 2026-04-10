@@ -172,7 +172,9 @@ class _HeatmapCanvas(QWidget):
 
 class StftModule(QWidget):
     module_id = "stft"
-    _DISPLAY_PHASES = frozenset({"running", "analyzing", "reviewing", "reanalyzing"})
+    _DISPLAY_PHASES = frozenset(
+        {"running", "analyzing", "reviewing", "reanalyzing", "stopped"}
+    )
     _REVIEW_PHASES = frozenset({"reviewing", "reanalyzing"})
     _LIVE_FLUSH_INTERVAL_MS = 50
 

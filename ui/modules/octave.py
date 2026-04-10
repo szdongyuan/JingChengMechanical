@@ -8,7 +8,7 @@ from ui.widgets.analysis_charts import OctaveBarChartWidget
 
 class OctaveModule(QWidget):
     module_id = "octave"
-    _RENDER_PHASES = frozenset({"reviewing"})
+    _RENDER_PHASES = frozenset({"reviewing", "stopped"})
 
     def __init__(self, services):
         super().__init__()

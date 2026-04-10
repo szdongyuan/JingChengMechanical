@@ -362,6 +362,31 @@ def test_loudness_module_keeps_selected_channel_without_fallback_when_only_loudn
 
 
 @pytest.mark.parametrize("module_cls", (SplModule, SpectrumModule, OctaveModule, LoudnessModule))
+def test_committed_chart_modules_keep_review_payload_visible_in_stopped_phase(
+    qapp,
+    module_cls,
+):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = module_cls(services)
+    module.selected_display_channel_provider = lambda: 1
+    review_payload = _review_payload_with_chart_payload(101, channels=(0, 1))
+    if module_cls is LoudnessModule:
+        review_payload = _with_loudness_payload(review_payload)
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is True
+
+    services.bus.factory_state_changed.emit(_state(101, "stopped"))
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is True
+    assert module.current_render_channel() == 1
+
+
+@pytest.mark.parametrize("module_cls", (SplModule, SpectrumModule, OctaveModule, LoudnessModule))
 def test_committed_chart_modules_stay_empty_in_reviewing_when_chart_payload_is_missing(
     qapp,
     module_cls,

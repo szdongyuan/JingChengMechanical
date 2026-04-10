@@ -286,6 +286,37 @@ def test_result_module_shows_analysis_in_progress_when_summary_payload_is_missin
     _assert_placeholder(module, badge_text="分析中")
 
 
+def test_result_module_keeps_in_progress_badge_when_plain_stopped_preserves_display(qapp):
+    module = _make_module()
+
+    module.services.bus.factory_state_changed.emit(
+        _state("running", displayed_config_id=101, active_config_id=101)
+    )
+
+    assert module.lb_overall.text() == "分析中"
+
+    module.services.bus.factory_state_changed.emit(_state("stopped", displayed_config_id=101))
+
+    _assert_placeholder(module, badge_text="分析中")
+
+
+def test_result_module_preserves_existing_summary_card_when_plain_stop_enters_stopped(qapp):
+    module = _make_module()
+    module.services.bus.factory_state_changed.emit(_state("reviewing", displayed_config_id=101))
+    module.services.bus.factory_review_changed.emit(
+        _make_review_payload(summary_payload=_summary_payload(overall_status="pass"))
+    )
+
+    assert module.lb_overall.text() == "PASS"
+
+    module.services.bus.factory_state_changed.emit(_state("stopped", displayed_config_id=101))
+
+    assert module.lb_overall.text() == "PASS"
+    assert module.lb_overall.property("resultLevel") == "pass"
+    assert _table_value(module, 0, 0) == "SPL"
+    assert _table_value(module, 4, 0) == "AI分析"
+
+
 def test_result_module_shows_no_result_plus_error_text_from_summary_payload(qapp):
     module = _make_module()
     module.services.bus.factory_state_changed.emit(_state("reviewing", displayed_config_id=101))

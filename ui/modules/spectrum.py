@@ -8,7 +8,7 @@ from ui.widgets.analysis_charts import FftLineChartWidget
 
 class SpectrumModule(QWidget):
     module_id = "spectrum"
-    _RENDER_PHASES = frozenset({"reviewing"})
+    _RENDER_PHASES = frozenset({"reviewing", "stopped"})
 
     def __init__(self, services):
         super().__init__()
