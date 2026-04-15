@@ -54,3 +54,16 @@ def test_model_defines_allow_incomplete_recording_analysis_with_false_default():
     config = ConfigTable(config_name="Incomplete Stop Defaults")
 
     assert config.allow_incomplete_recording_analysis is False
+
+
+def test_db_backed_plc_fk_clears_config_binding_on_plc_delete():
+    plc = PlcTable.create(plc_name="Shared Fixture PLC")
+    config = ConfigTable.create(config_name="Persisted PLC Binding", plc=plc)
+
+    persisted = ConfigTable.get_by_id(config.config_id)
+    assert persisted.plc_id == plc.id
+
+    plc.delete_instance()
+
+    reloaded = ConfigTable.get_by_id(config.config_id)
+    assert reloaded.plc_id is None
