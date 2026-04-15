@@ -374,7 +374,7 @@ class PlcSettingsModule(QWidget):
             self._on_connect_finished(row.id, plc_service, connect_thread, success, message)
 
         def on_connect_thread_stopped():
-            self._on_connect_thread_stopped(row.id)
+            self._on_connect_thread_stopped(row.id, plc_service, connect_thread)
 
         def on_state_changed(state, plc_id=row.id):
             self.on_plc_state_changed(plc_id, state)
@@ -404,23 +404,50 @@ class PlcSettingsModule(QWidget):
             if not success:
                 self.set_connect_label(f"连接失败: {message}" if message else "连接失败")
 
-    def _on_connect_thread_stopped(self, plc_id):
+    def _on_connect_thread_stopped(self, plc_id, plc_service=None, connect_thread=None):
         self.logger.info(f"plc {plc_id} 线程已停止")
-        self.services.plc_threads.pop(plc_id, None)
-        self.services.plc_services.pop(plc_id, None)
+        if plc_service is None:
+            plc_service = getattr(self.services, "plc_services", {}).get(plc_id)
+        if connect_thread is None:
+            connect_thread = getattr(self.services, "plc_threads", {}).get(plc_id)
+
+        cleared = self._clear_disconnected_runtime_state(
+            plc_id,
+            plc_service,
+            connect_thread,
+        )
+        if cleared:
+            row = self.get_current_row()
+            if row is not None and row.id == plc_id:
+                self.set_connect_label(self.set_lb_text(plc_id))
+                self.apply_connect_button_state(plc_id)
         self.logger.info(
             f"plc {plc_id} 后台plc_services："
             f"{getattr(self.services, 'plc_services', {}).get(plc_id)}, "
             f"后台线程{getattr(self.services, 'plc_threads', {}).get(plc_id)}"
         )
 
-    def _clear_disconnected_runtime_state(self, row_id, plc_service) -> None:
+    def _clear_disconnected_runtime_state(self, row_id, plc_service, plc_thread=None) -> bool:
+        current_service = getattr(self.services, "plc_services", {}).get(row_id)
+        current_thread = getattr(self.services, "plc_threads", {}).get(row_id)
+        if (
+            plc_service is not None
+            and current_service is not None
+            and current_service is not plc_service
+        ) or (
+            plc_thread is not None
+            and current_thread is not None
+            and current_thread is not plc_thread
+        ):
+            return False
+
         self.services.plc_services.pop(row_id, None)
         self.services.plc_threads.pop(row_id, None)
         self.services.plc_state[row_id] = "未连接"
         current_service = getattr(self.services, "plc", None)
         if current_service is plc_service:
             self.services.plc = None
+        return True
 
     def disconnect_row(self, row_id):
         # 断开时先停 service，再退出对应线程，最后把状态改回未连接。
@@ -440,7 +467,7 @@ class PlcSettingsModule(QWidget):
                 self._log_disconnect_failure(row_id, "线程未在超时内退出")
 
         if teardown_ok or thread_exited:
-            self._clear_disconnected_runtime_state(row_id, plc_service)
+            self._clear_disconnected_runtime_state(row_id, plc_service, plc_thread)
 
         if not teardown_ok:
             return False

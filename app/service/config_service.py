@@ -226,12 +226,31 @@ class ConfigService:
 
     def _raise_save_integrity_error(self, exc: IntegrityError, data: dict) -> None:
         error_text = str(exc).lower()
-        if (
-            data.get("plc_id") is not None
-            and "foreign key constraint failed" in error_text
-        ):
-            raise ValueError("PLC 不存在或已被删除") from exc
-        raise ValueError(f"配置名称「{data['config_name']}」已存在") from exc
+        if "foreign key constraint failed" in error_text:
+            config_id = data.get("config_id")
+            if (
+                isinstance(config_id, int)
+                and not isinstance(config_id, bool)
+                and not TestConfigTable.select().where(
+                    TestConfigTable.config_id == config_id
+                ).exists()
+            ):
+                raise ValueError("配置不存在或已被删除") from exc
+
+            plc_id = data.get("plc_id")
+            if (
+                isinstance(plc_id, int)
+                and not isinstance(plc_id, bool)
+                and not PlcTable.select().where(PlcTable.id == plc_id).exists()
+            ):
+                raise ValueError("PLC 不存在或已被删除") from exc
+
+            raise ValueError("配置保存失败，关联数据无效") from exc
+
+        if "unique constraint failed" in error_text:
+            raise ValueError(f"配置名称「{data['config_name']}」已存在") from exc
+
+        raise ValueError("配置保存失败，数据约束冲突") from exc
 
     def begin_save_config(self, data: dict) -> PendingConfigSave:
         errors = self.validate(data)

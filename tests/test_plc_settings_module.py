@@ -724,6 +724,42 @@ def test_plc_settings_module_disconnect_row_clears_runtime_state_when_stop_ack_t
     ]
 
 
+def test_plc_settings_module_late_thread_finish_resets_runtime_state_and_current_ui(
+    qapp,
+    plc_db,
+):
+    row = PlcTable.create(
+        plc_name="PLC Late Stop",
+        plc_ip="127.0.0.1",
+        plc_open_state=0,
+    )
+    bus = SimpleNamespace(log=_SignalProbe())
+    services = SimpleNamespace(
+        bus=bus,
+        _start_from_plc=lambda plc_id: None,
+    )
+    module = PlcSettingsModule(services)
+    qapp.processEvents()
+
+    plc_service = object()
+    services.plc_services[row.id] = plc_service
+    services.plc_threads[row.id] = object()
+    services.plc_state[row.id] = "已连接"
+    services.plc = plc_service
+    module.on_plc_state_changed(row.id, "已连接")
+
+    module._on_connect_thread_stopped(row.id)
+    qapp.processEvents()
+
+    assert row.id not in services.plc_services
+    assert row.id not in services.plc_threads
+    assert services.plc_state[row.id] == "未连接"
+    assert services.plc is None
+    assert module.lb_connect_state.text() == "未连接"
+    assert module.btn_connect.text() == "连接"
+    assert module.btn_connect.isEnabled() is True
+
+
 def test_plc_settings_module_delete_plc_aborts_when_disconnect_fails(
     qapp,
     plc_db,

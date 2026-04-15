@@ -405,6 +405,40 @@ def test_save_config_reports_late_db_level_plc_fk_failure_as_plc_error(monkeypat
     FakeBus.config_changed.emit.assert_not_called()
 
 
+def test_save_config_does_not_misreport_non_plc_fk_failure_as_plc_error(monkeypatch):
+    svc = _service()
+    plc = PlcTable.create(plc_name="PLC A")
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    payload = {
+        "config_id": config_id,
+        "config_name": "Cfg1",
+        "record_duration": 5.0,
+        "analysis_duration": 3.0,
+        "scan_triggers_test": False,
+        "plc_id": plc.id,
+        "selected_channels": [0],
+        "channels": [_channel_payload(0)],
+    }
+
+    assert svc.validate(payload) == []
+
+    original_collect_replaced_paths = svc._collect_replaced_paths
+
+    def _delete_config_before_write(config_id_arg, channels):
+        ConfigTable.delete().where(ConfigTable.config_id == config_id).execute()
+        return original_collect_replaced_paths(config_id_arg, channels)
+
+    monkeypatch.setattr(svc, "_collect_replaced_paths", _delete_config_before_write)
+
+    with pytest.raises(ValueError) as exc_info:
+        svc.save_config(payload)
+
+    assert str(exc_info.value) == "配置不存在或已被删除"
+    assert PlcTable.select().where(PlcTable.id == plc.id).exists()
+    assert not ConfigTable.select().where(ConfigTable.config_id == config_id).exists()
+    FakeBus.config_changed.emit.assert_not_called()
+
+
 def test_save_config_keeps_existing_ai_binding_row_while_offset_stays_config_owned():
     svc = _service()
     config_id = ConfigTable.create(config_name="Cfg1").config_id
