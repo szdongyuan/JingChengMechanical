@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import QMetaObject, QThread, Qt
+from PyQt6.QtCore import QEventLoop, QMetaObject, QThread, Qt, QTimer
 from PyQt6.QtWidgets import (
     QComboBox,
     QFormLayout,
@@ -20,6 +20,8 @@ from model.plc_table import PlcTable
 
 class PlcSettingsModule(QWidget):
     _SAVE_BLOCKED_STATES = {"连接中", "重连中", "已连接"}
+    _STOP_ACK_TIMEOUT_MS = 2000
+    _THREAD_EXIT_TIMEOUT_MS = 2000
 
     def __init__(self, services):
         super().__init__()
@@ -419,27 +421,13 @@ class PlcSettingsModule(QWidget):
         self.logger.info(f"断开前正在运行的plc_services:{plc_service} , 线程{plc_thread}")
         teardown_ok = True
         if plc_service:
-            try:
-                stop_invoked = QMetaObject.invokeMethod(
-                    plc_service,
-                    "stop_plc_service",
-                    Qt.ConnectionType.QueuedConnection,
-                )
-                if stop_invoked is False:
-                    teardown_ok = False
-                    self.services.bus.log.emit(f"plc{row_id}断开失败: stop_plc_service 未执行")
-                    self.logger.error(f"plc{row_id}断开失败: stop_plc_service 未执行")
-            except Exception as exc:
-                teardown_ok = False
-                self.services.bus.log.emit(f"plc{row_id}断开失败: {exc}")
-                self.logger.error(f"plc{row_id}断开失败: {exc}")
+            teardown_ok = self._request_stop_ack(row_id, plc_service)
 
         if plc_thread is not None:
             plc_thread.quit()
-            if not plc_thread.wait(2000):
+            if not plc_thread.wait(self._THREAD_EXIT_TIMEOUT_MS):
                 teardown_ok = False
-                self.services.bus.log.emit(f"plc{row_id}断开失败: 线程未在超时内退出")
-                self.logger.error(f"plc{row_id}断开失败: 线程未在超时内退出")
+                self._log_disconnect_failure(row_id, "线程未在超时内退出")
 
         if not teardown_ok:
             return False
@@ -451,6 +439,61 @@ class PlcSettingsModule(QWidget):
         if current_service is plc_service:
             self.services.plc = None
         return True
+
+    def _request_stop_ack(self, row_id, plc_service) -> bool:
+        stop_completed = getattr(plc_service, "stop_completed", None)
+        if stop_completed is None:
+            self._log_disconnect_failure(row_id, "stop_plc_service 完成信号不可用")
+            return False
+
+        stop_acknowledged = False
+        wait_loop = QEventLoop(self)
+        timeout_timer = QTimer(self)
+        timeout_timer.setSingleShot(True)
+
+        def _on_stop_completed():
+            nonlocal stop_acknowledged
+            stop_acknowledged = True
+            if wait_loop.isRunning():
+                wait_loop.quit()
+
+        stop_completed.connect(_on_stop_completed)
+        timeout_timer.timeout.connect(wait_loop.quit)
+        try:
+            stop_invoked = QMetaObject.invokeMethod(
+                plc_service,
+                "stop_plc_service",
+                Qt.ConnectionType.QueuedConnection,
+            )
+            if stop_invoked is False:
+                self._log_disconnect_failure(row_id, "stop_plc_service 未执行")
+                return False
+
+            if not stop_acknowledged:
+                timeout_timer.start(self._STOP_ACK_TIMEOUT_MS)
+                wait_loop.exec()
+
+            if not stop_acknowledged:
+                self._log_disconnect_failure(row_id, "stop_plc_service 未在超时内确认")
+                return False
+            return True
+        except Exception as exc:
+            self._log_disconnect_failure(row_id, str(exc))
+            return False
+        finally:
+            timeout_timer.stop()
+            timeout_timer.deleteLater()
+            disconnect_signal = getattr(stop_completed, "disconnect", None)
+            if callable(disconnect_signal):
+                try:
+                    disconnect_signal(_on_stop_completed)
+                except Exception:
+                    pass
+
+    def _log_disconnect_failure(self, row_id, message: str) -> None:
+        formatted = f"plc{row_id}断开失败: {message}"
+        self.services.bus.log.emit(formatted)
+        self.logger.error(formatted)
 
     def delete_plc(self, plc_id: int) -> bool:
         if not PlcTable.select().where(PlcTable.id == plc_id).exists():

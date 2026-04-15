@@ -6,7 +6,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 from peewee import SqliteDatabase
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QEventLoop, QObject, QThread, QTimer, Qt, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import QApplication
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -52,10 +52,35 @@ class _SignalStub:
     def connect(self, callback):
         self._callbacks.append(callback)
 
+    def disconnect(self, callback):
+        if callback in self._callbacks:
+            self._callbacks.remove(callback)
+
     def emit(self, *args, **kwargs):
         self.emissions.append((args, kwargs))
         for callback in list(self._callbacks):
             callback(*args, **kwargs)
+
+
+def _wait_for_signal(signal, timeout_ms=1000):
+    loop = QEventLoop()
+    timer = QTimer()
+    timer.setSingleShot(True)
+    received = []
+
+    def _on_signal(*args):
+        received.append(args)
+        if loop.isRunning():
+            loop.quit()
+
+    signal.connect(_on_signal)
+    timer.timeout.connect(loop.quit)
+    timer.start(timeout_ms)
+    if not received:
+        loop.exec()
+    timer.stop()
+    signal.disconnect(_on_signal)
+    return received
 
 
 @pytest.fixture(scope="session")
@@ -485,7 +510,82 @@ def test_plc_settings_module_delete_plc_disconnects_before_delete_and_emits_plc_
     assert module.combo_plc.count() == 0
 
 
-def test_plc_settings_module_disconnect_row_uses_non_blocking_stop_request_and_bounded_wait(
+def test_plc_settings_module_disconnect_row_waits_for_worker_stop_ack_before_success(
+    qapp,
+    plc_db,
+):
+    row = PlcTable.create(
+        plc_name="PLC Worker Ack",
+        plc_ip="127.0.0.1",
+        plc_open_state=0,
+    )
+    bus = SimpleNamespace(log=_SignalProbe())
+    services = SimpleNamespace(
+        bus=bus,
+        _start_from_plc=lambda plc_id: None,
+    )
+    module = PlcSettingsModule(services)
+    qapp.processEvents()
+
+    class _WorkerPlcService(QObject):
+        ready = pyqtSignal()
+        stop_completed = pyqtSignal()
+
+        def __init__(self):
+            super().__init__()
+            self.stop_called = False
+            self.cleanup_complete = False
+            self.stop_thread = None
+
+        @pyqtSlot()
+        def mark_ready(self):
+            self.ready.emit()
+
+        @pyqtSlot()
+        def stop_plc_service(self):
+            self.stop_called = True
+            self.stop_thread = QThread.currentThread()
+            QTimer.singleShot(0, self._finish_stop)
+
+        @pyqtSlot()
+        def _finish_stop(self):
+            self.cleanup_complete = True
+            self.stop_completed.emit()
+
+    plc_service = _WorkerPlcService()
+    plc_thread = QThread()
+    plc_service.moveToThread(plc_thread)
+    plc_thread.started.connect(plc_service.mark_ready)
+    plc_thread.start()
+
+    try:
+        assert _wait_for_signal(plc_service.ready, timeout_ms=1000)
+
+        services.plc_services[row.id] = plc_service
+        services.plc_threads[row.id] = plc_thread
+        services.plc_state[row.id] = "已连接"
+        services.plc = plc_service
+
+        disconnected = module.disconnect_row(row.id)
+        qapp.processEvents()
+
+        assert disconnected is True
+        assert plc_service.stop_called is True
+        assert plc_service.cleanup_complete is True
+        assert plc_service.stop_thread is plc_thread
+        assert not plc_thread.isRunning()
+        assert row.id not in services.plc_services
+        assert row.id not in services.plc_threads
+        assert services.plc_state[row.id] == "未连接"
+        assert services.plc is None
+        assert bus.log.messages == []
+    finally:
+        if plc_thread.isRunning():
+            plc_thread.quit()
+            plc_thread.wait(2000)
+
+
+def test_plc_settings_module_disconnect_row_aborts_when_stop_ack_or_thread_exit_times_out(
     qapp,
     plc_db,
     monkeypatch,
@@ -516,7 +616,7 @@ def test_plc_settings_module_disconnect_row_uses_non_blocking_stop_request_and_b
             return False
 
     stop_requests = []
-    plc_service = object()
+    plc_service = SimpleNamespace(stop_completed=_SignalStub())
     plc_thread = _StuckThread()
 
     def _invoke_method(target, method_name, connection_type):
@@ -527,6 +627,8 @@ def test_plc_settings_module_disconnect_row_uses_non_blocking_stop_request_and_b
         "ui.modules.plc_settings.QMetaObject",
         SimpleNamespace(invokeMethod=_invoke_method),
     )
+    monkeypatch.setattr(module, "_STOP_ACK_TIMEOUT_MS", 10)
+    monkeypatch.setattr(module, "_THREAD_EXIT_TIMEOUT_MS", 10)
     services.plc_services[row.id] = plc_service
     services.plc_threads[row.id] = plc_thread
     services.plc_state[row.id] = "已连接"
@@ -542,11 +644,14 @@ def test_plc_settings_module_disconnect_row_uses_non_blocking_stop_request_and_b
         )
     ]
     assert plc_thread.quit_calls == 1
-    assert plc_thread.wait_calls == [2000]
+    assert plc_thread.wait_calls == [10]
     assert services.plc_services[row.id] is plc_service
     assert services.plc_threads[row.id] is plc_thread
     assert services.plc_state[row.id] == "已连接"
-    assert bus.log.messages == ["plc1断开失败: 线程未在超时内退出"]
+    assert bus.log.messages == [
+        "plc1断开失败: stop_plc_service 未在超时内确认",
+        "plc1断开失败: 线程未在超时内退出",
+    ]
 
 
 def test_plc_settings_module_delete_plc_aborts_when_disconnect_fails(
