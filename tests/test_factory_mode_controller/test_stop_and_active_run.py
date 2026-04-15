@@ -38,8 +38,8 @@ def test_factory_mode_controller_blocks_new_starts_during_active_or_reanalysis_p
     controller_mod = _load_factory_mode_controller_module()
     services = _make_services(
         (
-            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_id=11, scan_triggers_test=True),
+            _make_config(202, plc_id=22, scan_triggers_test=True),
         )
     )
     controller = controller_mod.FactoryModeController(EventBus(), services)
@@ -59,7 +59,7 @@ def test_factory_mode_controller_blocks_new_starts_during_active_or_reanalysis_p
     assert controller.start_manual() is False
     assert (
         controller.handle_plc_event(
-            services_mod.FactoryPlcIngressPayload(plc_device_key="plc-a")
+            services_mod.FactoryPlcIngressPayload(plc_id=11)
         )
         is False
     )
@@ -183,8 +183,8 @@ def test_factory_mode_controller_ignores_selection_changes_during_active_or_rean
     bus.factory_state_changed.connect(states.append)
     services = _make_services(
         (
-            _make_config(101, plc_device_key="plc-a"),
-            _make_config(202, plc_device_key="plc-b"),
+            _make_config(101, plc_id=11),
+            _make_config(202, plc_id=22),
             _make_config(303),
             _make_config(404),
         )

@@ -118,24 +118,29 @@ class PlcSettingsModule(QWidget):
         self.btn_save.clicked.connect(self.save_current)
         self.btn_toggle.clicked.connect(self.toggle_state)
         self.btn_connect.clicked.connect(self.connect_plc)
+        plc_changed = getattr(self.services.bus, "plc_changed", None)
+        if plc_changed is not None:
+            plc_changed.connect(self.reload_rows)
 
     def reload_rows(self):
         # 每次重载都从数据库重新取 PLC 列表，并刷新下拉框。
+        current_plc_id = self.combo_plc.currentData()
         try:
             rows = list(PlcTable.select().order_by(PlcTable.id))
         except Exception as exc:
             rows = []
             self.services.bus.log.emit(f"读取 PLC 配置失败: {exc}")
             QMessageBox.warning(self, "提示", f"读取 PLC 配置失败: {exc}")
-
-        for row in rows:
-            self.services.plc_state[row.id] = "未连接"
+        existing_states = dict(getattr(self.services, "plc_state", {}))
+        self.services.plc_state = {
+            row.id: existing_states.get(row.id, "未连接")
+            for row in rows
+        }
 
         self.combo_plc.blockSignals(True)
         self.combo_plc.clear()
         for row in rows:
             self.combo_plc.addItem(str(row.id), row.id)
-        self.combo_plc.blockSignals(False)
 
         has_rows = bool(rows)
         self.combo_plc.setEnabled(has_rows)
@@ -145,8 +150,11 @@ class PlcSettingsModule(QWidget):
         self._set_fields_enabled(has_rows)
 
         if has_rows:
-            # 默认先显示第一条 PLC，并把开机自动连接的项拉起来。
-            self.combo_plc.setCurrentIndex(0)
+            selected_index = self.combo_plc.findData(current_plc_id)
+            self.combo_plc.setCurrentIndex(selected_index if selected_index >= 0 else 0)
+        self.combo_plc.blockSignals(False)
+
+        if has_rows:
             self.on_combo_changed()
             for row in rows:
                 if self._is_open_state_enabled(row.plc_open_state):
@@ -240,6 +248,7 @@ class PlcSettingsModule(QWidget):
         try:
             # 保存后重新按当前下拉框选中的 id 查询一次，确保界面显示数据库最新值。
             PlcTable.update(**values).where(PlcTable.id == row.id).execute()
+            self._emit_plc_changed()
             self.on_combo_changed()
             self.services.bus.log.emit(f"PLC {row.id} 保存成功")
             QMessageBox.information(self, "成功", f"PLC {row.id} 保存成功")
@@ -269,6 +278,7 @@ class PlcSettingsModule(QWidget):
         new_state = 0 if self._is_open_state_enabled(row.plc_open_state) else 1
         try:
             PlcTable.update(plc_open_state=new_state).where(PlcTable.id == row.id).execute()
+            self._emit_plc_changed()
             self.on_combo_changed()
             self.services.bus.log.emit(
                 f"PLC {row.id}: {row.plc_name or '-'} 开机自启动 已{'开启' if new_state == 1 else '关闭'}"
@@ -335,7 +345,7 @@ class PlcSettingsModule(QWidget):
 
         plc_service = PlcService(
             bus=self.services.bus,
-            on_start_requested=self.services._start_from_plc,
+            on_start_requested=lambda plc_id=row.id: self.services._start_from_plc(plc_id),
             ip=row.plc_ip,
             rack=row.plc_rack,
             slot=row.plc_slot,
@@ -395,8 +405,11 @@ class PlcSettingsModule(QWidget):
         self.logger.info(f"plc {plc_id} 线程已停止")
         self.services.plc_threads.pop(plc_id, None)
         self.services.plc_services.pop(plc_id, None)
-        self.logger.info(f"plc {plc_id} 后台plc_services：{getattr(self.services, "plc_services", {}).get(plc_id)}, "
-                         f"后台线程{getattr(self.services, "plc_threads", {}).get(plc_id)}")
+        self.logger.info(
+            f"plc {plc_id} 后台plc_services："
+            f"{getattr(self.services, 'plc_services', {}).get(plc_id)}, "
+            f"后台线程{getattr(self.services, 'plc_threads', {}).get(plc_id)}"
+        )
 
     def disconnect_row(self, row_id):
         # 断开时先停 service，再退出对应线程，最后把状态改回未连接。
@@ -418,6 +431,34 @@ class PlcSettingsModule(QWidget):
         if plc_thread is not None:
             plc_thread.quit()
             plc_thread.wait(2000)
+        self.services.plc_state[row_id] = "未连接"
+        current_service = getattr(self.services, "plc", None)
+        if current_service is plc_service:
+            self.services.plc = None
+
+    def delete_plc(self, plc_id: int) -> bool:
+        if not PlcTable.select().where(PlcTable.id == plc_id).exists():
+            return False
+
+        if (
+            getattr(self.services, "plc_services", {}).get(plc_id) is not None
+            or getattr(self.services, "plc_threads", {}).get(plc_id) is not None
+        ):
+            self.disconnect_row(plc_id)
+
+        with PlcTable._meta.database.atomic():
+            deleted = (
+                PlcTable.delete()
+                .where(PlcTable.id == plc_id)
+                .execute()
+            )
+
+        if deleted == 0:
+            return False
+
+        self.services.plc_state.pop(plc_id, None)
+        self._emit_plc_changed()
+        return True
 
     def set_lb_text(self, row_id):
         state = self.get_plc_state(row_id)
@@ -497,3 +538,8 @@ class PlcSettingsModule(QWidget):
             self.ed_reconnect_interval,
         ):
             edit.setEnabled(enabled)
+
+    def _emit_plc_changed(self) -> None:
+        plc_changed = getattr(self.services.bus, "plc_changed", None)
+        if plc_changed is not None:
+            plc_changed.emit()

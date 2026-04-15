@@ -62,6 +62,16 @@ def test_event_bus_exposes_ai_toolchains_changed_signal():
     assert received == ["fired"]
 
 
+def test_event_bus_exposes_plc_changed_signal():
+    bus = EventBus()
+    received = []
+
+    bus.plc_changed.connect(lambda: received.append("fired"))
+    bus.plc_changed.emit()
+
+    assert received == ["fired"]
+
+
 def test_analysis_frame_signals_include_run_id_contract():
     expected_argument_types = ("int", "QString", "int", "PyQt_PyObject")
 
@@ -254,6 +264,7 @@ def test_factory_review_payload_contract_is_explicit():
     assert plc_payload_cls is not None, "FactoryPlcIngressPayload is missing"
     assert abort_payload_cls is not None, "FactoryRuntimeAbortPayload is missing"
     assert is_dataclass(review_payload_cls)
+    assert is_dataclass(plc_payload_cls)
     assert is_dataclass(abort_payload_cls)
     assert [field.name for field in fields(review_payload_cls)] == [
         "displayed_config_id",
@@ -275,10 +286,11 @@ def test_factory_review_payload_contract_is_explicit():
         "trigger_source",
         "error_message",
     ]
+    assert [field.name for field in fields(plc_payload_cls)] == ["plc_id"]
 
     review_window = review_window_cls(start_sec=1.0, end_sec=3.0)
     payload = review_payload_cls(run_id="run-101-1", default_window=review_window)
-    plc_payload = plc_payload_cls(plc_device_key="plc-a")
+    plc_payload = plc_payload_cls(plc_id=12)
     abort_payload = abort_payload_cls(
         config_id=101,
         run_id="run-101-1",
@@ -288,7 +300,7 @@ def test_factory_review_payload_contract_is_explicit():
 
     assert payload.default_window == review_window
     assert payload.run_id == "run-101-1"
-    assert plc_payload.plc_device_key == "plc-a"
+    assert plc_payload.plc_id == 12
     assert abort_payload.config_id == 101
     assert abort_payload.run_id == "run-101-1"
     assert abort_payload.trigger_source == "manual"
@@ -336,7 +348,7 @@ def test_service_container_owns_factory_mode_controller(monkeypatch):
 
 
 def test_service_container_exposes_plc_start_hook(monkeypatch):
-    logged = []
+    payloads = []
 
     monkeypatch.setattr(mod.DbConnectionService, "connect", lambda self: None)
     monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
@@ -345,15 +357,15 @@ def test_service_container_exposes_plc_start_hook(monkeypatch):
     monkeypatch.setattr(mod, "AiService", MagicMock(return_value=MagicMock()))
 
     bus = mod.EventBus()
-    bus.log.connect(logged.append)
+    bus.factory_plc_event.connect(payloads.append)
 
     services = mod.ServiceContainer(bus=bus)
 
     assert hasattr(services, "_start_from_plc")
 
-    services._start_from_plc()
+    services._start_from_plc(42)
 
-    assert logged == ["[PLC] 触发开始 -> 执行测试开始逻辑"]
+    assert payloads == [mod.FactoryPlcIngressPayload(plc_id=42)]
 
 
 def test_service_container_exposes_factory_selection_settings(monkeypatch):

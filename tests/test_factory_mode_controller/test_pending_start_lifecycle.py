@@ -224,8 +224,8 @@ def test_factory_mode_controller_accepted_starts_clear_stale_review_context(star
     bus.factory_review_changed.connect(reviews.append)
     services = _make_services(
         (
-            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_id=11, scan_triggers_test=True),
+            _make_config(202, plc_id=22, scan_triggers_test=True),
         )
     )
     controller = controller_mod.FactoryModeController(bus, services)
@@ -242,7 +242,7 @@ def test_factory_mode_controller_accepted_starts_clear_stale_review_context(star
         expected_config_id = 101
     elif start_kind == "plc":
         accepted = controller.handle_plc_event(
-            services_mod.FactoryPlcIngressPayload(plc_device_key="plc-b")
+            services_mod.FactoryPlcIngressPayload(plc_id=22)
         )
         expected_config_id = 202
     else:
@@ -277,8 +277,8 @@ def test_factory_mode_controller_accepted_starts_preserve_review_context_until_s
     bus.factory_review_changed.connect(reviews.append)
     services = _make_services(
         (
-            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_id=11, scan_triggers_test=True),
+            _make_config(202, plc_id=22, scan_triggers_test=True),
         )
     )
     controller = controller_mod.FactoryModeController(bus, services)
@@ -321,7 +321,7 @@ def test_factory_mode_controller_accepted_starts_preserve_review_context_until_s
         expected_config_id = 101
     elif start_kind == "plc":
         accepted = controller.handle_plc_event(
-            services_mod.FactoryPlcIngressPayload(plc_device_key="plc-b")
+            services_mod.FactoryPlcIngressPayload(plc_id=22)
         )
         expected_config_id = 202
     else:
@@ -405,8 +405,8 @@ def test_factory_mode_controller_treats_pending_start_as_busy_until_acceptance()
     states: list[object] = []
     services = _make_services(
         (
-            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_id=11, scan_triggers_test=True),
+            _make_config(202, plc_id=22, scan_triggers_test=True),
         )
     )
     callbacks: list[object] = []
@@ -437,7 +437,7 @@ def test_factory_mode_controller_treats_pending_start_as_busy_until_acceptance()
     assert controller.start_manual({"sn": "second"}) is False
     assert (
         controller.handle_plc_event(
-            services_mod.FactoryPlcIngressPayload(plc_device_key="plc-b")
+            services_mod.FactoryPlcIngressPayload(plc_id=22)
         )
         is False
     )

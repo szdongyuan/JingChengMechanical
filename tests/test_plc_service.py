@@ -124,3 +124,36 @@ def test_plc_service_rejects_missing_numeric_fields_without_crashing():
         "配置不完整" in message and "数据块号" in message
         for message in bus.log.messages
     )
+
+
+def test_plc_service_invokes_captured_plc_start_hook_on_rising_edge(monkeypatch):
+    _qapp()
+    bus = _BusStub()
+    start_requests = []
+    reset_writes = []
+
+    service = PlcService(
+        bus=bus,
+        on_start_requested=lambda plc_id=7: start_requests.append(plc_id),
+        ip="127.0.0.1",
+        rack=0,
+        slot=1,
+        db_number=1,
+        byte_index=0,
+        bit_index=0,
+    )
+    service.plc_client = SimpleNamespace(disconnect=lambda: None)
+    service._last_value = False
+
+    monkeypatch.setattr(service, "_read_start_bit", lambda: True)
+    monkeypatch.setattr(
+        service,
+        "_write_start_bit",
+        lambda value: reset_writes.append(value) or True,
+    )
+
+    service.poll_once()
+
+    assert start_requests == [7]
+    assert reset_writes == [False]
+    assert bus.log.messages[-1] == "[PLC] 检测到开始信号"

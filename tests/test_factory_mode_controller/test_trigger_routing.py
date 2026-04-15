@@ -48,37 +48,37 @@ def test_factory_mode_controller_tracks_explicit_plc_ingress_and_display_reset()
     bus.factory_display_reset.connect(reset_reasons.append)
     controller = controller_mod.FactoryModeController(bus)
 
-    bus.factory_plc_event.emit(plc_payload_cls(plc_device_key="plc-a"))
+    bus.factory_plc_event.emit(plc_payload_cls(plc_id=11))
     controller.clear_display_state("selection_changed")
 
-    assert controller.last_plc_ingress.plc_device_key == "plc-a"
+    assert controller.last_plc_ingress.plc_id == 11
     assert reset_reasons == ["selection_changed"]
 
 
 @pytest.mark.parametrize(
-    ("configs", "plc_device_key", "expected_config_id"),
+    ("configs", "plc_id", "expected_config_id"),
     [
         (
             (
-                _make_config(101, plc_device_key="plc-a"),
-                _make_config(202, plc_device_key="plc-b"),
+                _make_config(101, plc_id=11),
+                _make_config(202, plc_id=22),
             ),
-            "plc-b",
+            22,
             202,
         ),
         (
             (
-                _make_config(101, plc_device_key="plc-a"),
-                _make_config(202, plc_device_key="plc-a"),
+                _make_config(101, plc_id=11),
+                _make_config(202, plc_id=11),
             ),
-            "plc-a",
+            11,
             101,
         ),
     ],
 )
-def test_factory_mode_controller_routes_plc_events(
+def test_factory_mode_controller_routes_plc_events_by_plc_id(
     configs,
-    plc_device_key,
+    plc_id,
     expected_config_id,
 ):
     controller_mod = _load_factory_mode_controller_module()
@@ -88,7 +88,7 @@ def test_factory_mode_controller_routes_plc_events(
     controller.set_selection((101, 202))
 
     accepted = controller.handle_plc_event(
-        services_mod.FactoryPlcIngressPayload(plc_device_key=plc_device_key)
+        services_mod.FactoryPlcIngressPayload(plc_id=plc_id)
     )
 
     assert accepted is True
@@ -160,8 +160,8 @@ def test_factory_mode_controller_routes_external_triggers_from_stopped_state(
     bus.factory_display_reset.connect(reset_reasons.append)
     services = _make_services(
         (
-            _make_config(101, plc_device_key="plc-a", scan_triggers_test=False),
-            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_id=11, scan_triggers_test=False),
+            _make_config(202, plc_id=22, scan_triggers_test=True),
         )
     )
     controller = controller_mod.FactoryModeController(bus, services)
@@ -181,7 +181,7 @@ def test_factory_mode_controller_routes_external_triggers_from_stopped_state(
 
     if trigger_kind == "plc":
         accepted = controller.handle_plc_event(
-            services_mod.FactoryPlcIngressPayload(plc_device_key="plc-b")
+            services_mod.FactoryPlcIngressPayload(plc_id=22)
         )
     else:
         accepted = controller.handle_scan_event(
@@ -208,8 +208,8 @@ def test_blocked_plc_and_scan_start_emit_factory_start_blocked_while_idle():
     bus.factory_start_blocked.connect(blocked_payloads.append)
     services = _make_services(
         (
-            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_id=11, scan_triggers_test=True),
+            _make_config(202, plc_id=22, scan_triggers_test=True),
         )
     )
     controller = controller_mod.FactoryModeController(bus, services)
@@ -217,7 +217,7 @@ def test_blocked_plc_and_scan_start_emit_factory_start_blocked_while_idle():
 
     assert (
         controller.handle_plc_event(
-            services_mod.FactoryPlcIngressPayload(plc_device_key="plc-a")
+            services_mod.FactoryPlcIngressPayload(plc_id=11)
         )
         is False
     )
@@ -242,8 +242,8 @@ def test_busy_external_triggers_do_not_emit_factory_start_blocked():
     bus.factory_start_blocked.connect(blocked_payloads.append)
     services = _make_services(
         (
-            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_id=11, scan_triggers_test=True),
+            _make_config(202, plc_id=22, scan_triggers_test=True),
         )
     )
     controller = controller_mod.FactoryModeController(bus, services)
@@ -257,7 +257,7 @@ def test_busy_external_triggers_do_not_emit_factory_start_blocked():
 
     assert (
         controller.handle_plc_event(
-            services_mod.FactoryPlcIngressPayload(plc_device_key="plc-a")
+            services_mod.FactoryPlcIngressPayload(plc_id=11)
         )
         is False
     )
@@ -275,9 +275,9 @@ def test_plc_trigger_uses_highest_priority_matching_config():
     controller_mod = _load_factory_mode_controller_module()
     services = _make_services(
         (
-            _make_config(101, plc_device_key="plc-a"),
-            _make_config(202, plc_device_key="plc-a"),
-            _make_config(303, plc_device_key="plc-b"),
+            _make_config(101, plc_id=11),
+            _make_config(202, plc_id=11),
+            _make_config(303, plc_id=22),
         )
     )
     _accept_start(services)
@@ -286,7 +286,7 @@ def test_plc_trigger_uses_highest_priority_matching_config():
 
     assert (
         controller.handle_plc_event(
-            services_mod.FactoryPlcIngressPayload(plc_device_key="plc-a")
+            services_mod.FactoryPlcIngressPayload(plc_id=11)
         )
         is True
     )
@@ -326,7 +326,7 @@ def test_scan_trigger_uses_first_enabled_scan_triggers_test_config():
 
 
 @pytest.mark.parametrize("phase", ["running", "analyzing"])
-def test_factory_mode_controller_applies_deferred_same_id_plc_refresh_after_active_phase(
+def test_factory_mode_controller_refreshes_selected_config_cache_after_plc_changed(
     phase,
 ):
     controller_mod = _load_factory_mode_controller_module()
@@ -346,8 +346,8 @@ def test_factory_mode_controller_applies_deferred_same_id_plc_refresh_after_acti
     if phase == "analyzing":
         controller.handle_runtime_analyzing(_make_runtime_config_payload(config_id=101))
 
-    config_map[202]["plc_device_key"] = "plc-b"
-    bus.config_changed.emit()
+    config_map[202]["plc_id"] = 22
+    bus.plc_changed.emit()
 
     _finish_active_run_to_reviewing(
         controller,
@@ -357,7 +357,7 @@ def test_factory_mode_controller_applies_deferred_same_id_plc_refresh_after_acti
     )
 
     accepted = controller.handle_plc_event(
-        services_mod.FactoryPlcIngressPayload(plc_device_key="plc-b")
+        services_mod.FactoryPlcIngressPayload(plc_id=22)
     )
 
     assert accepted is True
@@ -424,14 +424,14 @@ def test_factory_mode_controller_ignores_plc_and_scan_before_armed():
     controller_mod = _load_factory_mode_controller_module()
     services = _make_services(
         (
-            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_id=11, scan_triggers_test=True),
+            _make_config(202, plc_id=22, scan_triggers_test=True),
         )
     )
     controller = controller_mod.FactoryModeController(EventBus(), services)
 
     plc_accepted = controller.handle_plc_event(
-        services_mod.FactoryPlcIngressPayload(plc_device_key="plc-a")
+        services_mod.FactoryPlcIngressPayload(plc_id=11)
     )
     scan_accepted = controller.handle_scan_event(
         services_mod.FactoryScanIngressPayload(scan_text="SN-1")
@@ -450,14 +450,14 @@ def test_factory_mode_controller_logs_ignored_plc_and_scan_before_armed():
     bus.log.connect(log_messages.append)
     services = _make_services(
         (
-            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_id=11, scan_triggers_test=True),
+            _make_config(202, plc_id=22, scan_triggers_test=True),
         )
     )
     controller = controller_mod.FactoryModeController(bus, services)
 
     plc_accepted = controller.handle_plc_event(
-        services_mod.FactoryPlcIngressPayload(plc_device_key="plc-a")
+        services_mod.FactoryPlcIngressPayload(plc_id=11)
     )
     scan_accepted = controller.handle_scan_event(
         services_mod.FactoryScanIngressPayload(scan_text="SN-1")
@@ -480,8 +480,8 @@ def test_factory_mode_controller_logs_and_drops_plc_and_scan_during_active_phase
     bus.log.connect(log_messages.append)
     services = _make_services(
         (
-            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_id=11, scan_triggers_test=True),
+            _make_config(202, plc_id=22, scan_triggers_test=True),
         )
     )
     _accept_start(services)
@@ -508,7 +508,7 @@ def test_factory_mode_controller_logs_and_drops_plc_and_scan_during_active_phase
     log_messages.clear()
 
     plc_accepted = controller.handle_plc_event(
-        services_mod.FactoryPlcIngressPayload(plc_device_key="plc-b")
+        services_mod.FactoryPlcIngressPayload(plc_id=22)
     )
     scan_accepted = controller.handle_scan_event(
         services_mod.FactoryScanIngressPayload(scan_text="SN-2")
@@ -546,27 +546,27 @@ def test_factory_mode_controller_logs_and_drops_plc_and_scan_during_active_phase
 
 
 @pytest.mark.parametrize(
-    ("configs", "plc_device_key"),
+    ("configs", "plc_id"),
     [
         (
             (
-                _make_config(101, plc_device_key="plc-a"),
-                _make_config(202, plc_device_key="plc-b"),
+                _make_config(101, plc_id=11),
+                _make_config(202, plc_id=22),
             ),
-            "plc-missing",
+            999,
         ),
         (
             (
                 _make_config(101),
-                _make_config(202, plc_device_key=""),
+                _make_config(202),
             ),
-            "plc-a",
+            11,
         ),
     ],
 )
 def test_factory_mode_controller_logs_ignored_plc_no_match_for_current_pair(
     configs,
-    plc_device_key,
+    plc_id,
 ):
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()
@@ -580,7 +580,7 @@ def test_factory_mode_controller_logs_ignored_plc_no_match_for_current_pair(
     controller.set_selection((101, 202))
 
     accepted = controller.handle_plc_event(
-        services_mod.FactoryPlcIngressPayload(plc_device_key=plc_device_key)
+        services_mod.FactoryPlcIngressPayload(plc_id=plc_id)
     )
 
     assert controller.state.run_phase == "armed"
