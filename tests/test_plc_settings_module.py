@@ -846,6 +846,96 @@ def test_plc_settings_module_failed_initial_connect_keeps_failure_label_after_th
     assert module.btn_connect.isEnabled() is True
 
 
+def test_plc_settings_module_retry_during_failed_thread_cleanup_keeps_failure_label(
+    qapp,
+    plc_db,
+    monkeypatch,
+):
+    row = PlcTable.create(
+        plc_name="PLC Retry While Cleaning Up",
+        plc_ip="127.0.0.1",
+        plc_rack=0,
+        plc_slot=1,
+        plc_db_number=1,
+        plc_byte_index=2,
+        plc_bit_index=3,
+        plc_poll_interval_ms=250,
+        plc_reconnect_interval_ms=4000,
+        plc_open_state=0,
+    )
+    services = SimpleNamespace(
+        bus=SimpleNamespace(log=_SignalProbe()),
+        _start_from_plc=lambda plc_id: None,
+    )
+    created = {}
+
+    class _FakeThread:
+        def __init__(self, *_args, **_kwargs):
+            self.started = _SignalStub()
+            self.finished = _SignalStub()
+            self.quit_calls = 0
+            self.wait_calls = []
+            created["thread"] = self
+
+        def start(self):
+            self.started.emit()
+
+        def quit(self):
+            self.quit_calls += 1
+
+        def wait(self, timeout_ms):
+            self.wait_calls.append(timeout_ms)
+            return True
+
+    class _FakePlcService:
+        def __init__(self, **_kwargs):
+            self.connect_result = _SignalStub()
+            self.state_changed = _SignalStub()
+            created["service"] = self
+
+        @staticmethod
+        def validate_connection_config(**_kwargs):
+            return {}, None
+
+        def moveToThread(self, _thread):
+            return None
+
+        def start_plc_service(self):
+            return None
+
+        def deleteLater(self):
+            return None
+
+    monkeypatch.setattr("ui.modules.plc_settings.QThread", _FakeThread)
+    monkeypatch.setattr("ui.modules.plc_settings.PlcService", _FakePlcService)
+
+    module = PlcSettingsModule(services)
+    qapp.processEvents()
+
+    module.start_connect(row)
+    qapp.processEvents()
+
+    created["service"].connect_result.emit(False, "boom")
+    qapp.processEvents()
+    assert module.lb_connect_state.text() == "连接失败: boom"
+    assert services.plc_threads[row.id] is created["thread"]
+
+    module.start_connect(row)
+    qapp.processEvents()
+
+    created["thread"].finished.emit()
+    qapp.processEvents()
+
+    assert created["thread"].quit_calls == 1
+    assert created["thread"].wait_calls == [2000]
+    assert row.id not in services.plc_services
+    assert row.id not in services.plc_threads
+    assert services.plc_state[row.id] == "未连接"
+    assert module.lb_connect_state.text() == "连接失败: boom"
+    assert module.btn_connect.text() == "连接"
+    assert module.btn_connect.isEnabled() is True
+
+
 def test_plc_settings_module_delete_plc_aborts_when_disconnect_fails(
     qapp,
     plc_db,

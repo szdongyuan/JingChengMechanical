@@ -323,7 +323,6 @@ class PlcSettingsModule(QWidget):
         self.start_connect(row)
 
     def start_connect(self, row):
-        self._clear_connect_failure_label(row.id)
         if self.get_plc_state(row.id) != "未连接":
             return
         old_service = self.services.plc_services.get(row.id)
@@ -353,6 +352,7 @@ class PlcSettingsModule(QWidget):
                 QMessageBox.warning(self, "提示", failure_message)
             return
 
+        self._clear_connect_failure_label(row.id)
         plc_service = PlcService(
             bus=self.services.bus,
             on_start_requested=lambda plc_id=row.id: self.services._start_from_plc(plc_id),
