@@ -167,3 +167,70 @@ def test_plc_settings_module_warns_and_blocks_connect_when_numeric_fields_missin
     assert module.lb_connect_state.text().startswith("连接失败:")
     assert services.plc_services == {}
     assert services.plc_threads == {}
+
+
+@pytest.mark.parametrize(
+    ("plc_state", "expected_label"),
+    [
+        ("已连接", "连接成功"),
+        ("重连中", "重连中..."),
+    ],
+)
+def test_plc_settings_module_blocks_save_for_active_rows(
+    qapp,
+    plc_db,
+    monkeypatch,
+    plc_state,
+    expected_label,
+):
+    row = PlcTable.create(
+        plc_name="PLC Active",
+        plc_ip="127.0.0.1",
+        plc_rack=0,
+        plc_slot=1,
+        plc_db_number=1,
+        plc_byte_index=2,
+        plc_bit_index=3,
+        plc_poll_interval_ms=250,
+        plc_reconnect_interval_ms=4000,
+        plc_open_state=0,
+    )
+    services = SimpleNamespace(
+        bus=SimpleNamespace(log=_SignalProbe()),
+        _start_from_plc=lambda: None,
+    )
+    warnings = []
+    infos = []
+
+    monkeypatch.setattr(
+        "ui.modules.plc_settings.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+    monkeypatch.setattr(
+        "ui.modules.plc_settings.QMessageBox.information",
+        lambda *args: infos.append(args),
+    )
+
+    module = PlcSettingsModule(services)
+    qapp.processEvents()
+
+    services.plc_services[row.id] = object()
+    services.plc_threads[row.id] = object()
+    module.on_plc_state_changed(row.id, plc_state)
+    module.ed_ip.setText("10.0.0.9")
+
+    module.save_current()
+    qapp.processEvents()
+
+    saved_row = PlcTable.get_by_id(row.id)
+    assert saved_row.plc_ip == "127.0.0.1"
+    assert module.lb_connect_state.text() == expected_label
+    assert warnings
+    assert warnings[-1][-2:] == ("提示", "PLC 正在连接或已连接，请先断开后再保存配置")
+    assert infos == []
+    assert services.plc_state[row.id] == plc_state
+    assert services.plc_services[row.id] is not None
+    assert services.plc_threads[row.id] is not None
+    assert any(
+        "请先断开后再保存配置" in message for message in services.bus.log.messages
+    )

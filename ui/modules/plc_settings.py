@@ -19,6 +19,8 @@ from model.plc_table import PlcTable
 
 
 class PlcSettingsModule(QWidget):
+    _SAVE_BLOCKED_STATES = {"连接中", "重连中", "已连接"}
+
     def __init__(self, services):
         super().__init__()
         self.logger = LogManager.set_log_handler("core")
@@ -214,6 +216,8 @@ class PlcSettingsModule(QWidget):
         if row is None:
             self.services.bus.log.emit("plc_table表无此数据")
             return
+        if self._should_block_save(row.id):
+            return
         try:
             # 从界面收集数据，并把需要为整数的字段先转换掉。
             values = {
@@ -242,6 +246,18 @@ class PlcSettingsModule(QWidget):
         except Exception as exc:
             self.services.bus.log.emit(f"保存 PLC 配置失败: {exc}")
             QMessageBox.warning(self, "提示", f"保存 PLC 配置失败: {exc}")
+
+    def _should_block_save(self, row_id):
+        state = self.get_plc_state(row_id)
+        if state not in self._SAVE_BLOCKED_STATES:
+            return False
+
+        self.set_connect_label(self.set_lb_text(row_id))
+        self.apply_connect_button_state(row_id)
+        message = "PLC 正在连接或已连接，请先断开后再保存配置"
+        self.services.bus.log.emit(message)
+        QMessageBox.warning(self, "提示", message)
+        return True
 
     def toggle_state(self):
         row = self.get_current_row()
