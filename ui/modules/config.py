@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from model.plc_table import PlcTable
 from ui.popups.golden_sample_import_dialog import GoldenSampleImportDialog
 from ui.widgets.cards import Card
 from ui.widgets.collapsible_group_box import CollapsibleGroupBox
@@ -46,6 +47,7 @@ _GOLDEN_BINDING_FIELDS = (
     "golden_sample_duration_ms",
     "golden_sample_sample_rate",
 )
+_PRESERVE_PLC_SELECTION = object()
 
 
 class _NoWheelSpinBox(QDoubleSpinBox):
@@ -238,13 +240,8 @@ class ConfigModule(QWidget):
         hw_lay.setHorizontalSpacing(10)
         hw_lay.setVerticalSpacing(8)
 
-        self.ed_plc_device_key = QLineEdit()
-        self.ed_plc_device_key.setPlaceholderText("例如: plc-a")
-        hw_lay.addRow("PLC 设备标识", self.ed_plc_device_key)
-
-        self.ed_plc_device_label = QLineEdit()
-        self.ed_plc_device_label.setPlaceholderText("例如: PLC A")
-        hw_lay.addRow("PLC 显示名称", self.ed_plc_device_label)
+        self.combo_plc = _NoWheelComboBox()
+        hw_lay.addRow("PLC", self.combo_plc)
 
         self.combo_input_dev = _NoWheelComboBox()
         hw_lay.addRow("输入设备", self.combo_input_dev)
@@ -384,6 +381,9 @@ class ConfigModule(QWidget):
         )
         if ai_toolchains_changed is not None:
             ai_toolchains_changed.connect(self._on_ai_toolchains_changed)
+        plc_changed = getattr(self.services.bus, "plc_changed", None)
+        if plc_changed is not None:
+            plc_changed.connect(self._on_plc_changed)
 
     def _populate_devices(self):
         """Populate input/output device combos from hss_service."""
@@ -416,6 +416,37 @@ class ConfigModule(QWidget):
                 self.combo_input_dev.addItem(label, dev_info)
             if dev.get("max_output_channels", 0) > 0:
                 self.combo_output_dev.addItem(label, dev_info)
+
+    @staticmethod
+    def _format_plc_option_label(plc_row: PlcTable) -> str:
+        plc_name = (plc_row.plc_name or "").strip()
+        if plc_name:
+            return f"ID {plc_row.id} - {plc_name}"
+        return f"ID {plc_row.id}"
+
+    def _refresh_plc_selector(
+        self,
+        selected_plc_id: int | None | object = _PRESERVE_PLC_SELECTION,
+    ) -> None:
+        if (
+            selected_plc_id is _PRESERVE_PLC_SELECTION
+            and self.combo_plc.count() > 0
+        ):
+            selected_plc_id = self.combo_plc.currentData()
+        self.combo_plc.blockSignals(True)
+        self.combo_plc.clear()
+        self.combo_plc.addItem("（未绑定）", None)
+        for plc_row in PlcTable.select().order_by(PlcTable.id):
+            self.combo_plc.addItem(
+                self._format_plc_option_label(plc_row),
+                plc_row.id,
+            )
+        index = self.combo_plc.findData(selected_plc_id)
+        self.combo_plc.setCurrentIndex(index if index >= 0 else 0)
+        self.combo_plc.blockSignals(False)
+
+    def _on_plc_changed(self) -> None:
+        self._refresh_plc_selector()
 
     def _on_input_device_changed(self, index):
         """Rebuild channel checkboxes and tabs when input device changes."""
@@ -1355,8 +1386,7 @@ class ConfigModule(QWidget):
         self.combo_input_dev.blockSignals(True)
 
         self._populate_devices()
-        self.ed_plc_device_key.setText(data.get("plc_device_key") or "")
-        self.ed_plc_device_label.setText(data.get("plc_device_label") or "")
+        self._refresh_plc_selector(data.get("plc_id"))
 
         saved_input = data.get("input_device_name")
         saved_input_api = data.get("input_device_hostapi")
@@ -1511,8 +1541,7 @@ class ConfigModule(QWidget):
                 self.chk_allow_incomplete_recording_analysis.isChecked()
             ),
             "scan_triggers_test": self.chk_scan.isChecked(),
-            "plc_device_key": self.ed_plc_device_key.text(),
-            "plc_device_label": self.ed_plc_device_label.text(),
+            "plc_id": self.combo_plc.currentData(),
             "input_device_name": input_dev.get("name") if isinstance(input_dev, dict) else None,
             "input_device_hostapi": input_dev.get("hostapi") if isinstance(input_dev, dict) else None,
             "input_device_samplerate": input_dev.get("default_samplerate") if isinstance(input_dev, dict) else None,

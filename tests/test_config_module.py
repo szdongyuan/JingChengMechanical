@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
 from app.service.config_service import ConfigService
 from app.service.golden_sample_service import GoldenSampleService
 from model.channel_config_table import ChannelConfigTable
+from model.plc_table import PlcTable
 from model.test_config_table import TestConfigTable as ConfigTable
 from ui.modules.config import ConfigModule
 from ui.widgets.collapsible_group_box import CollapsibleGroupBox
@@ -344,6 +345,7 @@ def _detail_payload(
     *,
     config_id: int = 7,
     config_name: str = "Cfg1",
+    plc_id: int | None = None,
 ) -> dict:
     return {
         "config_id": config_id,
@@ -353,8 +355,7 @@ def _detail_payload(
         "analysis_window_offset_ms": 250,
         "allow_incomplete_recording_analysis": False,
         "scan_triggers_test": False,
-        "plc_device_key": "plc-a",
-        "plc_device_label": "PLC A",
+        "plc_id": plc_id,
         "input_device_name": "Mic 1",
         "input_device_hostapi": "ASIO",
         "input_device_samplerate": 48000,
@@ -421,7 +422,10 @@ def test_collapsible_group_box_exposes_public_section_state_api(qapp):
     assert box.is_expanded() is False
 
 
-def test_populate_detail_uses_main_config_analysis_offset_and_plc_fields(qapp):
+def test_config_module_renders_plc_selector_from_plc_table(qapp):
+    plc_alpha = PlcTable.create(plc_name="Alpha")
+    plc_blank = PlcTable.create(plc_name="")
+    plc_beta = PlcTable.create(plc_name="Beta")
     module = _make_module(
         binding={
             "enabled": True,
@@ -431,36 +435,57 @@ def test_populate_detail_uses_main_config_analysis_offset_and_plc_fields(qapp):
             "params_json": '{"legacy": true}',
         }
     )
+    module._populate_detail(_detail_payload([]))
 
     assert hasattr(module, "spin_analysis_window_offset")
-    assert hasattr(module, "ed_plc_device_key")
-    assert hasattr(module, "ed_plc_device_label")
+    assert hasattr(module, "combo_plc")
+    assert not hasattr(module, "ed_plc_device_key")
+    assert not hasattr(module, "ed_plc_device_label")
     assert not hasattr(module, "combo_trigger")
+    assert module.combo_plc.count() == 4
+    assert module.combo_plc.itemData(0) is None
+    assert [module.combo_plc.itemData(i) for i in range(1, 4)] == [
+        plc_alpha.id,
+        plc_blank.id,
+        plc_beta.id,
+    ]
+    assert module.combo_plc.itemText(1) == f"ID {plc_alpha.id} - Alpha"
+    assert module.combo_plc.itemText(2) == f"ID {plc_blank.id}"
+    assert module.combo_plc.itemText(3) == f"ID {plc_beta.id} - Beta"
 
-    module._populate_detail(
-        {
-            "config_id": 7,
-            "config_name": "Cfg1",
-            "record_duration": 5.0,
-            "analysis_duration": 3.0,
-            "analysis_window_offset_ms": 250,
-            "scan_triggers_test": False,
-            "plc_device_key": "plc-a",
-            "plc_device_label": "PLC A",
-            "input_device_name": "Mic 1",
-            "input_device_hostapi": "ASIO",
-            "input_device_samplerate": 48000,
-            "output_device_name": "Speaker 1",
-            "output_device_hostapi": "WASAPI",
-            "output_device_samplerate": 44100,
-            "selected_channels": [0],
-            "channels": [],
-        }
-    )
+
+def test_config_module_loads_valid_saved_plc_id_into_selector(qapp):
+    plc = PlcTable.create(plc_name="PLC A")
+    module = _make_module()
+
+    module._populate_detail(_detail_payload([], plc_id=plc.id))
 
     assert module.spin_analysis_window_offset.value() == 250
-    assert module.ed_plc_device_key.text() == "plc-a"
-    assert module.ed_plc_device_label.text() == "PLC A"
+    assert module.combo_plc.currentData() == plc.id
+
+
+def test_config_module_loads_stale_saved_plc_id_into_unbound_selector(qapp):
+    module = _make_module()
+
+    module._populate_detail(_detail_payload([], plc_id=9999))
+
+    assert module.combo_plc.currentData() is None
+
+
+def test_config_module_loads_explicit_unbound_config_after_bound_config_in_same_session(
+    qapp,
+):
+    plc = PlcTable.create(plc_name="PLC A")
+    module = _make_module()
+
+    module._populate_detail(_detail_payload([], plc_id=plc.id))
+    assert module.combo_plc.currentData() == plc.id
+
+    module._populate_detail(
+        _detail_payload([], config_id=8, config_name="Cfg2", plc_id=None)
+    )
+
+    assert module.combo_plc.currentData() is None
 
 
 def test_checkbox_uses_approved_visible_label_for_allow_incomplete_recording_analysis(
@@ -489,12 +514,15 @@ def test_checkbox_defaults_to_unchecked_for_newly_loaded_config(qapp):
     assert module.chk_allow_incomplete_recording_analysis.isChecked() is False
 
 
-def test_collect_data_returns_main_config_analysis_offset_and_plc_fields(qapp):
+def test_collect_data_returns_main_config_analysis_offset_and_plc_id(qapp):
+    plc = PlcTable.create(plc_name="PLC A")
     module = _make_module()
+    module._populate_detail(_detail_payload([]))
 
     assert hasattr(module, "spin_analysis_window_offset")
-    assert hasattr(module, "ed_plc_device_key")
-    assert hasattr(module, "ed_plc_device_label")
+    assert hasattr(module, "combo_plc")
+    assert not hasattr(module, "ed_plc_device_key")
+    assert not hasattr(module, "ed_plc_device_label")
     assert not hasattr(module, "combo_trigger")
 
     module._current_config_id = 7
@@ -502,14 +530,12 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_fields(qapp):
     module.spin_record.setValue(5.0)
     module.spin_analysis.setValue(3.0)
     module.spin_analysis_window_offset.setValue(500)
-    module.ed_plc_device_key.setText("plc-a")
-    module.ed_plc_device_label.setText("PLC A")
+    module.combo_plc.setCurrentIndex(module.combo_plc.findData(plc.id))
 
     data = module._collect_data()
 
     assert data["analysis_window_offset_ms"] == 500
-    assert data["plc_device_key"] == "plc-a"
-    assert data["plc_device_label"] == "PLC A"
+    assert data["plc_id"] == plc.id
     assert data["allow_incomplete_recording_analysis"] is False
     assert data["golden_editor_state"] == {}
     assert set(data) == {
@@ -520,8 +546,7 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_fields(qapp):
         "analysis_window_offset_ms",
         "allow_incomplete_recording_analysis",
         "scan_triggers_test",
-        "plc_device_key",
-        "plc_device_label",
+        "plc_id",
         "input_device_name",
         "input_device_hostapi",
         "input_device_samplerate",
@@ -532,6 +557,41 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_fields(qapp):
         "channels",
         "golden_editor_state",
     }
+
+
+def test_config_module_refreshes_open_selector_after_plc_changed_signal(qapp):
+    plc_alpha = PlcTable.create(plc_name="Alpha")
+    plc_beta = PlcTable.create(plc_name="Beta")
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        ai_toolchains_changed=_SignalStub(),
+        plc_changed=_SignalStub(),
+    )
+    module = _make_module(bus=bus)
+    module._current_config_id = 7
+    module._populate_detail(_detail_payload([], plc_id=plc_beta.id))
+
+    plc_gamma = PlcTable.create(plc_name="Gamma")
+    bus.plc_changed.emit()
+
+    assert [module.combo_plc.itemData(i) for i in range(module.combo_plc.count())] == [
+        None,
+        plc_alpha.id,
+        plc_beta.id,
+        plc_gamma.id,
+    ]
+    assert module.combo_plc.currentData() == plc_beta.id
+
+    plc_beta.delete_instance()
+    bus.plc_changed.emit()
+
+    assert [module.combo_plc.itemData(i) for i in range(module.combo_plc.count())] == [
+        None,
+        plc_alpha.id,
+        plc_gamma.id,
+    ]
+    assert module.combo_plc.currentData() is None
 
 
 def test_collect_data_includes_allow_incomplete_recording_analysis(qapp):

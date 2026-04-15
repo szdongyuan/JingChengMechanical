@@ -12,6 +12,7 @@ from scipy.io import wavfile
 from app.service.config_service import ConfigService
 from app.service.golden_sample_service import GoldenSampleService
 from model.channel_config_table import ChannelConfigTable
+from model.plc_table import PlcTable
 from model.test_config_ai_binding_table import (
     TestConfigAiBindingTable as AiBindingTable,
 )
@@ -95,6 +96,7 @@ def _config_payload(
         "config_name": config_name,
         "record_duration": record_duration,
         "analysis_duration": analysis_duration,
+        "plc_id": None,
         "scan_triggers_test": False,
         "input_device_name": "Mic 1",
         "input_device_hostapi": "ASIO",
@@ -208,8 +210,7 @@ def test_load_config_returns_hardware_fields_with_cleaned_trigger_model():
         "analysis_window_offset_ms",
         "allow_incomplete_recording_analysis",
         "scan_triggers_test",
-        "plc_device_key",
-        "plc_device_label",
+        "plc_id",
         "input_device_name",
         "input_device_hostapi",
         "input_device_samplerate",
@@ -225,14 +226,17 @@ def test_load_config_returns_hardware_fields_with_cleaned_trigger_model():
     assert result["output_device_name"] == "Speaker 1"
     assert result["output_device_hostapi"] == "WASAPI"
     assert result["output_device_samplerate"] == 44100
+    assert result["plc_id"] is None
     assert result["allow_incomplete_recording_analysis"] is False
     assert result["selected_channels"] == [0, 2]
 
 
-def test_load_config_returns_plc_binding_and_analysis_offset_fields():
+def test_load_config_returns_plc_id_and_not_legacy_plc_text_fields():
     svc = _service()
+    plc = PlcTable.create(plc_name="PLC A")
     cfg = ConfigTable.create(
         config_name="Cfg1",
+        plc=plc,
         plc_device_key="  plc-a  ",
         plc_device_label="  PLC A  ",
         analysis_window_offset_ms=250,
@@ -248,8 +252,7 @@ def test_load_config_returns_plc_binding_and_analysis_offset_fields():
         "analysis_window_offset_ms",
         "allow_incomplete_recording_analysis",
         "scan_triggers_test",
-        "plc_device_key",
-        "plc_device_label",
+        "plc_id",
         "input_device_name",
         "input_device_hostapi",
         "input_device_samplerate",
@@ -259,8 +262,9 @@ def test_load_config_returns_plc_binding_and_analysis_offset_fields():
         "selected_channels",
         "channels",
     }
-    assert result["plc_device_key"] == "plc-a"
-    assert result["plc_device_label"] == "PLC A"
+    assert result["plc_id"] == plc.id
+    assert "plc_device_key" not in result
+    assert "plc_device_label" not in result
     assert result["analysis_window_offset_ms"] == 250
     assert result["allow_incomplete_recording_analysis"] is False
 
@@ -298,8 +302,7 @@ def test_save_config_persists_hardware_fields():
         "analysis_window_offset_ms",
         "allow_incomplete_recording_analysis",
         "scan_triggers_test",
-        "plc_device_key",
-        "plc_device_label",
+        "plc_id",
         "input_device_name",
         "input_device_hostapi",
         "input_device_samplerate",
@@ -315,55 +318,15 @@ def test_save_config_persists_hardware_fields():
     assert loaded["output_device_name"] == "Speaker 1"
     assert loaded["output_device_hostapi"] == "WASAPI"
     assert loaded["output_device_samplerate"] == 44100
+    assert loaded["plc_id"] is None
     assert loaded["allow_incomplete_recording_analysis"] is False
     assert loaded["selected_channels"] == [0, 2]
-    assert row.plc_device_key is None
-    assert row.plc_device_label is None
+    assert row.plc_id is None
 
 
-def test_save_config_blank_plc_metadata_persists_none():
+def test_save_config_persists_plc_id_and_rejects_missing_plc_rows():
     svc = _service()
-    config_id = ConfigTable.create(config_name="Cfg1").config_id
-
-    svc.save_config(
-        {
-            "config_id": config_id,
-            "config_name": "Cfg1",
-            "record_duration": 5.0,
-            "analysis_duration": 3.0,
-            "scan_triggers_test": False,
-            "plc_device_key": "   ",
-            "plc_device_label": "   ",
-            "selected_channels": [],
-            "channels": [],
-        }
-    )
-
-    loaded = svc.load_config(config_id)
-    row = ConfigTable.get_by_id(config_id)
-
-    assert loaded["plc_device_key"] is None
-    assert loaded["plc_device_label"] is None
-    assert row.plc_device_key is None
-    assert row.plc_device_label is None
-
-
-def test_load_config_normalizes_direct_row_plc_metadata():
-    svc = _service()
-    cfg = ConfigTable.create(
-        config_name="Cfg1",
-        plc_device_key="  PLC-A  ",
-        plc_device_label="   ",
-    )
-
-    loaded = svc.load_config(cfg.config_id)
-
-    assert loaded["plc_device_key"] == "PLC-A"
-    assert loaded["plc_device_label"] is None
-
-
-def test_save_config_persists_analysis_window_offset_ms_and_plc_fields():
-    svc = _service()
+    plc = PlcTable.create(plc_name="PLC A")
     config_id = ConfigTable.create(config_name="Cfg1").config_id
 
     svc.save_config(
@@ -374,8 +337,7 @@ def test_save_config_persists_analysis_window_offset_ms_and_plc_fields():
             "analysis_duration": 3.0,
             "analysis_window_offset_ms": 500,
             "scan_triggers_test": False,
-            "plc_device_key": "  plc-a  ",
-            "plc_device_label": "  PLC A  ",
+            "plc_id": plc.id,
             "input_device_name": "Mic 1",
             "input_device_hostapi": "ASIO",
             "input_device_samplerate": 48000,
@@ -391,38 +353,90 @@ def test_save_config_persists_analysis_window_offset_ms_and_plc_fields():
     saved_row = ConfigTable.get_by_id(config_id)
 
     assert loaded["analysis_window_offset_ms"] == 500
-    assert loaded["plc_device_key"] == "plc-a"
-    assert loaded["plc_device_label"] == "PLC A"
-    assert saved_row.plc_device_key == "plc-a"
-    assert saved_row.plc_device_label == "PLC A"
+    assert loaded["plc_id"] == plc.id
+    assert saved_row.plc_id == plc.id
+
+    with pytest.raises(ValueError, match="PLC"):
+        svc.save_config(
+            {
+                "config_id": config_id,
+                "config_name": "Cfg1",
+                "record_duration": 5.0,
+                "analysis_duration": 3.0,
+                "scan_triggers_test": False,
+                "plc_id": plc.id + 999,
+                "selected_channels": [0],
+                "channels": [_channel_payload(0)],
+            }
+        )
 
 
-def test_save_config_blank_plc_metadata_persists_none():
+def test_save_config_reports_late_db_level_plc_fk_failure_as_plc_error(monkeypatch):
     svc = _service()
+    plc = PlcTable.create(plc_name="PLC A")
     config_id = ConfigTable.create(config_name="Cfg1").config_id
+    payload = {
+        "config_id": config_id,
+        "config_name": "Cfg1",
+        "record_duration": 5.0,
+        "analysis_duration": 3.0,
+        "scan_triggers_test": False,
+        "plc_id": plc.id,
+        "selected_channels": [0],
+        "channels": [_channel_payload(0)],
+    }
 
-    svc.save_config(
-        {
-            "config_id": config_id,
-            "config_name": "Cfg1",
-            "record_duration": 5.0,
-            "analysis_duration": 3.0,
-            "analysis_window_offset_ms": 500,
-            "scan_triggers_test": False,
-            "plc_device_key": "   ",
-            "plc_device_label": "\t",
-            "selected_channels": [0],
-            "channels": [_channel_payload(0)],
-        }
-    )
+    assert svc.validate(payload) == []
 
-    loaded = svc.load_config(config_id)
+    original_collect_replaced_paths = svc._collect_replaced_paths
+
+    def _delete_plc_before_write(config_id_arg, channels):
+        PlcTable.delete().where(PlcTable.id == plc.id).execute()
+        return original_collect_replaced_paths(config_id_arg, channels)
+
+    monkeypatch.setattr(svc, "_collect_replaced_paths", _delete_plc_before_write)
+
+    with pytest.raises(ValueError, match="PLC 不存在或已被删除"):
+        svc.save_config(payload)
+
     saved_row = ConfigTable.get_by_id(config_id)
 
-    assert loaded["plc_device_key"] is None
-    assert loaded["plc_device_label"] is None
-    assert saved_row.plc_device_key is None
-    assert saved_row.plc_device_label is None
+    assert saved_row.plc_id is None
+    FakeBus.config_changed.emit.assert_not_called()
+
+
+def test_save_config_does_not_misreport_non_plc_fk_failure_as_plc_error(monkeypatch):
+    svc = _service()
+    plc = PlcTable.create(plc_name="PLC A")
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    payload = {
+        "config_id": config_id,
+        "config_name": "Cfg1",
+        "record_duration": 5.0,
+        "analysis_duration": 3.0,
+        "scan_triggers_test": False,
+        "plc_id": plc.id,
+        "selected_channels": [0],
+        "channels": [_channel_payload(0)],
+    }
+
+    assert svc.validate(payload) == []
+
+    original_collect_replaced_paths = svc._collect_replaced_paths
+
+    def _delete_config_before_write(config_id_arg, channels):
+        ConfigTable.delete().where(ConfigTable.config_id == config_id).execute()
+        return original_collect_replaced_paths(config_id_arg, channels)
+
+    monkeypatch.setattr(svc, "_collect_replaced_paths", _delete_config_before_write)
+
+    with pytest.raises(ValueError) as exc_info:
+        svc.save_config(payload)
+
+    assert str(exc_info.value) == "配置不存在或已被删除"
+    assert PlcTable.select().where(PlcTable.id == plc.id).exists()
+    assert not ConfigTable.select().where(ConfigTable.config_id == config_id).exists()
+    FakeBus.config_changed.emit.assert_not_called()
 
 
 def test_save_config_keeps_existing_ai_binding_row_while_offset_stays_config_owned():
@@ -443,8 +457,6 @@ def test_save_config_keeps_existing_ai_binding_row_while_offset_stays_config_own
             "analysis_duration": 3.0,
             "analysis_window_offset_ms": 500,
             "scan_triggers_test": False,
-            "plc_device_key": "plc-a",
-            "plc_device_label": "PLC A",
             "input_device_name": "Mic 1",
             "input_device_hostapi": "ASIO",
             "input_device_samplerate": 48000,
@@ -745,19 +757,50 @@ def test_validate_factory_runtime_allows_exact_fit_analysis_window_boundary():
     assert errors == []
 
 
-def test_validate_factory_runtime_does_not_require_plc_device_key_when_unbound():
+def test_validate_allows_unbound_plc_id_and_existing_row_only():
     svc = _service()
+    plc = PlcTable.create(plc_name="PLC A")
 
-    errors = svc.validate_factory_runtime(
+    unbound_errors = svc.validate(
         {
+            "config_name": "Cfg1",
             "record_duration": 5.0,
             "analysis_duration": 3.0,
             "analysis_window_offset_ms": 0,
-            "plc_device_key": "",
+            "scan_triggers_test": False,
+            "plc_id": None,
+            "selected_channels": [],
+            "channels": [],
+        }
+    )
+    bound_errors = svc.validate(
+        {
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "analysis_window_offset_ms": 0,
+            "scan_triggers_test": False,
+            "plc_id": plc.id,
+            "selected_channels": [],
+            "channels": [],
+        }
+    )
+    missing_errors = svc.validate(
+        {
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "analysis_window_offset_ms": 0,
+            "scan_triggers_test": False,
+            "plc_id": plc.id + 999,
+            "selected_channels": [],
+            "channels": [],
         }
     )
 
-    assert errors == []
+    assert unbound_errors == []
+    assert bound_errors == []
+    assert any("PLC" in err for err in missing_errors)
 
 
 def test_load_config_round_trips_golden_fields():

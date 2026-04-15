@@ -1,7 +1,15 @@
-from peewee import AutoField, BooleanField, FloatField, IntegerField, TextField
+from peewee import (
+    AutoField,
+    BooleanField,
+    FloatField,
+    ForeignKeyField,
+    IntegerField,
+    TextField,
+)
 
 from consts.time_consts import now_str
 from model.base_mode import BaseModel
+from model.plc_table import PlcTable
 
 
 class TestConfigTable(BaseModel):
@@ -11,6 +19,14 @@ class TestConfigTable(BaseModel):
     analysis_duration = FloatField(default=3.0)
     allow_incomplete_recording_analysis = BooleanField(default=False)
     scan_triggers_test = BooleanField(default=False)
+    plc = ForeignKeyField(
+        PlcTable,
+        backref="configs",
+        null=True,
+        default=None,
+        on_delete="SET NULL",
+        column_name="plc_id",
+    )
     plc_device_key = TextField(null=True, default=None)
     plc_device_label = TextField(null=True, default=None)
     created_time = TextField(default=now_str)

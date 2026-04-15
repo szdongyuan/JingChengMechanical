@@ -122,7 +122,7 @@ class FactoryReviewPayload:
 
 @dataclass(frozen=True)
 class FactoryPlcIngressPayload:
-    plc_device_key: str
+    plc_id: int
 
 
 @dataclass(frozen=True)
@@ -188,6 +188,7 @@ class EventBus(QObject):
 
     # 配置变化（供外部模块监听，如工单模块刷新可选配置列表）
     config_changed = pyqtSignal()
+    plc_changed = pyqtSignal()
     ai_toolchains_changed = pyqtSignal()
 
     # ── Analysis kernel real-time signals ──
@@ -250,8 +251,8 @@ class ServiceContainer:
 
         self.factory_mode = FactoryModeController(self.bus, self)
 
-    def _start_from_plc(self) -> None:
-        self.bus.log.emit("[PLC] 触发开始 -> 执行测试开始逻辑")
+    def _start_from_plc(self, plc_id: int) -> None:
+        self.bus.factory_plc_event.emit(FactoryPlcIngressPayload(plc_id=plc_id))
 
     def shutdown(self) -> None:
         try:

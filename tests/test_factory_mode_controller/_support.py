@@ -156,7 +156,7 @@ def _enter_reviewing_state(
 def _make_config(
     config_id: int,
     *,
-    plc_device_key: str | None = None,
+    plc_id: int | None = None,
     scan_triggers_test: bool = False,
 ):
     return {
@@ -165,7 +165,7 @@ def _make_config(
         "record_duration": 5.0,
         "analysis_duration": 2.0,
         "analysis_window_offset_ms": 0,
-        "plc_device_key": plc_device_key,
+        "plc_id": plc_id,
         "scan_triggers_test": scan_triggers_test,
     }
 

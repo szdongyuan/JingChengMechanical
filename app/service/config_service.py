@@ -11,6 +11,7 @@ from app.service.golden_sample_service import GoldenSampleService, StagedGoldenS
 from consts.time_consts import now_str
 from model.channel_config_table import ChannelConfigTable
 from model.device_table import DeviceTable
+from model.plc_table import PlcTable
 from model.test_config_table import TestConfigTable
 
 logger = logging.getLogger(__name__)
@@ -127,8 +128,7 @@ class ConfigService:
                 getattr(cfg, "allow_incomplete_recording_analysis", False)
             ),
             "scan_triggers_test": bool(cfg.scan_triggers_test),
-            "plc_device_key": self._normalize_optional_text(cfg.plc_device_key),
-            "plc_device_label": self._normalize_optional_text(cfg.plc_device_label),
+            "plc_id": cfg.plc_id,
             "input_device_name": cfg.input_device_name,
             "input_device_hostapi": cfg.input_device_hostapi,
             "input_device_samplerate": cfg.input_device_samplerate,
@@ -224,6 +224,34 @@ class ConfigService:
         self.commit_pending_save(pending)
         return pending.config_id
 
+    def _raise_save_integrity_error(self, exc: IntegrityError, data: dict) -> None:
+        error_text = str(exc).lower()
+        if "foreign key constraint failed" in error_text:
+            config_id = data.get("config_id")
+            if (
+                isinstance(config_id, int)
+                and not isinstance(config_id, bool)
+                and not TestConfigTable.select().where(
+                    TestConfigTable.config_id == config_id
+                ).exists()
+            ):
+                raise ValueError("配置不存在或已被删除") from exc
+
+            plc_id = data.get("plc_id")
+            if (
+                isinstance(plc_id, int)
+                and not isinstance(plc_id, bool)
+                and not PlcTable.select().where(PlcTable.id == plc_id).exists()
+            ):
+                raise ValueError("PLC 不存在或已被删除") from exc
+
+            raise ValueError("配置保存失败，关联数据无效") from exc
+
+        if "unique constraint failed" in error_text:
+            raise ValueError(f"配置名称「{data['config_name']}」已存在") from exc
+
+        raise ValueError("配置保存失败，数据约束冲突") from exc
+
     def begin_save_config(self, data: dict) -> PendingConfigSave:
         errors = self.validate(data)
         if errors:
@@ -277,12 +305,7 @@ class ConfigService:
                         data.get("allow_incomplete_recording_analysis", False)
                     ),
                     scan_triggers_test=data["scan_triggers_test"],
-                    plc_device_key=self._normalize_optional_text(
-                        data.get("plc_device_key")
-                    ),
-                    plc_device_label=self._normalize_optional_text(
-                        data.get("plc_device_label")
-                    ),
+                    plc=data.get("plc_id"),
                     input_device_name=data.get("input_device_name"),
                     input_device_hostapi=data.get("input_device_hostapi"),
                     input_device_samplerate=data.get("input_device_samplerate"),
@@ -300,9 +323,9 @@ class ConfigService:
                         config=config_id,
                         **self._channel_db_values(channel),
                     )
-        except IntegrityError:
+        except IntegrityError as exc:
             self._safe_rollback(promoted_paths)
-            raise ValueError(f"配置名称「{data['config_name']}」已存在")
+            self._raise_save_integrity_error(exc, data)
         except Exception:
             self._safe_rollback(promoted_paths)
             raise
@@ -389,6 +412,12 @@ class ConfigService:
             data.get("allow_incomplete_recording_analysis", False), bool
         ):
             errors.append("允许分析不完整录音必须为布尔值")
+        plc_id = data.get("plc_id")
+        if plc_id is not None:
+            if not isinstance(plc_id, int) or isinstance(plc_id, bool):
+                errors.append("PLC 绑定无效")
+            elif not PlcTable.select().where(PlcTable.id == plc_id).exists():
+                errors.append("PLC 不存在或已被删除")
 
         errors.extend(self.validate_factory_runtime(data))
 

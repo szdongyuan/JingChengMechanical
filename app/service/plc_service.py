@@ -20,6 +20,8 @@ class PlcService(QObject):
     connect_result = pyqtSignal(bool, str)
     # 连接状态通知界面信号
     state_changed = pyqtSignal(str)
+    # 停止完成后通知调用方，供跨线程断开流程确认 stop slot 已实际执行。
+    stop_completed = pyqtSignal()
 
     @classmethod
     def validate_connection_config(
@@ -174,15 +176,18 @@ class PlcService(QObject):
     @pyqtSlot()
     def stop_plc_service(self):
         self.logger.info(f"停止 PLC 服务")
-        # 停止监听，销毁定时器并主动断开 PLC 连接。
-        if self.timer is not None:
-            self.timer.stop()
-            self.timer.deleteLater()
-            self.timer = None
-        self._disconnect()
-        self.state_changed.emit("未连接")
-        self._last_value = None
-        self.bus.log.emit("[PLC] 停止监听")
+        try:
+            # 停止监听，销毁定时器并主动断开 PLC 连接。
+            if self.timer is not None:
+                self.timer.stop()
+                self.timer.deleteLater()
+                self.timer = None
+            self._disconnect()
+            self.state_changed.emit("未连接")
+            self._last_value = None
+            self.bus.log.emit("[PLC] 停止监听")
+        finally:
+            self.stop_completed.emit()
 
     def _connect_once(self):
         self.logger.info("开始尝试连接 PLC")

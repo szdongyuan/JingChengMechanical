@@ -222,22 +222,22 @@ class FactoryModeController(QObject):
             self._log_ingress_ignored(
                 event_type="PLC",
                 reason=self._busy_state_reason_label(),
-                plc_device_key=payload.plc_device_key,
+                plc_id=payload.plc_id,
             )
             return False
         if not self.can_arm():
             self._log_ingress_ignored(
                 event_type="PLC",
                 reason="not armed",
-                plc_device_key=payload.plc_device_key,
+                plc_id=payload.plc_id,
             )
             return self._emit_blocked_start("plc")
-        config_id = self._resolve_plc_config_id(payload.plc_device_key)
+        config_id = self._resolve_plc_config_id(payload.plc_id)
         if config_id is None:
             self._log_ingress_ignored(
                 event_type="PLC",
                 reason="no match",
-                plc_device_key=payload.plc_device_key,
+                plc_id=payload.plc_id,
             )
             return False
         return self._accept_start(config_id, "plc")
@@ -494,6 +494,8 @@ class FactoryModeController(QObject):
     def _connect_bus(self) -> None:
         if hasattr(self.bus, "config_changed"):
             self.bus.config_changed.connect(self.refresh_selection)
+        if hasattr(self.bus, "plc_changed"):
+            self.bus.plc_changed.connect(self.refresh_selection)
         self.bus.factory_plc_event.connect(self.handle_plc_event)
         self.bus.factory_scan_event.connect(self.handle_scan_event)
         self.bus.factory_runtime_start_accepted.connect(self.handle_runtime_start_accepted)
@@ -728,15 +730,13 @@ class FactoryModeController(QObject):
             start_ready_reason=start_ready_reason,
         )
 
-    def _resolve_plc_config_id(self, plc_device_key: str) -> int | None:
-        normalized_plc_key = self._normalize_optional_text(plc_device_key)
-        if normalized_plc_key is None:
+    def _resolve_plc_config_id(self, plc_id: int) -> int | None:
+        if not isinstance(plc_id, int) or isinstance(plc_id, bool):
             return None
         matches = [
             config_id
             for config_id, config in self._selected_configs.items()
-            if self._normalize_optional_text(config.get("plc_device_key"))
-            == normalized_plc_key
+            if config.get("plc_id") == plc_id
         ]
         if matches:
             return matches[0]

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import QMetaObject, QThread, Qt
+from PyQt6.QtCore import QEventLoop, QMetaObject, QThread, Qt, QTimer
 from PyQt6.QtWidgets import (
     QComboBox,
     QFormLayout,
@@ -20,6 +20,8 @@ from model.plc_table import PlcTable
 
 class PlcSettingsModule(QWidget):
     _SAVE_BLOCKED_STATES = {"连接中", "重连中", "已连接"}
+    _STOP_ACK_TIMEOUT_MS = 2000
+    _THREAD_EXIT_TIMEOUT_MS = 2000
 
     def __init__(self, services):
         super().__init__()
@@ -29,10 +31,11 @@ class PlcSettingsModule(QWidget):
         self.services.plc_services = {}
         self.services.plc_threads = {}
         self.services.plc_state = {}
+        self._connect_failure_labels = {}
 
         self.init_ui()
         self.init_fun()
-        self.reload_rows()
+        self.reload_rows(auto_connect=True)
 
     def init_ui(self):
         root = QVBoxLayout(self)
@@ -118,24 +121,34 @@ class PlcSettingsModule(QWidget):
         self.btn_save.clicked.connect(self.save_current)
         self.btn_toggle.clicked.connect(self.toggle_state)
         self.btn_connect.clicked.connect(self.connect_plc)
+        plc_changed = getattr(self.services.bus, "plc_changed", None)
+        if plc_changed is not None:
+            plc_changed.connect(self.reload_rows)
 
-    def reload_rows(self):
+    def reload_rows(self, auto_connect: bool = False):
         # 每次重载都从数据库重新取 PLC 列表，并刷新下拉框。
+        current_plc_id = self.combo_plc.currentData()
         try:
             rows = list(PlcTable.select().order_by(PlcTable.id))
         except Exception as exc:
             rows = []
             self.services.bus.log.emit(f"读取 PLC 配置失败: {exc}")
             QMessageBox.warning(self, "提示", f"读取 PLC 配置失败: {exc}")
-
-        for row in rows:
-            self.services.plc_state[row.id] = "未连接"
+        existing_states = dict(getattr(self.services, "plc_state", {}))
+        self.services.plc_state = {
+            row.id: existing_states.get(row.id, "未连接")
+            for row in rows
+        }
+        self._connect_failure_labels = {
+            row.id: self._connect_failure_labels[row.id]
+            for row in rows
+            if row.id in self._connect_failure_labels
+        }
 
         self.combo_plc.blockSignals(True)
         self.combo_plc.clear()
         for row in rows:
             self.combo_plc.addItem(str(row.id), row.id)
-        self.combo_plc.blockSignals(False)
 
         has_rows = bool(rows)
         self.combo_plc.setEnabled(has_rows)
@@ -145,12 +158,16 @@ class PlcSettingsModule(QWidget):
         self._set_fields_enabled(has_rows)
 
         if has_rows:
-            # 默认先显示第一条 PLC，并把开机自动连接的项拉起来。
-            self.combo_plc.setCurrentIndex(0)
+            selected_index = self.combo_plc.findData(current_plc_id)
+            self.combo_plc.setCurrentIndex(selected_index if selected_index >= 0 else 0)
+        self.combo_plc.blockSignals(False)
+
+        if has_rows:
             self.on_combo_changed()
-            for row in rows:
-                if self._is_open_state_enabled(row.plc_open_state):
-                    self.start_connect(row)
+            if auto_connect:
+                for row in rows:
+                    if self._is_open_state_enabled(row.plc_open_state):
+                        self.start_connect(row)
         else:
             self._render_empty()
 
@@ -240,6 +257,7 @@ class PlcSettingsModule(QWidget):
         try:
             # 保存后重新按当前下拉框选中的 id 查询一次，确保界面显示数据库最新值。
             PlcTable.update(**values).where(PlcTable.id == row.id).execute()
+            self._emit_plc_changed()
             self.on_combo_changed()
             self.services.bus.log.emit(f"PLC {row.id} 保存成功")
             QMessageBox.information(self, "成功", f"PLC {row.id} 保存成功")
@@ -269,6 +287,7 @@ class PlcSettingsModule(QWidget):
         new_state = 0 if self._is_open_state_enabled(row.plc_open_state) else 1
         try:
             PlcTable.update(plc_open_state=new_state).where(PlcTable.id == row.id).execute()
+            self._emit_plc_changed()
             self.on_combo_changed()
             self.services.bus.log.emit(
                 f"PLC {row.id}: {row.plc_name or '-'} 开机自启动 已{'开启' if new_state == 1 else '关闭'}"
@@ -328,14 +347,15 @@ class PlcSettingsModule(QWidget):
             self.logger.warning(failure_message)
             self.services.bus.log.emit(failure_message)
             if self.combo_plc.currentData() == row.id:
-                self.set_connect_label(f"连接失败: {config_error}")
+                self.set_connect_label(self._set_connect_failure_label(row.id, config_error))
                 self.apply_connect_button_state(row.id)
                 QMessageBox.warning(self, "提示", failure_message)
             return
 
+        self._clear_connect_failure_label(row.id)
         plc_service = PlcService(
             bus=self.services.bus,
-            on_start_requested=self.services._start_from_plc,
+            on_start_requested=lambda plc_id=row.id: self.services._start_from_plc(plc_id),
             ip=row.plc_ip,
             rack=row.plc_rack,
             slot=row.plc_slot,
@@ -361,7 +381,7 @@ class PlcSettingsModule(QWidget):
             self._on_connect_finished(row.id, plc_service, connect_thread, success, message)
 
         def on_connect_thread_stopped():
-            self._on_connect_thread_stopped(row.id)
+            self._on_connect_thread_stopped(row.id, plc_service, connect_thread)
 
         def on_state_changed(state, plc_id=row.id):
             self.on_plc_state_changed(plc_id, state)
@@ -379,47 +399,177 @@ class PlcSettingsModule(QWidget):
 
         # 连接成功后记录 service；具体状态由 PlcService 的状态信号回传。
         if success and plc_service is not None:
+            self._clear_connect_failure_label(plc_id)
             self.services.plc_services[plc_id] = plc_service
             # 保留最近一次成功连接的服务，兼容原来单实例用法。
             self.services.plc = plc_service
             self.services.bus.log.emit(f"连接成功: {plc_id}")
+        elif not success:
+            failure_label = self._set_connect_failure_label(plc_id, message)
+            if row is not None and row.id == plc_id:
+                self.set_connect_label(failure_label)
+            if plc_service is not None:
+                connect_thread.quit()
+                connect_thread.wait(2000)
         elif plc_service is not None:
             connect_thread.quit()
             connect_thread.wait(2000)
 
-        if row is not None and row.id == plc_id:
-            if not success:
-                self.set_connect_label(f"连接失败: {message}" if message else "连接失败")
-
-    def _on_connect_thread_stopped(self, plc_id):
+    def _on_connect_thread_stopped(self, plc_id, plc_service=None, connect_thread=None):
         self.logger.info(f"plc {plc_id} 线程已停止")
-        self.services.plc_threads.pop(plc_id, None)
-        self.services.plc_services.pop(plc_id, None)
-        self.logger.info(f"plc {plc_id} 后台plc_services：{getattr(self.services, "plc_services", {}).get(plc_id)}, "
-                         f"后台线程{getattr(self.services, "plc_threads", {}).get(plc_id)}")
+        if plc_service is None:
+            plc_service = getattr(self.services, "plc_services", {}).get(plc_id)
+        if connect_thread is None:
+            connect_thread = getattr(self.services, "plc_threads", {}).get(plc_id)
+
+        cleared = self._clear_disconnected_runtime_state(
+            plc_id,
+            plc_service,
+            connect_thread,
+        )
+        if cleared:
+            row = self.get_current_row()
+            if row is not None and row.id == plc_id:
+                self.set_connect_label(self.set_lb_text(plc_id))
+                self.apply_connect_button_state(plc_id)
+        self.logger.info(
+            f"plc {plc_id} 后台plc_services："
+            f"{getattr(self.services, 'plc_services', {}).get(plc_id)}, "
+            f"后台线程{getattr(self.services, 'plc_threads', {}).get(plc_id)}"
+        )
+
+    def _clear_disconnected_runtime_state(self, row_id, plc_service, plc_thread=None) -> bool:
+        current_service = getattr(self.services, "plc_services", {}).get(row_id)
+        current_thread = getattr(self.services, "plc_threads", {}).get(row_id)
+        if (
+            plc_service is not None
+            and current_service is not None
+            and current_service is not plc_service
+        ) or (
+            plc_thread is not None
+            and current_thread is not None
+            and current_thread is not plc_thread
+        ):
+            return False
+
+        self.services.plc_services.pop(row_id, None)
+        self.services.plc_threads.pop(row_id, None)
+        self.services.plc_state[row_id] = "未连接"
+        current_service = getattr(self.services, "plc", None)
+        if current_service is plc_service:
+            self.services.plc = None
+        return True
 
     def disconnect_row(self, row_id):
         # 断开时先停 service，再退出对应线程，最后把状态改回未连接。
         plc_service = getattr(self.services, "plc_services", {}).get(row_id)
         plc_thread = getattr(self.services, "plc_threads", {}).get(row_id)
         self.logger.info(f"断开前正在运行的plc_services:{plc_service} , 线程{plc_thread}")
+        teardown_ok = True
+        thread_exited = False
         if plc_service:
-            try:
-                QMetaObject.invokeMethod(
-                    plc_service,
-                    "stop_plc_service",
-                    Qt.ConnectionType.BlockingQueuedConnection,
-                )
-                self.services.plc_services.pop(row_id, None)
-            except Exception as exc:
-                self.services.bus.log.emit(f"plc{row_id}断开失败: {exc}")
-                self.logger.error(f"plc{row_id}断开失败: {exc}")
+            teardown_ok = self._request_stop_ack(row_id, plc_service)
 
         if plc_thread is not None:
             plc_thread.quit()
-            plc_thread.wait(2000)
+            thread_exited = plc_thread.wait(self._THREAD_EXIT_TIMEOUT_MS)
+            if not thread_exited:
+                teardown_ok = False
+                self._log_disconnect_failure(row_id, "线程未在超时内退出")
+
+        if teardown_ok or thread_exited:
+            self._clear_disconnected_runtime_state(row_id, plc_service, plc_thread)
+
+        if not teardown_ok:
+            return False
+
+        return True
+
+    def _request_stop_ack(self, row_id, plc_service) -> bool:
+        stop_completed = getattr(plc_service, "stop_completed", None)
+        if stop_completed is None:
+            self._log_disconnect_failure(row_id, "stop_plc_service 完成信号不可用")
+            return False
+
+        stop_acknowledged = False
+        wait_loop = QEventLoop(self)
+        timeout_timer = QTimer(self)
+        timeout_timer.setSingleShot(True)
+
+        def _on_stop_completed():
+            nonlocal stop_acknowledged
+            stop_acknowledged = True
+            if wait_loop.isRunning():
+                wait_loop.quit()
+
+        stop_completed.connect(_on_stop_completed)
+        timeout_timer.timeout.connect(wait_loop.quit)
+        try:
+            stop_invoked = QMetaObject.invokeMethod(
+                plc_service,
+                "stop_plc_service",
+                Qt.ConnectionType.QueuedConnection,
+            )
+            if stop_invoked is False:
+                self._log_disconnect_failure(row_id, "stop_plc_service 未执行")
+                return False
+
+            if not stop_acknowledged:
+                timeout_timer.start(self._STOP_ACK_TIMEOUT_MS)
+                wait_loop.exec()
+
+            if not stop_acknowledged:
+                self._log_disconnect_failure(row_id, "stop_plc_service 未在超时内确认")
+                return False
+            return True
+        except Exception as exc:
+            self._log_disconnect_failure(row_id, str(exc))
+            return False
+        finally:
+            timeout_timer.stop()
+            timeout_timer.deleteLater()
+            disconnect_signal = getattr(stop_completed, "disconnect", None)
+            if callable(disconnect_signal):
+                try:
+                    disconnect_signal(_on_stop_completed)
+                except Exception:
+                    pass
+
+    def _log_disconnect_failure(self, row_id, message: str) -> None:
+        formatted = f"plc{row_id}断开失败: {message}"
+        self.services.bus.log.emit(formatted)
+        self.logger.error(formatted)
+
+    def delete_plc(self, plc_id: int) -> bool:
+        if not PlcTable.select().where(PlcTable.id == plc_id).exists():
+            return False
+
+        if (
+            getattr(self.services, "plc_services", {}).get(plc_id) is not None
+            or getattr(self.services, "plc_threads", {}).get(plc_id) is not None
+        ):
+            if self.disconnect_row(plc_id) is False:
+                return False
+
+        with PlcTable._meta.database.atomic():
+            deleted = (
+                PlcTable.delete()
+                .where(PlcTable.id == plc_id)
+                .execute()
+            )
+
+        if deleted == 0:
+            return False
+
+        self.services.plc_state.pop(plc_id, None)
+        self._clear_connect_failure_label(plc_id)
+        self._emit_plc_changed()
+        return True
 
     def set_lb_text(self, row_id):
+        failure_label = self._connect_failure_labels.get(row_id)
+        if failure_label is not None:
+            return failure_label
         state = self.get_plc_state(row_id)
         if state == "连接中":
             return "连接中..."
@@ -453,6 +603,7 @@ class PlcSettingsModule(QWidget):
         self.services.plc_state[row_id] = state
 
     def on_plc_state_changed(self, plc_id, state):
+        self._clear_connect_failure_label(plc_id)
         self.set_plc_state(plc_id, state)
         row = self.get_current_row()
         if row is None or row.id != plc_id:
@@ -497,3 +648,16 @@ class PlcSettingsModule(QWidget):
             self.ed_reconnect_interval,
         ):
             edit.setEnabled(enabled)
+
+    def _emit_plc_changed(self) -> None:
+        plc_changed = getattr(self.services.bus, "plc_changed", None)
+        if plc_changed is not None:
+            plc_changed.emit()
+
+    def _set_connect_failure_label(self, row_id: int, message: str | None) -> str:
+        label = f"连接失败: {message}" if message else "连接失败"
+        self._connect_failure_labels[row_id] = label
+        return label
+
+    def _clear_connect_failure_label(self, row_id: int) -> None:
+        self._connect_failure_labels.pop(row_id, None)
