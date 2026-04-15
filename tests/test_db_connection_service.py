@@ -16,6 +16,7 @@ from model.ai_toolchain_table import AiToolchainTable
 from model.audio_data_table import AudioDataTable
 from model.channel_config_table import ChannelConfigTable
 from model.device_table import DeviceTable
+from model.plc_table import PlcTable
 from model.system_info_table import SystemInfoTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable as AiBindingTable
 from model.test_config_table import TestConfigTable as ConfigTable
@@ -35,6 +36,7 @@ EXPECTED_RUNTIME_TABLES = {
     "users_table",
     "system_info_table",
     "training_model_table",
+    "plc_table",
 }
 
 RUNTIME_MODELS = [
@@ -48,6 +50,7 @@ RUNTIME_MODELS = [
     UsersTable,
     SystemInfoTable,
     TrainingModelTable,
+    PlcTable,
 ]
 
 

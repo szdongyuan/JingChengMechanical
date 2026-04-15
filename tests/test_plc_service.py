@@ -88,3 +88,39 @@ def test_plc_service_start_and_stop_create_and_clear_timer(monkeypatch):
     assert state_changes[-1] == "未连接"
     assert bus.log.messages[-1] == "[PLC] 停止监听"
     assert start_requests == []
+
+
+def test_plc_service_rejects_missing_numeric_fields_without_crashing():
+    _qapp()
+    bus = _BusStub()
+    state_changes = []
+    connect_results = []
+
+    service = PlcService(
+        bus=bus,
+        on_start_requested=lambda: None,
+        ip="127.0.0.1",
+        rack=0,
+        slot=1,
+        db_number=None,
+        byte_index=0,
+        bit_index=0,
+    )
+    service.state_changed.connect(state_changes.append)
+    service.connect_result.connect(
+        lambda success, message: connect_results.append((success, message))
+    )
+
+    service.start_plc_service()
+
+    assert service.timer is None
+    assert service.plc_client is None
+    assert state_changes == ["未连接"]
+    assert connect_results
+    assert connect_results[0][0] is False
+    assert "配置不完整" in connect_results[0][1]
+    assert "数据块号" in connect_results[0][1]
+    assert any(
+        "配置不完整" in message and "数据块号" in message
+        for message in bus.log.messages
+    )

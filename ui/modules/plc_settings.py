@@ -147,7 +147,7 @@ class PlcSettingsModule(QWidget):
             self.combo_plc.setCurrentIndex(0)
             self.on_combo_changed()
             for row in rows:
-                if int(row.plc_open_state) == 1:
+                if self._is_open_state_enabled(row.plc_open_state):
                     self.start_connect(row)
         else:
             self._render_empty()
@@ -178,7 +178,7 @@ class PlcSettingsModule(QWidget):
         self.ed_poll_interval.setText(text_or_empty(row.plc_poll_interval_ms))
         self.ed_reconnect_interval.setText(text_or_empty(row.plc_reconnect_interval_ms))
 
-        is_open = (int(row.plc_open_state) == 1)  # 是否已开启开机自启
+        is_open = self._is_open_state_enabled(row.plc_open_state)  # 是否已开启开机自启
         if is_open:
             self.lb_state.setText("开启")
             self.btn_toggle.setText("关闭")
@@ -250,7 +250,7 @@ class PlcSettingsModule(QWidget):
             return
 
         # plc_open_state: 0=关闭, 1=开启
-        new_state = 0 if int(row.plc_open_state) == 1 else 1
+        new_state = 0 if self._is_open_state_enabled(row.plc_open_state) else 1
         try:
             PlcTable.update(plc_open_state=new_state).where(PlcTable.id == row.id).execute()
             self.on_combo_changed()
@@ -295,6 +295,26 @@ class PlcSettingsModule(QWidget):
         if old_service is not None or old_thread is not None:
             self.services.bus.log.emit(f"PLC {row.id} 连接线程仍在运行，不重复创建")
             self.logger.info(f"PLC {row.id} 连接线程仍在运行，不重复创建")
+            return
+
+        _, config_error = PlcService.validate_connection_config(
+            ip=row.plc_ip,
+            rack=row.plc_rack,
+            slot=row.plc_slot,
+            db_number=row.plc_db_number,
+            byte_index=row.plc_byte_index,
+            bit_index=row.plc_bit_index,
+            poll_interval_ms=row.plc_poll_interval_ms,
+            reconnect_interval_ms=row.plc_reconnect_interval_ms,
+        )
+        if config_error is not None:
+            failure_message = f"PLC {row.id} 连接失败: {config_error}"
+            self.logger.warning(failure_message)
+            self.services.bus.log.emit(failure_message)
+            if self.combo_plc.currentData() == row.id:
+                self.set_connect_label(f"连接失败: {config_error}")
+                self.apply_connect_button_state(row.id)
+                QMessageBox.warning(self, "提示", failure_message)
             return
 
         plc_service = PlcService(
@@ -401,6 +421,12 @@ class PlcSettingsModule(QWidget):
             self.lb_connect_state.setStyleSheet("color: #dc2626;")
         else:
             self.lb_connect_state.setStyleSheet("")
+
+    def _is_open_state_enabled(self, value):
+        try:
+            return int(value) == 1
+        except (TypeError, ValueError):
+            return False
 
     def get_plc_state(self, row_id):
         return self.services.plc_state.get(

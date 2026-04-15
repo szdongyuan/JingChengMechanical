@@ -94,3 +94,76 @@ def test_plc_settings_module_loads_rows_and_initializes_service_maps(qapp, plc_d
     assert services.plc_services == {}
     assert services.plc_threads == {}
     assert services.plc_state == {1: "未连接"}
+
+
+def test_plc_settings_module_treats_null_open_state_as_closed(qapp, plc_db):
+    PlcTable.create(
+        plc_name="PLC Nullable",
+        plc_ip="127.0.0.1",
+        plc_open_state=None,
+    )
+    services = SimpleNamespace(
+        bus=SimpleNamespace(log=_SignalProbe()),
+        _start_from_plc=lambda: None,
+    )
+
+    module = PlcSettingsModule(services)
+    qapp.processEvents()
+
+    assert module.lb_state.text() == "关闭"
+    assert module.btn_toggle.text() == "开启"
+    assert module.lb_connect_state.text() == "未连接"
+    assert services.plc_state == {1: "未连接"}
+
+
+def test_plc_settings_module_warns_and_blocks_connect_when_numeric_fields_missing(
+    qapp,
+    plc_db,
+    monkeypatch,
+):
+    PlcTable.create(
+        plc_name="PLC Missing DB",
+        plc_ip="127.0.0.1",
+        plc_rack=0,
+        plc_slot=1,
+        plc_db_number=None,
+        plc_byte_index=0,
+        plc_bit_index=0,
+        plc_poll_interval_ms=250,
+        plc_reconnect_interval_ms=4000,
+        plc_open_state=0,
+    )
+    services = SimpleNamespace(
+        bus=SimpleNamespace(log=_SignalProbe()),
+        _start_from_plc=lambda: None,
+    )
+    warnings = []
+
+    def _unexpected_plc_service_init(self, *_args, **_kwargs):
+        raise AssertionError("PlcService should not be constructed for invalid PLC rows")
+
+    monkeypatch.setattr(
+        "ui.modules.plc_settings.PlcService.__init__",
+        _unexpected_plc_service_init,
+    )
+    monkeypatch.setattr(
+        "ui.modules.plc_settings.QMessageBox.warning",
+        lambda *_args: warnings.append(_args),
+    )
+
+    module = PlcSettingsModule(services)
+    qapp.processEvents()
+
+    module.connect_plc()
+    qapp.processEvents()
+
+    assert warnings
+    assert "配置不完整" in warnings[0][2]
+    assert "数据块号" in warnings[0][2]
+    assert any(
+        "配置不完整" in message and "数据块号" in message
+        for message in services.bus.log.messages
+    )
+    assert module.lb_connect_state.text().startswith("连接失败:")
+    assert services.plc_services == {}
+    assert services.plc_threads == {}

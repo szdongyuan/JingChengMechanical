@@ -21,6 +21,53 @@ class PlcService(QObject):
     # 连接状态通知界面信号
     state_changed = pyqtSignal(str)
 
+    @classmethod
+    def validate_connection_config(
+        cls,
+        *,
+        ip,
+        rack,
+        slot,
+        db_number,
+        byte_index,
+        bit_index,
+        poll_interval_ms,
+        reconnect_interval_ms,
+    ) -> tuple[dict[str, int | str] | None, str | None]:
+        missing_fields = []
+        invalid_fields = []
+        normalized = {}
+
+        ip_text = "" if ip is None else str(ip).strip()
+        if not ip_text:
+            missing_fields.append("IP")
+        else:
+            normalized["ip"] = ip_text
+
+        numeric_fields = (
+            ("机架号", "rack", rack),
+            ("槽号", "slot", slot),
+            ("数据块号", "db_number", db_number),
+            ("字节偏移", "byte_index", byte_index),
+            ("位偏移", "bit_index", bit_index),
+            ("轮询时间", "poll_interval_ms", poll_interval_ms),
+            ("断线重连时间", "reconnect_interval_ms", reconnect_interval_ms),
+        )
+        for label, key, value in numeric_fields:
+            if value is None or (isinstance(value, str) and not value.strip()):
+                missing_fields.append(label)
+                continue
+            try:
+                normalized[key] = int(value)
+            except (TypeError, ValueError):
+                invalid_fields.append(label)
+
+        if missing_fields:
+            return None, f"PLC 配置不完整: {'、'.join(missing_fields)}"
+        if invalid_fields:
+            return None, f"PLC 配置无效: {'、'.join(invalid_fields)}"
+        return normalized, None
+
     def __init__(self,
         bus,
         on_start_requested,
@@ -46,15 +93,15 @@ class PlcService(QObject):
         self._slot = slot
 
         # 数据块号DB
-        self._db_number = int(db_number)
+        self._db_number = db_number
         # 数据块里的第几个字节
-        self._byte_index = int(byte_index)
+        self._byte_index = byte_index
         # 字节里的第几位
-        self._bit_index = int(bit_index)
+        self._bit_index = bit_index
         # 轮询周期
-        self._poll_interval_ms = int(poll_interval_ms)
+        self._poll_interval_ms = poll_interval_ms
         # 重连周期
-        self._reconnect_interval_ms = int(reconnect_interval_ms)
+        self._reconnect_interval_ms = reconnect_interval_ms
 
         # 触发开始后，是否把 PLC 里的开始位自动写回 0
         self._auto_reset_bit = bool(auto_reset_bit)
@@ -66,11 +113,43 @@ class PlcService(QObject):
         self._reconnect_timer_ms = 0  # 重连计时器
         self._last_connect_error = ""
 
+    def _apply_normalized_connection_config(self) -> str | None:
+        normalized, error = self.validate_connection_config(
+            ip=self._ip,
+            rack=self._rack,
+            slot=self._slot,
+            db_number=self._db_number,
+            byte_index=self._byte_index,
+            bit_index=self._bit_index,
+            poll_interval_ms=self._poll_interval_ms,
+            reconnect_interval_ms=self._reconnect_interval_ms,
+        )
+        if error is not None:
+            return error
+
+        self._ip = normalized["ip"]
+        self._rack = normalized["rack"]
+        self._slot = normalized["slot"]
+        self._db_number = normalized["db_number"]
+        self._byte_index = normalized["byte_index"]
+        self._bit_index = normalized["bit_index"]
+        self._poll_interval_ms = normalized["poll_interval_ms"]
+        self._reconnect_interval_ms = normalized["reconnect_interval_ms"]
+        return None
+
     @pyqtSlot()
     def start_plc_service(self):
         # 启动 PLC 监听；如果已经启动过，就直接返回，避免重复创建定时器。
         self.logger.info(f"启动 PLC 服务")
         if self.timer is not None:
+            return
+        config_error = self._apply_normalized_connection_config()
+        if config_error is not None:
+            self._last_connect_error = config_error
+            self.logger.warning(f"[PLC] 启动失败: {config_error}")
+            self.bus.log.emit(f"[PLC] 启动失败: {config_error}")
+            self.state_changed.emit("未连接")
+            self.connect_result.emit(False, config_error)
             return
         self.state_changed.emit("连接中")
         # 启动时先尝试连一次 PLC。

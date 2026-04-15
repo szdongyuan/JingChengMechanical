@@ -7,6 +7,7 @@ from model.audio_data_table import AudioDataTable
 from model.base_mode import db
 from model.channel_config_table import ChannelConfigTable
 from model.device_table import DeviceTable
+from model.plc_table import PlcTable
 from model.system_info_table import SystemInfoTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable
 from model.test_config_table import TestConfigTable
@@ -35,6 +36,7 @@ class DbConnectionService:
         UsersTable,
         SystemInfoTable,
         TrainingModelTable,
+        PlcTable,
     )
 
     def connect(self):
