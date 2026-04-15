@@ -137,6 +137,7 @@ class DbConnectionService:
 
     def _ensure_test_config_table_plc_fk(self):
         if not self._test_config_table_requires_plc_fk_rebuild():
+            self._ensure_test_config_table_indexes()
             return
 
         existing_columns = self._get_table_column_rows("test_config_table")
@@ -184,8 +185,14 @@ class DbConnectionService:
                 )
                 db.execute_sql(
                     """
-                    CREATE UNIQUE INDEX IF NOT EXISTS test_config_table_config_name_unique
+                    CREATE UNIQUE INDEX IF NOT EXISTS testconfigtable_config_name
                     ON test_config_table (config_name)
+                    """
+                )
+                db.execute_sql(
+                    """
+                    CREATE INDEX IF NOT EXISTS testconfigtable_plc_id
+                    ON test_config_table (plc_id)
                     """
                 )
         finally:
@@ -223,6 +230,34 @@ class DbConnectionService:
     def _quote_identifier(self, identifier: str) -> str:
         escaped = identifier.replace('"', '""')
         return f'"{escaped}"'
+
+    def _ensure_test_config_table_indexes(self):
+        existing_indexes = {
+            (columns, unique)
+            for columns, unique in self._get_table_index_definitions("test_config_table")
+        }
+        if (("config_name",), True) not in existing_indexes:
+            db.execute_sql(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS testconfigtable_config_name
+                ON test_config_table (config_name)
+                """
+            )
+        if (("plc_id",), False) not in existing_indexes:
+            db.execute_sql(
+                """
+                CREATE INDEX IF NOT EXISTS testconfigtable_plc_id
+                ON test_config_table (plc_id)
+                """
+            )
+
+    def _get_table_index_definitions(self, table_name: str) -> list[tuple[tuple[str, ...], bool]]:
+        cursor = db.execute_sql(f"PRAGMA index_list({table_name})")
+        definitions = []
+        for _, index_name, unique, *_ in cursor.fetchall():
+            info = db.execute_sql(f"PRAGMA index_info({index_name})").fetchall()
+            definitions.append((tuple(row[2] for row in info), bool(unique)))
+        return definitions
 
     def _remove_obsolete_ai_binding_score_threshold(self):
         columns = self._get_table_columns("test_config_ai_binding_table")

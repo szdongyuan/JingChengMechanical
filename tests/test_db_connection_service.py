@@ -898,6 +898,42 @@ def test_connect_repairs_test_config_table_with_real_plc_fk_delete_semantics(
             )
 
 
+def test_connect_repair_restores_test_config_table_runtime_index_semantics(monkeypatch):
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
+        svc.connect()
+        fresh_index_semantics = {
+            (columns, unique)
+            for _, columns, unique in _index_definitions(tmp_db, "test_config_table")
+        }
+
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
+        tmp_db.connect()
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE test_config_table (
+                config_id INTEGER PRIMARY KEY,
+                config_name TEXT NOT NULL UNIQUE,
+                record_duration REAL NOT NULL DEFAULT 5.0,
+                analysis_duration REAL NOT NULL DEFAULT 3.0,
+                scan_triggers_test INTEGER NOT NULL DEFAULT 0,
+                created_time TEXT NOT NULL DEFAULT '',
+                updated_time TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+
+        svc.connect()
+
+        repaired_index_semantics = {
+            (columns, unique)
+            for _, columns, unique in _index_definitions(tmp_db, "test_config_table")
+        }
+
+        assert repaired_index_semantics == fresh_index_semantics
+        assert (("config_name",), True) in repaired_index_semantics
+        assert (("plc_id",), False) in repaired_index_semantics
+
+
 def test_deleting_plc_row_sets_bound_config_plc_id_to_null(monkeypatch):
     with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
         svc.connect()

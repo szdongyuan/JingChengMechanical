@@ -423,7 +423,7 @@ class PlcSettingsModule(QWidget):
                 stop_invoked = QMetaObject.invokeMethod(
                     plc_service,
                     "stop_plc_service",
-                    Qt.ConnectionType.BlockingQueuedConnection,
+                    Qt.ConnectionType.QueuedConnection,
                 )
                 if stop_invoked is False:
                     teardown_ok = False

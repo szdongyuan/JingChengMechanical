@@ -6,6 +6,7 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 from peewee import SqliteDatabase
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QApplication
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -482,6 +483,70 @@ def test_plc_settings_module_delete_plc_disconnects_before_delete_and_emits_plc_
     assert bus.plc_changed.emissions == [((), {})]
     assert plc_exists_when_signaled == [False]
     assert module.combo_plc.count() == 0
+
+
+def test_plc_settings_module_disconnect_row_uses_non_blocking_stop_request_and_bounded_wait(
+    qapp,
+    plc_db,
+    monkeypatch,
+):
+    row = PlcTable.create(
+        plc_name="PLC Stuck Worker",
+        plc_ip="127.0.0.1",
+        plc_open_state=0,
+    )
+    bus = SimpleNamespace(log=_SignalProbe())
+    services = SimpleNamespace(
+        bus=bus,
+        _start_from_plc=lambda plc_id: None,
+    )
+    module = PlcSettingsModule(services)
+    qapp.processEvents()
+
+    class _StuckThread:
+        def __init__(self):
+            self.quit_calls = 0
+            self.wait_calls = []
+
+        def quit(self):
+            self.quit_calls += 1
+
+        def wait(self, timeout_ms):
+            self.wait_calls.append(timeout_ms)
+            return False
+
+    stop_requests = []
+    plc_service = object()
+    plc_thread = _StuckThread()
+
+    def _invoke_method(target, method_name, connection_type):
+        stop_requests.append((target, method_name, connection_type))
+        return True
+
+    monkeypatch.setattr(
+        "ui.modules.plc_settings.QMetaObject",
+        SimpleNamespace(invokeMethod=_invoke_method),
+    )
+    services.plc_services[row.id] = plc_service
+    services.plc_threads[row.id] = plc_thread
+    services.plc_state[row.id] = "已连接"
+
+    disconnected = module.disconnect_row(row.id)
+
+    assert disconnected is False
+    assert stop_requests == [
+        (
+            plc_service,
+            "stop_plc_service",
+            Qt.ConnectionType.QueuedConnection,
+        )
+    ]
+    assert plc_thread.quit_calls == 1
+    assert plc_thread.wait_calls == [2000]
+    assert services.plc_services[row.id] is plc_service
+    assert services.plc_threads[row.id] is plc_thread
+    assert services.plc_state[row.id] == "已连接"
+    assert bus.log.messages == ["plc1断开失败: 线程未在超时内退出"]
 
 
 def test_plc_settings_module_delete_plc_aborts_when_disconnect_fails(
