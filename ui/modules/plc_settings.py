@@ -31,6 +31,7 @@ class PlcSettingsModule(QWidget):
         self.services.plc_services = {}
         self.services.plc_threads = {}
         self.services.plc_state = {}
+        self._connect_failure_labels = {}
 
         self.init_ui()
         self.init_fun()
@@ -137,6 +138,11 @@ class PlcSettingsModule(QWidget):
         self.services.plc_state = {
             row.id: existing_states.get(row.id, "未连接")
             for row in rows
+        }
+        self._connect_failure_labels = {
+            row.id: self._connect_failure_labels[row.id]
+            for row in rows
+            if row.id in self._connect_failure_labels
         }
 
         self.combo_plc.blockSignals(True)
@@ -317,6 +323,7 @@ class PlcSettingsModule(QWidget):
         self.start_connect(row)
 
     def start_connect(self, row):
+        self._clear_connect_failure_label(row.id)
         if self.get_plc_state(row.id) != "未连接":
             return
         old_service = self.services.plc_services.get(row.id)
@@ -341,7 +348,7 @@ class PlcSettingsModule(QWidget):
             self.logger.warning(failure_message)
             self.services.bus.log.emit(failure_message)
             if self.combo_plc.currentData() == row.id:
-                self.set_connect_label(f"连接失败: {config_error}")
+                self.set_connect_label(self._set_connect_failure_label(row.id, config_error))
                 self.apply_connect_button_state(row.id)
                 QMessageBox.warning(self, "提示", failure_message)
             return
@@ -392,17 +399,21 @@ class PlcSettingsModule(QWidget):
 
         # 连接成功后记录 service；具体状态由 PlcService 的状态信号回传。
         if success and plc_service is not None:
+            self._clear_connect_failure_label(plc_id)
             self.services.plc_services[plc_id] = plc_service
             # 保留最近一次成功连接的服务，兼容原来单实例用法。
             self.services.plc = plc_service
             self.services.bus.log.emit(f"连接成功: {plc_id}")
+        elif not success:
+            failure_label = self._set_connect_failure_label(plc_id, message)
+            if row is not None and row.id == plc_id:
+                self.set_connect_label(failure_label)
+            if plc_service is not None:
+                connect_thread.quit()
+                connect_thread.wait(2000)
         elif plc_service is not None:
             connect_thread.quit()
             connect_thread.wait(2000)
-
-        if row is not None and row.id == plc_id:
-            if not success:
-                self.set_connect_label(f"连接失败: {message}" if message else "连接失败")
 
     def _on_connect_thread_stopped(self, plc_id, plc_service=None, connect_thread=None):
         self.logger.info(f"plc {plc_id} 线程已停止")
@@ -551,10 +562,14 @@ class PlcSettingsModule(QWidget):
             return False
 
         self.services.plc_state.pop(plc_id, None)
+        self._clear_connect_failure_label(plc_id)
         self._emit_plc_changed()
         return True
 
     def set_lb_text(self, row_id):
+        failure_label = self._connect_failure_labels.get(row_id)
+        if failure_label is not None:
+            return failure_label
         state = self.get_plc_state(row_id)
         if state == "连接中":
             return "连接中..."
@@ -588,6 +603,7 @@ class PlcSettingsModule(QWidget):
         self.services.plc_state[row_id] = state
 
     def on_plc_state_changed(self, plc_id, state):
+        self._clear_connect_failure_label(plc_id)
         self.set_plc_state(plc_id, state)
         row = self.get_current_row()
         if row is None or row.id != plc_id:
@@ -637,3 +653,11 @@ class PlcSettingsModule(QWidget):
         plc_changed = getattr(self.services.bus, "plc_changed", None)
         if plc_changed is not None:
             plc_changed.emit()
+
+    def _set_connect_failure_label(self, row_id: int, message: str | None) -> str:
+        label = f"连接失败: {message}" if message else "连接失败"
+        self._connect_failure_labels[row_id] = label
+        return label
+
+    def _clear_connect_failure_label(self, row_id: int) -> None:
+        self._connect_failure_labels.pop(row_id, None)
