@@ -414,30 +414,37 @@ class PlcSettingsModule(QWidget):
             f"后台线程{getattr(self.services, 'plc_threads', {}).get(plc_id)}"
         )
 
-    def disconnect_row(self, row_id):
-        # 断开时先停 service，再退出对应线程，最后把状态改回未连接。
-        plc_service = getattr(self.services, "plc_services", {}).get(row_id)
-        plc_thread = getattr(self.services, "plc_threads", {}).get(row_id)
-        self.logger.info(f"断开前正在运行的plc_services:{plc_service} , 线程{plc_thread}")
-        teardown_ok = True
-        if plc_service:
-            teardown_ok = self._request_stop_ack(row_id, plc_service)
-
-        if plc_thread is not None:
-            plc_thread.quit()
-            if not plc_thread.wait(self._THREAD_EXIT_TIMEOUT_MS):
-                teardown_ok = False
-                self._log_disconnect_failure(row_id, "线程未在超时内退出")
-
-        if not teardown_ok:
-            return False
-
+    def _clear_disconnected_runtime_state(self, row_id, plc_service) -> None:
         self.services.plc_services.pop(row_id, None)
         self.services.plc_threads.pop(row_id, None)
         self.services.plc_state[row_id] = "未连接"
         current_service = getattr(self.services, "plc", None)
         if current_service is plc_service:
             self.services.plc = None
+
+    def disconnect_row(self, row_id):
+        # 断开时先停 service，再退出对应线程，最后把状态改回未连接。
+        plc_service = getattr(self.services, "plc_services", {}).get(row_id)
+        plc_thread = getattr(self.services, "plc_threads", {}).get(row_id)
+        self.logger.info(f"断开前正在运行的plc_services:{plc_service} , 线程{plc_thread}")
+        teardown_ok = True
+        thread_exited = False
+        if plc_service:
+            teardown_ok = self._request_stop_ack(row_id, plc_service)
+
+        if plc_thread is not None:
+            plc_thread.quit()
+            thread_exited = plc_thread.wait(self._THREAD_EXIT_TIMEOUT_MS)
+            if not thread_exited:
+                teardown_ok = False
+                self._log_disconnect_failure(row_id, "线程未在超时内退出")
+
+        if teardown_ok or thread_exited:
+            self._clear_disconnected_runtime_state(row_id, plc_service)
+
+        if not teardown_ok:
+            return False
+
         return True
 
     def _request_stop_ack(self, row_id, plc_service) -> bool:

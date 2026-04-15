@@ -654,6 +654,76 @@ def test_plc_settings_module_disconnect_row_aborts_when_stop_ack_or_thread_exit_
     ]
 
 
+def test_plc_settings_module_disconnect_row_clears_runtime_state_when_stop_ack_times_out_but_thread_exits(
+    qapp,
+    plc_db,
+    monkeypatch,
+):
+    row = PlcTable.create(
+        plc_name="PLC Ack Timeout",
+        plc_ip="127.0.0.1",
+        plc_open_state=0,
+    )
+    bus = SimpleNamespace(log=_SignalProbe())
+    services = SimpleNamespace(
+        bus=bus,
+        _start_from_plc=lambda plc_id: None,
+    )
+    module = PlcSettingsModule(services)
+    qapp.processEvents()
+
+    class _ExitedThread:
+        def __init__(self):
+            self.quit_calls = 0
+            self.wait_calls = []
+
+        def quit(self):
+            self.quit_calls += 1
+
+        def wait(self, timeout_ms):
+            self.wait_calls.append(timeout_ms)
+            return True
+
+    stop_requests = []
+    plc_service = SimpleNamespace(stop_completed=_SignalStub())
+    plc_thread = _ExitedThread()
+
+    def _invoke_method(target, method_name, connection_type):
+        stop_requests.append((target, method_name, connection_type))
+        return True
+
+    monkeypatch.setattr(
+        "ui.modules.plc_settings.QMetaObject",
+        SimpleNamespace(invokeMethod=_invoke_method),
+    )
+    monkeypatch.setattr(module, "_STOP_ACK_TIMEOUT_MS", 10)
+    monkeypatch.setattr(module, "_THREAD_EXIT_TIMEOUT_MS", 10)
+    services.plc_services[row.id] = plc_service
+    services.plc_threads[row.id] = plc_thread
+    services.plc_state[row.id] = "已连接"
+    services.plc = plc_service
+
+    disconnected = module.disconnect_row(row.id)
+
+    assert disconnected is False
+    assert stop_requests == [
+        (
+            plc_service,
+            "stop_plc_service",
+            Qt.ConnectionType.QueuedConnection,
+        )
+    ]
+    assert plc_thread.quit_calls == 1
+    assert plc_thread.wait_calls == [10]
+    assert row.id not in services.plc_services
+    assert row.id not in services.plc_threads
+    assert services.plc_state[row.id] == "未连接"
+    assert services.plc is None
+    assert bus.log.messages == [
+        "plc1断开失败: stop_plc_service 未在超时内确认",
+    ]
+
+
 def test_plc_settings_module_delete_plc_aborts_when_disconnect_fails(
     qapp,
     plc_db,

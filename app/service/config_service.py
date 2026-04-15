@@ -224,6 +224,15 @@ class ConfigService:
         self.commit_pending_save(pending)
         return pending.config_id
 
+    def _raise_save_integrity_error(self, exc: IntegrityError, data: dict) -> None:
+        error_text = str(exc).lower()
+        if (
+            data.get("plc_id") is not None
+            and "foreign key constraint failed" in error_text
+        ):
+            raise ValueError("PLC 不存在或已被删除") from exc
+        raise ValueError(f"配置名称「{data['config_name']}」已存在") from exc
+
     def begin_save_config(self, data: dict) -> PendingConfigSave:
         errors = self.validate(data)
         if errors:
@@ -295,9 +304,9 @@ class ConfigService:
                         config=config_id,
                         **self._channel_db_values(channel),
                     )
-        except IntegrityError:
+        except IntegrityError as exc:
             self._safe_rollback(promoted_paths)
-            raise ValueError(f"配置名称「{data['config_name']}」已存在")
+            self._raise_save_integrity_error(exc, data)
         except Exception:
             self._safe_rollback(promoted_paths)
             raise
