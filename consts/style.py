@@ -169,12 +169,22 @@ QPushButton {
   border-radius: 8px;
   padding: 8px 10px;
 }
+QPushButton:disabled {
+  background: #e5e7eb;
+  border: 1px solid #d1d5db;
+  color: #94a3b8;
+}
 QPushButton:hover { background: #f8fafc; }
 QPushButton:pressed { background: #eef2ff; }
 QPushButton#Primary {
   background: #2563eb;
   border: 1px solid #2563eb;
   color: white;
+}
+QPushButton#Primary:disabled {
+  background: #93c5fd;
+  border: 1px solid #93c5fd;
+  color: #e5e7eb;
 }
 QPushButton#Primary:hover { background: #1d4ed8; }
 QPushButton#Danger {

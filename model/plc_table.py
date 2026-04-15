@@ -14,7 +14,8 @@ class PlcTable(BaseModel):
     plc_bit_index = IntegerField(null=True)
     plc_poll_interval_ms = IntegerField(null=True)
     plc_reconnect_interval_ms = IntegerField(null=True)
-    plc_state = IntegerField(null=True) # 0 关闭, 1打开
+    # plc_connect_state = IntegerField(null=True) # 0 断开 1已连接, 2连接中  先不用
+    plc_open_state = IntegerField(null=True)  # 0 开机不连接, 1开机自动连接
 
     class Meta:
         table_name = "plc_table"

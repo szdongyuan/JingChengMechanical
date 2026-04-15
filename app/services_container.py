@@ -10,7 +10,6 @@ from app.service.db_connection_service import DbConnectionService
 from app.service.factory_selection_settings import FactorySelectionSettings
 from app.service.hardwareselect_service import HardwareSelectService
 from app.service.input_calibration_service import InputCalibrationService
-from app.service.plc_service import PlcService
 
 
 @dataclass(frozen=True)
@@ -242,25 +241,7 @@ class ServiceContainer:
 
         self.factory_mode = FactoryModeController(self.bus, self)
 
-        # PLC 对接说明：
-        # 1. 程序启动时自动尝试连接一次 PLC。
-        # 2. 然后持续轮询下面这个“开始信号位”。
-        # 3. 读到 0 -> 1 时，就触发 self.test.start(...)。
-        # self.plc = PlcService(
-        #     bus=self.bus,
-        #     on_start_requested=self._start_from_plc,
-        #     ip="192.168.0.1",  # PLC 的 IP 地址
-        #     rack=0,  # S7-1200 常用 rack=0  机架号
-        #     slot=1,  # S7-1200 常用 slot=1  槽号
-        #     db_number=1,  # 数据块号DB，例如 DB1
-        #     byte_index=0,  # 字节偏移，例如 DB1.DBB0
-        #     bit_index=0,  # 位偏移，例如 DB1.DBX0.0
-        #     poll_interval_ms=200,  # 每 200ms 轮询一次
-        #     reconnect_interval_ms=3000,  # 断线后每 3 秒重连一次
-        #     auto_reset_bit=True,  # 触发后自动写回 0
-        # )
-        # self.plc.start()
 
     def _start_from_plc(self):
         self.bus.log.emit("[PLC] 触发开始 -> 执行测试开始逻辑")
-        self.test.start({})
+        # 调用播放

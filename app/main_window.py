@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QAction, QCloseEvent, QKeyEvent
+from PyQt6.QtCore import Qt, QMetaObject
+from PyQt6.QtGui import QAction, QCloseEvent
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
@@ -12,7 +12,7 @@ from PyQt6.QtWidgets import (
     QStackedWidget,
     QToolButton,
     QVBoxLayout,
-    QWidget, QApplication, QLineEdit, QPlainTextEdit, QTextEdit,
+    QWidget,
 )
 
 from app.services_container import FactoryControllerState, FactoryReviewPayload
@@ -114,28 +114,6 @@ class MainWindow(QMainWindow):
             self.login_shown = True
             self.show_login_window(close_main_window=True, window_title="登录")
 
-    def keyPressEvent(self, event: QKeyEvent):
-        focus_widget = QApplication.focusWidget()
-        is_text_input = (
-                isinstance(focus_widget, QLineEdit)
-                or isinstance(focus_widget, QPlainTextEdit)
-                or (isinstance(focus_widget, QTextEdit) and not focus_widget.isReadOnly())
-        )
-        print("回车被按下")
-        print("is_text_input =", is_text_input)
-        print("event.key", event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter)
-        if (event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter) and not is_text_input:
-            print("有没有 plc 服务：", hasattr(self.services, "plc"))
-            if hasattr(self.services, "plc"):
-                print("有 plc 服务")
-                self.services.plc.simulate_rising_edge()
-                event.accept()
-                return
-            else:
-                print("没有 plc 服务")
-        else:
-            print("没有进入 PLC 模拟分支")
-        super().keyPressEvent(event)
 
     def show_login_window(self, close_main_window=False, window_title="登录"):
         self.setEnabled(False)
@@ -620,8 +598,19 @@ class MainWindow(QMainWindow):
         self.services.bus.log.emit("关闭程序")
         try:
             # 停止 PLC 监听
-            if hasattr(self.services, "plc"):
-                self.services.plc.stop()
+            for plc_service in getattr(self.services, "plc_services", {}).values():
+                if plc_service is None:
+                    continue
+                QMetaObject.invokeMethod(
+                    plc_service,
+                    "stop_plc_service",
+                    Qt.ConnectionType.BlockingQueuedConnection,
+                )
+            for plc_thread in getattr(self.services, "plc_threads", {}).values():
+                if plc_thread is None:
+                    continue
+                plc_thread.quit()
+                plc_thread.wait(2000)
             # 关闭 DB 长连接
             self.services.db.close()
             # 视频关闭
