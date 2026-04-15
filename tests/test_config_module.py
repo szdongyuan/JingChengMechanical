@@ -472,6 +472,22 @@ def test_config_module_loads_stale_saved_plc_id_into_unbound_selector(qapp):
     assert module.combo_plc.currentData() is None
 
 
+def test_config_module_loads_explicit_unbound_config_after_bound_config_in_same_session(
+    qapp,
+):
+    plc = PlcTable.create(plc_name="PLC A")
+    module = _make_module()
+
+    module._populate_detail(_detail_payload([], plc_id=plc.id))
+    assert module.combo_plc.currentData() == plc.id
+
+    module._populate_detail(
+        _detail_payload([], config_id=8, config_name="Cfg2", plc_id=None)
+    )
+
+    assert module.combo_plc.currentData() is None
+
+
 def test_checkbox_uses_approved_visible_label_for_allow_incomplete_recording_analysis(
     qapp,
 ):

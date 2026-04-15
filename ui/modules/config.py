@@ -47,6 +47,7 @@ _GOLDEN_BINDING_FIELDS = (
     "golden_sample_duration_ms",
     "golden_sample_sample_rate",
 )
+_PRESERVE_PLC_SELECTION = object()
 
 
 class _NoWheelSpinBox(QDoubleSpinBox):
@@ -423,8 +424,14 @@ class ConfigModule(QWidget):
             return f"ID {plc_row.id} - {plc_name}"
         return f"ID {plc_row.id}"
 
-    def _refresh_plc_selector(self, selected_plc_id: int | None = None) -> None:
-        if selected_plc_id is None and self.combo_plc.count() > 0:
+    def _refresh_plc_selector(
+        self,
+        selected_plc_id: int | None | object = _PRESERVE_PLC_SELECTION,
+    ) -> None:
+        if (
+            selected_plc_id is _PRESERVE_PLC_SELECTION
+            and self.combo_plc.count() > 0
+        ):
             selected_plc_id = self.combo_plc.currentData()
         self.combo_plc.blockSignals(True)
         self.combo_plc.clear()

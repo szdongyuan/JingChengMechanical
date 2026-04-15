@@ -475,8 +475,9 @@ def test_connect_migrates_legacy_config_tables_and_preserves_extra_columns(
         ).load_config(1)
         assert loaded["analysis_window_offset_ms"] == 0
         assert loaded["allow_incomplete_recording_analysis"] is False
-        assert loaded["plc_device_key"] is None
-        assert loaded["plc_device_label"] is None
+        assert loaded["plc_id"] is None
+        assert "plc_device_key" not in loaded
+        assert "plc_device_label" not in loaded
         assert loaded["selected_channels"] == [0]
         assert loaded["channels"] == [
             {
