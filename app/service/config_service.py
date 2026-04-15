@@ -11,6 +11,7 @@ from app.service.golden_sample_service import GoldenSampleService, StagedGoldenS
 from consts.time_consts import now_str
 from model.channel_config_table import ChannelConfigTable
 from model.device_table import DeviceTable
+from model.plc_table import PlcTable
 from model.test_config_table import TestConfigTable
 
 logger = logging.getLogger(__name__)
@@ -127,8 +128,7 @@ class ConfigService:
                 getattr(cfg, "allow_incomplete_recording_analysis", False)
             ),
             "scan_triggers_test": bool(cfg.scan_triggers_test),
-            "plc_device_key": self._normalize_optional_text(cfg.plc_device_key),
-            "plc_device_label": self._normalize_optional_text(cfg.plc_device_label),
+            "plc_id": cfg.plc_id,
             "input_device_name": cfg.input_device_name,
             "input_device_hostapi": cfg.input_device_hostapi,
             "input_device_samplerate": cfg.input_device_samplerate,
@@ -277,12 +277,7 @@ class ConfigService:
                         data.get("allow_incomplete_recording_analysis", False)
                     ),
                     scan_triggers_test=data["scan_triggers_test"],
-                    plc_device_key=self._normalize_optional_text(
-                        data.get("plc_device_key")
-                    ),
-                    plc_device_label=self._normalize_optional_text(
-                        data.get("plc_device_label")
-                    ),
+                    plc=data.get("plc_id"),
                     input_device_name=data.get("input_device_name"),
                     input_device_hostapi=data.get("input_device_hostapi"),
                     input_device_samplerate=data.get("input_device_samplerate"),
@@ -389,6 +384,12 @@ class ConfigService:
             data.get("allow_incomplete_recording_analysis", False), bool
         ):
             errors.append("允许分析不完整录音必须为布尔值")
+        plc_id = data.get("plc_id")
+        if plc_id is not None:
+            if not isinstance(plc_id, int) or isinstance(plc_id, bool):
+                errors.append("PLC 绑定无效")
+            elif not PlcTable.select().where(PlcTable.id == plc_id).exists():
+                errors.append("PLC 不存在或已被删除")
 
         errors.extend(self.validate_factory_runtime(data))
 
