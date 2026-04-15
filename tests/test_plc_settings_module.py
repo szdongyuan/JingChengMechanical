@@ -356,6 +356,40 @@ def test_plc_settings_module_reloads_rows_when_plc_changed_signal_fires(qapp, pl
     ]
 
 
+def test_plc_settings_module_refresh_does_not_reconnect_open_state_rows_after_bootstrap(
+    qapp,
+    plc_db,
+    monkeypatch,
+):
+    row = PlcTable.create(
+        plc_name="PLC Open",
+        plc_ip="127.0.0.1",
+        plc_open_state=1,
+    )
+    bus = SimpleNamespace(log=_SignalProbe(), plc_changed=_SignalStub())
+    services = SimpleNamespace(
+        bus=bus,
+        _start_from_plc=lambda plc_id: None,
+    )
+    start_calls = []
+
+    def _start_connect(self, plc_row):
+        start_calls.append(plc_row.id)
+
+    monkeypatch.setattr(PlcSettingsModule, "start_connect", _start_connect)
+
+    module = PlcSettingsModule(services)
+    qapp.processEvents()
+
+    assert start_calls == [row.id]
+
+    bus.plc_changed.emit()
+    qapp.processEvents()
+
+    assert start_calls == [row.id]
+    assert module.combo_plc.count() == 1
+
+
 def test_plc_settings_module_emits_plc_changed_after_committed_save(
     qapp,
     plc_db,
@@ -448,3 +482,44 @@ def test_plc_settings_module_delete_plc_disconnects_before_delete_and_emits_plc_
     assert bus.plc_changed.emissions == [((), {})]
     assert plc_exists_when_signaled == [False]
     assert module.combo_plc.count() == 0
+
+
+def test_plc_settings_module_delete_plc_aborts_when_disconnect_fails(
+    qapp,
+    plc_db,
+    monkeypatch,
+):
+    row = PlcTable.create(
+        plc_name="PLC Delete Fail",
+        plc_ip="127.0.0.1",
+        plc_open_state=0,
+    )
+    bus = SimpleNamespace(log=_SignalProbe(), plc_changed=_SignalStub())
+    services = SimpleNamespace(
+        bus=bus,
+        _start_from_plc=lambda plc_id: None,
+    )
+    module = PlcSettingsModule(services)
+    qapp.processEvents()
+
+    disconnect_calls = []
+    signal_calls = []
+
+    def _disconnect_row(plc_id):
+        disconnect_calls.append(plc_id)
+        return False
+
+    monkeypatch.setattr(module, "disconnect_row", _disconnect_row)
+    bus.plc_changed.connect(lambda: signal_calls.append("changed"))
+    services.plc_services[row.id] = object()
+    services.plc_threads[row.id] = object()
+
+    deleted = module.delete_plc(row.id)
+    qapp.processEvents()
+
+    assert deleted is False
+    assert disconnect_calls == [row.id]
+    assert PlcTable.select().where(PlcTable.id == row.id).exists()
+    assert bus.plc_changed.emissions == []
+    assert signal_calls == []
+    assert module.combo_plc.count() == 1

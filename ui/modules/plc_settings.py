@@ -32,7 +32,7 @@ class PlcSettingsModule(QWidget):
 
         self.init_ui()
         self.init_fun()
-        self.reload_rows()
+        self.reload_rows(auto_connect=True)
 
     def init_ui(self):
         root = QVBoxLayout(self)
@@ -122,7 +122,7 @@ class PlcSettingsModule(QWidget):
         if plc_changed is not None:
             plc_changed.connect(self.reload_rows)
 
-    def reload_rows(self):
+    def reload_rows(self, auto_connect: bool = False):
         # 每次重载都从数据库重新取 PLC 列表，并刷新下拉框。
         current_plc_id = self.combo_plc.currentData()
         try:
@@ -156,9 +156,10 @@ class PlcSettingsModule(QWidget):
 
         if has_rows:
             self.on_combo_changed()
-            for row in rows:
-                if self._is_open_state_enabled(row.plc_open_state):
-                    self.start_connect(row)
+            if auto_connect:
+                for row in rows:
+                    if self._is_open_state_enabled(row.plc_open_state):
+                        self.start_connect(row)
         else:
             self._render_empty()
 
@@ -416,25 +417,40 @@ class PlcSettingsModule(QWidget):
         plc_service = getattr(self.services, "plc_services", {}).get(row_id)
         plc_thread = getattr(self.services, "plc_threads", {}).get(row_id)
         self.logger.info(f"断开前正在运行的plc_services:{plc_service} , 线程{plc_thread}")
+        teardown_ok = True
         if plc_service:
             try:
-                QMetaObject.invokeMethod(
+                stop_invoked = QMetaObject.invokeMethod(
                     plc_service,
                     "stop_plc_service",
                     Qt.ConnectionType.BlockingQueuedConnection,
                 )
-                self.services.plc_services.pop(row_id, None)
+                if stop_invoked is False:
+                    teardown_ok = False
+                    self.services.bus.log.emit(f"plc{row_id}断开失败: stop_plc_service 未执行")
+                    self.logger.error(f"plc{row_id}断开失败: stop_plc_service 未执行")
             except Exception as exc:
+                teardown_ok = False
                 self.services.bus.log.emit(f"plc{row_id}断开失败: {exc}")
                 self.logger.error(f"plc{row_id}断开失败: {exc}")
 
         if plc_thread is not None:
             plc_thread.quit()
-            plc_thread.wait(2000)
+            if not plc_thread.wait(2000):
+                teardown_ok = False
+                self.services.bus.log.emit(f"plc{row_id}断开失败: 线程未在超时内退出")
+                self.logger.error(f"plc{row_id}断开失败: 线程未在超时内退出")
+
+        if not teardown_ok:
+            return False
+
+        self.services.plc_services.pop(row_id, None)
+        self.services.plc_threads.pop(row_id, None)
         self.services.plc_state[row_id] = "未连接"
         current_service = getattr(self.services, "plc", None)
         if current_service is plc_service:
             self.services.plc = None
+        return True
 
     def delete_plc(self, plc_id: int) -> bool:
         if not PlcTable.select().where(PlcTable.id == plc_id).exists():
@@ -444,7 +460,8 @@ class PlcSettingsModule(QWidget):
             getattr(self.services, "plc_services", {}).get(plc_id) is not None
             or getattr(self.services, "plc_threads", {}).get(plc_id) is not None
         ):
-            self.disconnect_row(plc_id)
+            if self.disconnect_row(plc_id) is False:
+                return False
 
         with PlcTable._meta.database.atomic():
             deleted = (
