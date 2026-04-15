@@ -63,6 +63,7 @@ class DbConnectionService:
                 ("allow_incomplete_recording_analysis", "INTEGER NOT NULL DEFAULT 0"),
             ],
         )
+        self._ensure_test_config_table_plc_fk()
         self._ensure_columns(
             "channel_config_table",
             [
@@ -124,8 +125,104 @@ class DbConnectionService:
             )
 
     def _get_table_columns(self, table_name: str) -> set[str]:
+        return {row[1] for row in self._get_table_column_rows(table_name)}
+
+    def _get_table_column_rows(self, table_name: str) -> list[tuple]:
         cursor = db.execute_sql(f"PRAGMA table_info({table_name})")
-        return {row[1] for row in cursor.fetchall()}
+        return cursor.fetchall()
+
+    def _get_table_foreign_keys(self, table_name: str) -> list[tuple]:
+        cursor = db.execute_sql(f"PRAGMA foreign_key_list({table_name})")
+        return cursor.fetchall()
+
+    def _ensure_test_config_table_plc_fk(self):
+        if not self._test_config_table_requires_plc_fk_rebuild():
+            return
+
+        existing_columns = self._get_table_column_rows("test_config_table")
+        retained_columns = [row for row in existing_columns if row[1] != "plc_id"]
+        column_definitions = [
+            self._build_test_config_column_definition(row) for row in retained_columns
+        ]
+        column_definitions.append(
+            '"plc_id" INTEGER REFERENCES "plc_table" ("id") ON DELETE SET NULL'
+        )
+
+        insert_columns = [row[1] for row in retained_columns] + ["plc_id"]
+        select_columns = [self._quote_identifier(row[1]) for row in retained_columns]
+        select_columns.append('NULL AS "plc_id"')
+
+        db.execute_sql("PRAGMA foreign_keys = OFF")
+        try:
+            with db.atomic():
+                db.execute_sql(
+                    """
+                    CREATE TABLE test_config_table__plc_rebuild (
+                        {}
+                    )
+                    """.format(",\n                        ".join(column_definitions))
+                )
+                db.execute_sql(
+                    """
+                    INSERT INTO test_config_table__plc_rebuild ({})
+                    SELECT {}
+                    FROM test_config_table
+                    """.format(
+                        ", ".join(
+                            self._quote_identifier(column_name)
+                            for column_name in insert_columns
+                        ),
+                        ", ".join(select_columns),
+                    )
+                )
+                db.execute_sql("DROP TABLE test_config_table")
+                db.execute_sql(
+                    """
+                    ALTER TABLE test_config_table__plc_rebuild
+                    RENAME TO test_config_table
+                    """
+                )
+                db.execute_sql(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS test_config_table_config_name_unique
+                    ON test_config_table (config_name)
+                    """
+                )
+        finally:
+            db.execute_sql("PRAGMA foreign_keys = ON")
+
+    def _test_config_table_requires_plc_fk_rebuild(self) -> bool:
+        columns = {row[1]: row for row in self._get_table_column_rows("test_config_table")}
+        plc_column = columns.get("plc_id")
+        if plc_column is None:
+            return True
+        if plc_column[3]:
+            return True
+
+        return not any(
+            row[2] == "plc_table"
+            and row[3] == "plc_id"
+            and row[4] == "id"
+            and row[6].upper() == "SET NULL"
+            for row in self._get_table_foreign_keys("test_config_table")
+        )
+
+    def _build_test_config_column_definition(self, column_row: tuple) -> str:
+        _, column_name, column_type, not_null, default_value, primary_key = column_row
+        definition = [self._quote_identifier(column_name)]
+        if column_type:
+            definition.append(column_type)
+        if primary_key:
+            definition.append("PRIMARY KEY")
+        if not_null and not primary_key:
+            definition.append("NOT NULL")
+        if default_value is not None:
+            definition.append(f"DEFAULT {default_value}")
+        return " ".join(definition)
+
+    def _quote_identifier(self, identifier: str) -> str:
+        escaped = identifier.replace('"', '""')
+        return f'"{escaped}"'
 
     def _remove_obsolete_ai_binding_score_threshold(self):
         columns = self._get_table_columns("test_config_ai_binding_table")

@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
-from peewee import SqliteDatabase
+from peewee import IntegrityError, SqliteDatabase
 
 from app.service.config_service import ConfigService
 from app.service.hardwareselect_service import HardwareSelectService
@@ -91,6 +91,11 @@ def _index_definitions(tmp_db, table_name: str) -> list[tuple[str, tuple[str, ..
 def _table_columns(tmp_db, table_name: str) -> dict[str, tuple]:
     cursor = tmp_db.execute_sql(f"PRAGMA table_info({table_name})")
     return {row[1]: row for row in cursor.fetchall()}
+
+
+def _foreign_keys(tmp_db, table_name: str) -> list[tuple]:
+    cursor = tmp_db.execute_sql(f"PRAGMA foreign_key_list({table_name})")
+    return cursor.fetchall()
 
 
 def _runtime_table_names(tmp_db) -> set[str]:
@@ -504,6 +509,438 @@ def test_connect_migrates_legacy_config_tables_and_preserves_extra_columns(
                 "oct_show_golden_overlay": False,
             }
         ]
+
+
+def test_connect_repairs_test_config_table_with_real_plc_fk_delete_semantics(
+    monkeypatch,
+):
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
+        svc.connect()
+
+        fresh_columns = _table_columns(tmp_db, "test_config_table")
+        fresh_foreign_keys = _foreign_keys(tmp_db, "test_config_table")
+
+        assert "plc_id" in fresh_columns
+        assert fresh_columns["plc_id"][3] == 0
+        assert (
+            "plc_table",
+            "plc_id",
+            "id",
+            "SET NULL",
+        ) in {(row[2], row[3], row[4], row[6]) for row in fresh_foreign_keys}
+
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
+        tmp_db.connect()
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE test_config_table (
+                config_id INTEGER PRIMARY KEY,
+                config_name TEXT NOT NULL UNIQUE,
+                record_duration REAL NOT NULL DEFAULT 5.0,
+                analysis_duration REAL NOT NULL DEFAULT 3.0,
+                allow_incomplete_recording_analysis INTEGER NOT NULL DEFAULT 0,
+                scan_triggers_test INTEGER NOT NULL DEFAULT 0,
+                plc_device_key TEXT,
+                plc_device_label TEXT,
+                created_time TEXT NOT NULL DEFAULT '',
+                updated_time TEXT NOT NULL DEFAULT '',
+                input_device_name TEXT,
+                input_device_hostapi TEXT,
+                input_device_samplerate REAL,
+                output_device_name TEXT,
+                output_device_hostapi TEXT,
+                output_device_samplerate REAL,
+                selected_channels TEXT DEFAULT '[]',
+                analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0,
+                legacy_note TEXT DEFAULT ''
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE channel_config_table (
+                channel_config_id INTEGER PRIMARY KEY,
+                config_id INTEGER NOT NULL REFERENCES test_config_table(config_id) ON DELETE CASCADE,
+                channel_index INTEGER NOT NULL,
+                stft_nfft INTEGER NOT NULL DEFAULT 1024,
+                fft_nfft INTEGER NOT NULL DEFAULT 4096,
+                stft_overlap REAL NOT NULL DEFAULT 0.5,
+                spl_weighting TEXT NOT NULL DEFAULT 'A',
+                spl_time_constant REAL NOT NULL DEFAULT 0.125,
+                spl_upper_limit REAL NOT NULL DEFAULT 85.0,
+                spl_lower_limit REAL NOT NULL DEFAULT 40.0,
+                loudness_unit TEXT NOT NULL DEFAULT 'sone',
+                loudness_lower_limit REAL NOT NULL DEFAULT 0,
+                loudness_upper_limit REAL NOT NULL DEFAULT 60,
+                fft_band_limits TEXT NOT NULL DEFAULT '[]',
+                oct_weighting TEXT NOT NULL DEFAULT 'A',
+                oct_band_limits TEXT NOT NULL DEFAULT '[]',
+                ai_config TEXT NOT NULL DEFAULT '{}',
+                golden_sample_path TEXT DEFAULT NULL,
+                golden_sample_label TEXT DEFAULT NULL,
+                golden_sample_source_channel INTEGER DEFAULT NULL,
+                golden_sample_start_sample INTEGER DEFAULT NULL,
+                golden_sample_num_samples INTEGER DEFAULT NULL,
+                golden_sample_start_ms INTEGER DEFAULT NULL,
+                golden_sample_duration_ms INTEGER DEFAULT NULL,
+                golden_sample_sample_rate REAL DEFAULT NULL,
+                fft_golden_mode TEXT DEFAULT 'off',
+                fft_show_golden_overlay INTEGER NOT NULL DEFAULT 0,
+                oct_golden_mode TEXT DEFAULT 'off',
+                oct_show_golden_overlay INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE ai_toolchain_table (
+                toolchain_id TEXT PRIMARY KEY
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE test_config_ai_binding_table (
+                binding_id INTEGER PRIMARY KEY,
+                config_id INTEGER NOT NULL UNIQUE REFERENCES test_config_table(config_id) ON DELETE CASCADE,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                toolchain_id TEXT REFERENCES ai_toolchain_table(toolchain_id) ON DELETE SET NULL,
+                timeout_ms INTEGER,
+                params_json TEXT NOT NULL DEFAULT '{}',
+                updated_time TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO test_config_table (
+                config_id,
+                config_name,
+                record_duration,
+                analysis_duration,
+                allow_incomplete_recording_analysis,
+                scan_triggers_test,
+                plc_device_key,
+                plc_device_label,
+                created_time,
+                updated_time,
+                input_device_name,
+                input_device_hostapi,
+                input_device_samplerate,
+                output_device_name,
+                output_device_hostapi,
+                output_device_samplerate,
+                selected_channels,
+                analysis_window_offset_ms,
+                legacy_note
+            ) VALUES
+                (
+                    7,
+                    'Legacy Config A',
+                    11.5,
+                    4.25,
+                    1,
+                    1,
+                    'legacy-a',
+                    'Legacy PLC A',
+                    '2026-04-10 01:02:03',
+                    '2026-04-10 04:05:06',
+                    'Mic A',
+                    'Host API A',
+                    44100,
+                    'Speaker A',
+                    'Output API A',
+                    48000,
+                    '[0, 2]',
+                    150,
+                    'keep row A'
+                ),
+                (
+                    11,
+                    'Legacy Config B',
+                    9.75,
+                    2.5,
+                    0,
+                    0,
+                    'legacy-b',
+                    'Legacy PLC B',
+                    '2026-04-11 01:02:03',
+                    '2026-04-11 04:05:06',
+                    'Mic B',
+                    'Host API B',
+                    22050,
+                    'Speaker B',
+                    'Output API B',
+                    96000,
+                    '[1]',
+                    25,
+                    'keep row B'
+                )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO channel_config_table (
+                channel_config_id,
+                config_id,
+                channel_index,
+                stft_nfft,
+                fft_nfft,
+                stft_overlap,
+                spl_weighting,
+                spl_time_constant,
+                spl_upper_limit,
+                spl_lower_limit,
+                loudness_unit,
+                loudness_lower_limit,
+                loudness_upper_limit,
+                fft_band_limits,
+                oct_weighting,
+                oct_band_limits,
+                ai_config,
+                golden_sample_path,
+                golden_sample_label,
+                golden_sample_source_channel,
+                golden_sample_start_sample,
+                golden_sample_num_samples,
+                golden_sample_start_ms,
+                golden_sample_duration_ms,
+                golden_sample_sample_rate,
+                fft_golden_mode,
+                fft_show_golden_overlay,
+                oct_golden_mode,
+                oct_show_golden_overlay
+            ) VALUES (
+                21,
+                7,
+                0,
+                1024,
+                8192,
+                0.75,
+                'Z',
+                0.5,
+                99.0,
+                10.0,
+                'phon',
+                5.0,
+                70.0,
+                '[10, 5000]',
+                'B',
+                '[31.5, 63.0]',
+                '{"mode": "legacy"}',
+                'golden.wav',
+                'Golden',
+                1,
+                128,
+                2048,
+                12,
+                34,
+                12345,
+                'overlay',
+                1,
+                'delta',
+                1
+            )
+            """
+        )
+        tmp_db.execute_sql(
+            """
+            INSERT INTO test_config_ai_binding_table (
+                binding_id,
+                config_id,
+                enabled,
+                toolchain_id,
+                timeout_ms,
+                params_json,
+                updated_time
+            ) VALUES (
+                31,
+                11,
+                1,
+                NULL,
+                2500,
+                '{"binding": true}',
+                '2026-04-11 07:08:09'
+            )
+            """
+        )
+
+        svc.connect()
+
+        repaired_columns = _table_columns(tmp_db, "test_config_table")
+        repaired_foreign_keys = _foreign_keys(tmp_db, "test_config_table")
+
+        assert "plc_id" in repaired_columns
+        assert repaired_columns["plc_id"][3] == 0
+        assert {
+            "config_id",
+            "config_name",
+            "record_duration",
+            "analysis_duration",
+            "allow_incomplete_recording_analysis",
+            "scan_triggers_test",
+            "plc_id",
+            "plc_device_key",
+            "plc_device_label",
+            "created_time",
+            "updated_time",
+            "input_device_name",
+            "input_device_hostapi",
+            "input_device_samplerate",
+            "output_device_name",
+            "output_device_hostapi",
+            "output_device_samplerate",
+            "selected_channels",
+            "analysis_window_offset_ms",
+            "legacy_note",
+        } <= set(repaired_columns)
+        assert (
+            "plc_table",
+            "plc_id",
+            "id",
+            "SET NULL",
+        ) in {(row[2], row[3], row[4], row[6]) for row in repaired_foreign_keys}
+        assert tmp_db.execute_sql(
+            """
+            SELECT
+                config_id,
+                config_name,
+                record_duration,
+                analysis_duration,
+                allow_incomplete_recording_analysis,
+                scan_triggers_test,
+                plc_id,
+                plc_device_key,
+                plc_device_label,
+                created_time,
+                updated_time,
+                input_device_name,
+                input_device_hostapi,
+                input_device_samplerate,
+                output_device_name,
+                output_device_hostapi,
+                output_device_samplerate,
+                selected_channels,
+                analysis_window_offset_ms,
+                legacy_note
+            FROM test_config_table
+            ORDER BY config_id
+            """
+        ).fetchall() == [
+            (
+                7,
+                "Legacy Config A",
+                11.5,
+                4.25,
+                1,
+                1,
+                None,
+                "legacy-a",
+                "Legacy PLC A",
+                "2026-04-10 01:02:03",
+                "2026-04-10 04:05:06",
+                "Mic A",
+                "Host API A",
+                44100.0,
+                "Speaker A",
+                "Output API A",
+                48000.0,
+                "[0, 2]",
+                150,
+                "keep row A",
+            ),
+            (
+                11,
+                "Legacy Config B",
+                9.75,
+                2.5,
+                0,
+                0,
+                None,
+                "legacy-b",
+                "Legacy PLC B",
+                "2026-04-11 01:02:03",
+                "2026-04-11 04:05:06",
+                "Mic B",
+                "Host API B",
+                22050.0,
+                "Speaker B",
+                "Output API B",
+                96000.0,
+                "[1]",
+                25,
+                "keep row B",
+            ),
+        ]
+        assert tmp_db.execute_sql(
+            """
+            SELECT channel_config_id, config_id, channel_index, fft_nfft, ai_config
+            FROM channel_config_table
+            ORDER BY channel_config_id
+            """
+        ).fetchall() == [(21, 7, 0, 8192, '{"mode": "legacy"}')]
+        assert tmp_db.execute_sql(
+            """
+            SELECT binding_id, config_id, enabled, timeout_ms, params_json
+            FROM test_config_ai_binding_table
+            ORDER BY binding_id
+            """
+        ).fetchall() == [(31, 11, 1, 2500, '{"binding": true}')]
+        assert tmp_db.execute_sql("PRAGMA foreign_key_check").fetchall() == []
+
+        with pytest.raises(IntegrityError):
+            tmp_db.execute_sql(
+                """
+                INSERT INTO test_config_table (config_name)
+                VALUES ('Legacy Config A')
+                """
+            )
+
+
+def test_deleting_plc_row_sets_bound_config_plc_id_to_null(monkeypatch):
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
+        svc.connect()
+        tmp_db.execute_sql(
+            """
+            INSERT INTO plc_table (
+                id,
+                plc_name,
+                plc_ip,
+                plc_rack,
+                plc_slot,
+                plc_db_number,
+                plc_byte_index,
+                plc_bit_index,
+                plc_poll_interval_ms,
+                plc_reconnect_interval_ms,
+                plc_open_state
+            ) VALUES (
+                5,
+                'PLC 5',
+                '192.168.1.5',
+                0,
+                1,
+                2,
+                3,
+                4,
+                250,
+                1000,
+                1
+            )
+            """
+        )
+        ConfigTable.create(config_id=17, config_name="Bound Config", plc=5)
+
+        tmp_db.execute_sql("DELETE FROM plc_table WHERE id = 5")
+
+        assert tmp_db.execute_sql(
+            """
+            SELECT plc_id
+            FROM test_config_table
+            WHERE config_id = 17
+            """
+        ).fetchone() == (None,)
+        assert tmp_db.execute_sql("PRAGMA foreign_key_check").fetchall() == []
 
 
 def test_connect_migrates_allow_incomplete_recording_analysis_column(monkeypatch):
