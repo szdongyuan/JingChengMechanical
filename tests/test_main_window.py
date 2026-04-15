@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -10,6 +10,26 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.modules.setdefault("cv2", SimpleNamespace())
+if "snap7" not in sys.modules:
+    snap7_module = ModuleType("snap7")
+    snap7_client_module = ModuleType("snap7.client")
+    snap7_util_module = ModuleType("snap7.util")
+
+    class _Client:
+        def connect(self, *_args, **_kwargs):
+            return None
+
+        def disconnect(self):
+            return None
+
+    snap7_client_module.Client = _Client
+    snap7_util_module.get_bool = lambda *_args, **_kwargs: False
+    snap7_util_module.set_bool = lambda *_args, **_kwargs: None
+    snap7_module.client = snap7_client_module
+    snap7_module.util = snap7_util_module
+    sys.modules["snap7"] = snap7_module
+    sys.modules["snap7.client"] = snap7_client_module
+    sys.modules["snap7.util"] = snap7_util_module
 
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
@@ -130,6 +150,15 @@ def qapp():
     return app
 
 
+@pytest.fixture(autouse=True)
+def _close_top_level_widgets(qapp):
+    yield
+    for widget in list(qapp.topLevelWidgets()):
+        widget.close()
+        widget.deleteLater()
+    qapp.processEvents()
+
+
 def _patch_non_target_modules(monkeypatch, *, use_real_control: bool = False):
     module_names = [
         "WorkOrderModule",
@@ -139,6 +168,7 @@ def _patch_non_target_modules(monkeypatch, *, use_real_control: bool = False):
         "ConfigModule",
         "AiToolManagementModule",
         "ChannelSelectModule",
+        "PlcSettingsModule",
     ]
     if not use_real_control:
         module_names.append("ControlModule")
@@ -533,6 +563,79 @@ def test_closing_main_window_is_blocked_when_ai_tool_management_rejects_leave(
     assert window.ai_tool_management_module.confirm_leave_calls == 1
 
 
+def test_hardware_page_includes_plc_settings_card_alongside_existing_hardware_content(
+    qapp,
+    monkeypatch,
+):
+    monkeypatch.setattr(main_window_mod, "PlcSettingsModule", _StubModule, raising=False)
+
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    hardware_index = window.tab_names.index("硬件")
+    hardware_page = window.tab.widget(hardware_index)
+    card_titles = {
+        label.text()
+        for label in hardware_page.findChildren(QLabel)
+        if label.objectName() == "CardTitle"
+    }
+
+    assert {"设备选择", "通道选择", "输入校准", "PLC设置"} <= card_titles
+
+
+def test_closing_main_window_stops_plc_cleanup_before_shared_shutdown_and_camera(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    cleanup_steps = []
+    plc_service = object()
+    plc_thread = MagicMock()
+    plc_thread.quit.side_effect = lambda: cleanup_steps.append("thread_quit")
+    plc_thread.wait.side_effect = (
+        lambda timeout: cleanup_steps.append(("thread_wait", timeout))
+    )
+    services.plc_services = {101: plc_service}
+    services.plc_threads = {101: plc_thread}
+    services.shutdown.side_effect = lambda: cleanup_steps.append("shutdown")
+    services.db.close = MagicMock()
+    window.video.stop_camera = MagicMock(side_effect=lambda: cleanup_steps.append("camera"))
+
+    monkeypatch.setattr(
+        main_window_mod,
+        "Qt",
+        SimpleNamespace(
+            ConnectionType=SimpleNamespace(BlockingQueuedConnection="blocking")
+        ),
+        raising=False,
+    )
+
+    def _invoke_method(target, method_name, connection_type):
+        cleanup_steps.append(("plc_stop", target, method_name, connection_type))
+        return True
+
+    monkeypatch.setattr(
+        main_window_mod,
+        "QMetaObject",
+        SimpleNamespace(invokeMethod=_invoke_method),
+        raising=False,
+    )
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+
+    assert cleanup_steps == [
+        ("plc_stop", plc_service, "stop_plc_service", "blocking"),
+        "thread_quit",
+        ("thread_wait", 2000),
+        "shutdown",
+        "camera",
+    ]
+    services.db.close.assert_not_called()
+
+
 def test_closing_main_window_uses_shared_shutdown_boundary_and_stops_camera(
     qapp,
     monkeypatch,
@@ -544,6 +647,49 @@ def test_closing_main_window_uses_shared_shutdown_boundary_and_stops_camera(
     close_event = QCloseEvent()
     window.closeEvent(close_event)
 
+    services.shutdown.assert_called_once_with()
+    services.db.close.assert_not_called()
+    window.video.stop_camera.assert_called_once_with()
+
+
+def test_closing_main_window_still_uses_shared_shutdown_and_camera_when_plc_cleanup_raises(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    cleanup_steps = []
+    services.plc_services = {101: object()}
+    services.plc_threads = {}
+    services.shutdown.side_effect = lambda: cleanup_steps.append("shutdown")
+    services.db.close = MagicMock()
+    window.video.stop_camera = MagicMock(side_effect=lambda: cleanup_steps.append("camera"))
+
+    monkeypatch.setattr(
+        main_window_mod,
+        "Qt",
+        SimpleNamespace(
+            ConnectionType=SimpleNamespace(BlockingQueuedConnection="blocking")
+        ),
+        raising=False,
+    )
+
+    def _failing_invoke_method(*_args, **_kwargs):
+        cleanup_steps.append("plc_stop")
+        raise RuntimeError("plc cleanup failed")
+
+    monkeypatch.setattr(
+        main_window_mod,
+        "QMetaObject",
+        SimpleNamespace(invokeMethod=_failing_invoke_method),
+        raising=False,
+    )
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+
+    assert cleanup_steps == ["plc_stop", "shutdown", "camera"]
     services.shutdown.assert_called_once_with()
     services.db.close.assert_not_called()
     window.video.stop_camera.assert_called_once_with()

@@ -250,6 +250,9 @@ class ServiceContainer:
 
         self.factory_mode = FactoryModeController(self.bus, self)
 
+    def _start_from_plc(self) -> None:
+        self.bus.log.emit("[PLC] 触发开始 -> 执行测试开始逻辑")
+
     def shutdown(self) -> None:
         try:
             self.ai_service.shutdown()

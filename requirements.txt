@@ -13,3 +13,4 @@ pyqtgraph==0.13.7
 pywin32==311
 scipy==1.17.1
 sounddevice==0.5.5
+python-snap7==2.0.2

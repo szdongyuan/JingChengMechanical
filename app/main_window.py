@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from PyQt6.QtCore import QMetaObject, Qt
 from PyQt6.QtGui import QAction, QCloseEvent
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -33,6 +34,7 @@ from ui.modules.input_calibration import InputCalibrationModule
 from ui.modules.config import ConfigModule
 from ui.modules.ai_tool_management import AiToolManagementModule
 from ui.modules.channel_select import ChannelSelectModule
+from ui.modules.plc_settings import PlcSettingsModule
 from ui.modules.login import LoginWindow
 from ui.modules.change_password import ChangePasswordWindow
 from ui.modules.add_user import AddUserWindow
@@ -411,8 +413,14 @@ class MainWindow(QMainWindow):
         channel_card.setMaximumWidth(380)
         channel_card.setFixedHeight(100)
 
+        plc = PlcSettingsModule(self.services)
+        plc_card = Card("PLC设置", plc)
+        plc_card.setMaximumWidth(560)
+        plc_card.setFixedHeight(420)
+
         main_lay.addWidget(channel_card, 0)
         main_lay.addWidget(cal_row, 0)
+        main_lay.addWidget(plc_card, 0)
 
         main_lay.addStretch(1)
         content_lay.addWidget(main, 1)
@@ -730,6 +738,29 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self.services.bus.log.emit("[App] 关闭程序")
+        try:
+            for plc_service in getattr(self.services, "plc_services", {}).values():
+                if plc_service is None:
+                    continue
+                try:
+                    QMetaObject.invokeMethod(
+                        plc_service,
+                        "stop_plc_service",
+                        Qt.ConnectionType.BlockingQueuedConnection,
+                    )
+                except Exception:
+                    pass
+
+            for plc_thread in getattr(self.services, "plc_threads", {}).values():
+                if plc_thread is None:
+                    continue
+                try:
+                    plc_thread.quit()
+                    plc_thread.wait(2000)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             self.services.shutdown()
         except Exception:

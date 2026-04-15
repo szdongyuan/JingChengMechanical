@@ -335,6 +335,27 @@ def test_service_container_owns_factory_mode_controller(monkeypatch):
     assert services.factory_mode.services is services
 
 
+def test_service_container_exposes_plc_start_hook(monkeypatch):
+    logged = []
+
+    monkeypatch.setattr(mod.DbConnectionService, "connect", lambda self: None)
+    monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "InputCalibrationService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "ConfigService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "AiService", MagicMock(return_value=MagicMock()))
+
+    bus = mod.EventBus()
+    bus.log.connect(logged.append)
+
+    services = mod.ServiceContainer(bus=bus)
+
+    assert hasattr(services, "_start_from_plc")
+
+    services._start_from_plc()
+
+    assert logged == ["[PLC] 触发开始 -> 执行测试开始逻辑"]
+
+
 def test_service_container_exposes_factory_selection_settings(monkeypatch):
     monkeypatch.setattr(mod.DbConnectionService, "connect", lambda self: None)
     monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
