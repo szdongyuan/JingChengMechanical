@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 
-from app.service.analysis.frames import JudgmentResult, SplFrame, StftFrame
+from app.service.analysis.frames import FftFrame, JudgmentResult, SplFrame, StftFrame
 from app.service.analysis.test_session import TestSession
 from app.service.config_service import _CHANNEL_DEFAULTS
 from model.audio_data_table import AudioDataTable
@@ -51,6 +51,7 @@ def _make_config() -> dict:
         "channels": [{
             "channel_index": 0,
             "stft_nfft": 1024,
+            "fft_nfft": 4096,
             "stft_overlap": 0.5,
             "spl_weighting": "Z",
             "spl_time_constant": 0.125,
@@ -172,6 +173,37 @@ class TestTestSessionProcessing:
         assert bus.stft_updated.emit.call_count == 2
         assert bus.stft_updated.emit.call_args_list[0].args == (1, "factory-run-1", 0, frame_a)
         assert bus.stft_updated.emit.call_args_list[1].args == (1, "factory-run-1", 0, frame_b)
+
+    def test_on_chunk_re_emits_fft_frame_with_factory_run_id(self):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        session = TestSession(
+            config=_make_config(),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"factory_run_id": "factory-run-1"},
+            audio_dir="/tmp/audio",
+        )
+        fft_frame = FftFrame(
+            time=0.10,
+            frequencies=np.array([0.0, 100.0], dtype=np.float64),
+            magnitudes=np.array([1.0, 2.0], dtype=np.float64),
+        )
+        fake_pipeline = MagicMock()
+        fake_pipeline.channel_index = 0
+        fake_pipeline.process_chunk.return_value = {
+            "stft_frames": [],
+            "stft": None,
+            "spl": SplFrame(time=0.05, spl_db=60.0, weighting="Z"),
+            "octave": None,
+            "fft": fft_frame,
+        }
+        session._pipelines = [fake_pipeline]
+
+        session._on_chunk(np.ones((2048, 1), dtype=np.float32), 0)
+
+        assert bus.fft_updated.emit.call_args.args == (1, "factory-run-1", 0, fft_frame)
 
     def test_on_chunk_notifies_when_session_duration_expires(self):
         bus = _make_mock_bus()
@@ -377,6 +409,7 @@ class TestTestSessionJudgment:
             "module_status": "success",
             "ai_label": "PASS",
             "score": 0.91,
+            "decision_threshold": 0.5,
             "error_summary": None,
         }
         session = TestSession(
@@ -430,6 +463,7 @@ class TestTestSessionJudgment:
             "module_status": "success",
             "ai_label": "FAIL",
             "score": 0.12,
+            "decision_threshold": 0.5,
             "error_summary": None,
         }
         session = TestSession(
@@ -494,7 +528,6 @@ class TestTestSessionJudgment:
         ai = MagicMock()
         ai.resolve_binding.return_value = {
             "enabled": True,
-            "score_threshold": 0.8,
         }
         ai.run_ai_analysis.return_value = {
             "module_status": "timeout",
@@ -525,7 +558,7 @@ class TestTestSessionJudgment:
         assert result.ai_score is None
         assert result.overall == "合格"
         assert session.last_ai_review["status"] == "timeout"
-        assert session.last_ai_review["threshold"] == 0.8
+        assert session.last_ai_review["threshold"] is None
         assert session.last_ai_review["score"] is None
         assert session.last_ai_review["channel_index"] == 0
         assert session.last_ai_review["error_message"] == "Process timed out"
@@ -596,6 +629,7 @@ class TestTestSessionJudgment:
             "module_status": "success",
             "ai_label": "FAIL",
             "score": 0.12,
+            "decision_threshold": 0.5,
             "error_summary": None,
         }
         session = TestSession(
@@ -641,6 +675,7 @@ class TestTestSessionJudgment:
             "module_status": "success",
             "ai_label": "PASS",
             "score": 0.88,
+            "decision_threshold": 0.5,
             "error_summary": None,
         }
         session = TestSession(
@@ -710,6 +745,7 @@ class TestTestSessionJudgment:
             "module_status": "success",
             "ai_label": "PASS",
             "score": 0.88,
+            "decision_threshold": 0.5,
             "error_summary": None,
         }
         session = TestSession(
@@ -750,6 +786,7 @@ class TestTestSessionJudgment:
             "module_status": "success",
             "ai_label": "PASS",
             "score": 0.91,
+            "decision_threshold": 0.5,
             "error_summary": None,
         }
         session = TestSession(
@@ -846,7 +883,7 @@ class TestTestSessionWavSave:
 
 
 class TestScoreThresholdDecision:
-    """_run_ai() score threshold decision logic."""
+    """_run_ai() runtime threshold decision logic."""
 
     def _make_session(self, tmp_path, ai_mock, binding):
         ai_mock.resolve_binding.return_value = binding
@@ -866,122 +903,134 @@ class TestScoreThresholdDecision:
             overall="合格", limit_pass=True, ai_pass=None, ai_score=None,
         )
 
-    def test_score_above_threshold(self, tmp_path):
-        ai = MagicMock()
-        ai.run_ai_analysis.return_value = {
-            "module_status": "success", "ai_label": "PASS",
-            "score": 0.9, "error_summary": None,
-        }
-        session = self._make_session(tmp_path, ai, {
-            "enabled": True, "score_threshold": 0.8,
-        })
-        result = session._run_ai(self._make_base_result())
-        assert result.ai_pass is True
-        assert result.overall == "合格"
-
-    def test_score_below_threshold_overrides_label(self, tmp_path):
-        ai = MagicMock()
-        ai.run_ai_analysis.return_value = {
-            "module_status": "success", "ai_label": "PASS",
-            "score": 0.3, "error_summary": None,
-        }
-        session = self._make_session(tmp_path, ai, {
-            "enabled": True, "score_threshold": 0.8,
-        })
-        result = session._run_ai(self._make_base_result())
-        assert result.ai_pass is False
-        assert result.overall == "不合格"
-
-    def test_score_at_threshold_passes(self, tmp_path):
-        ai = MagicMock()
-        ai.run_ai_analysis.return_value = {
-            "module_status": "success", "ai_label": "FAIL",
-            "score": 0.8, "error_summary": None,
-        }
-        session = self._make_session(tmp_path, ai, {
-            "enabled": True, "score_threshold": 0.8,
-        })
-        result = session._run_ai(self._make_base_result())
-        assert result.ai_pass is True
-        assert result.overall == "合格"
-
-    def test_score_present_no_threshold_falls_back_to_label(self, tmp_path):
-        ai = MagicMock()
-        ai.run_ai_analysis.return_value = {
-            "module_status": "success", "ai_label": "PASS",
-            "score": 0.9, "error_summary": None,
-        }
-        session = self._make_session(tmp_path, ai, {
-            "enabled": True, "score_threshold": None,
-        })
-        result = session._run_ai(self._make_base_result())
-        assert result.ai_pass is True
-
-    def test_no_score_threshold_set_falls_back_to_label(self, tmp_path):
-        ai = MagicMock()
-        ai.run_ai_analysis.return_value = {
-            "module_status": "success", "ai_label": "FAIL",
-            "score": None, "error_summary": None,
-        }
-        session = self._make_session(tmp_path, ai, {
-            "enabled": True, "score_threshold": 0.8,
-        })
-        result = session._run_ai(self._make_base_result())
-        assert result.ai_pass is False
-
-    def test_no_score_no_threshold_falls_back_to_label(self, tmp_path):
-        ai = MagicMock()
-        ai.run_ai_analysis.return_value = {
-            "module_status": "success", "ai_label": "PASS",
-            "score": None, "error_summary": None,
-        }
-        session = self._make_session(tmp_path, ai, {
-            "enabled": True, "score_threshold": None,
-        })
-        result = session._run_ai(self._make_base_result())
-        assert result.ai_pass is True
-
-    def test_nan_score_falls_back_to_label(self, tmp_path):
-        ai = MagicMock()
-        ai.run_ai_analysis.return_value = {
-            "module_status": "success", "ai_label": "PASS",
-            "score": float("nan"), "error_summary": None,
-        }
-        session = self._make_session(tmp_path, ai, {
-            "enabled": True, "score_threshold": 0.8,
-        })
-        result = session._run_ai(self._make_base_result())
-        assert result.ai_pass is True
-        assert result.ai_score is None
-
-    def test_nan_score_preserves_missing_score_ai_review_even_when_label_fallback_passes(self, tmp_path):
-        ai = MagicMock()
-        ai.run_ai_analysis.return_value = {
+    def _make_success_envelope(self, **overrides):
+        envelope = {
             "module_status": "success",
             "ai_label": "PASS",
-            "score": float("nan"),
+            "score": 0.9,
+            "decision_threshold": 0.8,
             "error_summary": None,
         }
-        session = self._make_session(tmp_path, ai, {
-            "enabled": True,
-            "score_threshold": 0.8,
-        })
+        envelope.update(overrides)
+        return envelope
+
+    def test_score_above_envelope_threshold_overrides_fail_label(self, tmp_path):
+        ai = MagicMock()
+        ai.run_ai_analysis.return_value = self._make_success_envelope(
+            ai_label="FAIL",
+        )
+        session = self._make_session(tmp_path, ai, {"enabled": True})
+        result = session._run_ai(self._make_base_result())
+        assert result.ai_pass is True
+        assert result.ai_score == 0.9
+        assert result.overall == "合格"
+        assert session.last_ai_review["status"] == "success"
+        assert session.last_ai_review["threshold"] == 0.8
+        assert session.last_ai_review["score"] == 0.9
+
+    def test_score_below_envelope_threshold_fails_even_if_ai_label_is_pass(self, tmp_path):
+        ai = MagicMock()
+        ai.run_ai_analysis.return_value = self._make_success_envelope(score=0.3)
+        session = self._make_session(tmp_path, ai, {"enabled": True})
+        result = session._run_ai(self._make_base_result())
+        assert result.ai_pass is False
+        assert result.ai_score == 0.3
+        assert result.overall == "不合格"
+
+    def test_score_uses_resolved_request_threshold_from_envelope(self, tmp_path):
+        ai = MagicMock()
+        ai.run_ai_analysis.return_value = self._make_success_envelope(
+            ai_label="FAIL",
+            score=0.6,
+            decision_threshold=0.6,
+        )
+        session = self._make_session(tmp_path, ai, {"enabled": True})
+        result = session._run_ai(self._make_base_result())
+        assert result.ai_pass is True
+        assert result.ai_score == 0.6
+        assert result.overall == "合格"
+        assert session.last_ai_review["threshold"] == 0.6
+
+    def test_score_uses_default_threshold_from_envelope_when_upstream_falls_back_to_point_five(self, tmp_path):
+        ai = MagicMock()
+        ai.run_ai_analysis.return_value = self._make_success_envelope(
+            score=0.4,
+            decision_threshold=0.5,
+        )
+        session = self._make_session(tmp_path, ai, {"enabled": True})
+        result = session._run_ai(self._make_base_result())
+        assert result.ai_pass is False
+        assert result.ai_score == 0.4
+        assert result.overall == "不合格"
+        assert session.last_ai_review["threshold"] == 0.5
+
+    def test_missing_score_ai_label_fail_falls_back_to_false(self, tmp_path):
+        ai = MagicMock()
+        ai.run_ai_analysis.return_value = self._make_success_envelope(
+            ai_label="FAIL",
+            score=None,
+        )
+        session = self._make_session(tmp_path, ai, {"enabled": True})
+        result = session._run_ai(self._make_base_result())
+        assert result.ai_pass is False
+        assert result.ai_score is None
+        assert result.overall == "不合格"
+        assert session.last_ai_review["status"] == "missing_score"
+        assert session.last_ai_review["threshold"] == 0.8
+        assert session.last_ai_review["error_message"] == "AI score unavailable"
+
+    def test_missing_score_ai_label_pass_falls_back_to_true(self, tmp_path):
+        ai = MagicMock()
+        ai.run_ai_analysis.return_value = self._make_success_envelope(score=None)
+        session = self._make_session(tmp_path, ai, {"enabled": True})
+        result = session._run_ai(self._make_base_result())
+        assert result.ai_pass is True
+        assert result.ai_score is None
+        assert result.overall == "合格"
+        assert session.last_ai_review["status"] == "missing_score"
+        assert session.last_ai_review["threshold"] == 0.8
+        assert session.last_ai_review["error_message"] == "AI score unavailable"
+
+    def test_missing_score_unknown_ai_label_degrades_to_no_result(self, tmp_path):
+        ai = MagicMock()
+        ai.run_ai_analysis.return_value = self._make_success_envelope(
+            ai_label="MAYBE",
+            score=None,
+        )
+        session = self._make_session(tmp_path, ai, {"enabled": True})
+        result = session._run_ai(self._make_base_result())
+        assert result.ai_pass is None
+        assert result.ai_score is None
+        assert result.overall == "合格"
+        assert session.last_ai_review["status"] == "missing_score"
+        assert session.last_ai_review["threshold"] == 0.8
+        assert session.last_ai_review["error_message"] == "AI label is not a recognized binary label"
+
+    @pytest.mark.parametrize("ai_label", [None, 123])
+    def test_missing_score_without_usable_ai_label_degrades_to_no_result_with_explicit_error(
+        self, tmp_path, ai_label
+    ):
+        ai = MagicMock()
+        ai.run_ai_analysis.return_value = self._make_success_envelope(
+            ai_label=ai_label,
+            score=None,
+        )
+        session = self._make_session(tmp_path, ai, {"enabled": True})
 
         result = session._run_ai(self._make_base_result())
 
-        assert result.ai_pass is True
+        assert result.ai_pass is None
         assert result.ai_score is None
+        assert result.overall == "合格"
         assert session.last_ai_review["status"] == "missing_score"
         assert session.last_ai_review["threshold"] == 0.8
         assert session.last_ai_review["score"] is None
+        assert session.last_ai_review["error_message"] == "AI score and usable AI label are unavailable"
 
     def test_run_ai_malformed_output_none_marks_invalid_output_and_preserves_limit_result(self, tmp_path):
         ai = MagicMock()
         ai.run_ai_analysis.return_value = None
-        session = self._make_session(tmp_path, ai, {
-            "enabled": True,
-            "score_threshold": 0.8,
-        })
+        session = self._make_session(tmp_path, ai, {"enabled": True})
 
         result = session._run_ai(self._make_base_result())
 
@@ -989,20 +1038,51 @@ class TestScoreThresholdDecision:
         assert result.ai_score is None
         assert result.overall == "合格"
         assert session.last_ai_review["status"] == "invalid_output"
-        assert session.last_ai_review["threshold"] == 0.8
+        assert session.last_ai_review["threshold"] is None
         assert session.last_ai_review["score"] is None
         assert session.last_ai_review["channel_index"] is None
         assert session.last_ai_review["error_message"] == "AI analysis returned invalid output"
 
-    def test_inf_score_falls_back_to_label(self, tmp_path):
+    @pytest.mark.parametrize(
+        ("score", "ai_label", "expected_ai_pass"),
+        [
+            (float("nan"), "PASS", True),
+            (float("inf"), "FAIL", False),
+            ("0.7", "PASS", True),
+        ],
+    )
+    def test_unusable_score_enters_ai_label_fallback_and_preserves_missing_score_review(
+        self, tmp_path, score, ai_label, expected_ai_pass
+    ):
         ai = MagicMock()
-        ai.run_ai_analysis.return_value = {
-            "module_status": "success", "ai_label": "FAIL",
-            "score": float("inf"), "error_summary": None,
-        }
-        session = self._make_session(tmp_path, ai, {
-            "enabled": True, "score_threshold": 0.8,
-        })
+        ai.run_ai_analysis.return_value = self._make_success_envelope(
+            ai_label=ai_label,
+            score=score,
+        )
+        session = self._make_session(tmp_path, ai, {"enabled": True})
         result = session._run_ai(self._make_base_result())
-        assert result.ai_pass is False
+
+        assert result.ai_pass is expected_ai_pass
         assert result.ai_score is None
+        assert session.last_ai_review["status"] == "missing_score"
+        assert session.last_ai_review["threshold"] == 0.8
+        assert session.last_ai_review["score"] is None
+        assert session.last_ai_review["error_message"] == "AI score unavailable"
+
+    def test_score_without_envelope_threshold_degrades_to_no_result_instead_of_label_fallback(self, tmp_path):
+        ai = MagicMock()
+        ai.run_ai_analysis.return_value = self._make_success_envelope(
+            ai_label="PASS",
+            decision_threshold=None,
+        )
+        session = self._make_session(tmp_path, ai, {"enabled": True})
+
+        result = session._run_ai(self._make_base_result())
+
+        assert result.ai_pass is None
+        assert result.ai_score == 0.9
+        assert result.overall == "合格"
+        assert session.last_ai_review["status"] == "success"
+        assert session.last_ai_review["threshold"] is None
+        assert session.last_ai_review["score"] == 0.9
+        assert session.last_ai_review["error_message"] == "AI decision threshold unavailable"

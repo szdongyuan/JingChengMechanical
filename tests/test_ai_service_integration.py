@@ -3,8 +3,13 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import textwrap
+import threading
+import time
+import uuid
 
 import pytest
 
@@ -17,7 +22,12 @@ from app.service.ai_service import AiService
 
 @pytest.fixture
 def ai_service():
-    return AiService()
+    service = AiService()
+    try:
+        yield service
+    finally:
+        if hasattr(service, "_resident_runtime"):
+            service._resident_runtime.shutdown_all()
 
 
 @pytest.fixture
@@ -76,6 +86,262 @@ with open(args["response"], "w", encoding="utf-8") as f:
     return str(script)
 
 
+_RESIDENT_TOOLCHAIN_SCRIPT = """
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+import uuid
+from pathlib import Path
+
+
+INSTANCE_ID = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+
+
+def _emit(payload: dict) -> None:
+    sys.stdout.write(json.dumps(payload) + "\\n")
+    sys.stdout.flush()
+
+
+def _arg(name: str) -> str | None:
+    if name not in sys.argv:
+        return None
+    index = sys.argv.index(name)
+    if index + 1 >= len(sys.argv):
+        return None
+    return sys.argv[index + 1]
+
+
+def _write_artifact(artifacts_dir: str, relative_path: str) -> None:
+    target = Path(artifacts_dir) / relative_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("artifact", encoding="utf-8")
+
+
+def _success_payload(request_id: str, *, label: str, transport: str, artifact_name: str) -> dict:
+    return {
+        "protocol_version": 1,
+        "request_id": request_id,
+        "toolchain_name": f"{transport}-toolchain",
+        "toolchain_version": "1.0",
+        "ai_result": {
+            "ai_label": label,
+            "score": 0.95,
+            "summary": f"{transport} success",
+            "confidence": 0.9,
+            "artifacts": [
+                {
+                    "type": "debug",
+                    "relative_path": artifact_name,
+                }
+            ],
+            "extra": {
+                "transport": transport,
+                "process_instance_id": INSTANCE_ID,
+            },
+        },
+    }
+
+
+request_path = _arg("--request")
+response_path = _arg("--response")
+artifacts_dir = _arg("--artifacts-dir")
+if request_path and response_path and artifacts_dir:
+    with open(request_path, "r", encoding="utf-8") as f:
+        request_payload = json.load(f)
+    _write_artifact(artifacts_dir, "fallback.txt")
+    with open(response_path, "w", encoding="utf-8") as f:
+        json.dump(
+            _success_payload(
+                request_payload["request_id"],
+                label="FALLBACK",
+                transport="oneshot_fallback",
+                artifact_name="fallback.txt",
+            ),
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    raise SystemExit(0)
+
+
+for raw_line in sys.stdin:
+    line = raw_line.rstrip("\\r\\n")
+    if not line:
+        continue
+    message = json.loads(line)
+    message_type = message.get("message_type")
+    if message_type == "shutdown":
+        break
+    if message_type != "analyze":
+        continue
+
+    request_id = message.get("request_id")
+    request_payload = message.get("request") or {}
+    params = request_payload.get("params") or {}
+    behavior = params.get("behavior", "success")
+    artifacts_dir = message.get("artifacts_dir")
+
+    if behavior == "error":
+        _emit(
+            {
+                "message_type": "error",
+                "request_id": request_id,
+                "error": "resident child reported failure",
+            }
+        )
+        continue
+
+    if behavior == "malformed_json":
+        sys.stdout.write("{not valid json\\n")
+        sys.stdout.flush()
+        continue
+
+    if behavior == "timeout":
+        time.sleep(float(params.get("sleep_s", 0.3)))
+
+    if behavior == "block":
+        Path(params["started_file"]).write_text("started", encoding="utf-8")
+        release_file = Path(params["release_file"])
+        while not release_file.exists():
+            time.sleep(0.01)
+
+    _write_artifact(artifacts_dir, "resident.txt")
+    _emit(
+        {
+            "message_type": "result",
+            "request_id": request_id,
+            "response": _success_payload(
+                request_id,
+                label="RESIDENT_PASS",
+                transport="resident",
+                artifact_name="resident.txt",
+            ),
+        }
+    )
+"""
+
+
+def _write_resident_toolchain_script(tmp_path):
+    script = tmp_path / f"resident_toolchain_{uuid.uuid4().hex[:8]}.py"
+    script.write_text(textwrap.dedent(_RESIDENT_TOOLCHAIN_SCRIPT), encoding="utf-8")
+    return script
+
+
+def _resident_entrypoint(script_path) -> str:
+    return subprocess.list2cmdline([sys.executable, "-u", str(script_path)])
+
+
+def _analysis_segments(audio_path: str) -> list[dict]:
+    return [{
+        "segment_id": "dev_1",
+        "role": "device_1",
+        "audio_path": audio_path,
+        "channels": [1],
+        "duration_ms": 5000,
+        "sample_rate": 48000,
+        "metadata": {},
+    }]
+
+
+def _wait_for_file(path, timeout_s: float = 2.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if path.exists():
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"Timed out waiting for {path}")
+
+
+def _write_threshold_toolchain_script(tmp_path, *, extra_payload: dict) -> str:
+    script = tmp_path / f"threshold_toolchain_{uuid.uuid4().hex[:8]}.py"
+    script.write_text(
+        f'''
+import json, sys
+
+args = {{}}
+i = 1
+while i < len(sys.argv):
+    if sys.argv[i] == "--request":
+        args["request"] = sys.argv[i+1]; i += 2
+    elif sys.argv[i] == "--response":
+        args["response"] = sys.argv[i+1]; i += 2
+    elif sys.argv[i] == "--artifacts-dir":
+        args["artifacts_dir"] = sys.argv[i+1]; i += 2
+    else:
+        i += 1
+
+with open(args["request"], "r", encoding="utf-8") as f:
+    req = json.load(f)
+
+response = {{
+    "protocol_version": 1,
+    "request_id": req["request_id"],
+    "toolchain_name": "Threshold Toolchain",
+    "toolchain_version": "0.1.0",
+    "ai_result": {{
+        "ai_label": "PASS",
+        "score": 0.95,
+        "summary": "Threshold test",
+        "confidence": 0.9,
+        "artifacts": [],
+        "extra": json.loads(r"""{json.dumps(extra_payload, ensure_ascii=False)}"""),
+    }},
+}}
+
+with open(args["response"], "w", encoding="utf-8") as f:
+    json.dump(response, f, ensure_ascii=False, indent=2)
+''',
+        encoding="utf-8",
+    )
+    return str(script)
+
+
+def _run_threshold_analysis(
+    ai_service,
+    fake_audio_file: str,
+    tmp_path,
+    *,
+    response_extra: dict,
+    request_params: dict,
+) -> dict:
+    cfg = TestConfigTable.create(config_name=f"Threshold Test {uuid.uuid4().hex[:8]}")
+    tc = AiToolchainTable.create(
+        toolchain_id=f"threshold-tc-{uuid.uuid4().hex[:8]}",
+        display_name="Threshold TC",
+        version="0.1.0",
+        entrypoint=f"{sys.executable} {_write_threshold_toolchain_script(tmp_path, extra_payload=response_extra)}",
+        default_timeout_ms=10000,
+        execution_mode="oneshot_process",
+    )
+    TestConfigAiBindingTable.create(
+        config=cfg,
+        toolchain=tc,
+        enabled=True,
+        params_json=json.dumps(request_params),
+    )
+
+    segments = [{
+        "segment_id": "dev_1",
+        "role": "device_1",
+        "audio_path": fake_audio_file,
+        "channels": [1],
+        "duration_ms": 5000,
+        "sample_rate": 48000,
+        "metadata": {},
+    }]
+
+    return ai_service.run_ai_analysis(
+        config_id=cfg.config_id,
+        test_run_id=f"run_threshold_{uuid.uuid4().hex[:8]}",
+        segments=segments,
+        context={"config_id": cfg.config_id},
+        ai_runs_dir=str(tmp_path / "ai_runs"),
+    )
+
+
 class TestRunAiAnalysis:
     def test_success_end_to_end(
         self, ai_service, fake_audio_file, fake_toolchain_script, tmp_path
@@ -87,6 +353,7 @@ class TestRunAiAnalysis:
             version="0.1.0",
             entrypoint=f"{sys.executable} {fake_toolchain_script}",
             default_timeout_ms=10000,
+            execution_mode="oneshot_process",
         )
         TestConfigAiBindingTable.create(
             config=cfg, toolchain=tc, enabled=True, params_json="{}"
@@ -126,6 +393,7 @@ class TestRunAiAnalysis:
             version="0.1.0",
             entrypoint=f"{sys.executable} {fake_toolchain_script}",
             default_timeout_ms=10000,
+            execution_mode="oneshot_process",
         )
         TestConfigAiBindingTable.create(
             config=cfg, toolchain=tc, enabled=True, params_json="{}"
@@ -158,6 +426,63 @@ class TestRunAiAnalysis:
 
         assert request_payload["window_info"] == window_info
 
+    def test_run_ai_analysis_uses_response_threshold_when_present(
+        self, ai_service, fake_audio_file, tmp_path
+    ):
+        result = _run_threshold_analysis(
+            ai_service,
+            fake_audio_file,
+            tmp_path,
+            response_extra={"decision_threshold": 0.8},
+            request_params={"decision_threshold": 0.6},
+        )
+
+        assert result["module_status"] == "success"
+        assert result["decision_threshold"] == pytest.approx(0.8)
+        assert result["decision_threshold_source"] == "response_extra"
+
+    def test_run_ai_analysis_falls_back_to_request_threshold_when_response_threshold_invalid(
+        self, ai_service, fake_audio_file, tmp_path
+    ):
+        result = _run_threshold_analysis(
+            ai_service,
+            fake_audio_file,
+            tmp_path,
+            response_extra={"decision_threshold": "not-a-number"},
+            request_params={"decision_threshold": 0.6},
+        )
+
+        assert result["module_status"] == "success"
+        assert result["decision_threshold"] == pytest.approx(0.6)
+        assert result["decision_threshold_source"] == "request_params"
+
+    @pytest.mark.parametrize(
+        ("response_extra", "request_params"),
+        [
+            ({"decision_threshold": 1.2}, {"decision_threshold": -0.1}),
+            ({}, {"decision_threshold": "bad"}),
+        ],
+    )
+    def test_run_ai_analysis_falls_back_to_default_point_five_when_no_valid_threshold_exists(
+        self,
+        ai_service,
+        fake_audio_file,
+        tmp_path,
+        response_extra,
+        request_params,
+    ):
+        result = _run_threshold_analysis(
+            ai_service,
+            fake_audio_file,
+            tmp_path,
+            response_extra=response_extra,
+            request_params=request_params,
+        )
+
+        assert result["module_status"] == "success"
+        assert result["decision_threshold"] == pytest.approx(0.5)
+        assert result["decision_threshold_source"] == "default"
+
     def test_preflight_failure_persisted(self, ai_service, tmp_path):
         cfg = TestConfigTable.create(config_name="PF Fail")
         result = ai_service.run_ai_analysis(
@@ -182,6 +507,7 @@ class TestRunAiAnalysis:
             version="1",
             entrypoint=f"{sys.executable} {fake_toolchain_script}",
             default_timeout_ms=10000,
+            execution_mode="oneshot_process",
         )
         TestConfigAiBindingTable.create(
             config=cfg, toolchain=tc, enabled=True, params_json="{}"
@@ -231,6 +557,7 @@ class TestRunAiAnalysis:
             display_name="VM TC", version="1",
             entrypoint=f"{sys.executable} {fake_toolchain_script}",
             default_timeout_ms=10000,
+            execution_mode="oneshot_process",
         )
         TestConfigAiBindingTable.create(
             config=cfg, toolchain=tc, enabled=True, params_json="{}"
@@ -284,6 +611,7 @@ with open(resp_path, "w") as f:
             display_name="Bad Resp TC", version="1",
             entrypoint=f"{sys.executable} {bad_script}",
             default_timeout_ms=10000,
+            execution_mode="oneshot_process",
         )
         TestConfigAiBindingTable.create(
             config=cfg, toolchain=tc, enabled=True, params_json="{}"
@@ -312,6 +640,7 @@ with open(resp_path, "w") as f:
             display_name="Dis TC Int", version="1",
             entrypoint="this_should_not_run",
             default_timeout_ms=10000,
+            execution_mode="oneshot_process",
         )
         TestConfigAiBindingTable.create(
             config=cfg, toolchain=tc, enabled=False, params_json="{}"
@@ -338,6 +667,7 @@ with open(resp_path, "w") as f:
             display_name="FAS TC", version="1",
             entrypoint=f"{sys.executable} {fake_toolchain_script}",
             default_timeout_ms=10000,
+            execution_mode="oneshot_process",
         )
         TestConfigAiBindingTable.create(
             config=cfg, toolchain=tc, enabled=True, params_json="{}"
@@ -399,3 +729,252 @@ with open(resp_path, "w") as f:
         assert vm["has_result"] is True
         assert vm["display_status"] == "invalid_output"
         assert vm["error_summary"] is not None
+
+    def test_resident_process_reuses_cached_runtime_and_persists_request_response_and_artifacts(
+        self, ai_service, fake_audio_file, tmp_path
+    ):
+        cfg = TestConfigTable.create(config_name="Resident Success")
+        script_path = _write_resident_toolchain_script(tmp_path)
+        tc = AiToolchainTable.create(
+            toolchain_id="resident-success-tc",
+            display_name="Resident Success TC",
+            version="1.0",
+            entrypoint=_resident_entrypoint(script_path),
+            default_timeout_ms=1000,
+            execution_mode="resident_process",
+        )
+        TestConfigAiBindingTable.create(
+            config=cfg,
+            toolchain=tc,
+            enabled=True,
+            params_json=json.dumps({"behavior": "success"}),
+        )
+        segments = _analysis_segments(fake_audio_file)
+
+        first = ai_service.run_ai_analysis(
+            config_id=cfg.config_id,
+            test_run_id="run_resident_success_1",
+            segments=segments,
+            context={"config_id": cfg.config_id},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+        second = ai_service.run_ai_analysis(
+            config_id=cfg.config_id,
+            test_run_id="run_resident_success_2",
+            segments=segments,
+            context={"config_id": cfg.config_id},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+
+        first_extra = json.loads(first["extra_json"])
+        second_extra = json.loads(second["extra_json"])
+
+        assert first["module_status"] == "success"
+        assert second["module_status"] == "success"
+        assert first_extra["transport"] == "resident"
+        assert second_extra["transport"] == "resident"
+        assert first_extra["process_instance_id"] == second_extra["process_instance_id"]
+        assert ai_service._resident_runtime.has_cached_process("resident-success-tc") is True
+
+        for result in (first, second):
+            assert os.path.isfile(result["request_json_path"])
+            assert os.path.isfile(result["response_json_path"])
+            assert os.path.isdir(result["artifacts_dir"])
+            assert os.path.isfile(os.path.join(result["artifacts_dir"], "resident.txt"))
+            with open(result["response_json_path"], "r", encoding="utf-8") as f:
+                response_payload = json.load(f)
+            assert response_payload["ai_result"]["ai_label"] == "RESIDENT_PASS"
+            assert response_payload["ai_result"]["extra"]["transport"] == "resident"
+
+    def test_resident_process_message_type_error_returns_process_error_without_response_json_or_oneshot_fallback(
+        self, ai_service, fake_audio_file, tmp_path
+    ):
+        cfg = TestConfigTable.create(config_name="Resident Error")
+        script_path = _write_resident_toolchain_script(tmp_path)
+        tc = AiToolchainTable.create(
+            toolchain_id="resident-error-tc",
+            display_name="Resident Error TC",
+            version="1.0",
+            entrypoint=_resident_entrypoint(script_path),
+            default_timeout_ms=1000,
+            execution_mode="resident_process",
+        )
+        TestConfigAiBindingTable.create(
+            config=cfg,
+            toolchain=tc,
+            enabled=True,
+            params_json=json.dumps({"behavior": "error"}),
+        )
+
+        result = ai_service.run_ai_analysis(
+            config_id=cfg.config_id,
+            test_run_id="run_resident_error",
+            segments=_analysis_segments(fake_audio_file),
+            context={"config_id": cfg.config_id},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+
+        assert result["module_status"] == "process_error"
+        assert result["error_summary"] == "resident child reported failure"
+        assert os.path.isfile(result["request_json_path"])
+        assert os.path.exists(result["response_json_path"]) is False
+        assert result["toolchain_name"] is None
+        assert result["ai_label"] is None
+        assert ai_service._resident_runtime.has_cached_process("resident-error-tc") is False
+
+    def test_resident_process_malformed_json_returns_protocol_error(
+        self, ai_service, fake_audio_file, tmp_path
+    ):
+        cfg = TestConfigTable.create(config_name="Resident Malformed")
+        script_path = _write_resident_toolchain_script(tmp_path)
+        tc = AiToolchainTable.create(
+            toolchain_id="resident-malformed-tc",
+            display_name="Resident Malformed TC",
+            version="1.0",
+            entrypoint=_resident_entrypoint(script_path),
+            default_timeout_ms=1000,
+            execution_mode="resident_process",
+        )
+        TestConfigAiBindingTable.create(
+            config=cfg,
+            toolchain=tc,
+            enabled=True,
+            params_json=json.dumps({"behavior": "malformed_json"}),
+        )
+
+        result = ai_service.run_ai_analysis(
+            config_id=cfg.config_id,
+            test_run_id="run_resident_malformed",
+            segments=_analysis_segments(fake_audio_file),
+            context={"config_id": cfg.config_id},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+
+        assert result["module_status"] == "protocol_error"
+        assert "JSON" in result["error_summary"]
+        assert os.path.exists(result["response_json_path"]) is False
+        assert ai_service._resident_runtime.has_cached_process("resident-malformed-tc") is False
+
+    def test_resident_process_timeout_returns_timeout_and_discards_cache(
+        self, ai_service, fake_audio_file, tmp_path
+    ):
+        cfg = TestConfigTable.create(config_name="Resident Timeout")
+        script_path = _write_resident_toolchain_script(tmp_path)
+        tc = AiToolchainTable.create(
+            toolchain_id="resident-timeout-tc",
+            display_name="Resident Timeout TC",
+            version="1.0",
+            entrypoint=_resident_entrypoint(script_path),
+            default_timeout_ms=1000,
+            execution_mode="resident_process",
+        )
+        TestConfigAiBindingTable.create(
+            config=cfg,
+            toolchain=tc,
+            enabled=True,
+            timeout_ms=50,
+            params_json=json.dumps({"behavior": "timeout", "sleep_s": 0.3}),
+        )
+
+        result = ai_service.run_ai_analysis(
+            config_id=cfg.config_id,
+            test_run_id="run_resident_timeout",
+            segments=_analysis_segments(fake_audio_file),
+            context={"config_id": cfg.config_id},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+
+        assert result["module_status"] == "timeout"
+        assert result["error_summary"] == "Process timed out"
+        assert os.path.exists(result["response_json_path"]) is False
+        assert ai_service._resident_runtime.has_cached_process("resident-timeout-tc") is False
+
+    def test_resident_process_busy_overlap_returns_process_error_without_fallback(
+        self, ai_service, fake_audio_file, tmp_path, monkeypatch
+    ):
+        cfg = TestConfigTable.create(config_name="Resident Busy")
+        script_path = _write_resident_toolchain_script(tmp_path)
+        tc = AiToolchainTable.create(
+            toolchain_id="resident-busy-tc",
+            display_name="Resident Busy TC",
+            version="1.0",
+            entrypoint=_resident_entrypoint(script_path),
+            default_timeout_ms=5000,
+            execution_mode="resident_process",
+        )
+        started_file = tmp_path / "resident-started.txt"
+        release_file = tmp_path / "resident-release.txt"
+        TestConfigAiBindingTable.create(
+            config=cfg,
+            toolchain=tc,
+            enabled=True,
+            params_json=json.dumps(
+                {
+                    "behavior": "block",
+                    "started_file": str(started_file),
+                    "release_file": str(release_file),
+                }
+            ),
+        )
+        binding = {
+            "binding_id": 1,
+            "config_id": cfg.config_id,
+            "enabled": True,
+            "toolchain_id": tc.toolchain_id,
+            "timeout_ms": None,
+            "effective_timeout_ms": 5000,
+            "params_json": json.dumps(
+                {
+                    "behavior": "block",
+                    "started_file": str(started_file),
+                    "release_file": str(release_file),
+                }
+            ),
+        }
+        monkeypatch.setattr(
+            ai_service,
+            "preflight_check",
+            lambda config_id, segments: {
+                "status": "ok",
+                "binding": binding,
+                "toolchain": tc,
+            },
+        )
+        monkeypatch.setattr(ai_service, "mark_previous_ineffective", lambda test_run_id: None)
+        monkeypatch.setattr(ai_service, "save_execution", lambda envelope: envelope)
+        first_result = {}
+        segments = _analysis_segments(fake_audio_file)
+
+        def _run_first():
+            first_result.update(
+                ai_service.run_ai_analysis(
+                    config_id=cfg.config_id,
+                    test_run_id="run_resident_busy_first",
+                    segments=segments,
+                    context={"config_id": cfg.config_id},
+                    ai_runs_dir=str(tmp_path / "ai_runs"),
+                )
+            )
+
+        worker = threading.Thread(target=_run_first)
+        worker.start()
+        _wait_for_file(started_file)
+
+        started = time.monotonic()
+        second = ai_service.run_ai_analysis(
+            config_id=cfg.config_id,
+            test_run_id="run_resident_busy_second",
+            segments=segments,
+            context={"config_id": cfg.config_id},
+            ai_runs_dir=str(tmp_path / "ai_runs"),
+        )
+        elapsed = time.monotonic() - started
+
+        release_file.write_text("release", encoding="utf-8")
+        worker.join(timeout=5)
+
+        assert second["module_status"] == "process_error"
+        assert second["error_summary"] == "Resident toolchain is busy"
+        assert elapsed < 0.5
+        assert os.path.exists(second["response_json_path"]) is False
+        assert first_result["module_status"] == "success"

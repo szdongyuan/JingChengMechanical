@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -10,8 +10,29 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 sys.modules.setdefault("cv2", SimpleNamespace())
+if "snap7" not in sys.modules:
+    snap7_module = ModuleType("snap7")
+    snap7_client_module = ModuleType("snap7.client")
+    snap7_util_module = ModuleType("snap7.util")
 
-from PyQt6.QtWidgets import QApplication, QWidget
+    class _Client:
+        def connect(self, *_args, **_kwargs):
+            return None
+
+        def disconnect(self):
+            return None
+
+    snap7_client_module.Client = _Client
+    snap7_util_module.get_bool = lambda *_args, **_kwargs: False
+    snap7_util_module.set_bool = lambda *_args, **_kwargs: None
+    snap7_module.client = snap7_client_module
+    snap7_module.util = snap7_util_module
+    sys.modules["snap7"] = snap7_module
+    sys.modules["snap7.client"] = snap7_client_module
+    sys.modules["snap7.util"] = snap7_util_module
+
+from PyQt6.QtGui import QCloseEvent
+from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
 from app.service.analysis.frames import StftFrame
 from app.services_container import (
@@ -58,6 +79,19 @@ class _StubModule(QWidget):
     def __init__(self, services=None):
         super().__init__()
         self.services = services
+
+
+def _make_guarded_ai_tool_management_module(confirm_leave_result: bool):
+    class _GuardedAiToolManagementModule(_StubModule):
+        def __init__(self, services=None):
+            super().__init__(services)
+            self.confirm_leave_calls = 0
+
+        def confirm_leave(self) -> bool:
+            self.confirm_leave_calls += 1
+            return confirm_leave_result
+
+    return _GuardedAiToolManagementModule
 
 
 class _ChannelProbeModule(_StubModule):
@@ -116,20 +150,30 @@ def qapp():
     return app
 
 
+@pytest.fixture(autouse=True)
+def _close_top_level_widgets(qapp):
+    yield
+    for widget in list(qapp.topLevelWidgets()):
+        widget.close()
+        widget.deleteLater()
+    qapp.processEvents()
+
+
 def _patch_non_target_modules(monkeypatch, *, use_real_control: bool = False):
     module_names = [
         "WorkOrderModule",
         "VideoModule",
-        "LogModule",
         "HardwareModule",
         "InputCalibrationModule",
         "ConfigModule",
+        "AiToolManagementModule",
         "ChannelSelectModule",
+        "PlcSettingsModule",
     ]
     if not use_real_control:
         module_names.append("ControlModule")
     for name in module_names:
-        monkeypatch.setattr(main_window_mod, name, _StubModule)
+        monkeypatch.setattr(main_window_mod, name, _StubModule, raising=False)
 
 
 def _make_services(
@@ -138,6 +182,7 @@ def _make_services(
     initial_review_payload: FactoryReviewPayload | None = None,
 ):
     bus = _BusStub()
+    shutdown = MagicMock()
     factory_mode = SimpleNamespace(
         state=initial_state or FactoryControllerState(),
         review_payload=initial_review_payload or FactoryReviewPayload(),
@@ -147,6 +192,7 @@ def _make_services(
     )
     return SimpleNamespace(
         bus=bus,
+        shutdown=shutdown,
         db=SimpleNamespace(close=MagicMock()),
         config_service=SimpleNamespace(
             load_config=MagicMock(return_value={"selected_channels": []})
@@ -161,8 +207,16 @@ def _make_window(
     initial_state: FactoryControllerState | None = None,
     initial_review_payload: FactoryReviewPayload | None = None,
     use_real_control: bool = False,
+    ai_tool_management_cls: type[QWidget] | None = None,
 ):
     _patch_non_target_modules(monkeypatch, use_real_control=use_real_control)
+    if ai_tool_management_cls is not None:
+        monkeypatch.setattr(
+            main_window_mod,
+            "AiToolManagementModule",
+            ai_tool_management_cls,
+            raising=False,
+        )
     services = _make_services(
         initial_state=initial_state,
         initial_review_payload=initial_review_payload,
@@ -206,7 +260,7 @@ def test_main_window_login_refreshes_control_owned_start_button_state_without_en
     qapp.processEvents()
 
     assert window.control.btn_start.isEnabled() is False
-    assert window.control.lbl_start_reason.text() == "当前测试运行中"
+    assert hasattr(window.control, "lbl_start_reason") is False
     assert window.control.btn_stop.isEnabled() is True
 
 
@@ -260,6 +314,24 @@ def test_show_login_window_cancel_reenables_main_window_without_closing_for_swit
     close_spy.assert_not_called()
 
 
+def test_show_change_password_window_when_logged_out_updates_visible_status_via_log(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    assert window.statusBar().currentMessage() == "[App] 启动程序"
+    assert window.change_password_window is None
+
+    window.show_change_password_window()
+    qapp.processEvents()
+
+    assert window.change_password_window is None
+    assert services.bus.log.emissions[-1][0] == ("请先登录",)
+    assert window.statusBar().currentMessage() == "请先登录"
+
+
 def test_show_login_window_cancel_reenables_main_window_before_closing_initial_login(
     qapp,
     monkeypatch,
@@ -285,6 +357,375 @@ def test_show_login_window_cancel_reenables_main_window_before_closing_initial_l
 
     assert enabled_state_when_close_called == [True]
     assert window.isEnabled() is True
+
+
+def test_main_window_includes_ai_tool_management_tab_in_topbar(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    assert window.tab_names == ["测试", "数据管理", "配置", "AI工具管理", "硬件"]
+    assert list(window.top_button_dict) == ["测试", "数据管理", "配置", "AI工具管理", "硬件"]
+
+
+def test_engineer_role_can_access_ai_tool_management_tab(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    window.current_user_role = "工程师"
+    window.set_role()
+
+    assert window.top_button_dict["AI工具管理"].isEnabled() is True
+
+
+def test_admin_role_can_access_ai_tool_management_tab(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    window.current_user_role = "管理员"
+    window.set_role()
+
+    assert window.top_button_dict["AI工具管理"].isEnabled() is True
+
+
+def test_operator_role_cannot_access_ai_tool_management_tab(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    window.current_user_role = "操作员"
+    window.set_role()
+
+    assert window.top_button_dict["AI工具管理"].isEnabled() is False
+
+
+def test_no_role_programmatic_page_reentry_remains_allowed(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    window.tab.setCurrentIndex(1)
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == 1
+    assert window.top_button_dict["数据管理"].isChecked() is True
+
+    window.tab.setCurrentIndex(0)
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == 0
+    assert window.top_button_dict["测试"].isChecked() is True
+
+
+def test_operator_cannot_activate_ai_tool_management_via_programmatic_tab_change(
+    qapp,
+    monkeypatch,
+):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    window.current_user_role = "操作员"
+    window.set_role()
+
+    ai_index = window.tab_names.index("AI工具管理")
+
+    window.tab.setCurrentIndex(ai_index)
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == 0
+    assert window.top_button_dict["测试"].isChecked() is True
+    assert window.top_button_dict["AI工具管理"].isChecked() is False
+
+
+def test_engineer_cannot_activate_data_management_via_programmatic_tab_change(
+    qapp,
+    monkeypatch,
+):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    window.current_user_role = "工程师"
+    window.set_role()
+
+    data_management_index = window.tab_names.index("数据管理")
+
+    window.tab.setCurrentIndex(data_management_index)
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == 0
+    assert window.top_button_dict["测试"].isChecked() is True
+    assert window.top_button_dict["数据管理"].isChecked() is False
+
+
+def test_switching_away_from_ai_tool_management_is_blocked_when_confirm_leave_rejects(
+    qapp,
+    monkeypatch,
+):
+    window, _ = _make_window(
+        monkeypatch,
+        ai_tool_management_cls=_make_guarded_ai_tool_management_module(False),
+    )
+    _show(window, qapp)
+
+    window.current_user_role = "管理员"
+    window.set_role()
+
+    ai_index = window.tab_names.index("AI工具管理")
+    window.top_button_dict["AI工具管理"].click()
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == ai_index
+
+    window.top_button_dict["硬件"].click()
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == ai_index
+    assert window.ai_tool_management_module.confirm_leave_calls == 1
+
+
+def test_programmatic_tab_change_reverts_when_ai_tool_management_rejects_leave(
+    qapp,
+    monkeypatch,
+):
+    window, _ = _make_window(
+        monkeypatch,
+        ai_tool_management_cls=_make_guarded_ai_tool_management_module(False),
+    )
+    _show(window, qapp)
+
+    window.current_user_role = "管理员"
+    window.set_role()
+
+    ai_index = window.tab_names.index("AI工具管理")
+    hardware_index = window.tab_names.index("硬件")
+
+    window.top_button_dict["AI工具管理"].click()
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == ai_index
+
+    window.tab.setCurrentIndex(hardware_index)
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == ai_index
+    assert window.top_button_dict["AI工具管理"].isChecked() is True
+    assert window.top_button_dict["硬件"].isChecked() is False
+    assert window.ai_tool_management_module.confirm_leave_calls == 1
+
+
+def test_role_switch_from_admin_to_operator_stays_consistent_when_ai_leave_is_rejected(
+    qapp,
+    monkeypatch,
+):
+    window, _ = _make_window(
+        monkeypatch,
+        ai_tool_management_cls=_make_guarded_ai_tool_management_module(False),
+    )
+    _show(window, qapp)
+
+    window.current_user_name = "admin"
+    window.current_user_role = "管理员"
+    window.set_role()
+
+    ai_index = window.tab_names.index("AI工具管理")
+    window.top_button_dict["AI工具管理"].click()
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == ai_index
+
+    window.current_user_name = "operator"
+    window.current_user_role = "操作员"
+    window.set_role()
+    qapp.processEvents()
+
+    assert window.current_user_name == "admin"
+    assert window.current_user_role == "管理员"
+    assert window.tab.currentIndex() == ai_index
+    assert window.top_button_dict["AI工具管理"].isEnabled() is True
+    assert window.top_button_dict["AI工具管理"].isChecked() is True
+    assert window.top_button_dict["测试"].isChecked() is False
+    assert window.ai_tool_management_module.confirm_leave_calls == 1
+
+
+def test_closing_main_window_is_blocked_when_ai_tool_management_rejects_leave(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        ai_tool_management_cls=_make_guarded_ai_tool_management_module(False),
+    )
+    _show(window, qapp)
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+
+    assert close_event.isAccepted() is False
+    services.shutdown.assert_not_called()
+    services.db.close.assert_not_called()
+    assert window.ai_tool_management_module.confirm_leave_calls == 1
+
+
+def test_hardware_page_includes_plc_settings_card_alongside_existing_hardware_content(
+    qapp,
+    monkeypatch,
+):
+    monkeypatch.setattr(main_window_mod, "PlcSettingsModule", _StubModule, raising=False)
+
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    hardware_index = window.tab_names.index("硬件")
+    hardware_page = window.tab.widget(hardware_index)
+    card_titles = {
+        label.text()
+        for label in hardware_page.findChildren(QLabel)
+        if label.objectName() == "CardTitle"
+    }
+
+    assert {"设备选择", "通道选择", "输入校准", "PLC设置"} <= card_titles
+
+
+def test_closing_main_window_stops_plc_cleanup_before_shared_shutdown_and_camera(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    cleanup_steps = []
+    plc_service = object()
+    plc_thread = MagicMock()
+    plc_thread.quit.side_effect = lambda: cleanup_steps.append("thread_quit")
+    plc_thread.wait.side_effect = (
+        lambda timeout: cleanup_steps.append(("thread_wait", timeout))
+    )
+    services.plc_services = {101: plc_service}
+    services.plc_threads = {101: plc_thread}
+    services.shutdown.side_effect = lambda: cleanup_steps.append("shutdown")
+    services.db.close = MagicMock()
+    window.video.stop_camera = MagicMock(side_effect=lambda: cleanup_steps.append("camera"))
+
+    monkeypatch.setattr(
+        main_window_mod,
+        "Qt",
+        SimpleNamespace(
+            ConnectionType=SimpleNamespace(BlockingQueuedConnection="blocking")
+        ),
+        raising=False,
+    )
+
+    def _invoke_method(target, method_name, connection_type):
+        cleanup_steps.append(("plc_stop", target, method_name, connection_type))
+        return True
+
+    monkeypatch.setattr(
+        main_window_mod,
+        "QMetaObject",
+        SimpleNamespace(invokeMethod=_invoke_method),
+        raising=False,
+    )
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+
+    assert cleanup_steps == [
+        ("plc_stop", plc_service, "stop_plc_service", "blocking"),
+        "thread_quit",
+        ("thread_wait", 2000),
+        "shutdown",
+        "camera",
+    ]
+    services.db.close.assert_not_called()
+
+
+def test_closing_main_window_uses_shared_shutdown_boundary_and_stops_camera(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(monkeypatch)
+    _show(window, qapp)
+    window.video.stop_camera = MagicMock()
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+
+    services.shutdown.assert_called_once_with()
+    services.db.close.assert_not_called()
+    window.video.stop_camera.assert_called_once_with()
+
+
+def test_closing_main_window_still_uses_shared_shutdown_and_camera_when_plc_cleanup_raises(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    cleanup_steps = []
+    services.plc_services = {101: object()}
+    services.plc_threads = {}
+    services.shutdown.side_effect = lambda: cleanup_steps.append("shutdown")
+    services.db.close = MagicMock()
+    window.video.stop_camera = MagicMock(side_effect=lambda: cleanup_steps.append("camera"))
+
+    monkeypatch.setattr(
+        main_window_mod,
+        "Qt",
+        SimpleNamespace(
+            ConnectionType=SimpleNamespace(BlockingQueuedConnection="blocking")
+        ),
+        raising=False,
+    )
+
+    def _failing_invoke_method(*_args, **_kwargs):
+        cleanup_steps.append("plc_stop")
+        raise RuntimeError("plc cleanup failed")
+
+    monkeypatch.setattr(
+        main_window_mod,
+        "QMetaObject",
+        SimpleNamespace(invokeMethod=_failing_invoke_method),
+        raising=False,
+    )
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+
+    assert cleanup_steps == ["plc_stop", "shutdown", "camera"]
+    services.shutdown.assert_called_once_with()
+    services.db.close.assert_not_called()
+    window.video.stop_camera.assert_called_once_with()
+
+
+def test_closing_main_window_swallows_camera_cleanup_errors_after_shared_shutdown(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(monkeypatch)
+    _show(window, qapp)
+    window.video.stop_camera = MagicMock(side_effect=RuntimeError("camera cleanup failed"))
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+
+    services.shutdown.assert_called_once_with()
+    services.db.close.assert_not_called()
+    window.video.stop_camera.assert_called_once_with()
+
+
+def test_closing_main_window_still_stops_camera_when_shared_shutdown_raises(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(monkeypatch)
+    _show(window, qapp)
+    services.shutdown.side_effect = RuntimeError("shutdown failed")
+    window.video.stop_camera = MagicMock()
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+
+    services.shutdown.assert_called_once_with()
+    services.db.close.assert_not_called()
+    window.video.stop_camera.assert_called_once_with()
 
 
 def _armed_state(
@@ -324,6 +765,19 @@ def _reviewing_state(
     )
 
 
+def _stopped_state(
+    config_id: int,
+    *,
+    selected_config_ids: tuple[int, ...] = (101, 202),
+) -> FactoryControllerState:
+    return FactoryControllerState(
+        selected_config_ids=selected_config_ids,
+        displayed_config_id=config_id,
+        run_phase="stopped",
+        trigger_source="manual",
+    )
+
+
 def _review_payload(config_id: int, *, run_id: str | None = None) -> FactoryReviewPayload:
     return FactoryReviewPayload(
         displayed_config_id=config_id,
@@ -350,10 +804,14 @@ def _review_payload(config_id: int, *, run_id: str | None = None) -> FactoryRevi
     )
 
 
-def _chart_payload_for_channels(channels: tuple[int, ...]) -> dict:
+def _chart_payload_for_channels(
+    channels: tuple[int, ...],
+    *,
+    missing_loudness_channels: tuple[int, ...] = (),
+) -> dict:
     payload: dict[int, dict] = {}
     for channel_index in channels:
-        payload[channel_index] = {
+        channel_payload = {
             "spl": {
                 "times_sec": [0.0, 1.0],
                 "values_db": [70.0 + channel_index, 71.0 + channel_index],
@@ -372,6 +830,9 @@ def _chart_payload_for_channels(channels: tuple[int, ...]) -> dict:
                         "passed": True,
                     }
                 ],
+                "golden_mode": "off",
+                "golden_overlay_levels_db": None,
+                "show_zero_reference": False,
             },
             "octave": {
                 "center_freqs_hz": [125.0, 250.0],
@@ -385,8 +846,20 @@ def _chart_payload_for_channels(channels: tuple[int, ...]) -> dict:
                         "passed": True,
                     }
                 ],
+                "golden_mode": "off",
+                "golden_overlay_levels_db": None,
+                "show_zero_reference": False,
             },
         }
+        if channel_index not in missing_loudness_channels:
+            channel_payload["loudness"] = {
+                "times_sec": [0.0, 1.0],
+                "values": [10.0 + channel_index, 12.0 + channel_index],
+                "unit": "sone",
+                "lower_limit": 0.0,
+                "upper_limit": 60.0,
+            }
+        payload[channel_index] = channel_payload
     return payload
 
 
@@ -395,6 +868,7 @@ def _review_payload_with_chart_payload(
     *,
     run_id: str | None = None,
     channels: tuple[int, ...] = (0, 1),
+    missing_loudness_channels: tuple[int, ...] = (),
 ) -> FactoryReviewPayload:
     return FactoryReviewPayload(
         displayed_config_id=config_id,
@@ -407,7 +881,10 @@ def _review_payload_with_chart_payload(
         no_result=False,
         error_message=None,
         summary_payload={"overall_status": "pass", "rows": []},
-        chart_payload=_chart_payload_for_channels(channels),
+        chart_payload=_chart_payload_for_channels(
+            channels,
+            missing_loudness_channels=missing_loudness_channels,
+        ),
     )
 
 
@@ -455,6 +932,16 @@ def _partial_no_result_review_payload(
                     "label": "SPL",
                     "deviation_value": -1.0,
                     "deviation_display": "-1 dB",
+                    "channel_index": 1,
+                    "channel_label": "CH2",
+                    "status": "OK",
+                    "constrained": True,
+                },
+                {
+                    "item_key": "loudness",
+                    "label": "Loudness",
+                    "deviation_value": -0.5,
+                    "deviation_display": "-0.5 sone",
                     "channel_index": 1,
                     "channel_label": "CH2",
                     "status": "OK",
@@ -513,18 +1000,22 @@ def _assert_run_specific_cards_cleared(window, *, result_badge: str = "-") -> No
     assert window.result.lb_empty_text.text() == ""
     assert window.stft.selection_box.isVisible() is False
     assert window.stft.analyze_button.isVisible() is False
+    assert window.loudness.plot.isHidden() is False
     assert window.spectrum.plot.isHidden() is False
     assert window.spl.plot.isHidden() is False
     assert window.octave.plot.isHidden() is False
+    assert window.loudness.has_committed_plot_data() is False
     assert window.spectrum.has_committed_plot_data() is False
     assert window.spl.has_committed_plot_data() is False
     assert window.octave.has_committed_plot_data() is False
 
 
 def _assert_chart_cards_visible(window) -> None:
+    assert window.loudness.plot.isHidden() is False
     assert window.spectrum.plot.isHidden() is False
     assert window.spl.plot.isHidden() is False
     assert window.octave.plot.isHidden() is False
+    assert window.loudness.has_committed_plot_data() is True
     assert window.spectrum.has_committed_plot_data() is True
     assert window.spl.has_committed_plot_data() is True
     assert window.octave.has_committed_plot_data() is True
@@ -592,6 +1083,11 @@ def _emit_review_ready(
 
 
 def _assert_committed_chart_channel(window, *, channel_index: int) -> None:
+    assert window.loudness.current_render_channel() == channel_index
+    assert window.loudness.current_plot_payload()["values"] == [
+        10.0 + channel_index,
+        12.0 + channel_index,
+    ]
     assert window.spl.current_render_channel() == channel_index
     assert window.spl.current_plot_payload()["y_values"] == [
         70.0 + channel_index,
@@ -602,17 +1098,68 @@ def _assert_committed_chart_channel(window, *, channel_index: int) -> None:
         40.0 + channel_index,
         42.0 + channel_index,
     ]
+    assert window.spectrum.current_plot_payload()["golden_overlay_levels_db"] is None
+    assert window.spectrum.current_plot_payload()["show_zero_reference"] is False
     assert window.octave.current_render_channel() == channel_index
     assert window.octave.current_plot_payload()["levels_db"] == [
         32.0 + channel_index,
         34.0 + channel_index,
     ]
+    assert window.octave.current_plot_payload()["golden_overlay_levels_db"] is None
+    assert window.octave.current_plot_payload()["show_zero_reference"] is False
 
 
 def _result_table_value(window, row: int, column: int) -> str:
     item = window.result.table.item(row, column)
     assert item is not None
     return item.text()
+
+
+def _card_title(card: QWidget) -> str:
+    title = card.findChild(QLabel, "CardTitle")
+    assert title is not None
+    return title.text()
+
+
+def _test_page(window) -> QWidget:
+    return window.tab.widget(window._TEST_PAGE_INDEX)
+
+
+def _test_page_left_slot_card(window, index: int) -> QWidget:
+    page = _test_page(window)
+    content_layout = page.layout()
+    assert content_layout is not None
+    left_column = content_layout.itemAt(0).widget()
+    assert left_column is not None
+    left_layout = left_column.layout()
+    assert left_layout is not None
+    card = left_layout.itemAt(index).widget()
+    assert card is not None
+    return card
+
+
+def _test_page_grid_card(window, row: int, column: int) -> QWidget:
+    page = _test_page(window)
+    content_layout = page.layout()
+    assert content_layout is not None
+    main_panel = content_layout.itemAt(1).widget()
+    assert main_panel is not None
+    main_layout = main_panel.layout()
+    assert main_layout is not None
+    grid = main_layout.itemAt(0).layout()
+    assert grid is not None
+    item = grid.itemAtPosition(row, column)
+    assert item is not None
+    card = item.widget()
+    assert card is not None
+    return card
+
+
+def _test_page_card_titles(window) -> list[str]:
+    return [
+        label.text()
+        for label in _test_page(window).findChildren(QLabel, "CardTitle")
+    ]
 
 
 def _make_stft_frame(
@@ -761,6 +1308,48 @@ def test_selection_changed_reset_clears_result_stft_and_chart_cards(qapp, monkey
     _assert_run_specific_cards_cleared(window)
 
 
+def test_main_window_reflows_test_page_for_loudness_and_video(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    assert "系统日志" not in _test_page_card_titles(window)
+    assert _card_title(_test_page_left_slot_card(window, 2)) == "视频预览"
+    assert window.video.parentWidget() is _test_page_left_slot_card(window, 2)
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "Loudness"
+    assert window.loudness.parentWidget() is _test_page_grid_card(window, 2, 0)
+
+
+def test_test_page_uses_renamed_spl_card_title(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    assert _card_title(_test_page_grid_card(window, 2, 1)) == "声压级 (SPL)"
+
+
+def test_main_window_routes_latest_log_line_to_status_bar(qapp, monkeypatch):
+    window, services = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    assert window.statusBar().currentMessage() == "[App] 启动程序"
+
+    window.current_user_name = "operator"
+    window.current_user_role = "操作员"
+    window.set_role()
+    qapp.processEvents()
+
+    assert window.statusBar().currentMessage() == "[App] 启动程序"
+
+    services.bus.status.emit("Analyzing...")
+    qapp.processEvents()
+
+    assert window.statusBar().currentMessage() == "[App] 启动程序"
+
+    services.bus.log.emit("line 1\n\n  line 2  \n")
+    qapp.processEvents()
+
+    assert window.statusBar().currentMessage() == "line 2"
+
+
 def test_main_window_channel_toolbar_shows_for_multi_channel_running_config(qapp, monkeypatch):
     window, services = _make_window(
         monkeypatch,
@@ -781,6 +1370,7 @@ def test_main_window_channel_toolbar_shows_for_multi_channel_running_config(qapp
     assert window.analysis_toolbar.current_channel_index() == 0
     assert window.display_channel_by_config_id == {101: 0}
     assert callable(window.stft.selected_display_channel_provider)
+    assert callable(window.loudness.selected_display_channel_provider)
     assert callable(window.spl.selected_display_channel_provider)
     assert callable(window.spectrum.selected_display_channel_provider)
     assert callable(window.octave.selected_display_channel_provider)
@@ -836,6 +1426,60 @@ def test_main_window_toolbar_selection_immediately_refreshes_stft_cached_channel
         window.stft.current_image_payload()["magnitude_db"],
         np.array([[9.0], [10.0]]),
     )
+
+
+def test_main_window_page_reentry_does_not_redraw_visible_unchanged_stft(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(
+            config_id=101,
+            run_id="run-101",
+            trigger_source="manual",
+        )
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        0,
+        _make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)),
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        1,
+        _make_stft_frame(time=0.0, magnitudes=(9.0, 10.0)),
+    )
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 1)
+
+    redraw_calls: list[dict[str, object]] = []
+
+    monkeypatch.setattr(
+        window.stft.canvas.heatmap,
+        "set_image",
+        lambda **kwargs: redraw_calls.append(kwargs),
+    )
+
+    window.tab.setCurrentIndex(1)
+    qapp.processEvents()
+    window.tab.setCurrentIndex(0)
+    qapp.processEvents()
+
+    assert redraw_calls == []
+    assert window.stft.current_render_cache_key() == (101, "run-101", 1)
 
 
 def test_main_window_page_reentry_refreshes_stft_from_existing_cache(
@@ -976,6 +1620,82 @@ def test_main_window_toolbar_selection_immediately_refreshes_committed_chart_mod
     _assert_committed_chart_channel(window, channel_index=1)
 
 
+def test_main_window_analysis_toolbar_remains_visible_in_stopped_phase(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(monkeypatch)
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    try:
+        services.bus.factory_state_changed.emit(_stopped_state(101))
+        qapp.processEvents()
+
+        assert window.analysis_toolbar.isVisible() is True
+        assert _toolbar_channel_options(window) == [0, 1]
+        assert window.analysis_toolbar.current_channel_index() == 0
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_main_window_stopped_state_preserves_review_channel_resolution(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0, 2)),
+    )
+    _show(window, qapp)
+
+    try:
+        services.bus.factory_state_changed.emit(_reviewing_state(101))
+        services.bus.factory_review_changed.emit(
+            _review_payload_with_chart_payload(101, channels=(0, 2))
+        )
+        qapp.processEvents()
+        _select_toolbar_channel(window, qapp, 2)
+
+        services.bus.factory_state_changed.emit(_stopped_state(101))
+        qapp.processEvents()
+
+        assert window.analysis_toolbar.current_channel_index() == 2
+        _assert_committed_chart_channel(window, channel_index=2)
+    finally:
+        window.close()
+        qapp.processEvents()
+
+
+def test_main_window_review_loudness_card_uses_data_focused_y_range(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0,)),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0,))
+    )
+    qapp.processEvents()
+
+    assert window.loudness.plot.plot_item.vb.viewRange()[1] == pytest.approx((9.8, 12.2))
+
+
 def test_main_window_ai_partial_no_result_keeps_rule_rows_and_committed_charts_visible(
     qapp,
     monkeypatch,
@@ -1007,17 +1727,21 @@ def test_main_window_ai_partial_no_result_keeps_rule_rows_and_committed_charts_v
     assert _result_table_value(window, 0, 1) == "-1 dB"
     assert _result_table_value(window, 0, 2) == "CH2"
     assert _result_table_value(window, 0, 3) == "OK"
-    assert _result_table_value(window, 1, 0) == "FFT"
-    assert _result_table_value(window, 1, 1) == "2 dB"
-    assert _result_table_value(window, 1, 2) == "CH1"
-    assert _result_table_value(window, 1, 3) == "NG"
-    assert _result_table_value(window, 2, 0) == "倍频程"
-    assert _result_table_value(window, 2, 1) == "-3 dB"
-    assert _result_table_value(window, 2, 2) == "CH2"
-    assert _result_table_value(window, 2, 3) == "OK"
-    assert _result_table_value(window, 3, 0) == "AI分析"
-    assert _result_table_value(window, 3, 2) == "--"
-    assert _result_table_value(window, 3, 3) == "无结果"
+    assert _result_table_value(window, 1, 0) == "Loudness"
+    assert _result_table_value(window, 1, 1) == "-0.5 sone"
+    assert _result_table_value(window, 1, 2) == "CH2"
+    assert _result_table_value(window, 1, 3) == "OK"
+    assert _result_table_value(window, 2, 0) == "FFT"
+    assert _result_table_value(window, 2, 1) == "2 dB"
+    assert _result_table_value(window, 2, 2) == "CH1"
+    assert _result_table_value(window, 2, 3) == "NG"
+    assert _result_table_value(window, 3, 0) == "倍频程"
+    assert _result_table_value(window, 3, 1) == "-3 dB"
+    assert _result_table_value(window, 3, 2) == "CH2"
+    assert _result_table_value(window, 3, 3) == "OK"
+    assert _result_table_value(window, 4, 0) == "AI分析"
+    assert _result_table_value(window, 4, 2) == "--"
+    assert _result_table_value(window, 4, 3) == "无结果"
     _assert_chart_cards_visible(window)
     _assert_committed_chart_channel(window, channel_index=1)
 
@@ -1028,7 +1752,13 @@ def test_main_window_resolves_display_channel_before_analysis_modules_handle_fac
 ):
     for name in ("ResultModule",):
         monkeypatch.setattr(main_window_mod, name, _StubModule)
-    for name in ("SpectrumModule", "StftModule", "SplModule", "OctaveModule"):
+    for name in (
+        "SpectrumModule",
+        "StftModule",
+        "SplModule",
+        "OctaveModule",
+        "LoudnessModule",
+    ):
         monkeypatch.setattr(main_window_mod, name, _ChannelProbeModule)
 
     window, services = _make_window(
@@ -1045,6 +1775,7 @@ def test_main_window_resolves_display_channel_before_analysis_modules_handle_fac
     qapp.processEvents()
 
     assert window.stft.state_seen_channels[-1] == 0
+    assert window.loudness.state_seen_channels[-1] == 0
     assert window.spl.state_seen_channels[-1] == 0
 
     _select_toolbar_channel(window, qapp, 1)
@@ -1056,7 +1787,85 @@ def test_main_window_resolves_display_channel_before_analysis_modules_handle_fac
     qapp.processEvents()
 
     assert window.stft.review_seen_channels[-1] == 0
+    assert window.loudness.review_seen_channels[-1] == 0
     assert window.octave.review_seen_channels[-1] == 0
+
+
+def test_main_window_review_selected_channel_without_loudness_payload_keeps_other_cards_on_channel(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(
+            101,
+            channels=(0, 1),
+            missing_loudness_channels=(1,),
+        ),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(
+            101,
+            channels=(0, 1),
+            missing_loudness_channels=(1,),
+        )
+    )
+    qapp.processEvents()
+
+    _select_toolbar_channel(window, qapp, 1)
+
+    assert window.analysis_toolbar.current_channel_index() == 1
+    assert window.display_channel_by_config_id[101] == 1
+    assert window.spl.current_render_channel() == 1
+    assert window.spectrum.current_render_channel() == 1
+    assert window.octave.current_render_channel() == 1
+    assert window.loudness.has_committed_plot_data() is False
+    assert window.loudness.current_render_channel() is None
+    assert window.loudness.current_plot_payload() is None
+
+
+def test_main_window_review_selected_channel_missing_fft_and_octave_payloads_keeps_channel_selected(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0, 1)),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    review_payload = _review_payload_with_chart_payload(101, channels=(0, 1))
+    del review_payload.chart_payload[1]["fft"]
+    del review_payload.chart_payload[1]["octave"]
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 1)
+
+    assert window.analysis_toolbar.current_channel_index() == 1
+    assert window.display_channel_by_config_id[101] == 1
+    assert window.spl.current_render_channel() == 1
+    assert window.loudness.current_render_channel() == 1
+    assert window.spectrum.has_committed_plot_data() is False
+    assert window.spectrum.current_render_channel() == 1
+    assert window.spectrum.current_plot_payload() is None
+    assert window.octave.has_committed_plot_data() is False
+    assert window.octave.current_render_channel() == 1
+    assert window.octave.current_plot_payload() is None
 
 
 def test_main_window_channel_toolbar_hides_or_disables_selector_for_single_channel_displayed_config(

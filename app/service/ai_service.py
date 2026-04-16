@@ -14,13 +14,23 @@ import subprocess
 import sys
 import time
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
 from peewee import DoesNotExist
 
+from app.service.ai_resident_runtime import ResidentToolchainRuntime
 from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable
 from model.ai_execution_table import AiExecutionTable
+from model.test_config_table import TestConfigTable
+
+_SUPPORTED_PROTOCOL_VERSION = 1
+_DEFAULT_EXECUTION_MODE = "resident_process"
+_SUPPORTED_EXECUTION_MODES = {
+    "resident_process",
+    "oneshot_process",
+}
 
 _TZ8 = timezone(timedelta(hours=8))
 
@@ -35,10 +45,68 @@ def _gen_request_id() -> str:
     return f"req_{ts}_{short}"
 
 
+def _coerce_probability(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    probability = float(value)
+    if not math.isfinite(probability):
+        return None
+    if 0.0 <= probability <= 1.0:
+        return probability
+    return None
+
+
+def _resolve_effective_decision_threshold(
+    ai_result: dict, request_params: dict
+) -> tuple[float, str]:
+    extra = ai_result.get("extra")
+    response_threshold = None
+    if isinstance(extra, dict):
+        response_threshold = _coerce_probability(extra.get("decision_threshold"))
+    if response_threshold is not None:
+        return response_threshold, "response_extra"
+
+    request_threshold = None
+    if isinstance(request_params, dict):
+        request_threshold = _coerce_probability(
+            request_params.get("decision_threshold")
+        )
+    if request_threshold is not None:
+        return request_threshold, "request_params"
+
+    return 0.5, "default"
+
+
 class AiService:
     """AI toolchain integration service."""
 
+    def __init__(
+        self,
+        resident_runtime: ResidentToolchainRuntime | None = None,
+    ) -> None:
+        self._resident_runtime = resident_runtime or ResidentToolchainRuntime()
+
+    def shutdown(self) -> None:
+        self._resident_runtime.shutdown_all()
+
+    @staticmethod
+    def _is_resident_toolchain(toolchain: AiToolchainTable | None) -> bool:
+        return bool(
+            toolchain is not None
+            and toolchain.execution_mode == "resident_process"
+        )
+
     # ── Toolchain Registry ──────────────────────────────────
+
+    def list_toolchains(self) -> list[dict]:
+        rows = (
+            AiToolchainTable.select()
+            .order_by(AiToolchainTable.toolchain_id)
+            .dicts()
+        )
+        return list(rows)
 
     def list_enabled_toolchains(self) -> list[dict]:
         rows = (
@@ -54,6 +122,192 @@ class AiService:
             return AiToolchainTable.get_by_id(toolchain_id)
         except DoesNotExist:
             return None
+
+    def list_toolchain_bindings(self, toolchain_id: str) -> list[dict]:
+        rows = (
+            TestConfigAiBindingTable.select(
+                TestConfigAiBindingTable.config_id.alias("config_id"),
+                TestConfigTable.config_name,
+            )
+            .join(TestConfigTable)
+            .where(TestConfigAiBindingTable.toolchain == toolchain_id)
+            .order_by(TestConfigAiBindingTable.config_id)
+            .dicts()
+        )
+        return list(rows)
+
+    def _normalize_toolchain_text(
+        self, value: str | None, field_name: str, *, allow_empty: bool
+    ) -> str:
+        if value is None:
+            value = ""
+        if not isinstance(value, str):
+            raise ValueError(f"{field_name} must be a string")
+        normalized = value.strip()
+        if not allow_empty and not normalized:
+            raise ValueError(f"{field_name} must not be empty")
+        return normalized
+
+    def _normalize_toolchain_payload(
+        self, original_toolchain_id: str | None, data: dict
+    ) -> dict:
+        if "execution_mode" in data:
+            execution_mode = data["execution_mode"]
+        elif original_toolchain_id is None:
+            execution_mode = _DEFAULT_EXECUTION_MODE
+        else:
+            existing = self.get_toolchain(original_toolchain_id)
+            if existing is None:
+                raise ValueError("toolchain_id not found")
+            execution_mode = existing.execution_mode
+        if not isinstance(execution_mode, str):
+            raise ValueError("execution_mode must be a string")
+        execution_mode = execution_mode.strip()
+        if execution_mode not in _SUPPORTED_EXECUTION_MODES:
+            raise ValueError("execution_mode must be one of resident_process or oneshot_process")
+
+        normalized = {
+            "toolchain_id": self._normalize_toolchain_text(
+                data.get("toolchain_id"), "toolchain_id", allow_empty=False
+            ),
+            "display_name": self._normalize_toolchain_text(
+                data.get("display_name"), "display_name", allow_empty=False
+            ),
+            "version": self._normalize_toolchain_text(
+                data.get("version", ""), "version", allow_empty=True
+            ),
+            "entrypoint": self._normalize_toolchain_text(
+                data.get("entrypoint"), "entrypoint", allow_empty=False
+            ),
+            "description": self._normalize_toolchain_text(
+                data.get("description", ""), "description", allow_empty=True
+            ),
+            "enabled": bool(data.get("enabled", True)),
+            "protocol_version": _SUPPORTED_PROTOCOL_VERSION,
+            "execution_mode": execution_mode,
+        }
+
+        timeout_ms = data.get("default_timeout_ms")
+        if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms <= 0:
+            raise ValueError("default_timeout_ms must be a positive integer")
+        normalized["default_timeout_ms"] = timeout_ms
+
+        existing = self.get_toolchain(normalized["toolchain_id"])
+        if existing is not None and normalized["toolchain_id"] != original_toolchain_id:
+            raise ValueError("toolchain_id must be unique")
+
+        return normalized
+
+    def _rewrite_toolchain_binding_ids(self, old_toolchain_id: str, new_toolchain_id: str):
+        from consts.time_consts import now_str
+
+        (
+            TestConfigAiBindingTable.update(
+                toolchain=new_toolchain_id,
+                updated_time=now_str(),
+            )
+            .where(TestConfigAiBindingTable.toolchain == old_toolchain_id)
+            .execute()
+        )
+
+    def _clear_toolchain_bindings(self, toolchain_id: str):
+        from consts.time_consts import now_str
+
+        (
+            TestConfigAiBindingTable.update(
+                enabled=False,
+                toolchain=None,
+                updated_time=now_str(),
+            )
+            .where(TestConfigAiBindingTable.toolchain == toolchain_id)
+            .execute()
+        )
+
+    def _delete_toolchain_row(self, toolchain_id: str):
+        (
+            AiToolchainTable.delete()
+            .where(AiToolchainTable.toolchain_id == toolchain_id)
+            .execute()
+        )
+
+    def save_toolchain(self, original_toolchain_id: str | None, data: dict) -> str:
+        from consts.time_consts import now_str
+
+        database = AiToolchainTable._meta.database
+        existing = None
+        resident_mutation_toolchain_id = None
+        if original_toolchain_id is not None:
+            existing = self.get_toolchain(original_toolchain_id)
+            if existing is None:
+                raise ValueError("toolchain_id not found")
+            if self._is_resident_toolchain(existing):
+                resident_mutation_toolchain_id = original_toolchain_id
+        mutation_lease = (
+            self._resident_runtime.hold_mutation_lease(resident_mutation_toolchain_id)
+            if resident_mutation_toolchain_id is not None
+            else nullcontext()
+        )
+        with mutation_lease:
+            normalized = self._normalize_toolchain_payload(original_toolchain_id, data)
+            timestamp = now_str()
+
+            with database.atomic():
+                if original_toolchain_id is None:
+                    row = AiToolchainTable.create(
+                        **normalized,
+                        created_time=timestamp,
+                        updated_time=timestamp,
+                    )
+                    return row.toolchain_id
+
+                assert existing is not None
+
+                if normalized["toolchain_id"] == original_toolchain_id:
+                    existing.display_name = normalized["display_name"]
+                    existing.version = normalized["version"]
+                    existing.entrypoint = normalized["entrypoint"]
+                    existing.default_timeout_ms = normalized["default_timeout_ms"]
+                    existing.enabled = normalized["enabled"]
+                    existing.description = normalized["description"]
+                    existing.protocol_version = _SUPPORTED_PROTOCOL_VERSION
+                    existing.execution_mode = normalized["execution_mode"]
+                    existing.updated_time = timestamp
+                    existing.save()
+                    saved_toolchain_id = existing.toolchain_id
+                else:
+                    AiToolchainTable.create(
+                        **normalized,
+                        created_time=existing.created_time,
+                        updated_time=timestamp,
+                    )
+                    self._rewrite_toolchain_binding_ids(
+                        original_toolchain_id, normalized["toolchain_id"]
+                    )
+                    self._delete_toolchain_row(original_toolchain_id)
+                    saved_toolchain_id = normalized["toolchain_id"]
+
+            if resident_mutation_toolchain_id is not None:
+                self._resident_runtime.invalidate(resident_mutation_toolchain_id)
+            return saved_toolchain_id
+
+    def delete_toolchain(self, toolchain_id: str):
+        database = AiToolchainTable._meta.database
+        existing = self.get_toolchain(toolchain_id)
+        if existing is None:
+            raise ValueError("toolchain_id not found")
+        should_invalidate_resident = self._is_resident_toolchain(existing)
+        mutation_lease = (
+            self._resident_runtime.hold_mutation_lease(toolchain_id)
+            if should_invalidate_resident
+            else nullcontext()
+        )
+
+        with mutation_lease:
+            with database.atomic():
+                self._clear_toolchain_bindings(toolchain_id)
+                self._delete_toolchain_row(toolchain_id)
+            if should_invalidate_resident:
+                self._resident_runtime.invalidate(toolchain_id)
 
     # ── Binding Resolver ────────────────────────────────────
 
@@ -79,7 +333,6 @@ class AiService:
             "timeout_ms": binding.timeout_ms,
             "effective_timeout_ms": effective_timeout,
             "params_json": binding.params_json,
-            "score_threshold": binding.score_threshold,
         }
 
     # ── Binding CRUD (for config UI) ────────────────────────
@@ -101,9 +354,8 @@ class AiService:
                 timeout_ms,
                 analysis_window_offset_ms,
                 params_json,
-                score_threshold,
                 updated_time
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 config_id,
@@ -112,7 +364,6 @@ class AiService:
                 data.get("timeout_ms"),
                 0,
                 data.get("params_json", "{}"),
-                data.get("score_threshold"),
                 now_str(),
             ),
         )
@@ -122,12 +373,7 @@ class AiService:
         """Create or update the AI binding for a test config.
         """
         if "score_threshold" in data:
-            st = data["score_threshold"]
-            if st is not None:
-                if isinstance(st, bool) or not isinstance(st, (int, float)):
-                    raise ValueError("score_threshold must be numeric (int or float, not bool)")
-                if math.isnan(st) or math.isinf(st):
-                    raise ValueError("score_threshold must be finite (not NaN or inf)")
+            raise ValueError("score_threshold has been removed")
 
         database = TestConfigAiBindingTable._meta.database
         with database.atomic():
@@ -139,8 +385,6 @@ class AiService:
                 existing.toolchain_id = data.get("toolchain_id")
                 existing.timeout_ms = data.get("timeout_ms")
                 existing.params_json = data.get("params_json", "{}")
-                if "score_threshold" in data:
-                    existing.score_threshold = data["score_threshold"]
                 from consts.time_consts import now_str
                 existing.updated_time = now_str()
                 existing.save()
@@ -154,7 +398,6 @@ class AiService:
                     toolchain=data.get("toolchain_id"),
                     timeout_ms=data.get("timeout_ms"),
                     params_json=data.get("params_json", "{}"),
-                    score_threshold=data.get("score_threshold"),
                 )
                 return row.binding_id
 
@@ -315,19 +558,7 @@ class AiService:
 
     # ── Result Validator ────────────────────────────────────
 
-    def validate_response(
-        self, response_json_path: str, request_id: str
-    ) -> dict:
-        """Validate response.json. Returns dict with 'status' and optional 'ai_result'."""
-        if not os.path.isfile(response_json_path):
-            return {"status": "protocol_error", "error": "response.json not found"}
-
-        try:
-            with open(response_json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, UnicodeDecodeError) as e:
-            return {"status": "invalid_output", "error": f"Invalid JSON: {e}"}
-
+    def _validate_response_payload(self, data: object, request_id: str) -> dict:
         if not isinstance(data, dict):
             return {"status": "invalid_output", "error": "Root must be a JSON object"}
 
@@ -398,11 +629,31 @@ class AiService:
             "toolchain_version": data.get("toolchain_version"),
         }
 
+    def validate_response(
+        self, response_json_path: str, request_id: str
+    ) -> dict:
+        """Validate response.json. Returns dict with 'status' and optional 'ai_result'."""
+        if not os.path.isfile(response_json_path):
+            return {"status": "protocol_error", "error": "response.json not found"}
+
+        try:
+            with open(response_json_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            return {"status": "invalid_output", "error": f"Invalid JSON: {e}"}
+
+        return self._validate_response_payload(data, request_id)
+
     # ── Persistence ─────────────────────────────────────────
 
     def save_execution(self, envelope: dict) -> AiExecutionTable:
         """Persist an AI execution record."""
-        return AiExecutionTable.create(**envelope)
+        persisted_fields = {
+            key: value
+            for key, value in envelope.items()
+            if key in AiExecutionTable._meta.fields
+        }
+        return AiExecutionTable.create(**persisted_fields)
 
     def mark_previous_ineffective(self, test_run_id: str):
         """Set is_current_effective=False for all records of a test run."""
@@ -423,6 +674,101 @@ class AiService:
             return None
 
     # ── Orchestrator (full run) ─────────────────────────────
+
+    def _execute_ai_transport(
+        self,
+        *,
+        toolchain: AiToolchainTable,
+        binding: dict,
+        request_id: str,
+        request_data: dict,
+        request_json_path: str,
+        response_json_path: str,
+        artifacts_dir: str,
+    ) -> tuple[dict, dict | None, str]:
+        if toolchain.execution_mode == "resident_process":
+            resident_result = self._resident_runtime.analyze(
+                toolchain_id=toolchain.toolchain_id,
+                entrypoint=toolchain.entrypoint,
+                request_id=request_id,
+                request_payload=request_data,
+                artifacts_dir=artifacts_dir,
+                timeout_ms=binding["effective_timeout_ms"],
+            )
+            exec_result = {
+                "started_at": resident_result.get("started_at"),
+                "finished_at": resident_result.get("finished_at"),
+                "duration_ms": resident_result.get("duration_ms"),
+                "exit_code": None,
+                "error_summary": resident_result.get("error_summary"),
+                "stdout_excerpt": resident_result.get("stdout_excerpt"),
+                "stderr_excerpt": resident_result.get("stderr_excerpt"),
+            }
+            validation = None
+            module_status = resident_result["module_status"]
+            if module_status == "success":
+                validation = self._validate_response_payload(
+                    resident_result["response_payload"],
+                    request_id,
+                )
+                module_status = validation["status"]
+                if module_status == "success":
+                    try:
+                        with open(response_json_path, "w", encoding="utf-8") as f:
+                            json.dump(
+                                validation["raw_response"],
+                                f,
+                                ensure_ascii=False,
+                                indent=2,
+                            )
+                    except OSError as e:
+                        if os.path.exists(response_json_path):
+                            try:
+                                os.remove(response_json_path)
+                            except OSError:
+                                pass
+                        validation = None
+                        module_status = "process_error"
+                        exec_result["error_summary"] = (
+                            f"Failed to persist response.json: {e}"
+                        )
+            return exec_result, validation, module_status
+
+        if toolchain.execution_mode != "oneshot_process":
+            started_at = _now_iso()
+            exec_result = {
+                "started_at": started_at,
+                "finished_at": started_at,
+                "duration_ms": 0,
+                "exit_code": None,
+                "error_summary": f"Unsupported execution_mode: {toolchain.execution_mode}",
+                "stdout_excerpt": None,
+                "stderr_excerpt": (
+                    f"Unsupported execution_mode: {toolchain.execution_mode}"
+                )[:2000],
+                "process_error": True,
+            }
+            return exec_result, None, "process_error"
+
+        exec_result = self.execute_toolchain(
+            entrypoint=toolchain.entrypoint,
+            request_json_path=request_json_path,
+            response_json_path=response_json_path,
+            artifacts_dir=artifacts_dir,
+            timeout_ms=binding["effective_timeout_ms"],
+        )
+
+        validation = None
+        if exec_result.get("timeout"):
+            module_status = "timeout"
+        elif exec_result.get("process_error"):
+            module_status = "process_error"
+        elif exec_result["exit_code"] != 0:
+            module_status = "process_error"
+        else:
+            validation = self.validate_response(response_json_path, request_id)
+            module_status = validation["status"]
+        return exec_result, validation, module_status
 
     def run_ai_analysis(
         self,
@@ -497,26 +843,15 @@ class AiService:
             json.dump(request_data, f, ensure_ascii=False, indent=2)
 
         # 4. Execute
-        exec_result = self.execute_toolchain(
-            entrypoint=tc.entrypoint,
+        exec_result, validation, module_status = self._execute_ai_transport(
+            toolchain=tc,
+            binding=binding,
+            request_id=request_id,
+            request_data=request_data,
             request_json_path=request_json_path,
             response_json_path=response_json_path,
             artifacts_dir=artifacts_dir,
-            timeout_ms=binding["effective_timeout_ms"],
         )
-
-        # 5. Determine module_status
-        validation = None
-        if exec_result.get("timeout"):
-            module_status = "timeout"
-        elif exec_result.get("process_error"):
-            module_status = "process_error"
-        elif exec_result["exit_code"] != 0:
-            module_status = "process_error"
-        else:
-            # 6. Validate response
-            validation = self.validate_response(response_json_path, request_id)
-            module_status = validation["status"]
 
         # 7. Build envelope
         wi = window_info or {}
@@ -558,18 +893,32 @@ class AiService:
         if module_status == "timeout":
             envelope["error_summary"] = "Process timed out"
         elif module_status == "process_error":
-            envelope["error_summary"] = exec_result.get("stderr_excerpt") or f"Exit code {exec_result.get('exit_code')}"
-        elif validation and module_status in ("protocol_error", "invalid_output"):
-            envelope["error_summary"] = validation.get("error")
+            envelope["error_summary"] = (
+                exec_result.get("error_summary")
+                or exec_result.get("stderr_excerpt")
+                or f"Exit code {exec_result.get('exit_code')}"
+            )
+        elif module_status in ("protocol_error", "invalid_output"):
+            envelope["error_summary"] = (
+                validation.get("error")
+                if validation
+                else exec_result.get("error_summary")
+            )
 
         if module_status == "success":
             ai_result = validation["ai_result"]
+            decision_threshold, threshold_source = _resolve_effective_decision_threshold(
+                ai_result,
+                params,
+            )
             envelope["toolchain_name"] = validation.get("toolchain_name")
             envelope["toolchain_version"] = validation.get("toolchain_version")
             envelope["ai_label"] = ai_result.get("ai_label")
             envelope["score"] = ai_result.get("score")
             envelope["summary"] = ai_result.get("summary")
             envelope["confidence"] = ai_result.get("confidence")
+            envelope["decision_threshold"] = decision_threshold
+            envelope["decision_threshold_source"] = threshold_source
             envelope["extra_json"] = json.dumps(
                 ai_result.get("extra", {}), ensure_ascii=False
             )

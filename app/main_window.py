@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, QMetaObject
+from PyQt6.QtCore import QMetaObject, Qt
 from PyQt6.QtGui import QAction, QCloseEvent
 from PyQt6.QtWidgets import (
     QButtonGroup,
@@ -23,15 +23,16 @@ from ui.modules.workorder import WorkOrderModule
 from ui.modules.control import ControlModule
 from ui.modules.spectrum import SpectrumModule
 from ui.modules.stft import StftModule
+from ui.modules.loudness import LoudnessModule
 from ui.modules.spl import SplModule
 from ui.modules.octave import OctaveModule
 from ui.modules.result import ResultModule
 from ui.modules.video import VideoModule
-from ui.modules.log import LogModule
 from ui.modules.hardware import HardwareModule
 from ui.modules.data_management import DataManagementModule
 from ui.modules.input_calibration import InputCalibrationModule
 from ui.modules.config import ConfigModule
+from ui.modules.ai_tool_management import AiToolManagementModule
 from ui.modules.channel_select import ChannelSelectModule
 from ui.modules.plc_settings import PlcSettingsModule
 from ui.modules.login import LoginWindow
@@ -41,11 +42,11 @@ from ui.modules.delete_user import DeleteUserWindow
 
 ROLE_PERMISSIONS = {
     "管理员": {
-        "tabs": {"测试", "数据管理", "配置", "硬件"},
+        "tabs": {"测试", "数据管理", "配置", "AI工具管理", "硬件"},
         "actions": {"切换用户", "添加用户", "删除用户", "修改密码"},
     },
     "工程师": {
-        "tabs": {"测试", "配置", "硬件"},
+        "tabs": {"测试", "配置", "AI工具管理", "硬件"},
         "actions": {"切换用户", "修改密码"},
     },
     "操作员": {
@@ -58,7 +59,7 @@ ROLE_PERMISSIONS = {
 class MainWindow(QMainWindow):
     _TEST_PAGE_INDEX = 0
     _DISPLAY_CHANNEL_PHASES = frozenset(
-        {"running", "analyzing", "reviewing", "reanalyzing"}
+        {"running", "analyzing", "reviewing", "reanalyzing", "stopped"}
     )
 
     def __init__(self, services):
@@ -66,6 +67,8 @@ class MainWindow(QMainWindow):
         self.services = services
         self.current_user_name = None  # current_user_name作为是否已登录的唯一判断
         self.current_user_role = None
+        self._applied_user_name = None
+        self._applied_user_role = None
         self.login_window = None
         self.change_password_window = None
         self.add_user_window = None
@@ -75,6 +78,9 @@ class MainWindow(QMainWindow):
         self._factory_state = getattr(factory_mode, "state", FactoryControllerState())
         self._review_payload = getattr(factory_mode, "review_payload", FactoryReviewPayload())
         self.display_channel_by_config_id: dict[int, int] = {}
+        self._current_main_tab_index = self._TEST_PAGE_INDEX
+        self._pending_guarded_tab_index: int | None = None
+        self._reverting_main_tab_change = False
 
         self.setWindowTitle("精成电机")
         self.setStyleSheet(APP_QSS)
@@ -94,16 +100,15 @@ class MainWindow(QMainWindow):
 
         self._connect_bus_signals()
 
-        # 页面：测试/数据管理/配置/硬件
+        # 页面：测试/数据管理/配置/AI工具管理/硬件
         self.tab.addWidget(self.build_test_page())
         self.tab.addWidget(self.build_data_page())
         self.tab.addWidget(self.build_config_page())
+        self.tab.addWidget(self.build_ai_tool_management_page())
         self.tab.addWidget(self.build_hardware_page())
         self.tab.currentChanged.connect(self._on_main_tab_changed)
 
-        self.statusBar().showMessage("Idle")
-
-        self.services.bus.log.emit("启动程序")
+        self.services.bus.log.emit("[App] 启动程序")
         self._sync_analysis_toolbar()
         self._refresh_analysis_display_modules()
         self.set_role()
@@ -113,7 +118,6 @@ class MainWindow(QMainWindow):
         if not self.login_shown:
             self.login_shown = True
             self.show_login_window(close_main_window=True, window_title="登录")
-
 
     def show_login_window(self, close_main_window=False, window_title="登录"):
         self.setEnabled(False)
@@ -175,13 +179,12 @@ class MainWindow(QMainWindow):
             group.addButton(b)
             lay.addWidget(b)
             return b
-        self.tab_names = ["测试", "数据管理", "配置", "硬件"]
+        self.tab_names = ["测试", "数据管理", "配置", "AI工具管理", "硬件"]
         for i, name in enumerate(self.tab_names):
             b = add_tab(name, checked=(i == 0))
             self.top_button_dict[name] = b
             group.setId(b, i)
-        # 把group中的按钮一起绑定页面设置
-        group.idClicked.connect(self.tab.setCurrentIndex)
+        group.idClicked.connect(self._on_topbar_tab_clicked)
 
         self.user_btn = QToolButton()
         self.user_btn.setText("用户")
@@ -212,8 +215,14 @@ class MainWindow(QMainWindow):
         return topbar
 
     def set_role(self):
+        role_applied = self._ensure_role_compatible_main_tab(self.current_user_role)
+        if not role_applied:
+            self.current_user_name = self._applied_user_name
+            self.current_user_role = self._applied_user_role
+            self._ensure_role_compatible_main_tab(self.current_user_role)
+
         role = self.current_user_role
-        perms = ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["操作员"])
+        perms = self._role_permissions(role)
         allowed_tabs = perms["tabs"]
         allowed_actions = perms["actions"]
         for name, btn in getattr(self, "top_button_dict", {}).items():
@@ -239,17 +248,12 @@ class MainWindow(QMainWindow):
             if stop_button is not None:
                 stop_button.setEnabled(bool(self.current_user_name))
 
-        if hasattr(self, "tab") and "测试" in getattr(self, "top_button_dict", {}):
-            current_name = self.tab_names[self.tab.currentIndex()]
-            current_btn = self.top_button_dict.get(current_name)
-            if current_btn and not current_btn.isEnabled():
-                self.tab.setCurrentIndex(0)
-                self.top_button_dict["测试"].setChecked(True)
+        if hasattr(self, "tab"):
+            self._sync_topbar_selection(self.tab.currentIndex())
 
-        if self.current_user_name and self.current_user_role:
-            self.statusBar().showMessage(
-                f"当前用户：{self.current_user_name} | 权限：{self.current_user_role}"
-            )
+        self._applied_user_name = self.current_user_name
+        self._applied_user_role = self.current_user_role
+        return role_applied
 
     def build_test_page(self) -> QWidget:
         page = QWidget()
@@ -270,8 +274,8 @@ class MainWindow(QMainWindow):
         self.control = ControlModule(self.services)
         left_lay.addWidget(Card("控制面板", self.control))
 
-        self.log = LogModule(self.services)
-        left_lay.addWidget(Card("系统日志", self.log), 1)
+        self.video = VideoModule(self.services)
+        left_lay.addWidget(Card("视频预览", self.video), 1)
 
         content_lay.addWidget(left)
 
@@ -295,9 +299,6 @@ class MainWindow(QMainWindow):
         self.result = ResultModule(self.services)
         grid.addWidget(Card("结果摘要", self.result), 1, 0)
 
-        self.video = VideoModule(self.services)
-        grid.addWidget(Card("视频预览", self.video), 2, 0)
-
         self.analysis_toolbar = AnalysisChannelToolbar()
         self.analysis_toolbar.channel_changed.connect(self._on_analysis_channel_changed)
         self.analysis_toolbar.hide()
@@ -309,8 +310,11 @@ class MainWindow(QMainWindow):
         self.stft = StftModule(self.services)
         grid.addWidget(Card("STFT 频谱图 (Spectrogram)", self.stft), 1, 1)
 
+        self.loudness = LoudnessModule(self.services)
+        grid.addWidget(Card("Loudness", self.loudness), 2, 0)
+
         self.spl = SplModule(self.services)
-        grid.addWidget(Card("SPL 时间曲线 (A计权)", self.spl), 2, 1)
+        grid.addWidget(Card("声压级 (SPL)", self.spl), 2, 1)
 
         self.octave = OctaveModule(self.services)
         grid.addWidget(Card("倍频程 (Octave)", self.octave), 2, 2)
@@ -354,6 +358,16 @@ class MainWindow(QMainWindow):
         lay.addWidget(Card("测试配置管理", self.config_module), 1)
         return page
 
+    def build_ai_tool_management_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+
+        self.ai_tool_management_module = AiToolManagementModule(self.services)
+        lay.addWidget(Card("AI工具管理", self.ai_tool_management_module), 1)
+        return page
+
     def build_hardware_page(self) -> QWidget:
         """
         左侧：设备选择/保存
@@ -366,6 +380,7 @@ class MainWindow(QMainWindow):
 
         # 左侧栏
         left = QWidget()
+        left.setFixedWidth(1200)
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
         left_lay.setSpacing(12)
@@ -382,7 +397,9 @@ class MainWindow(QMainWindow):
 
         cal = InputCalibrationModule(self.services)
         cal_card = Card("输入校准", cal)
-        cal_card.setFixedHeight(380)
+        # 让右侧校准区域更紧凑（类似参考图）
+        cal_card.setMaximumWidth(560)
+        cal_card.setFixedHeight(420)
 
         cal_row = QWidget()
         cal_row_lay = QHBoxLayout(cal_row)
@@ -392,7 +409,7 @@ class MainWindow(QMainWindow):
 
         channel = ChannelSelectModule(self.services)
         channel_card = Card("通道选择", channel)
-        channel_card.setMaximumWidth(560)
+        channel_card.setMaximumWidth(380)
         channel_card.setFixedHeight(100)
 
         plc = PlcSettingsModule(self.services)
@@ -409,13 +426,26 @@ class MainWindow(QMainWindow):
         return page
 
     def _connect_bus_signals(self) -> None:
-        self.services.bus.status.connect(self.statusBar().showMessage)
+        if hasattr(self.services.bus, "log"):
+            self.services.bus.log.connect(self._show_latest_log_line)
         if hasattr(self.services.bus, "factory_state_changed"):
             self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
         if hasattr(self.services.bus, "factory_review_changed"):
             self.services.bus.factory_review_changed.connect(self._on_factory_review_changed)
         if hasattr(self.services.bus, "factory_display_reset"):
             self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
+
+    def _show_latest_log_line(self, message) -> None:
+        self.statusBar().showMessage(self._latest_non_empty_log_line(message))
+
+    @staticmethod
+    def _latest_non_empty_log_line(message) -> str:
+        text = message if isinstance(message, str) else ("" if message is None else str(message))
+        for line in reversed(text.splitlines()):
+            normalized = line.strip()
+            if normalized:
+                return normalized
+        return ""
 
     def current_display_channel_index(self) -> int | None:
         config_id = self._factory_state.displayed_config_id
@@ -424,9 +454,9 @@ class MainWindow(QMainWindow):
         return self.display_channel_by_config_id.get(config_id)
 
     def _attach_analysis_channel_providers(self) -> None:
-        for module in (self.stft, self.spl, self.spectrum, self.octave):
+        for module in (self.stft, self.loudness, self.spl, self.spectrum, self.octave):
             module.selected_display_channel_provider = self.current_display_channel_index
-        for module in (self.spl, self.spectrum, self.octave):
+        for module in (self.loudness, self.spl, self.spectrum, self.octave):
             module.selected_display_channel_sync = self._sync_selected_display_channel
 
     def _on_factory_state_changed(self, state) -> None:
@@ -447,9 +477,121 @@ class MainWindow(QMainWindow):
         self._review_payload = FactoryReviewPayload()
         self._sync_analysis_toolbar()
 
+    def _on_topbar_tab_clicked(self, index: int) -> None:
+        current_index = self.tab.currentIndex()
+        if index == current_index:
+            self._sync_topbar_selection(index)
+            return
+        if not self._can_activate_main_tab(index):
+            self._sync_topbar_selection(current_index)
+            return
+        if not self._can_leave_main_tab(current_index):
+            self._sync_topbar_selection(current_index)
+            return
+
+        self._pending_guarded_tab_index = index
+        self.tab.setCurrentIndex(index)
+        if self.tab.currentIndex() == current_index:
+            self._pending_guarded_tab_index = None
+            self._sync_topbar_selection(current_index)
+
     def _on_main_tab_changed(self, index: int) -> None:
+        previous_index = self._current_main_tab_index
+        allowed_target = self._pending_guarded_tab_index
+        self._pending_guarded_tab_index = None
+
+        if self._reverting_main_tab_change:
+            self._reverting_main_tab_change = False
+        elif index != previous_index:
+            if not self._can_activate_main_tab(index):
+                self._revert_main_tab_change(previous_index)
+                return
+            if index != allowed_target and not self._can_leave_main_tab(previous_index):
+                self._revert_main_tab_change(previous_index)
+                return
+
+        self._finalize_main_tab_change(index)
+
+    def _finalize_main_tab_change(self, index: int) -> None:
+        self._current_main_tab_index = index
+        self._sync_topbar_selection(index)
         if index == self._TEST_PAGE_INDEX:
             self._refresh_analysis_display_modules()
+
+    def _revert_main_tab_change(self, previous_index: int) -> None:
+        self._reverting_main_tab_change = True
+        self.tab.setCurrentIndex(previous_index)
+        self._sync_topbar_selection(previous_index)
+
+    def _sync_topbar_selection(self, index: int) -> None:
+        for button_index, name in enumerate(getattr(self, "tab_names", [])):
+            button = self.top_button_dict.get(name)
+            if button is not None:
+                button.setChecked(button_index == index)
+
+    def _role_permissions(self, role):
+        return ROLE_PERMISSIONS.get(role, ROLE_PERMISSIONS["操作员"])
+
+    def _can_activate_main_tab(self, index: int | None, *, role=None) -> bool:
+        if index is None or index < 0 or index >= len(getattr(self, "tab_names", [])):
+            return False
+
+        effective_role = self.current_user_role if role is None else role
+        if effective_role is None:
+            return True
+
+        tab_name = self.tab_names[index]
+        allowed_tabs = self._role_permissions(effective_role)["tabs"]
+        return tab_name in allowed_tabs
+
+    def _ensure_role_compatible_main_tab(self, role) -> bool:
+        if not hasattr(self, "tab"):
+            return True
+
+        current_index = self.tab.currentIndex()
+        if self._can_activate_main_tab(current_index, role=role):
+            return True
+
+        target_index = self._first_allowed_main_tab_index(role)
+        if target_index is None:
+            return False
+        if target_index == current_index:
+            return True
+        if not self._can_leave_main_tab(current_index):
+            return False
+
+        self._pending_guarded_tab_index = target_index
+        self.tab.setCurrentIndex(target_index)
+        if self.tab.currentIndex() != target_index:
+            self._pending_guarded_tab_index = None
+            return False
+        return self._can_activate_main_tab(target_index, role=role)
+
+    def _first_allowed_main_tab_index(self, role) -> int | None:
+        allowed_tabs = self._role_permissions(role)["tabs"]
+        for index, name in enumerate(getattr(self, "tab_names", [])):
+            if name in allowed_tabs:
+                return index
+        return None
+
+    def _can_leave_main_tab(self, index: int | None) -> bool:
+        if index != self._ai_tool_management_tab_index():
+            return True
+
+        confirm_leave = getattr(
+            getattr(self, "ai_tool_management_module", None),
+            "confirm_leave",
+            None,
+        )
+        if callable(confirm_leave):
+            return bool(confirm_leave())
+        return True
+
+    def _ai_tool_management_tab_index(self) -> int | None:
+        try:
+            return self.tab_names.index("AI工具管理")
+        except ValueError:
+            return None
 
     def _on_analysis_channel_changed(self, channel_index: int) -> None:
         self._sync_selected_display_channel(channel_index, refresh_modules=False)
@@ -475,7 +617,7 @@ class MainWindow(QMainWindow):
             self._refresh_analysis_display_modules()
 
     def _refresh_analysis_display_modules(self) -> None:
-        for module in (self.stft, self.spl, self.spectrum, self.octave):
+        for module in (self.stft, self.loudness, self.spl, self.spectrum, self.octave):
             refresh = getattr(module, "refresh_selected_display_channel", None)
             if callable(refresh):
                 refresh()
@@ -521,7 +663,7 @@ class MainWindow(QMainWindow):
         if selected_channels:
             return selected_channels
 
-        if self._factory_state.run_phase in {"reviewing", "reanalyzing"}:
+        if self._factory_state.run_phase in {"reviewing", "reanalyzing", "stopped"}:
             return self._chart_payload_channels_for_config(config_id)
 
         return []
@@ -591,9 +733,11 @@ class MainWindow(QMainWindow):
         return f"配置 {config_id} / CH{channel_index + 1}"
 
     def closeEvent(self, event: QCloseEvent):
-        self.services.bus.log.emit("关闭程序")
+        if not self._can_leave_main_tab(self._ai_tool_management_tab_index()):
+            event.ignore()
+            return
+        self.services.bus.log.emit("[App] 关闭程序")
         try:
-            # 停止 PLC 监听
             for plc_service in getattr(self.services, "plc_services", {}).values():
                 if plc_service is None:
                     continue

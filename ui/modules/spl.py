@@ -8,7 +8,9 @@ from ui.widgets.analysis_charts import LineChartWidget
 
 class SplModule(QWidget):
     module_id = "spl"
-    _RENDER_PHASES = frozenset({"reviewing"})
+    _RENDER_PHASES = frozenset({"reviewing", "stopped"})
+    _BOTTOM_AXIS_LABEL = "Time (s)"
+    _LEFT_AXIS_LABEL = "SPL (dB)"
 
     def __init__(self, services):
         super().__init__()
@@ -32,6 +34,7 @@ class SplModule(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
 
         self.plot = LineChartWidget()
+        self._set_axis_labels()
         lay.addWidget(self.plot, 1)
 
         if hasattr(self.services.bus, "factory_state_changed"):
@@ -112,6 +115,7 @@ class SplModule(QWidget):
             self._clear_plot()
             return
 
+        self._set_axis_labels()
         self._has_plot_data = True
         self._rendered_channel_index = channel_index
 
@@ -119,6 +123,11 @@ class SplModule(QWidget):
         self._has_plot_data = False
         self._rendered_channel_index = None
         self.plot.clear_data()
+        self._set_axis_labels()
+
+    def _set_axis_labels(self) -> None:
+        self.plot.plot_item.setLabel("bottom", self._BOTTOM_AXIS_LABEL)
+        self.plot.plot_item.setLabel("left", self._LEFT_AXIS_LABEL)
 
     def _can_render_committed_chart(self) -> bool:
         return (

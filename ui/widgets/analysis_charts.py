@@ -10,6 +10,8 @@ from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 pg.setConfigOptions(antialias=True, background="w", foreground="#334155")
 
+_LINE_CHART_Y_AXIS_MODES = frozenset({"auto", "data_focus"})
+
 
 def _normalize_vector(values: Iterable[float], *, name: str) -> list[float]:
     normalized: list[float] = []
@@ -53,6 +55,21 @@ def _normalize_limit_bands(limit_bands: Iterable[dict] | None) -> list[dict]:
     return normalized
 
 
+def _normalize_optional_overlay_levels(
+    levels_db: Iterable[float] | None,
+    *,
+    expected_length: int,
+    name: str,
+) -> list[float] | None:
+    if levels_db is None:
+        return None
+
+    normalized = _normalize_vector(levels_db, name=name)
+    if len(normalized) != expected_length:
+        raise ValueError(f"{name} must be the same length as the plotted series")
+    return normalized
+
+
 def _nearest_positions(base_values: list[float], band_freqs: Iterable[float]) -> list[float]:
     if not base_values:
         return []
@@ -82,6 +99,32 @@ def _visible_axis_max(values: Iterable[float] | None) -> float:
     if payload_max <= 0.0 or np.isclose(payload_min, payload_max):
         return max(payload_max, 1.0)
     return payload_max
+
+
+def _normalize_line_chart_y_axis_mode(mode: str) -> str:
+    normalized = str(mode).strip().lower()
+    if normalized not in _LINE_CHART_Y_AXIS_MODES:
+        raise ValueError(f"y_axis_mode must be one of {sorted(_LINE_CHART_Y_AXIS_MODES)}")
+    return normalized
+
+
+def _validate_data_focus_series(*, x_values: list[float], y_values: list[float]) -> tuple[float, float]:
+    if not x_values or not y_values:
+        raise ValueError("data_focus requires a non-empty series")
+
+    x_array = np.asarray(x_values, dtype=float)
+    y_array = np.asarray(y_values, dtype=float)
+    if not np.all(np.isfinite(x_array)) or not np.all(np.isfinite(y_array)):
+        raise ValueError("data_focus requires only finite plotted values")
+
+    y_min = float(y_array.min())
+    y_max = float(y_array.max())
+    if np.isclose(y_min, y_max):
+        padding = max(0.1 * abs(y_min), 0.5)
+        return (y_min - padding, y_max + padding)
+
+    padding = max(0.1 * (y_max - y_min), 0.1)
+    return (y_min - padding, y_max + padding)
 
 
 class _BasePlotChart(QWidget):
@@ -321,6 +364,7 @@ class LineChartWidget(_BasePlotChart):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._series_payload: dict | None = None
+        self._y_axis_mode = "auto"
         self._curve = self.plot_item.plot(
             pen=pg.mkPen(color="#2563eb", width=2),
         )
@@ -346,11 +390,19 @@ class LineChartWidget(_BasePlotChart):
         *,
         lower_limit: float | None = None,
         upper_limit: float | None = None,
+        y_axis_mode: str = "auto",
     ) -> None:
         normalized_x = _normalize_vector(x_values, name="x_values")
         normalized_y = _normalize_vector(y_values, name="y_values")
         if len(normalized_x) != len(normalized_y):
             raise ValueError("x_values and y_values must be the same length")
+        normalized_mode = _normalize_line_chart_y_axis_mode(y_axis_mode)
+        data_focus_y_range = None
+        if normalized_mode == "data_focus":
+            data_focus_y_range = _validate_data_focus_series(
+                x_values=normalized_x,
+                y_values=normalized_y,
+            )
 
         self._series_payload = {
             "x_values": normalized_x,
@@ -358,6 +410,7 @@ class LineChartWidget(_BasePlotChart):
             "lower_limit": None if lower_limit is None else float(lower_limit),
             "upper_limit": None if upper_limit is None else float(upper_limit),
         }
+        self._y_axis_mode = normalized_mode
 
         self._curve.setData(normalized_x, normalized_y)
         self._update_limit_line(
@@ -369,6 +422,10 @@ class LineChartWidget(_BasePlotChart):
             self._series_payload["upper_limit"],
         )
         self._apply_x_axis_policy(payload_values=normalized_x)
+        if data_focus_y_range is None:
+            self._apply_auto_y_axis_policy()
+        else:
+            self._apply_data_focus_y_axis_policy(*data_focus_y_range)
 
     def clear_data(self) -> None:
         self._series_payload = None
@@ -376,6 +433,10 @@ class LineChartWidget(_BasePlotChart):
         self._lower_limit_line.hide()
         self._upper_limit_line.hide()
         self._apply_x_axis_policy(payload_values=None)
+        if self._y_axis_mode == "data_focus":
+            self._apply_data_focus_y_axis_policy(0.0, 1.0)
+        else:
+            self._apply_auto_y_axis_policy()
 
     def has_series(self) -> bool:
         return self._series_payload is not None
@@ -391,15 +452,43 @@ class LineChartWidget(_BasePlotChart):
         limit_line.setPos(value)
         limit_line.show()
 
+    def _apply_auto_y_axis_policy(self) -> None:
+        view_box = self.plot_item.vb
+        view_box.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+        view_box.updateAutoRange()
+
+    def _apply_data_focus_y_axis_policy(self, y_min: float, y_max: float) -> None:
+        view_box = self.plot_item.vb
+        view_box.enableAutoRange(axis=pg.ViewBox.YAxis, enable=False)
+        view_box.setYRange(y_min, y_max, padding=0.0)
+
 
 class FftLineChartWidget(LineChartWidget):
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
         self._spectrum_payload: dict | None = None
+        self._golden_overlay_curve_item = self.plot_item.plot(
+            pen=pg.mkPen(
+                color="#64748b",
+                width=2,
+                style=pg.QtCore.Qt.PenStyle.DashLine,
+            ),
+        )
         self._band_range_item = pg.ErrorBarItem()
         self._band_marker_item = pg.ScatterPlotItem(size=10, pen=pg.mkPen(None))
+        self._zero_reference_line = pg.InfiniteLine(
+            angle=0,
+            pen=pg.mkPen(
+                color="#94a3b8",
+                width=1,
+                style=pg.QtCore.Qt.PenStyle.DashLine,
+            ),
+            movable=False,
+        )
+        self.plot_item.addItem(self._zero_reference_line)
         self.plot_item.addItem(self._band_range_item)
         self.plot_item.addItem(self._band_marker_item)
+        self._zero_reference_line.hide()
         self.plot_item.setLabel("bottom", "Frequency", units="Hz")
         self.plot_item.setLabel("left", "Level", units="dB")
 
@@ -409,34 +498,69 @@ class FftLineChartWidget(LineChartWidget):
         frequencies_hz: Iterable[float],
         levels_db: Iterable[float],
         limit_bands: Iterable[dict] | None = None,
+        golden_overlay_levels_db: Iterable[float] | None = None,
+        show_zero_reference: bool = False,
     ) -> None:
         normalized_frequencies = _normalize_vector(
             frequencies_hz, name="frequencies_hz"
         )
         normalized_levels = _normalize_vector(levels_db, name="levels_db")
         normalized_limit_bands = _normalize_limit_bands(limit_bands)
+        normalized_golden_overlay = _normalize_optional_overlay_levels(
+            golden_overlay_levels_db,
+            expected_length=len(normalized_frequencies),
+            name="golden_overlay_levels_db",
+        )
 
         self.set_series(normalized_frequencies, normalized_levels)
         self._spectrum_payload = {
             "frequencies_hz": normalized_frequencies,
             "levels_db": normalized_levels,
             "limit_bands": normalized_limit_bands,
+            "golden_overlay_levels_db": normalized_golden_overlay,
+            "show_zero_reference": bool(show_zero_reference),
         }
 
+        self._render_golden_overlay(
+            x_values=normalized_frequencies,
+            levels_db=normalized_golden_overlay,
+        )
+        self._update_zero_reference_line(bool(show_zero_reference))
         self._render_band_markers(
             x_values=[band["freq_hz"] for band in normalized_limit_bands],
             limit_bands=normalized_limit_bands,
         )
         self._apply_x_axis_policy(payload_values=normalized_frequencies)
+        self.plot_item.vb.updateAutoRange()
 
     def clear_data(self) -> None:
         _clear_error_bar_item(self._band_range_item)
         super().clear_data()
         self._spectrum_payload = None
+        self._golden_overlay_curve_item.setData([], [])
         self._band_marker_item.setData([])
+        self._zero_reference_line.hide()
 
     def spectrum_payload(self) -> dict | None:
         return deepcopy(self._spectrum_payload)
+
+    def _render_golden_overlay(
+        self,
+        *,
+        x_values: list[float],
+        levels_db: list[float] | None,
+    ) -> None:
+        if levels_db is None:
+            self._golden_overlay_curve_item.setData([], [])
+            return
+        self._golden_overlay_curve_item.setData(x_values, levels_db)
+
+    def _update_zero_reference_line(self, show_zero_reference: bool) -> None:
+        if not show_zero_reference:
+            self._zero_reference_line.hide()
+            return
+        self._zero_reference_line.setPos(0.0)
+        self._zero_reference_line.show()
 
     def _render_band_markers(
         self,
@@ -487,10 +611,33 @@ class OctaveBarChartWidget(_BasePlotChart):
         super().__init__(parent)
         self._band_payload: dict | None = None
         self._bar_item: pg.BarGraphItem | None = None
+        self._golden_overlay_item = pg.PlotDataItem(
+            pen=pg.mkPen(
+                color="#64748b",
+                width=2,
+                style=pg.QtCore.Qt.PenStyle.DashLine,
+            ),
+            symbol="o",
+            symbolSize=7,
+            symbolBrush="#64748b",
+            symbolPen=pg.mkPen(color="#475569", width=1),
+        )
         self._band_range_item = pg.ErrorBarItem()
         self._band_marker_item = pg.ScatterPlotItem(size=10, pen=pg.mkPen(None))
+        self._zero_reference_line = pg.InfiniteLine(
+            angle=0,
+            pen=pg.mkPen(
+                color="#94a3b8",
+                width=1,
+                style=pg.QtCore.Qt.PenStyle.DashLine,
+            ),
+            movable=False,
+        )
+        self.plot_item.addItem(self._zero_reference_line)
+        self.plot_item.addItem(self._golden_overlay_item)
         self.plot_item.addItem(self._band_range_item)
         self.plot_item.addItem(self._band_marker_item)
+        self._zero_reference_line.hide()
         self.plot_item.setLabel("bottom", "Band", units="Hz")
         self.plot_item.setLabel("left", "Level", units="dB")
 
@@ -500,6 +647,8 @@ class OctaveBarChartWidget(_BasePlotChart):
         center_freqs_hz: Iterable[float],
         levels_db: Iterable[float],
         limit_bands: Iterable[dict] | None = None,
+        golden_overlay_levels_db: Iterable[float] | None = None,
+        show_zero_reference: bool = False,
     ) -> None:
         normalized_frequencies = _normalize_vector(
             center_freqs_hz, name="center_freqs_hz"
@@ -509,17 +658,51 @@ class OctaveBarChartWidget(_BasePlotChart):
             raise ValueError("center_freqs_hz and levels_db must be the same length")
 
         normalized_limit_bands = _normalize_limit_bands(limit_bands)
+        normalized_golden_overlay = _normalize_optional_overlay_levels(
+            golden_overlay_levels_db,
+            expected_length=len(normalized_frequencies),
+            name="golden_overlay_levels_db",
+        )
         self._band_payload = {
             "center_freqs_hz": normalized_frequencies,
             "levels_db": normalized_levels,
             "limit_bands": normalized_limit_bands,
+            "golden_overlay_levels_db": normalized_golden_overlay,
+            "show_zero_reference": bool(show_zero_reference),
         }
 
         x_values = np.arange(len(normalized_frequencies), dtype=float)
-        self._replace_bar_item(x=x_values, heights=np.asarray(normalized_levels, dtype=float))
-        self.plot_item.getAxis("bottom").setTicks(
-            [[(float(index), self._format_frequency_label(freq_hz)) for index, freq_hz in enumerate(normalized_frequencies)]]
+        self._replace_bar_item(
+            x=x_values,
+            heights=np.asarray(normalized_levels, dtype=float),
         )
+        self._render_golden_overlay(
+            x_values=x_values,
+            levels_db=normalized_golden_overlay,
+        )
+        self._update_zero_reference_line(bool(show_zero_reference))
+        visible_labels_hz = {
+            40.0,
+            80.0,
+            160.0,
+            315.0,
+            630.0,
+            1250.0,
+            2500.0,
+            5000.0,
+            10000.0,
+            16000.0,
+        }
+        ticks = [
+            (
+                float(index),
+                self._format_frequency_label(freq_hz)
+                if freq_hz in visible_labels_hz
+                else "",
+            )
+            for index, freq_hz in enumerate(normalized_frequencies)
+        ]
+        self.plot_item.getAxis("bottom").setTicks([ticks])
         self._render_band_markers(
             x_values=_nearest_positions(
                 normalized_frequencies,
@@ -528,14 +711,18 @@ class OctaveBarChartWidget(_BasePlotChart):
             limit_bands=normalized_limit_bands,
         )
         self._apply_x_axis_policy(payload_values=x_values.tolist())
+        self.plot_item.vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
+        self.plot_item.vb.updateAutoRange()
 
     def clear_data(self) -> None:
         self._band_payload = None
         _clear_error_bar_item(self._band_range_item)
+        self._golden_overlay_item.setData([], [])
         self._band_marker_item.setData([])
         self._replace_bar_item(x=np.array([], dtype=float), heights=np.array([], dtype=float))
         self.plot_item.getAxis("bottom").setTicks(None)
         self._apply_x_axis_policy(payload_values=None)
+        self._zero_reference_line.hide()
 
     def has_bars(self) -> bool:
         return self._band_payload is not None
@@ -548,12 +735,31 @@ class OctaveBarChartWidget(_BasePlotChart):
             self.plot_item.removeItem(self._bar_item)
         self._bar_item = pg.BarGraphItem(
             x=x,
+            y0=0.0,
             height=heights,
             width=0.6,
             brush="#f59e0b",
             pen=pg.mkPen(color="#d97706", width=1),
         )
         self.plot_item.addItem(self._bar_item)
+
+    def _render_golden_overlay(
+        self,
+        *,
+        x_values: np.ndarray,
+        levels_db: list[float] | None,
+    ) -> None:
+        if levels_db is None:
+            self._golden_overlay_item.setData([], [])
+            return
+        self._golden_overlay_item.setData(x_values, levels_db)
+
+    def _update_zero_reference_line(self, show_zero_reference: bool) -> None:
+        if not show_zero_reference:
+            self._zero_reference_line.hide()
+            return
+        self._zero_reference_line.setPos(0.0)
+        self._zero_reference_line.show()
 
     def _render_band_markers(
         self,

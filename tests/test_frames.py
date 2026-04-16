@@ -1,6 +1,8 @@
 """Tests for analysis frame dataclasses."""
 from __future__ import annotations
 
+from dataclasses import asdict
+
 import numpy as np
 
 from app.service.analysis.frames import (
@@ -52,6 +54,44 @@ class TestBandResult:
     def test_fail(self):
         b = BandResult(freq=1000.0, level=80.0, lower=50.0, upper=70.0, passed=False)
         assert b.passed is False
+
+
+class TestChannelJudgment:
+    def test_serializes_loudness_fields(self):
+        judgment = ChannelJudgment(
+            channel_index=0,
+            spl_db=65.0,
+            spl_pass=True,
+            loudness_max_sone=8.0,
+            loudness_pass=True,
+            loudness_available=True,
+            loudness_error_message=None,
+        )
+
+        payload = asdict(judgment)
+
+        assert payload["loudness_max_sone"] == 8.0
+        assert payload["loudness_pass"] is True
+        assert payload["loudness_available"] is True
+        assert payload["loudness_error_message"] is None
+
+    def test_serializes_fft_and_octave_availability_fields(self):
+        judgment = ChannelJudgment(
+            channel_index=0,
+            spl_db=65.0,
+            spl_pass=True,
+            fft_available=False,
+            fft_error_message="fft golden unavailable",
+            octave_available=False,
+            octave_error_message="octave golden unavailable",
+        )
+
+        payload = asdict(judgment)
+
+        assert payload["fft_available"] is False
+        assert payload["fft_error_message"] == "fft golden unavailable"
+        assert payload["octave_available"] is False
+        assert payload["octave_error_message"] == "octave golden unavailable"
 
 
 class TestJudgmentResult:

@@ -7,6 +7,8 @@ import importlib.util
 import inspect
 from unittest.mock import MagicMock
 
+import pytest
+
 import app.services_container as mod
 from app.service.factory_selection_settings import FactorySelectionSettings
 from app.service.analysis.test_manager import TestManager
@@ -50,6 +52,26 @@ def test_analysis_signals_exist():
         assert hasattr(EventBus, name), f"Missing signal: {name}"
 
 
+def test_event_bus_exposes_ai_toolchains_changed_signal():
+    bus = EventBus()
+    received = []
+
+    bus.ai_toolchains_changed.connect(lambda: received.append("fired"))
+    bus.ai_toolchains_changed.emit()
+
+    assert received == ["fired"]
+
+
+def test_event_bus_exposes_plc_changed_signal():
+    bus = EventBus()
+    received = []
+
+    bus.plc_changed.connect(lambda: received.append("fired"))
+    bus.plc_changed.emit()
+
+    assert received == ["fired"]
+
+
 def test_analysis_frame_signals_include_run_id_contract():
     expected_argument_types = ("int", "QString", "int", "PyQt_PyObject")
 
@@ -78,6 +100,7 @@ def test_factory_mode_signals_exist():
         "factory_runtime_auto_analysis_no_result",
         "factory_runtime_auto_analysis_error",
         "factory_runtime_auto_analysis_cleanup_settled",
+        "factory_runtime_stopped",
         "factory_runtime_aborted",
         "factory_runtime_reanalysis_completed",
         "factory_state_changed",
@@ -135,6 +158,28 @@ def test_factory_runtime_payload_contract_includes_run_id():
     assert abort_payload.run_id == "run-101-1"
 
 
+def test_factory_runtime_stopped_payload_contract_is_explicit():
+    stopped_payload_cls = getattr(mod, "FactoryRuntimeStoppedPayload", None)
+
+    assert stopped_payload_cls is not None, "FactoryRuntimeStoppedPayload is missing"
+    assert is_dataclass(stopped_payload_cls)
+    assert [field.name for field in fields(stopped_payload_cls)] == [
+        "config_id",
+        "run_id",
+        "trigger_source",
+    ]
+
+    payload = stopped_payload_cls(
+        config_id=101,
+        run_id="run-101-1",
+        trigger_source="manual",
+    )
+
+    assert payload.config_id == 101
+    assert payload.run_id == "run-101-1"
+    assert payload.trigger_source == "manual"
+
+
 def test_factory_controller_state_contract_exposes_only_spec_fields():
     state_cls = getattr(mod, "FactoryControllerState", None)
 
@@ -161,6 +206,7 @@ def test_factory_controller_state_derives_readiness_from_ordered_selection_witho
         run_phase="not_ready",
     )
     reviewing_state = mod.FactoryControllerState(selected_config_ids=(101, 202), run_phase="reviewing")
+    stopped_state = mod.FactoryControllerState(selected_config_ids=(101,), run_phase="stopped")
     busy_state = mod.FactoryControllerState(selected_config_ids=(101,), run_phase="running")
 
     assert ready_state.selection_ready is True
@@ -181,6 +227,10 @@ def test_factory_controller_state_derives_readiness_from_ordered_selection_witho
     assert reviewing_state.selection_ready is True
     assert reviewing_state.start_ready is True
     assert reviewing_state.start_ready_reason is None
+
+    assert stopped_state.selection_ready is True
+    assert stopped_state.start_ready is True
+    assert stopped_state.start_ready_reason is None
 
     assert busy_state.selection_ready is True
     assert busy_state.start_ready is False
@@ -214,6 +264,7 @@ def test_factory_review_payload_contract_is_explicit():
     assert plc_payload_cls is not None, "FactoryPlcIngressPayload is missing"
     assert abort_payload_cls is not None, "FactoryRuntimeAbortPayload is missing"
     assert is_dataclass(review_payload_cls)
+    assert is_dataclass(plc_payload_cls)
     assert is_dataclass(abort_payload_cls)
     assert [field.name for field in fields(review_payload_cls)] == [
         "displayed_config_id",
@@ -235,10 +286,11 @@ def test_factory_review_payload_contract_is_explicit():
         "trigger_source",
         "error_message",
     ]
+    assert [field.name for field in fields(plc_payload_cls)] == ["plc_id"]
 
     review_window = review_window_cls(start_sec=1.0, end_sec=3.0)
     payload = review_payload_cls(run_id="run-101-1", default_window=review_window)
-    plc_payload = plc_payload_cls(plc_device_key="plc-a")
+    plc_payload = plc_payload_cls(plc_id=12)
     abort_payload = abort_payload_cls(
         config_id=101,
         run_id="run-101-1",
@@ -248,7 +300,7 @@ def test_factory_review_payload_contract_is_explicit():
 
     assert payload.default_window == review_window
     assert payload.run_id == "run-101-1"
-    assert plc_payload.plc_device_key == "plc-a"
+    assert plc_payload.plc_id == 12
     assert abort_payload.config_id == 101
     assert abort_payload.run_id == "run-101-1"
     assert abort_payload.trigger_source == "manual"
@@ -295,6 +347,27 @@ def test_service_container_owns_factory_mode_controller(monkeypatch):
     assert services.factory_mode.services is services
 
 
+def test_service_container_exposes_plc_start_hook(monkeypatch):
+    payloads = []
+
+    monkeypatch.setattr(mod.DbConnectionService, "connect", lambda self: None)
+    monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "InputCalibrationService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "ConfigService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "AiService", MagicMock(return_value=MagicMock()))
+
+    bus = mod.EventBus()
+    bus.factory_plc_event.connect(payloads.append)
+
+    services = mod.ServiceContainer(bus=bus)
+
+    assert hasattr(services, "_start_from_plc")
+
+    services._start_from_plc(42)
+
+    assert payloads == [mod.FactoryPlcIngressPayload(plc_id=42)]
+
+
 def test_service_container_exposes_factory_selection_settings(monkeypatch):
     monkeypatch.setattr(mod.DbConnectionService, "connect", lambda self: None)
     monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
@@ -305,3 +378,48 @@ def test_service_container_exposes_factory_selection_settings(monkeypatch):
     services = mod.ServiceContainer()
 
     assert isinstance(services.factory_selection_settings, FactorySelectionSettings)
+
+
+def test_service_container_shutdown_stops_ai_before_closing_db(monkeypatch):
+    calls = []
+    ai_service = MagicMock()
+    ai_service.shutdown.side_effect = lambda: calls.append("ai_shutdown")
+    db_service = MagicMock()
+    db_service.close.side_effect = lambda: calls.append("db_close")
+    monkeypatch.setattr(mod, "DbConnectionService", MagicMock(return_value=db_service))
+    monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "InputCalibrationService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "ConfigService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "AiService", MagicMock(return_value=ai_service))
+
+    services = mod.ServiceContainer()
+
+    services.shutdown()
+
+    assert calls == ["ai_shutdown", "db_close"]
+
+
+def test_service_container_shutdown_closes_db_when_ai_shutdown_raises(monkeypatch):
+    calls = []
+    shutdown_error = RuntimeError("resident cleanup failed")
+    ai_service = MagicMock()
+
+    def fail_ai_shutdown():
+        calls.append("ai_shutdown")
+        raise shutdown_error
+
+    ai_service.shutdown.side_effect = fail_ai_shutdown
+    db_service = MagicMock()
+    db_service.close.side_effect = lambda: calls.append("db_close")
+    monkeypatch.setattr(mod, "DbConnectionService", MagicMock(return_value=db_service))
+    monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "InputCalibrationService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "ConfigService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "AiService", MagicMock(return_value=ai_service))
+
+    services = mod.ServiceContainer()
+
+    with pytest.raises(RuntimeError, match="resident cleanup failed"):
+        services.shutdown()
+
+    assert calls == ["ai_shutdown", "db_close"]

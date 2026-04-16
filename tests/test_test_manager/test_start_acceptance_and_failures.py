@@ -28,6 +28,7 @@ class TestTestManagerStartStop:
                 "channels": [{
                     "channel_index": 0,
                     "stft_nfft": 1024,
+                    "fft_nfft": 4096,
                     "stft_overlap": 0.5,
                     "spl_weighting": "Z",
                     "spl_time_constant": 0.125,
@@ -64,6 +65,7 @@ class TestTestManagerStartStop:
                 "channels": [{
                     "channel_index": 0,
                     "stft_nfft": 1024,
+                    "fft_nfft": 4096,
                     "stft_overlap": 0.5,
                     "spl_weighting": "Z",
                     "spl_time_constant": 0.125,
@@ -187,6 +189,7 @@ class TestTestManagerStartStop:
                 "channels": [{
                     "channel_index": 0,
                     "stft_nfft": 1024,
+                    "fft_nfft": 4096,
                     "stft_overlap": 0.5,
                     "spl_weighting": "Z",
                     "spl_time_constant": 0.125,
@@ -308,6 +311,7 @@ class TestTestManagerStartStop:
                 "channels": [{
                     "channel_index": 0,
                     "stft_nfft": 1024,
+                    "fft_nfft": 4096,
                     "stft_overlap": 0.5,
                     "spl_weighting": "Z",
                     "spl_time_constant": 0.125,
@@ -416,6 +420,7 @@ class TestTestManagerStartStop:
                 "channels": [{
                     "channel_index": 0,
                     "stft_nfft": 1024,
+                    "fft_nfft": 4096,
                     "stft_overlap": 0.5,
                     "spl_weighting": "Z",
                     "spl_time_constant": 0.125,
@@ -542,6 +547,7 @@ class TestTestManagerStartStop:
                 "channels": [{
                     "channel_index": 0,
                     "stft_nfft": 1024,
+                    "fft_nfft": 4096,
                     "stft_overlap": 0.5,
                     "spl_weighting": "Z",
                     "spl_time_constant": 0.125,
@@ -654,6 +660,7 @@ class TestTestManagerStartStop:
                 "channels": [{
                     "channel_index": 0,
                     "stft_nfft": 1024,
+                    "fft_nfft": 4096,
                     "stft_overlap": 0.5,
                     "spl_weighting": "Z",
                     "spl_time_constant": 0.125,

@@ -12,6 +12,7 @@ from dataclasses import asdict, is_dataclass
 import numpy as np
 from PyQt6.QtCore import QObject
 
+from app.service.analysis import dsp
 from app.service.analysis.audio_monitor import AudioMonitor
 from app.service.analysis.audio_recorder import AudioRecorder
 from app.service.analysis.review_payloads import build_chart_payload, build_summary_payload
@@ -36,6 +37,8 @@ class TestManager(QObject):
         self._shared_recorders: dict[str, AudioRecorder] = {}
         self._pending_factory_starts: dict[str, int] = {}
         self._canceled_factory_start_requests: set[str] = set()
+        self._analyzing_sessions: set[int] = set()
+        self._accepted_factory_stops: set[int] = set()
 
     def start(self, workorder: dict, *, on_start_accepted=None) -> bool:
         """Start a test for the config_id in the workorder."""
@@ -236,14 +239,23 @@ class TestManager(QObject):
             if not self._sessions:
                 return False
             for cid in list(self._sessions.keys()):
-                self._stop_one(cid, notify_factory_runtime_abort=False)
+                self._stop_factory_run(cid)
             return True
 
-        if config_id not in self._sessions:
-            return False
+        return self._stop_factory_run(config_id)
 
-        self._stop_one(config_id, notify_factory_runtime_abort=False)
-        return True
+    def _stop_factory_run(self, config_id: int) -> bool:
+        session = self._sessions.get(config_id)
+        if session is None:
+            return False
+        if config_id in self._accepted_factory_stops:
+            return True
+
+        self._accepted_factory_stops.add(config_id)
+
+        if self._session_is_analyzing(config_id):
+            return self._stop_to_stopped(config_id, session)
+        return self._stop_recording_with_optional_analysis(config_id, session)
 
     def _stop_one(
         self,
@@ -378,6 +390,7 @@ class TestManager(QObject):
         chart_payload = self._build_chart_payload(
             session,
             analysis_window=result_dict.get("analysis_window"),
+            judgment_payload=result_dict,
         )
         self._bus.test_finished.emit(config_id, result_dict)
         self._bus.result_changed.emit(result_dict)
@@ -395,116 +408,57 @@ class TestManager(QObject):
     def _on_recording_done(self, config_id: int):
         """Called when a recorder fills its buffer."""
         session = self._sessions.get(config_id)
-        if session is None or getattr(session, "_finished", False):
+        if (
+            session is None
+            or getattr(session, "_finished", False)
+            or config_id in self._accepted_factory_stops
+        ):
             return
         session._finished = True
         self._on_session_done(config_id)
 
     def _on_session_done(self, config_id: int):
         session = self._sessions.get(config_id)
-        if session is None:
+        if session is None or config_id in self._accepted_factory_stops:
             return
 
-        cleanup_settled_payload = None
-        factory_run_id = self._factory_run_id(session)
-        if factory_run_id is not None:
-            cleanup_settled_payload = self._make_factory_runtime_config_payload(
-                config_id,
-                factory_run_id,
-            )
-
-        self._bus.status.emit("Analyzing...")
-        self._bus.log.emit(f"[TestManager] recording done for config={config_id}")
-        self._emit_optional_signal(
-            "factory_runtime_analyzing_entered",
-            self._make_factory_runtime_config_payload(
-                config_id,
-                self._factory_run_id(session),
-            ),
-        )
-
-        rec = self._recorders.get(config_id)
-        mon = self._monitors.get(config_id)
-        if rec is not None:
-            session._buffer = rec.get_buffer_from(getattr(session, "_attach_snapshot", None))
-            session._sample_rate = rec._sample_rate
-            self._disconnect_session_signals(session, rec, mon)
-
-        analysis_error = None
-        result = None
-        result_dict = None
+        cleanup_settled_payload = self._make_cleanup_settled_payload(config_id, session)
+        self._analyzing_sessions.add(config_id)
         try:
-            result = session._run_judgment()
-            result_dict = self._serialize_result(result)
-        except Exception as exc:
-            analysis_error = exc
-
-        if self._sessions.get(config_id) is not session:
-            return
-
-        if analysis_error is not None:
-            payload = self._emit_no_result(config_id, analysis_error, context="analysis")
-            signal_name = (
-                "factory_runtime_auto_analysis_no_result"
-                if self._is_factory_no_result_error(analysis_error)
-                else "factory_runtime_auto_analysis_error"
-            )
-            summary_payload = self._build_summary_payload_for_error(
+            self._emit_factory_analyzing_entered(
+                config_id,
                 session,
-                error_message=payload["error_summary"],
+                log_message=f"[TestManager] recording done for config={config_id}",
             )
-            self._emit_optional_signal(
-                signal_name,
-                self._make_factory_review_payload(
-                    config_id,
-                    session,
-                    no_result=True,
-                    error_message=payload["error_summary"],
-                    summary_payload=summary_payload,
-                ),
-            )
-        else:
-            summary_payload = self._build_summary_payload(
-                session,
-                judgment_payload=result_dict,
-            )
-            chart_payload = self._build_chart_payload(
-                session,
-                analysis_window=result_dict.get("analysis_window"),
-            )
-            self._bus.test_finished.emit(config_id, result_dict)
-            self._bus.result_changed.emit(result_dict)
-            self._bus.log.emit(
-                f"[TestManager] result: {result.overall} (limit={result.limit_pass})"
-            )
-            self._emit_optional_signal(
-                "factory_runtime_auto_analysis_succeeded",
-                self._make_factory_review_payload(
-                    config_id,
-                    session,
-                    judgment_payload=result_dict,
-                    summary_payload=summary_payload,
-                    chart_payload=chart_payload,
-                ),
-            )
-        self._bus.status.emit("Idle")
 
-        session = self._sessions.pop(config_id, None)
-        if session is not None:
-            self._completed_sessions[config_id] = session
+            rec = self._recorders.get(config_id)
+            mon = self._monitors.get(config_id)
+            if rec is not None:
+                session._buffer = rec.get_buffer_from(getattr(session, "_attach_snapshot", None))
+                session._sample_rate = rec._sample_rate
+                self._disconnect_session_signals(session, rec, mon)
 
-        self._recorders.pop(config_id, None)
-        mon = self._monitors.pop(config_id, None)
-        if mon is not None:
-            mon.stop()
-            mon.wait(1000)
-        if rec is not None:
-            self._stop_recorder_if_unused(rec)
-        if cleanup_settled_payload is not None:
-            self._emit_optional_signal(
-                "factory_runtime_auto_analysis_cleanup_settled",
-                cleanup_settled_payload,
-            )
+            if not self._emit_auto_analysis_review(config_id, session):
+                return
+
+            completed_session = self._sessions.pop(config_id, None)
+            if completed_session is not None:
+                self._completed_sessions[config_id] = completed_session
+
+            self._recorders.pop(config_id, None)
+            mon = self._monitors.pop(config_id, None)
+            if mon is not None:
+                mon.stop()
+                mon.wait(1000)
+            if rec is not None:
+                self._stop_recorder_if_unused(rec)
+            if cleanup_settled_payload is not None:
+                self._emit_optional_signal(
+                    "factory_runtime_auto_analysis_cleanup_settled",
+                    cleanup_settled_payload,
+                )
+        finally:
+            self._analyzing_sessions.discard(config_id)
 
     def _on_error(self, config_id: int, message: str):
         session = self._sessions.get(config_id)
@@ -544,10 +498,23 @@ class TestManager(QObject):
             raise RuntimeError("analysis result unavailable")
         return asdict(result)
 
-    def _emit_no_result(self, config_id: int, error: Exception | str, *, context: str):
+    def _emit_no_result(
+        self,
+        config_id: int,
+        error: Exception | str,
+        *,
+        context: str,
+        still_owned=None,
+    ):
         payload = self._make_no_result_payload(error)
+        if callable(still_owned) and not still_owned():
+            return None
         self._bus.test_finished.emit(config_id, payload)
+        if callable(still_owned) and not still_owned():
+            return None
         self._bus.result_changed.emit(payload)
+        if callable(still_owned) and not still_owned():
+            return None
         self._bus.log.emit(
             f"[TestManager] no-result {context} for config={config_id}: {payload['error_summary']}"
         )
@@ -600,6 +567,384 @@ class TestManager(QObject):
             trigger_source=self._factory_trigger_source(session),
             error_message=error_message,
         )
+
+    def _make_factory_runtime_stopped_payload(self, config_id: int, session):
+        from app.services_container import FactoryRuntimeStoppedPayload
+
+        run_id = self._factory_run_id(session)
+        trigger_source = self._factory_trigger_source(session)
+        if run_id is None or trigger_source is None:
+            return None
+
+        return FactoryRuntimeStoppedPayload(
+            config_id=config_id,
+            run_id=run_id,
+            trigger_source=trigger_source,
+        )
+
+    def _make_cleanup_settled_payload(self, config_id: int, session):
+        factory_run_id = self._factory_run_id(session)
+        if factory_run_id is None:
+            return None
+        return self._make_factory_runtime_config_payload(
+            config_id,
+            factory_run_id,
+        )
+
+    def _emit_factory_analyzing_entered(
+        self,
+        config_id: int,
+        session,
+        *,
+        log_message: str,
+    ) -> None:
+        self._bus.status.emit("Analyzing...")
+        self._bus.log.emit(log_message)
+        self._emit_optional_signal(
+            "factory_runtime_analyzing_entered",
+            self._make_factory_runtime_config_payload(
+                config_id,
+                self._factory_run_id(session),
+            ),
+        )
+
+    def _auto_analysis_review_still_owned(
+        self,
+        config_id: int,
+        session,
+        *,
+        allow_accepted_stop: bool = False,
+    ) -> bool:
+        return (
+            self._sessions.get(config_id) is session
+            and (allow_accepted_stop or config_id not in self._accepted_factory_stops)
+        )
+
+    def _emit_auto_analysis_review(
+        self,
+        config_id: int,
+        session,
+        *,
+        allow_accepted_stop: bool = False,
+    ) -> bool:
+        analysis_error = None
+        result = None
+        result_dict = None
+        try:
+            result = session._run_judgment()
+            result_dict = self._serialize_result(result)
+        except Exception as exc:
+            analysis_error = exc
+
+        if not self._auto_analysis_review_still_owned(
+            config_id,
+            session,
+            allow_accepted_stop=allow_accepted_stop,
+        ):
+            return False
+
+        if analysis_error is not None:
+            payload = self._emit_no_result(
+                config_id,
+                analysis_error,
+                context="analysis",
+                still_owned=lambda: self._auto_analysis_review_still_owned(
+                    config_id,
+                    session,
+                    allow_accepted_stop=allow_accepted_stop,
+                ),
+            )
+            if payload is None:
+                return False
+            signal_name = (
+                "factory_runtime_auto_analysis_no_result"
+                if self._is_factory_no_result_error(analysis_error)
+                else "factory_runtime_auto_analysis_error"
+            )
+            summary_payload = self._build_summary_payload_for_error(
+                session,
+                error_message=payload["error_summary"],
+            )
+            if not self._auto_analysis_review_still_owned(
+                config_id,
+                session,
+                allow_accepted_stop=allow_accepted_stop,
+            ):
+                return False
+            self._emit_optional_signal(
+                signal_name,
+                self._make_factory_review_payload(
+                    config_id,
+                    session,
+                    no_result=True,
+                    error_message=payload["error_summary"],
+                    summary_payload=summary_payload,
+                ),
+            )
+        else:
+            summary_payload = self._build_summary_payload(
+                session,
+                judgment_payload=result_dict,
+            )
+            chart_payload = self._build_chart_payload(
+                session,
+                analysis_window=result_dict.get("analysis_window"),
+                judgment_payload=result_dict,
+            )
+            if not self._auto_analysis_review_still_owned(
+                config_id,
+                session,
+                allow_accepted_stop=allow_accepted_stop,
+            ):
+                return False
+            self._bus.test_finished.emit(config_id, result_dict)
+            if not self._auto_analysis_review_still_owned(
+                config_id,
+                session,
+                allow_accepted_stop=allow_accepted_stop,
+            ):
+                return False
+            self._bus.result_changed.emit(result_dict)
+            if not self._auto_analysis_review_still_owned(
+                config_id,
+                session,
+                allow_accepted_stop=allow_accepted_stop,
+            ):
+                return False
+            self._bus.log.emit(
+                f"[TestManager] result: {result.overall} (limit={result.limit_pass})"
+            )
+            if not self._auto_analysis_review_still_owned(
+                config_id,
+                session,
+                allow_accepted_stop=allow_accepted_stop,
+            ):
+                return False
+            self._emit_optional_signal(
+                "factory_runtime_auto_analysis_succeeded",
+                self._make_factory_review_payload(
+                    config_id,
+                    session,
+                    judgment_payload=result_dict,
+                    summary_payload=summary_payload,
+                    chart_payload=chart_payload,
+                ),
+            )
+
+        if not self._auto_analysis_review_still_owned(
+            config_id,
+            session,
+            allow_accepted_stop=allow_accepted_stop,
+        ):
+            return False
+        self._bus.status.emit("Idle")
+        return True
+
+    def _stop_recording_with_optional_analysis(self, config_id: int, session) -> bool:
+        rec = self._recorders.get(config_id)
+        mon = self._monitors.get(config_id)
+        if rec is not None:
+            self._disconnect_session_signals(session, rec, mon)
+
+        capture = self._capture_partial_stop_buffer(config_id, session, rec)
+        try:
+            self._stop_factory_runtime_io(config_id, rec=rec, mon=mon)
+        except Exception as exc:
+            return self._emit_factory_stop_abort(
+                config_id,
+                session,
+                exc,
+                rec=rec,
+                mon=mon,
+            )
+
+        if self._stop_is_analysis_eligible(
+            session,
+            captured_duration_sec=capture["captured_duration_sec"],
+            partial_wav_ok=capture["partial_wav_ok"],
+        ):
+            return self._run_stop_triggered_auto_analysis(
+                config_id,
+                session,
+            )
+        return self._emit_factory_runtime_stopped(config_id, session)
+
+    def _stop_to_stopped(self, config_id: int, session) -> bool:
+        rec = self._recorders.get(config_id)
+        mon = self._monitors.get(config_id)
+        if rec is not None:
+            self._disconnect_session_signals(session, rec, mon)
+
+        try:
+            self._stop_factory_runtime_io(config_id, rec=rec, mon=mon)
+        except Exception as exc:
+            return self._emit_factory_stop_abort(
+                config_id,
+                session,
+                exc,
+                rec=rec,
+                mon=mon,
+            )
+        return self._emit_factory_runtime_stopped(config_id, session)
+
+    def _capture_partial_stop_buffer(self, config_id: int, session, rec) -> dict[str, object]:
+        partial_buf = None
+        partial_wav_ok = False
+
+        if rec is None:
+            return {
+                "partial_buf": None,
+                "partial_wav_ok": False,
+                "captured_duration_sec": self._captured_duration_sec(session),
+            }
+
+        try:
+            partial_buf = rec.get_buffer_from(getattr(session, "_attach_snapshot", None))
+        except Exception as exc:
+            self._bus.log.emit(
+                f"[TestManager] ERROR capturing partial recording for config={config_id}: {exc}"
+            )
+            return {
+                "partial_buf": None,
+                "partial_wav_ok": False,
+                "captured_duration_sec": None,
+            }
+
+        if isinstance(partial_buf, np.ndarray):
+            session._buffer = partial_buf
+            session._sample_rate = rec._sample_rate
+
+        captured_duration_sec = self._captured_duration_sec(session)
+        if isinstance(partial_buf, np.ndarray) and partial_buf.size > 0:
+            try:
+                saved_path = session._save_wav(partial_buf, rec._sample_rate)
+            except Exception as exc:
+                self._bus.log.emit(
+                    f"[TestManager] ERROR saving partial recording for config={config_id}: {exc}"
+                )
+            else:
+                if isinstance(saved_path, str) and saved_path:
+                    session._audio_file_path = saved_path
+                partial_wav_ok = bool(getattr(session, "_audio_file_path", None))
+                self._bus.log.emit(
+                    f"[TestManager] saved partial recording for config={config_id}"
+                )
+
+        if captured_duration_sec is None:
+            self._bus.log.emit(
+                f"[TestManager] WARNING captured duration unavailable for config={config_id}"
+            )
+
+        return {
+            "partial_buf": partial_buf,
+            "partial_wav_ok": partial_wav_ok,
+            "captured_duration_sec": captured_duration_sec,
+        }
+
+    def _stop_is_analysis_eligible(
+        self,
+        session,
+        *,
+        captured_duration_sec: float | None,
+        partial_wav_ok: bool,
+    ) -> bool:
+        config = self._session_config(session)
+        if not bool(config.get("allow_incomplete_recording_analysis", False)):
+            return False
+        if captured_duration_sec is None or not partial_wav_ok:
+            return False
+        required_window_end_sec = self._configured_window_end_sec(config)
+        return required_window_end_sec is not None and captured_duration_sec >= required_window_end_sec
+
+    def _run_stop_triggered_auto_analysis(self, config_id: int, session) -> bool:
+        cleanup_settled_payload = self._make_cleanup_settled_payload(config_id, session)
+        self._analyzing_sessions.add(config_id)
+        self._emit_factory_analyzing_entered(
+            config_id,
+            session,
+            log_message=f"[TestManager] stop-triggered analysis for config={config_id}",
+        )
+        try:
+            if not self._emit_auto_analysis_review(
+                config_id,
+                session,
+                allow_accepted_stop=True,
+            ):
+                return True
+
+            completed_session = self._sessions.pop(config_id, None)
+            if completed_session is not None:
+                self._completed_sessions[config_id] = completed_session
+
+            if cleanup_settled_payload is not None:
+                self._emit_optional_signal(
+                    "factory_runtime_auto_analysis_cleanup_settled",
+                    cleanup_settled_payload,
+                )
+            return True
+        finally:
+            self._analyzing_sessions.discard(config_id)
+            self._accepted_factory_stops.discard(config_id)
+
+    def _stop_factory_runtime_io(self, config_id: int, *, rec, mon) -> None:
+        cleanup_error = None
+
+        try:
+            if mon is not None:
+                mon.stop()
+                mon.wait(1000)
+        except Exception as exc:
+            cleanup_error = exc
+
+        try:
+            if rec is not None:
+                self._stop_recorder_if_unused(rec, excluding_config_id=config_id)
+        except Exception as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
+        finally:
+            self._recorders.pop(config_id, None)
+            self._monitors.pop(config_id, None)
+
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    def _emit_factory_runtime_stopped(self, config_id: int, session) -> bool:
+        self._analyzing_sessions.discard(config_id)
+        self._accepted_factory_stops.discard(config_id)
+        self._sessions.pop(config_id, None)
+        stopped_payload = self._make_factory_runtime_stopped_payload(config_id, session)
+        if stopped_payload is not None:
+            self._emit_optional_signal(
+                "factory_runtime_stopped",
+                stopped_payload,
+            )
+        self._bus.log.emit(f"[TestManager] stopped config={config_id}")
+        self._bus.status.emit("Stopped")
+        return True
+
+    def _emit_factory_stop_abort(self, config_id: int, session, error: Exception, *, rec, mon) -> bool:
+        self._analyzing_sessions.discard(config_id)
+        self._accepted_factory_stops.discard(config_id)
+        self._sessions.pop(config_id, None)
+        self._recorders.pop(config_id, None)
+        self._monitors.pop(config_id, None)
+        if rec is not None and not self._recorder_has_live_owner(rec):
+            self._discard_shared_recorder(rec)
+        self._bus.log.emit(f"[TestManager] ERROR stopping config={config_id}: {error}")
+        self._emit_optional_signal(
+            "factory_runtime_aborted",
+            self._make_factory_runtime_abort_payload(
+                config_id,
+                session,
+                error_message=str(error),
+            ),
+        )
+        self._bus.status.emit(f"Error: {error}")
+        return False
+
+    def _session_is_analyzing(self, config_id: int) -> bool:
+        return config_id in self._analyzing_sessions
 
     @staticmethod
     def _is_factory_no_result_error(error: Exception) -> bool:
@@ -689,18 +1034,114 @@ class TestManager(QObject):
             error_message=error_message,
         )
 
-    @staticmethod
-    def _build_chart_payload(session, *, analysis_window) -> dict | None:
+    def _build_chart_payload(
+        self,
+        session,
+        *,
+        analysis_window,
+        judgment_payload: dict | None = None,
+    ) -> dict | None:
         mic_cal = getattr(session, "_mic_cal", None)
         if not isinstance(mic_cal, dict):
             mic_cal = {}
-        return build_chart_payload(
+        chart_payload = build_chart_payload(
             buffer=getattr(session, "_buffer", None),
             config=TestManager._session_config(session),
             sample_rate=float(getattr(session, "_sample_rate", 0) or 0),
             mic_cal=mic_cal,
             analysis_window=analysis_window,
+            judgment_payload=judgment_payload,
         )
+        self._warn_loudness_chart_issues(
+            session,
+            judgment_payload=judgment_payload,
+            chart_payload=chart_payload,
+        )
+        return chart_payload
+
+    def _warn_loudness_chart_issues(
+        self,
+        session,
+        *,
+        judgment_payload: dict | None,
+        chart_payload: dict | None,
+    ) -> None:
+        if not isinstance(judgment_payload, dict):
+            return
+
+        config = self._session_config(session)
+        config_id = config.get("config_id", getattr(session, "config_id", None))
+        for channel_result in judgment_payload.get("channel_results", []):
+            if not isinstance(channel_result, dict):
+                continue
+
+            channel_index = channel_result.get("channel_index")
+            if not isinstance(channel_index, int) or isinstance(channel_index, bool) or channel_index < 0:
+                continue
+            if channel_result.get("loudness_available") is not True:
+                continue
+
+            channel_payload = chart_payload.get(channel_index) if isinstance(chart_payload, dict) else None
+            loudness_payload = (
+                channel_payload.get("loudness")
+                if isinstance(channel_payload, dict)
+                else None
+            )
+            if not isinstance(loudness_payload, dict):
+                self._bus.log.emit(
+                    "[TestManager] WARNING: loudness chart recompute failed "
+                    f"for config={config_id} channel=CH{channel_index + 1}"
+                )
+                continue
+
+            serialized_peak = self._coerce_finite_float(channel_result.get("loudness_max_sone"))
+            chart_peak = self._loudness_chart_peak_sone(loudness_payload)
+            if serialized_peak is None or chart_peak is None:
+                self._bus.log.emit(
+                    "[TestManager] WARNING: loudness chart recompute failed "
+                    f"for config={config_id} channel=CH{channel_index + 1}"
+                )
+                continue
+
+            if not np.isclose(chart_peak, serialized_peak, atol=1e-4, rtol=1e-4):
+                self._bus.log.emit(
+                    "[TestManager] WARNING: loudness chart scalar mismatch "
+                    f"for config={config_id} channel=CH{channel_index + 1} "
+                    f"serialized={serialized_peak:g} recomputed={chart_peak:g}"
+                )
+
+    @staticmethod
+    def _loudness_chart_peak_sone(loudness_payload: dict) -> float | None:
+        values = loudness_payload.get("values")
+        if not isinstance(values, list) or not values:
+            return None
+
+        unit = str(loudness_payload.get("unit") or "").strip().lower()
+        normalized_values = []
+        for value in values:
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return None
+            if not np.isfinite(numeric):
+                return None
+            normalized_values.append(numeric)
+
+        if unit == "phon":
+            return max(dsp.phon_to_sone(value) for value in normalized_values)
+        if unit == "sone":
+            return max(max(value, 0.0) for value in normalized_values)
+        return None
+
+    @staticmethod
+    def _coerce_finite_float(value) -> float | None:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(numeric):
+            return None
+        return numeric
 
     @staticmethod
     def _analysis_duration_sec(config: dict) -> float:
@@ -749,6 +1190,17 @@ class TestManager(QObject):
         )
 
     @staticmethod
+    def _configured_window_end_sec(config: dict) -> float | None:
+        analysis_duration = TestManager._analysis_duration_sec(config)
+        if analysis_duration <= 0:
+            return None
+        try:
+            start_sec = float(config.get("analysis_window_offset_ms", 0) or 0) / 1000.0
+        except (TypeError, ValueError, AttributeError):
+            return None
+        return start_sec + analysis_duration
+
+    @staticmethod
     def _disconnect(signal, callback):
         if callback is None:
             return
@@ -765,14 +1217,30 @@ class TestManager(QObject):
         if monitor is not None:
             self._disconnect(monitor.error_occurred, getattr(session, "_monitor_error_lambda", None))
 
-    def _stop_recorder_if_unused(self, recorder):
-        still_used = any(r is recorder for r in self._recorders.values())
-        if not still_used:
+    def _recorder_has_live_owner(
+        self,
+        recorder,
+        *,
+        excluding_config_id: int | None = None,
+    ) -> bool:
+        return any(
+            cid != excluding_config_id and active_recorder is recorder
+            for cid, active_recorder in self._recorders.items()
+        )
+
+    def _stop_recorder_if_unused(self, recorder, *, excluding_config_id: int | None = None):
+        if not self._recorder_has_live_owner(
+            recorder,
+            excluding_config_id=excluding_config_id,
+        ):
             recorder.stop()
             recorder.wait(3000)
-            for key, shared_rec in list(self._shared_recorders.items()):
-                if shared_rec is recorder:
-                    del self._shared_recorders[key]
+            self._discard_shared_recorder(recorder)
+
+    def _discard_shared_recorder(self, recorder) -> None:
+        for key, shared_rec in list(self._shared_recorders.items()):
+            if shared_rec is recorder:
+                del self._shared_recorders[key]
 
     @staticmethod
     def _device_key(config: dict) -> str:

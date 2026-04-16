@@ -4,7 +4,7 @@ Receives raw audio chunks from AudioRecorder.  For each chunk, computes:
 - STFT (when enough samples have accumulated)
 - SPL (every chunk)
 - 1/3-octave bands (every chunk)
-- FFT spectrum (every chunk)
+- FFT spectrum (once the rolling FFT buffer is primed)
 """
 from __future__ import annotations
 
@@ -31,6 +31,7 @@ class AnalysisPipeline:
 
         # STFT config
         self._nfft: int = channel_config["stft_nfft"]
+        self._fft_nfft: int = channel_config["fft_nfft"]
         self._overlap: float = channel_config["stft_overlap"]
 
         # SPL config
@@ -43,6 +44,7 @@ class AnalysisPipeline:
         # Internal STFT overlap buffer
         self._stft_buffer = np.array([], dtype=np.float64)
         self._latest_stft_frame_sample_index: int | None = None
+        self._fft_buffer = np.array([], dtype=np.float64)
 
     def process_chunk(self, chunk_mono: np.ndarray,
                       elapsed_time: float) -> dict:
@@ -70,14 +72,23 @@ class AnalysisPipeline:
         spl_frame = SplFrame(time=elapsed_time, spl_db=spl_db,
                              weighting=self._spl_weighting)
 
-        # FFT spectrum — use latest chunk directly
-        if sig.size >= self._nfft:
-            freqs, mag_db = dsp.compute_fft_spectrum(sig, self.sample_rate,
-                                                     self._nfft)
-            fft_frame = FftFrame(time=elapsed_time, frequencies=freqs,
-                                 magnitudes=mag_db)
-        else:
-            fft_frame = None
+        # FFT spectrum — use a dedicated rolling window sized by fft_nfft
+        fft_frame = None
+        if sig.size > 0:
+            self._fft_buffer = np.concatenate([self._fft_buffer, sig])
+            if self._fft_buffer.size > self._fft_nfft:
+                self._fft_buffer = self._fft_buffer[-self._fft_nfft:]
+            if self._fft_buffer.size >= self._fft_nfft:
+                freqs, mag_db = dsp.compute_fft_spectrum(
+                    self._fft_buffer,
+                    self.sample_rate,
+                    self._fft_nfft,
+                )
+                fft_frame = FftFrame(
+                    time=elapsed_time,
+                    frequencies=freqs,
+                    magnitudes=mag_db,
+                )
 
         # Octave bands — need enough samples for low-freq resolution
         if sig.size >= 256:
@@ -142,3 +153,4 @@ class AnalysisPipeline:
         """Clear internal state for reuse."""
         self._stft_buffer = np.array([], dtype=np.float64)
         self._latest_stft_frame_sample_index = None
+        self._fft_buffer = np.array([], dtype=np.float64)
