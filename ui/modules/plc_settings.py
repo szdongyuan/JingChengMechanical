@@ -3,7 +3,7 @@ from __future__ import annotations
 from PyQt6.QtCore import QMetaObject, QThread, Qt
 from PyQt6.QtWidgets import (
     QComboBox,
-    QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -42,10 +42,12 @@ class PlcSettingsModule(QWidget):
         self.combo_plc.setMinimumWidth(220)
         root.addWidget(self.combo_plc, 0)
 
-        form = QFormLayout()
+        form = QGridLayout()
         form.setContentsMargins(0, 0, 0, 0)
         form.setHorizontalSpacing(12)
         form.setVerticalSpacing(6)
+        form.setColumnStretch(0, 4)
+        form.setColumnStretch(1, 6)
 
         # 这些输入框分别对应 plc_table 里的可编辑字段。
         self.ed_name = QLineEdit()
@@ -75,17 +77,36 @@ class PlcSettingsModule(QWidget):
             edit.setMinimumHeight(25)
             edit.setObjectName("PlcField")
 
-        form.addRow("PLC名称：", self.ed_name)
-        form.addRow("IP：", self.ed_ip)
-        form.addRow("机架号：", self.ed_rack)
-        form.addRow("槽号：", self.ed_slot)
-        form.addRow("数据块号：", self.ed_db_number)
-        form.addRow("字节偏移：", self.ed_byte_index)
-        form.addRow("位偏移：", self.ed_bit_index)
-        form.addRow("轮询时间(ms)：", self.ed_poll_interval)
-        form.addRow("断线重连时间(ms)：", self.ed_reconnect_interval)
-        form.addRow("开机启动：", self.lb_state)
-        form.addRow("连接状态：", self.lb_connect_state)
+        labels = [
+            "PLC名称：",
+            "IP：",
+            "机架号：",
+            "槽号：",
+            "数据块号：",
+            "字节偏移：",
+            "位偏移：",
+            "轮询时间(ms)：",
+            "断线重连时间(ms)：",
+            "开机启动：",
+            "连接状态：",
+        ]
+        fields = [
+            self.ed_name,
+            self.ed_ip,
+            self.ed_rack,
+            self.ed_slot,
+            self.ed_db_number,
+            self.ed_byte_index,
+            self.ed_bit_index,
+            self.ed_poll_interval,
+            self.ed_reconnect_interval,
+            self.lb_state,
+            self.lb_connect_state,
+        ]
+        for row_idx, (label_text, field_widget) in enumerate(zip(labels, fields)):
+            label = QLabel(label_text)
+            form.addWidget(label, row_idx, 0)
+            form.addWidget(field_widget, row_idx, 1)
         root.addLayout(form)
 
         btn_row = QHBoxLayout()
