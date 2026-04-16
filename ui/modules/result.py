@@ -16,8 +16,10 @@ from app.services_container import FactoryControllerState, FactoryReviewPayload
 
 class ResultModule(QWidget):
     module_id = "result"
-    _ROW_LABELS = ("SPL", "FFT", "倍频程", "AI分析")
-    _ACTIVE_PHASES = frozenset({"running", "analyzing", "reanalyzing"})
+    _ROW_LABELS = ("SPL", "Loudness", "FFT", "倍频程", "AI分析")
+    _DISPLAY_PRESERVING_PHASES = frozenset(
+        {"running", "analyzing", "reanalyzing", "stopped"}
+    )
 
     def __init__(self, services):
         super().__init__()
@@ -69,7 +71,7 @@ class ResultModule(QWidget):
         self.error_label = self.lb_empty_text
         lay.addWidget(self.empty_state)
 
-        self.table = QTableWidget(4, 4)
+        self.table = QTableWidget(len(self._ROW_LABELS), 4)
         self.table.setHorizontalHeaderLabels(["项目", "偏差值", "通道", "结果"])
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
@@ -83,7 +85,7 @@ class ResultModule(QWidget):
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.table.setFixedHeight(
-            self.table.horizontalHeader().height() + self.table.rowHeight(0) * 4 + 18
+            self.table.horizontalHeader().height() + self.table.rowHeight(0) * len(self._ROW_LABELS) + 18
         )
         lay.addWidget(self.table)
         lay.addStretch(1)
@@ -181,7 +183,7 @@ class ResultModule(QWidget):
     def _is_in_progress(self) -> bool:
         return (
             self._factory_state.displayed_config_id is not None
-            and self._factory_state.run_phase in self._ACTIVE_PHASES
+            and self._factory_state.run_phase in self._DISPLAY_PRESERVING_PHASES
             and getattr(self._review_payload, "summary_payload", None) is None
         )
 

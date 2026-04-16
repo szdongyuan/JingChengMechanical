@@ -12,6 +12,7 @@ from app.services_container import (
     FactoryReviewPayload,
     FactoryRuntimeConfigPayload,
     FactoryRuntimeStartPayload,
+    FactoryRuntimeStoppedPayload,
     FactoryScanIngressPayload,
     FactoryStartBlockedPayload,
 )
@@ -221,22 +222,22 @@ class FactoryModeController(QObject):
             self._log_ingress_ignored(
                 event_type="PLC",
                 reason=self._busy_state_reason_label(),
-                plc_device_key=payload.plc_device_key,
+                plc_id=payload.plc_id,
             )
             return False
         if not self.can_arm():
             self._log_ingress_ignored(
                 event_type="PLC",
                 reason="not armed",
-                plc_device_key=payload.plc_device_key,
+                plc_id=payload.plc_id,
             )
             return self._emit_blocked_start("plc")
-        config_id = self._resolve_plc_config_id(payload.plc_device_key)
+        config_id = self._resolve_plc_config_id(payload.plc_id)
         if config_id is None:
             self._log_ingress_ignored(
                 event_type="PLC",
                 reason="no match",
-                plc_device_key=payload.plc_device_key,
+                plc_id=payload.plc_id,
             )
             return False
         return self._accept_start(config_id, "plc")
@@ -339,6 +340,27 @@ class FactoryModeController(QObject):
 
     def handle_runtime_auto_analysis_error(self, payload: FactoryReviewPayload) -> None:
         self.handle_runtime_no_result(payload)
+
+    def handle_runtime_stopped(self, payload: FactoryRuntimeStoppedPayload) -> None:
+        if not self._owns_runtime_payload(
+            config_id=payload.config_id,
+            run_id=payload.run_id,
+            allowed_phases=self._ACTIVE_RUN_PHASES,
+        ):
+            return
+
+        self._owned_runtime_config_id = None
+        self._owned_runtime_run_id = None
+        self._state = self._state_with_readiness(
+            replace(
+                self._state,
+                active_config_id=None,
+                displayed_config_id=payload.config_id,
+                run_phase="stopped",
+                trigger_source=payload.trigger_source,
+            )
+        )
+        self._emit_state()
 
     def handle_runtime_aborted(self, payload) -> None:
         if not self._owns_runtime_payload(
@@ -462,8 +484,6 @@ class FactoryModeController(QObject):
         except Exception:
             stopped = False
 
-        if stopped:
-            self._reset_review_context("active_run_stopped")
         return stopped
 
     def clear_for_next_run(self, reason: str = "next_run_accepted") -> None:
@@ -474,6 +494,8 @@ class FactoryModeController(QObject):
     def _connect_bus(self) -> None:
         if hasattr(self.bus, "config_changed"):
             self.bus.config_changed.connect(self.refresh_selection)
+        if hasattr(self.bus, "plc_changed"):
+            self.bus.plc_changed.connect(self.refresh_selection)
         self.bus.factory_plc_event.connect(self.handle_plc_event)
         self.bus.factory_scan_event.connect(self.handle_scan_event)
         self.bus.factory_runtime_start_accepted.connect(self.handle_runtime_start_accepted)
@@ -491,6 +513,7 @@ class FactoryModeController(QObject):
             self.bus.factory_runtime_auto_analysis_cleanup_settled.connect(
                 self.handle_runtime_auto_analysis_cleanup_settled
             )
+        self.bus.factory_runtime_stopped.connect(self.handle_runtime_stopped)
         self.bus.factory_runtime_aborted.connect(self.handle_runtime_aborted)
         self.bus.factory_runtime_reanalysis_completed.connect(
             self.handle_runtime_reanalysis_completed
@@ -680,7 +703,7 @@ class FactoryModeController(QObject):
             return False, "当前测试运行中"
         if not selection_ready:
             return False, selection_ready_reason
-        if state.run_phase not in {"armed", "reviewing"}:
+        if state.run_phase not in {"armed", "reviewing", "stopped"}:
             return False, "工厂模式未就绪"
         return True, None
 
@@ -707,15 +730,13 @@ class FactoryModeController(QObject):
             start_ready_reason=start_ready_reason,
         )
 
-    def _resolve_plc_config_id(self, plc_device_key: str) -> int | None:
-        normalized_plc_key = self._normalize_optional_text(plc_device_key)
-        if normalized_plc_key is None:
+    def _resolve_plc_config_id(self, plc_id: int) -> int | None:
+        if not isinstance(plc_id, int) or isinstance(plc_id, bool):
             return None
         matches = [
             config_id
             for config_id, config in self._selected_configs.items()
-            if self._normalize_optional_text(config.get("plc_device_key"))
-            == normalized_plc_key
+            if config.get("plc_id") == plc_id
         ]
         if matches:
             return matches[0]
@@ -735,7 +756,7 @@ class FactoryModeController(QObject):
         return (
             self._review_payload != FactoryReviewPayload()
             or self._state.displayed_config_id is not None
-            or self._state.run_phase in {"reviewing", "reanalyzing"}
+            or self._state.run_phase in {"reviewing", "reanalyzing", "stopped"}
         )
 
     @staticmethod

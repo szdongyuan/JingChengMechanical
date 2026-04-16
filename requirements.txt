@@ -1,5 +1,6 @@
 cffi==2.0.0
 concurrent-log-handler==0.9.29
+mosqito==1.2.1
 numpy==2.4.2
 opencv-python==4.13.0.92
 peewee==4.0.1

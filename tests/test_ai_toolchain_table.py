@@ -8,29 +8,32 @@ from model.ai_toolchain_table import AiToolchainTable
 
 
 class TestAiToolchainTable:
-    def test_create_and_read(self):
+    @pytest.mark.parametrize(
+        "execution_mode", ["resident_process", "oneshot_process"]
+    )
+    def test_create_and_read_supported_execution_modes(self, execution_mode):
         row = AiToolchainTable.create(
-            toolchain_id="motor-dual-segment-ai",
+            toolchain_id=f"motor-dual-segment-ai-{execution_mode}",
             display_name="Motor AI v1",
             version="1.0.0",
             entrypoint="python ai_motor.py",
             protocol_version=1,
-            execution_mode="oneshot_process",
+            execution_mode=execution_mode,
             default_timeout_ms=30000,
             enabled=True,
             description="Motor dual-segment AI toolchain",
         )
-        fetched = AiToolchainTable.get_by_id("motor-dual-segment-ai")
+        fetched = AiToolchainTable.get_by_id(row.toolchain_id)
         assert fetched.display_name == "Motor AI v1"
         assert fetched.version == "1.0.0"
         assert fetched.entrypoint == "python ai_motor.py"
         assert fetched.protocol_version == 1
-        assert fetched.execution_mode == "oneshot_process"
+        assert fetched.execution_mode == execution_mode
         assert fetched.default_timeout_ms == 30000
         assert fetched.enabled is True
         assert fetched.description == "Motor dual-segment AI toolchain"
 
-    def test_defaults(self):
+    def test_defaults_to_resident_process(self):
         row = AiToolchainTable.create(
             toolchain_id="minimal-tc",
             display_name="Minimal",
@@ -39,7 +42,7 @@ class TestAiToolchainTable:
         fetched = AiToolchainTable.get_by_id("minimal-tc")
         assert fetched.enabled is True
         assert fetched.protocol_version == 1
-        assert fetched.execution_mode == "oneshot_process"
+        assert fetched.execution_mode == "resident_process"
         assert fetched.default_timeout_ms == 30000
         assert fetched.version == ""
         assert fetched.description == ""

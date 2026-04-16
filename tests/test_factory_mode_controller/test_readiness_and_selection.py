@@ -15,6 +15,23 @@ from ._support import (
 )
 
 
+def _make_stopped_payload(
+    *,
+    config_id: int = 101,
+    run_id: str | None = None,
+    trigger_source: str = "manual",
+):
+    stopped_payload_cls = getattr(services_mod, "FactoryRuntimeStoppedPayload", None)
+
+    assert stopped_payload_cls is not None, "FactoryRuntimeStoppedPayload is missing"
+
+    return stopped_payload_cls(
+        config_id=config_id,
+        run_id=run_id or f"run-{config_id}-1",
+        trigger_source=trigger_source,
+    )
+
+
 def test_factory_mode_controller_starts_not_ready():
     controller_mod = _load_factory_mode_controller_module()
     state_cls = getattr(services_mod, "FactoryControllerState", None)
@@ -188,6 +205,144 @@ def test_set_selection_preserves_review_context_for_noop_resubmit():
     assert reset_reasons == []
     assert reviews == []
     assert states == []
+
+
+def test_set_selection_from_stopped_clears_preserved_display_context_only_for_real_tuple_change():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    services = _make_services((
+        _make_config(101),
+        _make_config(202),
+        _make_config(303),
+    ))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        run_id="run-1",
+        trigger_source="manual",
+    )
+    controller.handle_runtime_stopped(
+        _make_stopped_payload(config_id=101, run_id="run-1", trigger_source="manual")
+    )
+    reset_reasons.clear()
+    reviews.clear()
+
+    controller.set_selection((202, 303))
+
+    assert controller.state.displayed_config_id is None
+    assert controller.state.trigger_source is None
+    assert controller.state.run_phase == "armed"
+    assert reset_reasons == ["selection_changed"]
+    assert reviews == [services_mod.FactoryReviewPayload()]
+
+
+def test_set_selection_from_stopped_reorder_clears_preserved_display_context():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        run_id="run-1",
+        trigger_source="manual",
+    )
+    controller.handle_runtime_stopped(
+        _make_stopped_payload(config_id=101, run_id="run-1", trigger_source="manual")
+    )
+    reset_reasons.clear()
+    reviews.clear()
+
+    controller.set_selection((202, 101))
+
+    assert controller.state.displayed_config_id is None
+    assert controller.state.trigger_source is None
+    assert controller.state.run_phase == "armed"
+    assert reset_reasons == ["selection_changed"]
+    assert reviews == [services_mod.FactoryReviewPayload()]
+
+
+def test_set_selection_noop_refresh_preserves_stopped_display_context():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    states: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    bus.factory_state_changed.connect(states.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        run_id="run-1",
+        trigger_source="manual",
+    )
+    controller.handle_runtime_stopped(
+        _make_stopped_payload(config_id=101, run_id="run-1", trigger_source="manual")
+    )
+    original_state = controller.state
+    reset_reasons.clear()
+    reviews.clear()
+    states.clear()
+
+    next_state = controller.set_selection((101, 202))
+
+    assert next_state == original_state
+    assert controller.state == original_state
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "stopped"
+    assert reset_reasons == []
+    assert reviews == []
+    assert states == []
+
+
+def test_refresh_selection_same_tuple_preserves_stopped_display_context():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        run_id="run-1",
+        trigger_source="manual",
+    )
+    controller.handle_runtime_stopped(
+        _make_stopped_payload(config_id=101, run_id="run-1", trigger_source="manual")
+    )
+    reset_reasons.clear()
+    reviews.clear()
+
+    next_state = controller.refresh_selection()
+
+    assert next_state == controller.state
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "stopped"
+    assert reset_reasons == []
+    assert reviews == []
 
 
 def test_set_selection_from_review_to_zero_enabled_configs_goes_directly_to_not_ready():

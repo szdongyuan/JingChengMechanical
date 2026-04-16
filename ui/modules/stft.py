@@ -19,6 +19,7 @@ class _StftCacheEntry:
     frequencies_hz: list[float] = field(default_factory=list)
     times_sec: list[float] = field(default_factory=list)
     magnitude_db: np.ndarray | None = None
+    render_revision: int = 0
     _magnitude_storage: np.ndarray | None = field(default=None, init=False, repr=False)
     _column_capacity: int = field(default=0, init=False, repr=False)
 
@@ -42,6 +43,7 @@ class _StftCacheEntry:
 
         self._append_magnitude_column(magnitudes)
         self.times_sec.append(float(getattr(frame, "time", 0.0)))
+        self.render_revision += 1
         return True
 
     def has_data(self) -> bool:
@@ -170,7 +172,9 @@ class _HeatmapCanvas(QWidget):
 
 class StftModule(QWidget):
     module_id = "stft"
-    _DISPLAY_PHASES = frozenset({"running", "analyzing", "reviewing", "reanalyzing"})
+    _DISPLAY_PHASES = frozenset(
+        {"running", "analyzing", "reviewing", "reanalyzing", "stopped"}
+    )
     _REVIEW_PHASES = frozenset({"reviewing", "reanalyzing"})
     _LIVE_FLUSH_INTERVAL_MS = 50
 
@@ -188,6 +192,7 @@ class StftModule(QWidget):
         self._drag_offset_px: float | None = None
         self._display_run_id = getattr(self._review_payload, "run_id", None)
         self._render_cache_key: tuple[int, str, int] | None = None
+        self._last_render_signature: tuple[tuple[int, str, int], int] | None = None
         self._stft_cache: dict[tuple[int, str, int], _StftCacheEntry] = {}
         self._pending_live_flush_key: tuple[int, str, int] | None = None
         self._live_flush_generation = 0
@@ -274,11 +279,11 @@ class StftModule(QWidget):
         if resolved_render_target is None:
             return
 
-        cache_key, payload = resolved_render_target
+        cache_key, cache_entry, payload = resolved_render_target
         if cache_key != pending_cache_key:
             return
 
-        self._render_payload(cache_key, payload)
+        self._render_payload(cache_key, cache_entry, payload)
         self._update_overlay_geometry()
 
     def move_selection_to_start(self, start_sec: float) -> bool:
@@ -363,10 +368,9 @@ class StftModule(QWidget):
         self._selected_window = None
         self._drag_offset_px = None
         self._display_run_id = None
-        self._render_cache_key = None
         self._clear_pending_live_flush()
         self._stft_cache.clear()
-        self.canvas.heatmap.clear_data()
+        self._clear_rendering()
         self._update_overlay_geometry()
 
     def _on_factory_runtime_context(self, payload) -> None:
@@ -775,10 +779,12 @@ class StftModule(QWidget):
             self._clear_rendering()
             return
 
-        cache_key, payload = resolved_render_target
-        self._render_payload(cache_key, payload)
+        cache_key, cache_entry, payload = resolved_render_target
+        self._render_payload(cache_key, cache_entry, payload)
 
-    def _resolve_render_target(self) -> tuple[tuple[int, str, int], dict] | None:
+    def _resolve_render_target(
+        self,
+    ) -> tuple[tuple[int, str, int], _StftCacheEntry, dict] | None:
         if not self._has_display_context():
             return None
 
@@ -797,10 +803,21 @@ class StftModule(QWidget):
         if payload is None:
             return None
 
-        return (cache_key, payload)
+        return (cache_key, cache_entry, payload)
 
-    def _render_payload(self, cache_key: tuple[int, str, int], payload: dict) -> None:
-        reset_levels = cache_key != self._render_cache_key or not self.canvas.heatmap.has_image()
+    def _render_payload(
+        self,
+        cache_key: tuple[int, str, int],
+        cache_entry: _StftCacheEntry,
+        payload: dict,
+    ) -> None:
+        render_signature = (cache_key, cache_entry.render_revision)
+        has_image = self.canvas.heatmap.has_image()
+        if render_signature == self._last_render_signature and has_image:
+            self._render_cache_key = cache_key
+            return
+
+        reset_levels = cache_key != self._render_cache_key or not has_image
         self._render_cache_key = cache_key
         self.canvas.heatmap.set_image(
             times_sec=payload["times_sec"],
@@ -808,9 +825,11 @@ class StftModule(QWidget):
             magnitude_db=payload["magnitude_db"],
             reset_levels=reset_levels,
         )
+        self._last_render_signature = render_signature
 
     def _clear_rendering(self) -> None:
         self._render_cache_key = None
+        self._last_render_signature = None
         self.canvas.heatmap.clear_data()
 
     def _schedule_live_refresh(self, cache_key: tuple[int, str, int]) -> None:

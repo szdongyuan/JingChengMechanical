@@ -5,7 +5,7 @@ The primary key is a human-readable string identifier (e.g. "motor-dual-segment-
 """
 from __future__ import annotations
 
-from peewee import BooleanField, IntegerField, TextField
+from peewee import SQL, BooleanField, IntegerField, TextField
 
 from consts.time_consts import now_str
 from model.base_mode import BaseModel
@@ -17,7 +17,10 @@ class AiToolchainTable(BaseModel):
     version = TextField(default="")
     entrypoint = TextField()
     protocol_version = IntegerField(default=1)
-    execution_mode = TextField(default="oneshot_process")
+    execution_mode = TextField(
+        default="resident_process",
+        constraints=[SQL("DEFAULT 'resident_process'")],
+    )
     default_timeout_ms = IntegerField(default=30000)
     enabled = BooleanField(default=True)
     description = TextField(default="")

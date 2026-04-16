@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from threading import Event, Thread
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -11,6 +12,7 @@ from app.service.analysis.test_manager import TestManager
 from ._support import (
     _DummySignal,
     _expected_no_result_payload,
+    _make_running_factory_manager,
     _mock_bus,
     _mock_services,
 )
@@ -176,6 +178,71 @@ class TestLateAttachBufferSlice:
         assert cleanup_payload.run_id == "run-1"
         assert mgr._completed_sessions[1] is session
 
+    @pytest.mark.parametrize(
+        ("judgment_outcome", "review_signal_name"),
+        [
+            ("success", "factory_runtime_auto_analysis_succeeded"),
+            ("no_result", "factory_runtime_auto_analysis_no_result"),
+            ("error", "factory_runtime_auto_analysis_error"),
+        ],
+    )
+    def test_stop_active_run_eligible_auto_analysis_emits_cleanup_settled_after_review_signal(
+        self,
+        monkeypatch,
+        judgment_outcome,
+        review_signal_name,
+    ):
+        partial_buf = np.arange(400, dtype=np.float32).reshape(400, 1)
+        bus, _, mgr, session, _, _, _ = _make_running_factory_manager(
+            monkeypatch,
+            analysis_duration=2.0,
+            analysis_window_offset_ms=1000,
+            allow_incomplete_recording_analysis=True,
+            partial_buf=partial_buf,
+            sample_rate=100.0,
+        )
+        if judgment_outcome == "success":
+            session._run_judgment = MagicMock(
+                return_value=JudgmentResult(
+                    overall="合格",
+                    limit_pass=True,
+                    ai_pass=True,
+                    ai_score=0.93,
+                    analysis_window=(1.0, 3.0),
+                )
+            )
+        elif judgment_outcome == "no_result":
+            session._run_judgment = MagicMock(
+                side_effect=ValueError("analysis window not fully captured")
+            )
+        else:
+            session._run_judgment = MagicMock(side_effect=RuntimeError("analysis crashed"))
+
+        emission_order: list[tuple[str, bool, bool, object]] = []
+
+        def _capture_emission(label, payload):
+            emission_order.append((label, bool(mgr._sessions), mgr.is_running(), payload))
+
+        getattr(bus, review_signal_name).emit.side_effect = (
+            lambda payload: _capture_emission("review", payload)
+        )
+        bus.factory_runtime_auto_analysis_cleanup_settled.emit.side_effect = (
+            lambda payload: _capture_emission("cleanup", payload)
+        )
+
+        stopped = mgr.stop_active_run(config_id=1)
+
+        assert stopped is True
+        assert [entry[0] for entry in emission_order] == ["review", "cleanup"]
+        assert emission_order[0][1:3] == (True, True)
+        assert emission_order[1][1:3] == (False, False)
+        cleanup_payload = emission_order[1][3]
+        assert cleanup_payload.config_id == 1
+        assert cleanup_payload.run_id == session._workorder["factory_run_id"]
+        bus.factory_runtime_stopped.emit.assert_not_called()
+        bus.factory_runtime_aborted.emit.assert_not_called()
+        assert mgr._completed_sessions[1] is session
+
     def test_on_session_done_required_window_failure_emits_no_result_payload_and_preserves_completed_session(self):
         bus = _mock_bus()
         services = _mock_services(bus)
@@ -321,6 +388,99 @@ class TestLateAttachBufferSlice:
         assert 1 not in mgr._completed_sessions
         assert mgr.is_running(config_id=1) is False
 
+    def test_stop_active_run_during_analyzing_emits_factory_runtime_stopped_and_suppresses_late_completion(
+        self,
+        monkeypatch,
+    ):
+        partial_buf = np.arange(400, dtype=np.float32).reshape(400, 1)
+        bus, _, mgr, session, _, _, _ = _make_running_factory_manager(
+            monkeypatch,
+            analysis_duration=2.0,
+            analysis_window_offset_ms=1000,
+            allow_incomplete_recording_analysis=True,
+            partial_buf=partial_buf,
+            sample_rate=100.0,
+        )
+        entered_analysis = Event()
+        release_analysis = Event()
+
+        def _blocking_judgment():
+            session._audio_file_path = "captured.wav"
+            entered_analysis.set()
+            assert release_analysis.wait(timeout=1)
+            raise RuntimeError("late analysis should be suppressed")
+
+        session._run_judgment = _blocking_judgment
+        worker = Thread(target=mgr._on_session_done, args=(1,))
+        worker.start()
+        assert entered_analysis.wait(timeout=1)
+
+        stopped = mgr.stop_active_run(config_id=1)
+
+        assert stopped is True
+        bus.factory_runtime_stopped.emit.assert_called_once()
+        bus.factory_runtime_aborted.emit.assert_not_called()
+
+        release_analysis.set()
+        worker.join(timeout=1)
+
+        bus.factory_runtime_auto_analysis_succeeded.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_no_result.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_error.emit.assert_not_called()
+        assert 1 not in mgr._completed_sessions
+        assert mgr.is_running(config_id=1) is False
+
+    def test_stop_active_run_ineligible_stop_window_suppresses_late_completion_callback(
+        self,
+        monkeypatch,
+    ):
+        partial_buf = np.arange(200, dtype=np.float32).reshape(200, 1)
+        bus, _, mgr, session, _, _, _ = _make_running_factory_manager(
+            monkeypatch,
+            analysis_duration=2.0,
+            analysis_window_offset_ms=1000,
+            allow_incomplete_recording_analysis=False,
+            partial_buf=partial_buf,
+            sample_rate=100.0,
+        )
+        stop_window_entered = Event()
+        release_stop_window = Event()
+        stop_results: list[bool] = []
+        original_capture = mgr._capture_partial_stop_buffer
+        session._run_judgment = MagicMock(
+            side_effect=AssertionError("late completion should be suppressed")
+        )
+
+        def _blocking_capture(config_id, running_session, recorder):
+            stop_window_entered.set()
+            assert release_stop_window.wait(timeout=1)
+            return original_capture(config_id, running_session, recorder)
+
+        monkeypatch.setattr(mgr, "_capture_partial_stop_buffer", _blocking_capture)
+
+        worker = Thread(target=lambda: stop_results.append(mgr.stop_active_run(config_id=1)))
+        worker.start()
+        assert stop_window_entered.wait(timeout=1)
+
+        mgr._on_session_done(1)
+
+        release_stop_window.set()
+        worker.join(timeout=1)
+
+        assert stop_results == [True]
+        bus.factory_runtime_stopped.emit.assert_called_once()
+        bus.factory_runtime_analyzing_entered.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_succeeded.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_no_result.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_error.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_cleanup_settled.emit.assert_not_called()
+        bus.factory_runtime_aborted.emit.assert_not_called()
+        bus.test_finished.emit.assert_not_called()
+        bus.result_changed.emit.assert_not_called()
+        session._run_judgment.assert_not_called()
+        assert 1 not in mgr._completed_sessions
+        assert mgr.is_running(config_id=1) is False
+
     def test_on_error_emits_factory_runtime_aborted_for_active_factory_run(self):
         bus = _mock_bus()
         services = _mock_services(bus)
@@ -374,6 +534,7 @@ class TestLateAttachBufferSlice:
                 "channels": [{
                     "channel_index": 0,
                     "stft_nfft": 1024,
+                    "fft_nfft": 4096,
                     "stft_overlap": 0.5,
                     "spl_weighting": "Z",
                     "spl_time_constant": 0.125,
@@ -397,6 +558,7 @@ class TestLateAttachBufferSlice:
                 "channels": [{
                     "channel_index": 0,
                     "stft_nfft": 1024,
+                    "fft_nfft": 4096,
                     "stft_overlap": 0.5,
                     "spl_weighting": "Z",
                     "spl_time_constant": 0.125,
@@ -543,6 +705,7 @@ class TestLateAttachBufferSlice:
                 "channels": [{
                     "channel_index": 0,
                     "stft_nfft": 1024,
+                    "fft_nfft": 4096,
                     "stft_overlap": 0.5,
                     "spl_weighting": "Z",
                     "spl_time_constant": 0.125,
@@ -566,6 +729,7 @@ class TestLateAttachBufferSlice:
                 "channels": [{
                     "channel_index": 0,
                     "stft_nfft": 1024,
+                    "fft_nfft": 4096,
                     "stft_overlap": 0.5,
                     "spl_weighting": "Z",
                     "spl_time_constant": 0.125,
@@ -701,6 +865,7 @@ class TestLateAttachBufferSlice:
                 "channels": [{
                     "channel_index": 0,
                     "stft_nfft": 1024,
+                    "fft_nfft": 4096,
                     "stft_overlap": 0.5,
                     "spl_weighting": "Z",
                     "spl_time_constant": 0.125,
@@ -724,6 +889,7 @@ class TestLateAttachBufferSlice:
                 "channels": [{
                     "channel_index": 0,
                     "stft_nfft": 1024,
+                    "fft_nfft": 4096,
                     "stft_overlap": 0.5,
                     "spl_weighting": "Z",
                     "spl_time_constant": 0.125,

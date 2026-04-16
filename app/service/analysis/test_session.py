@@ -222,7 +222,7 @@ class TestSession:
         if not binding.get("enabled"):
             self._last_ai_review = self._make_ai_review(
                 status="disabled",
-                threshold=self._coerce_ai_score(binding.get("score_threshold")),
+                threshold=None,
                 score=None,
                 channel_index=None,
                 error_message=None,
@@ -249,7 +249,6 @@ class TestSession:
         }
         ai_runs_dir = os.path.abspath(os.path.join(self._audio_dir, "..", "ai_runs"))
         test_run_id = self._get_or_create_test_run_id()
-        score_threshold = self._coerce_ai_score(binding.get("score_threshold"))
         effective_final_window_duration_ms = final_window_duration_ms or default_window_duration_ms
         window_info = {
             "window_overridden": (
@@ -274,7 +273,7 @@ class TestSession:
         except Exception as exc:
             self._last_ai_review = self._make_ai_review(
                 status="error",
-                threshold=score_threshold,
+                threshold=None,
                 score=None,
                 channel_index=None,
                 error_message=str(exc),
@@ -288,7 +287,7 @@ class TestSession:
             error_message = "AI analysis returned invalid output"
             self._last_ai_review = self._make_ai_review(
                 status="invalid_output",
-                threshold=score_threshold,
+                threshold=None,
                 score=None,
                 channel_index=None,
                 error_message=error_message,
@@ -301,10 +300,11 @@ class TestSession:
 
         module_status = str(envelope.get("module_status") or "").strip().lower()
         channel_index = self._coerce_ai_channel_index(envelope.get("channel_index"))
+        envelope_threshold = self._coerce_ai_score(envelope.get("decision_threshold"))
         if module_status != "success":
             self._last_ai_review = self._make_ai_review(
                 status=module_status or "error",
-                threshold=score_threshold,
+                threshold=envelope_threshold,
                 score=self._coerce_ai_score(envelope.get("score")),
                 channel_index=channel_index,
                 error_message=self._normalize_ai_error(
@@ -319,33 +319,45 @@ class TestSession:
             )
             return result
 
+        effective_threshold = envelope_threshold
         score = self._coerce_ai_score(envelope.get("score"))
         ai_label = envelope.get("ai_label")
 
-        # Primary: score + threshold
         ai_pass = None
-        if score is not None and score_threshold is not None:
-            ai_pass = (score >= score_threshold)
-        # Fallback: ai_label (legacy toolchains without numeric score)
+        ai_review_status = "success"
+        ai_review_error = None
+
+        if score is not None:
+            if effective_threshold is not None:
+                ai_pass = (score >= effective_threshold)
+            else:
+                ai_review_error = "AI decision threshold unavailable"
         elif isinstance(ai_label, str):
             label = ai_label.strip().upper()
             if label == "PASS":
                 ai_pass = True
+                ai_review_status = "missing_score"
+                ai_review_error = self._normalize_ai_error(
+                    envelope.get("error_summary"),
+                    fallback="AI score unavailable",
+                )
             elif label == "FAIL":
                 ai_pass = False
-
-        ai_review_status = "success"
-        ai_review_error = None
-        if score is None and (score_threshold is not None or ai_pass is None):
+                ai_review_status = "missing_score"
+                ai_review_error = self._normalize_ai_error(
+                    envelope.get("error_summary"),
+                    fallback="AI score unavailable",
+                )
+            else:
+                ai_review_status = "missing_score"
+                ai_review_error = "AI label is not a recognized binary label"
+        else:
             ai_review_status = "missing_score"
-            ai_review_error = self._normalize_ai_error(
-                envelope.get("error_summary"),
-                fallback="AI score unavailable",
-            )
+            ai_review_error = "AI score and usable AI label are unavailable"
 
         self._last_ai_review = self._make_ai_review(
             status=ai_review_status,
-            threshold=score_threshold,
+            threshold=effective_threshold,
             score=score,
             channel_index=channel_index,
             error_message=ai_review_error,

@@ -5,6 +5,8 @@ All functions operate on numpy arrays and have no side effects.
 from __future__ import annotations
 
 from functools import lru_cache
+from math import log2
+from numbers import Integral
 
 import numpy as np
 from scipy import signal as scipy_signal
@@ -80,6 +82,9 @@ def _c_weight_linear(f: float) -> float:
 
 
 _REF_PRESSURE = 20e-6
+_LOUDNESS_MIN_SAMPLE_RATE = 48000.0
+_LOUDNESS_NPERSEG = 2048
+_LOUDNESS_NOVERLAP = 1024
 
 
 def compute_spl(signal: np.ndarray, sample_rate: float,
@@ -125,6 +130,76 @@ def compute_spl(signal: np.ndarray, sample_rate: float,
     if rms <= 0:
         return -np.inf
     return 20.0 * np.log10(rms / _REF_PRESSURE)
+
+
+@lru_cache(maxsize=1)
+def _load_loudness_backend():
+    try:
+        from mosqito.sq_metrics import loudness_zwst_perseg
+    except ImportError as exc:
+        raise RuntimeError("MoSQITo loudness backend is unavailable") from exc
+    return loudness_zwst_perseg
+
+
+def _compute_loudness_zwst_perseg(signal: np.ndarray, sample_rate: float):
+    backend = _load_loudness_backend()
+    return backend(
+        signal,
+        int(round(sample_rate)),
+        nperseg=_LOUDNESS_NPERSEG,
+        noverlap=_LOUDNESS_NOVERLAP,
+    )
+
+
+def compute_loudness_trace(signal: np.ndarray, sample_rate: float) -> tuple[list[float], list[float], float]:
+    """Compute an ISO 532-1 loudness trace and its maximum in canonical sones."""
+    sig = np.asarray(signal, dtype=np.float64).reshape(-1)
+    if sig.size == 0:
+        raise ValueError("Loudness signal is empty")
+    if sample_rate <= 0.0:
+        raise ValueError("sample_rate must be positive")
+
+    backend_sample_rate = float(sample_rate)
+    if backend_sample_rate != _LOUDNESS_MIN_SAMPLE_RATE:
+        target_size = max(1, int(round(sig.size * _LOUDNESS_MIN_SAMPLE_RATE / backend_sample_rate)))
+        sig = scipy_signal.resample(sig, target_size)
+        backend_sample_rate = _LOUDNESS_MIN_SAMPLE_RATE
+
+    actual_duration_sec = sig.size / backend_sample_rate
+    if sig.size < _LOUDNESS_NPERSEG:
+        sig = np.pad(sig, (0, _LOUDNESS_NPERSEG - sig.size))
+
+    values_sone, _, _, times = _compute_loudness_zwst_perseg(sig, backend_sample_rate)
+    values = np.maximum(np.asarray(values_sone, dtype=np.float64).reshape(-1), 0.0)
+    time_axis = np.asarray(times, dtype=np.float64).reshape(-1)
+
+    if values.size == 0 or time_axis.size == 0 or values.size != time_axis.size:
+        raise RuntimeError("MoSQITo loudness backend returned unusable output")
+    if not np.all(np.isfinite(values)) or not np.all(np.isfinite(time_axis)):
+        raise RuntimeError("MoSQITo loudness backend returned non-finite output")
+    if time_axis.size:
+        time_axis = np.clip(time_axis, 0.0, actual_duration_sec)
+
+    max_sone = float(np.max(values))
+    return time_axis.tolist(), values.tolist(), max_sone
+
+
+def sone_to_phon(value_sone: float) -> float:
+    """Convert loudness from sones to phons using the project contract."""
+    sone = max(float(value_sone), 0.0)
+    if sone >= 1.0:
+        return float(40.0 + 10.0 * log2(sone))
+    return float(40.0 * (sone + 0.0005) ** 0.35)
+
+
+def phon_to_sone(value_phon: float) -> float:
+    """Convert loudness from phons to sones using the project contract."""
+    phon = max(float(value_phon), 0.0)
+    if phon >= 40.0:
+        return float(2.0 ** ((phon - 40.0) / 10.0))
+
+    sone = (phon / 40.0) ** (1.0 / 0.35) - 0.0005
+    return float(max(sone, 0.0))
 
 
 # ---------------------------------------------------------------------------
@@ -179,17 +254,54 @@ def compute_fft_spectrum(signal: np.ndarray, sample_rate: float,
     -------
     (frequencies, magnitudes_db) -- both 1-D, length nfft//2+1
     """
-    sig = np.asarray(signal, dtype=np.float64)
-    if sig.size < nfft:
-        sig = np.pad(sig, (0, nfft - sig.size))
+    sig = np.asarray(signal, dtype=np.float64).reshape(-1)
+    if sig.size <= 0:
+        raise ValueError("FFT input is empty")
+    try:
+        resolved_sample_rate = float(sample_rate)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("sample_rate must be a finite positive number") from exc
+    if not np.isfinite(resolved_sample_rate) or resolved_sample_rate <= 0.0:
+        raise ValueError("sample_rate must be a finite positive number")
+    if isinstance(nfft, (bool, np.bool_)) or not isinstance(nfft, Integral):
+        raise ValueError("nfft must be a positive integer")
+    resolved_nfft = int(nfft)
+    if resolved_nfft <= 0:
+        raise ValueError("nfft must be a positive integer")
+
+    if sig.size <= resolved_nfft:
+        if sig.size < resolved_nfft:
+            sig = np.pad(sig, (0, resolved_nfft - sig.size))
+        window = np.hanning(resolved_nfft)
+        spectrum = np.fft.rfft(sig * window)
+        mag = np.abs(spectrum) * 2.0 / resolved_nfft
     else:
-        sig = sig[:nfft]
-    window = np.hanning(nfft)
-    spectrum = np.fft.rfft(sig * window)
-    mag = np.abs(spectrum) * 2.0 / nfft
+        window = np.hanning(resolved_nfft)
+        mag_sum = np.zeros(resolved_nfft // 2 + 1, dtype=np.float64)
+        window_count = 0
+        for start in _iter_fft_window_starts(sig.size, resolved_nfft):
+            windowed = sig[start:start + resolved_nfft] * window
+            spectrum = np.fft.rfft(windowed)
+            mag_sum += np.abs(spectrum) * 2.0 / resolved_nfft
+            window_count += 1
+        mag = mag_sum / max(window_count, 1)
     mag_db = 20.0 * np.log10(np.maximum(mag, 1e-30))
-    freqs = np.fft.rfftfreq(nfft, d=1.0 / sample_rate)
+    freqs = np.fft.rfftfreq(resolved_nfft, d=1.0 / resolved_sample_rate)
     return freqs, mag_db
+
+
+def _iter_fft_window_starts(signal_size: int, nfft: int):
+    hop = max(1, nfft // 2)
+    start = 0
+    last_start = None
+    while start + nfft <= signal_size:
+        yield start
+        last_start = start
+        start += hop
+
+    tail_start = signal_size - nfft
+    if last_start != tail_start:
+        yield tail_start
 
 
 # ---------------------------------------------------------------------------

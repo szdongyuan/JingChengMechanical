@@ -29,7 +29,7 @@ class FactoryControllerState:
         "analyzing": "当前测试分析中",
         "reanalyzing": "当前正在重新分析",
     }
-    _START_READY_SELECTION_PHASES = frozenset({"idle", "armed", "reviewing"})
+    _START_READY_SELECTION_PHASES = frozenset({"idle", "armed", "reviewing", "stopped"})
 
     def __post_init__(self):
         selection_ready = self.selection_ready
@@ -122,7 +122,7 @@ class FactoryReviewPayload:
 
 @dataclass(frozen=True)
 class FactoryPlcIngressPayload:
-    plc_device_key: str
+    plc_id: int
 
 
 @dataclass(frozen=True)
@@ -157,6 +157,13 @@ class FactoryRuntimeAbortPayload:
     error_message: str | None = None
 
 
+@dataclass(frozen=True)
+class FactoryRuntimeStoppedPayload:
+    config_id: int
+    run_id: str
+    trigger_source: str
+
+
 class EventBus(QObject):
     """
     模块间通信的“信号总线”。
@@ -181,6 +188,8 @@ class EventBus(QObject):
 
     # 配置变化（供外部模块监听，如工单模块刷新可选配置列表）
     config_changed = pyqtSignal()
+    plc_changed = pyqtSignal()
+    ai_toolchains_changed = pyqtSignal()
 
     # ── Analysis kernel real-time signals ──
     # Real-time analysis frames (~20 Hz per channel)
@@ -205,6 +214,7 @@ class EventBus(QObject):
     factory_runtime_auto_analysis_no_result = pyqtSignal(object)  # FactoryReviewPayload
     factory_runtime_auto_analysis_error = pyqtSignal(object)      # FactoryReviewPayload
     factory_runtime_auto_analysis_cleanup_settled = pyqtSignal(object)  # FactoryRuntimeConfigPayload
+    factory_runtime_stopped = pyqtSignal(object)                  # FactoryRuntimeStoppedPayload
     factory_runtime_aborted = pyqtSignal(object)                  # FactoryRuntimeAbortPayload
     factory_runtime_reanalysis_completed = pyqtSignal(object)     # FactoryReviewPayload
     factory_state_changed = pyqtSignal(object)              # FactoryControllerState
@@ -241,7 +251,11 @@ class ServiceContainer:
 
         self.factory_mode = FactoryModeController(self.bus, self)
 
+    def _start_from_plc(self, plc_id: int) -> None:
+        self.bus.factory_plc_event.emit(FactoryPlcIngressPayload(plc_id=plc_id))
 
-    def _start_from_plc(self):
-        self.bus.log.emit("[PLC] 触发开始 -> 执行测试开始逻辑")
-        # 调用播放
+    def shutdown(self) -> None:
+        try:
+            self.ai_service.shutdown()
+        finally:
+            self.db.close()

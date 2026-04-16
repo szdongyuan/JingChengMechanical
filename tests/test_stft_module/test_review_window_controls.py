@@ -103,6 +103,63 @@ def test_auto_analysis_failure_without_full_valid_window_hides_reanalysis_contro
     services.factory_mode.begin_reanalysis.assert_not_called()
 
 
+def test_stft_keeps_rendering_in_stopped_phase_but_hides_manual_controls(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(module, services, qapp, channel_index=0)
+    payload = _make_review_payload()
+
+    _emit_phase(services, payload, run_phase="stopped")
+    qapp.processEvents()
+
+    assert module.current_image_payload() is not None
+    assert module.selection_box.isVisible() is False
+    assert module.analyze_button.isVisible() is False
+
+
+def test_stft_preserved_review_content_in_plain_stopped_still_hides_manual_controls(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(module, services, qapp, channel_index=0)
+    payload = _make_review_payload(
+        judgment_payload={
+            "overall": "合格",
+            "analysis_window": (1.0, 3.0),
+        }
+    )
+
+    _emit_reviewing(module, services, payload)
+    _emit_phase(services, payload, run_phase="stopped")
+    qapp.processEvents()
+
+    assert module.current_image_payload() is not None
+    assert module.selection_box.isVisible() is False
+    assert module.analyze_button.isVisible() is False
+
+
+def test_stft_shows_review_controls_for_stop_triggered_no_result_reviewing(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(module, services, qapp, channel_index=0)
+    payload = _make_review_payload(
+        no_result=True,
+        error_message="analysis unavailable",
+        fallback_window=FactoryReviewWindow(start_sec=0.0, end_sec=2.0),
+        judgment_payload=None,
+    )
+
+    _emit_phase(services, payload, run_phase="reviewing")
+    services.bus.factory_review_changed.emit(payload)
+    qapp.processEvents()
+
+    assert module.selection_box.isVisible() is True
+    assert module.analyze_button.isVisible() is True
+    assert module.analyze_button.isEnabled() is True
+
+
 @pytest.mark.parametrize(
     ("run_phase", "box_visible", "button_visible", "button_enabled"),
     [
@@ -112,6 +169,7 @@ def test_auto_analysis_failure_without_full_valid_window_hides_reanalysis_contro
         ("analyzing", False, False, False),
         ("reviewing", True, True, True),
         ("reanalyzing", True, True, False),
+        ("stopped", False, False, False),
     ],
 )
 def test_analysis_controls_follow_review_only_visibility_rule(

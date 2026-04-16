@@ -3,6 +3,8 @@ import math
 import numpy as np
 import pytest
 
+from app.service.analysis import dsp
+from app.service.analysis.golden_reference import GoldenReferenceError
 from app.service.analysis.review_payloads import build_chart_payload, build_summary_payload
 
 
@@ -10,8 +12,12 @@ def _make_config(*, fft_limits=True, octave_limits=True):
     def _channel(channel_index: int):
         return {
             "channel_index": channel_index,
+            "fft_nfft": 4096,
             "spl_lower_limit": 40.0,
             "spl_upper_limit": 80.0,
+            "loudness_unit": "sone",
+            "loudness_lower_limit": 0.0,
+            "loudness_upper_limit": 10.0,
             "fft_band_limits": (
                 [{"freq": 1000.0, "lower": 40.0, "upper": 60.0}]
                 if fft_limits
@@ -43,6 +49,14 @@ def _make_judgment_payload():
                 "channel_index": 0,
                 "spl_db": 77.0,
                 "spl_pass": True,
+                "loudness_max_sone": 7.0,
+                "loudness_pass": True,
+                "loudness_available": True,
+                "loudness_error_message": None,
+                "fft_available": True,
+                "fft_error_message": None,
+                "octave_available": True,
+                "octave_error_message": None,
                 "fft_band_results": [
                     {
                         "freq": 1000.0,
@@ -66,6 +80,14 @@ def _make_judgment_payload():
                 "channel_index": 1,
                 "spl_db": 86.0,
                 "spl_pass": False,
+                "loudness_max_sone": 12.0,
+                "loudness_pass": False,
+                "loudness_available": True,
+                "loudness_error_message": None,
+                "fft_available": True,
+                "fft_error_message": None,
+                "octave_available": True,
+                "octave_error_message": None,
                 "fft_band_results": [
                     {
                         "freq": 1000.0,
@@ -87,6 +109,86 @@ def _make_judgment_payload():
             },
         ],
     }
+
+
+def _make_single_channel_config(**channel_overrides):
+    config = _make_config()
+    channel = dict(config["channels"][0])
+    channel.update(channel_overrides)
+    config["selected_channels"] = [0]
+    config["channels"] = [channel]
+    return config
+
+
+def _make_single_channel_judgment_payload(**channel_overrides):
+    payload = _make_judgment_payload()
+    channel_result = dict(payload["channel_results"][0])
+    channel_result.update(channel_overrides)
+    payload["channel_results"] = [channel_result]
+    return payload
+
+
+def _make_ai_only_config():
+    return {
+        "config_id": 101,
+        "selected_channels": [],
+        "channels": [],
+    }
+
+
+def _make_ai_only_judgment_payload(*, ai_pass, ai_score):
+    return {
+        "overall": "合格" if ai_pass is not False else "不合格",
+        "limit_pass": True,
+        "ai_pass": ai_pass,
+        "ai_score": ai_score,
+        "analysis_window": (1.0, 3.0),
+        "channel_results": [],
+    }
+
+
+class _GoldenCacheStub:
+    def __init__(
+        self,
+        *,
+        fft_axis=None,
+        fft_levels=None,
+        octave_axis=None,
+        octave_levels=None,
+        bundle_error: Exception | None = None,
+        fft_error: Exception | None = None,
+        octave_error: Exception | None = None,
+    ):
+        self.bundle_calls = 0
+        self.ensure_fft_calls = 0
+        self.ensure_fft_nffts: list[int] = []
+        self.ensure_octave_calls = 0
+        self.fft_axis = np.asarray(fft_axis or [], dtype=np.float64)
+        self.fft_levels = np.asarray(fft_levels or [], dtype=np.float64)
+        self.octave_axis = np.asarray(octave_axis or [], dtype=np.float64)
+        self.octave_levels = np.asarray(octave_levels or [], dtype=np.float64)
+        self.bundle_error = bundle_error
+        self.fft_error = fft_error
+        self.octave_error = octave_error
+
+    def bundle_for_channel(self, **kwargs):
+        self.bundle_calls += 1
+        if self.bundle_error is not None:
+            raise self.bundle_error
+        return object()
+
+    def ensure_fft(self, bundle, *, nfft):
+        self.ensure_fft_calls += 1
+        self.ensure_fft_nffts.append(int(nfft))
+        if self.fft_error is not None:
+            raise self.fft_error
+        return self.fft_axis, self.fft_levels
+
+    def ensure_octave(self, bundle, *, weighting):
+        self.ensure_octave_calls += 1
+        if self.octave_error is not None:
+            raise self.octave_error
+        return self.octave_axis, self.octave_levels
 
 
 def _build_single_channel_band_summary(*, config_key, result_key, band_results):
@@ -120,12 +222,49 @@ def _build_single_channel_band_summary(*, config_key, result_key, band_results):
                     "channel_index": 0,
                     "spl_db": 70.0,
                     "spl_pass": True,
+                    "loudness_max_sone": 5.0,
+                    "loudness_pass": True,
+                    "loudness_available": True,
+                    "loudness_error_message": None,
                     "fft_band_results": band_results if result_key == "fft_band_results" else [],
                     "oct_band_results": band_results if result_key == "oct_band_results" else [],
                 }
             ],
         },
         ai_review={"status": "not_enabled"},
+    )
+
+
+def _patch_basic_chart_backends(
+    monkeypatch,
+    *,
+    fft_axis=(1000.0, 2000.0),
+    fft_levels=(67.0, 45.0),
+    octave_axis=(500.0, 1000.0),
+    octave_levels=(57.0, 43.0),
+):
+    ref_db = 20.0 * math.log10(20e-6)
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_spl",
+        lambda signal, sample_rate, weighting, time_constant: 70.0,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
+        lambda signal, sample_rate, nfft: (
+            np.asarray(fft_axis, dtype=np.float64),
+            np.asarray(fft_levels, dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_octave_bands",
+        lambda signal, sample_rate, weighting: (
+            np.asarray(octave_axis, dtype=np.float64),
+            np.asarray(octave_levels, dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_loudness_trace",
+        lambda signal, sample_rate: ([0.0, 1.0], [2.0, 3.0], 3.0),
     )
 
 
@@ -138,7 +277,7 @@ def test_build_summary_payload_uses_worst_case_deviation_across_channels():
 
     assert summary["overall_status"] == "fail"
     assert summary["overall_label"] == "FAIL"
-    assert [row["label"] for row in summary["rows"]] == ["SPL", "FFT", "倍频程", "AI分析"]
+    assert [row["label"] for row in summary["rows"]] == ["SPL", "Loudness", "FFT", "倍频程", "AI分析"]
     assert summary["rows"][0]["label"] == "SPL"
     assert summary["rows"][0]["item_key"] == "spl"
     assert summary["rows"][0]["deviation_value"] == 6.0
@@ -156,19 +295,75 @@ def test_build_summary_payload_handles_bounded_pass_margin_and_exact_boundary():
         ai_review={"status": "success", "threshold": 0.8, "score": 0.93},
     )
 
-    assert summary["rows"][1]["label"] == "FFT"
-    assert summary["rows"][1]["deviation_value"] == -3.0
-    assert summary["rows"][1]["deviation_display"] == "-3 dB"
-    assert summary["rows"][1]["channel_label"] == "CH1"
-    assert summary["rows"][1]["status"] == "OK"
-    assert summary["rows"][2]["label"] == "倍频程"
-    assert summary["rows"][2]["deviation_value"] == 0.0
-    assert summary["rows"][2]["deviation_display"] == "0 dB"
+    assert summary["rows"][1]["label"] == "Loudness"
+    assert summary["rows"][1]["deviation_value"] == 2.0
+    assert summary["rows"][1]["deviation_display"] == "2 sone"
+    assert summary["rows"][1]["channel_label"] == "CH2"
+    assert summary["rows"][1]["status"] == "NG"
+    assert summary["rows"][2]["label"] == "FFT"
+    assert summary["rows"][2]["deviation_value"] == -3.0
+    assert summary["rows"][2]["deviation_display"] == "-3 dB"
     assert summary["rows"][2]["channel_label"] == "CH1"
     assert summary["rows"][2]["status"] == "OK"
+    assert summary["rows"][3]["label"] == "倍频程"
+    assert summary["rows"][3]["deviation_value"] == 0.0
+    assert summary["rows"][3]["deviation_display"] == "0 dB"
+    assert summary["rows"][3]["channel_label"] == "CH1"
+    assert summary["rows"][3]["status"] == "OK"
 
 
-def test_build_summary_payload_renders_unconstrained_rows_and_ai_channel_fallback():
+def test_build_summary_payload_uses_ai_threshold_for_numeric_success():
+    summary = build_summary_payload(
+        config=_make_ai_only_config(),
+        judgment_payload=_make_ai_only_judgment_payload(ai_pass=False, ai_score=0.48),
+        ai_review={"status": "success", "threshold": 0.5, "score": 0.48},
+    )
+
+    assert summary["overall_status"] == "fail"
+    assert summary["rows"][-1]["label"] == "AI分析"
+    assert summary["rows"][-1]["deviation_value"] == 0.02
+    assert summary["rows"][-1]["deviation_display"] == "0.02"
+    assert summary["rows"][-1]["status"] == "NG"
+    assert summary["rows"][-1]["constrained"] is True
+
+
+def test_build_summary_payload_keeps_scoreless_success_with_ai_threshold_as_no_result_even_when_judgment_used_ai_label():
+    summary = build_summary_payload(
+        config=_make_ai_only_config(),
+        judgment_payload=_make_ai_only_judgment_payload(ai_pass=True, ai_score=None),
+        ai_review={"status": "success", "threshold": 0.5, "score": None},
+    )
+
+    assert summary["overall_status"] == "no_result"
+    assert summary["rows"][-1]["label"] == "AI分析"
+    assert summary["rows"][-1]["deviation_value"] is None
+    assert summary["rows"][-1]["deviation_display"] == "--"
+    assert summary["rows"][-1]["status"] == "无结果"
+    assert summary["rows"][-1]["constrained"] is True
+
+
+def test_build_summary_payload_marks_successful_numeric_ai_with_missing_ai_threshold_as_no_result():
+    summary = build_summary_payload(
+        config=_make_ai_only_config(),
+        judgment_payload=_make_ai_only_judgment_payload(ai_pass=True, ai_score=0.81),
+        ai_review={
+            "status": "success",
+            "threshold": None,
+            "score": 0.81,
+            "error_message": "missing threshold",
+        },
+    )
+
+    assert summary["overall_status"] == "no_result"
+    assert summary["error_message"] == "AI decision threshold unavailable"
+    assert summary["rows"][-1]["label"] == "AI分析"
+    assert summary["rows"][-1]["deviation_value"] is None
+    assert summary["rows"][-1]["deviation_display"] == "--"
+    assert summary["rows"][-1]["status"] == "无结果"
+    assert summary["rows"][-1]["constrained"] is True
+
+
+def test_build_summary_payload_renders_unconstrained_rows_and_scoreless_success_ai_as_no_result():
     summary = build_summary_payload(
         config=_make_config(fft_limits=False, octave_limits=False),
         judgment_payload={
@@ -182,6 +377,10 @@ def test_build_summary_payload_renders_unconstrained_rows_and_ai_channel_fallbac
                     "channel_index": 0,
                     "spl_db": 70.0,
                     "spl_pass": True,
+                    "loudness_max_sone": 5.0,
+                    "loudness_pass": True,
+                    "loudness_available": True,
+                    "loudness_error_message": None,
                     "fft_band_results": [],
                     "oct_band_results": [],
                 },
@@ -189,6 +388,10 @@ def test_build_summary_payload_renders_unconstrained_rows_and_ai_channel_fallbac
                     "channel_index": 1,
                     "spl_db": 71.0,
                     "spl_pass": True,
+                    "loudness_max_sone": 6.0,
+                    "loudness_pass": True,
+                    "loudness_available": True,
+                    "loudness_error_message": None,
                     "fft_band_results": [],
                     "oct_band_results": [],
                 },
@@ -197,21 +400,24 @@ def test_build_summary_payload_renders_unconstrained_rows_and_ai_channel_fallbac
         ai_review={"status": "success", "channel_index": None},
     )
 
-    assert summary["overall_status"] == "pass"
-    assert summary["rows"][1]["label"] == "FFT"
-    assert summary["rows"][1]["deviation_value"] is None
-    assert summary["rows"][1]["deviation_display"] == "--"
-    assert summary["rows"][1]["channel_index"] is None
-    assert summary["rows"][1]["channel_label"] == "--"
+    assert summary["overall_status"] == "no_result"
+    assert summary["rows"][1]["label"] == "Loudness"
     assert summary["rows"][1]["status"] == "OK"
-    assert summary["rows"][1]["constrained"] is False
-    assert summary["rows"][2]["label"] == "倍频程"
-    assert summary["rows"][2]["status"] == "OK"
+    assert summary["rows"][1]["constrained"] is True
+    assert summary["rows"][2]["label"] == "FFT"
+    assert summary["rows"][2]["deviation_value"] is None
     assert summary["rows"][2]["deviation_display"] == "--"
-    assert summary["rows"][3]["label"] == "AI分析"
-    assert summary["rows"][3]["channel_label"] == "--"
+    assert summary["rows"][2]["channel_index"] is None
+    assert summary["rows"][2]["channel_label"] == "--"
+    assert summary["rows"][2]["status"] == "OK"
+    assert summary["rows"][2]["constrained"] is False
+    assert summary["rows"][3]["label"] == "倍频程"
     assert summary["rows"][3]["status"] == "OK"
-    assert summary["rows"][3]["constrained"] is False
+    assert summary["rows"][3]["deviation_display"] == "--"
+    assert summary["rows"][4]["label"] == "AI分析"
+    assert summary["rows"][4]["channel_label"] == "--"
+    assert summary["rows"][4]["status"] == "无结果"
+    assert summary["rows"][4]["constrained"] is True
 
 
 @pytest.mark.parametrize("status", ["not_enabled", "not_configured", "disabled", "skipped"])
@@ -303,6 +509,10 @@ def test_build_summary_payload_marks_configured_octave_with_non_finite_actual_as
                     "channel_index": 0,
                     "spl_db": 70.0,
                     "spl_pass": True,
+                    "loudness_max_sone": 5.0,
+                    "loudness_pass": True,
+                    "loudness_available": True,
+                    "loudness_error_message": None,
                     "fft_band_results": [],
                     "oct_band_results": [
                         {
@@ -322,20 +532,20 @@ def test_build_summary_payload_marks_configured_octave_with_non_finite_actual_as
     assert summary["overall_status"] == "no_result"
     assert summary["overall_label"] == "无结果"
     assert summary["error_message"] == "分析结果不可用"
-    assert summary["rows"][2]["label"] == "倍频程"
-    assert summary["rows"][2]["deviation_value"] is None
-    assert summary["rows"][2]["deviation_display"] == "--"
-    assert summary["rows"][2]["channel_index"] is None
-    assert summary["rows"][2]["channel_label"] == "--"
-    assert summary["rows"][2]["status"] == "无结果"
-    assert summary["rows"][2]["constrained"] is True
+    assert summary["rows"][3]["label"] == "倍频程"
+    assert summary["rows"][3]["deviation_value"] is None
+    assert summary["rows"][3]["deviation_display"] == "--"
+    assert summary["rows"][3]["channel_index"] is None
+    assert summary["rows"][3]["channel_label"] == "--"
+    assert summary["rows"][3]["status"] == "无结果"
+    assert summary["rows"][3]["constrained"] is True
 
 
 @pytest.mark.parametrize(
     ("config_key", "result_key", "row_index", "label"),
     [
-        ("fft_band_limits", "fft_band_results", 1, "FFT"),
-        ("oct_band_limits", "oct_band_results", 2, "倍频程"),
+        ("fft_band_limits", "fft_band_results", 2, "FFT"),
+        ("oct_band_limits", "oct_band_results", 3, "倍频程"),
     ],
 )
 def test_build_summary_payload_marks_mixed_usable_and_non_finite_band_rows_as_no_result(
@@ -380,8 +590,8 @@ def test_build_summary_payload_marks_mixed_usable_and_non_finite_band_rows_as_no
 @pytest.mark.parametrize(
     ("config_key", "result_key", "row_index", "label"),
     [
-        ("fft_band_limits", "fft_band_results", 1, "FFT"),
-        ("oct_band_limits", "oct_band_results", 2, "倍频程"),
+        ("fft_band_limits", "fft_band_results", 2, "FFT"),
+        ("oct_band_limits", "oct_band_results", 3, "倍频程"),
     ],
 )
 def test_build_summary_payload_marks_mixed_usable_and_missing_band_rows_as_no_result(
@@ -441,16 +651,296 @@ def test_build_summary_payload_keeps_nearest_bin_fft_band_results_as_normal_row(
     assert summary["overall_status"] == "pass"
     assert summary["overall_label"] == "PASS"
     assert summary["error_message"] is None
-    assert summary["rows"][1]["label"] == "FFT"
-    assert summary["rows"][1]["deviation_value"] == -1.0
-    assert summary["rows"][1]["deviation_display"] == "-1 dB"
-    assert summary["rows"][1]["channel_index"] == 0
-    assert summary["rows"][1]["channel_label"] == "CH1"
-    assert summary["rows"][1]["status"] == "OK"
+    assert summary["rows"][2]["label"] == "FFT"
+    assert summary["rows"][2]["deviation_value"] == -1.0
+    assert summary["rows"][2]["deviation_display"] == "-1 dB"
+    assert summary["rows"][2]["channel_index"] == 0
+    assert summary["rows"][2]["channel_label"] == "CH1"
+    assert summary["rows"][2]["status"] == "OK"
+    assert summary["rows"][2]["constrained"] is True
+
+
+def test_build_summary_payload_uses_canonical_sone_ranking_for_loudness_but_displays_in_selected_channel_unit():
+    summary = build_summary_payload(
+        config={
+            "config_id": 101,
+            "selected_channels": [0, 1],
+            "channels": [
+                {
+                    "channel_index": 0,
+                    "spl_lower_limit": 40.0,
+                    "spl_upper_limit": 80.0,
+                    "loudness_unit": "sone",
+                    "loudness_lower_limit": 0.0,
+                    "loudness_upper_limit": 6.0,
+                    "fft_band_limits": [],
+                    "oct_band_limits": [],
+                },
+                {
+                    "channel_index": 1,
+                    "spl_lower_limit": 40.0,
+                    "spl_upper_limit": 80.0,
+                    "loudness_unit": "phon",
+                    "loudness_lower_limit": 20.0,
+                    "loudness_upper_limit": 40.0,
+                    "fft_band_limits": [],
+                    "oct_band_limits": [],
+                },
+            ],
+        },
+        judgment_payload={
+            "overall": "不合格",
+            "limit_pass": False,
+            "ai_pass": None,
+            "ai_score": None,
+            "analysis_window": (1.0, 3.0),
+            "channel_results": [
+                {
+                    "channel_index": 0,
+                    "spl_db": 70.0,
+                    "spl_pass": True,
+                    "loudness_max_sone": 6.5,
+                    "loudness_pass": False,
+                    "loudness_available": True,
+                    "loudness_error_message": None,
+                    "fft_band_results": [],
+                    "oct_band_results": [],
+                },
+                {
+                    "channel_index": 1,
+                    "spl_db": 70.0,
+                    "spl_pass": True,
+                    "loudness_max_sone": 2.0,
+                    "loudness_pass": False,
+                    "loudness_available": True,
+                    "loudness_error_message": None,
+                    "fft_band_results": [],
+                    "oct_band_results": [],
+                },
+            ],
+        },
+        ai_review={"status": "not_enabled"},
+    )
+
+    assert summary["rows"][1]["label"] == "Loudness"
+    assert summary["rows"][1]["channel_index"] == 1
+    assert summary["rows"][1]["channel_label"] == "CH2"
+    assert summary["rows"][1]["status"] == "NG"
+    assert summary["rows"][1]["deviation_value"] == pytest.approx(10.0)
+    assert summary["rows"][1]["deviation_display"] == "10 phon"
+
+
+def test_build_summary_payload_marks_loudness_row_no_result_from_serialized_judgment():
+    summary = build_summary_payload(
+        config=_make_config(),
+        judgment_payload={
+            "overall": "不合格",
+            "limit_pass": False,
+            "ai_pass": None,
+            "ai_score": None,
+            "analysis_window": (1.0, 3.0),
+            "channel_results": [
+                {
+                    "channel_index": 0,
+                    "spl_db": 70.0,
+                    "spl_pass": True,
+                    "loudness_max_sone": 5.0,
+                    "loudness_pass": True,
+                    "loudness_available": True,
+                    "loudness_error_message": None,
+                    "fft_band_results": [],
+                    "oct_band_results": [],
+                },
+                {
+                    "channel_index": 1,
+                    "spl_db": 72.0,
+                    "spl_pass": True,
+                    "loudness_max_sone": None,
+                    "loudness_pass": None,
+                    "loudness_available": False,
+                    "loudness_error_message": "MoSQITo unavailable",
+                    "fft_band_results": [],
+                    "oct_band_results": [],
+                },
+            ],
+        },
+        ai_review={"status": "not_enabled"},
+    )
+
+    assert summary["overall_status"] == "no_result"
+    assert summary["overall_label"] == "无结果"
+    assert summary["error_message"] == "MoSQITo unavailable"
+    assert summary["rows"][1]["label"] == "Loudness"
+    assert summary["rows"][1]["deviation_display"] == "--"
+    assert summary["rows"][1]["status"] == "无结果"
     assert summary["rows"][1]["constrained"] is True
 
 
-def test_build_summary_payload_renders_four_no_result_rows_for_full_no_result():
+def test_build_summary_payload_preserves_loudness_partial_no_result_after_backend_failure_serialization():
+    summary = build_summary_payload(
+        config=_make_config(),
+        judgment_payload={
+            "overall": "不合格",
+            "limit_pass": False,
+            "ai_pass": None,
+            "ai_score": None,
+            "analysis_window": (1.0, 3.0),
+            "channel_results": [
+                {
+                    "channel_index": 0,
+                    "spl_db": 70.0,
+                    "spl_pass": True,
+                    "loudness_max_sone": 5.0,
+                    "loudness_pass": True,
+                    "loudness_available": True,
+                    "loudness_error_message": None,
+                    "fft_band_results": [],
+                    "oct_band_results": [],
+                },
+                {
+                    "channel_index": 1,
+                    "spl_db": 72.0,
+                    "spl_pass": True,
+                    "loudness_max_sone": None,
+                    "loudness_pass": None,
+                    "loudness_available": False,
+                    "loudness_error_message": "backend failed",
+                    "fft_band_results": [],
+                    "oct_band_results": [],
+                },
+            ],
+        },
+        ai_review={"status": "not_enabled"},
+    )
+
+    assert summary["overall_status"] == "no_result"
+    assert summary["rows"][1]["status"] == "无结果"
+    assert summary["error_message"] == "backend failed"
+
+
+def test_build_summary_payload_keeps_loudness_row_ng_when_serialized_loudness_pass_is_false_even_if_scalar_is_in_range():
+    summary = build_summary_payload(
+        config={
+            "config_id": 101,
+            "selected_channels": [0],
+            "channels": [
+                {
+                    "channel_index": 0,
+                    "spl_lower_limit": 40.0,
+                    "spl_upper_limit": 80.0,
+                    "loudness_unit": "sone",
+                    "loudness_lower_limit": 0.0,
+                    "loudness_upper_limit": 10.0,
+                    "fft_band_limits": [],
+                    "oct_band_limits": [],
+                }
+            ],
+        },
+        judgment_payload={
+            "overall": "不合格",
+            "limit_pass": False,
+            "ai_pass": None,
+            "ai_score": None,
+            "analysis_window": (1.0, 3.0),
+            "channel_results": [
+                {
+                    "channel_index": 0,
+                    "spl_db": 70.0,
+                    "spl_pass": True,
+                    "loudness_max_sone": 5.0,
+                    "loudness_pass": False,
+                    "loudness_available": True,
+                    "loudness_error_message": None,
+                    "fft_band_results": [],
+                    "oct_band_results": [],
+                }
+            ],
+        },
+        ai_review={"status": "not_enabled"},
+    )
+
+    assert summary["overall_status"] == "fail"
+    assert summary["overall_label"] == "FAIL"
+    assert summary["error_message"] is None
+    assert summary["rows"][1]["label"] == "Loudness"
+    assert summary["rows"][1]["deviation_value"] == -5.0
+    assert summary["rows"][1]["deviation_display"] == "-5 sone"
+    assert summary["rows"][1]["status"] == "NG"
+    assert summary["rows"][1]["channel_label"] == "CH1"
+
+
+def test_build_summary_payload_ranks_loudness_using_unrounded_raw_canonical_deviation():
+    summary = build_summary_payload(
+        config={
+            "config_id": 101,
+            "selected_channels": [0, 1],
+            "channels": [
+                {
+                    "channel_index": 0,
+                    "spl_lower_limit": 40.0,
+                    "spl_upper_limit": 80.0,
+                    "loudness_unit": "sone",
+                    "loudness_lower_limit": 0.0,
+                    "loudness_upper_limit": 10.0,
+                    "fft_band_limits": [],
+                    "oct_band_limits": [],
+                },
+                {
+                    "channel_index": 1,
+                    "spl_lower_limit": 40.0,
+                    "spl_upper_limit": 80.0,
+                    "loudness_unit": "sone",
+                    "loudness_lower_limit": 0.0,
+                    "loudness_upper_limit": 10.0,
+                    "fft_band_limits": [],
+                    "oct_band_limits": [],
+                },
+            ],
+        },
+        judgment_payload={
+            "overall": "合格",
+            "limit_pass": True,
+            "ai_pass": None,
+            "ai_score": None,
+            "analysis_window": (1.0, 3.0),
+            "channel_results": [
+                {
+                    "channel_index": 0,
+                    "spl_db": 70.0,
+                    "spl_pass": True,
+                    "loudness_max_sone": 9.9999994,
+                    "loudness_pass": True,
+                    "loudness_available": True,
+                    "loudness_error_message": None,
+                    "fft_band_results": [],
+                    "oct_band_results": [],
+                },
+                {
+                    "channel_index": 1,
+                    "spl_db": 70.0,
+                    "spl_pass": True,
+                    "loudness_max_sone": 9.99999949,
+                    "loudness_pass": True,
+                    "loudness_available": True,
+                    "loudness_error_message": None,
+                    "fft_band_results": [],
+                    "oct_band_results": [],
+                },
+            ],
+        },
+        ai_review={"status": "not_enabled"},
+    )
+
+    assert summary["overall_status"] == "pass"
+    assert summary["rows"][1]["label"] == "Loudness"
+    assert summary["rows"][1]["channel_index"] == 1
+    assert summary["rows"][1]["channel_label"] == "CH2"
+    assert summary["rows"][1]["deviation_value"] == -1e-06
+    assert summary["rows"][1]["deviation_display"] == "-1e-06 sone"
+    assert summary["rows"][1]["status"] == "OK"
+
+
+def test_build_summary_payload_renders_five_no_result_rows_for_full_no_result():
     summary = build_summary_payload(
         config=_make_config(),
         judgment_payload=None,
@@ -460,11 +950,114 @@ def test_build_summary_payload_renders_four_no_result_rows_for_full_no_result():
     assert summary["overall_status"] == "no_result"
     assert summary["overall_label"] == "无结果"
     assert summary["error_message"] == "analysis window not fully captured"
-    assert [row["label"] for row in summary["rows"]] == ["SPL", "FFT", "倍频程", "AI分析"]
-    assert len(summary["rows"]) == 4
+    assert [row["label"] for row in summary["rows"]] == ["SPL", "Loudness", "FFT", "倍频程", "AI分析"]
+    assert len(summary["rows"]) == 5
     assert all(row["status"] == "无结果" for row in summary["rows"])
     assert all(row["deviation_display"] == "--" for row in summary["rows"])
     assert all(row["channel_label"] == "--" for row in summary["rows"])
+
+
+@pytest.mark.parametrize(
+    ("config_key", "result_key", "available_key", "error_key", "row_index", "label"),
+    [
+        ("fft_band_limits", "fft_band_results", "fft_available", "fft_error_message", 2, "FFT"),
+        ("oct_band_limits", "oct_band_results", "octave_available", "octave_error_message", 3, "倍频程"),
+    ],
+)
+def test_build_summary_payload_treats_serialized_band_availability_as_authoritative_no_result(
+    config_key,
+    result_key,
+    available_key,
+    error_key,
+    row_index,
+    label,
+):
+    summary = build_summary_payload(
+        config={
+            "config_id": 101,
+            "selected_channels": [0],
+            "channels": [
+                {
+                    "channel_index": 0,
+                    "spl_lower_limit": 40.0,
+                    "spl_upper_limit": 80.0,
+                    "fft_band_limits": (
+                        [{"freq": 1000.0, "lower": -1.0, "upper": 1.0}]
+                        if config_key == "fft_band_limits"
+                        else []
+                    ),
+                    "oct_band_limits": (
+                        [{"freq": 1000.0, "lower": -1.0, "upper": 1.0}]
+                        if config_key == "oct_band_limits"
+                        else []
+                    ),
+                }
+            ],
+        },
+        judgment_payload={
+            "overall": "不合格",
+            "limit_pass": False,
+            "ai_pass": None,
+            "ai_score": None,
+            "analysis_window": (1.0, 3.0),
+            "channel_results": [
+                {
+                    "channel_index": 0,
+                    "spl_db": 70.0,
+                    "spl_pass": True,
+                    "loudness_max_sone": 5.0,
+                    "loudness_pass": True,
+                    "loudness_available": True,
+                    "loudness_error_message": None,
+                    "fft_available": available_key != "fft_available",
+                    "fft_error_message": (
+                        "fft golden reference unavailable"
+                        if error_key == "fft_error_message"
+                        else None
+                    ),
+                    "octave_available": available_key != "octave_available",
+                    "octave_error_message": (
+                        "octave golden reference unavailable"
+                        if error_key == "octave_error_message"
+                        else None
+                    ),
+                    "fft_band_results": [
+                        {
+                            "freq": 1000.0,
+                            "level": 0.5,
+                            "lower": -1.0,
+                            "upper": 1.0,
+                            "passed": True,
+                        }
+                    ],
+                    "oct_band_results": [
+                        {
+                            "freq": 1000.0,
+                            "level": 0.5,
+                            "lower": -1.0,
+                            "upper": 1.0,
+                            "passed": True,
+                        }
+                    ],
+                }
+            ],
+        },
+        ai_review={"status": "not_enabled"},
+    )
+
+    assert summary["overall_status"] == "no_result"
+    assert summary["overall_label"] == "无结果"
+    assert summary["error_message"] in {
+        "fft golden reference unavailable",
+        "octave golden reference unavailable",
+    }
+    assert summary["rows"][row_index]["label"] == label
+    assert summary["rows"][row_index]["deviation_value"] is None
+    assert summary["rows"][row_index]["deviation_display"] == "--"
+    assert summary["rows"][row_index]["channel_index"] == 0
+    assert summary["rows"][row_index]["channel_label"] == "CH1"
+    assert summary["rows"][row_index]["status"] == "无结果"
+    assert summary["rows"][row_index]["constrained"] is True
 
 
 def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch):
@@ -499,7 +1092,19 @@ def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch
         "app.service.analysis.review_payloads.dsp.compute_octave_bands",
         fake_compute_octave_bands,
     )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_loudness_trace",
+        lambda signal, sample_rate: (
+            [0.0, 1.0],
+            [2.0 + (10.0 if float(signal[0]) > 0.15 else 0.0), 3.0 + (10.0 if float(signal[0]) > 0.15 else 0.0)],
+            3.0 + (10.0 if float(signal[0]) > 0.15 else 0.0),
+        ),
+    )
 
+    config = _make_config()
+    config["channels"][1]["loudness_unit"] = "phon"
+    config["channels"][1]["loudness_lower_limit"] = 40.0
+    config["channels"][1]["loudness_upper_limit"] = 70.0
     buffer = np.column_stack(
         [
             np.full(200, 0.1, dtype=np.float32),
@@ -509,21 +1114,36 @@ def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch
 
     payload = build_chart_payload(
         buffer=buffer,
-        config=_make_config(),
+        config=config,
         sample_rate=100.0,
         mic_cal={},
         analysis_window=(0.5, 1.5),
     )
 
     assert sorted(payload) == [0, 1]
-    assert set(payload[0]) == {"spl", "fft", "octave"}
+    assert set(payload[0]) == {"loudness", "spl", "fft", "octave"}
     assert "stft" not in payload[0]
+    assert payload[0]["loudness"] == {
+        "times_sec": [0.0, 1.0],
+        "values": [2.0, 3.0],
+        "unit": "sone",
+        "lower_limit": 0.0,
+        "upper_limit": 10.0,
+    }
+    assert payload[1]["loudness"]["times_sec"] == [0.0, 1.0]
+    assert payload[1]["loudness"]["unit"] == "phon"
+    assert payload[1]["loudness"]["lower_limit"] == 40.0
+    assert payload[1]["loudness"]["upper_limit"] == 70.0
+    assert payload[1]["loudness"]["values"] == pytest.approx(
+        [dsp.sone_to_phon(12.0), dsp.sone_to_phon(13.0)]
+    )
     assert payload[0]["spl"]["times_sec"]
     assert payload[0]["spl"]["values_db"]
     assert payload[0]["spl"]["lower_limit_db"] == 40.0
     assert payload[0]["spl"]["upper_limit_db"] == 80.0
     assert payload[0]["fft"]["frequencies_hz"] == [1000.0, 2000.0]
     assert payload[0]["fft"]["levels_db"] == [67.0, 45.0]
+    assert payload[0]["fft"]["golden_mode"] == "off"
     assert payload[0]["fft"]["limit_bands"][0] == {
         "freq_hz": 1000.0,
         "lower_db": 40.0,
@@ -533,6 +1153,7 @@ def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch
     }
     assert payload[0]["octave"]["center_freqs_hz"] == [500.0, 1000.0]
     assert payload[0]["octave"]["levels_db"] == [57.0, 43.0]
+    assert payload[0]["octave"]["golden_mode"] == "off"
     assert payload[0]["octave"]["limit_bands"][0] == {
         "freq_hz": 500.0,
         "lower_db": 35.0,
@@ -540,6 +1161,650 @@ def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch
         "actual_db": 57.0,
         "passed": False,
     }
+
+
+def test_build_chart_payload_spl_omits_trailing_partial_tail_for_a_weighted_series():
+    sample_rate = 48000.0
+    chunk_samples = int(round(sample_rate * 0.05))
+    signal = np.full(chunk_samples * 2 + 1, 0.1, dtype=np.float32).reshape(-1, 1)
+
+    config = _make_config()
+    config["selected_channels"] = [0]
+    config["channels"][0]["spl_weighting"] = "A"
+
+    payload = build_chart_payload(
+        buffer=signal,
+        config=config,
+        sample_rate=sample_rate,
+        mic_cal={},
+        analysis_window=(0.0, signal.shape[0] / sample_rate),
+    )
+
+    assert payload[0]["spl"]["times_sec"] == [0.05, 0.1]
+    assert len(payload[0]["spl"]["values_db"]) == 2
+
+
+def test_build_chart_payload_spl_omits_trailing_partial_tail_for_c_weighted_series():
+    sample_rate = 48000.0
+    chunk_samples = int(round(sample_rate * 0.05))
+    signal = np.full(chunk_samples * 2 + 1, 0.1, dtype=np.float32).reshape(-1, 1)
+
+    config = _make_config()
+    config["selected_channels"] = [0]
+    config["channels"][0]["spl_weighting"] = "C"
+
+    payload = build_chart_payload(
+        buffer=signal,
+        config=config,
+        sample_rate=sample_rate,
+        mic_cal={},
+        analysis_window=(0.0, signal.shape[0] / sample_rate),
+    )
+
+    assert payload[0]["spl"]["times_sec"] == [0.05, 0.1]
+    assert len(payload[0]["spl"]["values_db"]) == 2
+
+
+def test_build_chart_payload_spl_exact_chunk_boundary_keeps_full_point_count():
+    sample_rate = 48000.0
+    chunk_samples = int(round(sample_rate * 0.05))
+    signal = np.full(chunk_samples * 2, 0.1, dtype=np.float32).reshape(-1, 1)
+
+    payload = build_chart_payload(
+        buffer=signal,
+        config=_make_config(),
+        sample_rate=sample_rate,
+        mic_cal={},
+        analysis_window=(0.0, signal.shape[0] / sample_rate),
+    )
+
+    assert payload[0]["spl"]["times_sec"] == [0.05, 0.1]
+    assert len(payload[0]["spl"]["values_db"]) == 2
+
+
+def test_build_chart_payload_spl_shorter_than_one_chunk_returns_empty_series():
+    sample_rate = 48000.0
+    chunk_samples = int(round(sample_rate * 0.05))
+    signal = np.full(chunk_samples - 1, 0.1, dtype=np.float32).reshape(-1, 1)
+
+    config = _make_config()
+    config["selected_channels"] = [0]
+    config["channels"][0]["spl_weighting"] = "C"
+
+    payload = build_chart_payload(
+        buffer=signal,
+        config=config,
+        sample_rate=sample_rate,
+        mic_cal={},
+        analysis_window=(0.0, signal.shape[0] / sample_rate),
+    )
+
+    assert payload[0]["spl"] == {
+        "times_sec": [],
+        "values_db": [],
+        "lower_limit_db": 40.0,
+        "upper_limit_db": 80.0,
+    }
+
+
+def test_build_chart_payload_fft_absolute_mode_uses_serialized_markers_and_overlay(
+    monkeypatch,
+):
+    expected_nfft = 4096
+    _patch_basic_chart_backends(
+        monkeypatch,
+        fft_levels=(64.0, 45.0),
+    )
+    cache = _GoldenCacheStub(
+        fft_axis=(1000.0, 2000.0),
+        fft_levels=(60.0, 41.0),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.GoldenReferenceCache",
+        lambda: cache,
+    )
+
+    payload = build_chart_payload(
+        buffer=np.full((200, 1), 0.1, dtype=np.float32),
+        config=_make_single_channel_config(
+            fft_nfft=expected_nfft,
+            fft_golden_mode="absolute",
+            fft_show_golden_overlay=True,
+            fft_band_limits=[{"freq": 1000.0, "lower": -1.0, "upper": 1.0}],
+            oct_band_limits=[],
+        ),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.0, 2.0),
+        judgment_payload=_make_single_channel_judgment_payload(
+            fft_available=True,
+            fft_error_message=None,
+            fft_band_results=[
+                {
+                    "freq": 1000.0,
+                    "level": 64.0,
+                    "lower": 61.0,
+                    "upper": 66.0,
+                    "passed": True,
+                }
+            ],
+            oct_band_results=[],
+        ),
+    )
+
+    assert cache.bundle_calls == 1
+    assert cache.ensure_fft_calls == 1
+    assert cache.ensure_fft_nffts == [expected_nfft]
+    fft_payload = payload[0]["fft"]
+    assert fft_payload["frequencies_hz"] == [1000.0, 2000.0]
+    assert fft_payload["levels_db"] == [64.0, 45.0]
+    assert fft_payload["golden_mode"] == "absolute"
+    assert fft_payload["golden_overlay_levels_db"] == [60.0, 41.0]
+    assert "show_zero_reference" not in fft_payload
+    assert fft_payload["limit_bands"] == [
+        {
+            "freq_hz": 1000.0,
+            "lower_db": 61.0,
+            "upper_db": 66.0,
+            "actual_db": 64.0,
+            "passed": True,
+        }
+    ]
+
+
+def test_build_chart_payload_fft_delta_mode_serializes_main_series_in_delta_space(
+    monkeypatch,
+):
+    expected_nfft = 4096
+    _patch_basic_chart_backends(
+        monkeypatch,
+        fft_levels=(64.0, 45.0),
+    )
+    cache = _GoldenCacheStub(
+        fft_axis=(1000.0, 2000.0),
+        fft_levels=(66.0, 44.0),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.GoldenReferenceCache",
+        lambda: cache,
+    )
+
+    payload = build_chart_payload(
+        buffer=np.full((200, 1), 0.1, dtype=np.float32),
+        config=_make_single_channel_config(
+            fft_nfft=expected_nfft,
+            fft_golden_mode="delta",
+            fft_show_golden_overlay=False,
+            fft_band_limits=[{"freq": 1000.0, "lower": -5.0, "upper": 5.0}],
+            oct_band_limits=[],
+        ),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.0, 2.0),
+        judgment_payload=_make_single_channel_judgment_payload(
+            fft_available=True,
+            fft_error_message=None,
+            fft_band_results=[
+                {
+                    "freq": 1000.0,
+                    "level": -2.0,
+                    "lower": -3.0,
+                    "upper": 3.0,
+                    "passed": True,
+                }
+            ],
+            oct_band_results=[],
+        ),
+    )
+
+    assert cache.ensure_fft_nffts == [expected_nfft]
+    fft_payload = payload[0]["fft"]
+    assert fft_payload["levels_db"] == [-2.0, 1.0]
+    assert fft_payload["golden_mode"] == "delta"
+    assert fft_payload["show_zero_reference"] is True
+    assert "golden_overlay_levels_db" not in fft_payload
+    assert fft_payload["limit_bands"] == [
+        {
+            "freq_hz": 1000.0,
+            "lower_db": -3.0,
+            "upper_db": 3.0,
+            "actual_db": -2.0,
+            "passed": True,
+        }
+    ]
+
+
+def test_build_chart_payload_octave_absolute_mode_uses_serialized_markers_and_overlay(
+    monkeypatch,
+):
+    _patch_basic_chart_backends(
+        monkeypatch,
+        octave_levels=(57.0, 43.0),
+    )
+    cache = _GoldenCacheStub(
+        octave_axis=(500.0, 1000.0),
+        octave_levels=(55.0, 40.0),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.GoldenReferenceCache",
+        lambda: cache,
+    )
+
+    payload = build_chart_payload(
+        buffer=np.full((200, 1), 0.1, dtype=np.float32),
+        config=_make_single_channel_config(
+            fft_band_limits=[],
+            oct_golden_mode="absolute",
+            oct_show_golden_overlay=True,
+            oct_band_limits=[{"freq": 500.0, "lower": -2.0, "upper": 2.0}],
+        ),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.0, 2.0),
+        judgment_payload=_make_single_channel_judgment_payload(
+            fft_band_results=[],
+            octave_available=True,
+            octave_error_message=None,
+            oct_band_results=[
+                {
+                    "freq": 500.0,
+                    "level": 57.0,
+                    "lower": 54.0,
+                    "upper": 58.0,
+                    "passed": True,
+                }
+            ],
+        ),
+    )
+
+    octave_payload = payload[0]["octave"]
+    assert octave_payload["center_freqs_hz"] == [500.0, 1000.0]
+    assert octave_payload["levels_db"] == [57.0, 43.0]
+    assert octave_payload["golden_mode"] == "absolute"
+    assert octave_payload["golden_overlay_levels_db"] == [55.0, 40.0]
+    assert "show_zero_reference" not in octave_payload
+    assert octave_payload["limit_bands"] == [
+        {
+            "freq_hz": 500.0,
+            "lower_db": 54.0,
+            "upper_db": 58.0,
+            "actual_db": 57.0,
+            "passed": True,
+        }
+    ]
+
+
+def test_build_chart_payload_octave_delta_mode_serializes_main_series_in_delta_space(
+    monkeypatch,
+):
+    _patch_basic_chart_backends(
+        monkeypatch,
+        octave_levels=(57.0, 43.0),
+    )
+    cache = _GoldenCacheStub(
+        octave_axis=(500.0, 1000.0),
+        octave_levels=(55.0, 42.0),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.GoldenReferenceCache",
+        lambda: cache,
+    )
+
+    payload = build_chart_payload(
+        buffer=np.full((200, 1), 0.1, dtype=np.float32),
+        config=_make_single_channel_config(
+            fft_band_limits=[],
+            oct_golden_mode="delta",
+            oct_show_golden_overlay=False,
+            oct_band_limits=[{"freq": 500.0, "lower": 1.0, "upper": 3.0}],
+        ),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.0, 2.0),
+        judgment_payload=_make_single_channel_judgment_payload(
+            fft_band_results=[],
+            octave_available=True,
+            octave_error_message=None,
+            oct_band_results=[
+                {
+                    "freq": 500.0,
+                    "level": 2.0,
+                    "lower": 1.0,
+                    "upper": 3.0,
+                    "passed": True,
+                }
+            ],
+        ),
+    )
+
+    octave_payload = payload[0]["octave"]
+    assert octave_payload["levels_db"] == [2.0, 1.0]
+    assert octave_payload["golden_mode"] == "delta"
+    assert octave_payload["show_zero_reference"] is True
+    assert "golden_overlay_levels_db" not in octave_payload
+    assert octave_payload["limit_bands"] == [
+        {
+            "freq_hz": 500.0,
+            "lower_db": 1.0,
+            "upper_db": 3.0,
+            "actual_db": 2.0,
+            "passed": True,
+        }
+    ]
+
+
+def test_build_chart_payload_omits_fft_item_when_golden_recompute_fails(
+    monkeypatch,
+    caplog,
+):
+    _patch_basic_chart_backends(monkeypatch)
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.GoldenReferenceCache",
+        lambda: _GoldenCacheStub(
+            fft_error=RuntimeError("fft recompute failed"),
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger="app.service.analysis.review_payloads"):
+        payload = build_chart_payload(
+            buffer=np.full((200, 1), 0.1, dtype=np.float32),
+            config=_make_single_channel_config(
+                fft_golden_mode="absolute",
+                fft_band_limits=[{"freq": 1000.0, "lower": -1.0, "upper": 1.0}],
+                oct_band_limits=[],
+            ),
+            sample_rate=100.0,
+            mic_cal={},
+            analysis_window=(0.0, 2.0),
+            judgment_payload=_make_single_channel_judgment_payload(
+                fft_available=True,
+                fft_error_message=None,
+                fft_band_results=[
+                    {
+                        "freq": 1000.0,
+                        "level": 64.0,
+                        "lower": 61.0,
+                        "upper": 66.0,
+                        "passed": True,
+                    }
+                ],
+                oct_band_results=[],
+            ),
+        )
+
+    assert set(payload[0]) == {"loudness", "spl", "octave"}
+    assert "fft" not in payload[0]
+    assert "fft recompute failed" in caplog.text
+
+
+def test_build_chart_payload_omits_only_fft_item_when_measured_recompute_fails_in_off_mode(
+    monkeypatch,
+    caplog,
+):
+    _patch_basic_chart_backends(monkeypatch)
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
+        lambda signal, sample_rate, nfft: (_ for _ in ()).throw(
+            ValueError("empty fft input")
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger="app.service.analysis.review_payloads"):
+        payload = build_chart_payload(
+            buffer=np.full((200, 1), 0.1, dtype=np.float32),
+            config=_make_single_channel_config(
+                fft_nfft=4096,
+                fft_golden_mode="off",
+                fft_band_limits=[{"freq": 1000.0, "lower": 40.0, "upper": 60.0}],
+                oct_band_limits=[],
+            ),
+            sample_rate=100.0,
+            mic_cal={},
+            analysis_window=(0.0, 2.0),
+        )
+
+    assert set(payload[0]) == {"loudness", "spl", "octave"}
+    assert "fft" not in payload[0]
+    assert "FFT chart payload omitted" in caplog.text
+
+
+def test_build_chart_payload_keeps_off_mode_fft_payload_when_overlay_load_fails(
+    monkeypatch,
+    caplog,
+):
+    _patch_basic_chart_backends(monkeypatch)
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.GoldenReferenceCache",
+        lambda: _GoldenCacheStub(
+            bundle_error=GoldenReferenceError("golden overlay missing"),
+        ),
+    )
+
+    with caplog.at_level("WARNING", logger="app.service.analysis.review_payloads"):
+        payload = build_chart_payload(
+            buffer=np.full((200, 1), 0.1, dtype=np.float32),
+            config=_make_single_channel_config(
+                fft_golden_mode="off",
+                fft_show_golden_overlay=True,
+                fft_band_limits=[{"freq": 1000.0, "lower": 40.0, "upper": 60.0}],
+                oct_band_limits=[],
+            ),
+            sample_rate=100.0,
+            mic_cal={},
+            analysis_window=(0.0, 2.0),
+        )
+
+    assert payload[0]["fft"]["golden_mode"] == "off"
+    assert payload[0]["fft"]["levels_db"] == [67.0, 45.0]
+    assert "golden_overlay_levels_db" not in payload[0]["fft"]
+    assert "show_zero_reference" not in payload[0]["fft"]
+    assert "golden overlay missing" in caplog.text
+
+
+def test_build_chart_payload_reuses_one_golden_bundle_across_fft_and_octave(
+    monkeypatch,
+):
+    _patch_basic_chart_backends(monkeypatch)
+    cache = _GoldenCacheStub(
+        fft_axis=(1000.0, 2000.0),
+        fft_levels=(60.0, 41.0),
+        octave_axis=(500.0, 1000.0),
+        octave_levels=(55.0, 40.0),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.GoldenReferenceCache",
+        lambda: cache,
+    )
+
+    build_chart_payload(
+        buffer=np.full((200, 1), 0.1, dtype=np.float32),
+        config=_make_single_channel_config(
+            fft_golden_mode="absolute",
+            fft_band_limits=[{"freq": 1000.0, "lower": -1.0, "upper": 1.0}],
+            oct_golden_mode="absolute",
+            oct_band_limits=[{"freq": 500.0, "lower": -2.0, "upper": 2.0}],
+        ),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.0, 2.0),
+        judgment_payload=_make_single_channel_judgment_payload(
+            fft_available=True,
+            octave_available=True,
+            fft_band_results=[
+                {
+                    "freq": 1000.0,
+                    "level": 64.0,
+                    "lower": 61.0,
+                    "upper": 66.0,
+                    "passed": True,
+                }
+            ],
+            oct_band_results=[
+                {
+                    "freq": 500.0,
+                    "level": 57.0,
+                    "lower": 54.0,
+                    "upper": 58.0,
+                    "passed": True,
+                }
+            ],
+        ),
+    )
+
+    assert cache.bundle_calls == 1
+    assert cache.ensure_fft_calls == 1
+    assert cache.ensure_octave_calls == 1
+
+
+def test_build_chart_payload_keeps_loudness_payload_shape_with_segmented_backend(monkeypatch):
+    ref_db = 20.0 * math.log10(20e-6)
+
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_spl",
+        lambda signal, sample_rate, weighting, time_constant: 70.0,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
+        lambda signal, sample_rate, nfft: (
+            np.array([1000.0], dtype=np.float64),
+            np.array([67.0], dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_octave_bands",
+        lambda signal, sample_rate, weighting: (
+            np.array([500.0], dtype=np.float64),
+            np.array([57.0], dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_loudness_trace",
+        lambda signal, sample_rate: ([0.0, 1.0], [2.0, 3.0], 3.0),
+    )
+
+    payload = build_chart_payload(
+        buffer=np.column_stack(
+            [
+                np.full(200, 0.1, dtype=np.float32),
+                np.full(200, 0.2, dtype=np.float32),
+            ]
+        ),
+        config=_make_config(),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.5, 1.5),
+    )
+
+    assert payload[0]["loudness"] == {
+        "times_sec": [0.0, 1.0],
+        "values": [2.0, 3.0],
+        "unit": "sone",
+        "lower_limit": 0.0,
+        "upper_limit": 10.0,
+    }
+
+
+def test_build_chart_payload_omits_loudness_for_channel_when_recompute_fails(monkeypatch):
+    ref_db = 20.0 * math.log10(20e-6)
+
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_spl",
+        lambda signal, sample_rate, weighting, time_constant: 70.0,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
+        lambda signal, sample_rate, nfft: (
+            np.array([1000.0], dtype=np.float64),
+            np.array([67.0], dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_octave_bands",
+        lambda signal, sample_rate, weighting: (
+            np.array([500.0], dtype=np.float64),
+            np.array([57.0], dtype=np.float64) + ref_db,
+        ),
+    )
+
+    def fake_compute_loudness_trace(signal, sample_rate):
+        if float(signal[0]) > 0.15:
+            raise RuntimeError("loudness chart failed")
+        return [0.0, 1.0], [2.0, 3.0], 3.0
+
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_loudness_trace",
+        fake_compute_loudness_trace,
+    )
+
+    payload = build_chart_payload(
+        buffer=np.column_stack(
+            [
+                np.full(200, 0.1, dtype=np.float32),
+                np.full(200, 0.2, dtype=np.float32),
+            ]
+        ),
+        config=_make_config(),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.5, 1.5),
+    )
+
+    assert payload[0]["loudness"]["values"] == [2.0, 3.0]
+    assert "loudness" not in payload[1]
+    assert set(payload[1]) == {"spl", "fft", "octave"}
+
+
+def test_build_chart_payload_omits_loudness_when_serialized_judgment_marks_channel_unavailable(
+    monkeypatch,
+):
+    ref_db = 20.0 * math.log10(20e-6)
+
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_spl",
+        lambda signal, sample_rate, weighting, time_constant: 70.0,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
+        lambda signal, sample_rate, nfft: (
+            np.array([1000.0], dtype=np.float64),
+            np.array([67.0], dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_octave_bands",
+        lambda signal, sample_rate, weighting: (
+            np.array([500.0], dtype=np.float64),
+            np.array([57.0], dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_loudness_trace",
+        lambda signal, sample_rate: ([0.0, 1.0], [2.0, 3.0], 3.0),
+    )
+
+    judgment_payload = _make_judgment_payload()
+    judgment_payload["channel_results"][1]["loudness_max_sone"] = None
+    judgment_payload["channel_results"][1]["loudness_pass"] = None
+    judgment_payload["channel_results"][1]["loudness_available"] = False
+    judgment_payload["channel_results"][1]["loudness_error_message"] = "MoSQITo unavailable"
+
+    payload = build_chart_payload(
+        buffer=np.column_stack(
+            [
+                np.full(200, 0.1, dtype=np.float32),
+                np.full(200, 0.2, dtype=np.float32),
+            ]
+        ),
+        config=_make_config(),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.5, 1.5),
+        judgment_payload=judgment_payload,
+    )
+
+    assert payload[0]["loudness"]["values"] == [2.0, 3.0]
+    assert "loudness" not in payload[1]
+    assert set(payload[1]) == {"spl", "fft", "octave"}
 
 
 def test_build_chart_payload_octave_filters_non_finite_levels_without_axis_mismatch(monkeypatch):
@@ -656,15 +1921,17 @@ def test_build_chart_payload_octave_omits_limit_band_when_configured_bin_level_i
 
 
 @pytest.mark.parametrize("stft_nfft", [512, 4096])
-def test_build_chart_payload_fft_point_count_matches_selected_window_sample_count(
+def test_build_chart_payload_fft_point_count_matches_fft_nfft(
     stft_nfft,
 ):
+    fft_nfft = 128
     config = _make_config()
     config["selected_channels"] = [0]
     config["channels"] = [
         {
             **config["channels"][0],
             "stft_nfft": stft_nfft,
+            "fft_nfft": fft_nfft,
         }
     ]
 
@@ -676,16 +1943,18 @@ def test_build_chart_payload_fft_point_count_matches_selected_window_sample_coun
         analysis_window=(0.5, 1.5),
     )
 
-    assert len(payload[0]["fft"]["frequencies_hz"]) == 51
+    assert len(payload[0]["fft"]["frequencies_hz"]) == fft_nfft // 2 + 1
 
 
 def test_build_chart_payload_fft_point_count_is_independent_of_stft_nfft():
+    fft_nfft = 128
     small_nfft_config = _make_config()
     small_nfft_config["selected_channels"] = [0]
     small_nfft_config["channels"] = [
         {
             **small_nfft_config["channels"][0],
             "stft_nfft": 512,
+            "fft_nfft": fft_nfft,
         }
     ]
 
@@ -695,6 +1964,7 @@ def test_build_chart_payload_fft_point_count_is_independent_of_stft_nfft():
         {
             **large_nfft_config["channels"][0],
             "stft_nfft": 4096,
+            "fft_nfft": fft_nfft,
         }
     ]
 
@@ -715,8 +1985,8 @@ def test_build_chart_payload_fft_point_count_is_independent_of_stft_nfft():
         analysis_window=(0.5, 1.5),
     )
 
-    assert len(small_nfft_payload[0]["fft"]["frequencies_hz"]) == 51
-    assert len(large_nfft_payload[0]["fft"]["frequencies_hz"]) == 51
+    assert len(small_nfft_payload[0]["fft"]["frequencies_hz"]) == fft_nfft // 2 + 1
+    assert len(large_nfft_payload[0]["fft"]["frequencies_hz"]) == fft_nfft // 2 + 1
     assert (
         len(small_nfft_payload[0]["fft"]["frequencies_hz"])
         == len(large_nfft_payload[0]["fft"]["frequencies_hz"])

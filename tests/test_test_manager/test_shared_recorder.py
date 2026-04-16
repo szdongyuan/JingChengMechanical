@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 from app.service.analysis.test_manager import TestManager
 
 from ._support import (
+    _make_running_factory_manager,
     _mock_bus,
     _mock_services,
 )
@@ -28,3 +29,96 @@ class TestSharedRecorderTeardown:
         shared_rec.stop.assert_not_called()
         mgr._stop_one(2)
         shared_rec.stop.assert_called_once()
+
+    def test_failed_factory_stop_does_not_reuse_stale_shared_recorder_on_next_start(
+        self,
+        monkeypatch,
+    ):
+        bus, _, mgr, _, recorder, _, _ = _make_running_factory_manager(monkeypatch)
+
+        def _explode_stop():
+            recorder.stop_calls += 1
+            recorder._running = False
+            raise RuntimeError("stop exploded")
+
+        recorder.stop = MagicMock(side_effect=_explode_stop)
+
+        stopped = mgr.stop_active_run(config_id=1)
+
+        assert stopped is False
+        bus.factory_runtime_aborted.emit.assert_called_once()
+
+        recorder.start = MagicMock(side_effect=AssertionError("stale recorder reused"))
+
+        restarted = mgr.start({"config_id": 1, "sn": "SN2", "trigger_source": "manual"})
+
+        assert restarted is True
+        assert mgr._recorders[1] is not recorder
+        recorder.start.assert_not_called()
+        assert bus.factory_runtime_aborted.emit.call_count == 1
+
+    def test_monitor_stop_failure_still_stops_recorder_and_discards_shared_recorder(
+        self,
+        monkeypatch,
+    ):
+        bus, _, mgr, session, recorder, monitor, _ = _make_running_factory_manager(monkeypatch)
+
+        def _explode_monitor_stop():
+            monitor.stop_calls += 1
+            raise RuntimeError("monitor stop exploded")
+
+        monitor.stop = MagicMock(side_effect=_explode_monitor_stop)
+
+        stopped = mgr.stop_active_run(config_id=1)
+
+        assert stopped is False
+        bus.factory_runtime_aborted.emit.assert_called_once()
+        abort_payload = bus.factory_runtime_aborted.emit.call_args.args[0]
+        assert abort_payload.config_id == session.config_id
+        assert abort_payload.run_id == session._workorder["factory_run_id"]
+        assert abort_payload.error_message == "monitor stop exploded"
+        assert monitor.stop_calls == 1
+        assert recorder.stop_calls == 1
+        assert recorder.wait_calls == [3000]
+        assert mgr._sessions == {}
+        assert mgr._recorders == {}
+        assert mgr._monitors == {}
+        assert mgr._shared_recorders == {}
+
+        recorder.start = MagicMock(side_effect=AssertionError("stale recorder reused"))
+
+        restarted = mgr.start({"config_id": 1, "sn": "SN2", "trigger_source": "manual"})
+
+        assert restarted is True
+        assert mgr._recorders[1] is not recorder
+        recorder.start.assert_not_called()
+
+    def test_monitor_stop_failure_keeps_shared_recorder_mapping_when_another_owner_is_live(
+        self,
+        monkeypatch,
+    ):
+        bus, _, mgr, _, recorder, monitor, _ = _make_running_factory_manager(monkeypatch)
+        other_session = MagicMock()
+        other_session.config_id = 2
+        mgr._sessions[2] = other_session
+        mgr._recorders[2] = recorder
+
+        def _explode_monitor_stop():
+            monitor.stop_calls += 1
+            raise RuntimeError("monitor stop exploded")
+
+        monitor.stop = MagicMock(side_effect=_explode_monitor_stop)
+
+        stopped = mgr.stop_active_run(config_id=1)
+
+        assert stopped is False
+        bus.factory_runtime_aborted.emit.assert_called_once()
+        assert mgr._sessions == {2: other_session}
+        assert mgr._recorders == {2: recorder}
+        assert mgr._monitors == {}
+        assert mgr._shared_recorders == {
+            "InputMic|InputAPI|44100": recorder,
+        }
+        assert mgr.is_running(config_id=2) is True
+        assert recorder.stop_calls == 0
+        assert recorder.wait_calls == []

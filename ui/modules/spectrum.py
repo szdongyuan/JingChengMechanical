@@ -8,7 +8,7 @@ from ui.widgets.analysis_charts import FftLineChartWidget
 
 class SpectrumModule(QWidget):
     module_id = "spectrum"
-    _RENDER_PHASES = frozenset({"reviewing"})
+    _RENDER_PHASES = frozenset({"reviewing", "stopped"})
 
     def __init__(self, services):
         super().__init__()
@@ -92,13 +92,13 @@ class SpectrumModule(QWidget):
             else None
         )
         if not isinstance(fft_payload, dict):
-            self._clear_plot()
+            self._clear_plot(rendered_channel_index=channel_index)
             return
 
         frequencies_hz = fft_payload.get("frequencies_hz") or []
         levels_db = fft_payload.get("levels_db") or []
         if not frequencies_hz or not levels_db:
-            self._clear_plot()
+            self._clear_plot(rendered_channel_index=channel_index)
             return
 
         try:
@@ -106,17 +106,19 @@ class SpectrumModule(QWidget):
                 frequencies_hz=frequencies_hz,
                 levels_db=levels_db,
                 limit_bands=fft_payload.get("limit_bands"),
+                golden_overlay_levels_db=fft_payload.get("golden_overlay_levels_db"),
+                show_zero_reference=bool(fft_payload.get("show_zero_reference")),
             )
         except (TypeError, ValueError):
-            self._clear_plot()
+            self._clear_plot(rendered_channel_index=channel_index)
             return
 
         self._has_plot_data = True
         self._rendered_channel_index = channel_index
 
-    def _clear_plot(self) -> None:
+    def _clear_plot(self, *, rendered_channel_index: int | None = None) -> None:
         self._has_plot_data = False
-        self._rendered_channel_index = None
+        self._rendered_channel_index = rendered_channel_index
         self.plot.clear_data()
 
     def _can_render_committed_chart(self) -> bool:

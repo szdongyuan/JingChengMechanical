@@ -28,6 +28,9 @@ class _FakeSession:
         self._workorder = dict(workorder)
         self._buffer = None
         self._sample_rate = None
+        self._audio_file_path = None
+        self._audio_data_id = None
+        self.last_ai_review = None
         self._finished = False
         self._attach_snapshot = None
         self._attach_chunk_index = 0
@@ -47,24 +50,37 @@ class _FakeSession:
         raise AssertionError("not used in this test")
 
     def _save_wav(self, *args, **kwargs):
-        return None
+        self._audio_file_path = "partial.wav"
+        self._audio_data_id = "audio-123"
+        return self._audio_file_path
 
-def _factory_runtime_config(config_id: int = 1) -> dict:
+def _factory_runtime_config(
+    config_id: int = 1,
+    *,
+    analysis_duration: float = 1.0,
+    analysis_window_offset_ms: int = 0,
+    allow_incomplete_recording_analysis: bool = False,
+) -> dict:
     return {
         "config_id": config_id,
         "config_name": "Test",
         "record_duration": 2.0,
-        "analysis_duration": 1.0,
-        "analysis_window_offset_ms": 0,
+        "analysis_duration": analysis_duration,
+        "analysis_window_offset_ms": analysis_window_offset_ms,
+        "allow_incomplete_recording_analysis": allow_incomplete_recording_analysis,
         "selected_channels": [0],
         "channels": [{
             "channel_index": 0,
             "stft_nfft": 1024,
+            "fft_nfft": 4096,
             "stft_overlap": 0.5,
             "spl_weighting": "Z",
             "spl_time_constant": 0.125,
             "spl_upper_limit": 85.0,
             "spl_lower_limit": 40.0,
+            "loudness_unit": "sone",
+            "loudness_lower_limit": 0.0,
+            "loudness_upper_limit": 10.0,
             "fft_band_limits": [],
             "oct_weighting": "Z",
             "oct_band_limits": [],
@@ -77,12 +93,27 @@ def _factory_runtime_config(config_id: int = 1) -> dict:
         "output_device_samplerate": 48000,
     }
 
-def _make_running_factory_manager(monkeypatch, *, save_wav_error: Exception | None = None):
+def _make_running_factory_manager(
+    monkeypatch,
+    *,
+    save_wav_error: Exception | None = None,
+    analysis_duration: float = 1.0,
+    analysis_window_offset_ms: int = 0,
+    allow_incomplete_recording_analysis: bool = False,
+    trigger_source: str = "manual",
+    partial_buf: np.ndarray | None = None,
+    sample_rate: float = 44100.0,
+):
     bus = _mock_bus()
     services = _mock_services(bus)
-    services.config_service.load_config.return_value = _factory_runtime_config()
+    services.config_service.load_config.return_value = _factory_runtime_config(
+        analysis_duration=analysis_duration,
+        analysis_window_offset_ms=analysis_window_offset_ms,
+        allow_incomplete_recording_analysis=allow_incomplete_recording_analysis,
+    )
 
-    partial_buf = np.arange(20, dtype=np.float32).reshape(20, 1)
+    if partial_buf is None:
+        partial_buf = np.arange(20, dtype=np.float32).reshape(20, 1)
 
     class FakeRecorder:
         instances = []
@@ -165,6 +196,9 @@ def _make_running_factory_manager(monkeypatch, *, save_wav_error: Exception | No
             self.saved_wavs.append((buf.copy(), sample_rate))
             if save_wav_error is not None:
                 raise save_wav_error
+            self._audio_file_path = "partial.wav"
+            self._audio_data_id = "audio-123"
+            return self._audio_file_path
 
     monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
     monkeypatch.setattr("app.service.analysis.test_manager.AudioMonitor", FakeMonitor)
@@ -172,13 +206,15 @@ def _make_running_factory_manager(monkeypatch, *, save_wav_error: Exception | No
 
     mgr = TestManager(bus, services)
 
-    started = mgr.start({"config_id": 1, "sn": "SN1", "trigger_source": "manual"})
+    started = mgr.start({"config_id": 1, "sn": "SN1", "trigger_source": trigger_source})
 
     assert started is True
     assert mgr.is_running(config_id=1) is True
     assert len(FakeSession.instances) == 1
     assert len(FakeRecorder.instances) == 1
     assert len(FakeMonitor.instances) == 1
+
+    FakeRecorder.instances[0]._sample_rate = sample_rate
 
     return (
         bus,
@@ -208,6 +244,7 @@ def _mock_bus():
         "factory_runtime_auto_analysis_no_result",
         "factory_runtime_auto_analysis_error",
         "factory_runtime_auto_analysis_cleanup_settled",
+        "factory_runtime_stopped",
         "factory_runtime_aborted",
         "factory_runtime_reanalysis_completed",
     ):
@@ -276,10 +313,20 @@ def _expected_summary_payload(*, overall_status: str, error_message: str | None 
                 "constrained": True,
             },
             {
+                "item_key": "loudness",
+                "label": "Loudness",
+                "deviation_value": -2.0,
+                "deviation_display": "-2 sone",
+                "channel_index": 0,
+                "channel_label": "CH1",
+                "status": "OK",
+                "constrained": True,
+            },
+            {
                 "item_key": "fft",
                 "label": "FFT",
-                "deviation_value": -2.0,
-                "deviation_display": "-2 dB",
+                "deviation_value": -3.0,
+                "deviation_display": "-3 dB",
                 "channel_index": 0,
                 "channel_label": "CH1",
                 "status": "OK",
@@ -288,8 +335,8 @@ def _expected_summary_payload(*, overall_status: str, error_message: str | None 
             {
                 "item_key": "octave",
                 "label": "倍频程",
-                "deviation_value": -3.0,
-                "deviation_display": "-3 dB",
+                "deviation_value": -4.0,
+                "deviation_display": "-4 dB",
                 "channel_index": 0,
                 "channel_label": "CH1",
                 "status": "OK",
@@ -311,6 +358,13 @@ def _expected_summary_payload(*, overall_status: str, error_message: str | None 
 def _expected_chart_payload() -> dict:
     return {
         0: {
+            "loudness": {
+                "times_sec": [0.0, 1.0],
+                "values": [2.0, 3.0],
+                "unit": "sone",
+                "lower_limit": 0.0,
+                "upper_limit": 10.0,
+            },
             "spl": {
                 "times_sec": [0.05, 0.1],
                 "values_db": [71.0, 72.0],
@@ -320,6 +374,7 @@ def _expected_chart_payload() -> dict:
             "fft": {
                 "frequencies_hz": [1000.0],
                 "levels_db": [67.0],
+                "golden_mode": "off",
                 "limit_bands": [
                     {
                         "freq_hz": 1000.0,
@@ -333,6 +388,7 @@ def _expected_chart_payload() -> dict:
             "octave": {
                 "center_freqs_hz": [500.0],
                 "levels_db": [57.0],
+                "golden_mode": "off",
                 "limit_bands": [
                     {
                         "freq_hz": 500.0,

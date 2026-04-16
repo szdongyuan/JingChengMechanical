@@ -19,6 +19,23 @@ from ._support import (
 )
 
 
+def _make_stopped_payload(
+    *,
+    config_id: int = 101,
+    run_id: str | None = None,
+    trigger_source: str = "manual",
+):
+    stopped_payload_cls = getattr(services_mod, "FactoryRuntimeStoppedPayload", None)
+
+    assert stopped_payload_cls is not None, "FactoryRuntimeStoppedPayload is missing"
+
+    return stopped_payload_cls(
+        config_id=config_id,
+        run_id=run_id or _run_id_for(config_id),
+        trigger_source=trigger_source,
+    )
+
+
 def test_factory_mode_controller_ignores_out_of_band_factory_runtime_start_acceptance():
     controller_mod = _load_factory_mode_controller_module()
     runtime_start_cls = getattr(services_mod, "FactoryRuntimeStartPayload", None)
@@ -84,6 +101,76 @@ def test_runtime_start_accepted_clears_review_context_before_running():
     assert states[1].trigger_source == "plc"
 
 
+def test_newly_accepted_run_clears_stopped_display_context_via_next_run_accepted():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        run_id="run-1",
+        trigger_source="manual",
+    )
+    controller.handle_runtime_stopped(
+        _make_stopped_payload(config_id=101, run_id="run-1", trigger_source="manual")
+    )
+    reset_reasons.clear()
+    reviews.clear()
+
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=202,
+        run_id="run-2",
+        trigger_source="plc",
+    )
+
+    assert controller.state.active_config_id == 202
+    assert controller.state.displayed_config_id == 202
+    assert controller.state.run_phase == "running"
+    assert controller.state.trigger_source == "plc"
+    assert reset_reasons == ["next_run_accepted"]
+    assert reviews == [services_mod.FactoryReviewPayload()]
+
+
+def test_start_manual_from_stopped_accepts_next_run_and_clears_preserved_context():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    reset_reasons: list[str] = []
+    bus.factory_display_reset.connect(reset_reasons.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        run_id="run-1",
+        trigger_source="manual",
+    )
+    controller.handle_runtime_stopped(
+        _make_stopped_payload(config_id=101, run_id="run-1", trigger_source="manual")
+    )
+    reset_reasons.clear()
+    _accept_start(services)
+
+    started = controller.start_manual()
+
+    assert started is True
+    assert controller.state.active_config_id == 101
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "running"
+    assert controller.state.trigger_source == "manual"
+    assert reset_reasons == ["next_run_accepted"]
+
+
 def test_manual_start_uses_first_enabled_config_id():
     controller_mod = _load_factory_mode_controller_module()
     services = _make_services((_make_config(101), _make_config(202), _make_config(303)))
@@ -137,8 +224,8 @@ def test_factory_mode_controller_accepted_starts_clear_stale_review_context(star
     bus.factory_review_changed.connect(reviews.append)
     services = _make_services(
         (
-            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_id=11, scan_triggers_test=True),
+            _make_config(202, plc_id=22, scan_triggers_test=True),
         )
     )
     controller = controller_mod.FactoryModeController(bus, services)
@@ -155,7 +242,7 @@ def test_factory_mode_controller_accepted_starts_clear_stale_review_context(star
         expected_config_id = 101
     elif start_kind == "plc":
         accepted = controller.handle_plc_event(
-            services_mod.FactoryPlcIngressPayload(plc_device_key="plc-b")
+            services_mod.FactoryPlcIngressPayload(plc_id=22)
         )
         expected_config_id = 202
     else:
@@ -190,8 +277,8 @@ def test_factory_mode_controller_accepted_starts_preserve_review_context_until_s
     bus.factory_review_changed.connect(reviews.append)
     services = _make_services(
         (
-            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_id=11, scan_triggers_test=True),
+            _make_config(202, plc_id=22, scan_triggers_test=True),
         )
     )
     controller = controller_mod.FactoryModeController(bus, services)
@@ -234,7 +321,7 @@ def test_factory_mode_controller_accepted_starts_preserve_review_context_until_s
         expected_config_id = 101
     elif start_kind == "plc":
         accepted = controller.handle_plc_event(
-            services_mod.FactoryPlcIngressPayload(plc_device_key="plc-b")
+            services_mod.FactoryPlcIngressPayload(plc_id=22)
         )
         expected_config_id = 202
     else:
@@ -318,8 +405,8 @@ def test_factory_mode_controller_treats_pending_start_as_busy_until_acceptance()
     states: list[object] = []
     services = _make_services(
         (
-            _make_config(101, plc_device_key="plc-a", scan_triggers_test=True),
-            _make_config(202, plc_device_key="plc-b", scan_triggers_test=True),
+            _make_config(101, plc_id=11, scan_triggers_test=True),
+            _make_config(202, plc_id=22, scan_triggers_test=True),
         )
     )
     callbacks: list[object] = []
@@ -350,7 +437,7 @@ def test_factory_mode_controller_treats_pending_start_as_busy_until_acceptance()
     assert controller.start_manual({"sn": "second"}) is False
     assert (
         controller.handle_plc_event(
-            services_mod.FactoryPlcIngressPayload(plc_device_key="plc-b")
+            services_mod.FactoryPlcIngressPayload(plc_id=22)
         )
         is False
     )

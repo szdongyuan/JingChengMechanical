@@ -72,6 +72,124 @@ def test_line_chart_widget_limit_lines_do_not_expand_zero_based_x_range(qapp):
         widget.close()
 
 
+def test_line_chart_widget_rejects_unknown_y_axis_mode(qapp):
+    widget = LineChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+
+        with pytest.raises(ValueError):
+            widget.set_series([0.0], [1.0], y_axis_mode="nope")
+    finally:
+        widget.close()
+
+
+def test_line_chart_widget_data_focus_mode_resets_zero_span_and_clear_state(qapp):
+    widget = LineChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_series([0.0], [7.0], y_axis_mode="data_focus")
+        qapp.processEvents()
+
+        _x_range, y_range = widget.plot_item.vb.viewRange()
+        assert y_range == pytest.approx((6.3, 7.7))
+
+        widget.clear_data()
+        qapp.processEvents()
+
+        assert widget.plot_item.vb.viewRange()[1] == pytest.approx((0.0, 1.0))
+    finally:
+        widget.close()
+
+
+def test_line_chart_widget_data_focus_uses_exact_non_zero_span_padding_formula(qapp):
+    widget = LineChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_series([0.0, 1.0], [7.0, 8.0], y_axis_mode="data_focus")
+        qapp.processEvents()
+
+        assert widget.plot_item.vb.viewRange()[1] == pytest.approx((6.9, 8.1))
+    finally:
+        widget.close()
+
+
+def test_line_chart_widget_data_focus_rejects_non_finite_values(qapp):
+    widget = LineChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_series([0.0, 1.0], [7.0, 8.0], y_axis_mode="auto")
+        qapp.processEvents()
+        previous_y_range = widget.plot_item.vb.viewRange()[1]
+        previous_payload = widget.series_payload()
+        previous_mode = widget._y_axis_mode
+
+        with pytest.raises(ValueError):
+            widget.set_series([0.0, 1.0], [7.0, float("nan")], y_axis_mode="data_focus")
+
+        assert widget._y_axis_mode == previous_mode
+        assert widget.series_payload() == previous_payload
+        assert widget.plot_item.vb.viewRange()[1] == pytest.approx(previous_y_range)
+    finally:
+        widget.close()
+
+
+def test_line_chart_widget_data_focus_rejects_empty_series_without_mutating_prior_state(qapp):
+    widget = LineChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_series([0.0, 1.0], [7.0, 8.0], y_axis_mode="auto")
+        qapp.processEvents()
+        previous_y_range = widget.plot_item.vb.viewRange()[1]
+        previous_payload = widget.series_payload()
+        previous_mode = widget._y_axis_mode
+
+        with pytest.raises(ValueError):
+            widget.set_series([], [], y_axis_mode="data_focus")
+
+        assert widget._y_axis_mode == previous_mode
+        assert widget.series_payload() == previous_payload
+        assert widget.plot_item.vb.viewRange()[1] == pytest.approx(previous_y_range)
+    finally:
+        widget.close()
+
+
+def test_line_chart_widget_auto_mode_clears_prior_data_focus_override(qapp):
+    widget = LineChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_series([0.0, 1.0], [7.0, 8.0], y_axis_mode="data_focus")
+        qapp.processEvents()
+
+        widget.set_series([0.0, 1.0], [1.0, 9.0], y_axis_mode="auto")
+        qapp.processEvents()
+
+        assert widget.plot_item.vb.state["autoRange"][1] is not False
+    finally:
+        widget.close()
+
+
+def test_line_chart_widget_clear_data_in_auto_mode_keeps_backward_compatible_y_behavior(qapp):
+    widget = LineChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_series([0.0, 1.0], [7.0, 8.0], y_axis_mode="auto")
+        qapp.processEvents()
+
+        widget.clear_data()
+        qapp.processEvents()
+
+        assert widget.plot_item.vb.state["autoRange"][1] is not False
+    finally:
+        widget.close()
+
+
 def test_fft_line_chart_widget_limit_markers_do_not_expand_zero_based_x_range(qapp):
     widget = FftLineChartWidget()
 
