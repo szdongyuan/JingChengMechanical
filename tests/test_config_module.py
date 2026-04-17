@@ -12,7 +12,7 @@ from scipy.io import wavfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import Qt, qInstallMessageHandler
+from PyQt6.QtCore import QPoint, Qt, qInstallMessageHandler
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -1024,6 +1024,130 @@ def test_on_save_preserves_selected_channel_and_collapsed_sections_and_shows_suc
     assert bus.status.emissions == [(("配置已保存",), {})]
     assert status_count_at_info == [1]
     assert infos[-1][-2:] == ("保存成功", "配置保存成功！")
+
+
+def test_channel_section_layout_does_not_stretch_after_repeated_collapses(qapp):
+    loaded = {
+        7: _detail_payload([_channel_payload(0)], config_id=7, config_name="Cfg1"),
+    }
+    module = _make_module(config_service=_ConfigServiceStub(loaded_configs=loaded))
+    module.resize(1600, 1200)
+    module.show()
+    qapp.processEvents()
+
+    container = module._channel_containers[0]
+    boxes = {
+        box.section_id(): box
+        for box in container.findChildren(CollapsibleGroupBox)
+    }
+    baseline = {
+        key: boxes[key].sizeHint().height()
+        for key in ("loudness", "golden_sample", "fft", "octave")
+    }
+
+    for _ in range(5):
+        boxes["stft"].set_expanded(False)
+        qapp.processEvents()
+        boxes["spl"].set_expanded(False)
+        qapp.processEvents()
+        boxes["stft"].set_expanded(True)
+        qapp.processEvents()
+        boxes["spl"].set_expanded(True)
+        qapp.processEvents()
+
+    boxes["stft"].set_expanded(False)
+    qapp.processEvents()
+    boxes["spl"].set_expanded(False)
+    qapp.processEvents()
+
+    assert boxes["stft"].height() == boxes["stft"].sizeHint().height()
+    assert boxes["spl"].height() == boxes["spl"].sizeHint().height()
+    for key, expected_height in baseline.items():
+        assert boxes[key].height() == expected_height
+        assert boxes[key].height() == boxes[key].sizeHint().height()
+
+
+def test_channel_section_layout_preserves_scroll_reachability_in_short_viewport(qapp):
+    loaded = {
+        7: _detail_payload([_channel_payload(0)], config_id=7, config_name="Cfg1"),
+    }
+    module = _make_module(config_service=_ConfigServiceStub(loaded_configs=loaded))
+    module.resize(900, 700)
+    module.show()
+    qapp.processEvents()
+
+    container = module._channel_containers[0]
+    boxes = {
+        box.section_id(): box
+        for box in container.findChildren(CollapsibleGroupBox)
+    }
+    scroll_bar = module.detail_scroll.verticalScrollBar()
+
+    assert scroll_bar.maximum() > 0
+
+    module.detail_scroll.ensureWidgetVisible(boxes["octave"], 0, 0)
+    qapp.processEvents()
+
+    top_in_viewport = boxes["octave"].mapTo(
+        module.detail_scroll.viewport(),
+        QPoint(0, 0),
+    ).y()
+    bottom_in_viewport = boxes["octave"].mapTo(
+        module.detail_scroll.viewport(),
+        QPoint(0, boxes["octave"].height()),
+    ).y()
+
+    assert top_in_viewport >= 0
+    assert bottom_in_viewport <= module.detail_scroll.viewport().height()
+
+
+def test_on_save_preserves_collapsed_section_geometry_in_tall_viewport(
+    qapp, monkeypatch
+):
+    loaded = {
+        7: _detail_payload([_channel_payload(0)], config_id=7, config_name="Cfg1"),
+    }
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        config_changed=_SignalStub(),
+    )
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service, bus=bus)
+    module.resize(1600, 1200)
+    module.show()
+    qapp.processEvents()
+
+    container = module._channel_containers[0]
+    boxes = {
+        box.section_id(): box
+        for box in container.findChildren(CollapsibleGroupBox)
+    }
+    boxes["stft"].set_expanded(False)
+    qapp.processEvents()
+    boxes["spl"].set_expanded(False)
+    qapp.processEvents()
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    monkeypatch.setattr("ui.modules.config.QMessageBox.information", lambda *args: None)
+
+    module._on_save()
+    qapp.processEvents()
+
+    restored = module._channel_containers[0]
+    restored_boxes = {
+        box.section_id(): box
+        for box in restored.findChildren(CollapsibleGroupBox)
+    }
+
+    assert restored_boxes["stft"].is_expanded() is False
+    assert restored_boxes["spl"].is_expanded() is False
+    assert restored_boxes["stft"].height() == restored_boxes["stft"].sizeHint().height()
+    assert restored_boxes["spl"].height() == restored_boxes["spl"].sizeHint().height()
+    for key in ("loudness", "golden_sample", "fft", "octave"):
+        assert restored_boxes[key].height() == restored_boxes[key].sizeHint().height()
 
 
 def test_on_save_falls_back_to_first_available_channel_when_selected_channel_disappears(

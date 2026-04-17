@@ -1200,6 +1200,7 @@ class ConfigModule(QWidget):
         of_lay.addWidget(oct_table)
         oct_section.add_widget(oct_form)
         lay.addWidget(oct_section)
+        lay.addStretch(1)
 
         self._apply_golden_mode_state(fft_mode, fft_overlay)
         self._apply_golden_mode_state(oct_mode, oct_overlay)
