@@ -86,7 +86,7 @@ def test_plc_service_start_and_stop_create_and_clear_timer(monkeypatch):
     assert service.timer is None
     assert service.plc_client is None
     assert state_changes[-1] == "未连接"
-    assert bus.log.messages[-1] == "[PLC] 停止监听"
+    assert bus.log.messages[-1] == "PLC 停止监听"
     assert start_requests == []
 
 
@@ -156,4 +156,4 @@ def test_plc_service_invokes_captured_plc_start_hook_on_rising_edge(monkeypatch)
 
     assert start_requests == [7]
     assert reset_writes == [False]
-    assert bus.log.messages[-1] == "[PLC] 检测到开始信号"
+    assert bus.log.messages[-1] == "PLC 检测到开始信号"
