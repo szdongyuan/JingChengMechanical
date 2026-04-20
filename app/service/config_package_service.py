@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import nullcontext
 import json
 import os
 import re
@@ -311,115 +312,126 @@ class ConfigPackageService:
         restored_ai: _RestoredAiPackage | None = None
         restored_golden_paths: list[str] = []
         warnings = list(preview.warnings)
+        old_golden_paths: list[str] = []
+        ai_binding_status = "unchanged"
+        toolchain_row_written = False
+        binding_target_toolchain_id: str | None = None
+        mutation_lease = self._toolchain_import_mutation_lease(
+            ai_action=ai_action,
+            preview=preview,
+        )
 
         with tempfile.TemporaryDirectory(prefix="config-package-import-") as extract_root:
             self._extract_archive(path, inspection, extract_root)
-            try:
-                restored_golden = self._restore_golden_samples(
-                    inspection=inspection,
-                    extract_root=extract_root,
-                    target_config_id=target_config_id,
-                )
-                restored_golden_paths = [
-                    binding["golden_sample_path"]
-                    for binding in restored_golden.values()
-                    if isinstance(binding, dict)
-                    and isinstance(binding.get("golden_sample_path"), str)
-                ]
-                prepared_config = self._config_service.prepare_import_payload(
-                    inspection.config_payload["config"],
-                    golden_asset_paths_by_channel=restored_golden,
-                )
-                prepared_config["config_id"] = target_config_id
-                config_errors = self._config_service.validate(prepared_config)
-                if config_errors:
-                    raise ValueError("\n".join(config_errors))
-                if config_action == "create" and TestConfigTable.select().where(
-                    TestConfigTable.config_id == target_config_id
-                ).exists():
-                    raise ValueError("导入配置 ID 已被占用")
-
-                old_golden_paths = (
-                    self._config_service._collect_replaced_paths(
-                        target_config_id,
-                        prepared_config["channels"],
+            with mutation_lease:
+                try:
+                    restored_golden = self._restore_golden_samples(
+                        inspection=inspection,
+                        extract_root=extract_root,
+                        target_config_id=target_config_id,
                     )
-                    if config_action == "overwrite"
-                    else []
-                )
+                    restored_golden_paths = [
+                        binding["golden_sample_path"]
+                        for binding in restored_golden.values()
+                        if isinstance(binding, dict)
+                        and isinstance(binding.get("golden_sample_path"), str)
+                    ]
+                    prepared_config = self._config_service.prepare_import_payload(
+                        inspection.config_payload["config"],
+                        golden_asset_paths_by_channel=restored_golden,
+                    )
+                    prepared_config["config_id"] = target_config_id
+                    config_errors = self._config_service.validate(prepared_config)
+                    if config_errors:
+                        raise ValueError("\n".join(config_errors))
+                    if config_action == "create" and TestConfigTable.select().where(
+                        TestConfigTable.config_id == target_config_id
+                    ).exists():
+                        raise ValueError("导入配置 ID 已被占用")
 
-                ai_binding_status = "unchanged"
-                toolchain_row_written = False
-                binding_target_toolchain_id: str | None = None
-                normalized_toolchain = None
-                if inspection.ai_toolchain_metadata is None:
-                    ai_binding_status = "no_ai_metadata"
-                elif inspection.contents["ai_package"]:
-                    if ai_action == "use_existing_toolchain":
-                        binding_target_toolchain_id = preview.ai_toolchain_id
-                        ai_binding_status = "used_existing_toolchain"
-                    else:
-                        restored_ai = self._restore_ai_package(
-                            inspection=inspection,
-                            extract_root=extract_root,
-                            toolchain_id=preview.ai_toolchain_id,
+                    old_golden_paths = (
+                        self._config_service._collect_replaced_paths(
+                            target_config_id,
+                            prepared_config["channels"],
                         )
-                        normalized_toolchain = self._normalize_imported_toolchain_payload(
-                            inspection.ai_toolchain_metadata,
-                            package_dir=restored_ai.package_dir,
-                        )
-                        toolchain_row_written = True
-                        binding_target_toolchain_id = normalized_toolchain["toolchain_id"]
-                        ai_binding_status = (
-                            "overwrote_toolchain"
-                            if preview.ai_conflict
-                            else "created_toolchain"
-                        )
-                else:
-                    if ai_action == "use_existing_toolchain":
-                        binding_target_toolchain_id = preview.ai_toolchain_id
-                        ai_binding_status = "used_existing_toolchain"
-                    else:
-                        ai_binding_status = "cleared_binding"
-                        if not warnings:
-                            warnings.append("AI binding was cleared during import.")
+                        if config_action == "overwrite"
+                        else []
+                    )
 
-                binding_payload = self._build_import_binding_payload(
-                    imported_binding=inspection.config_payload.get("ai_binding"),
+                    normalized_toolchain = None
+                    if inspection.ai_toolchain_metadata is None:
+                        ai_binding_status = "no_ai_metadata"
+                    elif inspection.contents["ai_package"]:
+                        if ai_action == "use_existing_toolchain":
+                            binding_target_toolchain_id = preview.ai_toolchain_id
+                            ai_binding_status = "used_existing_toolchain"
+                        else:
+                            restored_ai = self._restore_ai_package(
+                                inspection=inspection,
+                                extract_root=extract_root,
+                                toolchain_id=preview.ai_toolchain_id,
+                            )
+                            normalized_toolchain = self._normalize_imported_toolchain_payload(
+                                inspection.ai_toolchain_metadata,
+                                package_dir=restored_ai.package_dir,
+                            )
+                            toolchain_row_written = True
+                            binding_target_toolchain_id = normalized_toolchain["toolchain_id"]
+                            ai_binding_status = (
+                                "overwrote_toolchain"
+                                if preview.ai_conflict
+                                else "created_toolchain"
+                            )
+                    else:
+                        if ai_action == "use_existing_toolchain":
+                            binding_target_toolchain_id = preview.ai_toolchain_id
+                            ai_binding_status = "used_existing_toolchain"
+                        else:
+                            ai_binding_status = "cleared_binding"
+                            if not warnings:
+                                warnings.append("AI binding was cleared during import.")
+
+                    binding_payload = self._build_import_binding_payload(
+                        imported_binding=inspection.config_payload.get("ai_binding"),
+                        toolchain_id=binding_target_toolchain_id,
+                        clear_binding=ai_binding_status in {"cleared_binding", "no_ai_metadata"},
+                    )
+
+                    database = TestConfigTable._meta.database
+                    with database.atomic():
+                        if normalized_toolchain is not None:
+                            self._upsert_imported_toolchain_row(normalized_toolchain)
+                        self._persist_imported_config(
+                            prepared_config,
+                            config_action=config_action,
+                        )
+                        self._upsert_binding_row(
+                            config_id=target_config_id,
+                            binding=binding_payload,
+                        )
+                except Exception:
+                    self._rollback_restored_golden_paths(restored_golden_paths)
+                    self._rollback_restored_ai_package(restored_ai)
+                    raise
+
+                self._invalidate_imported_toolchain(
+                    toolchain_row_written=toolchain_row_written,
                     toolchain_id=binding_target_toolchain_id,
-                    clear_binding=ai_binding_status in {"cleared_binding", "no_ai_metadata"},
                 )
 
-                database = TestConfigTable._meta.database
-                with database.atomic():
-                    if normalized_toolchain is not None:
-                        self._upsert_imported_toolchain_row(normalized_toolchain)
-                    self._persist_imported_config(
-                        prepared_config,
-                        config_action=config_action,
-                    )
-                    self._upsert_binding_row(
-                        config_id=target_config_id,
-                        binding=binding_payload,
-                    )
-
-                self._config_service._post_commit_cleanup(
-                    old_paths=old_golden_paths,
-                    staged_paths=[],
-                )
-                self._cleanup_restored_ai_backup(restored_ai)
-                self._emit_import_signals(toolchain_row_written, preview.ai_toolchain_id)
-                return ConfigPackageImportResult(
-                    status="created" if config_action == "create" else "overwritten",
-                    config_id=target_config_id,
-                    config_name=preview.config_name,
-                    ai_binding_status=ai_binding_status,
-                    warnings=tuple(warnings),
-                )
-            except Exception:
-                self._rollback_restored_golden_paths(restored_golden_paths)
-                self._rollback_restored_ai_package(restored_ai)
-                raise
+            self._config_service._post_commit_cleanup(
+                old_paths=old_golden_paths,
+                staged_paths=[],
+            )
+            self._cleanup_restored_ai_backup(restored_ai)
+            self._emit_import_signals(toolchain_row_written)
+            return ConfigPackageImportResult(
+                status="created" if config_action == "create" else "overwritten",
+                config_id=target_config_id,
+                config_name=preview.config_name,
+                ai_binding_status=ai_binding_status,
+                warnings=tuple(warnings),
+            )
 
     def _build_preview(self, inspection: _ArchiveInspection) -> ConfigPackagePreview:
         config_root = inspection.config_payload.get("config")
@@ -793,6 +805,21 @@ class ConfigPackageService:
         with open(marker_path, "w", encoding="utf-8") as marker:
             marker.write(toolchain_id)
 
+    def _toolchain_import_mutation_lease(
+        self,
+        *,
+        ai_action: str | None,
+        preview: ConfigPackagePreview,
+    ):
+        if ai_action != "overwrite" or not preview.ai_toolchain_id:
+            return nullcontext()
+        existing = self._ai_service.get_toolchain(preview.ai_toolchain_id)
+        if not self._ai_service._is_resident_toolchain(existing):
+            return nullcontext()
+        return self._ai_service._resident_runtime.hold_mutation_lease(
+            preview.ai_toolchain_id
+        )
+
     def _rollback_restored_golden_paths(self, golden_paths: list[str]) -> None:
         if not golden_paths:
             return
@@ -819,10 +846,18 @@ class ConfigPackageService:
         except OSError as exc:  # pragma: no cover - logging branch
             logger.warning("Failed to cleanup AI package backup: %s", exc)
 
-    def _emit_import_signals(self, toolchain_row_written: bool, toolchain_id: str | None) -> None:
-        self._config_service.bus.config_changed.emit()
+    def _invalidate_imported_toolchain(
+        self,
+        *,
+        toolchain_row_written: bool,
+        toolchain_id: str | None,
+    ) -> None:
         if toolchain_row_written and toolchain_id:
             self._ai_service._resident_runtime.invalidate(toolchain_id)
+
+    def _emit_import_signals(self, toolchain_row_written: bool) -> None:
+        self._config_service.bus.config_changed.emit()
+        if toolchain_row_written:
             ai_signal = getattr(self._config_service.bus, "ai_toolchains_changed", None)
             if ai_signal is not None:
                 ai_signal.emit()
@@ -872,6 +907,9 @@ class ConfigPackageService:
                         file_entries=file_entries,
                         ai_toolchain_metadata=ai_toolchain_metadata,
                         ai_package_included=contents["ai_package"],
+                    )
+                    ai_toolchain_metadata = self._normalize_imported_toolchain_metadata(
+                        ai_toolchain_metadata
                     )
                 elif contents["ai_package"] or contents["ai_toolchain"]:
                     raise ValueError("ai/toolchain.json is missing")
@@ -1088,6 +1126,18 @@ class ConfigPackageService:
         )
         if not has_package_files:
             raise ValueError("Manifest declared ai_package but no files exist under package_archive_path")
+
+    def _normalize_imported_toolchain_metadata(self, metadata: dict) -> dict:
+        normalized = dict(metadata)
+        normalized["toolchain_id"] = self._ai_service._normalize_toolchain_text(
+            metadata.get("toolchain_id"),
+            "toolchain_id",
+            allow_empty=False,
+        )
+        package_archive_path = normalized.get("package_archive_path")
+        if isinstance(package_archive_path, str) and package_archive_path.strip():
+            normalized["package_archive_path"] = self._normalize_archive_name(package_archive_path)
+        return normalized
 
     def _serialize_ai_binding(self, binding: dict | None) -> dict:
         if not isinstance(binding, dict):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -1338,6 +1339,62 @@ def test_import_package_runnable_ai_overwrite_external_package_dir_keeps_externa
     assert (Path(toolchain.package_dir) / "main.py").read_text(encoding="utf-8") == "print('ok')\n"
 
 
+def test_import_package_overwrite_normalizes_whitespace_padded_toolchain_id_conflict(
+    tmp_path: Path,
+    services: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(config_package_module, "base_dir", str(tmp_path))
+    local_package_dir = tmp_path / "local-tool"
+    local_package_dir.mkdir()
+    (local_package_dir / "main.py").write_text("print('local')\n", encoding="utf-8")
+    services.ai_service.save_toolchain(
+        None,
+        _toolchain_payload(local_package_dir, version="0.9"),
+    )
+    invalidations: list[str] = []
+    monkeypatch.setattr(
+        services.ai_service._resident_runtime,
+        "invalidate",
+        lambda toolchain_id: invalidations.append(toolchain_id),
+    )
+    path = _write_package(
+        tmp_path / "trimmed-overwrite.dy",
+        _package_entries(
+            include_ai_metadata=True,
+            include_ai_package=True,
+            toolchain_overrides={
+                "toolchain_id": "  motor-ai  ",
+                "version": "2.0",
+            },
+        ),
+    )
+
+    preview = services.config_package_service.inspect_package(str(path))
+
+    assert preview.ai_toolchain_id == "motor-ai"
+    assert preview.ai_conflict is True
+    assert preview.ai_action_options == (
+        "overwrite",
+        "use_existing_toolchain",
+        "cancel",
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(ai_action="overwrite"),
+    )
+
+    binding = services.ai_service.resolve_binding(result.config_id)
+    toolchain = services.ai_service.get_toolchain("motor-ai")
+
+    assert result.ai_binding_status == "overwrote_toolchain"
+    assert binding["toolchain_id"] == "motor-ai"
+    assert toolchain.version == "2.0"
+    assert Path(toolchain.package_dir).name == _managed_toolchain_dir_name("motor-ai")
+    assert invalidations == ["motor-ai"]
+
+
 def test_import_package_overwrite_managed_ai_package_restores_backup_on_db_failure(
     tmp_path: Path,
     services: SimpleNamespace,
@@ -1377,6 +1434,60 @@ def test_import_package_overwrite_managed_ai_package_restores_backup_on_db_failu
     toolchain = services.ai_service.get_toolchain("motor-ai")
     assert toolchain.package_dir == str(managed_dir)
     assert (managed_dir / "main.py").read_text(encoding="utf-8") == "print('old')\n"
+
+
+def test_import_package_overwrite_busy_resident_toolchain_holds_mutation_lease(
+    tmp_path: Path,
+    services: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(config_package_module, "base_dir", str(tmp_path))
+    managed_dir = tmp_path / "data" / "ai_toolchains" / _managed_toolchain_dir_name("motor-ai")
+    _write_toolchain_marker(managed_dir, "motor-ai")
+    (managed_dir / "main.py").write_text("print('old')\n", encoding="utf-8")
+    services.ai_service.save_toolchain(
+        None,
+        _toolchain_payload(managed_dir, version="0.9"),
+    )
+
+    @contextmanager
+    def _raise_busy(toolchain_id: str):
+        assert toolchain_id == "motor-ai"
+        raise ValueError("Resident toolchain is busy")
+        yield
+
+    invalidations: list[str] = []
+    monkeypatch.setattr(
+        services.ai_service._resident_runtime,
+        "hold_mutation_lease",
+        _raise_busy,
+    )
+    monkeypatch.setattr(
+        services.ai_service._resident_runtime,
+        "invalidate",
+        lambda toolchain_id: invalidations.append(toolchain_id),
+    )
+    path = _write_package(
+        tmp_path / "busy-resident.dy",
+        _package_entries(
+            include_ai_metadata=True,
+            include_ai_package=True,
+            toolchain_overrides={"version": "2.0"},
+        ),
+    )
+
+    with pytest.raises(ValueError, match="busy"):
+        services.config_package_service.import_package(
+            str(path),
+            ConfigPackageImportDecision(ai_action="overwrite"),
+        )
+
+    toolchain = services.ai_service.get_toolchain("motor-ai")
+    assert toolchain.version == "0.9"
+    assert toolchain.package_dir == str(managed_dir)
+    assert (managed_dir / "main.py").read_text(encoding="utf-8") == "print('old')\n"
+    assert services.config_service.list_configs() == []
+    assert invalidations == []
 
 
 def test_import_package_reuses_same_marker_managed_ai_directory(
