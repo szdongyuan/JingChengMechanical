@@ -146,8 +146,11 @@ class ConfigPackageService:
 
         if options.include_ai_package:
             assert toolchain is not None
+            ai_package_files = self._iter_ai_package_files(toolchain.package_dir)
+            if not ai_package_files:
+                raise ValueError("AI package directory is empty or contains no regular files")
             manifest_contents["ai_package"] = True
-            for source_path, archive_name, file_size in self._iter_ai_package_files(toolchain.package_dir):
+            for source_path, archive_name, file_size in ai_package_files:
                 normalized_name, file_count, total_bytes = self._track_archive_entry(
                     archive_name,
                     size=file_size,
@@ -375,6 +378,13 @@ class ConfigPackageService:
         if not contents["ai_toolchain"] and has_toolchain_metadata:
             raise ValueError("Manifest contents.ai_toolchain is false but ai/toolchain.json is present")
 
+        has_ai_package_payload = any(
+            entry_name == _AI_PACKAGE_PREFIX or self._is_child_of(entry_name, _AI_PACKAGE_PREFIX)
+            for entry_name in file_entries
+        )
+        if not contents["ai_package"] and has_ai_package_payload:
+            raise ValueError("Manifest contents.ai_package is false but AI package payload files are present")
+
         if contents["ai_package"] and not contents["ai_toolchain"]:
             raise ValueError("Manifest contents.ai_package requires contents.ai_toolchain")
 
@@ -478,7 +488,7 @@ class ConfigPackageService:
             raise ValueError("ai/toolchain.json must include package_archive_path")
         normalized_prefix = self._normalize_archive_name(package_archive_path)
         has_package_files = any(
-            self._is_under(entry_name, normalized_prefix)
+            self._is_child_of(entry_name, normalized_prefix)
             for entry_name in file_entries
         )
         if not has_package_files:
@@ -710,6 +720,9 @@ class ConfigPackageService:
 
     def _is_under(self, name: str, prefix: str) -> bool:
         return name == prefix or name.startswith(f"{prefix}/")
+
+    def _is_child_of(self, name: str, prefix: str) -> bool:
+        return name.startswith(f"{prefix}/")
 
     def _is_within_root(self, candidate: str, root: str) -> bool:
         try:

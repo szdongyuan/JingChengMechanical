@@ -404,6 +404,23 @@ def test_export_rejects_missing_package_dir_when_ai_package_requested(tmp_path: 
         )
 
 
+def test_export_rejects_empty_package_dir_when_ai_package_requested(tmp_path: Path, services: SimpleNamespace):
+    config_id = _create_saved_config(services, name="Cfg1")
+    package_dir = tmp_path / "package"
+    package_dir.mkdir()
+    _bind_toolchain(services, config_id=config_id, package_dir=package_dir)
+
+    with pytest.raises(ValueError, match="regular files|empty"):
+        services.config_package_service.export_package(
+            config_id=config_id,
+            target_path=str(tmp_path / "bad.dy"),
+            options=ConfigPackageExportOptions(
+                include_ai_toolchain=True,
+                include_ai_package=True,
+            ),
+        )
+
+
 def test_export_rejects_missing_selected_golden_sample_file(tmp_path: Path, services: SimpleNamespace):
     source_wav = _write_wav(tmp_path / "source.wav")
     binding = services.config_service.golden_sample_service.restore_imported_sample(
@@ -746,6 +763,32 @@ def test_inspect_package_rejects_import_file_count_limit(
     monkeypatch.setattr(config_package_module, "MAX_FILE_COUNT", 3)
 
     with pytest.raises(ValueError, match="file count"):
+        services.config_package_service.inspect_package(str(path))
+
+
+def test_inspect_package_rejects_exact_package_archive_path_file(tmp_path: Path, services: SimpleNamespace):
+    entries = _package_entries(include_ai_metadata=True, include_ai_package=True)
+    entries.pop("ai/package/main.py")
+    entries["ai/package"] = b"not-a-child-file"
+    path = _write_package(
+        tmp_path / "exact-package-path.dy",
+        entries,
+    )
+
+    with pytest.raises(ValueError, match="package_archive_path"):
+        services.config_package_service.inspect_package(str(path))
+
+
+def test_inspect_package_rejects_undeclared_ai_package_payload(tmp_path: Path, services: SimpleNamespace):
+    path = _write_package(
+        tmp_path / "undeclared-ai-package.dy",
+        {
+            **_package_entries(include_ai_metadata=True, include_ai_package=False),
+            "ai/package/model.bin": b"\x00\x01",
+        },
+    )
+
+    with pytest.raises(ValueError, match="ai_package"):
         services.config_package_service.inspect_package(str(path))
 
 
