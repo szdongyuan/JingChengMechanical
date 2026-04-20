@@ -658,6 +658,10 @@ class FftLineChartWidget(LineChartWidget):
         )
 
 
+_OCTAVE_BAR_WIDTH = 0.6
+_OCTAVE_BAR_EDGE_MARGIN = 0.2
+
+
 class OctaveBarChartWidget(_BasePlotChart):
     def __init__(
         self,
@@ -769,7 +773,7 @@ class OctaveBarChartWidget(_BasePlotChart):
             ),
             limit_bands=normalized_limit_bands,
         )
-        self._apply_x_axis_policy(payload_values=x_values.tolist())
+        self._apply_bar_x_axis_policy(x_values=x_values)
         self.plot_item.vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
         self.plot_item.vb.updateAutoRange()
 
@@ -789,6 +793,20 @@ class OctaveBarChartWidget(_BasePlotChart):
     def band_payload(self) -> dict | None:
         return deepcopy(self._band_payload)
 
+    def _apply_bar_x_axis_policy(self, *, x_values: np.ndarray) -> None:
+        if x_values.size == 0:
+            self._apply_x_axis_policy(payload_values=None)
+            return
+
+        edge_padding = (_OCTAVE_BAR_WIDTH / 2.0) + _OCTAVE_BAR_EDGE_MARGIN
+        view_box = self.plot_item.vb
+        view_box.enableAutoRange(axis=pg.ViewBox.XAxis, enable=False)
+        view_box.setXRange(
+            float(x_values[0]) - edge_padding,
+            float(x_values[-1]) + edge_padding,
+            padding=0.0,
+        )
+
     def _replace_bar_item(self, *, x: np.ndarray, heights: np.ndarray) -> None:
         if self._bar_item is not None:
             self.plot_item.removeItem(self._bar_item)
@@ -796,7 +814,7 @@ class OctaveBarChartWidget(_BasePlotChart):
             x=x,
             y0=0.0,
             height=heights,
-            width=0.6,
+            width=_OCTAVE_BAR_WIDTH,
             brush="#f59e0b",
             pen=pg.mkPen(color="#d97706", width=1),
         )
