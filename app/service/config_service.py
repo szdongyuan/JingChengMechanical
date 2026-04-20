@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal
 
@@ -224,6 +226,135 @@ class ConfigService:
         self.commit_pending_save(pending)
         return pending.config_id
 
+    def reserve_import_config_id(self) -> int:
+        row = (
+            TestConfigTable.select(TestConfigTable.config_id)
+            .order_by(TestConfigTable.config_id.desc())
+            .first()
+        )
+        if row is None:
+            return 1
+        return int(row.config_id) + 1
+
+    def create_imported_config(
+        self,
+        payload: dict,
+        *,
+        reserved_config_id: int,
+    ) -> int:
+        if (
+            not isinstance(reserved_config_id, int)
+            or isinstance(reserved_config_id, bool)
+            or reserved_config_id <= 0
+        ):
+            raise ValueError("导入配置 ID 无效")
+
+        prepared = self.prepare_import_payload(payload)
+        prepared["config_id"] = reserved_config_id
+        errors = self.validate(prepared)
+        if errors:
+            raise ValueError("\n".join(errors))
+        if TestConfigTable.select().where(
+            TestConfigTable.config_id == reserved_config_id
+        ).exists():
+            raise ValueError("导入配置 ID 已被占用")
+
+        imported_paths = self._collect_imported_channel_paths(prepared["channels"])
+        try:
+            with TestConfigTable._meta.database.atomic():
+                TestConfigTable.create(
+                    config_id=reserved_config_id,
+                    created_time=now_str(),
+                    updated_time=now_str(),
+                    **self._config_row_values(prepared),
+                )
+                self._replace_channel_rows(
+                    config_id=reserved_config_id,
+                    channels=prepared["channels"],
+                )
+        except IntegrityError as exc:
+            self._safe_rollback(imported_paths)
+            self._raise_save_integrity_error(exc, prepared)
+        except Exception:
+            self._safe_rollback(imported_paths)
+            raise
+
+        self.bus.config_changed.emit()
+        return reserved_config_id
+
+    def overwrite_imported_config(self, config_id: int, payload: dict) -> int:
+        prepared = self.prepare_import_payload(payload)
+        prepared["config_id"] = config_id
+        existing_paths = set(self._collect_managed_config_paths(config_id))
+        imported_paths = self._collect_imported_channel_paths(
+            prepared["channels"],
+            exclude_paths=existing_paths,
+        )
+        try:
+            pending = self.begin_save_config(prepared)
+        except Exception:
+            self._safe_rollback(imported_paths)
+            raise
+        self.commit_pending_save(pending)
+        return pending.config_id
+
+    def prepare_import_payload(
+        self,
+        payload: dict,
+        golden_asset_paths_by_channel: dict[int, dict] | None = None,
+    ) -> dict:
+        source = deepcopy(payload or {})
+        channels = source.get("channels", [])
+        if not isinstance(channels, list):
+            channels = []
+
+        prepared_channels: list[dict] = []
+        for channel in channels:
+            if not isinstance(channel, dict):
+                prepared_channels.append(channel)
+                continue
+            channel_index = channel.get("channel_index")
+            restored_binding = None
+            if isinstance(channel_index, int) and not isinstance(channel_index, bool):
+                restored_binding = (golden_asset_paths_by_channel or {}).get(channel_index)
+            prepared_channels.append(
+                self._normalize_import_channel(
+                    channel,
+                    restored_binding=restored_binding,
+                )
+            )
+
+        selected_channels = source.get("selected_channels")
+        if not isinstance(selected_channels, list):
+            selected_channels = [
+                channel.get("channel_index")
+                for channel in prepared_channels
+                if isinstance(channel, dict)
+                and isinstance(channel.get("channel_index"), int)
+                and not isinstance(channel.get("channel_index"), bool)
+            ]
+
+        return {
+            "config_name": str(source.get("config_name", "")).strip(),
+            "record_duration": source.get("record_duration"),
+            "analysis_duration": source.get("analysis_duration"),
+            "analysis_window_offset_ms": source.get("analysis_window_offset_ms", 0),
+            "allow_incomplete_recording_analysis": source.get(
+                "allow_incomplete_recording_analysis",
+                False,
+            ),
+            "scan_triggers_test": source.get("scan_triggers_test", False),
+            "plc_id": None,
+            "input_device_name": source.get("input_device_name"),
+            "input_device_hostapi": source.get("input_device_hostapi"),
+            "input_device_samplerate": source.get("input_device_samplerate"),
+            "output_device_name": source.get("output_device_name"),
+            "output_device_hostapi": source.get("output_device_hostapi"),
+            "output_device_samplerate": source.get("output_device_samplerate"),
+            "selected_channels": selected_channels,
+            "channels": prepared_channels,
+        }
+
     def _raise_save_integrity_error(self, exc: IntegrityError, data: dict) -> None:
         error_text = str(exc).lower()
         if "foreign key constraint failed" in error_text:
@@ -293,36 +424,13 @@ class ConfigService:
                 raise ValueError("\n".join(post_promotion_errors))
             cleanup_after_commit = self._collect_replaced_paths(config_id, channels)
 
-        analysis_window_offset_ms = int(data.get("analysis_window_offset_ms", 0))
         try:
             with TestConfigTable._meta.database.atomic():
                 TestConfigTable.update(
-                    config_name=data["config_name"].strip(),
-                    record_duration=data["record_duration"],
-                    analysis_duration=data["analysis_duration"],
-                    analysis_window_offset_ms=analysis_window_offset_ms,
-                    allow_incomplete_recording_analysis=bool(
-                        data.get("allow_incomplete_recording_analysis", False)
-                    ),
-                    scan_triggers_test=data["scan_triggers_test"],
-                    plc=data.get("plc_id"),
-                    input_device_name=data.get("input_device_name"),
-                    input_device_hostapi=data.get("input_device_hostapi"),
-                    input_device_samplerate=data.get("input_device_samplerate"),
-                    output_device_name=data.get("output_device_name"),
-                    output_device_hostapi=data.get("output_device_hostapi"),
-                    output_device_samplerate=data.get("output_device_samplerate"),
-                    selected_channels=json.dumps(data.get("selected_channels", [])),
+                    **self._config_row_values(data),
                     updated_time=now_str(),
                 ).where(TestConfigTable.config_id == config_id).execute()
-                ChannelConfigTable.delete().where(
-                    ChannelConfigTable.config == config_id
-                ).execute()
-                for channel in channels:
-                    ChannelConfigTable.create(
-                        config=config_id,
-                        **self._channel_db_values(channel),
-                    )
+                self._replace_channel_rows(config_id=config_id, channels=channels)
         except IntegrityError as exc:
             self._safe_rollback(promoted_paths)
             self._raise_save_integrity_error(exc, data)
@@ -713,6 +821,107 @@ class ConfigService:
                 paths.append(path)
         return paths
 
+    def _collect_imported_channel_paths(
+        self,
+        channels: list[dict],
+        *,
+        exclude_paths: set[str] | None = None,
+    ) -> list[str]:
+        excluded = set(exclude_paths or ())
+        paths: list[str] = []
+        for channel in channels:
+            if not isinstance(channel, dict):
+                continue
+            path = self._normalize_optional_text(channel.get("golden_sample_path"))
+            if (
+                path
+                and path not in excluded
+                and self._golden_samples.is_managed_path(path)
+                and not self._golden_samples.is_managed_staged_path(path)
+            ):
+                paths.append(path)
+        return paths
+
+    def _normalize_import_channel(
+        self,
+        channel: dict,
+        *,
+        restored_binding: dict | None,
+    ) -> dict:
+        normalized = {
+            "channel_index": channel.get("channel_index"),
+            "stft_nfft": channel.get("stft_nfft", _CHANNEL_DEFAULTS["stft_nfft"]),
+            "fft_nfft": channel.get("fft_nfft", _CHANNEL_DEFAULTS["fft_nfft"]),
+            "stft_overlap": channel.get(
+                "stft_overlap",
+                _CHANNEL_DEFAULTS["stft_overlap"],
+            ),
+            "spl_weighting": channel.get(
+                "spl_weighting",
+                _CHANNEL_DEFAULTS["spl_weighting"],
+            ),
+            "spl_time_constant": channel.get(
+                "spl_time_constant",
+                _CHANNEL_DEFAULTS["spl_time_constant"],
+            ),
+            "spl_upper_limit": channel.get(
+                "spl_upper_limit",
+                _CHANNEL_DEFAULTS["spl_upper_limit"],
+            ),
+            "spl_lower_limit": channel.get(
+                "spl_lower_limit",
+                _CHANNEL_DEFAULTS["spl_lower_limit"],
+            ),
+            "loudness_unit": channel.get(
+                "loudness_unit",
+                _CHANNEL_DEFAULTS["loudness_unit"],
+            ),
+            "loudness_lower_limit": channel.get(
+                "loudness_lower_limit",
+                _CHANNEL_DEFAULTS["loudness_lower_limit"],
+            ),
+            "loudness_upper_limit": channel.get(
+                "loudness_upper_limit",
+                _CHANNEL_DEFAULTS["loudness_upper_limit"],
+            ),
+            "fft_band_limits": deepcopy(channel.get("fft_band_limits", [])),
+            "oct_weighting": channel.get(
+                "oct_weighting",
+                _CHANNEL_DEFAULTS["oct_weighting"],
+            ),
+            "oct_band_limits": deepcopy(channel.get("oct_band_limits", [])),
+            "ai_config": deepcopy(channel.get("ai_config", {})),
+            "fft_golden_mode": channel.get(
+                "fft_golden_mode",
+                _CHANNEL_DEFAULTS["fft_golden_mode"],
+            ),
+            "fft_show_golden_overlay": channel.get(
+                "fft_show_golden_overlay",
+                _CHANNEL_DEFAULTS["fft_show_golden_overlay"],
+            ),
+            "oct_golden_mode": channel.get(
+                "oct_golden_mode",
+                _CHANNEL_DEFAULTS["oct_golden_mode"],
+            ),
+            "oct_show_golden_overlay": channel.get(
+                "oct_show_golden_overlay",
+                _CHANNEL_DEFAULTS["oct_show_golden_overlay"],
+            ),
+        }
+
+        binding = restored_binding
+        if binding is None and self._channel_has_local_import_binding(channel):
+            binding = {
+                field: channel.get(field)
+                for field in _GOLDEN_BINDING_FIELDS
+            }
+        if binding is None:
+            self._clear_golden_binding(normalized)
+        else:
+            for field in _GOLDEN_BINDING_FIELDS:
+                normalized[field] = binding.get(field)
+        return normalized
+
     def _channel_db_values(self, channel: dict) -> dict:
         return {
             "channel_index": channel["channel_index"],
@@ -768,6 +977,35 @@ class ConfigService:
             ),
         }
 
+    def _config_row_values(self, data: dict) -> dict:
+        analysis_window_offset_ms = int(data.get("analysis_window_offset_ms", 0))
+        return {
+            "config_name": data["config_name"].strip(),
+            "record_duration": data["record_duration"],
+            "analysis_duration": data["analysis_duration"],
+            "analysis_window_offset_ms": analysis_window_offset_ms,
+            "allow_incomplete_recording_analysis": bool(
+                data.get("allow_incomplete_recording_analysis", False)
+            ),
+            "scan_triggers_test": data["scan_triggers_test"],
+            "plc": data.get("plc_id"),
+            "input_device_name": data.get("input_device_name"),
+            "input_device_hostapi": data.get("input_device_hostapi"),
+            "input_device_samplerate": data.get("input_device_samplerate"),
+            "output_device_name": data.get("output_device_name"),
+            "output_device_hostapi": data.get("output_device_hostapi"),
+            "output_device_samplerate": data.get("output_device_samplerate"),
+            "selected_channels": json.dumps(data.get("selected_channels", [])),
+        }
+
+    def _replace_channel_rows(self, *, config_id: int, channels: list[dict]) -> None:
+        ChannelConfigTable.delete().where(ChannelConfigTable.config == config_id).execute()
+        for channel in channels:
+            ChannelConfigTable.create(
+                config=config_id,
+                **self._channel_db_values(channel),
+            )
+
     def _post_commit_cleanup(
         self,
         *,
@@ -806,6 +1044,27 @@ class ConfigService:
             elif value is not None:
                 return True
         return False
+
+    def _channel_has_local_import_binding(self, channel: dict) -> bool:
+        path = self._normalize_optional_text(channel.get("golden_sample_path"))
+        if not path:
+            return False
+        if not self._golden_samples.is_managed_path(path):
+            return False
+        if self._golden_samples.is_managed_staged_path(path):
+            return False
+        if not os.path.isfile(path):
+            return False
+        return self._channel_has_binding(channel)
+
+    @staticmethod
+    def _clear_golden_binding(channel: dict) -> None:
+        for key in _GOLDEN_BINDING_FIELDS:
+            channel[key] = None
+        channel["fft_golden_mode"] = "off"
+        channel["fft_show_golden_overlay"] = False
+        channel["oct_golden_mode"] = "off"
+        channel["oct_show_golden_overlay"] = False
 
     @staticmethod
     def _parse_json(text: str, default):
