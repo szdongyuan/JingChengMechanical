@@ -779,6 +779,21 @@ def test_inspect_package_rejects_exact_package_archive_path_file(tmp_path: Path,
         services.config_package_service.inspect_package(str(path))
 
 
+def test_inspect_package_rejects_mixed_exact_package_archive_path_file_and_children(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    entries = _package_entries(include_ai_metadata=True, include_ai_package=True)
+    entries["ai/package"] = b"not-a-child-file"
+    path = _write_package(
+        tmp_path / "mixed-exact-package-path.dy",
+        entries,
+    )
+
+    with pytest.raises(ValueError, match="package_archive_path"):
+        services.config_package_service.inspect_package(str(path))
+
+
 def test_inspect_package_rejects_undeclared_ai_package_payload(tmp_path: Path, services: SimpleNamespace):
     path = _write_package(
         tmp_path / "undeclared-ai-package.dy",

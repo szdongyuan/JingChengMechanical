@@ -487,6 +487,8 @@ class ConfigPackageService:
         if not isinstance(package_archive_path, str) or not package_archive_path.strip():
             raise ValueError("ai/toolchain.json must include package_archive_path")
         normalized_prefix = self._normalize_archive_name(package_archive_path)
+        if normalized_prefix in file_entries:
+            raise ValueError("Manifest declared ai_package but package_archive_path resolves to a file entry")
         has_package_files = any(
             self._is_child_of(entry_name, normalized_prefix)
             for entry_name in file_entries
