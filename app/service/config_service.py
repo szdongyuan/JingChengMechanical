@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal
@@ -241,6 +240,7 @@ class ConfigService:
         payload: dict,
         *,
         reserved_config_id: int,
+        golden_asset_paths_by_channel: dict[int, dict] | None = None,
     ) -> int:
         if (
             not isinstance(reserved_config_id, int)
@@ -249,18 +249,23 @@ class ConfigService:
         ):
             raise ValueError("导入配置 ID 无效")
 
-        prepared = self.prepare_import_payload(payload)
-        prepared["config_id"] = reserved_config_id
-        errors = self.validate(prepared)
-        if errors:
-            raise ValueError("\n".join(errors))
-        if TestConfigTable.select().where(
-            TestConfigTable.config_id == reserved_config_id
-        ).exists():
-            raise ValueError("导入配置 ID 已被占用")
-
-        imported_paths = self._collect_imported_channel_paths(prepared["channels"])
+        imported_paths = self._collect_owned_import_asset_paths(
+            golden_asset_paths_by_channel
+        )
         try:
+            prepared = self.prepare_import_payload(
+                payload,
+                golden_asset_paths_by_channel=golden_asset_paths_by_channel,
+            )
+            prepared["config_id"] = reserved_config_id
+            errors = self.validate(prepared)
+            if errors:
+                raise ValueError("\n".join(errors))
+            if TestConfigTable.select().where(
+                TestConfigTable.config_id == reserved_config_id
+            ).exists():
+                raise ValueError("导入配置 ID 已被占用")
+
             with TestConfigTable._meta.database.atomic():
                 TestConfigTable.create(
                     config_id=reserved_config_id,
@@ -282,13 +287,20 @@ class ConfigService:
         self.bus.config_changed.emit()
         return reserved_config_id
 
-    def overwrite_imported_config(self, config_id: int, payload: dict) -> int:
-        prepared = self.prepare_import_payload(payload)
+    def overwrite_imported_config(
+        self,
+        config_id: int,
+        payload: dict,
+        *,
+        golden_asset_paths_by_channel: dict[int, dict] | None = None,
+    ) -> int:
+        prepared = self.prepare_import_payload(
+            payload,
+            golden_asset_paths_by_channel=golden_asset_paths_by_channel,
+        )
         prepared["config_id"] = config_id
-        existing_paths = set(self._collect_managed_config_paths(config_id))
-        imported_paths = self._collect_imported_channel_paths(
-            prepared["channels"],
-            exclude_paths=existing_paths,
+        imported_paths = self._collect_owned_import_asset_paths(
+            golden_asset_paths_by_channel
         )
         try:
             pending = self.begin_save_config(prepared)
@@ -842,6 +854,26 @@ class ConfigService:
                 paths.append(path)
         return paths
 
+    def _collect_owned_import_asset_paths(
+        self,
+        golden_asset_paths_by_channel: dict[int, dict] | None,
+    ) -> list[str]:
+        if not isinstance(golden_asset_paths_by_channel, dict):
+            return []
+
+        paths: list[str] = []
+        for binding in golden_asset_paths_by_channel.values():
+            if not isinstance(binding, dict):
+                continue
+            path = self._normalize_optional_text(binding.get("golden_sample_path"))
+            if (
+                path
+                and self._golden_samples.is_managed_path(path)
+                and not self._golden_samples.is_managed_staged_path(path)
+            ):
+                paths.append(path)
+        return paths
+
     def _normalize_import_channel(
         self,
         channel: dict,
@@ -909,17 +941,11 @@ class ConfigService:
             ),
         }
 
-        binding = restored_binding
-        if binding is None and self._channel_has_local_import_binding(channel):
-            binding = {
-                field: channel.get(field)
-                for field in _GOLDEN_BINDING_FIELDS
-            }
-        if binding is None:
+        if restored_binding is None:
             self._clear_golden_binding(normalized)
         else:
             for field in _GOLDEN_BINDING_FIELDS:
-                normalized[field] = binding.get(field)
+                normalized[field] = restored_binding.get(field)
         return normalized
 
     def _channel_db_values(self, channel: dict) -> dict:
@@ -1044,18 +1070,6 @@ class ConfigService:
             elif value is not None:
                 return True
         return False
-
-    def _channel_has_local_import_binding(self, channel: dict) -> bool:
-        path = self._normalize_optional_text(channel.get("golden_sample_path"))
-        if not path:
-            return False
-        if not self._golden_samples.is_managed_path(path):
-            return False
-        if self._golden_samples.is_managed_staged_path(path):
-            return False
-        if not os.path.isfile(path):
-            return False
-        return self._channel_has_binding(channel)
 
     @staticmethod
     def _clear_golden_binding(channel: dict) -> None:

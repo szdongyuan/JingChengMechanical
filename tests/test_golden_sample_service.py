@@ -176,6 +176,49 @@ def test_restore_imported_sample_rolls_back_copied_file_on_validation_failure(tm
     assert source_path.exists()
 
 
+@pytest.mark.parametrize(
+    ("mutate", "expected_fragment"),
+    [
+        (
+            lambda metadata: metadata.__setitem__("golden_sample_sample_rate", 0),
+            "采样率",
+        ),
+        (
+            lambda metadata: metadata.__setitem__("golden_sample_sample_rate", "bad"),
+            "采样率",
+        ),
+        (
+            lambda metadata: metadata.pop("golden_sample_num_samples"),
+            "长度",
+        ),
+        (
+            lambda metadata: metadata.__setitem__("golden_sample_num_samples", "bad"),
+            "长度",
+        ),
+    ],
+)
+def test_restore_imported_sample_normalizes_invalid_metadata_to_value_error(
+    tmp_path,
+    mutate,
+    expected_fragment,
+):
+    svc = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    source_path, _ = _write_temp_wav(tmp_path / "package" / "channel_0.wav")
+    metadata = _binding(source_path)
+    mutate(metadata)
+
+    with pytest.raises(ValueError, match=expected_fragment):
+        svc.restore_imported_sample(
+            config_id=17,
+            channel_index=0,
+            source_path=str(source_path),
+            metadata=metadata,
+        )
+
+    assert list((tmp_path / "managed").rglob("*.wav")) == []
+    assert source_path.exists()
+
+
 def test_discard_staged_samples_only_deletes_managed_staged_files(tmp_path):
     svc = GoldenSampleService(root_dir=str(tmp_path / "managed"))
     managed_staged_path, _ = _write_temp_wav(tmp_path / "managed" / "staged" / "clip.wav")

@@ -616,6 +616,98 @@ def test_imported_config_omitted_golden_assets_clear_bindings_and_modes(tmp_path
     assert channel["oct_show_golden_overlay"] is False
 
 
+def test_imported_config_omitted_golden_assets_clear_existing_local_managed_binding(
+    tmp_path,
+):
+    svc = _service(tmp_path / "managed")
+    existing_local = _write_temp_wav(tmp_path / "managed" / "config_99" / "gold.wav")
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[
+            _channel_payload_with_golden(
+                0,
+                **_golden_binding(existing_local),
+                fft_golden_mode="absolute",
+                fft_show_golden_overlay=True,
+                oct_golden_mode="delta",
+                oct_show_golden_overlay=False,
+            )
+        ],
+        selected_channels=[0],
+    )
+    reserved_id = svc.reserve_import_config_id()
+
+    new_id = svc.create_imported_config(source, reserved_config_id=reserved_id)
+    channel = svc.load_config(new_id)["channels"][0]
+
+    for key in _GOLDEN_BINDING_FIELDS:
+        assert channel[key] is None
+    assert channel["fft_golden_mode"] == "off"
+    assert channel["fft_show_golden_overlay"] is False
+    assert channel["oct_golden_mode"] == "off"
+    assert channel["oct_show_golden_overlay"] is False
+    assert existing_local.exists()
+
+
+def test_create_imported_config_failure_does_not_delete_payload_only_managed_file(
+    tmp_path,
+):
+    svc = _service(tmp_path / "managed")
+    existing_local = _write_temp_wav(tmp_path / "managed" / "config_99" / "gold.wav")
+    ConfigTable.create(config_name="Imported")
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[
+            _channel_payload_with_golden(
+                0,
+                **_golden_binding(existing_local),
+                fft_golden_mode="absolute",
+            )
+        ],
+        selected_channels=[0],
+    )
+    reserved_id = svc.reserve_import_config_id()
+
+    with pytest.raises(ValueError, match="已存在"):
+        svc.create_imported_config(source, reserved_config_id=reserved_id)
+
+    assert existing_local.exists()
+    assert list((tmp_path / "managed").rglob("*.wav")) == [existing_local]
+
+
+def test_create_imported_config_validation_failure_rolls_back_explicit_restored_asset(
+    tmp_path,
+):
+    svc = _service(tmp_path / "managed")
+    restored_path = _write_temp_wav(tmp_path / "managed" / "config_42" / "restored.wav")
+    source = _config_payload(
+        999,
+        config_name="   ",
+        channels=[
+            _channel_payload_with_golden(
+                0,
+                fft_golden_mode="absolute",
+            )
+        ],
+        selected_channels=[0],
+    )
+    reserved_id = svc.reserve_import_config_id()
+
+    with pytest.raises(ValueError, match="配置名称不能为空"):
+        svc.create_imported_config(
+            source,
+            reserved_config_id=reserved_id,
+            golden_asset_paths_by_channel={
+                0: _golden_binding(restored_path),
+            },
+        )
+
+    assert not restored_path.exists()
+    assert list((tmp_path / "managed").rglob("*.wav")) == []
+
+
 def test_overwrite_imported_config_rollback_preserves_old_golden_binding(
     tmp_path,
     monkeypatch,

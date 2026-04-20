@@ -292,10 +292,13 @@ class GoldenSampleService:
                 committed_path=committed_path,
                 metadata=metadata,
             )
+            analysis_duration = (
+                restored["golden_sample_num_samples"]
+                / float(restored["golden_sample_sample_rate"])
+            )
             errors = self.validate_committed_binding(
                 channel_config=restored,
-                analysis_duration=restored["golden_sample_num_samples"]
-                / float(restored["golden_sample_sample_rate"]),
+                analysis_duration=analysis_duration,
                 sample_rate=restored["golden_sample_sample_rate"],
             )
             if errors:
@@ -377,7 +380,10 @@ class GoldenSampleService:
         committed_path: str,
         metadata: dict,
     ) -> dict:
-        return {
+        if not isinstance(metadata, dict):
+            raise ValueError("黄金样本导入元数据无效")
+
+        normalized = {
             "golden_sample_path": committed_path,
             "golden_sample_label": self._normalize_import_text(
                 metadata.get("golden_sample_label"),
@@ -415,6 +421,22 @@ class GoldenSampleService:
                 "sample_rate",
             ),
         }
+        self._validate_imported_metadata(normalized)
+        return normalized
+
+    def _validate_imported_metadata(self, metadata: dict) -> None:
+        if not self._is_non_negative_int(metadata.get("golden_sample_source_channel")):
+            raise ValueError("黄金样本源通道必须大于等于 0")
+        if not self._is_non_negative_int(metadata.get("golden_sample_start_sample")):
+            raise ValueError("黄金样本起始采样点必须大于等于 0")
+        if not self._is_positive_int(metadata.get("golden_sample_num_samples")):
+            raise ValueError("黄金样本长度必须大于 0")
+        if not self._is_non_negative_int(metadata.get("golden_sample_start_ms")):
+            raise ValueError("黄金样本起始时间元数据无效")
+        if not self._is_non_negative_int(metadata.get("golden_sample_duration_ms")):
+            raise ValueError("黄金样本时长元数据无效")
+        if not self._is_positive_number(metadata.get("golden_sample_sample_rate")):
+            raise ValueError("黄金样本采样率无效")
 
     def _is_within_root(self, path: str) -> bool:
         root = os.path.realpath(self.managed_root())
