@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import os
 from contextlib import contextmanager
 from contextlib import nullcontext
@@ -25,6 +26,12 @@ from PyQt6.QtWidgets import (
 )
 
 from app.service.config_service import ConfigService
+from app.service.config_package_service import (
+    ConfigPackageExportOptions,
+    ConfigPackageImportDecision,
+    ConfigPackageImportResult,
+    ConfigPackagePreview,
+)
 from app.service.golden_sample_service import GoldenSampleService
 from model.channel_config_table import ChannelConfigTable
 from model.plc_table import PlcTable
@@ -192,6 +199,74 @@ class _AiServiceStub:
         return 1
 
 
+class _ConfigPackageServiceStub:
+    def __init__(
+        self,
+        *,
+        preview: ConfigPackagePreview | None = None,
+        import_result: ConfigPackageImportResult | None = None,
+        export_error: Exception | None = None,
+        inspect_error: Exception | None = None,
+        import_error: Exception | None = None,
+        on_import=None,
+    ):
+        self.preview = preview or ConfigPackagePreview(
+            config_name="ImportedCfg",
+            contents={
+                "config": True,
+                "golden_samples": False,
+                "ai_toolchain": False,
+                "ai_package": False,
+            },
+            config_conflict=False,
+            ai_toolchain_id=None,
+            ai_conflict=False,
+            config_action_options=("create",),
+            default_config_action="create",
+            ai_action_options=(),
+            default_ai_action=None,
+            warnings=(),
+        )
+        self.import_result = import_result or ConfigPackageImportResult(
+            status="created",
+            config_id=101,
+            config_name=self.preview.config_name,
+            ai_binding_status="no_ai_metadata",
+        )
+        self.export_error = export_error
+        self.inspect_error = inspect_error
+        self.import_error = import_error
+        self.on_import = on_import
+        self.export_calls = []
+        self.inspect_calls = []
+        self.import_calls = []
+
+    def export_package(self, *, config_id: int, target_path: str, options):
+        self.export_calls.append(
+            {
+                "config_id": config_id,
+                "target_path": target_path,
+                "options": options,
+            }
+        )
+        if self.export_error is not None:
+            raise self.export_error
+
+    def inspect_package(self, path: str):
+        self.inspect_calls.append(path)
+        if self.inspect_error is not None:
+            raise self.inspect_error
+        return self.preview
+
+    def import_package(self, path: str, decision):
+        self.import_calls.append((path, decision))
+        if self.import_error is not None:
+            raise self.import_error
+        if callable(self.on_import):
+            self.on_import(path, decision)
+        return self.import_result
+
+
 class _HardwareServiceStub:
     def __init__(self, devices: list[dict] | None = None, hostapis: list[dict] | None = None):
         self._devices = devices or [
@@ -247,6 +322,7 @@ def _make_module(
     binding: dict | None = None,
     config_service: _ConfigServiceStub | None = None,
     ai_service: _AiServiceStub | None = None,
+    config_package_service: _ConfigPackageServiceStub | None = None,
     hardware_service: _HardwareServiceStub | None = None,
     bus=None,
 ) -> ConfigModule:
@@ -258,6 +334,7 @@ def _make_module(
     services = SimpleNamespace(
         config_service=config_service or _ConfigServiceStub(),
         ai_service=ai_service or _AiServiceStub(binding=binding),
+        config_package_service=config_package_service or _ConfigPackageServiceStub(),
         hss_service=hardware_service or _HardwareServiceStub(),
         bus=services_bus,
     )
@@ -365,6 +442,40 @@ def _detail_payload(
         "selected_channels": [0],
         "channels": channels,
     }
+
+
+def _package_preview(
+    *,
+    config_name: str = "ImportedCfg",
+    config_conflict: bool = False,
+    ai_toolchain_id: str | None = None,
+    ai_conflict: bool = False,
+    config_action_options: tuple[str, ...] = ("create",),
+    default_config_action: str = "create",
+    ai_action_options: tuple[str, ...] = (),
+    default_ai_action: str | None = None,
+    golden_samples: bool = False,
+    ai_toolchain: bool = False,
+    ai_package: bool = False,
+    warnings: tuple[str, ...] = (),
+) -> ConfigPackagePreview:
+    return ConfigPackagePreview(
+        config_name=config_name,
+        contents={
+            "config": True,
+            "golden_samples": golden_samples,
+            "ai_toolchain": ai_toolchain,
+            "ai_package": ai_package,
+        },
+        config_conflict=config_conflict,
+        ai_toolchain_id=ai_toolchain_id,
+        ai_conflict=ai_conflict,
+        config_action_options=config_action_options,
+        default_config_action=default_config_action,
+        ai_action_options=ai_action_options,
+        default_ai_action=default_ai_action,
+        warnings=warnings,
+    )
 
 
 def _field_label_text(container: QWidget, object_name: str) -> str | None:
@@ -2272,3 +2383,306 @@ def test_post_commit_reload_failure_keeps_new_authoritative_cleared_binding(
     assert editor_channel["golden_sample_path"] is None
     assert editor_channel["golden_sample_label"] is None
     assert editor_data["golden_editor_state"] == {}
+
+
+def test_import_export_buttons_render_on_config_list_actions(qapp):
+    module = _make_module()
+
+    assert module.btn_import.text() == "导入"
+    assert module.btn_export.text() == "导出"
+
+
+def test_import_export_warns_when_export_without_selected_config(qapp, monkeypatch):
+    module = _make_module()
+    module._current_config_id = None
+    module.config_list.clear()
+
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module._on_export_package()
+
+    assert any("请选择" in str(args[-1]) for args in warnings)
+
+
+def test_dy_package_export_dialog_disables_ai_package_without_toolchain(qapp):
+    dialogs = importlib.import_module("ui.popups.config_package_dialogs")
+    dialog = dialogs.ConfigPackageExportDialog()
+
+    assert dialog.chk_include_ai_package.isEnabled() is False
+    assert dialog.chk_include_ai_package.isChecked() is False
+
+    dialog.chk_include_ai_toolchain.setChecked(True)
+    dialog.chk_include_ai_package.setChecked(True)
+
+    assert dialog.chk_include_ai_package.isEnabled() is True
+    assert dialog.chk_include_ai_package.isChecked() is True
+
+    dialog.chk_include_ai_toolchain.setChecked(False)
+
+    assert dialog.chk_include_ai_package.isEnabled() is False
+    assert dialog.chk_include_ai_package.isChecked() is False
+
+
+def test_dy_package_export_flow_uses_dy_filter_and_suffix(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    dialogs = importlib.import_module("ui.popups.config_package_dialogs")
+    captured = {}
+
+    def _fake_get_save_file_name(parent, title, default_name, selected_filter):
+        captured["title"] = title
+        captured["default_name"] = default_name
+        captured["filter"] = selected_filter
+        return str(tmp_path / "exported_config"), selected_filter
+
+    monkeypatch.setattr(
+        dialogs.QFileDialog,
+        "getSaveFileName",
+        staticmethod(_fake_get_save_file_name),
+    )
+
+    chosen = dialogs.choose_dy_export_path(None, default_name="Cfg1")
+
+    assert captured["filter"] == "DY Packages (*.dy)"
+    assert chosen == str(tmp_path / "exported_config.dy")
+
+
+def test_import_export_export_flow_collects_options_and_calls_package_service(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    config_service = _ConfigServiceStub(
+        loaded_configs={
+            7: _detail_payload([], config_id=7, config_name="Cfg1"),
+        }
+    )
+    package_service = _ConfigPackageServiceStub()
+    module = _make_module(
+        config_service=config_service,
+        config_package_service=package_service,
+    )
+    options = ConfigPackageExportOptions(
+        include_golden_samples=True,
+        include_ai_toolchain=True,
+        include_ai_package=False,
+    )
+    option_prompts = []
+    path_prompts = []
+    infos = []
+
+    monkeypatch.setattr(
+        "ui.modules.config.config_package_dialogs.choose_export_options",
+        lambda parent: option_prompts.append(parent) or options,
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.config_package_dialogs.choose_dy_export_path",
+        lambda parent, default_name: (
+            path_prompts.append((parent, default_name))
+            or str(tmp_path / "Cfg1.dy")
+        ),
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.information",
+        lambda *args: infos.append(args),
+    )
+
+    module._on_export_package()
+
+    assert option_prompts == [module]
+    assert path_prompts == [(module, "Cfg1")]
+    assert package_service.export_calls == [
+        {
+            "config_id": 7,
+            "target_path": str(tmp_path / "Cfg1.dy"),
+            "options": options,
+        }
+    ]
+    assert any("Cfg1.dy" in str(args[-1]) for args in infos)
+
+
+def test_dy_package_metadata_only_ai_conflict_uses_required_actions_and_default(
+    qapp,
+    monkeypatch,
+):
+    dialogs = importlib.import_module("ui.popups.config_package_dialogs")
+    preview = _package_preview(
+        config_name="ImportedCfg",
+        ai_toolchain_id="tc-1",
+        ai_conflict=True,
+        ai_action_options=("use_existing_toolchain", "clear_binding", "cancel"),
+        default_ai_action="use_existing_toolchain",
+        golden_samples=True,
+        ai_toolchain=True,
+        ai_package=False,
+    )
+    captured = {}
+
+    def _fake_exec(self):
+        captured["buttons"] = [button.text() for button in self.buttons()]
+        captured["default"] = self.defaultButton().text()
+        captured["text"] = self.text()
+        self._clicked_button = next(
+            button for button in self.buttons() if button.text() == "使用旧工具链"
+        )
+        return 0
+
+    monkeypatch.setattr(dialogs.QMessageBox, "exec", _fake_exec)
+    monkeypatch.setattr(
+        dialogs.QMessageBox,
+        "clickedButton",
+        lambda self: getattr(self, "_clicked_button", None),
+    )
+
+    decision = dialogs.choose_import_decision(None, preview)
+
+    assert captured["buttons"] == ["使用旧工具链", "清空 AI 绑定", "取消"]
+    assert captured["default"] == "使用旧工具链"
+    assert "源配置名称：ImportedCfg" in captured["text"]
+    assert "包含黄金样本：是" in captured["text"]
+    assert "包含 AI 工具链：是" in captured["text"]
+    assert "包含 AI 包：否" in captured["text"]
+    assert decision == ConfigPackageImportDecision(
+        config_action="create",
+        ai_action="use_existing_toolchain",
+    )
+
+
+def test_import_export_import_flow_inspects_imports_refreshes_and_selects_config(
+    qapp,
+    monkeypatch,
+):
+    config_service = _ConfigServiceStub(
+        loaded_configs={
+            7: _detail_payload([], config_id=7, config_name="ExistingCfg"),
+        }
+    )
+    preview = _package_preview(
+        config_name="ImportedCfg",
+        ai_toolchain_id="tc-1",
+        ai_conflict=True,
+        ai_action_options=("use_existing_toolchain", "clear_binding", "cancel"),
+        default_ai_action="use_existing_toolchain",
+        golden_samples=True,
+        ai_toolchain=True,
+        ai_package=False,
+    )
+    import_result = ConfigPackageImportResult(
+        status="created",
+        config_id=8,
+        config_name="ImportedCfg",
+        ai_binding_status="used_existing_toolchain",
+        warnings=("AI 绑定已沿用旧工具链。",),
+        info_message="导入完成。",
+    )
+    package_service = _ConfigPackageServiceStub(
+        preview=preview,
+        import_result=import_result,
+        on_import=lambda _path, _decision: config_service._loaded_configs.__setitem__(
+            8,
+            _detail_payload([], config_id=8, config_name="ImportedCfg"),
+        ),
+    )
+    module = _make_module(
+        config_service=config_service,
+        config_package_service=package_service,
+    )
+    chosen_decisions = []
+    infos = []
+    warnings = []
+
+    monkeypatch.setattr(
+        "ui.modules.config.config_package_dialogs.choose_dy_import_path",
+        lambda parent: "D:/packages/imported.dy",
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.config_package_dialogs.choose_import_decision",
+        lambda parent, incoming_preview: (
+            chosen_decisions.append(incoming_preview)
+            or ConfigPackageImportDecision(
+                config_action="create",
+                ai_action="use_existing_toolchain",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.information",
+        lambda *args: infos.append(args),
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module._on_import_package()
+
+    assert package_service.inspect_calls == ["D:/packages/imported.dy"]
+    assert package_service.import_calls == [
+        (
+            "D:/packages/imported.dy",
+            ConfigPackageImportDecision(
+                config_action="create",
+                ai_action="use_existing_toolchain",
+            ),
+        )
+    ]
+    assert chosen_decisions == [preview]
+    assert module.config_list.currentItem().data(Qt.ItemDataRole.UserRole) == 8
+    assert any("AI 绑定已沿用旧工具链。" in str(args[-1]) for args in warnings)
+    assert any("导入完成。" in str(args[-1]) for args in infos)
+
+
+def test_import_export_kept_existing_config_shows_info_message(qapp, monkeypatch):
+    preview = _package_preview(
+        config_name="ExistingCfg",
+        config_conflict=True,
+        config_action_options=("overwrite", "use_existing_config", "cancel"),
+        default_config_action="use_existing_config",
+    )
+    package_service = _ConfigPackageServiceStub(
+        preview=preview,
+        import_result=ConfigPackageImportResult(
+            status="kept_existing",
+            config_id=7,
+            config_name="ExistingCfg",
+            ai_binding_status="unchanged",
+            info_message="保留现有配置。",
+        ),
+    )
+    module = _make_module(config_package_service=package_service)
+    infos = []
+
+    monkeypatch.setattr(
+        "ui.modules.config.config_package_dialogs.choose_dy_import_path",
+        lambda parent: "D:/packages/existing.dy",
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.config_package_dialogs.choose_import_decision",
+        lambda parent, incoming_preview: ConfigPackageImportDecision(
+            config_action="use_existing_config",
+            ai_action="create",
+        ),
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.information",
+        lambda *args: infos.append(args),
+    )
+
+    module._on_import_package()
+
+    assert package_service.import_calls == [
+        (
+            "D:/packages/existing.dy",
+            ConfigPackageImportDecision(
+                config_action="use_existing_config",
+                ai_action="create",
+            ),
+        )
+    ]
+    assert any("保留现有配置。" in str(args[-1]) for args in infos)

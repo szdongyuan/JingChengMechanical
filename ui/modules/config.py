@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 )
 
 from model.plc_table import PlcTable
+from ui.popups import config_package_dialogs
 from ui.popups.golden_sample_import_dialog import GoldenSampleImportDialog
 from ui.widgets.cards import Card
 from ui.widgets.collapsible_group_box import CollapsibleGroupBox
@@ -140,8 +141,12 @@ class ConfigModule(QWidget):
         self.btn_new.setObjectName("Primary")
         self.btn_delete = QPushButton("删除")
         self.btn_delete.setObjectName("Danger")
+        self.btn_import = QPushButton("导入")
+        self.btn_export = QPushButton("导出")
         btn_lay.addWidget(self.btn_new)
         btn_lay.addWidget(self.btn_delete)
+        btn_lay.addWidget(self.btn_import)
+        btn_lay.addWidget(self.btn_export)
         left_lay.addWidget(btn_row)
 
         self.config_list = QListWidget()
@@ -363,6 +368,8 @@ class ConfigModule(QWidget):
     def _connect_signals(self):
         self.btn_new.clicked.connect(self._on_new)
         self.btn_delete.clicked.connect(self._on_delete)
+        self.btn_import.clicked.connect(self._on_import_package)
+        self.btn_export.clicked.connect(self._on_export_package)
         self.btn_save.clicked.connect(self._on_save)
         self.config_list.currentItemChanged.connect(self._on_item_changed)
         self.combo_input_dev.currentIndexChanged.connect(self._on_input_device_changed)
@@ -1644,6 +1651,7 @@ class ConfigModule(QWidget):
         self.empty_label.setVisible(not has_items)
         self.detail.setVisible(has_items)
         self.btn_delete.setEnabled(has_items)
+        self.btn_export.setEnabled(has_items)
         self.btn_save.setEnabled(has_items)
 
         if has_items:
@@ -1701,6 +1709,69 @@ class ConfigModule(QWidget):
         self.services.config_service.delete_config(config_id)
         self._current_config_id = None
         self._refresh_list()
+
+    def _on_export_package(self):
+        current = self.config_list.currentItem()
+        if current is None:
+            QMessageBox.warning(self, "导出失败", "请选择要导出的配置。")
+            return
+
+        config_id = current.data(Qt.ItemDataRole.UserRole)
+        config_name = current.text()
+        options = config_package_dialogs.choose_export_options(self)
+        if options is None:
+            return
+        target_path = config_package_dialogs.choose_dy_export_path(
+            self,
+            default_name=config_name,
+        )
+        if not target_path:
+            return
+
+        try:
+            self.services.config_package_service.export_package(
+                config_id=config_id,
+                target_path=target_path,
+                options=options,
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
+            return
+
+        QMessageBox.information(self, "导出成功", f"配置包已导出：{target_path}")
+
+    def _on_import_package(self):
+        source_path = config_package_dialogs.choose_dy_import_path(self)
+        if not source_path:
+            return
+
+        try:
+            preview = self.services.config_package_service.inspect_package(source_path)
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", str(e))
+            return
+
+        decision = config_package_dialogs.choose_import_decision(self, preview)
+        if decision is None:
+            return
+
+        try:
+            result = self.services.config_package_service.import_package(
+                source_path,
+                decision,
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", str(e))
+            return
+
+        if result.status in {"created", "overwritten"} and result.config_id is not None:
+            self._refresh_list()
+            self._select_config_by_id(result.config_id)
+
+        if result.warnings:
+            QMessageBox.warning(self, "导入提示", "\n".join(result.warnings))
+        if result.info_message:
+            QMessageBox.information(self, "导入提示", result.info_message)
 
     def _on_save(self):
         if self._current_config_id is None:
