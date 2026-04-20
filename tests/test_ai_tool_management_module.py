@@ -104,6 +104,7 @@ def _toolchain(toolchain_id: str, **updates) -> dict:
         "display_name": f"Toolchain {toolchain_id}",
         "version": "1.0",
         "entrypoint": f"python {toolchain_id}.py",
+        "package_dir": os.getcwd(),
         "default_timeout_ms": 30000,
         "enabled": True,
         "description": "",
@@ -237,6 +238,7 @@ def test_selecting_row_populates_execution_mode_and_runtime_helper_text(qapp):
     assert module.ed_display_name.text() == "Motor AI"
     assert module.ed_version.text() == "2.0"
     assert module.ed_entrypoint.toPlainText() == "python motor_ai_v2.py"
+    assert module.ed_package_dir.text() == os.getcwd()
     assert module.spin_timeout.value() == 45000
     assert module.chk_enabled.isChecked() is False
     assert module.txt_description.toPlainText() == "updated registry entry"
@@ -244,6 +246,27 @@ def test_selecting_row_populates_execution_mode_and_runtime_helper_text(qapp):
     assert "protocol_version = 1" in module.runtime_helper.text()
     assert "resident_process" in module.runtime_helper.text()
     assert "oneshot_process" in module.runtime_helper.text()
+
+
+def test_package_dir_browse_populates_editor_and_marks_dirty(qapp, tmp_path, monkeypatch):
+    module, _service, _bus = _make_module(toolchains=[_toolchain("motor-ai")])
+    _show(module, qapp)
+
+    module._select_toolchain("motor-ai")
+    qapp.processEvents()
+
+    selected_dir = tmp_path / "selected-package"
+    selected_dir.mkdir()
+    monkeypatch.setattr(
+        "ui.modules.ai_tool_management.QFileDialog.getExistingDirectory",
+        lambda *args, **kwargs: str(selected_dir),
+    )
+
+    module.btn_browse_package_dir.click()
+    qapp.processEvents()
+
+    assert module.ed_package_dir.text() == str(selected_dir)
+    assert module._is_dirty() is True
 
 
 def test_save_persists_selected_execution_mode(qapp):
@@ -254,13 +277,16 @@ def test_save_persists_selected_execution_mode(qapp):
     module.ed_toolchain_id.setText("motor-ai")
     module.ed_display_name.setText("Motor AI")
     module.ed_entrypoint.setPlainText("python motor_ai.py")
+    module.ed_package_dir.setText(os.getcwd())
     module.combo_execution_mode.setCurrentIndex(
         module.combo_execution_mode.findData("oneshot_process")
     )
 
+    assert module._collect_save_payload()["package_dir"] == os.getcwd()
     module.btn_save.click()
 
     assert service.saved_requests[-1][1]["execution_mode"] == "oneshot_process"
+    assert service.saved_requests[-1][1]["package_dir"] == os.getcwd()
 
 
 def test_large_timeout_value_loads_and_saves_without_clamping(qapp):
@@ -329,6 +355,7 @@ def test_save_new_toolchain_emits_registry_refresh(qapp):
     module.ed_display_name.setText("Motor AI")
     module.ed_version.setText("1.0")
     module.ed_entrypoint.setPlainText("python motor_ai.py")
+    module.ed_package_dir.setText(os.getcwd())
     module.spin_timeout.setValue(30000)
     module.chk_enabled.setChecked(True)
     module.txt_description.setPlainText("registry entry")
@@ -339,6 +366,7 @@ def test_save_new_toolchain_emits_registry_refresh(qapp):
     assert saved_original_id is None
     assert saved["toolchain_id"] == "motor-ai"
     assert saved["display_name"] == "Motor AI"
+    assert saved["package_dir"] == os.getcwd()
     assert bus.ai_toolchains_changed.emissions == [((), {})]
     assert module.toolchain_list.currentItem().data(Qt.ItemDataRole.UserRole) == "motor-ai"
     assert module.empty_label.isVisible() is False
@@ -397,6 +425,7 @@ def test_save_normalizes_editor_snapshot_and_discard_restores_persisted_row(
 
     module.ed_display_name.setText("Motor AI   ")
     module.ed_entrypoint.setPlainText("python motor_ai.py   ")
+    module.ed_package_dir.setText(f"  {os.getcwd()}  ")
     module.txt_description.setPlainText("saved description   ")
     qapp.processEvents()
 
@@ -407,12 +436,15 @@ def test_save_normalizes_editor_snapshot_and_discard_restores_persisted_row(
 
     assert service.saved_requests[-1][1]["display_name"] == "Motor AI"
     assert service.saved_requests[-1][1]["entrypoint"] == "python motor_ai.py"
+    assert service.saved_requests[-1][1]["package_dir"] == os.getcwd()
     assert service.saved_requests[-1][1]["description"] == "saved description"
     assert module.ed_display_name.text() == "Motor AI"
     assert module.ed_entrypoint.toPlainText() == "python motor_ai.py"
+    assert module.ed_package_dir.text() == os.getcwd()
     assert module.txt_description.toPlainText() == "saved description"
     assert module._editor_snapshot["display_name"] == "Motor AI"
     assert module._editor_snapshot["entrypoint"] == "python motor_ai.py"
+    assert module._editor_snapshot["package_dir"] == os.getcwd()
     assert module._editor_snapshot["description"] == "saved description"
 
     module.ed_version.setText("2.0")
@@ -422,6 +454,7 @@ def test_save_normalizes_editor_snapshot_and_discard_restores_persisted_row(
     assert module.confirm_leave() is True
     assert module.ed_display_name.text() == "Motor AI"
     assert module.ed_entrypoint.toPlainText() == "python motor_ai.py"
+    assert module.ed_package_dir.text() == os.getcwd()
     assert module.ed_version.text() == "1.0"
     assert module.txt_description.toPlainText() == "saved description"
 
@@ -484,6 +517,7 @@ def test_delete_button_is_disabled_for_new_draft_without_selection(qapp):
     [
         ("duplicate", "工具链标识已存在"),
         ("missing_required", "工具链标识、显示名称和入口命令不能为空"),
+        ("missing_package_dir", "AI 包目录不能为空"),
         ("invalid_timeout", "默认超时必须大于 0"),
     ],
 )
@@ -505,12 +539,15 @@ def test_local_validation_shows_warning_before_service_write(
     module.ed_toolchain_id.setText("new-ai")
     module.ed_display_name.setText("New AI")
     module.ed_entrypoint.setPlainText("python new_ai.py")
+    module.ed_package_dir.setText(os.getcwd())
     module.spin_timeout.setValue(30000)
 
     if setup == "duplicate":
         module.ed_toolchain_id.setText("existing-ai")
     elif setup == "missing_required":
         module.ed_toolchain_id.setText("")
+    elif setup == "missing_package_dir":
+        module.ed_package_dir.setText("")
     elif setup == "invalid_timeout":
         module.spin_timeout.setValue(0)
 
@@ -536,6 +573,7 @@ def test_busy_save_error_shows_user_warning(qapp, monkeypatch):
     module.ed_toolchain_id.setText("motor-ai")
     module.ed_display_name.setText("Motor AI")
     module.ed_entrypoint.setPlainText("python motor_ai.py")
+    module.ed_package_dir.setText(os.getcwd())
     module.combo_execution_mode.setCurrentIndex(
         module.combo_execution_mode.findData("resident_process")
     )
@@ -550,6 +588,7 @@ def test_busy_save_error_shows_user_warning(qapp, monkeypatch):
                 "display_name": "Motor AI",
                 "version": "",
                 "entrypoint": "python motor_ai.py",
+                "package_dir": os.getcwd(),
                 "default_timeout_ms": 30000,
                 "enabled": True,
                 "description": "",

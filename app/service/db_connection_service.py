@@ -92,6 +92,7 @@ class DbConnectionService:
                 ("protocol_version", "INTEGER NOT NULL DEFAULT 1"),
                 ("execution_mode", "TEXT NOT NULL DEFAULT 'resident_process'"),
                 ("description", "TEXT NOT NULL DEFAULT ''"),
+                ("package_dir", "TEXT NOT NULL DEFAULT ''"),
             ],
         )
         self._ensure_columns(

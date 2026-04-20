@@ -187,6 +187,17 @@ class AiService:
             "execution_mode": execution_mode,
         }
 
+        package_dir = data.get("package_dir")
+        if not isinstance(package_dir, str):
+            raise ValueError("package_dir must be a string")
+        package_dir = package_dir.strip()
+        if not package_dir:
+            raise ValueError("package_dir must not be empty")
+        package_dir = os.path.abspath(package_dir)
+        if not os.path.isdir(package_dir):
+            raise ValueError("package_dir must be an existing directory")
+        normalized["package_dir"] = package_dir
+
         timeout_ms = data.get("default_timeout_ms")
         if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms <= 0:
             raise ValueError("default_timeout_ms must be a positive integer")
@@ -266,6 +277,7 @@ class AiService:
                     existing.display_name = normalized["display_name"]
                     existing.version = normalized["version"]
                     existing.entrypoint = normalized["entrypoint"]
+                    existing.package_dir = normalized["package_dir"]
                     existing.default_timeout_ms = normalized["default_timeout_ms"]
                     existing.enabled = normalized["enabled"]
                     existing.description = normalized["description"]
@@ -442,6 +454,11 @@ class AiService:
                 "status": "not_configured",
                 "error": "Toolchain not found or disabled",
             }
+        if not getattr(tc, "package_dir", "").strip() or not os.path.isdir(tc.package_dir):
+            return {
+                "status": "preflight_error",
+                "error": "Toolchain package_dir is missing or invalid",
+            }
 
         # Validate params_json
         try:
@@ -498,11 +515,13 @@ class AiService:
 
     def execute_toolchain(
         self,
+        *,
         entrypoint: str,
         request_json_path: str,
         response_json_path: str,
         artifacts_dir: str,
         timeout_ms: int,
+        package_dir: str | None = None,
     ) -> dict:
         """Execute external toolchain process. Returns execution envelope dict."""
         started_at = _now_iso()
@@ -521,6 +540,7 @@ class AiService:
                 capture_output=True,
                 text=True,
                 timeout=timeout_ms / 1000.0,
+                cwd=package_dir or None,
             )
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             finished_at = _now_iso()
@@ -690,6 +710,7 @@ class AiService:
             resident_result = self._resident_runtime.analyze(
                 toolchain_id=toolchain.toolchain_id,
                 entrypoint=toolchain.entrypoint,
+                package_dir=toolchain.package_dir,
                 request_id=request_id,
                 request_payload=request_data,
                 artifacts_dir=artifacts_dir,
@@ -752,6 +773,7 @@ class AiService:
 
         exec_result = self.execute_toolchain(
             entrypoint=toolchain.entrypoint,
+            package_dir=toolchain.package_dir,
             request_json_path=request_json_path,
             response_json_path=response_json_path,
             artifacts_dir=artifacts_dir,

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
+
 from PyQt6.QtCore import QRegularExpression, Qt
 from PyQt6.QtGui import QRegularExpressionValidator
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -150,6 +153,16 @@ class AiToolManagementModule(QWidget):
         self.ed_entrypoint.setMaximumHeight(80)
         form_lay.addRow("入口命令", self.ed_entrypoint)
 
+        package_dir_row = QWidget()
+        package_dir_lay = QHBoxLayout(package_dir_row)
+        package_dir_lay.setContentsMargins(0, 0, 0, 0)
+        package_dir_lay.setSpacing(8)
+        self.ed_package_dir = QLineEdit()
+        self.btn_browse_package_dir = QPushButton("浏览")
+        package_dir_lay.addWidget(self.ed_package_dir, 1)
+        package_dir_lay.addWidget(self.btn_browse_package_dir)
+        form_lay.addRow("AI 包目录", package_dir_row)
+
         self.spin_timeout = _LargeIntegerEditor()
         self.spin_timeout.setRange(0, 2_147_483_647)
         self.spin_timeout.setSingleStep(1000)
@@ -200,10 +213,12 @@ class AiToolManagementModule(QWidget):
         self.ed_display_name.textChanged.connect(self._on_editor_changed)
         self.ed_version.textChanged.connect(self._on_editor_changed)
         self.ed_entrypoint.textChanged.connect(self._on_editor_changed)
+        self.ed_package_dir.textChanged.connect(self._on_editor_changed)
         self.spin_timeout.textChanged.connect(self._on_editor_changed)
         self.chk_enabled.toggled.connect(self._on_editor_changed)
         self.combo_execution_mode.currentIndexChanged.connect(self._on_editor_changed)
         self.txt_description.textChanged.connect(self._on_editor_changed)
+        self.btn_browse_package_dir.clicked.connect(self._browse_package_dir)
 
     def _refresh_list(self, selected_toolchain_id: str | None = None):
         rows = sorted(
@@ -242,6 +257,7 @@ class AiToolManagementModule(QWidget):
             "display_name": "",
             "version": "",
             "entrypoint": "",
+            "package_dir": "",
             "default_timeout_ms": 30000,
             "enabled": True,
             "execution_mode": _DEFAULT_EXECUTION_MODE,
@@ -259,6 +275,7 @@ class AiToolManagementModule(QWidget):
                 "display_name": row.get("display_name", ""),
                 "version": row.get("version", ""),
                 "entrypoint": row.get("entrypoint", ""),
+                "package_dir": row.get("package_dir", ""),
                 "default_timeout_ms": int(row.get("default_timeout_ms") or 0),
                 "enabled": bool(row.get("enabled", True)),
                 "execution_mode": row.get("execution_mode", _DEFAULT_EXECUTION_MODE),
@@ -319,6 +336,7 @@ class AiToolManagementModule(QWidget):
             self.ed_display_name.setText(row.get("display_name", ""))
             self.ed_version.setText(row.get("version", ""))
             self.ed_entrypoint.setPlainText(row.get("entrypoint", ""))
+            self.ed_package_dir.setText(row.get("package_dir", ""))
             self.spin_timeout.setValue(int(row.get("default_timeout_ms") or 0))
             self.chk_enabled.setChecked(bool(row.get("enabled", True)))
             self._set_execution_mode(
@@ -327,6 +345,16 @@ class AiToolManagementModule(QWidget):
             self.txt_description.setPlainText(row.get("description", ""))
         finally:
             self._suspend_editor_change_tracking = False
+
+    def _browse_package_dir(self):
+        start_dir = self.ed_package_dir.text().strip() or os.getcwd()
+        selected_dir = QFileDialog.getExistingDirectory(
+            self,
+            "选择 AI 包目录",
+            start_dir,
+        )
+        if selected_dir:
+            self.ed_package_dir.setText(selected_dir)
 
     def _set_execution_mode(self, execution_mode: str):
         index = self.combo_execution_mode.findData(execution_mode)
@@ -387,6 +415,7 @@ class AiToolManagementModule(QWidget):
             "display_name": self.ed_display_name.text(),
             "version": self.ed_version.text(),
             "entrypoint": self.ed_entrypoint.toPlainText(),
+            "package_dir": self.ed_package_dir.text(),
             "default_timeout_ms": self.spin_timeout.value(),
             "enabled": self.chk_enabled.isChecked(),
             "execution_mode": self.combo_execution_mode.currentData()
@@ -401,6 +430,7 @@ class AiToolManagementModule(QWidget):
             "display_name": payload["display_name"].strip(),
             "version": payload["version"].strip(),
             "entrypoint": payload["entrypoint"].strip(),
+            "package_dir": payload["package_dir"].strip(),
             "default_timeout_ms": payload["default_timeout_ms"],
             "enabled": payload["enabled"],
             "execution_mode": payload["execution_mode"],
@@ -414,6 +444,10 @@ class AiToolManagementModule(QWidget):
             or not payload["entrypoint"]
         ):
             raise ValueError("工具链标识、显示名称和入口命令不能为空")
+        if not payload["package_dir"]:
+            raise ValueError("AI 包目录不能为空")
+        if not os.path.isdir(payload["package_dir"]):
+            raise ValueError("AI 包目录必须是已存在的目录")
         if payload["default_timeout_ms"] <= 0:
             raise ValueError("默认超时必须大于 0")
         duplicate = payload["toolchain_id"] in self._toolchain_rows

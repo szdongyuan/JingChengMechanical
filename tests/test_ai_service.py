@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from contextlib import contextmanager
 from unittest.mock import MagicMock
 
@@ -50,6 +51,7 @@ def _toolchain_payload(**overrides):
         "display_name": "Motor AI",
         "version": "1.0",
         "entrypoint": "python motor_ai.py",
+        "package_dir": os.getcwd(),
         "default_timeout_ms": 30000,
         "enabled": True,
         "description": "",
@@ -89,6 +91,7 @@ def toolchain():
         display_name="Motor AI",
         version="1.0",
         entrypoint="python motor_ai.py",
+        package_dir=os.getcwd(),
         default_timeout_ms=30000,
     )
 
@@ -111,6 +114,7 @@ class TestToolchainRegistry:
             display_name="Disabled",
             version="2",
             entrypoint="disabled.py",
+            package_dir=os.getcwd(),
             enabled=False,
         )
 
@@ -124,6 +128,7 @@ class TestToolchainRegistry:
             display_name="Disabled",
             version="1",
             entrypoint="x",
+            package_dir=os.getcwd(),
             enabled=False,
         )
         assert ai_service.list_enabled_toolchains() == []
@@ -152,6 +157,43 @@ class TestToolchainRegistry:
 
 
 class TestToolchainRegistryCrud:
+    def test_save_toolchain_rejects_missing_package_dir(self, ai_service):
+        with pytest.raises(ValueError, match="package_dir"):
+            ai_service.save_toolchain(
+                None,
+                _toolchain_payload(package_dir=""),
+            )
+
+    def test_save_toolchain_rejects_non_directory_package_dir(
+        self, ai_service, tmp_path
+    ):
+        missing = tmp_path / "missing"
+
+        with pytest.raises(ValueError, match="package_dir"):
+            ai_service.save_toolchain(
+                None,
+                _toolchain_payload(package_dir=str(missing)),
+            )
+
+    def test_save_toolchain_round_trips_package_dir(self, ai_service, tmp_path):
+        package_dir = tmp_path / "tool"
+        package_dir.mkdir()
+
+        saved_id = ai_service.save_toolchain(
+            None,
+            _toolchain_payload(
+                toolchain_id="roundtrip-ai",
+                display_name="Roundtrip AI",
+                package_dir=str(package_dir),
+            ),
+        )
+
+        row = ai_service.get_toolchain(saved_id)
+
+        assert row is not None
+        assert row.package_dir == str(package_dir)
+        assert ai_service.list_toolchains()[0]["package_dir"] == str(package_dir)
+
     def test_save_toolchain_defaults_execution_mode_to_resident_process(
         self, ai_service
     ):
@@ -845,6 +887,30 @@ class TestToolchainRegistryCrud:
 
 
 class TestRunAiAnalysisRouting:
+    def test_execute_toolchain_runs_with_package_dir_cwd(
+        self, ai_service, tmp_path, monkeypatch
+    ):
+        package_dir = tmp_path / "pkg"
+        package_dir.mkdir()
+        captured = {}
+
+        def _run(cmd, **kwargs):
+            captured["cwd"] = kwargs.get("cwd")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", _run)
+
+        ai_service.execute_toolchain(
+            entrypoint="python main.py",
+            package_dir=str(package_dir),
+            request_json_path="request.json",
+            response_json_path="response.json",
+            artifacts_dir="artifacts",
+            timeout_ms=30000,
+        )
+
+        assert captured["cwd"] == str(package_dir)
+
     def test_run_ai_analysis_routes_resident_process_through_runtime(
         self, ai_service, config, toolchain, tmp_path, monkeypatch
     ):
@@ -902,6 +968,7 @@ class TestRunAiAnalysisRouting:
         assert resident_calls[0]["toolchain_id"] == "motor-ai"
         assert resident_calls[0]["request_id"] == result["request_id"]
         assert resident_calls[0]["request_payload"]["toolchain_id"] == "motor-ai"
+        assert resident_calls[0]["package_dir"] == toolchain.package_dir
         assert resident_calls[0]["artifacts_dir"] == result["artifacts_dir"]
 
     def test_run_ai_analysis_routes_oneshot_process_through_execute_toolchain(
@@ -927,6 +994,7 @@ class TestRunAiAnalysisRouting:
         def _execute(
             *,
             entrypoint: str,
+            package_dir: str,
             request_json_path: str,
             response_json_path: str,
             artifacts_dir: str,
@@ -935,6 +1003,7 @@ class TestRunAiAnalysisRouting:
             execute_calls.append(
                 {
                     "entrypoint": entrypoint,
+                    "package_dir": package_dir,
                     "request_json_path": request_json_path,
                     "response_json_path": response_json_path,
                     "artifacts_dir": artifacts_dir,
@@ -975,6 +1044,7 @@ class TestRunAiAnalysisRouting:
         )
 
         assert result["module_status"] == "success"
+        assert execute_calls[0]["package_dir"] == toolchain.package_dir
         assert execute_calls[0]["request_json_path"] == result["request_json_path"]
         assert execute_calls[0]["response_json_path"] == result["response_json_path"]
 

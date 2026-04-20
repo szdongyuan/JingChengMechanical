@@ -10,10 +10,14 @@ from model.test_config_table import TestConfigTable as ConfigTable
 
 
 @pytest.fixture
-def config_and_toolchain():
+def config_and_toolchain(tmp_path):
     cfg = ConfigTable.create(config_name="Test Config 1")
     tc = AiToolchainTable.create(
-        toolchain_id="tc-1", display_name="TC1", version="1", entrypoint="echo"
+        toolchain_id="tc-1",
+        display_name="TC1",
+        version="1",
+        entrypoint="echo",
+        package_dir=str(tmp_path),
     )
     return cfg, tc
 
@@ -52,7 +56,11 @@ class TestAiBindingTable:
         cfg, tc = config_and_toolchain
         AiBindingTable.create(config=cfg, toolchain=tc)
         tc2 = AiToolchainTable.create(
-            toolchain_id="tc-2", display_name="TC2", version="1", entrypoint="echo2"
+            toolchain_id="tc-2",
+            display_name="TC2",
+            version="1",
+            entrypoint="echo2",
+            package_dir=tc.package_dir,
         )
         with pytest.raises(IntegrityError):
             AiBindingTable.create(config=cfg, toolchain=tc2)
