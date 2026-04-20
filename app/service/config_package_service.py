@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 import json
+import ntpath
 import os
 import re
 import hashlib
@@ -1355,6 +1356,8 @@ class ConfigPackageService:
         if re.match(r"^[A-Za-z]:($|/)", normalized):
             raise ValueError("Archive contains a drive-prefixed path")
         parts = normalized.split("/")
+        if any(ntpath.splitdrive(part)[0] for part in parts):
+            raise ValueError("Archive contains a drive-prefixed path")
         if any(part == "" for part in parts):
             raise ValueError("Archive contains an empty path segment")
         if any(part == ".." for part in parts):

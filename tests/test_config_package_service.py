@@ -689,6 +689,8 @@ def test_inspect_package_rejects_missing_manifest(tmp_path: Path, services: Simp
     ("entries", "match"),
     [
         ({"C:/evil.txt": b"x"}, "drive"),
+        ({"C:evil.txt": b"x"}, "drive"),
+        ({"dir/C:evil.txt": b"x"}, "drive"),
         ({"/evil.txt": b"x"}, "absolute"),
         ({"../evil.txt": b"x"}, "traversal"),
     ],
