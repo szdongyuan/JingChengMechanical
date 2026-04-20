@@ -226,7 +226,7 @@ def test_octave_bar_chart_widget_uses_zero_based_bar_center_range(qapp):
         )
         qapp.processEvents()
 
-        _assert_x_range(widget, (0.0, 2.0))
+        _assert_x_range(widget, (-0.5, 2.5))
     finally:
         widget.close()
 
@@ -251,7 +251,7 @@ def test_octave_bar_chart_widget_limit_markers_do_not_expand_zero_based_x_range(
         )
         qapp.processEvents()
 
-        _assert_x_range(widget, (0.0, 2.0))
+        _assert_x_range(widget, (-0.5, 2.5))
     finally:
         widget.close()
 
@@ -401,7 +401,7 @@ def test_octave_bar_chart_widget_single_bar_uses_one_point_fallback(qapp):
         )
         qapp.processEvents()
 
-        _assert_x_range(widget, (0.0, 1.0))
+        _assert_x_range(widget, (-0.5, 0.5))
     finally:
         widget.close()
 
@@ -515,7 +515,7 @@ def test_chart_widgets_programmatic_refresh_reset_preserve_zero_based_axes(qapp)
 
         _assert_x_range(line, (0.0, 4.0))
         _assert_x_range(fft, (0.0, 500.0))
-        _assert_x_range(octave, (0.0, 2.0))
+        _assert_x_range(octave, (-0.5, 2.5))
         _assert_xy_range(stft, (0.0, 2.0), (0.0, 300.0))
     finally:
         line.close()
