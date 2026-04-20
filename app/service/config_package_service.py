@@ -3,12 +3,22 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
+import logging
+import shutil
 import stat
 import tempfile
+import uuid
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
+
+from consts.running_consts import base_dir
+from consts.time_consts import now_str
+from model.ai_toolchain_table import AiToolchainTable
+from model.test_config_ai_binding_table import TestConfigAiBindingTable
+from model.test_config_table import TestConfigTable
 
 if TYPE_CHECKING:
     from app.service.ai_service import AiService
@@ -26,6 +36,8 @@ _MANIFEST_ENTRY = "manifest.json"
 _AI_TOOLCHAIN_ENTRY = "ai/toolchain.json"
 _AI_PACKAGE_PREFIX = "ai/package"
 _GOLDEN_PREFIX = "golden_samples"
+_AI_MANAGED_ROOT_PARTS = ("data", "ai_toolchains")
+_TOOLCHAIN_MARKER_NAME = ".jingcheng_toolchain_id"
 _TOOLCHAIN_METADATA_FIELDS = (
     "toolchain_id",
     "display_name",
@@ -39,6 +51,7 @@ _TOOLCHAIN_METADATA_FIELDS = (
     "source_package_dir",
 )
 _OPTIONAL_TOOLCHAIN_METADATA_FIELDS = ("package_archive_path",)
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -63,12 +76,48 @@ class ConfigPackagePreview:
 
 
 @dataclass(frozen=True)
+class ConfigPackageImportDecision:
+    config_action: Literal["create", "overwrite", "use_existing_config", "cancel"] = "create"
+    ai_action: Literal[
+        "create",
+        "overwrite",
+        "use_existing_toolchain",
+        "clear_binding",
+        "cancel",
+    ] = "create"
+
+
+@dataclass(frozen=True)
+class ConfigPackageImportResult:
+    status: Literal["created", "overwritten", "kept_existing", "cancelled"]
+    config_id: int | None
+    config_name: str
+    ai_binding_status: Literal[
+        "created_toolchain",
+        "overwrote_toolchain",
+        "used_existing_toolchain",
+        "cleared_binding",
+        "no_ai_metadata",
+        "cancelled",
+        "unchanged",
+    ]
+    warnings: tuple[str, ...] = ()
+    info_message: str | None = None
+
+
+@dataclass(frozen=True)
 class _ArchiveInspection:
     manifest: dict
     contents: dict[str, bool]
     config_payload: dict
     ai_toolchain_metadata: dict | None
     file_entries: dict[str, zipfile.ZipInfo]
+
+
+@dataclass(frozen=True)
+class _RestoredAiPackage:
+    package_dir: str
+    backup_dir: str | None = None
 
 
 class ConfigPackageService:
@@ -206,6 +255,173 @@ class ConfigPackageService:
 
     def inspect_package(self, path: str) -> ConfigPackagePreview:
         inspection = self._inspect_archive(path)
+        return self._build_preview(inspection)
+
+    def import_package(
+        self,
+        path: str,
+        decision: ConfigPackageImportDecision,
+    ) -> ConfigPackageImportResult:
+        if not isinstance(decision, ConfigPackageImportDecision):
+            raise ValueError("decision must be ConfigPackageImportDecision")
+
+        inspection = self._inspect_archive(path)
+        preview = self._build_preview(inspection)
+        existing_config = self._get_config_row_by_name(preview.config_name)
+        config_action = self._resolve_requested_action(
+            decision.config_action,
+            allowed=preview.config_action_options,
+            default_action=preview.default_config_action,
+            label="config",
+        )
+        if config_action == "cancel":
+            return ConfigPackageImportResult(
+                status="cancelled",
+                config_id=None,
+                config_name=preview.config_name,
+                ai_binding_status="cancelled",
+                info_message="Import cancelled.",
+            )
+        if config_action == "use_existing_config":
+            if existing_config is None:
+                raise ValueError("配置不存在或已被删除")
+            return ConfigPackageImportResult(
+                status="kept_existing",
+                config_id=int(existing_config.config_id),
+                config_name=preview.config_name,
+                ai_binding_status="unchanged",
+                info_message="Existing local config was kept.",
+            )
+
+        target_config_id = (
+            int(existing_config.config_id)
+            if config_action == "overwrite"
+            else self._config_service.reserve_import_config_id()
+        )
+        ai_action = self._resolve_ai_action(decision.ai_action, preview)
+        if ai_action == "cancel":
+            return ConfigPackageImportResult(
+                status="cancelled",
+                config_id=None,
+                config_name=preview.config_name,
+                ai_binding_status="cancelled",
+                info_message="Import cancelled.",
+            )
+
+        restored_ai: _RestoredAiPackage | None = None
+        restored_golden_paths: list[str] = []
+        warnings = list(preview.warnings)
+
+        with tempfile.TemporaryDirectory(prefix="config-package-import-") as extract_root:
+            self._extract_archive(path, inspection, extract_root)
+            try:
+                restored_golden = self._restore_golden_samples(
+                    inspection=inspection,
+                    extract_root=extract_root,
+                    target_config_id=target_config_id,
+                )
+                restored_golden_paths = [
+                    binding["golden_sample_path"]
+                    for binding in restored_golden.values()
+                    if isinstance(binding, dict)
+                    and isinstance(binding.get("golden_sample_path"), str)
+                ]
+                prepared_config = self._config_service.prepare_import_payload(
+                    inspection.config_payload["config"],
+                    golden_asset_paths_by_channel=restored_golden,
+                )
+                prepared_config["config_id"] = target_config_id
+                config_errors = self._config_service.validate(prepared_config)
+                if config_errors:
+                    raise ValueError("\n".join(config_errors))
+                if config_action == "create" and TestConfigTable.select().where(
+                    TestConfigTable.config_id == target_config_id
+                ).exists():
+                    raise ValueError("导入配置 ID 已被占用")
+
+                old_golden_paths = (
+                    self._config_service._collect_replaced_paths(
+                        target_config_id,
+                        prepared_config["channels"],
+                    )
+                    if config_action == "overwrite"
+                    else []
+                )
+
+                ai_binding_status = "unchanged"
+                toolchain_row_written = False
+                binding_target_toolchain_id: str | None = None
+                normalized_toolchain = None
+                if inspection.ai_toolchain_metadata is None:
+                    ai_binding_status = "no_ai_metadata"
+                elif inspection.contents["ai_package"]:
+                    if ai_action == "use_existing_toolchain":
+                        binding_target_toolchain_id = preview.ai_toolchain_id
+                        ai_binding_status = "used_existing_toolchain"
+                    else:
+                        restored_ai = self._restore_ai_package(
+                            inspection=inspection,
+                            extract_root=extract_root,
+                            toolchain_id=preview.ai_toolchain_id,
+                        )
+                        normalized_toolchain = self._normalize_imported_toolchain_payload(
+                            inspection.ai_toolchain_metadata,
+                            package_dir=restored_ai.package_dir,
+                        )
+                        toolchain_row_written = True
+                        binding_target_toolchain_id = normalized_toolchain["toolchain_id"]
+                        ai_binding_status = (
+                            "overwrote_toolchain"
+                            if preview.ai_conflict
+                            else "created_toolchain"
+                        )
+                else:
+                    if ai_action == "use_existing_toolchain":
+                        binding_target_toolchain_id = preview.ai_toolchain_id
+                        ai_binding_status = "used_existing_toolchain"
+                    else:
+                        ai_binding_status = "cleared_binding"
+                        if not warnings:
+                            warnings.append("AI binding was cleared during import.")
+
+                binding_payload = self._build_import_binding_payload(
+                    imported_binding=inspection.config_payload.get("ai_binding"),
+                    toolchain_id=binding_target_toolchain_id,
+                    clear_binding=ai_binding_status in {"cleared_binding", "no_ai_metadata"},
+                )
+
+                database = TestConfigTable._meta.database
+                with database.atomic():
+                    if normalized_toolchain is not None:
+                        self._upsert_imported_toolchain_row(normalized_toolchain)
+                    self._persist_imported_config(
+                        prepared_config,
+                        config_action=config_action,
+                    )
+                    self._upsert_binding_row(
+                        config_id=target_config_id,
+                        binding=binding_payload,
+                    )
+
+                self._config_service._post_commit_cleanup(
+                    old_paths=old_golden_paths,
+                    staged_paths=[],
+                )
+                self._cleanup_restored_ai_backup(restored_ai)
+                self._emit_import_signals(toolchain_row_written, preview.ai_toolchain_id)
+                return ConfigPackageImportResult(
+                    status="created" if config_action == "create" else "overwritten",
+                    config_id=target_config_id,
+                    config_name=preview.config_name,
+                    ai_binding_status=ai_binding_status,
+                    warnings=tuple(warnings),
+                )
+            except Exception:
+                self._rollback_restored_golden_paths(restored_golden_paths)
+                self._rollback_restored_ai_package(restored_ai)
+                raise
+
+    def _build_preview(self, inspection: _ArchiveInspection) -> ConfigPackagePreview:
         config_root = inspection.config_payload.get("config")
         if not isinstance(config_root, dict):
             raise ValueError("config/config.json must contain a config object")
@@ -214,10 +430,7 @@ class ConfigPackageService:
         if not config_name:
             raise ValueError("config/config.json is missing config_name")
 
-        config_conflict = any(
-            row.get("config_name") == config_name
-            for row in self._config_service.list_configs()
-        )
+        config_conflict = self._get_config_row_by_name(config_name) is not None
         if config_conflict:
             config_action_options = ("overwrite", "use_existing_config", "cancel")
             default_config_action = "use_existing_config"
@@ -275,6 +488,354 @@ class ConfigPackageService:
             warnings=tuple(warnings),
         )
 
+    def _get_config_row_by_name(self, config_name: str) -> TestConfigTable | None:
+        normalized = str(config_name or "").strip()
+        if not normalized:
+            return None
+        return (
+            TestConfigTable.select()
+            .where(TestConfigTable.config_name == normalized)
+            .first()
+        )
+
+    def _resolve_requested_action(
+        self,
+        requested_action: str | None,
+        *,
+        allowed: tuple[str, ...],
+        default_action: str | None,
+        label: str,
+    ) -> str | None:
+        if requested_action == "cancel":
+            return "cancel"
+        if not allowed:
+            return None
+        if requested_action in allowed:
+            return requested_action
+        if requested_action in (None, "create") and default_action in allowed:
+            return default_action
+        raise ValueError(f"Unsupported {label} import action: {requested_action}")
+
+    def _resolve_ai_action(
+        self,
+        requested_action: str | None,
+        preview: ConfigPackagePreview,
+    ) -> str | None:
+        if preview.ai_action_options:
+            return self._resolve_requested_action(
+                requested_action,
+                allowed=preview.ai_action_options,
+                default_action=preview.default_ai_action,
+                label="AI",
+            )
+        if requested_action == "cancel":
+            return "cancel"
+        return None
+
+    def _extract_archive(
+        self,
+        path: str,
+        inspection: _ArchiveInspection,
+        extract_root: str,
+    ) -> None:
+        with zipfile.ZipFile(os.path.abspath(str(path))) as zf:
+            for normalized_name, info in inspection.file_entries.items():
+                target_path = os.path.abspath(
+                    os.path.join(extract_root, *normalized_name.split("/"))
+                )
+                if not self._is_within_root(target_path, extract_root):
+                    raise ValueError("Archive extraction would escape target directory")
+                os.makedirs(os.path.dirname(target_path), exist_ok=True)
+                with zf.open(info) as src, open(target_path, "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+
+    def _restore_golden_samples(
+        self,
+        *,
+        inspection: _ArchiveInspection,
+        extract_root: str,
+        target_config_id: int,
+    ) -> dict[int, dict]:
+        golden_assets = inspection.config_payload.get("golden_sample_assets", {})
+        if golden_assets is None:
+            golden_assets = {}
+        if not isinstance(golden_assets, dict):
+            raise ValueError("config/config.json golden_sample_assets must be an object")
+
+        restored: dict[int, dict] = {}
+        config_root = inspection.config_payload["config"]
+        channels = config_root.get("channels", [])
+        if not isinstance(channels, list):
+            return restored
+
+        for channel in channels:
+            if not isinstance(channel, dict):
+                continue
+            channel_index = channel.get("channel_index")
+            if not isinstance(channel_index, int) or isinstance(channel_index, bool):
+                continue
+            raw_archive_name = golden_assets.get(str(channel_index))
+            if raw_archive_name is None:
+                continue
+            normalized_name = self._normalize_archive_name(raw_archive_name)
+            if normalized_name not in inspection.file_entries:
+                raise ValueError("Package references a golden sample asset that is missing")
+            source_path = os.path.abspath(
+                os.path.join(extract_root, *normalized_name.split("/"))
+            )
+            restored[channel_index] = self._golden_samples.restore_imported_sample(
+                config_id=target_config_id,
+                channel_index=channel_index,
+                source_path=source_path,
+                metadata=channel,
+            )
+        return restored
+
+    def _normalize_imported_toolchain_payload(
+        self,
+        metadata: dict,
+        *,
+        package_dir: str,
+    ) -> dict:
+        payload = {
+            "toolchain_id": metadata["toolchain_id"],
+            "display_name": metadata["display_name"],
+            "version": metadata["version"],
+            "entrypoint": metadata["entrypoint"],
+            "protocol_version": metadata["protocol_version"],
+            "execution_mode": metadata["execution_mode"],
+            "default_timeout_ms": metadata["default_timeout_ms"],
+            "enabled": metadata["enabled"],
+            "description": metadata["description"],
+            "package_dir": package_dir,
+        }
+        original_toolchain_id = (
+            payload["toolchain_id"]
+            if self._ai_service.get_toolchain(payload["toolchain_id"]) is not None
+            else None
+        )
+        return self._ai_service._normalize_toolchain_payload(
+            original_toolchain_id,
+            payload,
+        )
+
+    def _build_import_binding_payload(
+        self,
+        *,
+        imported_binding: object,
+        toolchain_id: str | None,
+        clear_binding: bool,
+    ) -> dict:
+        source = imported_binding if isinstance(imported_binding, dict) else {}
+        params_json = source.get("params_json", "{}")
+        if not isinstance(params_json, str):
+            params_json = json.dumps(params_json, ensure_ascii=False)
+        timeout_ms = source.get("timeout_ms")
+        if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int):
+            timeout_ms = None
+        enabled = bool(source.get("enabled", False)) and toolchain_id is not None
+        if clear_binding:
+            enabled = False
+            toolchain_id = None
+        return {
+            "enabled": enabled,
+            "toolchain_id": toolchain_id,
+            "timeout_ms": timeout_ms,
+            "params_json": params_json,
+        }
+
+    def _upsert_imported_toolchain_row(self, normalized_toolchain: dict) -> None:
+        existing = self._ai_service.get_toolchain(normalized_toolchain["toolchain_id"])
+        timestamp = now_str()
+        if existing is None:
+            AiToolchainTable.create(
+                **normalized_toolchain,
+                created_time=timestamp,
+                updated_time=timestamp,
+            )
+            return
+
+        existing.display_name = normalized_toolchain["display_name"]
+        existing.version = normalized_toolchain["version"]
+        existing.entrypoint = normalized_toolchain["entrypoint"]
+        existing.package_dir = normalized_toolchain["package_dir"]
+        existing.default_timeout_ms = normalized_toolchain["default_timeout_ms"]
+        existing.enabled = normalized_toolchain["enabled"]
+        existing.description = normalized_toolchain["description"]
+        existing.protocol_version = normalized_toolchain["protocol_version"]
+        existing.execution_mode = normalized_toolchain["execution_mode"]
+        existing.updated_time = timestamp
+        existing.save()
+
+    def _persist_imported_config(self, prepared_config: dict, *, config_action: str) -> None:
+        config_id = prepared_config["config_id"]
+        if config_action == "create":
+            TestConfigTable.create(
+                config_id=config_id,
+                created_time=now_str(),
+                updated_time=now_str(),
+                **self._config_service._config_row_values(prepared_config),
+            )
+            self._config_service._replace_channel_rows(
+                config_id=config_id,
+                channels=prepared_config["channels"],
+            )
+            return
+
+        if not TestConfigTable.select().where(TestConfigTable.config_id == config_id).exists():
+            raise ValueError("配置不存在或已被删除")
+        (
+            TestConfigTable.update(
+                **self._config_service._config_row_values(prepared_config),
+                updated_time=now_str(),
+            )
+            .where(TestConfigTable.config_id == config_id)
+            .execute()
+        )
+        self._config_service._replace_channel_rows(
+            config_id=config_id,
+            channels=prepared_config["channels"],
+        )
+
+    def _upsert_binding_row(self, *, config_id: int, binding: dict) -> None:
+        timestamp = now_str()
+        existing = (
+            TestConfigAiBindingTable.select()
+            .where(TestConfigAiBindingTable.config == config_id)
+            .first()
+        )
+        if existing is None:
+            TestConfigAiBindingTable.create(
+                config=config_id,
+                enabled=binding["enabled"],
+                toolchain=binding["toolchain_id"],
+                timeout_ms=binding["timeout_ms"],
+                params_json=binding["params_json"],
+                updated_time=timestamp,
+            )
+            return
+
+        existing.enabled = binding["enabled"]
+        existing.toolchain = binding["toolchain_id"]
+        existing.timeout_ms = binding["timeout_ms"]
+        existing.params_json = binding["params_json"]
+        existing.updated_time = timestamp
+        existing.save()
+
+    def _managed_ai_root(self) -> str:
+        return os.path.abspath(os.path.join(base_dir, *_AI_MANAGED_ROOT_PARTS))
+
+    def _restore_ai_package(
+        self,
+        *,
+        inspection: _ArchiveInspection,
+        extract_root: str,
+        toolchain_id: str | None,
+    ) -> _RestoredAiPackage:
+        if not isinstance(toolchain_id, str) or not toolchain_id.strip():
+            raise ValueError("ai/toolchain.json toolchain_id must not be empty")
+        source_prefix = inspection.ai_toolchain_metadata["package_archive_path"]
+        normalized_prefix = self._normalize_archive_name(source_prefix)
+        source_root = os.path.abspath(
+            os.path.join(extract_root, *normalized_prefix.split("/"))
+        )
+        if not os.path.isdir(source_root):
+            raise ValueError("Extracted AI package directory is missing")
+
+        final_dir = self._select_managed_toolchain_dir(toolchain_id)
+        backup_dir = None
+        if os.path.isdir(final_dir):
+            backup_dir = f"{final_dir}.backup.{uuid.uuid4().hex}"
+            os.replace(final_dir, backup_dir)
+        elif os.path.exists(final_dir):
+            raise ValueError("Managed AI package path is occupied by a non-directory entry")
+
+        try:
+            shutil.copytree(source_root, final_dir)
+            self._write_toolchain_marker(final_dir, toolchain_id)
+        except Exception:
+            self._remove_managed_dir(final_dir)
+            if backup_dir is not None and os.path.isdir(backup_dir):
+                os.replace(backup_dir, final_dir)
+            raise
+        return _RestoredAiPackage(package_dir=final_dir, backup_dir=backup_dir)
+
+    def _select_managed_toolchain_dir(self, toolchain_id: str) -> str:
+        root = self._managed_ai_root()
+        os.makedirs(root, exist_ok=True)
+        digest = hashlib.sha256(toolchain_id.encode("utf-8")).hexdigest()[:16]
+        sanitized = re.sub(r"[^A-Za-z0-9._-]+", "_", toolchain_id).strip("._-")
+        if not sanitized:
+            sanitized = "toolchain"
+        base_name = f"{sanitized}_{digest}"
+        suffix = 1
+        while True:
+            candidate_name = base_name if suffix == 1 else f"{base_name}_{suffix}"
+            candidate = os.path.abspath(os.path.join(root, candidate_name))
+            if not os.path.exists(candidate):
+                return candidate
+            if self._read_toolchain_marker(candidate) == toolchain_id:
+                return candidate
+            suffix += 1
+
+    def _read_toolchain_marker(self, package_dir: str) -> str | None:
+        marker_path = os.path.join(package_dir, _TOOLCHAIN_MARKER_NAME)
+        if not os.path.isfile(marker_path):
+            return None
+        try:
+            with open(marker_path, "r", encoding="utf-8") as marker:
+                return marker.read().strip() or None
+        except OSError:
+            return None
+
+    def _write_toolchain_marker(self, package_dir: str, toolchain_id: str) -> None:
+        marker_path = os.path.join(package_dir, _TOOLCHAIN_MARKER_NAME)
+        with open(marker_path, "w", encoding="utf-8") as marker:
+            marker.write(toolchain_id)
+
+    def _rollback_restored_golden_paths(self, golden_paths: list[str]) -> None:
+        if not golden_paths:
+            return
+        try:
+            self._golden_samples.cleanup_paths(golden_paths)
+        except Exception as exc:  # pragma: no cover - logging branch
+            logger.warning("Failed to rollback imported golden samples: %s", exc)
+
+    def _rollback_restored_ai_package(
+        self,
+        restored_ai: _RestoredAiPackage | None,
+    ) -> None:
+        if restored_ai is None:
+            return
+        self._remove_managed_dir(restored_ai.package_dir)
+        if restored_ai.backup_dir and os.path.isdir(restored_ai.backup_dir):
+            os.replace(restored_ai.backup_dir, restored_ai.package_dir)
+
+    def _cleanup_restored_ai_backup(self, restored_ai: _RestoredAiPackage | None) -> None:
+        if restored_ai is None or restored_ai.backup_dir is None:
+            return
+        try:
+            shutil.rmtree(restored_ai.backup_dir)
+        except OSError as exc:  # pragma: no cover - logging branch
+            logger.warning("Failed to cleanup AI package backup: %s", exc)
+
+    def _emit_import_signals(self, toolchain_row_written: bool, toolchain_id: str | None) -> None:
+        self._config_service.bus.config_changed.emit()
+        if toolchain_row_written and toolchain_id:
+            self._ai_service._resident_runtime.invalidate(toolchain_id)
+            ai_signal = getattr(self._config_service.bus, "ai_toolchains_changed", None)
+            if ai_signal is not None:
+                ai_signal.emit()
+
+    def _remove_managed_dir(self, package_dir: str) -> None:
+        if (
+            not package_dir
+            or not os.path.isdir(package_dir)
+            or not self._is_within_root(package_dir, self._managed_ai_root())
+        ):
+            return
+        shutil.rmtree(package_dir)
+
     def _inspect_archive(self, path: str) -> _ArchiveInspection:
         archive_path = os.path.abspath(str(path))
         try:
@@ -291,6 +852,11 @@ class ConfigPackageService:
                     raise ValueError("config/config.json is missing")
                 config_payload = self._read_json_entry(zf, config_info, "config/config.json")
                 self._validate_layout(
+                    contents=contents,
+                    file_entries=file_entries,
+                )
+                self._validate_import_config_payload(
+                    config_payload=config_payload,
                     contents=contents,
                     file_entries=file_entries,
                 )
@@ -387,6 +953,33 @@ class ConfigPackageService:
 
         if contents["ai_package"] and not contents["ai_toolchain"]:
             raise ValueError("Manifest contents.ai_package requires contents.ai_toolchain")
+
+    def _validate_import_config_payload(
+        self,
+        *,
+        config_payload: dict,
+        contents: dict[str, bool],
+        file_entries: dict[str, zipfile.ZipInfo],
+    ) -> None:
+        config_root = config_payload.get("config")
+        if not isinstance(config_root, dict):
+            raise ValueError("config/config.json must contain a config object")
+
+        golden_assets = config_payload.get("golden_sample_assets", {})
+        if golden_assets is None:
+            golden_assets = {}
+        if not isinstance(golden_assets, dict):
+            raise ValueError("config/config.json golden_sample_assets must be an object")
+
+        if contents["golden_samples"]:
+            for archive_name in golden_assets.values():
+                if not isinstance(archive_name, str) or not archive_name.strip():
+                    raise ValueError("config/config.json golden_sample_assets is invalid")
+                normalized_name = self._normalize_archive_name(archive_name)
+                if normalized_name not in file_entries:
+                    raise ValueError("Manifest declared golden samples but an asset is missing")
+        elif golden_assets:
+            raise ValueError("Manifest contradicts packaged golden samples")
 
     def _validate_manifest(self, manifest: dict) -> dict[str, bool]:
         if not isinstance(manifest, dict):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -16,10 +17,13 @@ import app.service.config_package_service as config_package_module
 from app.service.ai_service import AiService
 from app.service.config_package_service import (
     ConfigPackageExportOptions,
+    ConfigPackageImportDecision,
     ConfigPackageService,
 )
 from app.service.config_service import ConfigService
 from app.service.golden_sample_service import GoldenSampleService
+
+_TOOLCHAIN_MARKER_NAME = ".jingcheng_toolchain_id"
 
 
 class FakeBus:
@@ -103,6 +107,39 @@ def _config_payload(config_id: int, *, config_name: str = "Cfg1") -> dict:
     }
 
 
+def _channel_payload_with_golden(channel_index: int, **binding) -> dict:
+    channel = _channel_payload(channel_index)
+    if "label" in binding:
+        channel["golden_sample_label"] = binding["label"]
+    if "source_channel" in binding:
+        channel["golden_sample_source_channel"] = binding["source_channel"]
+    if "start_sample" in binding:
+        channel["golden_sample_start_sample"] = binding["start_sample"]
+    if "num_samples" in binding:
+        channel["golden_sample_num_samples"] = binding["num_samples"]
+    if "start_ms" in binding:
+        channel["golden_sample_start_ms"] = binding["start_ms"]
+    if "duration_ms" in binding:
+        channel["golden_sample_duration_ms"] = binding["duration_ms"]
+    if "sample_rate" in binding:
+        channel["golden_sample_sample_rate"] = binding["sample_rate"]
+    channel.update({
+        key: value
+        for key, value in binding.items()
+        if key
+        not in {
+            "label",
+            "source_channel",
+            "start_sample",
+            "num_samples",
+            "start_ms",
+            "duration_ms",
+            "sample_rate",
+        }
+    })
+    return channel
+
+
 def _write_wav(path: Path, *, samples: int = 144_000, sample_rate: int = 48_000) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     data = np.linspace(-0.5, 0.5, num=samples, dtype=np.float32)
@@ -110,15 +147,21 @@ def _write_wav(path: Path, *, samples: int = 144_000, sample_rate: int = 48_000)
     return path
 
 
-def _golden_binding(source_path: Path) -> dict:
+def _golden_binding(
+    source_path: Path,
+    *,
+    num_samples: int = 144_000,
+    sample_rate: float = 48_000.0,
+    duration_ms: int = 3000,
+) -> dict:
     return {
         "label": source_path.name,
         "source_channel": 0,
         "start_sample": 0,
-        "num_samples": 144_000,
+        "num_samples": num_samples,
         "start_ms": 0,
-        "duration_ms": 3000,
-        "sample_rate": 48_000.0,
+        "duration_ms": duration_ms,
+        "sample_rate": sample_rate,
     }
 
 
@@ -176,16 +219,32 @@ def _bind_toolchain(
     return toolchain_id
 
 
-def _package_entries(*, include_ai_metadata: bool = False, include_ai_package: bool = False) -> dict[str, object]:
-    config_payload = {
-        "config": _config_payload(999, config_name="Imported"),
-        "ai_binding": {
+def _package_entries(
+    *,
+    include_ai_metadata: bool = False,
+    include_ai_package: bool = False,
+    config_payload: dict | None = None,
+    ai_binding: dict | None = None,
+    golden_assets: dict[int, bytes] | None = None,
+    toolchain_overrides: dict | None = None,
+) -> dict[str, object]:
+    config_root = config_payload or _config_payload(999, config_name="Imported")
+    golden_assets = golden_assets or {}
+    binding_payload = ai_binding
+    if binding_payload is None:
+        binding_payload = {
             "enabled": include_ai_metadata,
             "toolchain_id": "motor-ai" if include_ai_metadata else None,
             "timeout_ms": None,
             "params_json": "{}",
+        }
+    config_payload = {
+        "config": config_root,
+        "ai_binding": binding_payload,
+        "golden_sample_assets": {
+            str(channel_index): f"golden_samples/channel_{channel_index}.wav"
+            for channel_index in golden_assets
         },
-        "golden_sample_assets": {},
     }
     manifest = {
         "format": "jingcheng-config-package",
@@ -194,7 +253,7 @@ def _package_entries(*, include_ai_metadata: bool = False, include_ai_package: b
         "exported_at": "2026-04-20T12:00:00Z",
         "contents": {
             "config": True,
-            "golden_samples": False,
+            "golden_samples": bool(golden_assets),
             "ai_toolchain": include_ai_metadata,
             "ai_package": include_ai_package,
         },
@@ -217,8 +276,12 @@ def _package_entries(*, include_ai_metadata: bool = False, include_ai_package: b
             "source_package_dir": "D:/source-machine/motor-ai",
             **({"package_archive_path": "ai/package"} if include_ai_package else {}),
         }
+        if toolchain_overrides:
+            entries["ai/toolchain.json"].update(toolchain_overrides)
     if include_ai_package:
         entries["ai/package/main.py"] = b"print('ok')\n"
+    for channel_index, payload in golden_assets.items():
+        entries[f"golden_samples/channel_{channel_index}.wav"] = payload
     return entries
 
 
@@ -876,3 +939,527 @@ def test_inspect_package_reports_config_and_runnable_ai_conflicts(
         "cancel",
     )
     assert preview.default_ai_action in preview.ai_action_options
+
+
+def _managed_toolchain_dir_name(toolchain_id: str) -> str:
+    digest = hashlib.sha256(toolchain_id.encode("utf-8")).hexdigest()[:16]
+    return f"{toolchain_id}_{digest}"
+
+
+def _write_toolchain_marker(path: Path, toolchain_id: str) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    (path / _TOOLCHAIN_MARKER_NAME).write_text(toolchain_id, encoding="utf-8")
+
+
+def test_import_package_creates_new_config_by_default_and_restores_golden_samples(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    source_wav = _write_wav(
+        tmp_path / "source-machine.wav",
+        samples=288_000,
+        sample_rate=96_000,
+    )
+    imported_channel = _channel_payload_with_golden(
+        0,
+        **_golden_binding(
+            source_wav,
+            num_samples=288_000,
+            sample_rate=96_000.0,
+        ),
+        fft_golden_mode="absolute",
+        fft_show_golden_overlay=True,
+        oct_golden_mode="absolute",
+        oct_show_golden_overlay=True,
+    )
+    imported_config = _config_payload(999, config_name="Imported")
+    imported_config.update(
+        {
+            "plc_id": 123,
+            "input_device_name": "Imported Mic",
+            "input_device_hostapi": "Imported API",
+            "input_device_samplerate": 96_000.0,
+            "output_device_name": "Imported Speaker",
+            "output_device_hostapi": "Imported Output API",
+            "output_device_samplerate": 44_100.0,
+            "channels": [imported_channel],
+            "selected_channels": [0],
+        }
+    )
+    path = _write_package(
+        tmp_path / "import.dy",
+        _package_entries(
+            config_payload=imported_config,
+            golden_assets={0: source_wav.read_bytes()},
+        ),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(),
+    )
+
+    assert result.status == "created"
+    assert result.config_id not in (None, 999)
+    assert result.ai_binding_status == "no_ai_metadata"
+
+    loaded = services.config_service.load_config(result.config_id)
+    channel = loaded["channels"][0]
+
+    assert loaded["plc_id"] is None
+    assert loaded["input_device_name"] == "Imported Mic"
+    assert loaded["input_device_hostapi"] == "Imported API"
+    assert loaded["input_device_samplerate"] == 96_000.0
+    assert loaded["output_device_name"] == "Imported Speaker"
+    assert loaded["output_device_hostapi"] == "Imported Output API"
+    assert loaded["output_device_samplerate"] == 44_100.0
+    assert channel["golden_sample_path"] != str(source_wav)
+    assert Path(channel["golden_sample_path"]).exists()
+    assert services.config_service.golden_sample_service.is_managed_path(
+        channel["golden_sample_path"]
+    )
+
+
+def test_import_package_config_conflict_use_existing_skips_entire_package_import(
+    tmp_path: Path,
+    services: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(config_package_module, "base_dir", str(tmp_path))
+    existing_id = _create_saved_config(services, name="Imported")
+    local_package_dir = tmp_path / "local-tool"
+    local_package_dir.mkdir()
+    (local_package_dir / "main.py").write_text("print('local')\n", encoding="utf-8")
+    services.ai_service.save_toolchain(None, _toolchain_payload(local_package_dir))
+    source_wav = _write_wav(tmp_path / "source-machine.wav")
+    imported_config = _config_payload(999, config_name="Imported")
+    imported_config["channels"] = [
+        _channel_payload_with_golden(0, **_golden_binding(source_wav))
+    ]
+    imported_config["selected_channels"] = [0]
+    path = _write_package(
+        tmp_path / "conflict.dy",
+        _package_entries(
+            include_ai_metadata=True,
+            include_ai_package=True,
+            config_payload=imported_config,
+            golden_assets={0: source_wav.read_bytes()},
+        ),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(
+            config_action="use_existing_config",
+            ai_action="overwrite",
+        ),
+    )
+
+    assert result.status == "kept_existing"
+    assert result.config_id == existing_id
+    assert result.ai_binding_status == "unchanged"
+    assert services.config_service.list_configs() == [
+        {"config_id": existing_id, "config_name": "Imported"}
+    ]
+    assert services.ai_service.get_toolchain("motor-ai").package_dir == str(local_package_dir)
+    assert not (tmp_path / "data" / "ai_toolchains").exists()
+
+
+def test_import_package_overwrites_existing_config_and_keeps_local_id(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    config_id = _create_saved_config(services, name="Imported")
+    imported_config = _config_payload(999, config_name="Imported")
+    imported_config.update(
+        {
+            "plc_id": 999,
+            "input_device_name": "Source Mic",
+            "input_device_hostapi": "Source API",
+            "input_device_samplerate": 44_100.0,
+            "output_device_name": "Source Speaker",
+            "output_device_hostapi": "Source Out API",
+            "output_device_samplerate": 48_000.0,
+        }
+    )
+    path = _write_package(
+        tmp_path / "overwrite.dy",
+        _package_entries(config_payload=imported_config),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="overwrite"),
+    )
+
+    loaded = services.config_service.load_config(config_id)
+
+    assert result.status == "overwritten"
+    assert result.config_id == config_id
+    assert loaded["config_id"] == config_id
+    assert loaded["plc_id"] is None
+    assert loaded["input_device_name"] == "Source Mic"
+    assert loaded["input_device_hostapi"] == "Source API"
+    assert loaded["input_device_samplerate"] == 44_100.0
+    assert loaded["output_device_name"] == "Source Speaker"
+    assert loaded["output_device_hostapi"] == "Source Out API"
+    assert loaded["output_device_samplerate"] == 48_000.0
+
+
+def test_import_package_overwrite_rollback_preserves_old_golden_binding(
+    tmp_path: Path,
+    services: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    existing_id = _create_saved_config(services, name="Imported")
+    old_source = _write_wav(tmp_path / "existing-source.wav")
+    old_binding = services.config_service.golden_sample_service.restore_imported_sample(
+        config_id=existing_id,
+        channel_index=0,
+        source_path=str(old_source),
+        metadata=_golden_binding(old_source),
+    )
+    payload = _config_payload(existing_id, config_name="Imported")
+    payload["channels"][0].update(old_binding)
+    services.config_service.save_config(payload)
+
+    new_source = _write_wav(tmp_path / "new-source.wav")
+    imported_config = _config_payload(999, config_name="Imported")
+    imported_config["channels"] = [
+        _channel_payload_with_golden(0, **_golden_binding(new_source))
+    ]
+    imported_config["selected_channels"] = [0]
+    path = _write_package(
+        tmp_path / "rollback.dy",
+        _package_entries(
+            config_payload=imported_config,
+            golden_assets={0: new_source.read_bytes()},
+        ),
+    )
+
+    original_replace = services.config_service._replace_channel_rows
+
+    def _explode(*args, **kwargs):
+        original_replace(*args, **kwargs)
+        raise RuntimeError("db exploded")
+
+    monkeypatch.setattr(services.config_service, "_replace_channel_rows", _explode)
+
+    with pytest.raises(RuntimeError, match="db exploded"):
+        services.config_package_service.import_package(
+            str(path),
+            ConfigPackageImportDecision(config_action="overwrite"),
+        )
+
+    loaded = services.config_service.load_config(existing_id)
+    assert loaded["channels"][0]["golden_sample_path"] == old_binding["golden_sample_path"]
+    assert Path(old_binding["golden_sample_path"]).exists()
+    assert sorted((tmp_path / "managed").rglob("*.wav")) == [
+        Path(old_binding["golden_sample_path"])
+    ]
+
+
+def test_import_package_cancel_aborts_without_mutation(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    existing_id = _create_saved_config(services, name="Imported")
+    path = _write_package(
+        tmp_path / "cancel.dy",
+        _package_entries(config_payload=_config_payload(999, config_name="Imported")),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="cancel"),
+    )
+
+    assert result.status == "cancelled"
+    assert result.config_id is None
+    assert result.ai_binding_status == "cancelled"
+    assert services.config_service.list_configs() == [
+        {"config_id": existing_id, "config_name": "Imported"}
+    ]
+
+
+def test_import_package_metadata_only_without_local_toolchain_clears_binding_and_warns(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    path = _write_package(
+        tmp_path / "metadata-only.dy",
+        _package_entries(include_ai_metadata=True, include_ai_package=False),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(ai_action="clear_binding"),
+    )
+
+    binding = services.ai_service.resolve_binding(result.config_id)
+
+    assert result.status == "created"
+    assert result.ai_binding_status == "cleared_binding"
+    assert binding["enabled"] is False
+    assert binding["toolchain_id"] is None
+    assert services.ai_service.list_toolchains() == []
+    assert any("runnable AI package" in warning for warning in result.warnings)
+
+
+def test_import_package_metadata_only_matching_local_toolchain_uses_existing_by_default(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    local_package_dir = tmp_path / "local-tool"
+    local_package_dir.mkdir()
+    toolchain_id = services.ai_service.save_toolchain(
+        None,
+        _toolchain_payload(local_package_dir),
+    )
+    original_toolchain = services.ai_service.get_toolchain(toolchain_id)
+    path = _write_package(
+        tmp_path / "metadata-default.dy",
+        _package_entries(include_ai_metadata=True, include_ai_package=False),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(),
+    )
+
+    rebound = services.ai_service.resolve_binding(result.config_id)
+    toolchain = services.ai_service.get_toolchain(toolchain_id)
+
+    assert result.ai_binding_status == "used_existing_toolchain"
+    assert rebound["toolchain_id"] == toolchain_id
+    assert toolchain.package_dir == str(local_package_dir)
+    assert toolchain.updated_time == original_toolchain.updated_time
+
+
+def test_import_package_runnable_ai_create_restores_managed_package_dir(
+    tmp_path: Path,
+    services: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(config_package_module, "base_dir", str(tmp_path))
+    path = _write_package(
+        tmp_path / "runnable.dy",
+        _package_entries(include_ai_metadata=True, include_ai_package=True),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(),
+    )
+
+    binding = services.ai_service.resolve_binding(result.config_id)
+    toolchain = services.ai_service.get_toolchain("motor-ai")
+
+    assert result.ai_binding_status == "created_toolchain"
+    assert binding["toolchain_id"] == "motor-ai"
+    assert toolchain is not None
+    assert Path(toolchain.package_dir).is_dir()
+    assert toolchain.package_dir.startswith(str(tmp_path / "data" / "ai_toolchains"))
+    assert (Path(toolchain.package_dir) / "main.py").read_text(encoding="utf-8") == "print('ok')\n"
+    assert (Path(toolchain.package_dir) / _TOOLCHAIN_MARKER_NAME).read_text(encoding="utf-8") == "motor-ai"
+
+
+def test_import_package_runnable_ai_use_existing_toolchain_keeps_local_metadata_and_package(
+    tmp_path: Path,
+    services: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(config_package_module, "base_dir", str(tmp_path))
+    local_package_dir = tmp_path / "local-tool"
+    local_package_dir.mkdir()
+    (local_package_dir / "main.py").write_text("print('local')\n", encoding="utf-8")
+    services.ai_service.save_toolchain(
+        None,
+        _toolchain_payload(
+            local_package_dir,
+            version="9.9",
+            display_name="Local AI",
+        ),
+    )
+    path = _write_package(
+        tmp_path / "runnable-use-existing.dy",
+        _package_entries(include_ai_metadata=True, include_ai_package=True),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(ai_action="use_existing_toolchain"),
+    )
+
+    toolchain = services.ai_service.get_toolchain("motor-ai")
+
+    assert result.ai_binding_status == "used_existing_toolchain"
+    assert toolchain.version == "9.9"
+    assert toolchain.display_name == "Local AI"
+    assert toolchain.package_dir == str(local_package_dir)
+    assert (local_package_dir / "main.py").read_text(encoding="utf-8") == "print('local')\n"
+
+
+def test_import_package_runnable_ai_overwrite_external_package_dir_keeps_external_dir(
+    tmp_path: Path,
+    services: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(config_package_module, "base_dir", str(tmp_path))
+    external_dir = tmp_path / "external-tool"
+    external_dir.mkdir()
+    (external_dir / "main.py").write_text("print('external')\n", encoding="utf-8")
+    services.ai_service.save_toolchain(
+        None,
+        _toolchain_payload(external_dir, version="0.9"),
+    )
+    path = _write_package(
+        tmp_path / "runnable-overwrite.dy",
+        _package_entries(
+            include_ai_metadata=True,
+            include_ai_package=True,
+            toolchain_overrides={"version": "2.0"},
+        ),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(ai_action="overwrite"),
+    )
+
+    toolchain = services.ai_service.get_toolchain("motor-ai")
+
+    assert result.ai_binding_status == "overwrote_toolchain"
+    assert toolchain.version == "2.0"
+    assert toolchain.package_dir != str(external_dir)
+    assert toolchain.package_dir.startswith(str(tmp_path / "data" / "ai_toolchains"))
+    assert external_dir.exists()
+    assert (external_dir / "main.py").read_text(encoding="utf-8") == "print('external')\n"
+    assert (Path(toolchain.package_dir) / "main.py").read_text(encoding="utf-8") == "print('ok')\n"
+
+
+def test_import_package_overwrite_managed_ai_package_restores_backup_on_db_failure(
+    tmp_path: Path,
+    services: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(config_package_module, "base_dir", str(tmp_path))
+    managed_dir = tmp_path / "data" / "ai_toolchains" / _managed_toolchain_dir_name("motor-ai")
+    _write_toolchain_marker(managed_dir, "motor-ai")
+    (managed_dir / "main.py").write_text("print('old')\n", encoding="utf-8")
+    services.ai_service.save_toolchain(
+        None,
+        _toolchain_payload(managed_dir, version="0.9"),
+    )
+    path = _write_package(
+        tmp_path / "ai-rollback.dy",
+        _package_entries(
+            include_ai_metadata=True,
+            include_ai_package=True,
+            toolchain_overrides={"version": "2.0"},
+        ),
+    )
+
+    original_replace = services.config_service._replace_channel_rows
+
+    def _explode(*args, **kwargs):
+        original_replace(*args, **kwargs)
+        raise RuntimeError("db exploded")
+
+    monkeypatch.setattr(services.config_service, "_replace_channel_rows", _explode)
+
+    with pytest.raises(RuntimeError, match="db exploded"):
+        services.config_package_service.import_package(
+            str(path),
+            ConfigPackageImportDecision(ai_action="overwrite"),
+        )
+
+    toolchain = services.ai_service.get_toolchain("motor-ai")
+    assert toolchain.package_dir == str(managed_dir)
+    assert (managed_dir / "main.py").read_text(encoding="utf-8") == "print('old')\n"
+
+
+def test_import_package_reuses_same_marker_managed_ai_directory(
+    tmp_path: Path,
+    services: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(config_package_module, "base_dir", str(tmp_path))
+    managed_dir = tmp_path / "data" / "ai_toolchains" / _managed_toolchain_dir_name("motor-ai")
+    _write_toolchain_marker(managed_dir, "motor-ai")
+    (managed_dir / "stale.txt").write_text("stale", encoding="utf-8")
+    path = _write_package(
+        tmp_path / "reuse-marker.dy",
+        _package_entries(include_ai_metadata=True, include_ai_package=True),
+    )
+
+    services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(),
+    )
+
+    toolchain = services.ai_service.get_toolchain("motor-ai")
+    assert toolchain.package_dir == str(managed_dir)
+    assert (managed_dir / "main.py").exists()
+    assert not (managed_dir / "stale.txt").exists()
+
+
+def test_import_package_uses_suffix_when_managed_ai_directory_marker_collides(
+    tmp_path: Path,
+    services: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(config_package_module, "base_dir", str(tmp_path))
+    managed_root = tmp_path / "data" / "ai_toolchains"
+    base_name = _managed_toolchain_dir_name("motor-ai")
+    _write_toolchain_marker(managed_root / base_name, "other-a")
+    _write_toolchain_marker(managed_root / f"{base_name}_2", "other-b")
+    path = _write_package(
+        tmp_path / "suffix-collision.dy",
+        _package_entries(include_ai_metadata=True, include_ai_package=True),
+    )
+
+    services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(),
+    )
+
+    toolchain = services.ai_service.get_toolchain("motor-ai")
+    assert Path(toolchain.package_dir).name == f"{base_name}_3"
+
+
+def test_import_package_without_ai_metadata_clears_binding_without_mutating_local_toolchains(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    local_package_dir = tmp_path / "local-tool"
+    local_package_dir.mkdir()
+    services.ai_service.save_toolchain(None, _toolchain_payload(local_package_dir))
+    original = services.ai_service.get_toolchain("motor-ai")
+    path = _write_package(
+        tmp_path / "no-ai-metadata.dy",
+        _package_entries(
+            include_ai_metadata=False,
+            include_ai_package=False,
+            ai_binding={
+                "enabled": True,
+                "toolchain_id": "motor-ai",
+                "timeout_ms": None,
+                "params_json": "{}",
+            },
+        ),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(),
+    )
+
+    binding = services.ai_service.resolve_binding(result.config_id)
+    toolchain = services.ai_service.get_toolchain("motor-ai")
+
+    assert result.ai_binding_status == "no_ai_metadata"
+    assert binding["enabled"] is False
+    assert binding["toolchain_id"] is None
+    assert toolchain.package_dir == str(local_package_dir)
+    assert toolchain.updated_time == original.updated_time
