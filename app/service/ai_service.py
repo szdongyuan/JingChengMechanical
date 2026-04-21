@@ -9,15 +9,18 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
+import secrets
 import shlex
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
-from peewee import DoesNotExist
+from peewee import DoesNotExist, IntegrityError
 
 from app.service.ai_resident_runtime import ResidentToolchainRuntime
 from model.ai_toolchain_table import AiToolchainTable
@@ -31,6 +34,9 @@ _SUPPORTED_EXECUTION_MODES = {
     "resident_process",
     "oneshot_process",
 }
+_GENERATED_TOOLCHAIN_PREFIX_FALLBACK = "toolchain"
+_GENERATED_TOOLCHAIN_PREFIX_MAX_LEN = 24
+_GENERATED_TOOLCHAIN_RANDOM_HEX_LEN = 8
 
 _TZ8 = timezone(timedelta(hours=8))
 
@@ -148,6 +154,37 @@ class AiService:
             raise ValueError(f"{field_name} must not be empty")
         return normalized
 
+    @classmethod
+    def generated_toolchain_prefix(cls, display_name: str) -> str:
+        value = display_name.strip().lower()
+        value = unicodedata.normalize("NFKD", value)
+        value = value.encode("ascii", "ignore").decode("ascii")
+        value = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
+        if not value:
+            return _GENERATED_TOOLCHAIN_PREFIX_FALLBACK
+        value = value[:_GENERATED_TOOLCHAIN_PREFIX_MAX_LEN].strip("_")
+        return value or _GENERATED_TOOLCHAIN_PREFIX_FALLBACK
+
+    def generate_toolchain_id_from_prefix(self, prefix: str) -> str:
+        normalized_prefix = self.generated_toolchain_prefix(prefix)
+        while True:
+            suffix = secrets.token_hex(_GENERATED_TOOLCHAIN_RANDOM_HEX_LEN // 2)
+            toolchain_id = f"{normalized_prefix}_{suffix}"
+            if self.get_toolchain(toolchain_id) is None:
+                return toolchain_id
+
+    def generate_toolchain_id(self, display_name: str) -> str:
+        return self.generate_toolchain_id_from_prefix(
+            self.generated_toolchain_prefix(display_name)
+        )
+
+    @staticmethod
+    def _is_toolchain_id_uniqueness_error(exc: IntegrityError) -> bool:
+        message = str(exc).lower()
+        if "toolchain_id" not in message:
+            return False
+        return "unique" in message or "primary key" in message
+
     def _normalize_toolchain_payload(
         self, original_toolchain_id: str | None, data: dict
     ) -> dict:
@@ -202,6 +239,15 @@ class AiService:
         if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms <= 0:
             raise ValueError("default_timeout_ms must be a positive integer")
         normalized["default_timeout_ms"] = timeout_ms
+
+        generated_id_prefix = data.get("generated_id_prefix")
+        if generated_id_prefix is not None:
+            if not isinstance(generated_id_prefix, str):
+                raise ValueError("generated_id_prefix must be a string")
+            if generated_id_prefix.strip():
+                normalized["generated_id_prefix"] = self.generated_toolchain_prefix(
+                    generated_id_prefix
+                )
 
         existing = self.get_toolchain(normalized["toolchain_id"])
         if existing is not None and normalized["toolchain_id"] != original_toolchain_id:
@@ -260,15 +306,29 @@ class AiService:
         )
         with mutation_lease:
             normalized = self._normalize_toolchain_payload(original_toolchain_id, data)
+            generated_id_prefix = normalized.pop("generated_id_prefix", None)
             timestamp = now_str()
 
             with database.atomic():
                 if original_toolchain_id is None:
-                    row = AiToolchainTable.create(
+                    create_payload = {
                         **normalized,
-                        created_time=timestamp,
-                        updated_time=timestamp,
-                    )
+                        "created_time": timestamp,
+                        "updated_time": timestamp,
+                    }
+                    try:
+                        row = AiToolchainTable.create(**create_payload)
+                    except IntegrityError as exc:
+                        if (
+                            generated_id_prefix is None
+                            or not self._is_toolchain_id_uniqueness_error(exc)
+                        ):
+                            raise
+                        normalized["toolchain_id"] = self.generate_toolchain_id_from_prefix(
+                            generated_id_prefix
+                        )
+                        create_payload["toolchain_id"] = normalized["toolchain_id"]
+                        row = AiToolchainTable.create(**create_payload)
                     return row.toolchain_id
 
                 assert existing is not None

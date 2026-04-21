@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -157,6 +158,170 @@ class TestToolchainRegistry:
 
 
 class TestToolchainRegistryCrud:
+    def test_generate_toolchain_id_uses_ascii_prefix_and_random_suffix(
+        self, ai_service, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ai_service_module,
+            "secrets",
+            SimpleNamespace(token_hex=lambda n: "a1b2c3d4"),
+            raising=False,
+        )
+
+        generated = ai_service.generate_toolchain_id("  Mötör AI ++  ")
+
+        assert generated == "motor_ai_a1b2c3d4"
+        assert len(generated) <= 33
+        assert generated.isascii()
+
+    def test_generate_toolchain_id_falls_back_for_non_ascii_display_name(
+        self, ai_service, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ai_service_module,
+            "secrets",
+            SimpleNamespace(token_hex=lambda n: "11112222"),
+            raising=False,
+        )
+
+        generated = ai_service.generate_toolchain_id("电机异音")
+
+        assert generated == "toolchain_11112222"
+
+    def test_generate_toolchain_id_regenerates_when_persisted_id_collides(
+        self, ai_service, monkeypatch, tmp_path
+    ):
+        package_dir = tmp_path / "pkg"
+        package_dir.mkdir()
+        AiToolchainTable.create(
+            toolchain_id="motor_ai_aaaabbbb",
+            display_name="Existing",
+            version="1.0",
+            entrypoint="python main.py",
+            package_dir=str(package_dir),
+            protocol_version=1,
+            execution_mode="resident_process",
+            default_timeout_ms=30000,
+            enabled=True,
+            description="",
+        )
+        suffixes = iter(["aaaabbbb", "ccccdddd"])
+        monkeypatch.setattr(
+            ai_service_module.secrets,
+            "token_hex",
+            lambda n: next(suffixes),
+        )
+
+        assert ai_service.generate_toolchain_id("Motor AI") == "motor_ai_ccccdddd"
+
+    def test_generate_toolchain_id_from_prefix_reuses_original_prefix(
+        self, ai_service, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ai_service_module.secrets,
+            "token_hex",
+            lambda n: "9999aaaa",
+        )
+
+        assert ai_service.generate_toolchain_id_from_prefix("motor_ai") == "motor_ai_9999aaaa"
+
+    def test_save_generated_draft_retries_once_when_create_id_collides(
+        self, ai_service, monkeypatch, tmp_path
+    ):
+        from peewee import IntegrityError
+
+        package_dir = tmp_path / "pkg"
+        package_dir.mkdir()
+        original_create = AiToolchainTable.create
+        calls = {"count": 0}
+
+        def create_with_one_collision(**kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise IntegrityError(
+                    "UNIQUE constraint failed: ai_toolchain_table.toolchain_id"
+                )
+            return original_create(**kwargs)
+
+        monkeypatch.setattr(
+            ai_service_module.secrets,
+            "token_hex",
+            lambda n: "11112222",
+        )
+        monkeypatch.setattr(AiToolchainTable, "create", create_with_one_collision)
+
+        saved_id = ai_service.save_toolchain(
+            None,
+            _toolchain_payload(
+                toolchain_id="motor_ai_aaaabbbb",
+                display_name="Motor AI",
+                package_dir=str(package_dir),
+                generated_id_prefix="motor_ai",
+            ),
+        )
+
+        assert saved_id == "motor_ai_11112222"
+        assert calls["count"] == 2
+
+    def test_save_explicit_create_id_collision_without_generated_prefix_does_not_retry(
+        self, ai_service, monkeypatch, tmp_path
+    ):
+        from peewee import IntegrityError
+
+        package_dir = tmp_path / "pkg"
+        package_dir.mkdir()
+        calls = {"count": 0}
+
+        def always_raise_id_integrity(**_kwargs):
+            calls["count"] += 1
+            raise IntegrityError(
+                "UNIQUE constraint failed: ai_toolchain_table.toolchain_id"
+            )
+
+        monkeypatch.setattr(AiToolchainTable, "create", always_raise_id_integrity)
+
+        with pytest.raises(IntegrityError, match="toolchain_id"):
+            ai_service.save_toolchain(
+                None,
+                _toolchain_payload(
+                    toolchain_id="motor_ai_aaaabbbb",
+                    display_name="Motor AI",
+                    package_dir=str(package_dir),
+                ),
+            )
+
+        assert calls["count"] == 1
+
+    def test_save_generated_draft_does_not_retry_non_id_integrity_errors(
+        self, ai_service, monkeypatch, tmp_path
+    ):
+        from peewee import IntegrityError
+
+        package_dir = tmp_path / "pkg"
+        package_dir.mkdir()
+        calls = {"count": 0}
+
+        def always_raise_non_id_integrity(**_kwargs):
+            calls["count"] += 1
+            raise IntegrityError(
+                "NOT NULL constraint failed: ai_toolchain_table.display_name"
+            )
+
+        monkeypatch.setattr(AiToolchainTable, "create", always_raise_non_id_integrity)
+
+        with pytest.raises(IntegrityError, match="display_name"):
+            ai_service.save_toolchain(
+                None,
+                _toolchain_payload(
+                    toolchain_id="motor_ai_aaaabbbb",
+                    display_name="Motor AI",
+                    package_dir=str(package_dir),
+                    generated_id_prefix="motor_ai",
+                ),
+            )
+
+        assert calls["count"] == 1
+
     def test_save_toolchain_rejects_missing_package_dir(self, ai_service):
         with pytest.raises(ValueError, match="package_dir"):
             ai_service.save_toolchain(
