@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
 from types import SimpleNamespace
+import unicodedata
 
 import pytest
 
@@ -29,6 +31,13 @@ class _SignalStub:
 
 
 class _AiServiceStub:
+    _GENERATED_ID_SUFFIXES = (
+        "a1b2c3d4",
+        "b1c2d3e4",
+        "c1d2e3f4",
+        "d1e2f3a4",
+    )
+
     def __init__(
         self,
         *,
@@ -50,9 +59,45 @@ class _AiServiceStub:
         self.list_binding_requests: list[str] = []
         self.deleted_toolchain_ids: list[str] = []
         self.cleared_binding_rows: list[dict] = []
+        self._generated_id_counters: dict[str, int] = {}
 
     def list_toolchains(self) -> list[dict]:
         return [dict(toolchain) for toolchain in self.toolchains]
+
+    @classmethod
+    def generated_toolchain_prefix(cls, display_name: str) -> str:
+        value = display_name.strip().lower()
+        value = unicodedata.normalize("NFKD", value)
+        value = value.encode("ascii", "ignore").decode("ascii")
+        value = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
+        if not value:
+            return "toolchain"
+        value = value[:24].strip("_")
+        return value or "toolchain"
+
+    def generate_toolchain_id(self, display_name: str) -> str:
+        return self.generate_toolchain_id_from_prefix(
+            self.generated_toolchain_prefix(display_name)
+        )
+
+    def generate_toolchain_id_from_prefix(self, prefix: str) -> str:
+        normalized_prefix = self.generated_toolchain_prefix(prefix)
+        while True:
+            index = self._generated_id_counters.get(normalized_prefix, 0)
+            self._generated_id_counters[normalized_prefix] = index + 1
+            if index < len(self._GENERATED_ID_SUFFIXES):
+                suffix = self._GENERATED_ID_SUFFIXES[index]
+            else:
+                suffix = f"{index:08x}"
+            toolchain_id = f"{normalized_prefix}_{suffix}"
+            if self.get_toolchain(toolchain_id) is None:
+                return toolchain_id
+
+    def get_toolchain(self, toolchain_id: str):
+        for toolchain in self.toolchains:
+            if toolchain["toolchain_id"] == toolchain_id:
+                return dict(toolchain)
+        return None
 
     def save_toolchain(self, original_toolchain_id: str | None, data: dict) -> str:
         payload = dict(data)
@@ -60,14 +105,20 @@ class _AiServiceStub:
         if self.save_error is not None:
             raise self.save_error
 
+        persisted_payload = {
+            key: value for key, value in payload.items() if key != "generated_id_prefix"
+        }
+
         if original_toolchain_id is None:
-            self.toolchains.append(payload)
+            self.toolchains.append(persisted_payload)
         else:
             self.toolchains = [
-                payload if toolchain["toolchain_id"] == original_toolchain_id else toolchain
+                persisted_payload
+                if toolchain["toolchain_id"] == original_toolchain_id
+                else toolchain
                 for toolchain in self.toolchains
             ]
-        return payload["toolchain_id"]
+        return persisted_payload["toolchain_id"]
 
     def list_toolchain_bindings(self, toolchain_id: str) -> list[dict]:
         self.list_binding_requests.append(toolchain_id)
@@ -160,6 +211,32 @@ def _current_toolchain_item_id(module: AiToolManagementModule) -> str | None:
     return current.data(Qt.ItemDataRole.UserRole)
 
 
+def _mock_new_toolchain_name_dialog(
+    monkeypatch,
+    *,
+    value: str = "Motor AI",
+    accepted: bool = True,
+):
+    monkeypatch.setattr(
+        ai_tool_management_module,
+        "QInputDialog",
+        SimpleNamespace(getText=lambda *args, **kwargs: (value, accepted)),
+        raising=False,
+    )
+
+
+def _create_draft(
+    module: AiToolManagementModule,
+    qapp,
+    monkeypatch,
+    *,
+    name: str = "Motor AI",
+):
+    _mock_new_toolchain_name_dialog(monkeypatch, value=name, accepted=True)
+    module.btn_new.click()
+    qapp.processEvents()
+
+
 def test_module_shows_empty_state_when_no_toolchains_exist(qapp):
     module, _service, _bus = _make_module(toolchains=[])
     _show(module, qapp)
@@ -169,14 +246,89 @@ def test_module_shows_empty_state_when_no_toolchains_exist(qapp):
     assert module.btn_delete.isEnabled() is False
 
 
-def test_new_toolchain_defaults_execution_mode_to_resident_process(qapp):
+def test_new_toolchain_cancel_name_dialog_leaves_empty_state(qapp, monkeypatch):
+    _mock_new_toolchain_name_dialog(monkeypatch, value="", accepted=False)
     module, _service, _bus = _make_module(toolchains=[])
     _show(module, qapp)
 
     module.btn_new.click()
-    qapp.processEvents()
 
+    assert module.toolchain_list.count() == 0
+    assert module.empty_label.isVisible() is True
+    assert module.detail.isVisible() is False
+
+
+def test_new_cancel_name_dialog_after_discarding_dirty_row_creates_no_draft(
+    qapp,
+    monkeypatch,
+):
+    module, _service, _bus = _make_module(toolchains=[_toolchain("motor-ai")])
+    _show(module, qapp)
+
+    module.ed_display_name.setText("Dirty Name")
+    monkeypatch.setattr(module, "_prompt_unsaved_changes", lambda action: "discard")
+    _mock_new_toolchain_name_dialog(monkeypatch, value="", accepted=False)
+
+    module.btn_new.click()
+
+    assert module.toolchain_list.count() == 1
+    assert _current_toolchain_item_id(module) == "motor-ai"
+    assert "[未保存]" not in module.toolchain_list.item(0).text()
+    assert module.ed_display_name.text() == "Toolchain motor-ai"
+
+
+def test_new_cancel_name_dialog_after_saving_dirty_row_creates_no_draft(
+    qapp,
+    monkeypatch,
+):
+    module, service, _bus = _make_module(toolchains=[_toolchain("motor-ai")])
+    _show(module, qapp)
+
+    module.ed_display_name.setText("Saved Name")
+    monkeypatch.setattr(module, "_prompt_unsaved_changes", lambda action: "save")
+    _mock_new_toolchain_name_dialog(monkeypatch, value="", accepted=False)
+
+    module.btn_new.click()
+
+    assert service.saved_requests[-1][1]["display_name"] == "Saved Name"
+    assert module.toolchain_list.count() == 1
+    assert _current_toolchain_item_id(module) == "motor-ai"
+    assert "[未保存]" not in module.toolchain_list.item(0).text()
+
+
+def test_new_toolchain_blank_display_name_warns_and_creates_no_draft(
+    qapp,
+    monkeypatch,
+):
+    warnings = []
+    _mock_new_toolchain_name_dialog(monkeypatch, value="   ", accepted=True)
+    monkeypatch.setattr(
+        "ui.modules.ai_tool_management.QMessageBox.warning",
+        lambda *args: warnings.append(args[1:3]),
+    )
+    module, _service, _bus = _make_module(toolchains=[])
+    _show(module, qapp)
+
+    module.btn_new.click()
+
+    assert warnings == [("创建失败", "显示名称不能为空")]
+    assert module.toolchain_list.count() == 0
+    assert module.detail.isVisible() is False
+
+
+def test_new_toolchain_creates_selected_unsaved_draft_row(qapp, monkeypatch):
+    module, _service, _bus = _make_module(toolchains=[])
+    _show(module, qapp)
+
+    _create_draft(module, qapp, monkeypatch, name="Motor AI")
+
+    assert module.toolchain_list.count() == 1
+    assert _current_toolchain_item_id(module) == "motor_ai_a1b2c3d4"
+    assert module.toolchain_list.item(0).text().endswith("[未保存]")
+    assert module.ed_display_name.text() == "Motor AI"
+    assert module.lb_toolchain_id_value.text() == "motor_ai_a1b2c3d4"
     assert module.combo_execution_mode.currentData() == "resident_process"
+    assert module.btn_delete.isEnabled() is False
 
 
 def test_left_list_sorts_rows_and_marks_disabled_toolchains(qapp):
@@ -276,16 +428,16 @@ def test_detail_pane_wraps_form_in_scroll_area_and_keeps_save_row_outside(qapp):
     assert save_row.parentWidget() != module.detail_scroll.widget()
 
 
-def test_tall_detail_pane_keeps_form_host_near_compact_height(qapp):
+def test_tall_detail_pane_keeps_form_host_near_compact_height(qapp, monkeypatch):
     module, _service, _bus = _make_module(toolchains=[])
     _show(module, qapp)
 
-    module.btn_new.click()
+    _create_draft(module, qapp, monkeypatch, name="Motor AI")
     module.resize(1280, 1400)
     module.show()
     qapp.processEvents()
 
-    form_host = module.ed_toolchain_id.parentWidget()
+    form_host = module.lb_toolchain_id_value.parentWidget()
     assert form_host.height() < module.detail.height()
     assert form_host.height() <= form_host.sizeHint().height() + 40
 
@@ -310,7 +462,7 @@ def test_selecting_row_populates_execution_mode_and_timeout_unit(qapp):
     module._select_toolchain("motor-ai")
     qapp.processEvents()
 
-    assert module.ed_toolchain_id.text() == "motor-ai"
+    assert module.lb_toolchain_id_value.text() == "motor-ai"
     assert module.ed_display_name.text() == "Motor AI"
     assert module.ed_version.text() == "2.0"
     assert module.ed_entrypoint.toPlainText() == "python motor_ai_v2.py"
@@ -362,13 +514,11 @@ def test_package_dir_browse_populates_editor_and_marks_dirty(qapp, tmp_path, mon
     assert module._is_dirty() is True
 
 
-def test_save_persists_selected_execution_mode(qapp):
+def test_save_persists_selected_execution_mode(qapp, monkeypatch):
     module, service, _bus = _make_module(toolchains=[])
     _show(module, qapp)
 
-    module.btn_new.click()
-    module.ed_toolchain_id.setText("motor-ai")
-    module.ed_display_name.setText("Motor AI")
+    _create_draft(module, qapp, monkeypatch, name="Motor AI")
     module.ed_entrypoint.setPlainText("python motor_ai.py")
     module.ed_package_dir.setText(os.getcwd())
     module.combo_execution_mode.setCurrentIndex(
@@ -380,6 +530,8 @@ def test_save_persists_selected_execution_mode(qapp):
 
     assert service.saved_requests[-1][1]["execution_mode"] == "oneshot_process"
     assert service.saved_requests[-1][1]["package_dir"] == os.getcwd()
+    assert service.saved_requests[-1][1]["toolchain_id"] == "motor_ai_a1b2c3d4"
+    assert service.saved_requests[-1][1]["generated_id_prefix"] == "motor_ai"
 
 
 def test_large_timeout_value_loads_and_saves_without_clamping(qapp):
@@ -439,13 +591,11 @@ def test_left_list_labels_include_toolchain_id_for_duplicate_name_version_rows(q
     assert "motor-ai-b" in item_texts[1]
 
 
-def test_save_new_toolchain_emits_registry_refresh(qapp):
+def test_save_new_toolchain_emits_registry_refresh(qapp, monkeypatch):
     module, service, bus = _make_module(toolchains=[])
     _show(module, qapp)
 
-    module.btn_new.click()
-    module.ed_toolchain_id.setText("motor-ai")
-    module.ed_display_name.setText("Motor AI")
+    _create_draft(module, qapp, monkeypatch, name="Motor AI")
     module.ed_version.setText("1.0")
     module.ed_entrypoint.setPlainText("python motor_ai.py")
     module.ed_package_dir.setText(os.getcwd())
@@ -457,13 +607,126 @@ def test_save_new_toolchain_emits_registry_refresh(qapp):
 
     saved_original_id, saved = service.saved_requests[-1]
     assert saved_original_id is None
-    assert saved["toolchain_id"] == "motor-ai"
+    assert saved["toolchain_id"] == "motor_ai_a1b2c3d4"
     assert saved["display_name"] == "Motor AI"
+    assert saved["generated_id_prefix"] == "motor_ai"
     assert saved["package_dir"] == os.getcwd()
     assert bus.ai_toolchains_changed.emissions == [((), {})]
-    assert module.toolchain_list.currentItem().data(Qt.ItemDataRole.UserRole) == "motor-ai"
+    assert (
+        module.toolchain_list.currentItem().data(Qt.ItemDataRole.UserRole)
+        == "motor_ai_a1b2c3d4"
+    )
     assert module.empty_label.isVisible() is False
     assert module.detail.isVisible() is True
+
+
+def test_draft_display_name_edit_updates_left_list_label(qapp, monkeypatch):
+    module, _service, _bus = _make_module(toolchains=[_toolchain("persisted-ai")])
+    _show(module, qapp)
+
+    _create_draft(module, qapp, monkeypatch, name="Motor AI")
+    module.ed_display_name.setText("Updated Motor AI")
+    module.ed_version.setText("2.0")
+    qapp.processEvents()
+
+    assert module.toolchain_list.item(0).data(Qt.ItemDataRole.UserRole) == "motor_ai_a1b2c3d4"
+    assert (
+        module.toolchain_list.item(0).text()
+        == "Updated Motor AI (2.0) - motor_ai_a1b2c3d4 [未保存]"
+    )
+    assert module.toolchain_list.item(1).data(Qt.ItemDataRole.UserRole) == "persisted-ai"
+
+
+def test_empty_draft_display_name_uses_placeholder_in_left_list(qapp, monkeypatch):
+    module, _service, _bus = _make_module(toolchains=[])
+    _show(module, qapp)
+
+    _create_draft(module, qapp, monkeypatch, name="Motor AI")
+    module.ed_display_name.setText("")
+    qapp.processEvents()
+
+    assert (
+        module.toolchain_list.item(0).text()
+        == "未命名工具链 (-) - motor_ai_a1b2c3d4 [未保存]"
+    )
+
+
+def test_discarding_unsaved_draft_removes_draft_row(qapp, monkeypatch):
+    module, _service, _bus = _make_module(toolchains=[_toolchain("persisted-ai")])
+    _show(module, qapp)
+
+    _create_draft(module, qapp, monkeypatch, name="Motor AI")
+    actions = []
+    monkeypatch.setattr(
+        module,
+        "_prompt_unsaved_changes",
+        lambda action: actions.append(action) or "discard",
+    )
+
+    module._select_toolchain("persisted-ai")
+    qapp.processEvents()
+
+    assert actions == ["switch"]
+    assert module.toolchain_list.count() == 1
+    assert _current_toolchain_item_id(module) == "persisted-ai"
+    assert "[未保存]" not in module.toolchain_list.item(0).text()
+    assert module.ed_display_name.text() == "Toolchain persisted-ai"
+
+
+def test_canceling_unsaved_draft_switch_keeps_draft_row(qapp, monkeypatch):
+    module, _service, _bus = _make_module(toolchains=[_toolchain("persisted-ai")])
+    _show(module, qapp)
+
+    _create_draft(module, qapp, monkeypatch, name="Motor AI")
+    monkeypatch.setattr(module, "_prompt_unsaved_changes", lambda action: "cancel")
+
+    module._select_toolchain("persisted-ai")
+    qapp.processEvents()
+
+    assert module.toolchain_list.count() == 2
+    assert _current_toolchain_item_id(module) == "motor_ai_a1b2c3d4"
+    assert module.toolchain_list.item(0).text().endswith("[未保存]")
+    assert module.ed_display_name.text() == "Motor AI"
+
+
+def test_saving_draft_persists_generated_id(qapp, monkeypatch):
+    module, service, _bus = _make_module(toolchains=[])
+    _show(module, qapp)
+
+    _create_draft(module, qapp, monkeypatch, name="Motor AI")
+    module.ed_entrypoint.setPlainText("python motor_ai.py")
+    module.ed_package_dir.setText(os.getcwd())
+    module.btn_save.click()
+    qapp.processEvents()
+
+    assert service.saved_requests[-1][1]["toolchain_id"] == "motor_ai_a1b2c3d4"
+    assert service.saved_requests[-1][1]["generated_id_prefix"] == "motor_ai"
+    assert service.toolchains[0]["toolchain_id"] == "motor_ai_a1b2c3d4"
+    assert "[未保存]" not in module.toolchain_list.item(0).text()
+    assert module.lb_toolchain_id_value.text() == "motor_ai_a1b2c3d4"
+    assert module._is_new_draft is False
+
+
+def test_saving_draft_regenerates_when_generated_id_is_already_taken(
+    qapp,
+    monkeypatch,
+):
+    module, service, _bus = _make_module(toolchains=[])
+    _show(module, qapp)
+
+    _create_draft(module, qapp, monkeypatch, name="Motor AI")
+    module.ed_display_name.setText("Motor AI Renamed")
+    module.ed_entrypoint.setPlainText("python motor_ai.py")
+    module.ed_package_dir.setText(os.getcwd())
+    service.toolchains.append(_toolchain("motor_ai_a1b2c3d4", display_name="Occupied"))
+
+    module.btn_save.click()
+    qapp.processEvents()
+
+    assert service.saved_requests[-1][1]["toolchain_id"] == "motor_ai_b1c2d3e4"
+    assert service.saved_requests[-1][1]["generated_id_prefix"] == "motor_ai"
+    assert _current_toolchain_item_id(module) == "motor_ai_b1c2d3e4"
+    assert module.lb_toolchain_id_value.text() == "motor_ai_b1c2d3e4"
 
 
 def test_edit_save_updates_existing_row_without_creating_duplicate(qapp):
@@ -594,21 +857,19 @@ def test_delete_button_is_enabled_when_row_is_selected(qapp):
     assert module.btn_delete.isEnabled() is True
 
 
-def test_delete_button_is_disabled_for_new_draft_without_selection(qapp):
+def test_delete_button_is_disabled_for_selected_new_draft(qapp, monkeypatch):
     module, _service, _bus = _make_module(toolchains=[_toolchain("motor-ai")])
     _show(module, qapp)
 
-    module.btn_new.click()
-    qapp.processEvents()
+    _create_draft(module, qapp, monkeypatch, name="Motor AI")
 
-    assert module.toolchain_list.currentItem() is None
+    assert module.toolchain_list.currentItem() is not None
     assert module.btn_delete.isEnabled() is False
 
 
 @pytest.mark.parametrize(
     ("setup", "expected_message"),
     [
-        ("duplicate", "工具链标识已存在"),
         ("missing_required", "工具链标识、显示名称和入口命令不能为空"),
         ("missing_package_dir", "AI 包目录不能为空"),
         ("invalid_timeout", "默认超时必须大于 0"),
@@ -628,17 +889,13 @@ def test_local_validation_shows_warning_before_service_write(
     module, service, _bus = _make_module(toolchains=[_toolchain("existing-ai")])
     _show(module, qapp)
 
-    module.btn_new.click()
-    module.ed_toolchain_id.setText("new-ai")
-    module.ed_display_name.setText("New AI")
+    _create_draft(module, qapp, monkeypatch, name="New AI")
     module.ed_entrypoint.setPlainText("python new_ai.py")
     module.ed_package_dir.setText(os.getcwd())
     module.spin_timeout.setValue(30000)
 
-    if setup == "duplicate":
-        module.ed_toolchain_id.setText("existing-ai")
-    elif setup == "missing_required":
-        module.ed_toolchain_id.setText("")
+    if setup == "missing_required":
+        module.ed_display_name.setText("")
     elif setup == "missing_package_dir":
         module.ed_package_dir.setText("")
     elif setup == "invalid_timeout":
@@ -662,9 +919,7 @@ def test_busy_save_error_shows_user_warning(qapp, monkeypatch):
     )
     _show(module, qapp)
 
-    module.btn_new.click()
-    module.ed_toolchain_id.setText("motor-ai")
-    module.ed_display_name.setText("Motor AI")
+    _create_draft(module, qapp, monkeypatch, name="Motor AI")
     module.ed_entrypoint.setPlainText("python motor_ai.py")
     module.ed_package_dir.setText(os.getcwd())
     module.combo_execution_mode.setCurrentIndex(
@@ -677,7 +932,7 @@ def test_busy_save_error_shows_user_warning(qapp, monkeypatch):
         (
             None,
             {
-                "toolchain_id": "motor-ai",
+                "toolchain_id": "motor_ai_a1b2c3d4",
                 "display_name": "Motor AI",
                 "version": "",
                 "entrypoint": "python motor_ai.py",
@@ -686,6 +941,7 @@ def test_busy_save_error_shows_user_warning(qapp, monkeypatch):
                 "enabled": True,
                 "description": "",
                 "execution_mode": "resident_process",
+                "generated_id_prefix": "motor_ai",
             },
         )
     ]
