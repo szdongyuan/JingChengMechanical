@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QVBoxLayout,
     QWidget,
@@ -216,7 +217,18 @@ class AiToolManagementModule(QWidget):
         self.txt_description.setMaximumHeight(100)
         form_lay.addRow("描述", self.txt_description)
 
-        detail_lay.addWidget(form_host)
+        scroll_content = QWidget()
+        scroll_lay = QVBoxLayout(scroll_content)
+        scroll_lay.setContentsMargins(0, 0, 0, 0)
+        scroll_lay.setSpacing(10)
+        scroll_lay.addWidget(form_host)
+        scroll_lay.addStretch(1)
+
+        self.detail_scroll = QScrollArea()
+        self.detail_scroll.setWidgetResizable(True)
+        self.detail_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.detail_scroll.setWidget(scroll_content)
+        detail_lay.addWidget(self.detail_scroll, 1)
 
         save_row = QWidget()
         save_lay = QHBoxLayout(save_row)

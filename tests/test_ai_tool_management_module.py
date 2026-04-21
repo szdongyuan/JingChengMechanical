@@ -258,6 +258,38 @@ def test_timeout_row_uses_fixed_single_line_height_and_preserves_ms_label(qapp):
     assert module.spin_timeout.text() == "30000"
 
 
+def test_detail_pane_wraps_form_in_scroll_area_and_keeps_save_row_outside(qapp):
+    module, _service, _bus = _make_module(toolchains=[_toolchain("motor-ai")])
+    _show(module, qapp)
+
+    assert hasattr(module, "detail_scroll")
+    assert module.detail_scroll.widgetResizable() is True
+    assert module.detail_scroll.widget() is not None
+    assert module.detail_scroll.frameShape().name == "NoFrame"
+    assert module.detail_scroll.parentWidget() == module.detail
+
+    save_row = module.btn_save.parentWidget()
+    detail_layout = module.detail.layout()
+    assert save_row.parentWidget() == module.detail
+    assert detail_layout.indexOf(module.detail_scroll) >= 0
+    assert detail_layout.indexOf(save_row) > detail_layout.indexOf(module.detail_scroll)
+    assert save_row.parentWidget() != module.detail_scroll.widget()
+
+
+def test_tall_detail_pane_keeps_form_host_near_compact_height(qapp):
+    module, _service, _bus = _make_module(toolchains=[])
+    _show(module, qapp)
+
+    module.btn_new.click()
+    module.resize(1280, 1400)
+    module.show()
+    qapp.processEvents()
+
+    form_host = module.ed_toolchain_id.parentWidget()
+    assert form_host.height() < module.detail.height()
+    assert form_host.height() <= form_host.sizeHint().height() + 40
+
+
 def test_selecting_row_populates_execution_mode_and_timeout_unit(qapp):
     module, _service, _bus = _make_module(
         toolchains=[
