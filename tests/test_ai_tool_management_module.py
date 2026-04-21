@@ -8,7 +8,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication, QMessageBox
+from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
 
 from ui.modules.ai_tool_management import AiToolManagementModule
 
@@ -214,7 +214,26 @@ def test_left_list_sorts_rows_and_marks_disabled_toolchains(qapp):
     assert item_texts[1].endswith("[禁用]")
 
 
-def test_selecting_row_populates_execution_mode_and_runtime_helper_text(qapp):
+def test_package_dir_row_is_bounded_and_aligned(qapp):
+    module, _service, _bus = _make_module(toolchains=[_toolchain("motor-ai")])
+    _show(module, qapp)
+
+    layout = module.package_dir_row.layout()
+    editor_index = layout.indexOf(module.ed_package_dir)
+    button_index = layout.indexOf(module.btn_browse_package_dir)
+    assert editor_index >= 0
+    assert button_index >= 0
+    expected_alignment = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignTop
+    assert layout.itemAt(editor_index).alignment() & expected_alignment
+    assert layout.itemAt(button_index).alignment() & expected_alignment
+    assert module.package_dir_row.sizePolicy().verticalPolicy().name in {
+        "Fixed",
+        "Maximum",
+    }
+    assert module.btn_browse_package_dir.height() == module.ed_package_dir.height()
+
+
+def test_selecting_row_populates_execution_mode_and_timeout_unit(qapp):
     module, _service, _bus = _make_module(
         toolchains=[
             _toolchain(
@@ -240,12 +259,27 @@ def test_selecting_row_populates_execution_mode_and_runtime_helper_text(qapp):
     assert module.ed_entrypoint.toPlainText() == "python motor_ai_v2.py"
     assert module.ed_package_dir.text() == os.getcwd()
     assert module.spin_timeout.value() == 45000
+    assert module.spin_timeout.text() == "45000"
+    assert module.spin_timeout.placeholderText() == ""
+    assert module.spin_timeout.alignment() == Qt.AlignmentFlag.AlignLeft
+    assert module.lb_timeout_unit.text() == "ms"
+    assert module.lb_timeout_unit.isVisible() is True
     assert module.chk_enabled.isChecked() is False
     assert module.txt_description.toPlainText() == "updated registry entry"
     assert module.combo_execution_mode.currentData() == "oneshot_process"
-    assert "protocol_version = 1" in module.runtime_helper.text()
-    assert "resident_process" in module.runtime_helper.text()
-    assert "oneshot_process" in module.runtime_helper.text()
+
+
+def test_runtime_helper_copy_is_removed(qapp):
+    module, _service, _bus = _make_module(toolchains=[_toolchain("motor-ai")])
+    _show(module, qapp)
+
+    labels_text = [label.text() for label in module.findChildren(QLabel)]
+
+    assert not hasattr(module, "runtime_helper")
+    assert not any("运行时说明" in text for text in labels_text)
+    assert not any("protocol_version" in text for text in labels_text)
+    assert not any("resident_process" in text for text in labels_text)
+    assert not any("oneshot_process" in text for text in labels_text)
 
 
 def test_package_dir_browse_populates_editor_and_marks_dirty(qapp, tmp_path, monkeypatch):

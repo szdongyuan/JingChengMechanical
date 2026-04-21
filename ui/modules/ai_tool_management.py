@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -33,7 +34,7 @@ class _LargeIntegerEditor(QLineEdit):
         self._suffix = ""
         self._single_step = 1
         self._minimum = 0
-        self.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self.setValidator(
             QRegularExpressionValidator(
                 QRegularExpression(r"(?:0|[1-9]\d*)?"),
@@ -153,22 +154,55 @@ class AiToolManagementModule(QWidget):
         self.ed_entrypoint.setMaximumHeight(80)
         form_lay.addRow("入口命令", self.ed_entrypoint)
 
-        package_dir_row = QWidget()
-        package_dir_lay = QHBoxLayout(package_dir_row)
+        self.package_dir_row = QWidget()
+        self.package_dir_row.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
+        )
+        package_dir_lay = QHBoxLayout(self.package_dir_row)
         package_dir_lay.setContentsMargins(0, 0, 0, 0)
         package_dir_lay.setSpacing(8)
+        package_dir_lay.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self.ed_package_dir = QLineEdit()
         self.btn_browse_package_dir = QPushButton("浏览")
-        package_dir_lay.addWidget(self.ed_package_dir, 1)
-        package_dir_lay.addWidget(self.btn_browse_package_dir)
-        form_lay.addRow("AI 包目录", package_dir_row)
+        package_dir_height = self.ed_package_dir.sizeHint().height()
+        self.ed_package_dir.setFixedHeight(package_dir_height)
+        self.btn_browse_package_dir.setFixedHeight(package_dir_height)
+        self.package_dir_row.setMaximumHeight(package_dir_height)
+        package_dir_lay.addWidget(
+            self.ed_package_dir,
+            1,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+        package_dir_lay.addWidget(
+            self.btn_browse_package_dir,
+            0,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+        form_lay.addRow("AI 包目录", self.package_dir_row)
 
+        timeout_row = QWidget()
+        timeout_lay = QHBoxLayout(timeout_row)
+        timeout_lay.setContentsMargins(0, 0, 0, 0)
+        timeout_lay.setSpacing(6)
+        timeout_lay.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self.spin_timeout = _LargeIntegerEditor()
         self.spin_timeout.setRange(0, 2_147_483_647)
         self.spin_timeout.setSingleStep(1000)
-        self.spin_timeout.setSuffix(" ms")
         self.spin_timeout.setValue(30000)
-        form_lay.addRow("默认超时", self.spin_timeout)
+        self.lb_timeout_unit = QLabel("ms")
+        timeout_lay.addWidget(
+            self.spin_timeout,
+            0,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+        timeout_lay.addWidget(
+            self.lb_timeout_unit,
+            0,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+        timeout_lay.addStretch(1)
+        form_lay.addRow("默认超时", timeout_row)
 
         self.chk_enabled = QCheckBox("启用")
         form_lay.addRow("状态", self.chk_enabled)
@@ -181,14 +215,6 @@ class AiToolManagementModule(QWidget):
         self.txt_description = QPlainTextEdit()
         self.txt_description.setMaximumHeight(100)
         form_lay.addRow("描述", self.txt_description)
-
-        self.runtime_helper = QLabel(
-            "protocol_version = 1（固定）；推荐使用 resident_process 以复用预加载模型；"
-            "oneshot_process 适用于仍使用基于文件 CLI 的工具链。"
-        )
-        self.runtime_helper.setObjectName("Muted")
-        self.runtime_helper.setWordWrap(True)
-        form_lay.addRow("运行时说明", self.runtime_helper)
 
         detail_lay.addWidget(form_host)
 
