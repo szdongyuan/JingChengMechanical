@@ -773,7 +773,7 @@ class AiToolManagementModule(QWidget):
             return False
         if decision == "discard":
             if self._is_new_draft and self._draft_payload is not None:
-                self._remove_draft(auto_select_first=action == "new")
+                self._remove_draft()
                 return True
             self._restore_snapshot()
             return True

@@ -689,6 +689,59 @@ def test_canceling_unsaved_draft_switch_keeps_draft_row(qapp, monkeypatch):
     assert module.ed_display_name.text() == "Motor AI"
 
 
+@pytest.mark.parametrize(
+    ("dialog_value", "accepted", "expected_warnings"),
+    [
+        ("", False, []),
+        ("   ", True, [("创建失败", "显示名称不能为空")]),
+    ],
+)
+def test_new_name_dialog_cancel_or_blank_after_discarding_active_draft_keeps_discard_state(
+    qapp,
+    monkeypatch,
+    dialog_value,
+    accepted,
+    expected_warnings,
+):
+    warnings = []
+    module, _service, _bus = _make_module(
+        toolchains=[
+            _toolchain("alpha-ai"),
+            _toolchain("zeta-ai"),
+        ]
+    )
+    _show(module, qapp)
+
+    _create_draft(module, qapp, monkeypatch, name="Motor AI")
+    monkeypatch.setattr(module, "_prompt_unsaved_changes", lambda action: "discard")
+    _mock_new_toolchain_name_dialog(
+        monkeypatch,
+        value=dialog_value,
+        accepted=accepted,
+    )
+    monkeypatch.setattr(
+        "ui.modules.ai_tool_management.QMessageBox.warning",
+        lambda *args: warnings.append(args[1:3]),
+    )
+
+    module.btn_new.click()
+    qapp.processEvents()
+
+    assert warnings == expected_warnings
+    assert module.toolchain_list.count() == 2
+    assert _current_toolchain_item_id(module) is None
+    assert module._current_toolchain_id is None
+    assert module._draft_payload is None
+    assert module._is_new_draft is False
+    assert module.detail.isVisible() is False
+    assert module.empty_label.isVisible() is False
+    assert module.ed_display_name.text() == ""
+    assert all(
+        "[未保存]" not in module.toolchain_list.item(index).text()
+        for index in range(module.toolchain_list.count())
+    )
+
+
 def test_saving_draft_persists_generated_id(qapp, monkeypatch):
     module, service, _bus = _make_module(toolchains=[])
     _show(module, qapp)
