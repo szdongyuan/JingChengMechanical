@@ -165,10 +165,6 @@ class AiToolManagementModule(QWidget):
         package_dir_lay.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self.ed_package_dir = QLineEdit()
         self.btn_browse_package_dir = QPushButton("浏览")
-        package_dir_height = self.ed_package_dir.sizeHint().height()
-        self.ed_package_dir.setFixedHeight(package_dir_height)
-        self.btn_browse_package_dir.setFixedHeight(package_dir_height)
-        self.package_dir_row.setMaximumHeight(package_dir_height)
         package_dir_lay.addWidget(
             self.ed_package_dir,
             1,
@@ -181,8 +177,12 @@ class AiToolManagementModule(QWidget):
         )
         form_lay.addRow("AI 包目录", self.package_dir_row)
 
-        timeout_row = QWidget()
-        timeout_lay = QHBoxLayout(timeout_row)
+        self.timeout_row = QWidget()
+        self.timeout_row.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
+        )
+        timeout_lay = QHBoxLayout(self.timeout_row)
         timeout_lay.setContentsMargins(0, 0, 0, 0)
         timeout_lay.setSpacing(6)
         timeout_lay.setAlignment(Qt.AlignmentFlag.AlignVCenter)
@@ -202,7 +202,7 @@ class AiToolManagementModule(QWidget):
             Qt.AlignmentFlag.AlignVCenter,
         )
         timeout_lay.addStretch(1)
-        form_lay.addRow("默认超时", timeout_row)
+        form_lay.addRow("默认超时", self.timeout_row)
 
         self.chk_enabled = QCheckBox("启用")
         form_lay.addRow("状态", self.chk_enabled)
@@ -229,6 +229,7 @@ class AiToolManagementModule(QWidget):
 
         self.right_lay.addWidget(self.detail, 1)
         root.addWidget(right, 1)
+        self._apply_fixed_row_heights()
 
     def _connect_signals(self):
         self.btn_new.clicked.connect(self._on_new)
@@ -245,6 +246,29 @@ class AiToolManagementModule(QWidget):
         self.combo_execution_mode.currentIndexChanged.connect(self._on_editor_changed)
         self.txt_description.textChanged.connect(self._on_editor_changed)
         self.btn_browse_package_dir.clicked.connect(self._browse_package_dir)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._apply_fixed_row_heights()
+
+    def _apply_fixed_row_heights(self):
+        self.ed_package_dir.ensurePolished()
+        self.btn_browse_package_dir.ensurePolished()
+        package_dir_height = max(
+            self.ed_package_dir.sizeHint().height(),
+            self.btn_browse_package_dir.sizeHint().height(),
+        )
+        self.ed_package_dir.setFixedHeight(package_dir_height)
+        self.btn_browse_package_dir.setFixedHeight(package_dir_height)
+        self.package_dir_row.setFixedHeight(package_dir_height)
+
+        self.spin_timeout.ensurePolished()
+        self.lb_timeout_unit.ensurePolished()
+        timeout_row_height = max(
+            self.spin_timeout.sizeHint().height(),
+            self.lb_timeout_unit.sizeHint().height(),
+        )
+        self.timeout_row.setFixedHeight(timeout_row_height)
 
     def _refresh_list(self, selected_toolchain_id: str | None = None):
         rows = sorted(

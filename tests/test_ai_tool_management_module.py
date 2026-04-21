@@ -7,9 +7,10 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
+from PyQt6.QtCore import QSize, Qt
+from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox, QPushButton
 
+import ui.modules.ai_tool_management as ai_tool_management_module
 from ui.modules.ai_tool_management import AiToolManagementModule
 
 
@@ -214,7 +215,16 @@ def test_left_list_sorts_rows_and_marks_disabled_toolchains(qapp):
     assert item_texts[1].endswith("[禁用]")
 
 
-def test_package_dir_row_is_bounded_and_aligned(qapp):
+def test_package_dir_row_uses_shared_fixed_single_line_height(qapp, monkeypatch):
+    class TallBrowseButton(QPushButton):
+        def sizeHint(self):
+            size = super().sizeHint()
+            if self.text() == "浏览":
+                return QSize(size.width(), size.height() + 12)
+            return size
+
+    monkeypatch.setattr(ai_tool_management_module, "QPushButton", TallBrowseButton)
+
     module, _service, _bus = _make_module(toolchains=[_toolchain("motor-ai")])
     _show(module, qapp)
 
@@ -226,11 +236,26 @@ def test_package_dir_row_is_bounded_and_aligned(qapp):
     expected_alignment = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignTop
     assert layout.itemAt(editor_index).alignment() & expected_alignment
     assert layout.itemAt(button_index).alignment() & expected_alignment
-    assert module.package_dir_row.sizePolicy().verticalPolicy().name in {
-        "Fixed",
-        "Maximum",
-    }
-    assert module.btn_browse_package_dir.height() == module.ed_package_dir.height()
+    assert module.package_dir_row.sizePolicy().verticalPolicy().name == "Fixed"
+    assert (
+        module.btn_browse_package_dir.height()
+        >= module.btn_browse_package_dir.sizeHint().height()
+    )
+    assert module.ed_package_dir.height() == module.btn_browse_package_dir.height()
+    assert module.package_dir_row.height() == module.ed_package_dir.height()
+
+
+def test_timeout_row_uses_fixed_single_line_height_and_preserves_ms_label(qapp):
+    module, _service, _bus = _make_module(toolchains=[_toolchain("motor-ai")])
+    _show(module, qapp)
+
+    assert module.timeout_row.sizePolicy().verticalPolicy().name == "Fixed"
+    assert module.timeout_row.height() >= module.spin_timeout.sizeHint().height()
+    assert module.timeout_row.layout().indexOf(module.spin_timeout) >= 0
+    assert module.timeout_row.layout().indexOf(module.lb_timeout_unit) >= 0
+    assert module.lb_timeout_unit.text() == "ms"
+    assert module.lb_timeout_unit.isVisible() is True
+    assert module.spin_timeout.text() == "30000"
 
 
 def test_selecting_row_populates_execution_mode_and_timeout_unit(qapp):
@@ -262,6 +287,8 @@ def test_selecting_row_populates_execution_mode_and_timeout_unit(qapp):
     assert module.spin_timeout.text() == "45000"
     assert module.spin_timeout.placeholderText() == ""
     assert module.spin_timeout.alignment() == Qt.AlignmentFlag.AlignLeft
+    assert module.timeout_row.layout().indexOf(module.spin_timeout) >= 0
+    assert module.timeout_row.layout().indexOf(module.lb_timeout_unit) >= 0
     assert module.lb_timeout_unit.text() == "ms"
     assert module.lb_timeout_unit.isVisible() is True
     assert module.chk_enabled.isChecked() is False
