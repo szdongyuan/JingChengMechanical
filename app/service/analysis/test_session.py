@@ -191,6 +191,7 @@ class TestSession:
         )
         result = self._run_ai(result)
         self._last_result = result
+        self._persist_audio_result_metadata(result)
         return result
 
     def _audio_config_metadata(self) -> tuple[str, str | None]:
@@ -219,6 +220,52 @@ class TestSession:
             )
 
         return config_name, config_snapshot
+
+    def _persist_audio_result_metadata(self, result: JudgmentResult) -> None:
+        if not self._audio_data_id:
+            self._bus.log.emit(
+                f"[TestSession] WARNING: audio metadata update skipped: missing audio_data_id "
+                f"for config={self.config_id}"
+            )
+            return
+
+        config_name, config_snapshot = self._audio_config_metadata()
+        update_payload = {
+            "analyse_config": config_name,
+            "config_content": config_snapshot,
+        }
+
+        label_value = None
+        if result.overall == "合格":
+            label_value = "OK"
+        elif result.overall == "不合格":
+            label_value = "NG"
+        else:
+            self._bus.log.emit(
+                f"[TestSession] WARNING: unexpected judgment overall for config={self.config_id}: "
+                f"{result.overall!r}"
+            )
+
+        if label_value is not None:
+            update_payload["labels"] = label_value
+
+        try:
+            updated = (
+                AudioDataTable
+                .update(**update_payload)
+                .where(AudioDataTable.audio_data_id == self._audio_data_id)
+                .execute()
+            )
+            if updated != 1:
+                self._bus.log.emit(
+                    f"[TestSession] WARNING: audio metadata update affected {updated} rows "
+                    f"for audio_data_id={self._audio_data_id}"
+                )
+        except Exception as exc:
+            self._bus.log.emit(
+                f"[TestSession] WARNING: failed to persist audio result metadata "
+                f"for audio_data_id={self._audio_data_id}: {exc}"
+            )
 
     def _run_ai(self, result: JudgmentResult) -> JudgmentResult:
         """Patch AI result into judgment when an enabled binding exists."""
