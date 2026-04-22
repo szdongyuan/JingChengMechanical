@@ -10,13 +10,14 @@ class AudioDataTable(BaseModel):
     SQL 里有约束 (sample_rate > 0)；这里先按字段建模，约束由 DB 侧保证。
     """
 
-    audio_data_id = TextField(primary_key=True)
-    file_path = TextField(unique=True)
-    product_model = TextField()
-    sample_rate = IntegerField()
-    record_date = TextField()
-    labels = TextField(null=True)
-    barcode = TextField(null=True)
+    audio_data_id = TextField(primary_key=True) # audio_id
+    file_path = TextField(unique=True) # 路径
+    product_model = TextField() # 产品型号
+    sample_rate = IntegerField() # 采样率
+    record_date = TextField() # 创建时间
+    labels = TextField(null=True) # 标签结果
+    barcode = TextField(null=True) # SN码
+    analyse_config = TextField(null=True) # 分析配置
 
     class Meta:
         table_name = "audio_data_table"

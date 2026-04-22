@@ -365,6 +365,7 @@ class PlcSettingsModule(QWidget):
             poll_interval_ms=row.plc_poll_interval_ms,
             reconnect_interval_ms=row.plc_reconnect_interval_ms,
             auto_reset_bit=True,
+            plc_id=row.id,
         )
 
         connect_thread = QThread(self)

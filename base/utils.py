@@ -4,6 +4,7 @@ import sys
 import ctypes
 from ctypes import wintypes
 import socket
+from datetime import datetime
 
 from consts.running_consts import base_dir, DEFAULT_DIR
 
@@ -228,3 +229,26 @@ def int_or_none(value, label):
         return int(text)
     except ValueError as exc:
         raise ValueError(f"{label}必须是整数") from exc
+
+
+def normalize_path(value):
+    """路径文本去空白后转绝对路径；空值返回 None。"""
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    return os.path.abspath(os.path.expanduser(text))
+
+
+def format_datetime_display(value):
+    """把 ISO 时间文本格式化成 YYYY-MM-DD HH:MM:SS。"""
+    if value is None:
+        return ""
+    text = str(value).strip()
+    if not text:
+        return ""
+    try:
+        return datetime.fromisoformat(text).strftime("%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return text

@@ -82,12 +82,14 @@ class PlcService(QObject):
         poll_interval_ms = 200,
         reconnect_interval_ms = 3000,
         auto_reset_bit = True,
+        plc_id = None,
     ):
         # 初始化 PLC 服务，保存连接参数、轮询参数和运行时状态。
         super().__init__()
         self.bus = bus
         self.logger = LogManager.set_log_handler("core")
         self._on_start_requested = on_start_requested
+        self._plc_id = plc_id
 
         # PLC 连接参数(IP，机架号，槽号）
         self._ip = ip
@@ -168,6 +170,8 @@ class PlcService(QObject):
         self.timer.start()
         self.connect_result.emit(True, "")
 
+        self.logger.info(f"PLC开始监听: ip={self._ip}, rack={self._rack}, slot={self._slot}, "
+            f"DB{self._db_number}.DBX{self._byte_index}.{self._bit_index}")
         self.bus.log.emit(
             f"PLC开始监听: ip={self._ip}, rack={self._rack}, slot={self._slot}, "
             f"DB{self._db_number}.DBX{self._byte_index}.{self._bit_index}"
@@ -185,7 +189,8 @@ class PlcService(QObject):
             self._disconnect()
             self.state_changed.emit("未连接")
             self._last_value = None
-            self.bus.log.emit("[PLC] 停止监听")
+            self.bus.log.emit("PLC 停止监听")
+            self.logger.info("PLC 停止监听")
         finally:
             self.stop_completed.emit()
 
@@ -215,13 +220,13 @@ class PlcService(QObject):
             self._reconnect_timer_ms = 0
             self._last_connect_error = ""
             self.state_changed.emit("已连接")
-            self.logger.info(f"[PLC] 连接成功: {self._ip}")
-            self.bus.log.emit(f"[PLC] 连接成功: {self._ip}")
+            self.logger.info(f"PLC 连接成功: {self._ip}")
+            self.bus.log.emit(f"PLC 连接成功: {self._ip}")
         except Exception as exc:
             self.plc_client = None
             self._last_connect_error = str(exc)
-            self.logger.error(f"[PLC] 连接失败: {exc}")
-            self.bus.log.emit(f"[PLC] 连接失败: {exc}")
+            self.logger.error(f"PLC 连接失败: {exc}")
+            self.bus.log.emit(f"PLC 连接失败: {exc}")
 
     def _disconnect(self):
         # 断开当前 PLC 连接，并清空 plc_client，供后续重连使用。
@@ -262,7 +267,8 @@ class PlcService(QObject):
             return bool(data)
         except Exception as exc:
             self._disconnect()
-            self.bus.log.emit(f"[PLC] 读取失败: {exc}")
+            self.bus.log.emit(f"PLC 读取失败: {exc}")
+            self.logger.error(f"PLC 读取失败: {exc}")
             return None
 
     def _write_start_bit(self, value: bool) -> bool:
@@ -277,7 +283,8 @@ class PlcService(QObject):
             return True
         except Exception as exc:
             self._disconnect()
-            self.bus.log.emit(f"[PLC] 写入失败: {exc}")
+            self.bus.log.emit(f"PLC 写入失败: {exc}")
+            self.logger.error(f"PLC 写入失败: {exc}")
             return False
 
     def poll_once(self):
@@ -305,12 +312,13 @@ class PlcService(QObject):
         if not rising:
             # 未检测到信号
             return
-
-        self.bus.log.emit("[PLC] 检测到开始信号")
+        self.bus.log.emit(f"PLC {self._plc_id} 检测到开始信号")
+        self.logger.info(f"PLC {self._plc_id} 检测到开始信号")
         try:
             self._on_start_requested()
         except Exception as exc:
-            self.bus.log.emit(f"[PLC] 开始回调失败: {exc}")
+            self.bus.log.emit(f"PLC 开始回调失败: {exc}")
+            self.logger.error(f"PLC 开始回调失败: {exc}")
 
         # 如果需要，触发后自动清零，方便 PLC 下次再次置 1 触发。
         if self._auto_reset_bit:

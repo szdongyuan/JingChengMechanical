@@ -54,19 +54,17 @@ class InputCalibrationModule(QWidget):
         self.std_group.addButton(self.rb_114, 114)
 
         std_lay.addWidget(self.rb_94)
-        std_lay.addSpacing(80)
+        std_lay.addSpacing(150)
         std_lay.addWidget(self.rb_114)
         std_lay.addStretch(1)
 
         # 录制状态
         gb_state = QGroupBox("录制状态")
         gb_state.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        state_lay = QFormLayout(gb_state)
+        state_lay = QHBoxLayout(gb_state)
         state_lay.setContentsMargins(56, 10, 56, 10)
-        state_lay.setHorizontalSpacing(120)
-        state_lay.setVerticalSpacing(8)
-        state_lay.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        state_lay.setFormAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        # 录制状态移动右边一点
+        state_lay.setSpacing(115)
 
         self.record_state = QLabel("待录制")
         self.record_state.setObjectName("Muted")
@@ -74,7 +72,11 @@ class InputCalibrationModule(QWidget):
         self.record_state.setStyleSheet("color: rgb(255, 170, 0);")
 
         record_state_label = QLabel("录制状态 : ")
-        state_lay.addRow(record_state_label, self.record_state)
+        record_state_label.setFixedWidth(92)
+        state_lay.addWidget(record_state_label)
+        state_lay.addSpacing(40)
+        state_lay.addWidget(self.record_state)
+        state_lay.addStretch(1)
 
         # 校准结果
         gb_result = QGroupBox("校准结果")
@@ -110,7 +112,7 @@ class InputCalibrationModule(QWidget):
 
         row_dev_lay.addWidget(spl_deviation_label)
         # 让输入框整体往右移动一点
-        row_dev_lay.addSpacing(40)
+        row_dev_lay.addSpacing(120)
         row_dev_lay.addWidget(self.deviation_lineedit)
         row_dev_lay.addStretch(1)
 
@@ -120,7 +122,7 @@ class InputCalibrationModule(QWidget):
         row_action_lay.setSpacing(14)
         row_action_lay.addWidget(self.combo_channel)
         # 让“保存”按钮右移一点（不顶到最右侧）
-        row_action_lay.addSpacing(70)
+        row_action_lay.addSpacing(150)
         row_action_lay.addWidget(self.save_button)
         row_action_lay.addStretch(1)
 
@@ -135,20 +137,23 @@ class InputCalibrationModule(QWidget):
         bottom = QWidget()
         bottom_lay = QHBoxLayout(bottom)
         bottom_lay.setContentsMargins(0, 0, 0, 0)
-        bottom_lay.setSpacing(12)
+        bottom_lay.setSpacing(0)
 
         self.cal_button = QPushButton("校准")
         self.reset_button = QPushButton("重置")
         # 使用 Primary 样式
         self.cal_button.setObjectName("Primary")
         self.reset_button.setObjectName("Primary")
-        self.cal_button.setFixedWidth(160)
-        self.reset_button.setFixedWidth(160)
+        self.cal_button.setFixedWidth(96)
+        self.reset_button.setFixedWidth(96)
         self.cal_button.setMinimumHeight(34)
         self.reset_button.setMinimumHeight(34)
 
-        bottom_lay.addStretch(1)
+        # 控制“校准”位置
+        bottom_lay.addSpacing(50)
         bottom_lay.addWidget(self.cal_button)
+        # 控制“重置”位置
+        bottom_lay.addSpacing(135)
         bottom_lay.addWidget(self.reset_button)
         bottom_lay.addStretch(1)
         root.addStretch(1)

@@ -387,7 +387,7 @@ class MainWindow(QMainWindow):
 
         hw = HardwareModule(self.services)
         left_lay.addWidget(Card("设备选择", hw), 1)
-        content_lay.addWidget(left)
+        content_lay.addWidget(left, 7)
 
         # 右侧主区域（先占位，后续替换为真正的输入校准模块）
         main = QWidget()
@@ -405,8 +405,7 @@ class MainWindow(QMainWindow):
         cal_row_lay = QHBoxLayout(cal_row)
         cal_row_lay.setContentsMargins(0, 0, 0, 0)
         cal_row_lay.setSpacing(0)
-        cal_row_lay.addWidget(cal_card, 0)
-        cal_row_lay.addStretch(1)
+        cal_row_lay.addWidget(cal_card, 1)
 
         channel = ChannelSelectModule(self.services)
         channel_card = Card("通道选择", channel)
@@ -423,7 +422,7 @@ class MainWindow(QMainWindow):
         main_lay.addWidget(plc_card, 0)
 
         main_lay.addStretch(1)
-        content_lay.addWidget(main, 1)
+        content_lay.addWidget(main, 3)
         return page
 
     def _connect_bus_signals(self) -> None:

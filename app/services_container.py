@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from app.service.ai_service import AiService
+from app.service.audio_data_service import AudioDataService
 from app.service.analysis.test_manager import TestManager
 from app.service.config_package_service import ConfigPackageService
 from app.service.config_service import ConfigService
@@ -244,6 +245,7 @@ class ServiceContainer:
 
         # 配置服务
         self.config_service = ConfigService(self.bus)
+        self.audio_data_service = AudioDataService()
 
         self.ai_service = AiService()
         self.config_package_service = ConfigPackageService(
