@@ -259,14 +259,15 @@ class MainWindow(QMainWindow):
         page = QWidget()
         content_lay = QHBoxLayout(page)
         content_lay.setContentsMargins(0, 0, 0, 0)
-        content_lay.setSpacing(14)
+        # 左侧栏 和 右侧主区域 之间的横向间距
+        content_lay.setSpacing(5)
 
         # 左侧栏
         left = QWidget()
-        left.setFixedWidth(320)
+        left.setFixedWidth(420)
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
-        left_lay.setSpacing(12)
+        left_lay.setSpacing(5)
 
         self.workorder = WorkOrderModule(self.services)
         left_lay.addWidget(Card("工单输入", self.workorder))
@@ -287,7 +288,7 @@ class MainWindow(QMainWindow):
 
         grid = QGridLayout()
         grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(12)
+        grid.setSpacing(5)
 
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
@@ -376,7 +377,7 @@ class MainWindow(QMainWindow):
         page = QWidget()
         content_lay = QHBoxLayout(page)
         content_lay.setContentsMargins(0, 0, 0, 0)
-        content_lay.setSpacing(14)
+        content_lay.setSpacing(10)
 
         # 左侧栏
         left = QWidget()
