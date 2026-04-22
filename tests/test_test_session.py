@@ -338,6 +338,15 @@ class TestTestSessionProcessing:
 
 
 class TestTestSessionJudgment:
+    @staticmethod
+    def _make_persistence_result(overall: str) -> JudgmentResult:
+        return JudgmentResult(
+            overall=overall,
+            limit_pass=(overall == "合格"),
+            ai_pass=None,
+            ai_score=None,
+        )
+
     def test_run_judgment_produces_result(self, tmp_path):
         bus = _make_mock_bus()
         ai = MagicMock()
@@ -489,6 +498,163 @@ class TestTestSessionJudgment:
         assert result.ai_pass is False
         assert result.ai_score == 0.12
         assert result.overall == "不合格"
+
+    def test_run_judgment_updates_saved_audio_row_to_ok(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = None
+        session = TestSession(
+            config=_make_config(config_name="Config A"),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = self._make_persistence_result("合格")
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+
+        session._run_judgment()
+
+        rec = AudioDataTable.get_by_id(session._audio_data_id)
+        assert rec.labels == "OK"
+        assert rec.analyse_config == "Config A"
+
+    def test_run_judgment_updates_saved_audio_row_to_ng(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = None
+        session = TestSession(
+            config=_make_config(config_name="Config A"),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = self._make_persistence_result("不合格")
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+
+        session._run_judgment()
+
+        rec = AudioDataTable.get_by_id(session._audio_data_id)
+        assert rec.labels == "NG"
+        assert rec.analyse_config == "Config A"
+
+    def test_run_judgment_keeps_flow_when_audio_row_update_affects_zero_rows(
+        self, tmp_path, monkeypatch
+    ):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = None
+        session = TestSession(
+            config=_make_config(config_name="Config A"),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = self._make_persistence_result("合格")
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+
+        class _ZeroRowQuery:
+            def where(self, *_args, **_kwargs):
+                return self
+
+            def execute(self):
+                return 0
+
+        monkeypatch.setattr(AudioDataTable, "update", lambda **_kwargs: _ZeroRowQuery())
+
+        result = session._run_judgment()
+
+        assert result.overall == "合格"
+        assert any(
+            "audio metadata update affected 0 rows" in call.args[0]
+            for call in bus.log.emit.call_args_list
+        )
+
+    def test_persist_audio_result_metadata_warns_and_continues_for_missing_audio_data_id(self, tmp_path):
+        bus = _make_mock_bus()
+        session = TestSession(
+            config=_make_config(config_name="Config A"),
+            bus=bus,
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._audio_data_id = None
+
+        session._persist_audio_result_metadata(self._make_persistence_result("合格"))
+
+        assert any(
+            "audio metadata update skipped: missing audio_data_id" in call.args[0]
+            for call in bus.log.emit.call_args_list
+        )
+
+    def test_run_judgment_keeps_flow_when_audio_row_update_raises(self, tmp_path, monkeypatch):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = None
+        session = TestSession(
+            config=_make_config(config_name="Config A"),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = self._make_persistence_result("合格")
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+
+        def _raise_update(**_kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(AudioDataTable, "update", _raise_update)
+
+        result = session._run_judgment()
+
+        assert result.overall == "合格"
+        assert any(
+            "failed to persist audio result metadata" in call.args[0]
+            for call in bus.log.emit.call_args_list
+        )
+
+    def test_run_judgment_leaves_label_empty_for_unexpected_overall(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = None
+        session = TestSession(
+            config=_make_config(config_name="Config A"),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = self._make_persistence_result("未知")
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+
+        session._run_judgment()
+
+        rec = AudioDataTable.get_by_id(session._audio_data_id)
+        assert rec.labels is None
+        assert any(
+            "unexpected judgment overall" in call.args[0]
+            for call in bus.log.emit.call_args_list
+        )
 
     def test_run_judgment_logs_warning_and_preserves_limit_result_when_ai_envelope_not_success(self, tmp_path):
         bus = _make_mock_bus()
