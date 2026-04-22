@@ -112,6 +112,13 @@ class DbConnectionService:
                 ("artifacts_dir", "TEXT"),
             ],
         )
+        self._ensure_columns(
+            "audio_data_table",
+            [
+                ("analyse_config", "TEXT"),
+                ("config_content", "TEXT"),
+            ],
+        )
         self._backfill_channel_fft_defaults()
         self._backfill_channel_loudness_defaults()
         self._ensure_ai_binding_indexes()

@@ -1,14 +1,15 @@
 """Tests for TestSession lifecycle."""
 from __future__ import annotations
 
-import pytest
+import json
 import os
-import re
 import math
+import re
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from app.service.analysis.frames import FftFrame, JudgmentResult, SplFrame, StftFrame
 from app.service.analysis.test_session import TestSession
@@ -41,8 +42,8 @@ def _make_mock_bus():
     return bus
 
 
-def _make_config() -> dict:
-    return {
+def _make_config(**overrides) -> dict:
+    config = {
         "config_id": 1,
         "config_name": "Test",
         "record_duration": 2.0,
@@ -66,6 +67,8 @@ def _make_config() -> dict:
         "input_device_samplerate": 44100,
         "output_device_name": None,
     }
+    config.update(overrides)
+    return config
 
 
 class TestTestSessionInit:
@@ -863,6 +866,78 @@ class TestTestSessionWavSave:
         assert rec.audio_data_id
         assert rec.record_date
         assert rec.labels is None
+
+    def test_save_wav_persists_config_name_and_snapshot(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        session = TestSession(
+            config=_make_config(config_name="Config A"),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"sn": "SN001", "model": "M1"},
+            audio_dir=str(tmp_path),
+        )
+        sr = 44100.0
+        buf = np.random.randn(int(sr * 1), 1).astype(np.float32)
+
+        path = session._save_wav(buf, sr)
+
+        rec = AudioDataTable.get(AudioDataTable.file_path == path)
+        assert rec.analyse_config == "Config A"
+        snapshot = json.loads(rec.config_content)
+        assert snapshot["config_name"] == "Config A"
+        assert snapshot["selected_channels"] == [0]
+
+    def test_audio_config_metadata_falls_back_to_config_id_when_name_blank(self, tmp_path):
+        session = TestSession(
+            config=_make_config(config_id=42, config_name="   "),
+            bus=_make_mock_bus(),
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={"sn": "SN001", "model": "M1"},
+            audio_dir=str(tmp_path),
+        )
+
+        config_name, _snapshot = session._audio_config_metadata()
+
+        assert config_name == "42"
+
+    def test_audio_config_metadata_final_fallback_is_empty_string(self, tmp_path):
+        session = TestSession(
+            config=_make_config(config_id=None, config_name=""),
+            bus=_make_mock_bus(),
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={"sn": "SN001", "model": "M1"},
+            audio_dir=str(tmp_path),
+        )
+
+        config_name, _snapshot = session._audio_config_metadata()
+
+        assert config_name == ""
+
+    def test_audio_config_metadata_returns_none_snapshot_and_warns_when_json_fails(self, tmp_path):
+        config = _make_config(config_name="Config A")
+        config["self"] = config
+        bus = _make_mock_bus()
+        session = TestSession(
+            config=config,
+            bus=bus,
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={"sn": "SN001", "model": "M1"},
+            audio_dir=str(tmp_path),
+        )
+
+        config_name, snapshot = session._audio_config_metadata()
+
+        assert config_name == "Config A"
+        assert snapshot is None
+        assert any(
+            "failed to serialize config snapshot" in call.args[0]
+            for call in bus.log.emit.call_args_list
+        )
 
     def test_save_wav_returns_absolute_path(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)

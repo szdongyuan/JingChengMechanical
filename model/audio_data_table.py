@@ -18,6 +18,7 @@ class AudioDataTable(BaseModel):
     labels = TextField(null=True) # 标签结果
     barcode = TextField(null=True) # SN码
     analyse_config = TextField(null=True) # 分析配置
+    config_content = TextField(null=True) # 配置快照
 
     class Meta:
         table_name = "audio_data_table"

@@ -4,6 +4,7 @@ Orchestrates: recorder -> pipelines -> judgment -> result.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import uuid
@@ -192,6 +193,33 @@ class TestSession:
         self._last_result = result
         return result
 
+    def _audio_config_metadata(self) -> tuple[str, str | None]:
+        config_name = ""
+        raw_config_name = self._config.get("config_name")
+        if isinstance(raw_config_name, str):
+            config_name = raw_config_name.strip()
+
+        if not config_name:
+            config_id = self._config.get("config_id")
+            if config_id is not None:
+                config_name = str(config_id)
+
+        config_snapshot = None
+        try:
+            config_snapshot = json.dumps(
+                self._config,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        except Exception as exc:
+            self._bus.log.emit(
+                f"[TestSession] WARNING: failed to serialize config snapshot "
+                f"for config={self.config_id}: {exc}"
+            )
+
+        return config_name, config_snapshot
+
     def _run_ai(self, result: JudgmentResult) -> JudgmentResult:
         """Patch AI result into judgment when an enabled binding exists."""
         try:
@@ -379,6 +407,7 @@ class TestSession:
         wavfile.write(filepath, int(sample_rate), data)
 
         audio_id = uuid.uuid4().hex
+        config_name, config_snapshot = self._audio_config_metadata()
         AudioDataTable.create(
             audio_data_id=audio_id,
             file_path=filepath,
@@ -387,6 +416,8 @@ class TestSession:
             record_date=datetime.now(_TZ8).isoformat(),
             labels=None,
             barcode=self._workorder.get("sn", ""),
+            analyse_config=config_name,
+            config_content=config_snapshot,
         )
         self._audio_data_id = audio_id
         return filepath
