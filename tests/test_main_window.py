@@ -197,10 +197,6 @@ def _make_services(
         config_service=SimpleNamespace(
             load_config=MagicMock(return_value={"selected_channels": []})
         ),
-        audio_data_service=SimpleNamespace(
-            list_column_names=MagicMock(return_value=[]),
-            list_records=MagicMock(return_value=[]),
-        ),
         factory_mode=factory_mode,
     )
 
