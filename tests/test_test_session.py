@@ -479,7 +479,7 @@ class TestTestSessionJudgment:
             "error_summary": None,
         }
         session = TestSession(
-            config=_make_config(), bus=bus, ai_service=ai,
+            config=_make_config(config_name="Config A"), bus=bus, ai_service=ai,
             mic_cal={}, workorder={"sn": "test", "model": "M"},
             audio_dir=str(tmp_path),
         )
@@ -498,6 +498,12 @@ class TestTestSessionJudgment:
         assert result.ai_pass is False
         assert result.ai_score == 0.12
         assert result.overall == "不合格"
+        rec = AudioDataTable.get_by_id(session._audio_data_id)
+        assert rec.labels == "NG"
+        assert rec.analyse_config == "Config A"
+        snapshot = json.loads(rec.config_content)
+        assert snapshot["config_name"] == "Config A"
+        assert snapshot["selected_channels"] == [0]
 
     def test_run_judgment_updates_saved_audio_row_to_ok(self, tmp_path):
         bus = _make_mock_bus()
