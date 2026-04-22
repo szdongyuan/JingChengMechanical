@@ -1,14 +1,15 @@
 """Tests for TestSession lifecycle."""
 from __future__ import annotations
 
-import pytest
+import json
 import os
-import re
 import math
+import re
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from app.service.analysis.frames import FftFrame, JudgmentResult, SplFrame, StftFrame
 from app.service.analysis.test_session import TestSession
@@ -41,8 +42,8 @@ def _make_mock_bus():
     return bus
 
 
-def _make_config() -> dict:
-    return {
+def _make_config(**overrides) -> dict:
+    config = {
         "config_id": 1,
         "config_name": "Test",
         "record_duration": 2.0,
@@ -66,6 +67,8 @@ def _make_config() -> dict:
         "input_device_samplerate": 44100,
         "output_device_name": None,
     }
+    config.update(overrides)
+    return config
 
 
 class TestTestSessionInit:
@@ -335,6 +338,15 @@ class TestTestSessionProcessing:
 
 
 class TestTestSessionJudgment:
+    @staticmethod
+    def _make_persistence_result(overall: str) -> JudgmentResult:
+        return JudgmentResult(
+            overall=overall,
+            limit_pass=(overall == "合格"),
+            ai_pass=None,
+            ai_score=None,
+        )
+
     def test_run_judgment_produces_result(self, tmp_path):
         bus = _make_mock_bus()
         ai = MagicMock()
@@ -467,7 +479,7 @@ class TestTestSessionJudgment:
             "error_summary": None,
         }
         session = TestSession(
-            config=_make_config(), bus=bus, ai_service=ai,
+            config=_make_config(config_name="Config A"), bus=bus, ai_service=ai,
             mic_cal={}, workorder={"sn": "test", "model": "M"},
             audio_dir=str(tmp_path),
         )
@@ -486,6 +498,169 @@ class TestTestSessionJudgment:
         assert result.ai_pass is False
         assert result.ai_score == 0.12
         assert result.overall == "不合格"
+        rec = AudioDataTable.get_by_id(session._audio_data_id)
+        assert rec.labels == "NG"
+        assert rec.analyse_config == "Config A"
+        snapshot = json.loads(rec.config_content)
+        assert snapshot["config_name"] == "Config A"
+        assert snapshot["selected_channels"] == [0]
+
+    def test_run_judgment_updates_saved_audio_row_to_ok(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = None
+        session = TestSession(
+            config=_make_config(config_name="Config A"),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = self._make_persistence_result("合格")
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+
+        session._run_judgment()
+
+        rec = AudioDataTable.get_by_id(session._audio_data_id)
+        assert rec.labels == "OK"
+        assert rec.analyse_config == "Config A"
+
+    def test_run_judgment_updates_saved_audio_row_to_ng(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = None
+        session = TestSession(
+            config=_make_config(config_name="Config A"),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = self._make_persistence_result("不合格")
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+
+        session._run_judgment()
+
+        rec = AudioDataTable.get_by_id(session._audio_data_id)
+        assert rec.labels == "NG"
+        assert rec.analyse_config == "Config A"
+
+    def test_run_judgment_keeps_flow_when_audio_row_update_affects_zero_rows(
+        self, tmp_path, monkeypatch
+    ):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = None
+        session = TestSession(
+            config=_make_config(config_name="Config A"),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = self._make_persistence_result("合格")
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+
+        class _ZeroRowQuery:
+            def where(self, *_args, **_kwargs):
+                return self
+
+            def execute(self):
+                return 0
+
+        monkeypatch.setattr(AudioDataTable, "update", lambda **_kwargs: _ZeroRowQuery())
+
+        result = session._run_judgment()
+
+        assert result.overall == "合格"
+        assert any(
+            "audio metadata update affected 0 rows" in call.args[0]
+            for call in bus.log.emit.call_args_list
+        )
+
+    def test_persist_audio_result_metadata_warns_and_continues_for_missing_audio_data_id(self, tmp_path):
+        bus = _make_mock_bus()
+        session = TestSession(
+            config=_make_config(config_name="Config A"),
+            bus=bus,
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._audio_data_id = None
+
+        session._persist_audio_result_metadata(self._make_persistence_result("合格"))
+
+        assert any(
+            "audio metadata update skipped: missing audio_data_id" in call.args[0]
+            for call in bus.log.emit.call_args_list
+        )
+
+    def test_run_judgment_keeps_flow_when_audio_row_update_raises(self, tmp_path, monkeypatch):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = None
+        session = TestSession(
+            config=_make_config(config_name="Config A"),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = self._make_persistence_result("合格")
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+
+        def _raise_update(**_kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(AudioDataTable, "update", _raise_update)
+
+        result = session._run_judgment()
+
+        assert result.overall == "合格"
+        assert any(
+            "failed to persist audio result metadata" in call.args[0]
+            for call in bus.log.emit.call_args_list
+        )
+
+    def test_run_judgment_leaves_label_empty_for_unexpected_overall(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = None
+        session = TestSession(
+            config=_make_config(config_name="Config A"),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = self._make_persistence_result("未知")
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+
+        session._run_judgment()
+
+        rec = AudioDataTable.get_by_id(session._audio_data_id)
+        assert rec.labels is None
+        assert any(
+            "unexpected judgment overall" in call.args[0]
+            for call in bus.log.emit.call_args_list
+        )
 
     def test_run_judgment_logs_warning_and_preserves_limit_result_when_ai_envelope_not_success(self, tmp_path):
         bus = _make_mock_bus()
@@ -863,6 +1038,78 @@ class TestTestSessionWavSave:
         assert rec.audio_data_id
         assert rec.record_date
         assert rec.labels is None
+
+    def test_save_wav_persists_config_name_and_snapshot(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        session = TestSession(
+            config=_make_config(config_name="Config A"),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"sn": "SN001", "model": "M1"},
+            audio_dir=str(tmp_path),
+        )
+        sr = 44100.0
+        buf = np.random.randn(int(sr * 1), 1).astype(np.float32)
+
+        path = session._save_wav(buf, sr)
+
+        rec = AudioDataTable.get(AudioDataTable.file_path == path)
+        assert rec.analyse_config == "Config A"
+        snapshot = json.loads(rec.config_content)
+        assert snapshot["config_name"] == "Config A"
+        assert snapshot["selected_channels"] == [0]
+
+    def test_audio_config_metadata_falls_back_to_config_id_when_name_blank(self, tmp_path):
+        session = TestSession(
+            config=_make_config(config_id=42, config_name="   "),
+            bus=_make_mock_bus(),
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={"sn": "SN001", "model": "M1"},
+            audio_dir=str(tmp_path),
+        )
+
+        config_name, _snapshot = session._audio_config_metadata()
+
+        assert config_name == "42"
+
+    def test_audio_config_metadata_final_fallback_is_empty_string(self, tmp_path):
+        session = TestSession(
+            config=_make_config(config_id=None, config_name=""),
+            bus=_make_mock_bus(),
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={"sn": "SN001", "model": "M1"},
+            audio_dir=str(tmp_path),
+        )
+
+        config_name, _snapshot = session._audio_config_metadata()
+
+        assert config_name == ""
+
+    def test_audio_config_metadata_returns_none_snapshot_and_warns_when_json_fails(self, tmp_path):
+        config = _make_config(config_name="Config A")
+        config["self"] = config
+        bus = _make_mock_bus()
+        session = TestSession(
+            config=config,
+            bus=bus,
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={"sn": "SN001", "model": "M1"},
+            audio_dir=str(tmp_path),
+        )
+
+        config_name, snapshot = session._audio_config_metadata()
+
+        assert config_name == "Config A"
+        assert snapshot is None
+        assert any(
+            "failed to serialize config snapshot" in call.args[0]
+            for call in bus.log.emit.call_args_list
+        )
 
     def test_save_wav_returns_absolute_path(self, tmp_path, monkeypatch):
         monkeypatch.chdir(tmp_path)

@@ -4,6 +4,7 @@ Orchestrates: recorder -> pipelines -> judgment -> result.
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import uuid
@@ -190,7 +191,81 @@ class TestSession:
         )
         result = self._run_ai(result)
         self._last_result = result
+        self._persist_audio_result_metadata(result)
         return result
+
+    def _audio_config_metadata(self) -> tuple[str, str | None]:
+        config_name = ""
+        raw_config_name = self._config.get("config_name")
+        if isinstance(raw_config_name, str):
+            config_name = raw_config_name.strip()
+
+        if not config_name:
+            config_id = self._config.get("config_id")
+            if config_id is not None:
+                config_name = str(config_id)
+
+        config_snapshot = None
+        try:
+            config_snapshot = json.dumps(
+                self._config,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+        except Exception as exc:
+            self._bus.log.emit(
+                f"[TestSession] WARNING: failed to serialize config snapshot "
+                f"for config={self.config_id}: {exc}"
+            )
+
+        return config_name, config_snapshot
+
+    def _persist_audio_result_metadata(self, result: JudgmentResult) -> None:
+        if not self._audio_data_id:
+            self._bus.log.emit(
+                f"[TestSession] WARNING: audio metadata update skipped: missing audio_data_id "
+                f"for config={self.config_id}"
+            )
+            return
+
+        config_name, config_snapshot = self._audio_config_metadata()
+        update_payload = {
+            "analyse_config": config_name,
+            "config_content": config_snapshot,
+        }
+
+        label_value = None
+        if result.overall == "合格":
+            label_value = "OK"
+        elif result.overall == "不合格":
+            label_value = "NG"
+        else:
+            self._bus.log.emit(
+                f"[TestSession] WARNING: unexpected judgment overall for config={self.config_id}: "
+                f"{result.overall!r}"
+            )
+
+        if label_value is not None:
+            update_payload["labels"] = label_value
+
+        try:
+            updated = (
+                AudioDataTable
+                .update(**update_payload)
+                .where(AudioDataTable.audio_data_id == self._audio_data_id)
+                .execute()
+            )
+            if updated != 1:
+                self._bus.log.emit(
+                    f"[TestSession] WARNING: audio metadata update affected {updated} rows "
+                    f"for audio_data_id={self._audio_data_id}"
+                )
+        except Exception as exc:
+            self._bus.log.emit(
+                f"[TestSession] WARNING: failed to persist audio result metadata "
+                f"for audio_data_id={self._audio_data_id}: {exc}"
+            )
 
     def _run_ai(self, result: JudgmentResult) -> JudgmentResult:
         """Patch AI result into judgment when an enabled binding exists."""
@@ -379,6 +454,7 @@ class TestSession:
         wavfile.write(filepath, int(sample_rate), data)
 
         audio_id = uuid.uuid4().hex
+        config_name, config_snapshot = self._audio_config_metadata()
         AudioDataTable.create(
             audio_data_id=audio_id,
             file_path=filepath,
@@ -387,6 +463,8 @@ class TestSession:
             record_date=datetime.now(_TZ8).isoformat(),
             labels=None,
             barcode=self._workorder.get("sn", ""),
+            analyse_config=config_name,
+            config_content=config_snapshot,
         )
         self._audio_data_id = audio_id
         return filepath

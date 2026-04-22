@@ -151,6 +151,41 @@ def test_connect_bootstraps_full_runtime_schema_and_default_rows(monkeypatch):
         assert login_user is not None
 
 
+def test_connect_bootstraps_audio_data_table_with_config_content(monkeypatch):
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
+        svc.connect()
+
+        bootstrapped_columns = _table_columns(tmp_db, "audio_data_table")
+
+        assert "analyse_config" in bootstrapped_columns
+        assert "config_content" in bootstrapped_columns
+
+
+def test_connect_migrates_audio_data_table_config_content_metadata_columns(monkeypatch):
+    with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
+        tmp_db.connect()
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE audio_data_table (
+                audio_data_id TEXT PRIMARY KEY,
+                file_path TEXT UNIQUE,
+                product_model TEXT NOT NULL,
+                sample_rate INTEGER NOT NULL,
+                record_date TEXT NOT NULL,
+                labels TEXT,
+                barcode TEXT
+            )
+            """
+        )
+
+        svc.connect()
+
+        repaired_columns = _table_columns(tmp_db, "audio_data_table")
+
+        assert "analyse_config" in repaired_columns
+        assert "config_content" in repaired_columns
+
+
 def test_connect_bootstraps_execution_mode_default_to_resident_process(monkeypatch):
     with _temporary_runtime_db(monkeypatch) as (tmp_db, svc, _):
         svc.connect()
