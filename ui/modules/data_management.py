@@ -34,6 +34,7 @@ class DataManagementModule(QWidget):
         "labels": "标签结果",
         "barcode": "SN码",
         "analyse_config": "分析配置",
+        "config_content": "配置内容",
     }
     header_min_widths = {
         "__select__": 52,
@@ -45,6 +46,7 @@ class DataManagementModule(QWidget):
         "labels": 90,
         "barcode": 90,
         "analyse_config": 120,
+        "config_content": 180,
         "__action__": 60,
     }
 
@@ -101,7 +103,9 @@ class DataManagementModule(QWidget):
     def refresh_table(self) -> None:
         # 每次刷新都重新读表结构和数据，适配数据库字段变化。
         service = self.services.audio_data_service
-        self._column_names = service.list_column_names()
+        self._column_names = [
+            name for name in service.list_column_names() if name != "config_content"
+        ]
         self._records = service.list_records()
         self._render_table()
 

@@ -102,6 +102,7 @@ class AudioDataService:
             labels = AudioDataTable.labels.clone()
             barcode = AudioDataTable.barcode.clone()
             analyse_config = AudioDataTable.analyse_config.clone()
+            config_content = AudioDataTable.config_content.clone()
 
             class Meta:
                 database = target_db

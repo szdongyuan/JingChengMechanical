@@ -90,7 +90,7 @@ class PlcSettingsModule(QWidget):
 
         btn_row = QHBoxLayout()
         btn_row.setContentsMargins(0, 0, 0, 0)
-        btn_row.setSpacing(8)
+        btn_row.setSpacing(60)
 
         self.btn_save = QPushButton("保存")
         self.btn_save.setObjectName("Primary")
@@ -104,6 +104,7 @@ class PlcSettingsModule(QWidget):
         self.btn_connect.setObjectName("Primary")
         self.btn_connect.setFixedWidth(96)
 
+        btn_row.addStretch(1)
         btn_row.addWidget(self.btn_save)
         btn_row.addWidget(self.btn_toggle)
         btn_row.addWidget(self.btn_connect)
@@ -456,3 +457,24 @@ class PlcSettingsModule(QWidget):
             self.ed_reconnect_interval,
         ):
             edit.setEnabled(enabled)
+
+    def set_permission_enabled(self, allowed: bool) -> None:
+        """
+        设置权限
+        """
+        for widget in (
+                self.ed_name,
+                self.ed_ip,
+                self.ed_rack,
+                self.ed_slot,
+                self.ed_db_number,
+                self.ed_byte_index,
+                self.ed_bit_index,
+                self.ed_poll_interval,
+                self.ed_reconnect_interval,
+                self.btn_save,
+                self.btn_toggle,
+                self.btn_connect,
+        ):
+            widget.setEnabled(allowed)
+        self.combo_plc.setEnabled(True)
