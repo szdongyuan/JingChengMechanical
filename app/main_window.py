@@ -248,6 +248,11 @@ class MainWindow(QMainWindow):
             if stop_button is not None:
                 stop_button.setEnabled(bool(self.current_user_name))
 
+        if hasattr(self, "plc_settings_card"):
+            plc_allowed = self.current_user_role in {"管理员", "工程师"}
+            self.plc_settings_card.setEnabled(plc_allowed)
+            self.plc_settings_card.setToolTip("" if plc_allowed else "暂无权限操作 PLC 设置")
+
         if hasattr(self, "tab"):
             self._sync_topbar_selection(self.tab.currentIndex())
 
@@ -259,23 +264,24 @@ class MainWindow(QMainWindow):
         page = QWidget()
         content_lay = QHBoxLayout(page)
         content_lay.setContentsMargins(0, 0, 0, 0)
-        content_lay.setSpacing(14)
+        # 左侧栏 和 右侧主区域 之间的横向间距
+        content_lay.setSpacing(5)
 
         # 左侧栏
         left = QWidget()
-        left.setFixedWidth(320)
+        left.setFixedWidth(420)
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
-        left_lay.setSpacing(12)
+        left_lay.setSpacing(5)
 
         self.workorder = WorkOrderModule(self.services)
-        left_lay.addWidget(Card("工单输入", self.workorder))
+        left_lay.addWidget(Card("工单输入", self.workorder), 2)
 
         self.control = ControlModule(self.services)
-        left_lay.addWidget(Card("控制面板", self.control))
+        left_lay.addWidget(Card("控制面板", self.control), 1)
 
         self.video = VideoModule(self.services)
-        left_lay.addWidget(Card("视频预览", self.video), 1)
+        left_lay.addWidget(Card("视频预览", self.video))
 
         content_lay.addWidget(left)
 
@@ -287,7 +293,7 @@ class MainWindow(QMainWindow):
 
         grid = QGridLayout()
         grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(12)
+        grid.setSpacing(5)
 
         grid.setColumnStretch(0, 1)
         grid.setColumnStretch(1, 1)
@@ -376,11 +382,10 @@ class MainWindow(QMainWindow):
         page = QWidget()
         content_lay = QHBoxLayout(page)
         content_lay.setContentsMargins(0, 0, 0, 0)
-        content_lay.setSpacing(14)
+        content_lay.setSpacing(10)
 
         # 左侧栏
         left = QWidget()
-        left.setFixedWidth(1200)
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
         left_lay.setSpacing(12)
@@ -389,7 +394,7 @@ class MainWindow(QMainWindow):
         left_lay.addWidget(Card("设备选择", hw), 1)
         content_lay.addWidget(left, 7)
 
-        # 右侧主区域（先占位，后续替换为真正的输入校准模块）
+        # 右侧主区域：通道选择 / 输入校准 / PLC 设置作为一个整体垂直排列。
         main = QWidget()
         main_lay = QVBoxLayout(main)
         main_lay.setContentsMargins(0, 0, 0, 0)
@@ -397,31 +402,16 @@ class MainWindow(QMainWindow):
 
         cal = InputCalibrationModule(self.services)
         cal_card = Card("输入校准", cal)
-        # 让右侧校准区域更紧凑（类似参考图）
-        cal_card.setMaximumWidth(560)
-        cal_card.setFixedHeight(420)
-
-        cal_row = QWidget()
-        cal_row_lay = QHBoxLayout(cal_row)
-        cal_row_lay.setContentsMargins(0, 0, 0, 0)
-        cal_row_lay.setSpacing(0)
-        cal_row_lay.addWidget(cal_card, 1)
 
         channel = ChannelSelectModule(self.services)
         channel_card = Card("通道选择", channel)
-        channel_card.setMaximumWidth(380)
-        channel_card.setFixedHeight(100)
 
-        plc = PlcSettingsModule(self.services)
-        plc_card = Card("PLC设置", plc)
-        plc_card.setMaximumWidth(560)
-        plc_card.setFixedHeight(420)
+        self.plc_settings_module = PlcSettingsModule(self.services)
+        self.plc_settings_card = Card("PLC设置", self.plc_settings_module)
 
-        main_lay.addWidget(channel_card, 0)
-        main_lay.addWidget(cal_row, 0)
-        main_lay.addWidget(plc_card, 0)
-
-        main_lay.addStretch(1)
+        main_lay.addWidget(channel_card, 1)
+        main_lay.addWidget(cal_card, 2)
+        main_lay.addWidget(self.plc_settings_card, 2)
         content_lay.addWidget(main, 3)
         return page
 

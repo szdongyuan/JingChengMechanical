@@ -70,7 +70,7 @@ class VideoModule(QWidget):
         self.lb.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
         self.lb.setMinimumHeight(220)
         # 让画面铺满预览区域
-        self.lb.setScaledContents(True)
+        self.lb.setScaledContents(False)
         self.lb.setStyleSheet(
             "background:#f8fafc; border:1px dashed #d1d5db; border-radius:10px;"
         )
@@ -126,7 +126,13 @@ class VideoModule(QWidget):
         )
 
         self.lb.setText("")
-        self.lb.setPixmap(QPixmap.fromImage(image))
+        pixmap = QPixmap.fromImage(image)
+        scaled = pixmap.scaled(
+            self.lb.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.lb.setPixmap(scaled)
 
     def set_text(self, message):
         self.lb.clear()
