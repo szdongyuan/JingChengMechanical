@@ -116,4 +116,3 @@ Required verification:
 ```powershell
 pytest tests/test_analysis_chart_modules/test_zero_based_axes.py tests/test_analysis_chart_modules/test_committed_chart_modules.py tests/test_main_window.py tests/test_result_module.py -q
 ```
-

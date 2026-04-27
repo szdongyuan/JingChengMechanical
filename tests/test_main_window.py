@@ -31,6 +31,8 @@ if "snap7" not in sys.modules:
     sys.modules["snap7.client"] = snap7_client_module
     sys.modules["snap7.util"] = snap7_util_module
 
+from PyQt6 import sip
+from PyQt6.QtCore import QCoreApplication, Qt
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
@@ -154,13 +156,56 @@ def qapp():
     return app
 
 
+def _is_analysis_chart_widget(widget: QWidget) -> bool:
+    return type(widget).__module__ == "ui.widgets.analysis_charts"
+
+
+def _disable_updates_and_remove_events(widget: QWidget) -> None:
+    widget.setUpdatesEnabled(False)
+    widgets = [widget]
+    try:
+        widgets.extend(widget.findChildren(QWidget))
+    except RuntimeError:
+        pass
+    for target in widgets:
+        if not sip.isdeleted(target):
+            target.setUpdatesEnabled(False)
+            QCoreApplication.removePostedEvents(target)
+
+
+def _close_plot_widget(chart_widget: QWidget) -> None:
+    plot_widget = getattr(chart_widget, "plot_widget", None)
+    if plot_widget is None or sip.isdeleted(plot_widget):
+        return
+    _disable_updates_and_remove_events(plot_widget)
+    if getattr(plot_widget, "plotItem", None) is None:
+        return
+    try:
+        plot_widget.close()
+    except AttributeError:
+        pass
+
+
 @pytest.fixture(autouse=True)
 def _close_top_level_widgets(qapp):
     yield
     for widget in list(qapp.topLevelWidgets()):
-        widget.close()
+        if sip.isdeleted(widget):
+            continue
+        for child in widget.findChildren(QWidget):
+            if _is_analysis_chart_widget(child):
+                _disable_updates_and_remove_events(child)
+                _close_plot_widget(child)
+        widget.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        try:
+            widget.close()
+        except AttributeError:
+            pass
+        if sip.isdeleted(widget):
+            continue
         widget.deleteLater()
-    qapp.processEvents()
+    for _ in range(5):
+        qapp.processEvents()
 
 
 def _patch_non_target_modules(monkeypatch, *, use_real_control: bool = False):
