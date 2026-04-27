@@ -734,20 +734,32 @@ class MainWindow(QMainWindow):
             for plc_service in getattr(self.services, "plc_services", {}).values():
                 if plc_service is None:
                     continue
-                QMetaObject.invokeMethod(
-                    plc_service,
-                    "stop_plc_service",
-                    Qt.ConnectionType.BlockingQueuedConnection,
-                )
+                try:
+                    QMetaObject.invokeMethod(
+                        plc_service,
+                        "stop_plc_service",
+                        Qt.ConnectionType.BlockingQueuedConnection,
+                    )
+                except Exception:
+                    pass
             for plc_thread in getattr(self.services, "plc_threads", {}).values():
                 if plc_thread is None:
                     continue
-                plc_thread.quit()
-                plc_thread.wait(2000)
-            # 关闭 DB 长连接
-            self.services.db.close()
-            # 视频关闭
-            self.video.stop_camera()
+                try:
+                    plc_thread.quit()
+                    plc_thread.wait(2000)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            self.services.shutdown()
+        except Exception:
+            pass
+        try:
+            stop_camera = getattr(getattr(self, "video", None), "stop_camera", None)
+            if callable(stop_camera):
+                stop_camera()
         except Exception:
             pass
         super().closeEvent(event)
