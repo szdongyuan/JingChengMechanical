@@ -128,8 +128,14 @@ def _validate_data_focus_series(*, x_values: list[float], y_values: list[float])
 
 
 class _BasePlotChart(QWidget):
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        hide_left_axis: bool = False,
+    ):
         super().__init__(parent)
+        self._hide_left_axis = bool(hide_left_axis)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -143,6 +149,11 @@ class _BasePlotChart(QWidget):
         self.plot_item = self.plot_widget.getPlotItem()
         self.plot_item.showGrid(x=True, y=True, alpha=0.18)
         self._apply_x_axis_policy(payload_values=None)
+        if self._hide_left_axis:
+            self.apply_left_axis_hidden_style()
+
+    def apply_left_axis_hidden_style(self) -> None:
+        self.plot_item.hideAxis("left")
 
     def _apply_x_axis_policy(self, *, payload_values: Iterable[float] | None) -> None:
         visible_max = _visible_axis_max(payload_values)
@@ -152,8 +163,13 @@ class _BasePlotChart(QWidget):
 
 
 class StftImageChartWidget(_BasePlotChart):
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        hide_left_axis: bool = False,
+    ):
+        super().__init__(parent, hide_left_axis=hide_left_axis)
         self._image_payload: dict | None = None
         self._cached_levels: tuple[float, float] | None = None
         self._image_item = pg.ImageItem(axisOrder="row-major")
@@ -174,6 +190,8 @@ class StftImageChartWidget(_BasePlotChart):
         self.plot_item.addItem(self._image_item)
         self.plot_item.setLabel("bottom", "Time", units="s")
         self.plot_item.setLabel("left", "Frequency", units="Hz")
+        if self._hide_left_axis:
+            self.apply_left_axis_hidden_style()
         self._apply_stft_y_axis_policy(payload_values=None)
 
     def set_image(
@@ -361,8 +379,13 @@ class StftImageChartWidget(_BasePlotChart):
 
 
 class LineChartWidget(_BasePlotChart):
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        hide_left_axis: bool = False,
+    ):
+        super().__init__(parent, hide_left_axis=hide_left_axis)
         self._series_payload: dict | None = None
         self._y_axis_mode = "auto"
         self._curve = self.plot_item.plot(
@@ -464,8 +487,13 @@ class LineChartWidget(_BasePlotChart):
 
 
 class FftLineChartWidget(LineChartWidget):
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        hide_left_axis: bool = False,
+    ):
+        super().__init__(parent, hide_left_axis=hide_left_axis)
         self._spectrum_payload: dict | None = None
         self._golden_overlay_curve_item = self.plot_item.plot(
             pen=pg.mkPen(
@@ -491,6 +519,8 @@ class FftLineChartWidget(LineChartWidget):
         self._zero_reference_line.hide()
         self.plot_item.setLabel("bottom", "Frequency", units="Hz")
         self.plot_item.setLabel("left", "Level", units="dB")
+        if self._hide_left_axis:
+            self.apply_left_axis_hidden_style()
 
     def set_spectrum(
         self,
@@ -607,8 +637,13 @@ class FftLineChartWidget(LineChartWidget):
 
 
 class OctaveBarChartWidget(_BasePlotChart):
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        hide_left_axis: bool = False,
+    ):
+        super().__init__(parent, hide_left_axis=hide_left_axis)
         self._band_payload: dict | None = None
         self._bar_item: pg.BarGraphItem | None = None
         self._golden_overlay_item = pg.PlotDataItem(
@@ -640,6 +675,8 @@ class OctaveBarChartWidget(_BasePlotChart):
         self._zero_reference_line.hide()
         self.plot_item.setLabel("bottom", "Band", units="Hz")
         self.plot_item.setLabel("left", "Level", units="dB")
+        if self._hide_left_axis:
+            self.apply_left_axis_hidden_style()
 
     def set_bands(
         self,

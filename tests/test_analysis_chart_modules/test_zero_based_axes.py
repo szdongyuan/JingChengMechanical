@@ -13,6 +13,15 @@ from ui.widgets.analysis_charts import (
 from ._support import _assert_x_range, _assert_xy_range, _show_widget
 
 
+def _assert_left_axis_hidden_bottom_visible(widget) -> None:
+    assert widget.plot_item.getAxis("left").isVisible() is False
+    assert widget.plot_item.getAxis("bottom").isVisible() is True
+
+
+def _assert_left_axis_visible(widget) -> None:
+    assert widget.plot_item.getAxis("left").isVisible() is True
+
+
 @pytest.mark.parametrize(
     ("widget_cls", "expected_x_range", "expected_y_range"),
     (
@@ -39,6 +48,75 @@ def test_chart_widgets_initial_visible_state_use_zero_based_fallback_axes(
             _assert_xy_range(widget, expected_x_range, expected_y_range)
     finally:
         widget.close()
+
+
+@pytest.mark.parametrize(
+    "widget_cls",
+    (LineChartWidget, FftLineChartWidget, OctaveBarChartWidget, StftImageChartWidget),
+)
+def test_chart_widgets_keep_left_axis_visible_by_default(qapp, widget_cls):
+    widget = widget_cls()
+
+    try:
+        _show_widget(widget, qapp)
+        _assert_left_axis_visible(widget)
+        assert widget.plot_item.getAxis("bottom").isVisible() is True
+    finally:
+        widget.close()
+
+
+@pytest.mark.parametrize(
+    "widget_cls",
+    (LineChartWidget, FftLineChartWidget, OctaveBarChartWidget, StftImageChartWidget),
+)
+def test_chart_widgets_can_hide_only_left_axis_when_opted_in(qapp, widget_cls):
+    widget = widget_cls(hide_left_axis=True)
+
+    try:
+        _show_widget(widget, qapp)
+        _assert_left_axis_hidden_bottom_visible(widget)
+    finally:
+        widget.close()
+
+
+def test_left_axis_hiding_preserves_zero_based_ranges(qapp):
+    line = LineChartWidget(hide_left_axis=True)
+    fft = FftLineChartWidget(hide_left_axis=True)
+    octave = OctaveBarChartWidget(hide_left_axis=True)
+    stft = StftImageChartWidget(hide_left_axis=True)
+
+    try:
+        for widget in (line, fft, octave, stft):
+            _show_widget(widget, qapp)
+
+        line.set_series([1.0, 2.0], [70.0, 71.0])
+        fft.set_spectrum(
+            frequencies_hz=[125.0, 250.0],
+            levels_db=[42.0, 45.0],
+            limit_bands=[],
+        )
+        octave.set_bands(
+            center_freqs_hz=[125.0, 250.0],
+            levels_db=[32.0, 34.0],
+        )
+        stft.set_image(
+            times_sec=[0.0, 1.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0, 2.0], [3.0, 4.0]]),
+        )
+        qapp.processEvents()
+
+        _assert_x_range(line, (0.0, 2.0))
+        _assert_x_range(fft, (0.0, 250.0))
+        _assert_x_range(octave, (-0.5, 1.5))
+        _assert_xy_range(stft, (0.0, 1.0), (0.0, 200.0))
+        for widget in (line, fft, octave, stft):
+            _assert_left_axis_hidden_bottom_visible(widget)
+    finally:
+        line.close()
+        fft.close()
+        octave.close()
+        stft.close()
 
 
 def test_line_chart_widget_uses_zero_based_x_axis_without_horizontal_padding(qapp):
