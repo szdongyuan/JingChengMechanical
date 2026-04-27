@@ -1452,6 +1452,25 @@ def test_main_window_channel_toolbar_shows_for_multi_channel_running_config(qapp
     assert window.stft.selected_display_channel_provider() == 0
 
 
+def test_main_window_analysis_toolbar_uses_chinese_channel_text(qapp, monkeypatch):
+    window, services = _make_window(monkeypatch, initial_state=_running_state(101))
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+
+    combo = window.analysis_toolbar.channel_combo
+    assert combo.itemText(0) == "通道1"
+    assert combo.itemData(0) == 0
+    assert combo.itemText(1) == "通道2"
+    assert combo.itemData(1) == 1
+    assert window.analysis_toolbar.context_label.text() == "配置 101 / 通道1"
+
+
 def test_main_window_toolbar_selection_immediately_refreshes_stft_cached_channel(
     qapp,
     monkeypatch,
@@ -1798,21 +1817,21 @@ def test_main_window_ai_partial_no_result_keeps_rule_rows_and_committed_charts_v
     assert window.result.lb_overall.text() == "无结果"
     assert window.result.error_label.isHidden() is False
     assert window.result.error_label.text() == "AI timeout"
-    assert _result_table_value(window, 0, 0) == "SPL"
+    assert _result_table_value(window, 0, 0) == "声压级"
     assert _result_table_value(window, 0, 1) == "-1 dB"
-    assert _result_table_value(window, 0, 2) == "CH2"
+    assert _result_table_value(window, 0, 2) == "通道2"
     assert _result_table_value(window, 0, 3) == "OK"
-    assert _result_table_value(window, 1, 0) == "Loudness"
+    assert _result_table_value(window, 1, 0) == "响度"
     assert _result_table_value(window, 1, 1) == "-0.5 sone"
-    assert _result_table_value(window, 1, 2) == "CH2"
+    assert _result_table_value(window, 1, 2) == "通道2"
     assert _result_table_value(window, 1, 3) == "OK"
-    assert _result_table_value(window, 2, 0) == "FFT"
+    assert _result_table_value(window, 2, 0) == "FFT频谱"
     assert _result_table_value(window, 2, 1) == "2 dB"
-    assert _result_table_value(window, 2, 2) == "CH1"
+    assert _result_table_value(window, 2, 2) == "通道1"
     assert _result_table_value(window, 2, 3) == "NG"
     assert _result_table_value(window, 3, 0) == "倍频程"
     assert _result_table_value(window, 3, 1) == "-3 dB"
-    assert _result_table_value(window, 3, 2) == "CH2"
+    assert _result_table_value(window, 3, 2) == "通道2"
     assert _result_table_value(window, 3, 3) == "OK"
     assert _result_table_value(window, 4, 0) == "AI分析"
     assert _result_table_value(window, 4, 2) == "--"
