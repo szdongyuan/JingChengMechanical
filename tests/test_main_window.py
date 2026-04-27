@@ -97,6 +97,7 @@ def _make_guarded_ai_tool_management_module(confirm_leave_result: bool):
 class _ChannelProbeModule(_StubModule):
     def __init__(self, services=None):
         super().__init__(services)
+        self.title_changed = _SignalStub()
         self.selected_display_channel_provider = None
         self.state_seen_channels = []
         self.review_seen_channels = []
@@ -115,6 +116,9 @@ class _ChannelProbeModule(_StubModule):
 
     def _on_factory_review_changed(self, _review) -> None:
         self._record_current_channel(self.review_seen_channels)
+
+    def current_title(self) -> str:
+        return "响度"
 
 
 class _FakeLoginWindow:
