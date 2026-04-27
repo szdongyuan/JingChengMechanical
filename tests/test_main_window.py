@@ -169,6 +169,7 @@ def _patch_non_target_modules(monkeypatch, *, use_real_control: bool = False):
         "AiToolManagementModule",
         "ChannelSelectModule",
         "PlcSettingsModule",
+        "DataManagementModule",
     ]
     if not use_real_control:
         module_names.append("ControlModule")
@@ -1315,15 +1316,85 @@ def test_main_window_reflows_test_page_for_loudness_and_video(qapp, monkeypatch)
     assert "系统日志" not in _test_page_card_titles(window)
     assert _card_title(_test_page_left_slot_card(window, 2)) == "视频预览"
     assert window.video.parentWidget() is _test_page_left_slot_card(window, 2)
-    assert _card_title(_test_page_grid_card(window, 2, 0)) == "Loudness"
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度"
     assert window.loudness.parentWidget() is _test_page_grid_card(window, 2, 0)
 
 
-def test_test_page_uses_renamed_spl_card_title(qapp, monkeypatch):
+def test_test_page_uses_chinese_chart_titles_with_units(qapp, monkeypatch):
     window, _ = _make_window(monkeypatch)
     _show(window, qapp)
 
-    assert _card_title(_test_page_grid_card(window, 2, 1)) == "声压级 (SPL)"
+    assert _card_title(_test_page_grid_card(window, 1, 2)) == "FFT频谱（声压级dB）"
+    assert _card_title(_test_page_grid_card(window, 1, 1)) == "STFT时频图（频率Hz，幅值dB）"
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度"
+    assert _card_title(_test_page_grid_card(window, 2, 1)) == "声压级（dB）"
+    assert _card_title(_test_page_grid_card(window, 2, 2)) == "倍频程（声压级dB）"
+
+
+def test_test_page_left_sidebar_is_wider_for_video_preview(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    page = _test_page(window)
+    left_column = page.layout().itemAt(0).widget()
+    assert left_column.width() >= 480
+    assert left_column.minimumWidth() >= 480 or left_column.maximumWidth() >= 480
+
+
+def test_loudness_card_title_updates_to_rendered_unit(qapp, monkeypatch):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0,)),
+    )
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0,))
+    )
+    qapp.processEvents()
+
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度（sone）"
+
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["loudness"]["unit"] = "phon"
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度（phon）"
+
+
+def test_loudness_card_title_initializes_from_existing_review_payload(qapp, monkeypatch):
+    window, _services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0,)),
+    )
+    _show(window, qapp)
+
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度（sone）"
+
+
+def test_loudness_card_title_restores_fallback_when_rendering_clears(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0,)),
+    )
+    _show(window, qapp)
+
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度（sone）"
+
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["loudness"]["unit"] = "bogus"
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度"
 
 
 def test_main_window_routes_latest_log_line_to_status_bar(qapp, monkeypatch):
