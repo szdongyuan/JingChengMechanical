@@ -33,7 +33,7 @@ class SplModule(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
 
-        self.plot = LineChartWidget()
+        self.plot = LineChartWidget(hide_left_axis=True)
         self._set_axis_labels()
         lay.addWidget(self.plot, 1)
 
