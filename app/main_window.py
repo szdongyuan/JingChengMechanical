@@ -723,7 +723,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _build_analysis_toolbar_context(config_id: int, channel_index: int) -> str:
-        return f"配置 {config_id} / CH{channel_index + 1}"
+        return f"配置 {config_id} / 通道{channel_index + 1}"
 
     def closeEvent(self, event: QCloseEvent):
         if not self._can_leave_main_tab(self._ai_tool_management_tab_index()):
