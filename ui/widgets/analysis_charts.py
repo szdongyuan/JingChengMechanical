@@ -147,6 +147,8 @@ class _BasePlotChart(QWidget):
         layout.addWidget(self.plot_widget)
 
         self.plot_item = self.plot_widget.getPlotItem()
+        if self._hide_left_axis:
+            self._install_left_axis_hidden_label_guard()
         self.plot_item.showGrid(x=True, y=True, alpha=0.18)
         self._apply_x_axis_policy(payload_values=None)
         if self._hide_left_axis:
@@ -154,6 +156,18 @@ class _BasePlotChart(QWidget):
 
     def apply_left_axis_hidden_style(self) -> None:
         self.plot_item.hideAxis("left")
+
+    def _install_left_axis_hidden_label_guard(self) -> None:
+        original_set_label = self.plot_item.setLabel
+
+        def set_label_with_left_axis_guard(*args, **kwargs):
+            axis = args[0] if args else kwargs.get("axis")
+            result = original_set_label(*args, **kwargs)
+            if isinstance(axis, str) and axis.lower() == "left":
+                self.apply_left_axis_hidden_style()
+            return result
+
+        self.plot_item.setLabel = set_label_with_left_axis_guard
 
     def _apply_x_axis_policy(self, *, payload_values: Iterable[float] | None) -> None:
         visible_max = _visible_axis_max(payload_values)

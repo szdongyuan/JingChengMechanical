@@ -79,6 +79,48 @@ def test_chart_widgets_can_hide_only_left_axis_when_opted_in(qapp, widget_cls):
         widget.close()
 
 
+@pytest.mark.parametrize(
+    "widget_cls",
+    (LineChartWidget, FftLineChartWidget, OctaveBarChartWidget, StftImageChartWidget),
+)
+def test_opted_in_chart_widgets_keep_left_axis_hidden_after_left_label_refresh(
+    qapp,
+    widget_cls,
+):
+    widget = widget_cls(hide_left_axis=True)
+
+    try:
+        _show_widget(widget, qapp)
+        widget.plot_item.setLabel("left", "Refreshed", units="dB")
+        qapp.processEvents()
+
+        _assert_left_axis_hidden_bottom_visible(widget)
+    finally:
+        widget.close()
+
+
+@pytest.mark.parametrize(
+    "widget_cls",
+    (LineChartWidget, FftLineChartWidget, OctaveBarChartWidget, StftImageChartWidget),
+)
+def test_default_chart_widgets_keep_normal_left_label_refresh_behavior(
+    qapp,
+    widget_cls,
+):
+    widget = widget_cls()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.plot_item.hideAxis("left")
+        widget.plot_item.setLabel("left", "Refreshed", units="dB")
+        qapp.processEvents()
+
+        _assert_left_axis_visible(widget)
+        assert widget.plot_item.getAxis("bottom").isVisible() is True
+    finally:
+        widget.close()
+
+
 def test_left_axis_hiding_preserves_zero_based_ranges(qapp):
     line = LineChartWidget(hide_left_axis=True)
     fft = FftLineChartWidget(hide_left_axis=True)
