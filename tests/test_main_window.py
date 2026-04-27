@@ -1328,11 +1328,11 @@ def test_test_page_uses_chinese_chart_titles_with_units(qapp, monkeypatch):
     window, _ = _make_window(monkeypatch)
     _show(window, qapp)
 
-    assert _card_title(_test_page_grid_card(window, 1, 2)) == "FFT频谱（声压级dB）"
+    assert _card_title(_test_page_grid_card(window, 1, 2)) == "FFT频谱（dB）"
     assert _card_title(_test_page_grid_card(window, 1, 1)) == "STFT时频图（频率Hz，幅值dB）"
     assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度"
     assert _card_title(_test_page_grid_card(window, 2, 1)) == "声压级（dB）"
-    assert _card_title(_test_page_grid_card(window, 2, 2)) == "倍频程（声压级dB）"
+    assert _card_title(_test_page_grid_card(window, 2, 2)) == "倍频程（dB）"
 
 
 def test_test_page_left_sidebar_is_wider_for_video_preview(qapp, monkeypatch):

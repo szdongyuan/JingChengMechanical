@@ -37,7 +37,7 @@ class LoudnessModule(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
 
-        self.plot = LineChartWidget(hide_left_axis=True)
+        self.plot = LineChartWidget(hide_left_axis_label=True)
         self.plot.plot_item.setLabel("bottom", "Time (s)")
         self.plot.plot_item.setLabel("left", "Loudness")
         lay.addWidget(self.plot, 1)

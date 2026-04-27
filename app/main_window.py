@@ -311,7 +311,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.analysis_toolbar, 0, 1, 1, 2)
 
         self.spectrum = SpectrumModule(self.services)
-        grid.addWidget(Card("FFT频谱（声压级dB）", self.spectrum), 1, 2)
+        grid.addWidget(Card("FFT频谱（dB）", self.spectrum), 1, 2)
 
         self.stft = StftModule(self.services)
         grid.addWidget(Card("STFT时频图（频率Hz，幅值dB）", self.stft), 1, 1)
@@ -326,7 +326,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(Card("声压级（dB）", self.spl), 2, 1)
 
         self.octave = OctaveModule(self.services)
-        grid.addWidget(Card("倍频程（声压级dB）", self.octave), 2, 2)
+        grid.addWidget(Card("倍频程（dB）", self.octave), 2, 2)
 
         self._attach_analysis_channel_providers()
 
