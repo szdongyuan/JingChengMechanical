@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QWidget
 
 
 def _channel_label(channel_index: int) -> str:
-    return f"CH{channel_index + 1}"
+    return f"通道{channel_index + 1}"
 
 
 class AnalysisChannelToolbar(QWidget):

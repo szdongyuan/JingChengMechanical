@@ -269,7 +269,7 @@ class MainWindow(QMainWindow):
 
         # 左侧栏
         left = QWidget()
-        left.setFixedWidth(420)
+        left.setFixedWidth(480)
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
         left_lay.setSpacing(5)
@@ -311,19 +311,22 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.analysis_toolbar, 0, 1, 1, 2)
 
         self.spectrum = SpectrumModule(self.services)
-        grid.addWidget(Card("频谱 (Spectrum)", self.spectrum), 1, 2)
+        grid.addWidget(Card("FFT频谱（dB）", self.spectrum), 1, 2)
 
         self.stft = StftModule(self.services)
-        grid.addWidget(Card("STFT 频谱图 (Spectrogram)", self.stft), 1, 1)
+        grid.addWidget(Card("STFT时频图（频率Hz，幅值dB）", self.stft), 1, 1)
 
         self.loudness = LoudnessModule(self.services)
-        grid.addWidget(Card("Loudness", self.loudness), 2, 0)
+        self.loudness_card = Card("响度", self.loudness)
+        self.loudness.title_changed.connect(self.loudness_card.set_title)
+        self.loudness_card.set_title(self.loudness.current_title())
+        grid.addWidget(self.loudness_card, 2, 0)
 
         self.spl = SplModule(self.services)
-        grid.addWidget(Card("声压级 (SPL)", self.spl), 2, 1)
+        grid.addWidget(Card("声压级（dB）", self.spl), 2, 1)
 
         self.octave = OctaveModule(self.services)
-        grid.addWidget(Card("倍频程 (Octave)", self.octave), 2, 2)
+        grid.addWidget(Card("倍频程（dB）", self.octave), 2, 2)
 
         self._attach_analysis_channel_providers()
 
@@ -720,7 +723,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _build_analysis_toolbar_context(config_id: int, channel_index: int) -> str:
-        return f"配置 {config_id} / CH{channel_index + 1}"
+        return f"配置 {config_id} / 通道{channel_index + 1}"
 
     def closeEvent(self, event: QCloseEvent):
         if not self._can_leave_main_tab(self._ai_tool_management_tab_index()):
@@ -731,20 +734,32 @@ class MainWindow(QMainWindow):
             for plc_service in getattr(self.services, "plc_services", {}).values():
                 if plc_service is None:
                     continue
-                QMetaObject.invokeMethod(
-                    plc_service,
-                    "stop_plc_service",
-                    Qt.ConnectionType.BlockingQueuedConnection,
-                )
+                try:
+                    QMetaObject.invokeMethod(
+                        plc_service,
+                        "stop_plc_service",
+                        Qt.ConnectionType.BlockingQueuedConnection,
+                    )
+                except Exception:
+                    pass
             for plc_thread in getattr(self.services, "plc_threads", {}).values():
                 if plc_thread is None:
                     continue
-                plc_thread.quit()
-                plc_thread.wait(2000)
-            # 关闭 DB 长连接
-            self.services.db.close()
-            # 视频关闭
-            self.video.stop_camera()
+                try:
+                    plc_thread.quit()
+                    plc_thread.wait(2000)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            self.services.shutdown()
+        except Exception:
+            pass
+        try:
+            stop_camera = getattr(getattr(self, "video", None), "stop_camera", None)
+            if callable(stop_camera):
+                stop_camera()
         except Exception:
             pass
         super().closeEvent(event)

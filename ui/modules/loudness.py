@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 
+from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 from app.services_container import FactoryControllerState, FactoryReviewPayload
@@ -10,6 +11,7 @@ from ui.widgets.analysis_charts import LineChartWidget
 
 class LoudnessModule(QWidget):
     module_id = "loudness"
+    title_changed = pyqtSignal(str)
     _RENDER_PHASES = frozenset({"reviewing", "stopped"})
 
     def __init__(self, services):
@@ -30,11 +32,12 @@ class LoudnessModule(QWidget):
         self._has_plot_data = False
         self._rendered_channel_index: int | None = None
         self._current_payload: dict | None = None
+        self._current_title = "响度"
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
 
-        self.plot = LineChartWidget()
+        self.plot = LineChartWidget(hide_left_axis_label=True)
         self.plot.plot_item.setLabel("bottom", "Time (s)")
         self.plot.plot_item.setLabel("left", "Loudness")
         lay.addWidget(self.plot, 1)
@@ -57,8 +60,22 @@ class LoudnessModule(QWidget):
     def current_render_channel(self) -> int | None:
         return self._rendered_channel_index
 
+    def current_title(self) -> str:
+        return self._current_title
+
     def refresh_selected_display_channel(self) -> None:
         self._refresh_committed_rendering()
+
+    @staticmethod
+    def _title_for_unit(unit: str | None) -> str:
+        normalized = str(unit or "").strip().lower()
+        if normalized in {"sone", "phon"}:
+            return f"响度（{normalized}）"
+        return "响度"
+
+    def _emit_title_for_unit(self, unit: str | None) -> None:
+        self._current_title = self._title_for_unit(unit)
+        self.title_changed.emit(self._current_title)
 
     def _on_factory_state_changed(self, state) -> None:
         if isinstance(state, FactoryControllerState):
@@ -128,6 +145,7 @@ class LoudnessModule(QWidget):
             "lower_limit": loudness_payload.get("lower_limit"),
             "upper_limit": loudness_payload.get("upper_limit"),
         }
+        self._emit_title_for_unit(unit)
 
     def _clear_plot(self) -> None:
         self._has_plot_data = False
@@ -136,6 +154,7 @@ class LoudnessModule(QWidget):
         self.plot.clear_data()
         self.plot.plot_item.setLabel("bottom", "Time (s)")
         self.plot.plot_item.setLabel("left", "Loudness")
+        self._emit_title_for_unit(None)
 
     def _can_render_committed_chart(self) -> bool:
         return (

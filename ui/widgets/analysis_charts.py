@@ -128,8 +128,14 @@ def _validate_data_focus_series(*, x_values: list[float], y_values: list[float])
 
 
 class _BasePlotChart(QWidget):
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        hide_left_axis_label: bool = False,
+    ):
         super().__init__(parent)
+        self._hide_left_axis_label = bool(hide_left_axis_label)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -141,8 +147,35 @@ class _BasePlotChart(QWidget):
         layout.addWidget(self.plot_widget)
 
         self.plot_item = self.plot_widget.getPlotItem()
+        if self._hide_left_axis_label:
+            self._install_left_axis_hidden_label_guard()
         self.plot_item.showGrid(x=True, y=True, alpha=0.18)
         self._apply_x_axis_policy(payload_values=None)
+        if self._hide_left_axis_label:
+            self.apply_left_axis_label_hidden_style()
+
+    def apply_left_axis_label_hidden_style(self) -> None:
+        left_axis = self.plot_item.getAxis("left")
+        left_axis.show()
+        left_axis.setStyle(showValues=True)
+        original_set_label = getattr(self, "_original_set_label", self.plot_item.setLabel)
+        original_set_label("left", "", units="")
+
+    def _install_left_axis_hidden_label_guard(self) -> None:
+        self._original_set_label = self.plot_item.setLabel
+
+        def set_label_with_left_axis_guard(*args, **kwargs):
+            axis = args[0] if args else kwargs.get("axis")
+            result = self._original_set_label(*args, **kwargs)
+            if (
+                isinstance(axis, str)
+                and axis.lower() == "left"
+                and self._hide_left_axis_label
+            ):
+                self.apply_left_axis_label_hidden_style()
+            return result
+
+        self.plot_item.setLabel = set_label_with_left_axis_guard
 
     def _apply_x_axis_policy(self, *, payload_values: Iterable[float] | None) -> None:
         visible_max = _visible_axis_max(payload_values)
@@ -152,8 +185,13 @@ class _BasePlotChart(QWidget):
 
 
 class StftImageChartWidget(_BasePlotChart):
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        hide_left_axis_label: bool = False,
+    ):
+        super().__init__(parent, hide_left_axis_label=hide_left_axis_label)
         self._image_payload: dict | None = None
         self._cached_levels: tuple[float, float] | None = None
         self._image_item = pg.ImageItem(axisOrder="row-major")
@@ -174,6 +212,8 @@ class StftImageChartWidget(_BasePlotChart):
         self.plot_item.addItem(self._image_item)
         self.plot_item.setLabel("bottom", "Time", units="s")
         self.plot_item.setLabel("left", "Frequency", units="Hz")
+        if self._hide_left_axis_label:
+            self.apply_left_axis_label_hidden_style()
         self._apply_stft_y_axis_policy(payload_values=None)
 
     def set_image(
@@ -361,8 +401,13 @@ class StftImageChartWidget(_BasePlotChart):
 
 
 class LineChartWidget(_BasePlotChart):
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        hide_left_axis_label: bool = False,
+    ):
+        super().__init__(parent, hide_left_axis_label=hide_left_axis_label)
         self._series_payload: dict | None = None
         self._y_axis_mode = "auto"
         self._curve = self.plot_item.plot(
@@ -464,8 +509,13 @@ class LineChartWidget(_BasePlotChart):
 
 
 class FftLineChartWidget(LineChartWidget):
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        hide_left_axis_label: bool = False,
+    ):
+        super().__init__(parent, hide_left_axis_label=hide_left_axis_label)
         self._spectrum_payload: dict | None = None
         self._golden_overlay_curve_item = self.plot_item.plot(
             pen=pg.mkPen(
@@ -491,6 +541,8 @@ class FftLineChartWidget(LineChartWidget):
         self._zero_reference_line.hide()
         self.plot_item.setLabel("bottom", "Frequency", units="Hz")
         self.plot_item.setLabel("left", "Level", units="dB")
+        if self._hide_left_axis_label:
+            self.apply_left_axis_label_hidden_style()
 
     def set_spectrum(
         self,
@@ -606,9 +658,18 @@ class FftLineChartWidget(LineChartWidget):
         )
 
 
+_OCTAVE_BAR_WIDTH = 0.6
+_OCTAVE_BAR_EDGE_MARGIN = 0.2
+
+
 class OctaveBarChartWidget(_BasePlotChart):
-    def __init__(self, parent: QWidget | None = None):
-        super().__init__(parent)
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        hide_left_axis_label: bool = False,
+    ):
+        super().__init__(parent, hide_left_axis_label=hide_left_axis_label)
         self._band_payload: dict | None = None
         self._bar_item: pg.BarGraphItem | None = None
         self._golden_overlay_item = pg.PlotDataItem(
@@ -640,6 +701,8 @@ class OctaveBarChartWidget(_BasePlotChart):
         self._zero_reference_line.hide()
         self.plot_item.setLabel("bottom", "Band", units="Hz")
         self.plot_item.setLabel("left", "Level", units="dB")
+        if self._hide_left_axis_label:
+            self.apply_left_axis_label_hidden_style()
 
     def set_bands(
         self,
@@ -710,7 +773,7 @@ class OctaveBarChartWidget(_BasePlotChart):
             ),
             limit_bands=normalized_limit_bands,
         )
-        self._apply_x_axis_policy(payload_values=x_values.tolist())
+        self._apply_bar_x_axis_policy(x_values=x_values)
         self.plot_item.vb.enableAutoRange(axis=pg.ViewBox.YAxis, enable=True)
         self.plot_item.vb.updateAutoRange()
 
@@ -730,6 +793,20 @@ class OctaveBarChartWidget(_BasePlotChart):
     def band_payload(self) -> dict | None:
         return deepcopy(self._band_payload)
 
+    def _apply_bar_x_axis_policy(self, *, x_values: np.ndarray) -> None:
+        if x_values.size == 0:
+            self._apply_x_axis_policy(payload_values=None)
+            return
+
+        edge_padding = (_OCTAVE_BAR_WIDTH / 2.0) + _OCTAVE_BAR_EDGE_MARGIN
+        view_box = self.plot_item.vb
+        view_box.enableAutoRange(axis=pg.ViewBox.XAxis, enable=False)
+        view_box.setXRange(
+            float(x_values[0]) - edge_padding,
+            float(x_values[-1]) + edge_padding,
+            padding=0.0,
+        )
+
     def _replace_bar_item(self, *, x: np.ndarray, heights: np.ndarray) -> None:
         if self._bar_item is not None:
             self.plot_item.removeItem(self._bar_item)
@@ -737,7 +814,7 @@ class OctaveBarChartWidget(_BasePlotChart):
             x=x,
             y0=0.0,
             height=heights,
-            width=0.6,
+            width=_OCTAVE_BAR_WIDTH,
             brush="#f59e0b",
             pen=pg.mkPen(color="#d97706", width=1),
         )
