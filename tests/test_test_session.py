@@ -11,7 +11,7 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 
-from app.service.analysis.frames import FftFrame, JudgmentResult, SplFrame, StftFrame
+from app.service.analysis.frames import FftFrame, JudgmentResult, LoudnessFrame, SplFrame, StftFrame
 from app.service.analysis.test_session import TestSession
 from app.service.config_service import _CHANNEL_DEFAULTS
 from model.audio_data_table import AudioDataTable
@@ -29,6 +29,8 @@ def _make_mock_bus():
     bus.stft_updated.emit = MagicMock()
     bus.spl_updated = MagicMock()
     bus.spl_updated.emit = MagicMock()
+    bus.loudness_updated = MagicMock()
+    bus.loudness_updated.emit = MagicMock()
     bus.octave_updated = MagicMock()
     bus.octave_updated.emit = MagicMock()
     bus.fft_updated = MagicMock()
@@ -166,6 +168,7 @@ class TestTestSessionProcessing:
             "stft_frames": [frame_a, frame_b],
             "stft": frame_b,
             "spl": SplFrame(time=0.05, spl_db=60.0, weighting="Z"),
+            "loudness": None,
             "octave": None,
             "fft": None,
         }
@@ -199,6 +202,7 @@ class TestTestSessionProcessing:
             "stft_frames": [],
             "stft": None,
             "spl": SplFrame(time=0.05, spl_db=60.0, weighting="Z"),
+            "loudness": None,
             "octave": None,
             "fft": fft_frame,
         }
@@ -207,6 +211,39 @@ class TestTestSessionProcessing:
         session._on_chunk(np.ones((2048, 1), dtype=np.float32), 0)
 
         assert bus.fft_updated.emit.call_args.args == (1, "factory-run-1", 0, fft_frame)
+
+    def test_on_chunk_re_emits_loudness_frame_with_factory_run_id(self):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        session = TestSession(
+            config=_make_config(),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"factory_run_id": "factory-run-1"},
+            audio_dir="/tmp/audio",
+        )
+        loudness_frame = LoudnessFrame(time=0.10, loudness_sone=2.25)
+        fake_pipeline = MagicMock()
+        fake_pipeline.channel_index = 0
+        fake_pipeline.process_chunk.return_value = {
+            "stft_frames": [],
+            "stft": None,
+            "spl": SplFrame(time=0.05, spl_db=60.0, weighting="Z"),
+            "loudness": loudness_frame,
+            "octave": None,
+            "fft": None,
+        }
+        session._pipelines = [fake_pipeline]
+
+        session._on_chunk(np.ones((2048, 1), dtype=np.float32), 0)
+
+        assert bus.loudness_updated.emit.call_args.args == (
+            1,
+            "factory-run-1",
+            0,
+            loudness_frame,
+        )
 
     def test_on_chunk_notifies_when_session_duration_expires(self):
         bus = _make_mock_bus()
@@ -271,6 +308,7 @@ class TestTestSessionProcessing:
             "stft_frames": [],
             "stft": None,
             "spl": None,
+            "loudness": None,
             "octave": None,
             "fft": None,
         }
@@ -303,6 +341,7 @@ class TestTestSessionProcessing:
             "stft_frames": [],
             "stft": None,
             "spl": None,
+            "loudness": None,
             "octave": None,
             "fft": None,
         }

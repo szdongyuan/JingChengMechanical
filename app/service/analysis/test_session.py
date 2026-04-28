@@ -162,6 +162,13 @@ class TestSession:
                 self._bus.stft_updated.emit(self.config_id, frame_run_id, ch_idx, stft_frame)
             if result["spl"] is not None:
                 self._bus.spl_updated.emit(self.config_id, frame_run_id, ch_idx, result["spl"])
+            if result.get("loudness") is not None:
+                self._bus.loudness_updated.emit(
+                    self.config_id,
+                    frame_run_id,
+                    ch_idx,
+                    result["loudness"],
+                )
             if result["octave"] is not None:
                 self._bus.octave_updated.emit(self.config_id, frame_run_id, ch_idx, result["octave"])
             if result["fft"] is not None:
