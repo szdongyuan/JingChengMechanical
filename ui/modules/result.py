@@ -329,11 +329,13 @@ class ResultModule(QWidget):
     def _on_spl_updated(self, config_id, run_id, channel_idx, frame) -> None:
         if not self._live_frame_matches(config_id, run_id, channel_idx):
             return
-        value = getattr(frame, "spl_db", None)
-        if not self._is_finite_number(value):
-            return
         key = self._current_metric_key()
         if key is None:
+            return
+        value = getattr(frame, "spl_db", None)
+        if not self._is_finite_number(value):
+            self._live_spl_by_key.pop(key, None)
+            self._refresh_metric_display()
             return
         self._live_spl_by_key[key] = float(value)
         self._refresh_metric_display()
@@ -341,11 +343,13 @@ class ResultModule(QWidget):
     def _on_loudness_updated(self, config_id, run_id, channel_idx, frame) -> None:
         if not self._live_frame_matches(config_id, run_id, channel_idx):
             return
-        value = getattr(frame, "loudness_sone", None)
-        if not self._is_finite_number(value):
-            return
         key = self._current_metric_key()
         if key is None:
+            return
+        value = getattr(frame, "loudness_sone", None)
+        if not self._is_finite_number(value):
+            self._live_loudness_by_key.pop(key, None)
+            self._refresh_metric_display()
             return
         self._live_loudness_by_key[key] = float(value)
         self._refresh_metric_display()
