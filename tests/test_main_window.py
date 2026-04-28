@@ -122,6 +122,16 @@ class _ChannelProbeModule(_StubModule):
         return "响度"
 
 
+class _RefreshProbeResultModule(_StubModule):
+    def __init__(self, services=None):
+        super().__init__(services)
+        self.selected_display_channel_provider = None
+        self.refresh_selected_display_channel_calls = 0
+
+    def refresh_selected_display_channel(self) -> None:
+        self.refresh_selected_display_channel_calls += 1
+
+
 class _FakeLoginWindow:
     def __init__(
         self,
@@ -1569,6 +1579,62 @@ def test_main_window_toolbar_selection_immediately_refreshes_stft_cached_channel
         window.stft.current_image_payload()["magnitude_db"],
         np.array([[9.0], [10.0]]),
     )
+
+
+def test_main_window_chart_sync_ignores_channel_outside_selected_channels(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 1)
+
+    assert window.current_display_channel_index() == 1
+    assert window.display_channel_by_config_id[101] == 1
+
+    window.spl.selected_display_channel_sync(2)
+    qapp.processEvents()
+
+    assert window.analysis_toolbar.current_channel_index() == 1
+    assert window.current_display_channel_index() == 1
+    assert window._last_selected_display_channel == 1
+    assert window.display_channel_by_config_id[101] == 1
+    assert window.result.selected_display_channel_provider() == 1
+
+
+def test_main_window_toolbar_selection_refreshes_result_module_hook(
+    qapp,
+    monkeypatch,
+):
+    monkeypatch.setattr(main_window_mod, "ResultModule", _RefreshProbeResultModule)
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+    initial_calls = window.result.refresh_selected_display_channel_calls
+
+    _select_toolbar_channel(window, qapp, 1)
+
+    assert window.current_display_channel_index() == 1
+    assert window.result.refresh_selected_display_channel_calls == initial_calls + 1
 
 
 def test_main_window_page_reentry_does_not_redraw_visible_unchanged_stft(

@@ -601,6 +601,10 @@ class MainWindow(QMainWindow):
         if config_id is None:
             return
 
+        selected_channels = self._selected_channels_for_config(config_id)
+        if selected_channels and channel_index not in selected_channels:
+            return
+
         self._last_selected_display_channel = channel_index
         self.display_channel_by_config_id[config_id] = channel_index
         self.analysis_toolbar.set_current_channel(channel_index)
