@@ -292,6 +292,52 @@ def test_result_module_live_metric_frames_use_cached_config_after_refresh(qapp):
     assert len(load_calls) == established_load_count
 
 
+def test_result_module_non_current_spl_frames_reuse_displayed_config_metadata(qapp):
+    selected_channel = 0
+    module = _make_module()
+    module.selected_display_channel_provider = lambda: selected_channel
+    load_calls: list[int] = []
+
+    def load_config(config_id):
+        load_calls.append(config_id)
+        return {
+            "config_id": 101,
+            "selected_channels": [0, 1],
+            "channels": [
+                {"channel_index": 0, "loudness_unit": "sone"},
+                {"channel_index": 1, "loudness_unit": "sone"},
+            ],
+        }
+
+    module.services.config_service = SimpleNamespace(load_config=load_config)
+    module.services.bus.factory_state_changed.emit(
+        _state("running", displayed_config_id=101, active_config_id=101)
+    )
+    module.services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
+    )
+    module.refresh_selected_display_channel()
+    established_load_count = len(load_calls)
+    assert established_load_count >= 1
+
+    for value, frame_time in ((71.0, 0.0), (72.0, 0.1), (73.0, 0.2)):
+        module.services.bus.spl_updated.emit(
+            101,
+            "run-101",
+            1,
+            SimpleNamespace(spl_db=value, time=frame_time),
+        )
+
+    assert len(load_calls) == established_load_count
+    assert module._live_spl_by_key[(101, "run-101", 1)] == pytest.approx(73.0)
+    assert module.lb_spl_metric_value.text() == "--"
+
+    selected_channel = 1
+    module.refresh_selected_display_channel()
+
+    assert module.lb_spl_metric_value.text() == "73.0 dB"
+
+
 def test_result_module_throttles_only_spl_metric_repaint_while_updating_cache(qapp):
     module = _make_module()
     _set_selected_channel(module, 0)

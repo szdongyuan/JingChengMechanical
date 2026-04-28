@@ -55,6 +55,8 @@ class ResultModule(QWidget):
         self._metric_loudness_unit: str | None = None
         self._metric_channel_valid = False
         self._metric_config_load_failed = False
+        self._displayed_config_selected_channels_cache_key: int | None = None
+        self._displayed_config_selected_channel_indexes: frozenset[int] = frozenset()
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -489,19 +491,9 @@ class ResultModule(QWidget):
         return (displayed_config_id, self._current_live_run_id, channel_index)
 
     def _channel_is_selected_for_displayed_config(self, channel_index: int) -> bool:
-        config_id = self._displayed_config_id()
-        config = self._load_config(config_id)
-        if config is None:
+        if not self._ensure_displayed_config_selected_channel_metadata():
             return False
-        selected_channels = config.get("selected_channels")
-        if not isinstance(selected_channels, list):
-            return False
-        selected_channel_indexes = {
-            selected
-            for selected in (self._as_int(channel) for channel in selected_channels)
-            if selected is not None
-        }
-        return channel_index in selected_channel_indexes
+        return channel_index in self._displayed_config_selected_channel_indexes
 
     def _should_repaint_spl_metric(
         self,
@@ -559,20 +551,17 @@ class ResultModule(QWidget):
         self._metric_config_load_failed = False
 
         if config_id is None or selected_channel is None:
+            self._clear_displayed_config_selected_channel_metadata()
             return
 
         config = self._load_config(config_id)
+        selected_channel_indexes = self._refresh_displayed_config_selected_channel_metadata(
+            config_id,
+            config,
+        )
         if config is None:
             self._metric_config_load_failed = True
             return
-        selected_channels = config.get("selected_channels") if isinstance(config, dict) else None
-        if not isinstance(selected_channels, list):
-            return
-        selected_channel_indexes = {
-            channel_index
-            for channel_index in (self._as_int(channel) for channel in selected_channels)
-            if channel_index is not None
-        }
         if selected_channel not in selected_channel_indexes:
             return
         channels = config.get("channels") if isinstance(config, dict) else None
@@ -586,6 +575,37 @@ class ResultModule(QWidget):
                     )
                     self._metric_channel_valid = True
                     return
+
+    def _ensure_displayed_config_selected_channel_metadata(self) -> bool:
+        config_id = self._displayed_config_id()
+        if config_id is None:
+            return False
+        if self._displayed_config_selected_channels_cache_key != config_id:
+            config = self._load_config(config_id)
+            self._refresh_displayed_config_selected_channel_metadata(config_id, config)
+        return self._displayed_config_selected_channels_cache_key == config_id
+
+    def _refresh_displayed_config_selected_channel_metadata(
+        self,
+        config_id: int,
+        config: dict | None,
+    ) -> frozenset[int]:
+        selected_channels = config.get("selected_channels") if isinstance(config, dict) else None
+        if not isinstance(selected_channels, list):
+            selected_channel_indexes = frozenset()
+        else:
+            selected_channel_indexes = frozenset(
+                channel_index
+                for channel_index in (self._as_int(channel) for channel in selected_channels)
+                if channel_index is not None
+            )
+        self._displayed_config_selected_channels_cache_key = config_id
+        self._displayed_config_selected_channel_indexes = selected_channel_indexes
+        return selected_channel_indexes
+
+    def _clear_displayed_config_selected_channel_metadata(self) -> None:
+        self._displayed_config_selected_channels_cache_key = None
+        self._displayed_config_selected_channel_indexes = frozenset()
 
     @staticmethod
     def _normalize_loudness_unit(value) -> str:
@@ -654,6 +674,7 @@ class ResultModule(QWidget):
         self._metric_loudness_unit = None
         self._metric_channel_valid = False
         self._metric_config_load_failed = False
+        self._clear_displayed_config_selected_channel_metadata()
 
     @staticmethod
     def _payload_run_id(payload) -> str | None:
