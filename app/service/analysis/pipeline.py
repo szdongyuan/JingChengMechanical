@@ -14,8 +14,8 @@ from app.service.analysis.frames import FftFrame, LoudnessFrame, OctaveFrame, Sp
 from app.service.analysis import dsp
 
 
-_LIVE_LOUDNESS_THROTTLE_SEC = 1.0
-_LIVE_LOUDNESS_WINDOW_SEC = 1.0
+_LIVE_LOUDNESS_THROTTLE_SEC = 0.5
+_LIVE_LOUDNESS_WINDOW_SEC = 0.5
 
 
 class AnalysisPipeline:
@@ -52,8 +52,12 @@ class AnalysisPipeline:
         self._loudness_buffer = np.array([], dtype=np.float64)
         self._last_live_loudness_emit_time = 0.0
 
-    def process_chunk(self, chunk_mono: np.ndarray,
-                      elapsed_time: float) -> dict:
+    def process_chunk(
+        self,
+        chunk_mono: np.ndarray,
+        elapsed_time: float,
+        compute_loudness: bool = True,
+    ) -> dict:
         """Process one audio chunk and return analysis results.
 
         Parameters
@@ -77,7 +81,11 @@ class AnalysisPipeline:
             loudness_window_samples = int(round(self.sample_rate * _LIVE_LOUDNESS_WINDOW_SEC))
             if loudness_window_samples > 0 and self._loudness_buffer.size > loudness_window_samples:
                 self._loudness_buffer = self._loudness_buffer[-loudness_window_samples:]
-        loudness_frame = self._maybe_compute_live_loudness(elapsed_time)
+        loudness_frame = (
+            self._maybe_compute_live_loudness(elapsed_time)
+            if compute_loudness
+            else None
+        )
 
         # SPL — always computed (even for short chunks)
         spl_db = dsp.compute_spl(sig, self.sample_rate,

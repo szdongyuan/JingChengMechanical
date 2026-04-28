@@ -6,15 +6,29 @@ import os
 import math
 import re
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 
 from app.service.analysis.frames import FftFrame, JudgmentResult, LoudnessFrame, SplFrame, StftFrame
+from app.service.analysis.test_manager import TestManager
 from app.service.analysis.test_session import TestSession
 from app.service.config_service import _CHANNEL_DEFAULTS
 from model.audio_data_table import AudioDataTable
+
+
+class _SignalStub:
+    def __init__(self):
+        self._callbacks = []
+
+    def connect(self, callback):
+        self._callbacks.append(callback)
+
+    def emit(self, *args, **kwargs):
+        for callback in list(self._callbacks):
+            callback(*args, **kwargs)
 
 
 def _make_mock_bus():
@@ -41,6 +55,7 @@ def _make_mock_bus():
     bus.test_started.emit = MagicMock()
     bus.test_finished = MagicMock()
     bus.test_finished.emit = MagicMock()
+    bus.factory_display_channel_changed = _SignalStub()
     return bus
 
 
@@ -71,6 +86,177 @@ def _make_config(**overrides) -> dict:
     }
     config.update(overrides)
     return config
+
+
+class _FakeRecorder:
+    def __init__(self, *args, **kwargs):
+        self.chunk_ready = _SignalStub()
+        self.recording_done = _SignalStub()
+        self.error_occurred = _SignalStub()
+        self._sample_rate = float(kwargs.get("sample_rate", 44100.0))
+        self.started = False
+
+    def attach_session(self, *, record_duration):
+        return SimpleNamespace(chunk_index=0)
+
+    def isRunning(self):
+        return False
+
+    def start(self):
+        self.started = True
+
+
+class TestTestManagerDisplayChannelRouting:
+    def test_display_channel_change_is_stored_and_applied_to_running_session(self):
+        bus = _make_mock_bus()
+        manager = TestManager(bus, SimpleNamespace())
+        session = SimpleNamespace(
+            _config=_make_config(selected_channels=[0, 1]),
+            set_live_loudness_channel_index=MagicMock(),
+        )
+        manager._sessions[1] = session
+
+        bus.factory_display_channel_changed.emit(1, 1)
+
+        assert manager._live_loudness_channel_by_config_id[1] == 1
+        session.set_live_loudness_channel_index.assert_called_once_with(1)
+
+    def test_start_applies_stored_display_channel_after_pipeline_setup(
+        self,
+        monkeypatch,
+    ):
+        events = []
+
+        class FakeSession:
+            def __init__(
+                self,
+                *,
+                config,
+                bus,
+                ai_service,
+                mic_cal,
+                workorder,
+                audio_dir,
+            ):
+                self._config = config
+                self.config_id = config["config_id"]
+                self._sample_rate = float(config.get("input_device_samplerate", 44100))
+                self._on_chunk = MagicMock()
+                self._live_loudness_channel_index = None
+
+            def _setup_pipelines(self):
+                events.append("setup")
+                self._live_loudness_channel_index = self._config["selected_channels"][0]
+
+            def set_live_loudness_channel_index(self, channel_index):
+                events.append(("set_live", channel_index))
+                self._live_loudness_channel_index = channel_index
+
+            def prepare_for_attach(self):
+                events.append("prepare")
+
+            def attach_to_recorder(self, *, chunk_index, snapshot=None):
+                events.append(("attach", chunk_index))
+
+        config = _make_config(selected_channels=[0, 1])
+        config["channels"] = [
+            config["channels"][0],
+            {**config["channels"][0], "channel_index": 1},
+        ]
+        services = SimpleNamespace(
+            config_service=SimpleNamespace(load_config=MagicMock(return_value=config)),
+            hss_service=SimpleNamespace(
+                load_io_devices=MagicMock(
+                    return_value={
+                        "mic_cal": {},
+                        "input": {"samplerate": 44100.0, "channel_count": 2},
+                    }
+                )
+            ),
+            ai_service=MagicMock(),
+        )
+        bus = _make_mock_bus()
+        manager = TestManager(bus, services)
+        bus.factory_display_channel_changed.emit(1, 1)
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.TestSession",
+            FakeSession,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.AudioRecorder",
+            _FakeRecorder,
+        )
+
+        assert manager.start({"config_id": 1}) is True
+
+        assert events[:3] == ["setup", ("set_live", 1), "prepare"]
+        assert manager._sessions[1]._live_loudness_channel_index == 1
+
+    def test_start_ignores_stored_display_channel_outside_selected_channels(
+        self,
+        monkeypatch,
+    ):
+        events = []
+
+        class FakeSession:
+            def __init__(
+                self,
+                *,
+                config,
+                bus,
+                ai_service,
+                mic_cal,
+                workorder,
+                audio_dir,
+            ):
+                self._config = config
+                self.config_id = config["config_id"]
+                self._sample_rate = float(config.get("input_device_samplerate", 44100))
+                self._on_chunk = MagicMock()
+                self._live_loudness_channel_index = None
+
+            def _setup_pipelines(self):
+                self._live_loudness_channel_index = self._config["selected_channels"][0]
+
+            def set_live_loudness_channel_index(self, channel_index):
+                events.append(("set_live", channel_index))
+                self._live_loudness_channel_index = channel_index
+
+            def prepare_for_attach(self):
+                pass
+
+            def attach_to_recorder(self, *, chunk_index, snapshot=None):
+                pass
+
+        config = _make_config(selected_channels=[0, 1])
+        services = SimpleNamespace(
+            config_service=SimpleNamespace(load_config=MagicMock(return_value=config)),
+            hss_service=SimpleNamespace(
+                load_io_devices=MagicMock(
+                    return_value={
+                        "mic_cal": {},
+                        "input": {"samplerate": 44100.0, "channel_count": 2},
+                    }
+                )
+            ),
+            ai_service=MagicMock(),
+        )
+        bus = _make_mock_bus()
+        manager = TestManager(bus, services)
+        bus.factory_display_channel_changed.emit(1, 3)
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.TestSession",
+            FakeSession,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.AudioRecorder",
+            _FakeRecorder,
+        )
+
+        assert manager.start({"config_id": 1}) is True
+
+        assert events == []
+        assert manager._sessions[1]._live_loudness_channel_index == 0
 
 
 class TestTestSessionInit:
@@ -106,6 +292,75 @@ class TestTestSessionProcessing:
         assert pipeline.channel_index == 1
         assert pipeline._cfg["stft_nfft"] == _CHANNEL_DEFAULTS["stft_nfft"]
         assert pipeline._cfg["spl_weighting"] == _CHANNEL_DEFAULTS["spl_weighting"]
+
+    def test_setup_pipelines_defaults_live_loudness_channel_to_first_selected_channel(self):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        config = _make_config(selected_channels=[2, 0])
+        config["channels"] = [
+            {
+                **config["channels"][0],
+                "channel_index": 2,
+            },
+            config["channels"][0],
+        ]
+        session = TestSession(
+            config=config,
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={},
+            audio_dir="/tmp/audio",
+        )
+
+        session._setup_pipelines()
+
+        assert session._live_loudness_channel_index == 2
+
+    def test_on_chunk_computes_live_loudness_only_for_selected_live_loudness_channel(self):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        config = _make_config(selected_channels=[0, 1])
+        config["channels"] = [
+            config["channels"][0],
+            {**config["channels"][0], "channel_index": 1},
+        ]
+        session = TestSession(
+            config=config,
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"factory_run_id": "factory-run-1"},
+            audio_dir="/tmp/audio",
+        )
+        first_pipeline = MagicMock()
+        first_pipeline.channel_index = 0
+        first_pipeline.process_chunk.return_value = {
+            "stft_frames": [],
+            "stft": None,
+            "spl": None,
+            "loudness": None,
+            "octave": None,
+            "fft": None,
+        }
+        second_pipeline = MagicMock()
+        second_pipeline.channel_index = 1
+        second_pipeline.process_chunk.return_value = {
+            "stft_frames": [],
+            "stft": None,
+            "spl": None,
+            "loudness": LoudnessFrame(time=0.05, loudness_sone=2.0),
+            "octave": None,
+            "fft": None,
+        }
+        session._pipelines = [first_pipeline, second_pipeline]
+        session.set_live_loudness_channel_index(1)
+
+        session._on_chunk(np.ones((2048, 2), dtype=np.float32), 0)
+
+        assert first_pipeline.process_chunk.call_args.kwargs["compute_loudness"] is False
+        assert second_pipeline.process_chunk.call_args.kwargs["compute_loudness"] is True
+        assert bus.loudness_updated.emit.call_args.args[2] == 1
 
     def test_on_chunk_emits_analysis_signals(self):
         bus = _make_mock_bus()

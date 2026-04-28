@@ -114,9 +114,27 @@ def test_factory_mode_signals_exist():
         "factory_runtime_reanalysis_completed",
         "factory_state_changed",
         "factory_review_changed",
+        "factory_display_channel_changed",
         "factory_display_reset",
     ):
         assert hasattr(EventBus, name), f"Missing factory signal: {name}"
+
+
+def test_factory_display_channel_changed_signal_contract():
+    expected_argument_types = ("int", "int")
+
+    assert (
+        _normalized_signal_argument_types(EventBus.factory_display_channel_changed)
+        == expected_argument_types
+    )
+
+    bus = EventBus()
+    received = []
+    bus.factory_display_channel_changed.connect(lambda config_id, channel: received.append((config_id, channel)))
+
+    bus.factory_display_channel_changed.emit(101, 2)
+
+    assert received == [(101, 2)]
 
 
 def test_factory_runtime_payload_contract_includes_run_id():

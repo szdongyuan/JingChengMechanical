@@ -18,6 +18,7 @@ from app.services_container import (
 )
 from app.service.analysis import dsp
 from app.service.analysis.judgment import JudgmentEngine
+import ui.modules.result as result_module_mod
 from ui.modules.result import ResultModule
 
 
@@ -272,12 +273,12 @@ def test_result_module_live_metric_frames_use_cached_config_after_refresh(qapp):
     established_load_count = len(load_calls)
     assert established_load_count >= 1
 
-    for value in (70.0, 71.0, 72.0):
+    for value, frame_time in ((70.0, 0.0), (71.0, 0.25), (72.0, 0.50)):
         module.services.bus.spl_updated.emit(
             101,
             "run-101",
             0,
-            SimpleNamespace(spl_db=value),
+            SimpleNamespace(spl_db=value, time=frame_time),
         )
         module.services.bus.loudness_updated.emit(
             101,
@@ -289,6 +290,206 @@ def test_result_module_live_metric_frames_use_cached_config_after_refresh(qapp):
     assert module.lb_spl_metric_value.text() == "72.0 dB"
     assert module.lb_loudness_metric_value.text() == "2.00 sone"
     assert len(load_calls) == established_load_count
+
+
+def test_result_module_throttles_only_spl_metric_repaint_while_updating_cache(qapp):
+    module = _make_module()
+    _set_selected_channel(module, 0)
+    module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
+        "config_id": 101,
+        "selected_channels": [0],
+        "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
+    })
+    module.services.bus.factory_state_changed.emit(
+        _state("running", displayed_config_id=101, active_config_id=101)
+    )
+    module.services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
+    )
+
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=61.0, time=0.0),
+    )
+    assert module.lb_spl_metric_value.text() == "61.0 dB"
+
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=62.0, time=0.10),
+    )
+    assert module.lb_spl_metric_value.text() == "61.0 dB"
+    assert module._live_spl_by_key[(101, "run-101", 0)] == pytest.approx(62.0)
+
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=63.0, time=0.25),
+    )
+    assert module.lb_spl_metric_value.text() == "63.0 dB"
+
+
+def test_result_module_spl_throttle_uses_monotonic_fallback_for_nonfinite_frame_time(
+    qapp,
+    monkeypatch,
+):
+    times = iter([10.0, 10.1, 10.3])
+    monkeypatch.setattr(
+        result_module_mod,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(times)),
+        raising=False,
+    )
+    module = _make_module()
+    _set_selected_channel(module, 0)
+    module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
+        "config_id": 101,
+        "selected_channels": [0],
+        "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
+    })
+    module.services.bus.factory_state_changed.emit(
+        _state("running", displayed_config_id=101, active_config_id=101)
+    )
+    module.services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
+    )
+
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=60.0, time=float("nan")),
+    )
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=61.0, time=None),
+    )
+    assert module.lb_spl_metric_value.text() == "60.0 dB"
+
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=62.0),
+    )
+    assert module.lb_spl_metric_value.text() == "62.0 dB"
+
+
+def test_result_module_selected_channel_refresh_bypasses_spl_throttle(qapp):
+    module = _make_module()
+    _set_selected_channel(module, 0)
+    module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
+        "config_id": 101,
+        "selected_channels": [0],
+        "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
+    })
+    module.services.bus.factory_state_changed.emit(
+        _state("running", displayed_config_id=101, active_config_id=101)
+    )
+    module.services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
+    )
+
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=61.0, time=0.0),
+    )
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=62.0, time=0.10),
+    )
+    assert module.lb_spl_metric_value.text() == "61.0 dB"
+
+    module.refresh_selected_display_channel()
+
+    assert module.lb_spl_metric_value.text() == "62.0 dB"
+
+
+def test_result_module_invalid_spl_clears_repaint_timestamp_and_next_valid_repaints(qapp):
+    module = _make_module()
+    _set_selected_channel(module, 0)
+    module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
+        "config_id": 101,
+        "selected_channels": [0],
+        "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
+    })
+    module.services.bus.factory_state_changed.emit(
+        _state("running", displayed_config_id=101, active_config_id=101)
+    )
+    module.services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
+    )
+
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=61.0, time=0.0),
+    )
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=float("nan"), time=0.10),
+    )
+    assert module.lb_spl_metric_value.text() == "--"
+
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=63.0, time=0.11),
+    )
+
+    assert module.lb_spl_metric_value.text() == "63.0 dB"
+
+
+def test_result_module_loudness_repaints_immediately_without_forcing_spl_repaint(qapp):
+    module = _make_module()
+    _set_selected_channel(module, 0)
+    module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
+        "config_id": 101,
+        "selected_channels": [0],
+        "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
+    })
+    module.services.bus.factory_state_changed.emit(
+        _state("running", displayed_config_id=101, active_config_id=101)
+    )
+    module.services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
+    )
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=61.0, time=0.0),
+    )
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=62.0, time=0.10),
+    )
+
+    module.services.bus.loudness_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(loudness_sone=2.0, time=0.10),
+    )
+
+    assert module.lb_spl_metric_value.text() == "61.0 dB"
+    assert module.lb_loudness_metric_value.text() == "2.00 sone"
 
 
 def test_result_module_matching_invalid_spl_clears_only_spl_metric(qapp):
@@ -386,7 +587,7 @@ def test_result_module_matching_invalid_loudness_clears_only_loudness_metric(qap
     assert module.lb_loudness_metric_value.text() == "--"
 
 
-def test_result_module_clears_live_metrics_when_selected_channel_changes(qapp):
+def test_result_module_preserves_live_metric_caches_when_selected_channel_changes(qapp):
     module = _make_module()
     _set_selected_channel(module, 0)
     module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
@@ -404,7 +605,12 @@ def test_result_module_clears_live_metrics_when_selected_channel_changes(qapp):
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
     )
 
-    module.services.bus.spl_updated.emit(101, "run-101", 0, SimpleNamespace(spl_db=61.0))
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=61.0, time=0.0),
+    )
     module.services.bus.loudness_updated.emit(101, "run-101", 0, SimpleNamespace(loudness_sone=1.25))
     assert module.lb_spl_metric_value.text() == "61.0 dB"
     assert module.lb_loudness_metric_value.text() == "1.25 sone"
@@ -414,17 +620,27 @@ def test_result_module_clears_live_metrics_when_selected_channel_changes(qapp):
     assert module.lb_spl_metric_value.text() == "--"
     assert module.lb_loudness_metric_value.text() == "--"
 
-    module.services.bus.spl_updated.emit(101, "run-101", 1, SimpleNamespace(spl_db=72.34))
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        1,
+        SimpleNamespace(spl_db=72.34, time=0.0),
+    )
     module.services.bus.loudness_updated.emit(101, "run-101", 1, SimpleNamespace(loudness_sone=2.0))
     assert module.lb_spl_metric_value.text() == "72.3 dB"
     assert module.lb_loudness_metric_value.text() == "2.00 sone"
 
     _set_selected_channel(module, 0)
     module.refresh_selected_display_channel()
-    assert module.lb_spl_metric_value.text() == "--"
-    assert module.lb_loudness_metric_value.text() == "--"
+    assert module.lb_spl_metric_value.text() == "61.0 dB"
+    assert module.lb_loudness_metric_value.text() == "1.25 sone"
 
-    module.services.bus.spl_updated.emit(101, "run-101", 0, SimpleNamespace(spl_db=62.0))
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=62.0, time=0.25),
+    )
     module.services.bus.loudness_updated.emit(101, "run-101", 0, SimpleNamespace(loudness_sone=1.5))
     assert module.lb_spl_metric_value.text() == "62.0 dB"
     assert module.lb_loudness_metric_value.text() == "1.50 sone"
@@ -459,6 +675,144 @@ def test_result_module_renders_selected_channel_average_metrics_from_judgment_pa
     assert module.lb_loudness_metric_value.text() == "50.0 phon"
 
 
+def test_result_module_review_channel_switch_rerenders_selected_channel_average_metrics(qapp):
+    selected_channel = 0
+    module = _make_module()
+    module.selected_display_channel_provider = lambda: selected_channel
+    module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+        "channels": [
+            {"channel_index": 0, "loudness_unit": "sone"},
+            {"channel_index": 1, "loudness_unit": "sone"},
+        ],
+    })
+    judgment_payload = {
+        "channel_results": [
+            {"channel_index": 0, "spl_average_db": 60.0, "loudness_average_sone": 1.0},
+            {"channel_index": 1, "spl_average_db": 66.0, "loudness_average_sone": 2.0},
+        ]
+    }
+
+    module.services.bus.factory_state_changed.emit(_state("reviewing", displayed_config_id=101))
+    module.services.bus.factory_review_changed.emit(
+        _make_review_payload(
+            judgment_payload=judgment_payload,
+            summary_payload=_summary_payload(overall_status="pass"),
+        )
+    )
+    assert module.lb_spl_metric_value.text() == "60.0 dB"
+
+    selected_channel = 1
+    module.refresh_selected_display_channel()
+
+    assert module.lb_spl_metric_value.text() == "66.0 dB"
+    assert module.lb_loudness_metric_value.text() == "2.00 sone"
+
+
+def test_result_module_review_average_requires_matching_displayed_config(qapp):
+    module = _make_module()
+    _set_selected_channel(module, 0)
+    module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
+        "config_id": 101,
+        "selected_channels": [0],
+        "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
+    })
+    review_payload = FactoryReviewPayload(
+        displayed_config_id=202,
+        run_id="run-202",
+        judgment_payload={
+            "channel_results": [
+                {"channel_index": 0, "spl_average_db": 66.0, "loudness_average_sone": 2.0},
+            ]
+        },
+        summary_payload=_summary_payload(overall_status="pass"),
+    )
+
+    module.services.bus.factory_state_changed.emit(_state("reviewing", displayed_config_id=101))
+    module.services.bus.factory_review_changed.emit(review_payload)
+
+    assert module.lb_spl_metric_label.text() == "平均声压级"
+    assert module.lb_spl_metric_value.text() == "--"
+    assert module.lb_loudness_metric_label.text() == "平均响度"
+    assert module.lb_loudness_metric_value.text() == "--"
+
+
+@pytest.mark.parametrize("phase", ["running", "analyzing", "reanalyzing", "armed", "idle"])
+def test_result_module_review_averages_render_only_in_reviewing_or_stopped(qapp, phase):
+    module = _make_module()
+    _set_selected_channel(module, 0)
+    module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
+        "config_id": 101,
+        "selected_channels": [0],
+        "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
+    })
+    module.services.bus.factory_state_changed.emit(
+        _state(phase, displayed_config_id=101, active_config_id=101)
+    )
+    module.services.bus.factory_review_changed.emit(
+        _make_review_payload(
+            judgment_payload={
+                "channel_results": [
+                    {"channel_index": 0, "spl_average_db": 66.0, "loudness_average_sone": 2.0},
+                ]
+            },
+            summary_payload=_summary_payload(overall_status="pass"),
+        )
+    )
+
+    assert module.lb_spl_metric_value.text() == "--"
+    assert module.lb_loudness_metric_value.text() == "--"
+    assert module.lb_spl_metric_label.text() != "平均声压级"
+
+
+@pytest.mark.parametrize(
+    ("channel_result", "expected_spl", "expected_loudness"),
+    [
+        (
+            {"channel_index": 1, "spl_average_db": 88.0, "loudness_average_sone": 8.0},
+            "--",
+            "--",
+        ),
+        ({"channel_index": 0, "spl_average_db": 66.0}, "66.0 dB", "--"),
+        ({"channel_index": 0, "loudness_average_sone": 2.0}, "--", "2.00 sone"),
+        (
+            {
+                "channel_index": 0,
+                "spl_average_db": float("nan"),
+                "loudness_average_sone": 3.0,
+            },
+            "--",
+            "3.00 sone",
+        ),
+    ],
+)
+def test_result_module_review_average_missing_fields_are_independent(
+    qapp,
+    channel_result,
+    expected_spl,
+    expected_loudness,
+):
+    module = _make_module()
+    _set_selected_channel(module, 0)
+    module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
+        "config_id": 101,
+        "selected_channels": [0],
+        "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
+    })
+
+    module.services.bus.factory_state_changed.emit(_state("reviewing", displayed_config_id=101))
+    module.services.bus.factory_review_changed.emit(
+        _make_review_payload(
+            judgment_payload={"channel_results": [channel_result]},
+            summary_payload=_summary_payload(overall_status="pass"),
+        )
+    )
+
+    assert module.lb_spl_metric_value.text() == expected_spl
+    assert module.lb_loudness_metric_value.text() == expected_loudness
+
+
 def test_result_module_renders_average_metrics_from_production_serialized_judgment_result(
     qapp,
     monkeypatch,
@@ -484,8 +838,8 @@ def test_result_module_renders_average_metrics_from_production_serialized_judgme
     }
     config = {
         "config_id": 101,
-        "analysis_duration": 1.0,
-        "analysis_window_offset_ms": 0,
+        "analysis_duration": 0.5,
+        "analysis_window_offset_ms": 1000,
         "selected_channels": [0],
         "channels": [channel_config],
     }
@@ -495,8 +849,14 @@ def test_result_module_renders_average_metrics_from_production_serialized_judgme
         lambda *args, **kwargs: ([0.0, 0.5], [1.0, 3.0], 3.0),
     )
     engine = JudgmentEngine(SimpleNamespace(resolve_binding=lambda _config_id: None))
+    background_pressure = 20e-6 * 10 ** (40.0 / 20.0)
     target_pressure = 20e-6 * 10 ** (50.0 / 20.0)
-    buffer = np.full((1000, 1), target_pressure, dtype=np.float64)
+    buffer = np.concatenate(
+        [
+            np.full((1000, 1), background_pressure, dtype=np.float64),
+            np.full((1000, 1), target_pressure, dtype=np.float64),
+        ]
+    )
     judgment_payload = asdict(
         engine.judge(
             config,
@@ -507,6 +867,7 @@ def test_result_module_renders_average_metrics_from_production_serialized_judgme
         )
     )
     serialized_channel = judgment_payload["channel_results"][0]
+    assert judgment_payload["analysis_window"] == pytest.approx((1.0, 1.5))
     assert serialized_channel["spl_average_db"] == pytest.approx(50.0, abs=0.01)
     assert serialized_channel["loudness_average_sone"] == pytest.approx(2.0)
 
@@ -695,12 +1056,18 @@ def test_result_module_clears_live_run_when_displayed_config_changes(qapp):
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
     )
     module.services.bus.spl_updated.emit(101, "run-101", 0, SimpleNamespace(spl_db=61.0))
+    module._live_spl_by_key[(303, "run-303", 0)] = 80.0
+    module._last_spl_repaint_time_by_key[(303, "run-303", 0)] = 3.0
     assert module.lb_spl_metric_value.text() == "61.0 dB"
 
     module.services.bus.factory_state_changed.emit(
         _state("running", displayed_config_id=202, active_config_id=202)
     )
     assert module.lb_spl_metric_value.text() == "--"
+    assert (101, "run-101", 0) not in module._live_spl_by_key
+    assert (101, "run-101", 0) not in module._last_spl_repaint_time_by_key
+    assert module._live_spl_by_key[(303, "run-303", 0)] == pytest.approx(80.0)
+    assert module._last_spl_repaint_time_by_key[(303, "run-303", 0)] == pytest.approx(3.0)
 
     module.services.bus.spl_updated.emit(101, "run-101", 0, SimpleNamespace(spl_db=70.0))
     assert module.lb_spl_metric_value.text() == "--"
@@ -721,17 +1088,50 @@ def test_result_module_new_matching_start_clears_prior_live_metrics_and_rejects_
         SimpleNamespace(config_id=101, run_id="run-1", trigger_source="manual")
     )
     module.services.bus.spl_updated.emit(101, "run-1", 0, SimpleNamespace(spl_db=61.0))
+    module._live_spl_by_key[(202, "run-x", 0)] = 99.0
+    module._live_loudness_by_key[(202, "run-x", 0)] = 4.0
+    module._last_spl_repaint_time_by_key[(202, "run-x", 0)] = 9.0
     assert module.lb_spl_metric_value.text() == "61.0 dB"
 
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-2", trigger_source="manual")
     )
     assert module.lb_spl_metric_value.text() == "--"
+    assert (101, "run-1", 0) not in module._live_spl_by_key
+    assert (101, "run-1", 0) not in module._last_spl_repaint_time_by_key
+    assert module._live_spl_by_key[(202, "run-x", 0)] == pytest.approx(99.0)
+    assert module._live_loudness_by_key[(202, "run-x", 0)] == pytest.approx(4.0)
+    assert module._last_spl_repaint_time_by_key[(202, "run-x", 0)] == pytest.approx(9.0)
 
     module.services.bus.spl_updated.emit(101, "run-1", 0, SimpleNamespace(spl_db=70.0))
     assert module.lb_spl_metric_value.text() == "--"
     module.services.bus.spl_updated.emit(101, "run-2", 0, SimpleNamespace(spl_db=62.0))
     assert module.lb_spl_metric_value.text() == "62.0 dB"
+
+
+def test_result_module_runtime_start_for_active_non_displayed_config_does_not_replace_displayed_run(qapp):
+    module = _make_module()
+    _set_selected_channel(module, 0)
+    module.services.config_service = SimpleNamespace(load_config=lambda config_id: {
+        "config_id": config_id,
+        "selected_channels": [0],
+        "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
+    })
+    module.services.bus.factory_state_changed.emit(
+        _state("running", displayed_config_id=202, active_config_id=101)
+    )
+    module.services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(config_id=202, run_id="run-202", trigger_source="manual")
+    )
+    module.services.bus.spl_updated.emit(202, "run-202", 0, SimpleNamespace(spl_db=61.0))
+    assert module.lb_spl_metric_value.text() == "61.0 dB"
+
+    module.services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
+    )
+
+    assert module._current_live_run_id == "run-202"
+    assert module.lb_spl_metric_value.text() == "61.0 dB"
 
 
 def test_result_module_preserves_latest_live_metrics_during_analyzing_until_review_arrives(qapp):
@@ -791,12 +1191,16 @@ def test_result_module_factory_display_reset_clears_metrics_and_live_run(qapp):
     )
     module.services.bus.spl_updated.emit(101, "run-101", 0, SimpleNamespace(spl_db=61.0))
     module.services.bus.loudness_updated.emit(101, "run-101", 0, SimpleNamespace(loudness_sone=1.25))
+    assert module._last_spl_repaint_time_by_key
     assert module.lb_spl_metric_value.text() == "61.0 dB"
     assert module.lb_loudness_metric_value.text() == "1.25 sone"
 
     module.services.bus.factory_display_reset.emit("next_run_accepted")
     assert module.lb_spl_metric_value.text() == "--"
     assert module.lb_loudness_metric_value.text() == "--"
+    assert module._live_spl_by_key == {}
+    assert module._live_loudness_by_key == {}
+    assert module._last_spl_repaint_time_by_key == {}
 
     module.services.bus.spl_updated.emit(101, "run-101", 0, SimpleNamespace(spl_db=70.0))
     module.services.bus.loudness_updated.emit(101, "run-101", 0, SimpleNamespace(loudness_sone=2.0))

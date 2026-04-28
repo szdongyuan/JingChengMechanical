@@ -614,6 +614,7 @@ class MainWindow(QMainWindow):
         self.analysis_toolbar.set_context_label_text(
             self._build_analysis_toolbar_context(config_id, channel_index)
         )
+        self._emit_factory_display_channel_changed(config_id, channel_index)
 
         if refresh_modules:
             self._refresh_analysis_display_modules()
@@ -663,6 +664,17 @@ class MainWindow(QMainWindow):
             self._build_analysis_toolbar_context(config_id, current_channel)
         )
         self.analysis_toolbar.show()
+        self._emit_factory_display_channel_changed(config_id, current_channel)
+
+    def _emit_factory_display_channel_changed(
+        self,
+        config_id: int,
+        channel_index: int,
+    ) -> None:
+        signal = getattr(self.services.bus, "factory_display_channel_changed", None)
+        emit = getattr(signal, "emit", None)
+        if callable(emit):
+            emit(config_id, channel_index)
 
     def _resolve_display_channels(self, config_id: int) -> list[int]:
         return self._selected_channels_for_config(config_id)

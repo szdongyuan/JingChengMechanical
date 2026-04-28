@@ -73,6 +73,7 @@ class _BusStub:
         self.factory_runtime_analyzing_entered = _SignalStub()
         self.factory_state_changed = _SignalStub()
         self.factory_review_changed = _SignalStub()
+        self.factory_display_channel_changed = _SignalStub()
         self.factory_display_reset = _SignalStub()
 
 
@@ -1463,6 +1464,44 @@ def test_main_window_channel_toolbar_shows_for_multi_channel_running_config(qapp
     assert callable(window.octave.selected_display_channel_provider)
     assert window.stft.selected_display_channel_provider() == 0
     assert window.result.selected_display_channel_provider() == 0
+
+
+def test_main_window_emits_display_channel_after_initial_resolution(qapp, monkeypatch):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_display_channel_changed.emissions.clear()
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+
+    assert services.bus.factory_display_channel_changed.emissions[-1][0] == (101, 0)
+
+
+def test_main_window_emits_display_channel_after_toolbar_selection(qapp, monkeypatch):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+    services.bus.factory_display_channel_changed.emissions.clear()
+
+    _select_toolbar_channel(window, qapp, 1)
+
+    assert services.bus.factory_display_channel_changed.emissions[-1][0] == (101, 1)
 
 
 def test_main_window_uses_process_last_channel_when_valid_for_new_config(

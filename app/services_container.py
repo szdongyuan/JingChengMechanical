@@ -222,6 +222,7 @@ class EventBus(QObject):
     factory_runtime_reanalysis_completed = pyqtSignal(object)     # FactoryReviewPayload
     factory_state_changed = pyqtSignal(object)              # FactoryControllerState
     factory_review_changed = pyqtSignal(object)             # FactoryReviewPayload
+    factory_display_channel_changed = pyqtSignal(int, int)  # config_id, channel_index
     factory_display_reset = pyqtSignal(str)                 # reset reason
 
 
