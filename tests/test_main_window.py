@@ -66,6 +66,7 @@ class _BusStub:
         self.stft_updated = _SignalStub()
         self.fft_updated = _SignalStub()
         self.spl_updated = _SignalStub()
+        self.loudness_updated = _SignalStub()
         self.octave_updated = _SignalStub()
         self.factory_start_blocked = _SignalStub()
         self.factory_runtime_start_accepted = _SignalStub()
@@ -1445,11 +1446,59 @@ def test_main_window_channel_toolbar_shows_for_multi_channel_running_config(qapp
     assert window.analysis_toolbar.current_channel_index() == 0
     assert window.display_channel_by_config_id == {101: 0}
     assert callable(window.stft.selected_display_channel_provider)
+    assert callable(window.result.selected_display_channel_provider)
     assert callable(window.loudness.selected_display_channel_provider)
     assert callable(window.spl.selected_display_channel_provider)
     assert callable(window.spectrum.selected_display_channel_provider)
     assert callable(window.octave.selected_display_channel_provider)
     assert window.stft.selected_display_channel_provider() == 0
+    assert window.result.selected_display_channel_provider() == 0
+
+
+def test_main_window_uses_process_last_channel_when_valid_for_new_config(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(monkeypatch, initial_state=_running_state(101))
+    services.config_service.load_config.side_effect = lambda config_id: {
+        101: {"config_id": 101, "selected_channels": [0, 2]},
+        202: {"config_id": 202, "selected_channels": [2, 1]},
+    }[config_id]
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 2)
+
+    services.bus.factory_state_changed.emit(_running_state(202))
+    qapp.processEvents()
+
+    assert window.analysis_toolbar.current_channel_index() == 2
+    assert window.current_display_channel_index() == 2
+    assert window.result.selected_display_channel_provider() == 2
+
+
+def test_main_window_falls_back_to_first_selected_channel_when_process_last_is_invalid(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(monkeypatch, initial_state=_running_state(101))
+    services.config_service.load_config.side_effect = lambda config_id: {
+        101: {"config_id": 101, "selected_channels": [0, 2]},
+        202: {"config_id": 202, "selected_channels": [1, 0]},
+    }[config_id]
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 2)
+
+    services.bus.factory_state_changed.emit(_running_state(202))
+    qapp.processEvents()
+
+    assert window.analysis_toolbar.current_channel_index() == 1
+    assert window.current_display_channel_index() == 1
+    assert window.result.selected_display_channel_provider() == 1
 
 
 def test_main_window_analysis_toolbar_uses_chinese_channel_text(qapp, monkeypatch):
@@ -1988,7 +2037,7 @@ def test_main_window_channel_toolbar_hides_or_disables_selector_for_single_chann
     assert window.display_channel_by_config_id == {101: 0}
 
 
-def test_main_window_remembers_selected_channel_per_config_when_switching_displayed_configs(
+def test_main_window_uses_process_last_channel_instead_of_per_config_restore_when_switching_displayed_configs(
     qapp,
     monkeypatch,
 ):
@@ -2013,9 +2062,10 @@ def test_main_window_remembers_selected_channel_per_config_when_switching_displa
     services.bus.factory_state_changed.emit(_running_state(101))
     qapp.processEvents()
 
-    assert window.analysis_toolbar.current_channel_index() == 1
-    assert window.display_channel_by_config_id[101] == 1
-    assert window.spl.selected_display_channel_provider() == 1
+    assert window.analysis_toolbar.current_channel_index() == 0
+    assert window.display_channel_by_config_id[101] == 0
+    assert window.spl.selected_display_channel_provider() == 0
+    assert window.result.selected_display_channel_provider() == 0
 
     services.bus.factory_state_changed.emit(_running_state(202))
     qapp.processEvents()
@@ -2025,7 +2075,7 @@ def test_main_window_remembers_selected_channel_per_config_when_switching_displa
     assert window.spectrum.selected_display_channel_provider() == 2
 
 
-def test_main_window_review_switching_displayed_configs_restores_last_selected_channel_for_charts(
+def test_main_window_review_switching_displayed_configs_uses_process_last_channel_for_charts(
     qapp,
     monkeypatch,
 ):
@@ -2062,9 +2112,9 @@ def test_main_window_review_switching_displayed_configs_restores_last_selected_c
     )
     qapp.processEvents()
 
-    assert window.analysis_toolbar.current_channel_index() == 1
-    assert window.display_channel_by_config_id[101] == 1
-    _assert_committed_chart_channel(window, channel_index=1)
+    assert window.analysis_toolbar.current_channel_index() == 0
+    assert window.display_channel_by_config_id[101] == 0
+    _assert_committed_chart_channel(window, channel_index=0)
 
     services.bus.factory_state_changed.emit(_reviewing_state(202))
     services.bus.factory_review_changed.emit(

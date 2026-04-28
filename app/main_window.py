@@ -78,6 +78,7 @@ class MainWindow(QMainWindow):
         self._factory_state = getattr(factory_mode, "state", FactoryControllerState())
         self._review_payload = getattr(factory_mode, "review_payload", FactoryReviewPayload())
         self.display_channel_by_config_id: dict[int, int] = {}
+        self._last_selected_display_channel: int | None = None
         self._current_main_tab_index = self._TEST_PAGE_INDEX
         self._pending_guarded_tab_index: int | None = None
         self._reverting_main_tab_change = False
@@ -447,7 +448,7 @@ class MainWindow(QMainWindow):
         return self.display_channel_by_config_id.get(config_id)
 
     def _attach_analysis_channel_providers(self) -> None:
-        for module in (self.stft, self.loudness, self.spl, self.spectrum, self.octave):
+        for module in (self.result, self.stft, self.loudness, self.spl, self.spectrum, self.octave):
             module.selected_display_channel_provider = self.current_display_channel_index
         for module in (self.loudness, self.spl, self.spectrum, self.octave):
             module.selected_display_channel_sync = self._sync_selected_display_channel
@@ -600,6 +601,7 @@ class MainWindow(QMainWindow):
         if config_id is None:
             return
 
+        self._last_selected_display_channel = channel_index
         self.display_channel_by_config_id[config_id] = channel_index
         self.analysis_toolbar.set_current_channel(channel_index)
         self.analysis_toolbar.set_context_label_text(
@@ -610,7 +612,7 @@ class MainWindow(QMainWindow):
             self._refresh_analysis_display_modules()
 
     def _refresh_analysis_display_modules(self) -> None:
-        for module in (self.stft, self.loudness, self.spl, self.spectrum, self.octave):
+        for module in (self.stft, self.loudness, self.spl, self.spectrum, self.octave, self.result):
             refresh = getattr(module, "refresh_selected_display_channel", None)
             if callable(refresh):
                 refresh()
@@ -669,21 +671,21 @@ class MainWindow(QMainWindow):
         if not channels:
             return None
 
-        remembered_channel = self.display_channel_by_config_id.get(config_id)
+        remembered_channel = self._last_selected_display_channel
         review_channels = self._chart_payload_channels_for_config(config_id)
-        if (
-            remembered_channel is not None
-            and review_channels
-            and remembered_channel not in review_channels
-        ):
-            for review_channel in review_channels:
-                if review_channel in channels:
-                    return review_channel
 
         if remembered_channel in channels:
-            return remembered_channel
+            candidate_channel = remembered_channel
+        else:
+            candidate_channel = channels[0]
 
-        return channels[0]
+        if review_channels and candidate_channel not in review_channels:
+            for channel in channels:
+                if channel in review_channels:
+                    return channel
+            return None
+
+        return candidate_channel
 
     def _selected_channels_for_config(self, config_id: int) -> list[int]:
         config_service = getattr(self.services, "config_service", None)
