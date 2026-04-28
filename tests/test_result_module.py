@@ -291,6 +291,50 @@ def test_result_module_live_metric_frames_use_cached_config_after_refresh(qapp):
     assert len(load_calls) == established_load_count
 
 
+def test_result_module_clears_live_metrics_when_selected_channel_changes(qapp):
+    module = _make_module()
+    _set_selected_channel(module, 0)
+    module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+        "channels": [
+            {"channel_index": 0, "loudness_unit": "sone"},
+            {"channel_index": 1, "loudness_unit": "sone"},
+        ],
+    })
+    module.services.bus.factory_state_changed.emit(
+        _state("running", displayed_config_id=101, active_config_id=101)
+    )
+    module.services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
+    )
+
+    module.services.bus.spl_updated.emit(101, "run-101", 0, SimpleNamespace(spl_db=61.0))
+    module.services.bus.loudness_updated.emit(101, "run-101", 0, SimpleNamespace(loudness_sone=1.25))
+    assert module.lb_spl_metric_value.text() == "61.0 dB"
+    assert module.lb_loudness_metric_value.text() == "1.25 sone"
+
+    _set_selected_channel(module, 1)
+    module.refresh_selected_display_channel()
+    assert module.lb_spl_metric_value.text() == "--"
+    assert module.lb_loudness_metric_value.text() == "--"
+
+    module.services.bus.spl_updated.emit(101, "run-101", 1, SimpleNamespace(spl_db=72.34))
+    module.services.bus.loudness_updated.emit(101, "run-101", 1, SimpleNamespace(loudness_sone=2.0))
+    assert module.lb_spl_metric_value.text() == "72.3 dB"
+    assert module.lb_loudness_metric_value.text() == "2.00 sone"
+
+    _set_selected_channel(module, 0)
+    module.refresh_selected_display_channel()
+    assert module.lb_spl_metric_value.text() == "--"
+    assert module.lb_loudness_metric_value.text() == "--"
+
+    module.services.bus.spl_updated.emit(101, "run-101", 0, SimpleNamespace(spl_db=62.0))
+    module.services.bus.loudness_updated.emit(101, "run-101", 0, SimpleNamespace(loudness_sone=1.5))
+    assert module.lb_spl_metric_value.text() == "62.0 dB"
+    assert module.lb_loudness_metric_value.text() == "1.50 sone"
+
+
 def test_result_module_renders_selected_channel_average_metrics_from_judgment_payload(qapp):
     module = _make_module()
     _set_selected_channel(module, 1)

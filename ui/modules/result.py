@@ -268,7 +268,15 @@ class ResultModule(QWidget):
         )
 
     def refresh_selected_display_channel(self) -> None:
+        previous_channel = self._metric_selected_channel_index
+        previous_cache_known = self._metric_channel_cache_key is not None
         self._refresh_metric_channel_cache(force=True)
+        if (
+            previous_cache_known
+            and getattr(self._factory_state, "run_phase", None) in self._LIVE_METRIC_PHASES
+            and self._metric_selected_channel_index != previous_channel
+        ):
+            self._clear_current_run_live_metric_values()
         self._refresh_metric_display()
 
     def _on_factory_state_changed(self, state) -> None:
@@ -527,6 +535,16 @@ class ResultModule(QWidget):
     def _clear_live_metric_values(self) -> None:
         self._live_spl_by_key.clear()
         self._live_loudness_by_key.clear()
+
+    def _clear_current_run_live_metric_values(self) -> None:
+        config_id = self._displayed_config_id()
+        run_id = self._current_live_run_id
+        if config_id is None or run_id is None:
+            return
+        for cache in (self._live_spl_by_key, self._live_loudness_by_key):
+            for key in list(cache):
+                if key[0] == config_id and key[1] == run_id:
+                    del cache[key]
 
     def _clear_metric_channel_cache(self) -> None:
         self._metric_channel_cache_key = None
