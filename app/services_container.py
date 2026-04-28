@@ -197,6 +197,7 @@ class EventBus(QObject):
     # Real-time analysis frames (~20 Hz per channel)
     stft_updated = pyqtSignal(int, str, int, object)     # config_id, run_id, channel_idx, StftFrame
     spl_updated = pyqtSignal(int, str, int, object)      # config_id, run_id, channel_idx, SplFrame
+    loudness_updated = pyqtSignal(int, str, int, object)  # config_id, run_id, channel_idx, LoudnessFrame
     octave_updated = pyqtSignal(int, str, int, object)   # config_id, run_id, channel_idx, OctaveFrame
     fft_updated = pyqtSignal(int, str, int, object)      # config_id, run_id, channel_idx, FftFrame
 

@@ -22,6 +22,13 @@ class SplFrame:
 
 
 @dataclass
+class LoudnessFrame:
+    """One live loudness measurement for a single channel."""
+    time: float
+    loudness_sone: float
+
+
+@dataclass
 class OctaveFrame:
     """One 1/3-octave band analysis frame for a single channel."""
     time: float

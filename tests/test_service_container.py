@@ -49,6 +49,7 @@ def test_analysis_signals_exist():
     for name in (
         "stft_updated",
         "spl_updated",
+        "loudness_updated",
         "octave_updated",
         "fft_updated",
         "recording_progress",
@@ -83,6 +84,7 @@ def test_analysis_frame_signals_include_run_id_contract():
 
     assert _normalized_signal_argument_types(EventBus.stft_updated) == expected_argument_types
     assert _normalized_signal_argument_types(EventBus.spl_updated) == expected_argument_types
+    assert _normalized_signal_argument_types(EventBus.loudness_updated) == expected_argument_types
     assert _normalized_signal_argument_types(EventBus.octave_updated) == expected_argument_types
     assert _normalized_signal_argument_types(EventBus.fft_updated) == expected_argument_types
 
@@ -90,6 +92,7 @@ def test_analysis_frame_signals_include_run_id_contract():
 
     assert _normalized_signal_argument_types(EventBus.stft_updated) == expected_argument_types
     assert _normalized_signal_argument_types(EventBus.spl_updated) == expected_argument_types
+    assert _normalized_signal_argument_types(EventBus.loudness_updated) == expected_argument_types
     assert _normalized_signal_argument_types(EventBus.octave_updated) == expected_argument_types
     assert _normalized_signal_argument_types(EventBus.fft_updated) == expected_argument_types
 

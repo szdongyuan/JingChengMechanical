@@ -10,8 +10,12 @@ from __future__ import annotations
 
 import numpy as np
 
-from app.service.analysis.frames import FftFrame, OctaveFrame, SplFrame, StftFrame
+from app.service.analysis.frames import FftFrame, LoudnessFrame, OctaveFrame, SplFrame, StftFrame
 from app.service.analysis import dsp
+
+
+_LIVE_LOUDNESS_THROTTLE_SEC = 1.0
+_LIVE_LOUDNESS_WINDOW_SEC = 1.0
 
 
 class AnalysisPipeline:
@@ -45,6 +49,8 @@ class AnalysisPipeline:
         self._stft_buffer = np.array([], dtype=np.float64)
         self._latest_stft_frame_sample_index: int | None = None
         self._fft_buffer = np.array([], dtype=np.float64)
+        self._loudness_buffer = np.array([], dtype=np.float64)
+        self._last_live_loudness_emit_time = 0.0
 
     def process_chunk(self, chunk_mono: np.ndarray,
                       elapsed_time: float) -> dict:
@@ -65,6 +71,13 @@ class AnalysisPipeline:
         # Apply mic calibration
         if self._mic_sensitivity != 0.0:
             sig = dsp.apply_mic_calibration(sig, self._mic_sensitivity)
+
+        if sig.size > 0:
+            self._loudness_buffer = np.concatenate([self._loudness_buffer, sig])
+            loudness_window_samples = int(round(self.sample_rate * _LIVE_LOUDNESS_WINDOW_SEC))
+            if loudness_window_samples > 0 and self._loudness_buffer.size > loudness_window_samples:
+                self._loudness_buffer = self._loudness_buffer[-loudness_window_samples:]
+        loudness_frame = self._maybe_compute_live_loudness(elapsed_time)
 
         # SPL — always computed (even for short chunks)
         spl_db = dsp.compute_spl(sig, self.sample_rate,
@@ -145,12 +158,38 @@ class AnalysisPipeline:
             "stft_frames": stft_frames,
             "stft": stft_frame,
             "spl": spl_frame,
+            "loudness": loudness_frame,
             "octave": octave_frame,
             "fft": fft_frame,
         }
+
+    def _maybe_compute_live_loudness(self, elapsed_time: float) -> LoudnessFrame | None:
+        if elapsed_time - self._last_live_loudness_emit_time < _LIVE_LOUDNESS_THROTTLE_SEC:
+            return None
+        if self._loudness_buffer.size == 0 or self.sample_rate <= 0:
+            return None
+
+        self._last_live_loudness_emit_time = elapsed_time
+        try:
+            _times_sec, values_sone, _max_sone = dsp.compute_loudness_trace(
+                self._loudness_buffer,
+                self.sample_rate,
+            )
+            values = np.asarray(values_sone, dtype=np.float64).reshape(-1)
+            finite_values = values[np.isfinite(values)]
+            if finite_values.size == 0:
+                return None
+            return LoudnessFrame(
+                time=elapsed_time,
+                loudness_sone=float(finite_values[-1]),
+            )
+        except Exception:
+            return None
 
     def reset(self):
         """Clear internal state for reuse."""
         self._stft_buffer = np.array([], dtype=np.float64)
         self._latest_stft_frame_sample_index = None
         self._fft_buffer = np.array([], dtype=np.float64)
+        self._loudness_buffer = np.array([], dtype=np.float64)
+        self._last_live_loudness_emit_time = 0.0
