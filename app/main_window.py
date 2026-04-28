@@ -602,7 +602,7 @@ class MainWindow(QMainWindow):
             return
 
         selected_channels = self._selected_channels_for_config(config_id)
-        if selected_channels and channel_index not in selected_channels:
+        if channel_index not in selected_channels:
             return
 
         self._last_selected_display_channel = channel_index

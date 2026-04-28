@@ -1612,6 +1612,30 @@ def test_main_window_chart_sync_ignores_channel_outside_selected_channels(
     assert window.result.selected_display_channel_provider() == 1
 
 
+def test_main_window_chart_sync_ignores_channel_when_config_has_no_selected_channels(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [],
+    }
+    _show(window, qapp)
+
+    window.spl.selected_display_channel_sync(0)
+    qapp.processEvents()
+
+    assert window._last_selected_display_channel is None
+    assert 101 not in window.display_channel_by_config_id
+    assert window.current_display_channel_index() is None
+    assert window.spl.selected_display_channel_provider() is None
+    assert window.result.selected_display_channel_provider() is None
+
+
 def test_main_window_toolbar_selection_refreshes_result_module_hook(
     qapp,
     monkeypatch,
@@ -1861,6 +1885,10 @@ def test_main_window_stopped_state_preserves_review_channel_resolution(
         initial_state=_reviewing_state(101),
         initial_review_payload=_review_payload_with_chart_payload(101, channels=(0, 2)),
     )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 2],
+    }
     _show(window, qapp)
 
     try:
