@@ -61,6 +61,9 @@ class MainWindow(QMainWindow):
     _DISPLAY_CHANNEL_PHASES = frozenset(
         {"running", "analyzing", "reviewing", "reanalyzing", "stopped"}
     )
+    _COMMITTED_CHART_CHANNEL_PHASES = frozenset(
+        {"reviewing", "reanalyzing", "stopped"}
+    )
 
     def __init__(self, services):
         super().__init__()
@@ -630,6 +633,8 @@ class MainWindow(QMainWindow):
             config_id is None
             or self._factory_state.run_phase not in self._DISPLAY_CHANNEL_PHASES
         ):
+            if config_id is not None:
+                self.display_channel_by_config_id.pop(config_id, None)
             self.analysis_toolbar.set_available_channels([])
             self.analysis_toolbar.set_context_label_text("")
             self.analysis_toolbar.hide()
@@ -637,6 +642,7 @@ class MainWindow(QMainWindow):
 
         channels = self._resolve_display_channels(config_id)
         if not channels:
+            self.display_channel_by_config_id.pop(config_id, None)
             self.analysis_toolbar.set_available_channels([])
             self.analysis_toolbar.set_context_label_text("")
             self.analysis_toolbar.hide()
@@ -644,6 +650,7 @@ class MainWindow(QMainWindow):
 
         current_channel = self._resolve_current_display_channel(config_id, channels)
         if current_channel is None:
+            self.display_channel_by_config_id.pop(config_id, None)
             self.analysis_toolbar.set_available_channels([])
             self.analysis_toolbar.set_context_label_text("")
             self.analysis_toolbar.hide()
@@ -658,14 +665,7 @@ class MainWindow(QMainWindow):
         self.analysis_toolbar.show()
 
     def _resolve_display_channels(self, config_id: int) -> list[int]:
-        selected_channels = self._selected_channels_for_config(config_id)
-        if selected_channels:
-            return selected_channels
-
-        if self._factory_state.run_phase in {"reviewing", "reanalyzing", "stopped"}:
-            return self._chart_payload_channels_for_config(config_id)
-
-        return []
+        return self._selected_channels_for_config(config_id)
 
     def _resolve_current_display_channel(
         self,
@@ -676,7 +676,9 @@ class MainWindow(QMainWindow):
             return None
 
         remembered_channel = self._last_selected_display_channel
-        review_channels = self._chart_payload_channels_for_config(config_id)
+        review_channels = []
+        if self._factory_state.run_phase in self._COMMITTED_CHART_CHANNEL_PHASES:
+            review_channels = self._chart_payload_channels_for_config(config_id)
 
         if remembered_channel in channels:
             candidate_channel = remembered_channel

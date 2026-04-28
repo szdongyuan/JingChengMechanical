@@ -1636,6 +1636,94 @@ def test_main_window_chart_sync_ignores_channel_when_config_has_no_selected_chan
     assert window.result.selected_display_channel_provider() is None
 
 
+def test_main_window_stopped_config_with_empty_selected_channels_ignores_chart_payload_channels(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_stopped_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0, 1)),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_stopped_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0, 1))
+    )
+    qapp.processEvents()
+
+    assert window.analysis_toolbar.isHidden() is True
+    assert 101 not in window.display_channel_by_config_id
+    assert window.current_display_channel_index() is None
+    assert window.result.selected_display_channel_provider() is None
+
+
+def test_main_window_running_state_ignores_stale_review_payload_channel_guard(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0,)),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 1)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+
+    assert window.analysis_toolbar.current_channel_index() == 1
+    assert window.current_display_channel_index() == 1
+    assert window.result.selected_display_channel_provider() == 1
+
+
+def test_main_window_sync_toolbar_clears_display_channel_when_selected_channels_empty(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_running_state(101),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 1)
+
+    assert window.current_display_channel_index() == 1
+    assert window.display_channel_by_config_id[101] == 1
+
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [],
+    }
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+
+    assert window.analysis_toolbar.isHidden() is True
+    assert 101 not in window.display_channel_by_config_id
+    assert window.current_display_channel_index() is None
+    assert window.result.selected_display_channel_provider() is None
+
+
 def test_main_window_toolbar_selection_refreshes_result_module_hook(
     qapp,
     monkeypatch,
