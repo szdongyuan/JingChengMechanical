@@ -162,7 +162,7 @@ class _HeatmapCanvas(QWidget):
     def __init__(self, owner: "StftModule"):
         super().__init__(owner)
         self._owner = owner
-        self.heatmap = StftImageChartWidget(self)
+        self.heatmap = StftImageChartWidget(self, hide_left_axis_label=True)
 
     def resizeEvent(self, event):
         self.heatmap.setGeometry(self.rect())

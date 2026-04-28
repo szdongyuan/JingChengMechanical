@@ -31,7 +31,7 @@ class OctaveModule(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
 
-        self.plot = OctaveBarChartWidget()
+        self.plot = OctaveBarChartWidget(hide_left_axis_label=True)
         lay.addWidget(self.plot, 1)
 
         if hasattr(self.services.bus, "factory_state_changed"):

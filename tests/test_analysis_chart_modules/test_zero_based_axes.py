@@ -13,6 +13,28 @@ from ui.widgets.analysis_charts import (
 from ._support import _assert_x_range, _assert_xy_range, _show_widget
 
 
+def _assert_left_axis_title_hidden_ticks_visible(widget) -> None:
+    left_axis = widget.plot_item.getAxis("left")
+    assert left_axis.isVisible() is True
+    assert left_axis.labelText == ""
+    assert left_axis.style.get("showValues") is True
+    assert left_axis.style.get("tickLength") not in (None, 0)
+    assert left_axis.tickStrings([0.0, 1.0], 1.0, 1.0) == ["0", "1"]
+    assert widget.plot_item.getAxis("bottom").isVisible() is True
+
+
+def _assert_left_axis_visible(widget) -> None:
+    assert widget.plot_item.getAxis("left").isVisible() is True
+
+
+def _assert_default_left_axis_label_refresh_visible(widget) -> None:
+    widget.plot_item.setLabel("left", "Refreshed", units="dB")
+    left_axis = widget.plot_item.getAxis("left")
+    assert left_axis.isVisible() is True
+    assert left_axis.labelText == "Refreshed"
+    assert left_axis.style.get("showValues") is True
+
+
 @pytest.mark.parametrize(
     ("widget_cls", "expected_x_range", "expected_y_range"),
     (
@@ -39,6 +61,116 @@ def test_chart_widgets_initial_visible_state_use_zero_based_fallback_axes(
             _assert_xy_range(widget, expected_x_range, expected_y_range)
     finally:
         widget.close()
+
+
+@pytest.mark.parametrize(
+    "widget_cls",
+    (LineChartWidget, FftLineChartWidget, OctaveBarChartWidget, StftImageChartWidget),
+)
+def test_chart_widgets_keep_left_axis_visible_by_default(qapp, widget_cls):
+    widget = widget_cls()
+
+    try:
+        _show_widget(widget, qapp)
+        _assert_left_axis_visible(widget)
+        assert widget.plot_item.getAxis("bottom").isVisible() is True
+    finally:
+        widget.close()
+
+
+@pytest.mark.parametrize(
+    "widget_cls",
+    (LineChartWidget, FftLineChartWidget, OctaveBarChartWidget, StftImageChartWidget),
+)
+def test_chart_widgets_can_hide_only_left_axis_title_when_opted_in(qapp, widget_cls):
+    widget = widget_cls(hide_left_axis_label=True)
+
+    try:
+        _show_widget(widget, qapp)
+        _assert_left_axis_title_hidden_ticks_visible(widget)
+    finally:
+        widget.close()
+
+
+@pytest.mark.parametrize(
+    "widget_cls",
+    (LineChartWidget, FftLineChartWidget, OctaveBarChartWidget, StftImageChartWidget),
+)
+def test_opted_in_chart_widgets_keep_left_axis_title_hidden_after_left_label_refresh(
+    qapp,
+    widget_cls,
+):
+    widget = widget_cls(hide_left_axis_label=True)
+
+    try:
+        _show_widget(widget, qapp)
+        widget.plot_item.setLabel("left", "Refreshed", units="dB")
+        qapp.processEvents()
+
+        _assert_left_axis_title_hidden_ticks_visible(widget)
+    finally:
+        widget.close()
+
+
+@pytest.mark.parametrize(
+    "widget_cls",
+    (LineChartWidget, FftLineChartWidget, OctaveBarChartWidget, StftImageChartWidget),
+)
+def test_default_chart_widgets_keep_normal_left_label_refresh_behavior(
+    qapp,
+    widget_cls,
+):
+    widget = widget_cls()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.plot_item.hideAxis("left")
+        _assert_default_left_axis_label_refresh_visible(widget)
+        qapp.processEvents()
+
+        assert widget.plot_item.getAxis("bottom").isVisible() is True
+    finally:
+        widget.close()
+
+
+def test_left_axis_title_hiding_preserves_zero_based_ranges(qapp):
+    line = LineChartWidget(hide_left_axis_label=True)
+    fft = FftLineChartWidget(hide_left_axis_label=True)
+    octave = OctaveBarChartWidget(hide_left_axis_label=True)
+    stft = StftImageChartWidget(hide_left_axis_label=True)
+
+    try:
+        for widget in (line, fft, octave, stft):
+            _show_widget(widget, qapp)
+
+        line.set_series([1.0, 2.0], [70.0, 71.0])
+        fft.set_spectrum(
+            frequencies_hz=[125.0, 250.0],
+            levels_db=[42.0, 45.0],
+            limit_bands=[],
+        )
+        octave.set_bands(
+            center_freqs_hz=[125.0, 250.0],
+            levels_db=[32.0, 34.0],
+        )
+        stft.set_image(
+            times_sec=[0.0, 1.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0, 2.0], [3.0, 4.0]]),
+        )
+        qapp.processEvents()
+
+        _assert_x_range(line, (0.0, 2.0))
+        _assert_x_range(fft, (0.0, 250.0))
+        _assert_x_range(octave, (-0.5, 1.5))
+        _assert_xy_range(stft, (0.0, 1.0), (0.0, 200.0))
+        for widget in (line, fft, octave, stft):
+            _assert_left_axis_title_hidden_ticks_visible(widget)
+    finally:
+        line.close()
+        fft.close()
+        octave.close()
+        stft.close()
 
 
 def test_line_chart_widget_uses_zero_based_x_axis_without_horizontal_padding(qapp):
@@ -226,7 +358,7 @@ def test_octave_bar_chart_widget_uses_zero_based_bar_center_range(qapp):
         )
         qapp.processEvents()
 
-        _assert_x_range(widget, (0.0, 2.0))
+        _assert_x_range(widget, (-0.5, 2.5))
     finally:
         widget.close()
 
@@ -251,7 +383,7 @@ def test_octave_bar_chart_widget_limit_markers_do_not_expand_zero_based_x_range(
         )
         qapp.processEvents()
 
-        _assert_x_range(widget, (0.0, 2.0))
+        _assert_x_range(widget, (-0.5, 2.5))
     finally:
         widget.close()
 
@@ -401,7 +533,7 @@ def test_octave_bar_chart_widget_single_bar_uses_one_point_fallback(qapp):
         )
         qapp.processEvents()
 
-        _assert_x_range(widget, (0.0, 1.0))
+        _assert_x_range(widget, (-0.5, 0.5))
     finally:
         widget.close()
 
@@ -515,7 +647,7 @@ def test_chart_widgets_programmatic_refresh_reset_preserve_zero_based_axes(qapp)
 
         _assert_x_range(line, (0.0, 4.0))
         _assert_x_range(fft, (0.0, 500.0))
-        _assert_x_range(octave, (0.0, 2.0))
+        _assert_x_range(octave, (-0.5, 2.5))
         _assert_xy_range(stft, (0.0, 2.0), (0.0, 300.0))
     finally:
         line.close()

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QHBoxLayout,
@@ -14,9 +16,20 @@ from PyQt6.QtWidgets import (
 from app.services_container import FactoryControllerState, FactoryReviewPayload
 
 
+_DISPLAY_LABEL_MAP = {
+    "SPL": "声压级",
+    "平均SPL": "平均声压级",
+    "Loudness": "响度",
+    "平均Loudness": "平均响度",
+    "FFT": "FFT频谱",
+    "Octave": "倍频程",
+}
+_CHANNEL_LABEL_RE = re.compile(r"CH(\d+)", flags=re.IGNORECASE)
+
+
 class ResultModule(QWidget):
     module_id = "result"
-    _ROW_LABELS = ("SPL", "Loudness", "FFT", "倍频程", "AI分析")
+    _ROW_LABELS = ("声压级", "响度", "FFT频谱", "倍频程", "AI分析")
     _DISPLAY_PRESERVING_PHASES = frozenset(
         {"running", "analyzing", "reanalyzing", "stopped"}
     )
@@ -164,9 +177,9 @@ class ResultModule(QWidget):
             row_payload = rows[row_index] if row_index < len(rows) and isinstance(rows[row_index], dict) else {}
             self._set_row(
                 row_index,
-                self._text_or_default(row_payload.get("label"), default_label),
+                self._display_label(row_payload.get("label"), default_label),
                 self._text_or_default(row_payload.get("deviation_display"), "-"),
-                self._text_or_default(row_payload.get("channel_label"), "-"),
+                self._display_channel(row_payload.get("channel_label"), "-"),
                 self._text_or_default(row_payload.get("status"), "-"),
             )
 
@@ -212,4 +225,21 @@ class ResultModule(QWidget):
         text = str(value)
         if text == "":
             return default
+        return text
+
+    @staticmethod
+    def _display_label(value, default: str | None) -> str | None:
+        text = ResultModule._text_or_default(value, default)
+        if text is None:
+            return None
+        return _DISPLAY_LABEL_MAP.get(text, text)
+
+    @staticmethod
+    def _display_channel(value, default: str | None) -> str | None:
+        text = ResultModule._text_or_default(value, default)
+        if text is None:
+            return None
+        match = _CHANNEL_LABEL_RE.fullmatch(text.strip())
+        if match:
+            return f"通道{match.group(1)}"
         return text

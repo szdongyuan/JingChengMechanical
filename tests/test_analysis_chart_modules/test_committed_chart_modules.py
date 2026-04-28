@@ -7,6 +7,7 @@ from ui.modules.loudness import LoudnessModule
 from ui.modules.octave import OctaveModule
 from ui.modules.spectrum import SpectrumModule
 from ui.modules.spl import SplModule
+from ui.modules.stft import StftModule
 
 from ._support import (
     _assert_empty_chart_visible,
@@ -43,6 +44,16 @@ def _with_loudness_payload(
     return review_payload
 
 
+def _assert_left_axis_title_hidden_ticks_visible(widget) -> None:
+    left_axis = widget.plot_item.getAxis("left")
+    assert left_axis.isVisible() is True
+    assert left_axis.labelText == ""
+    assert left_axis.style.get("showValues") is True
+    assert left_axis.style.get("tickLength") not in (None, 0)
+    assert left_axis.tickStrings([0.0, 1.0], 1.0, 1.0) == ["0", "1"]
+    assert widget.plot_item.getAxis("bottom").isVisible() is True
+
+
 def test_spl_module_renders_committed_chart_for_selected_channel(qapp):
     services = _make_services(initial_state=_state(101, "reviewing"))
     module = SplModule(services)
@@ -59,10 +70,10 @@ def test_spl_module_renders_committed_chart_for_selected_channel(qapp):
     assert module.current_plot_payload()["y_values"] == [71.0, 72.0]
     assert module.current_render_channel() == 1
     assert module.plot.plot_item.getAxis("bottom").labelText == "Time (s)"
-    assert module.plot.plot_item.getAxis("left").labelText == "SPL (dB)"
+    _assert_left_axis_title_hidden_ticks_visible(module.plot)
 
 
-def test_spl_module_keeps_axis_labels_when_committed_payload_has_no_series_points(qapp):
+def test_spl_module_keeps_axes_visibility_when_committed_payload_has_no_series_points(qapp):
     services = _make_services(initial_state=_state(101, "reviewing"))
     module = SplModule(services)
     module.selected_display_channel_provider = lambda: 0
@@ -80,7 +91,7 @@ def test_spl_module_keeps_axis_labels_when_committed_payload_has_no_series_point
 
     _assert_empty_chart_visible(module, qapp)
     assert module.plot.plot_item.getAxis("bottom").labelText == "Time (s)"
-    assert module.plot.plot_item.getAxis("left").labelText == "SPL (dB)"
+    _assert_left_axis_title_hidden_ticks_visible(module.plot)
 
 
 def test_loudness_module_renders_committed_chart_for_selected_channel(qapp):
@@ -103,7 +114,36 @@ def test_loudness_module_renders_committed_chart_for_selected_channel(qapp):
     assert module.current_plot_payload()["unit"] == "phon"
     assert module.current_render_channel() == 1
     assert module.plot.plot_item.getAxis("bottom").labelText == "Time (s)"
-    assert module.plot.plot_item.getAxis("left").labelText == "Loudness (phon)"
+    _assert_left_axis_title_hidden_ticks_visible(module.plot)
+
+
+@pytest.mark.parametrize("module_cls", (SplModule, SpectrumModule, OctaveModule, LoudnessModule))
+def test_committed_chart_modules_hide_left_axis_title_but_keep_ticks(qapp, module_cls):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = module_cls(services)
+    module.selected_display_channel_provider = lambda: 0
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    if module_cls is LoudnessModule:
+        review_payload = _with_loudness_payload(review_payload)
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    _assert_left_axis_title_hidden_ticks_visible(module.plot)
+
+
+def test_stft_module_hides_left_axis_title_but_keeps_ticks(qapp):
+    services = _make_services(initial_state=_state(101, "running"))
+    module = StftModule(services)
+
+    try:
+        module.show()
+        qapp.processEvents()
+
+        _assert_left_axis_title_hidden_ticks_visible(module.canvas.heatmap)
+    finally:
+        module.close()
 
 
 def test_loudness_module_uses_data_focused_y_range_when_default_limits_are_far_away(qapp):

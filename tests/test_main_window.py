@@ -31,6 +31,8 @@ if "snap7" not in sys.modules:
     sys.modules["snap7.client"] = snap7_client_module
     sys.modules["snap7.util"] = snap7_util_module
 
+from PyQt6 import sip
+from PyQt6.QtCore import QCoreApplication, Qt
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
@@ -97,6 +99,7 @@ def _make_guarded_ai_tool_management_module(confirm_leave_result: bool):
 class _ChannelProbeModule(_StubModule):
     def __init__(self, services=None):
         super().__init__(services)
+        self.title_changed = _SignalStub()
         self.selected_display_channel_provider = None
         self.state_seen_channels = []
         self.review_seen_channels = []
@@ -115,6 +118,9 @@ class _ChannelProbeModule(_StubModule):
 
     def _on_factory_review_changed(self, _review) -> None:
         self._record_current_channel(self.review_seen_channels)
+
+    def current_title(self) -> str:
+        return "响度"
 
 
 class _FakeLoginWindow:
@@ -150,13 +156,56 @@ def qapp():
     return app
 
 
+def _is_analysis_chart_widget(widget: QWidget) -> bool:
+    return type(widget).__module__ == "ui.widgets.analysis_charts"
+
+
+def _disable_updates_and_remove_events(widget: QWidget) -> None:
+    widget.setUpdatesEnabled(False)
+    widgets = [widget]
+    try:
+        widgets.extend(widget.findChildren(QWidget))
+    except RuntimeError:
+        pass
+    for target in widgets:
+        if not sip.isdeleted(target):
+            target.setUpdatesEnabled(False)
+            QCoreApplication.removePostedEvents(target)
+
+
+def _close_plot_widget(chart_widget: QWidget) -> None:
+    plot_widget = getattr(chart_widget, "plot_widget", None)
+    if plot_widget is None or sip.isdeleted(plot_widget):
+        return
+    _disable_updates_and_remove_events(plot_widget)
+    if getattr(plot_widget, "plotItem", None) is None:
+        return
+    try:
+        plot_widget.close()
+    except AttributeError:
+        pass
+
+
 @pytest.fixture(autouse=True)
 def _close_top_level_widgets(qapp):
     yield
     for widget in list(qapp.topLevelWidgets()):
-        widget.close()
+        if sip.isdeleted(widget):
+            continue
+        for child in widget.findChildren(QWidget):
+            if _is_analysis_chart_widget(child):
+                _disable_updates_and_remove_events(child)
+                _close_plot_widget(child)
+        widget.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        try:
+            widget.close()
+        except AttributeError:
+            pass
+        if sip.isdeleted(widget):
+            continue
         widget.deleteLater()
-    qapp.processEvents()
+    for _ in range(5):
+        qapp.processEvents()
 
 
 def _patch_non_target_modules(monkeypatch, *, use_real_control: bool = False):
@@ -169,6 +218,7 @@ def _patch_non_target_modules(monkeypatch, *, use_real_control: bool = False):
         "AiToolManagementModule",
         "ChannelSelectModule",
         "PlcSettingsModule",
+        "DataManagementModule",
     ]
     if not use_real_control:
         module_names.append("ControlModule")
@@ -1315,15 +1365,85 @@ def test_main_window_reflows_test_page_for_loudness_and_video(qapp, monkeypatch)
     assert "系统日志" not in _test_page_card_titles(window)
     assert _card_title(_test_page_left_slot_card(window, 2)) == "视频预览"
     assert window.video.parentWidget() is _test_page_left_slot_card(window, 2)
-    assert _card_title(_test_page_grid_card(window, 2, 0)) == "Loudness"
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度"
     assert window.loudness.parentWidget() is _test_page_grid_card(window, 2, 0)
 
 
-def test_test_page_uses_renamed_spl_card_title(qapp, monkeypatch):
+def test_test_page_uses_chinese_chart_titles_with_units(qapp, monkeypatch):
     window, _ = _make_window(monkeypatch)
     _show(window, qapp)
 
-    assert _card_title(_test_page_grid_card(window, 2, 1)) == "声压级 (SPL)"
+    assert _card_title(_test_page_grid_card(window, 1, 2)) == "FFT频谱（dB）"
+    assert _card_title(_test_page_grid_card(window, 1, 1)) == "STFT时频图（频率Hz，幅值dB）"
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度"
+    assert _card_title(_test_page_grid_card(window, 2, 1)) == "声压级（dB）"
+    assert _card_title(_test_page_grid_card(window, 2, 2)) == "倍频程（dB）"
+
+
+def test_test_page_left_sidebar_is_wider_for_video_preview(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    page = _test_page(window)
+    left_column = page.layout().itemAt(0).widget()
+    assert left_column.width() >= 480
+    assert left_column.minimumWidth() >= 480 or left_column.maximumWidth() >= 480
+
+
+def test_loudness_card_title_updates_to_rendered_unit(qapp, monkeypatch):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0,)),
+    )
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0,))
+    )
+    qapp.processEvents()
+
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度（sone）"
+
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["loudness"]["unit"] = "phon"
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度（phon）"
+
+
+def test_loudness_card_title_initializes_from_existing_review_payload(qapp, monkeypatch):
+    window, _services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0,)),
+    )
+    _show(window, qapp)
+
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度（sone）"
+
+
+def test_loudness_card_title_restores_fallback_when_rendering_clears(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0,)),
+    )
+    _show(window, qapp)
+
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度（sone）"
+
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["loudness"]["unit"] = "bogus"
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度"
 
 
 def test_main_window_routes_latest_log_line_to_status_bar(qapp, monkeypatch):
@@ -1375,6 +1495,25 @@ def test_main_window_channel_toolbar_shows_for_multi_channel_running_config(qapp
     assert callable(window.spectrum.selected_display_channel_provider)
     assert callable(window.octave.selected_display_channel_provider)
     assert window.stft.selected_display_channel_provider() == 0
+
+
+def test_main_window_analysis_toolbar_uses_chinese_channel_text(qapp, monkeypatch):
+    window, services = _make_window(monkeypatch, initial_state=_running_state(101))
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_running_state(101))
+    qapp.processEvents()
+
+    combo = window.analysis_toolbar.channel_combo
+    assert combo.itemText(0) == "通道1"
+    assert combo.itemData(0) == 0
+    assert combo.itemText(1) == "通道2"
+    assert combo.itemData(1) == 1
+    assert window.analysis_toolbar.context_label.text() == "配置 101 / 通道1"
 
 
 def test_main_window_toolbar_selection_immediately_refreshes_stft_cached_channel(
@@ -1723,21 +1862,21 @@ def test_main_window_ai_partial_no_result_keeps_rule_rows_and_committed_charts_v
     assert window.result.lb_overall.text() == "无结果"
     assert window.result.error_label.isHidden() is False
     assert window.result.error_label.text() == "AI timeout"
-    assert _result_table_value(window, 0, 0) == "SPL"
+    assert _result_table_value(window, 0, 0) == "声压级"
     assert _result_table_value(window, 0, 1) == "-1 dB"
-    assert _result_table_value(window, 0, 2) == "CH2"
+    assert _result_table_value(window, 0, 2) == "通道2"
     assert _result_table_value(window, 0, 3) == "OK"
-    assert _result_table_value(window, 1, 0) == "Loudness"
+    assert _result_table_value(window, 1, 0) == "响度"
     assert _result_table_value(window, 1, 1) == "-0.5 sone"
-    assert _result_table_value(window, 1, 2) == "CH2"
+    assert _result_table_value(window, 1, 2) == "通道2"
     assert _result_table_value(window, 1, 3) == "OK"
-    assert _result_table_value(window, 2, 0) == "FFT"
+    assert _result_table_value(window, 2, 0) == "FFT频谱"
     assert _result_table_value(window, 2, 1) == "2 dB"
-    assert _result_table_value(window, 2, 2) == "CH1"
+    assert _result_table_value(window, 2, 2) == "通道1"
     assert _result_table_value(window, 2, 3) == "NG"
     assert _result_table_value(window, 3, 0) == "倍频程"
     assert _result_table_value(window, 3, 1) == "-3 dB"
-    assert _result_table_value(window, 3, 2) == "CH2"
+    assert _result_table_value(window, 3, 2) == "通道2"
     assert _result_table_value(window, 3, 3) == "OK"
     assert _result_table_value(window, 4, 0) == "AI分析"
     assert _result_table_value(window, 4, 2) == "--"
