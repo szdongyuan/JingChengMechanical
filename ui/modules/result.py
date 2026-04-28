@@ -352,7 +352,7 @@ class ResultModule(QWidget):
         unit = self._loudness_unit_for_selected_channel()
         spl_text = "--"
         loudness_text = "--"
-        if key is not None:
+        if key is not None and unit is not None:
             spl_text = self._format_spl_db(self._live_spl_by_key.get(key))
             loudness_text = self._format_loudness(
                 self._live_loudness_by_key.get(key),
@@ -365,7 +365,7 @@ class ResultModule(QWidget):
         unit = self._loudness_unit_for_selected_channel()
         spl_text = "--"
         loudness_text = "--"
-        if channel_result is not None:
+        if channel_result is not None and unit is not None:
             spl_text = self._format_spl_db(channel_result.get("spl_average_db"))
             loudness_text = self._format_loudness(
                 channel_result.get("loudness_average_sone"),
@@ -388,7 +388,10 @@ class ResultModule(QWidget):
     def _selected_channel_result(self) -> dict | None:
         if self._review_payload.displayed_config_id != self._displayed_config_id():
             return None
-        selected_channel = self._selected_channel_index()
+        channel_config = self._selected_channel_config()
+        if channel_config is None:
+            return None
+        selected_channel = self._as_int(channel_config.get("channel_index"))
         if selected_channel is None:
             return None
         judgment_payload = getattr(self._review_payload, "judgment_payload", None)
@@ -407,7 +410,12 @@ class ResultModule(QWidget):
     def _current_metric_key(self) -> tuple[int, str, int] | None:
         config_id = self._displayed_config_id()
         run_id = self._current_live_run_id
-        channel_index = self._selected_channel_index()
+        channel_config = self._selected_channel_config()
+        channel_index = (
+            self._as_int(channel_config.get("channel_index"))
+            if channel_config is not None
+            else None
+        )
         if config_id is None or run_id is None or channel_index is None:
             return None
         return (config_id, run_id, channel_index)
@@ -440,20 +448,37 @@ class ResultModule(QWidget):
             return None
         return self._as_int(provider())
 
-    def _loudness_unit_for_selected_channel(self) -> str:
-        config_id = self._displayed_config_id()
+    def _selected_channel_config(self) -> dict | None:
         selected_channel = self._selected_channel_index()
+        if selected_channel is None:
+            return None
+        config_id = self._displayed_config_id()
         config = self._load_config(config_id)
+        selected_channels = config.get("selected_channels") if isinstance(config, dict) else None
+        if not isinstance(selected_channels, list):
+            return None
+        selected_channel_indexes = {
+            channel_index
+            for channel_index in (self._as_int(channel) for channel in selected_channels)
+            if channel_index is not None
+        }
+        if selected_channel not in selected_channel_indexes:
+            return None
         channels = config.get("channels") if isinstance(config, dict) else None
         if isinstance(channels, list):
             for channel in channels:
                 if not isinstance(channel, dict):
                     continue
-                if self._as_int(channel.get("channel_index")) != selected_channel:
-                    continue
-                unit = str(channel.get("loudness_unit") or "sone").strip().lower()
-                return unit if unit in {"sone", "phon"} else "sone"
-        return "sone"
+                if self._as_int(channel.get("channel_index")) == selected_channel:
+                    return channel
+        return None
+
+    def _loudness_unit_for_selected_channel(self) -> str | None:
+        channel_config = self._selected_channel_config()
+        if channel_config is None:
+            return None
+        unit = str(channel_config.get("loudness_unit") or "sone").strip().lower()
+        return unit if unit in {"sone", "phon"} else "sone"
 
     def _load_config(self, config_id: int | None) -> dict | None:
         if config_id is None:

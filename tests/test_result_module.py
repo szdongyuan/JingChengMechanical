@@ -273,6 +273,116 @@ def test_result_module_renders_selected_channel_average_metrics_from_judgment_pa
     assert module.lb_loudness_metric_value.text() == "50.0 phon"
 
 
+@pytest.mark.parametrize("config_service_available", [False, True])
+def test_result_module_hides_average_metrics_when_displayed_config_cannot_load(
+    qapp,
+    config_service_available,
+):
+    module = _make_module()
+    _set_selected_channel(module, 1)
+    if config_service_available:
+        def raise_load_error(_cid):
+            raise RuntimeError("config unavailable")
+
+        module.services.config_service = SimpleNamespace(load_config=raise_load_error)
+    judgment_payload = {
+        "channel_results": [
+            {"channel_index": 1, "spl_average_db": 66.66, "loudness_average_sone": 2.0},
+        ]
+    }
+
+    module.services.bus.factory_state_changed.emit(_state("reviewing", displayed_config_id=101))
+    module.services.bus.factory_review_changed.emit(
+        _make_review_payload(
+            judgment_payload=judgment_payload,
+            summary_payload=_summary_payload(overall_status="pass"),
+        )
+    )
+
+    assert module.lb_spl_metric_label.text() == "平均声压级"
+    assert module.lb_spl_metric_value.text() == "--"
+    assert module.lb_loudness_metric_label.text() == "平均响度"
+    assert module.lb_loudness_metric_value.text() == "--"
+
+
+def test_result_module_hides_metrics_when_provider_channel_is_not_selected(qapp):
+    module = _make_module()
+    _set_selected_channel(module, 1)
+    module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
+        "config_id": 101,
+        "selected_channels": [0],
+        "channels": [{"channel_index": 1, "loudness_unit": "phon"}],
+    })
+
+    module.services.bus.factory_state_changed.emit(
+        _state("running", displayed_config_id=101, active_config_id=101)
+    )
+    module.services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
+    )
+    module.services.bus.spl_updated.emit(101, "run-101", 1, SimpleNamespace(spl_db=72.34))
+    module.services.bus.loudness_updated.emit(101, "run-101", 1, SimpleNamespace(loudness_sone=2.0))
+
+    assert module.lb_spl_metric_value.text() == "--"
+    assert module.lb_loudness_metric_value.text() == "--"
+
+    module.services.bus.factory_state_changed.emit(_state("reviewing", displayed_config_id=101))
+    module.services.bus.factory_review_changed.emit(
+        _make_review_payload(
+            judgment_payload={
+                "channel_results": [
+                    {"channel_index": 1, "spl_average_db": 66.66, "loudness_average_sone": 2.0},
+                ]
+            },
+            summary_payload=_summary_payload(overall_status="pass"),
+        )
+    )
+
+    assert module.lb_spl_metric_label.text() == "平均声压级"
+    assert module.lb_spl_metric_value.text() == "--"
+    assert module.lb_loudness_metric_label.text() == "平均响度"
+    assert module.lb_loudness_metric_value.text() == "--"
+
+
+def test_result_module_hides_metrics_when_selected_channel_config_is_missing(qapp):
+    module = _make_module()
+    _set_selected_channel(module, 1)
+    module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+        "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
+    })
+
+    module.services.bus.factory_state_changed.emit(
+        _state("running", displayed_config_id=101, active_config_id=101)
+    )
+    module.services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
+    )
+    module.services.bus.spl_updated.emit(101, "run-101", 1, SimpleNamespace(spl_db=72.34))
+    module.services.bus.loudness_updated.emit(101, "run-101", 1, SimpleNamespace(loudness_sone=2.0))
+
+    assert module.lb_spl_metric_value.text() == "--"
+    assert module.lb_loudness_metric_value.text() == "--"
+
+    module.services.bus.factory_state_changed.emit(_state("reviewing", displayed_config_id=101))
+    module.services.bus.factory_review_changed.emit(
+        _make_review_payload(
+            judgment_payload={
+                "channel_results": [
+                    {"channel_index": 1, "spl_average_db": 66.66, "loudness_average_sone": 2.0},
+                ]
+            },
+            summary_payload=_summary_payload(overall_status="pass"),
+        )
+    )
+
+    assert module.lb_spl_metric_label.text() == "平均声压级"
+    assert module.lb_spl_metric_value.text() == "--"
+    assert module.lb_loudness_metric_label.text() == "平均响度"
+    assert module.lb_loudness_metric_value.text() == "--"
+
+
 def test_result_module_clears_metric_values_during_reanalysis_until_replacement_review(qapp):
     module = _make_module()
     _set_selected_channel(module, 0)
