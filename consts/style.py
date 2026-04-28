@@ -110,6 +110,20 @@ QLabel#ResultBadge[resultLevel="fail"] {
   background: rgba(239, 68, 68, 0.10);
   color: #ef4444;
 }
+QWidget#ResultMetricBadge {
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+}
+QLabel#ResultMetricLabel {
+  color: #64748b;
+  font-weight: 700;
+}
+QLabel#ResultMetricValue {
+  color: #0f172a;
+  font-size: 20px;
+  font-weight: 700;
+}
 QWidget#EmptyState { background: transparent; }
 QLabel#EmptyIcon {
   min-width: 56px;
