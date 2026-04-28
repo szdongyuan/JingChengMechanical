@@ -508,9 +508,6 @@ class ResultModule(QWidget):
         return repaint_time - last_repaint_time >= _SPL_METRIC_UI_THROTTLE_SEC
 
     def _spl_metric_repaint_time(self, frame) -> float:
-        frame_time = getattr(frame, "time", None)
-        if self._is_finite_number(frame_time):
-            return float(frame_time)
         return float(time.monotonic())
 
     def _review_payload_matches_display(self) -> bool:

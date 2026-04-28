@@ -249,7 +249,14 @@ def test_result_module_updates_live_metrics_only_for_current_run_and_channel(qap
     assert module.lb_loudness_metric_value.text() == "2.35 sone"
 
 
-def test_result_module_live_metric_frames_use_cached_config_after_refresh(qapp):
+def test_result_module_live_metric_frames_use_cached_config_after_refresh(qapp, monkeypatch):
+    times = iter([0.0, 0.25, 0.50])
+    monkeypatch.setattr(
+        result_module_mod,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(times)),
+        raising=False,
+    )
     module = _make_module()
     _set_selected_channel(module, 0)
     load_calls: list[int] = []
@@ -338,7 +345,17 @@ def test_result_module_non_current_spl_frames_reuse_displayed_config_metadata(qa
     assert module.lb_spl_metric_value.text() == "73.0 dB"
 
 
-def test_result_module_throttles_only_spl_metric_repaint_while_updating_cache(qapp):
+def test_result_module_throttles_only_spl_metric_repaint_while_updating_cache(
+    qapp,
+    monkeypatch,
+):
+    times = iter([0.0, 0.10, 0.25])
+    monkeypatch.setattr(
+        result_module_mod,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(times)),
+        raising=False,
+    )
     module = _make_module()
     _set_selected_channel(module, 0)
     module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
@@ -377,6 +394,57 @@ def test_result_module_throttles_only_spl_metric_repaint_while_updating_cache(qa
         SimpleNamespace(spl_db=63.0, time=0.25),
     )
     assert module.lb_spl_metric_value.text() == "63.0 dB"
+
+
+def test_result_module_spl_throttle_uses_one_clock_after_missing_frame_time(
+    qapp,
+    monkeypatch,
+):
+    times = iter([1000.0, 1000.10, 1000.30])
+    monkeypatch.setattr(
+        result_module_mod,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(times)),
+        raising=False,
+    )
+    module = _make_module()
+    _set_selected_channel(module, 0)
+    module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
+        "config_id": 101,
+        "selected_channels": [0],
+        "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
+    })
+    module.services.bus.factory_state_changed.emit(
+        _state("running", displayed_config_id=101, active_config_id=101)
+    )
+    module.services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
+    )
+
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=60.0),
+    )
+    assert module.lb_spl_metric_value.text() == "60.0 dB"
+
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=61.0, time=0.10),
+    )
+    assert module.lb_spl_metric_value.text() == "60.0 dB"
+    assert module._live_spl_by_key[(101, "run-101", 0)] == pytest.approx(61.0)
+
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=62.0, time=0.30),
+    )
+    assert module.lb_spl_metric_value.text() == "62.0 dB"
 
 
 def test_result_module_spl_throttle_uses_monotonic_fallback_for_nonfinite_frame_time(
@@ -633,7 +701,17 @@ def test_result_module_matching_invalid_loudness_clears_only_loudness_metric(qap
     assert module.lb_loudness_metric_value.text() == "--"
 
 
-def test_result_module_preserves_live_metric_caches_when_selected_channel_changes(qapp):
+def test_result_module_preserves_live_metric_caches_when_selected_channel_changes(
+    qapp,
+    monkeypatch,
+):
+    times = iter([0.0, 0.0, 0.25])
+    monkeypatch.setattr(
+        result_module_mod,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(times)),
+        raising=False,
+    )
     module = _make_module()
     _set_selected_channel(module, 0)
     module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
