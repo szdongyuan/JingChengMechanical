@@ -396,6 +396,49 @@ def test_result_module_throttles_only_spl_metric_repaint_while_updating_cache(
     assert module.lb_spl_metric_value.text() == "63.0 dB"
 
 
+def test_result_module_spl_throttle_uses_finite_frame_time_over_wall_clock(
+    qapp,
+    monkeypatch,
+):
+    times = iter([5000.0, 5000.10])
+    monkeypatch.setattr(
+        result_module_mod,
+        "time",
+        SimpleNamespace(monotonic=lambda: next(times)),
+        raising=False,
+    )
+    module = _make_module()
+    _set_selected_channel(module, 0)
+    module.services.config_service = SimpleNamespace(load_config=lambda _cid: {
+        "config_id": 101,
+        "selected_channels": [0],
+        "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
+    })
+    module.services.bus.factory_state_changed.emit(
+        _state("running", displayed_config_id=101, active_config_id=101)
+    )
+    module.services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
+    )
+
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=60.0, time=10.00),
+    )
+    assert module.lb_spl_metric_value.text() == "60.0 dB"
+
+    module.services.bus.spl_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(spl_db=61.0, time=10.25),
+    )
+
+    assert module.lb_spl_metric_value.text() == "61.0 dB"
+
+
 def test_result_module_spl_throttle_uses_one_clock_after_missing_frame_time(
     qapp,
     monkeypatch,
@@ -435,14 +478,14 @@ def test_result_module_spl_throttle_uses_one_clock_after_missing_frame_time(
         0,
         SimpleNamespace(spl_db=61.0, time=0.10),
     )
-    assert module.lb_spl_metric_value.text() == "60.0 dB"
+    assert module.lb_spl_metric_value.text() == "61.0 dB"
     assert module._live_spl_by_key[(101, "run-101", 0)] == pytest.approx(61.0)
 
     module.services.bus.spl_updated.emit(
         101,
         "run-101",
         0,
-        SimpleNamespace(spl_db=62.0, time=0.30),
+        SimpleNamespace(spl_db=62.0, time=0.36),
     )
     assert module.lb_spl_metric_value.text() == "62.0 dB"
 

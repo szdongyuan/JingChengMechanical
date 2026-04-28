@@ -50,6 +50,7 @@ class ResultModule(QWidget):
         self._live_spl_by_key: dict[tuple[int, str, int], float] = {}
         self._live_loudness_by_key: dict[tuple[int, str, int], float] = {}
         self._last_spl_repaint_time_by_key: dict[tuple[int, str, int], float] = {}
+        self._last_spl_repaint_source_by_key: dict[tuple[int, str, int], str] = {}
         self._metric_channel_cache_key: tuple[int | None, int | None] | None = None
         self._metric_selected_channel_index: int | None = None
         self._metric_loudness_unit: str | None = None
@@ -340,15 +341,17 @@ class ResultModule(QWidget):
         if not self._is_finite_number(value):
             self._live_spl_by_key.pop(key, None)
             self._last_spl_repaint_time_by_key.pop(key, None)
+            self._last_spl_repaint_source_by_key.pop(key, None)
             if is_current_key:
                 self._render_live_spl_metric()
             return
         self._live_spl_by_key[key] = float(value)
         if not is_current_key:
             return
-        repaint_time = self._spl_metric_repaint_time(frame)
-        if self._should_repaint_spl_metric(key, repaint_time):
+        repaint_source, repaint_time = self._spl_metric_repaint_clock(frame)
+        if self._should_repaint_spl_metric(key, repaint_source, repaint_time):
             self._last_spl_repaint_time_by_key[key] = repaint_time
+            self._last_spl_repaint_source_by_key[key] = repaint_source
             self._render_live_spl_metric()
 
     def _on_loudness_updated(self, config_id, run_id, channel_idx, frame) -> None:
@@ -498,17 +501,24 @@ class ResultModule(QWidget):
     def _should_repaint_spl_metric(
         self,
         key: tuple[int, str, int],
+        repaint_source: str,
         repaint_time: float,
     ) -> bool:
         last_repaint_time = self._last_spl_repaint_time_by_key.get(key)
+        last_repaint_source = self._last_spl_repaint_source_by_key.get(key)
         if last_repaint_time is None:
             return True
         if self.lb_spl_metric_value.text() == "--":
             return True
+        if last_repaint_source != repaint_source:
+            return True
         return repaint_time - last_repaint_time >= _SPL_METRIC_UI_THROTTLE_SEC
 
-    def _spl_metric_repaint_time(self, frame) -> float:
-        return float(time.monotonic())
+    def _spl_metric_repaint_clock(self, frame) -> tuple[str, float]:
+        frame_time = getattr(frame, "time", None)
+        if self._is_finite_number(frame_time):
+            return "frame", float(frame_time)
+        return "monotonic", float(time.monotonic())
 
     def _review_payload_matches_display(self) -> bool:
         return self._review_payload.displayed_config_id == self._displayed_config_id()
@@ -630,6 +640,7 @@ class ResultModule(QWidget):
         self._live_spl_by_key.clear()
         self._live_loudness_by_key.clear()
         self._last_spl_repaint_time_by_key.clear()
+        self._last_spl_repaint_source_by_key.clear()
 
     def _clear_live_metric_values_for_config(
         self,
@@ -643,6 +654,7 @@ class ResultModule(QWidget):
             self._live_spl_by_key,
             self._live_loudness_by_key,
             self._last_spl_repaint_time_by_key,
+            self._last_spl_repaint_source_by_key,
         ):
             for key in list(cache):
                 if key[0] != config_id:
@@ -660,6 +672,7 @@ class ResultModule(QWidget):
             self._live_spl_by_key,
             self._live_loudness_by_key,
             self._last_spl_repaint_time_by_key,
+            self._last_spl_repaint_source_by_key,
         ):
             for key in list(cache):
                 if key[0] == config_id and key[1] == run_id:
