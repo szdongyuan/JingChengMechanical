@@ -61,7 +61,9 @@ class ChannelJudgment:
     channel_index: int
     spl_db: float
     spl_pass: bool
+    spl_average_db: float | None = None
     loudness_max_sone: float | None = None
+    loudness_average_sone: float | None = None
     loudness_pass: bool | None = None
     loudness_available: bool = False
     loudness_error_message: str | None = None

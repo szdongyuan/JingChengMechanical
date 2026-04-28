@@ -47,6 +47,11 @@ class ResultModule(QWidget):
         self._current_live_run_id: str | None = None
         self._live_spl_by_key: dict[tuple[int, str, int], float] = {}
         self._live_loudness_by_key: dict[tuple[int, str, int], float] = {}
+        self._metric_channel_cache_key: tuple[int | None, int | None] | None = None
+        self._metric_selected_channel_index: int | None = None
+        self._metric_loudness_unit: str | None = None
+        self._metric_channel_valid = False
+        self._metric_config_load_failed = False
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -263,6 +268,7 @@ class ResultModule(QWidget):
         )
 
     def refresh_selected_display_channel(self) -> None:
+        self._refresh_metric_channel_cache(force=True)
         self._refresh_metric_display()
 
     def _on_factory_state_changed(self, state) -> None:
@@ -273,6 +279,7 @@ class ResultModule(QWidget):
             self._factory_state = FactoryControllerState()
         if self._displayed_config_id() != previous_config_id:
             self._clear_live_run()
+            self._clear_metric_channel_cache()
         self._refresh_display()
 
     def _on_factory_review_changed(self, review) -> None:
@@ -285,6 +292,7 @@ class ResultModule(QWidget):
     def _on_factory_display_reset(self, _reason: str) -> None:
         self._review_payload = FactoryReviewPayload()
         self._clear_live_run()
+        self._clear_metric_channel_cache()
         self._show_empty()
 
     def _on_factory_runtime_start_accepted(self, payload) -> None:
@@ -349,7 +357,7 @@ class ResultModule(QWidget):
 
     def _render_live_metrics(self) -> None:
         key = self._current_metric_key()
-        unit = self._loudness_unit_for_selected_channel()
+        unit = self._metric_loudness_unit
         spl_text = "--"
         loudness_text = "--"
         if key is not None and unit is not None:
@@ -362,7 +370,7 @@ class ResultModule(QWidget):
 
     def _render_average_metrics(self) -> None:
         channel_result = self._selected_channel_result()
-        unit = self._loudness_unit_for_selected_channel()
+        unit = self._metric_loudness_unit
         spl_text = "--"
         loudness_text = "--"
         if channel_result is not None and unit is not None:
@@ -388,10 +396,9 @@ class ResultModule(QWidget):
     def _selected_channel_result(self) -> dict | None:
         if self._review_payload.displayed_config_id != self._displayed_config_id():
             return None
-        channel_config = self._selected_channel_config()
-        if channel_config is None:
+        if not self._ensure_metric_channel_cache():
             return None
-        selected_channel = self._as_int(channel_config.get("channel_index"))
+        selected_channel = self._metric_selected_channel_index
         if selected_channel is None:
             return None
         judgment_payload = getattr(self._review_payload, "judgment_payload", None)
@@ -410,12 +417,9 @@ class ResultModule(QWidget):
     def _current_metric_key(self) -> tuple[int, str, int] | None:
         config_id = self._displayed_config_id()
         run_id = self._current_live_run_id
-        channel_config = self._selected_channel_config()
-        channel_index = (
-            self._as_int(channel_config.get("channel_index"))
-            if channel_config is not None
-            else None
-        )
+        if not self._ensure_metric_channel_cache():
+            return None
+        channel_index = self._metric_selected_channel_index
         if config_id is None or run_id is None or channel_index is None:
             return None
         return (config_id, run_id, channel_index)
@@ -428,7 +432,9 @@ class ResultModule(QWidget):
         if self._as_int(config_id) != self._displayed_config_id():
             return False
         selected_channel = self._selected_channel_index()
-        return selected_channel is not None and self._as_int(channel_idx) == selected_channel
+        if selected_channel is None or self._as_int(channel_idx) != selected_channel:
+            return False
+        return self._ensure_metric_channel_cache()
 
     def _payload_config_matches_display(self, payload) -> bool:
         payload_config_id = self._as_int(getattr(payload, "config_id", None))
@@ -448,36 +454,57 @@ class ResultModule(QWidget):
             return None
         return self._as_int(provider())
 
-    def _selected_channel_config(self) -> dict | None:
-        selected_channel = self._selected_channel_index()
-        if selected_channel is None:
-            return None
+    def _ensure_metric_channel_cache(self) -> bool:
+        key = (self._displayed_config_id(), self._selected_channel_index())
+        if key != self._metric_channel_cache_key:
+            self._refresh_metric_channel_cache(force=True)
+        return self._metric_channel_valid
+
+    def _refresh_metric_channel_cache(self, *, force: bool = False) -> None:
         config_id = self._displayed_config_id()
+        selected_channel = self._selected_channel_index()
+        key = (config_id, selected_channel)
+        if not force and key == self._metric_channel_cache_key:
+            return
+
+        self._metric_channel_cache_key = key
+        self._metric_selected_channel_index = selected_channel
+        self._metric_loudness_unit = None
+        self._metric_channel_valid = False
+        self._metric_config_load_failed = False
+
+        if config_id is None or selected_channel is None:
+            return
+
         config = self._load_config(config_id)
+        if config is None:
+            self._metric_config_load_failed = True
+            return
         selected_channels = config.get("selected_channels") if isinstance(config, dict) else None
         if not isinstance(selected_channels, list):
-            return None
+            return
         selected_channel_indexes = {
             channel_index
             for channel_index in (self._as_int(channel) for channel in selected_channels)
             if channel_index is not None
         }
         if selected_channel not in selected_channel_indexes:
-            return None
+            return
         channels = config.get("channels") if isinstance(config, dict) else None
         if isinstance(channels, list):
             for channel in channels:
                 if not isinstance(channel, dict):
                     continue
                 if self._as_int(channel.get("channel_index")) == selected_channel:
-                    return channel
-        return None
+                    self._metric_loudness_unit = self._normalize_loudness_unit(
+                        channel.get("loudness_unit")
+                    )
+                    self._metric_channel_valid = True
+                    return
 
-    def _loudness_unit_for_selected_channel(self) -> str | None:
-        channel_config = self._selected_channel_config()
-        if channel_config is None:
-            return None
-        unit = str(channel_config.get("loudness_unit") or "sone").strip().lower()
+    @staticmethod
+    def _normalize_loudness_unit(value) -> str:
+        unit = str(value or "sone").strip().lower()
         return unit if unit in {"sone", "phon"} else "sone"
 
     def _load_config(self, config_id: int | None) -> dict | None:
@@ -500,6 +527,13 @@ class ResultModule(QWidget):
     def _clear_live_metric_values(self) -> None:
         self._live_spl_by_key.clear()
         self._live_loudness_by_key.clear()
+
+    def _clear_metric_channel_cache(self) -> None:
+        self._metric_channel_cache_key = None
+        self._metric_selected_channel_index = None
+        self._metric_loudness_unit = None
+        self._metric_channel_valid = False
+        self._metric_config_load_failed = False
 
     @staticmethod
     def _payload_run_id(payload) -> str | None:

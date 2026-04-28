@@ -107,17 +107,7 @@ def compute_spl(signal: np.ndarray, sample_rate: float,
     if sig.size == 0:
         return -np.inf
 
-    if weighting in ("A", "C"):
-        n = sig.size
-        freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
-        spectrum = np.fft.rfft(sig)
-        if weighting == "A":
-            gains_db = a_weighting(freqs)
-        else:
-            gains_db = c_weighting(freqs)
-        gains_linear = 10.0 ** (gains_db / 20.0)
-        spectrum *= gains_linear
-        sig = np.fft.irfft(spectrum, n=n)
+    sig = _apply_spl_frequency_weighting(sig, sample_rate, weighting)
 
     alpha = 1.0 - np.exp(-1.0 / (sample_rate * time_constant))
     sq = sig ** 2
@@ -130,6 +120,40 @@ def compute_spl(signal: np.ndarray, sample_rate: float,
     if rms <= 0:
         return -np.inf
     return 20.0 * np.log10(rms / _REF_PRESSURE)
+
+
+def compute_average_spl(signal: np.ndarray, sample_rate: float, weighting: str) -> float:
+    """Compute Leq-style average SPL over a whole weighted signal."""
+    sig = np.asarray(signal, dtype=np.float64)
+    if sig.size == 0:
+        return -np.inf
+
+    sig = _apply_spl_frequency_weighting(sig, sample_rate, weighting)
+    rms = float(np.sqrt(np.mean(sig ** 2)))
+    if rms <= 0.0:
+        return -np.inf
+    return float(20.0 * np.log10(rms / _REF_PRESSURE))
+
+
+def _apply_spl_frequency_weighting(
+    signal: np.ndarray,
+    sample_rate: float,
+    weighting: str,
+) -> np.ndarray:
+    sig = np.asarray(signal, dtype=np.float64)
+    if sig.size == 0 or weighting not in ("A", "C"):
+        return sig
+
+    n = sig.size
+    freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+    spectrum = np.fft.rfft(sig)
+    if weighting == "A":
+        gains_db = a_weighting(freqs)
+    else:
+        gains_db = c_weighting(freqs)
+    gains_linear = 10.0 ** (gains_db / 20.0)
+    spectrum *= gains_linear
+    return np.fft.irfft(spectrum, n=n)
 
 
 @lru_cache(maxsize=1)

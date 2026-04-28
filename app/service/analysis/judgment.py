@@ -157,16 +157,26 @@ class JudgmentEngine:
                 ch_cfg.get("spl_weighting", "Z"),
                 ch_cfg.get("spl_time_constant", 0.125),
             ))
+            spl_average_db = float(dsp.compute_average_spl(
+                sig,
+                sample_rate,
+                ch_cfg.get("spl_weighting", "Z"),
+            ))
             spl_lo = ch_cfg.get("spl_lower_limit", 0.0)
             spl_hi = ch_cfg.get("spl_upper_limit", 100.0)
             spl_pass = bool(spl_lo <= spl_db <= spl_hi)
 
             loudness_max_sone: float | None = None
+            loudness_average_sone: float | None = None
             loudness_pass: bool | None = None
             loudness_available = False
             loudness_error_message: str | None = None
             try:
-                _, _, loudness_max_sone = dsp.compute_loudness_trace(sig, sample_rate)
+                _, values_sone, loudness_max_sone = dsp.compute_loudness_trace(sig, sample_rate)
+                values = np.asarray(values_sone, dtype=np.float64).reshape(-1)
+                finite_values = values[np.isfinite(values)]
+                if finite_values.size > 0:
+                    loudness_average_sone = float(np.mean(finite_values))
                 loudness_lo, loudness_hi = self._loudness_limits_sone(ch_cfg)
                 loudness_pass = bool(loudness_lo <= loudness_max_sone <= loudness_hi)
                 loudness_available = True
@@ -210,7 +220,9 @@ class JudgmentEngine:
                 channel_index=ch_idx,
                 spl_db=spl_db,
                 spl_pass=spl_pass,
+                spl_average_db=spl_average_db,
                 loudness_max_sone=loudness_max_sone,
+                loudness_average_sone=loudness_average_sone,
                 loudness_pass=loudness_pass,
                 loudness_available=loudness_available,
                 loudness_error_message=loudness_error_message,

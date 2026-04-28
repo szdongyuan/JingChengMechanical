@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import os
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -14,6 +16,8 @@ from app.services_container import (
     FactoryReviewPayload,
     FactoryReviewWindow,
 )
+from app.service.analysis import dsp
+from app.service.analysis.judgment import JudgmentEngine
 from ui.modules.result import ResultModule
 
 
@@ -244,6 +248,49 @@ def test_result_module_updates_live_metrics_only_for_current_run_and_channel(qap
     assert module.lb_loudness_metric_value.text() == "2.35 sone"
 
 
+def test_result_module_live_metric_frames_use_cached_config_after_refresh(qapp):
+    module = _make_module()
+    _set_selected_channel(module, 0)
+    load_calls: list[int] = []
+
+    def load_config(config_id):
+        load_calls.append(config_id)
+        return {
+            "config_id": 101,
+            "selected_channels": [0],
+            "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
+        }
+
+    module.services.config_service = SimpleNamespace(load_config=load_config)
+    module.services.bus.factory_state_changed.emit(
+        _state("running", displayed_config_id=101, active_config_id=101)
+    )
+    module.services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
+    )
+    module.refresh_selected_display_channel()
+    established_load_count = len(load_calls)
+    assert established_load_count >= 1
+
+    for value in (70.0, 71.0, 72.0):
+        module.services.bus.spl_updated.emit(
+            101,
+            "run-101",
+            0,
+            SimpleNamespace(spl_db=value),
+        )
+        module.services.bus.loudness_updated.emit(
+            101,
+            "run-101",
+            0,
+            SimpleNamespace(loudness_sone=2.0),
+        )
+
+    assert module.lb_spl_metric_value.text() == "72.0 dB"
+    assert module.lb_loudness_metric_value.text() == "2.00 sone"
+    assert len(load_calls) == established_load_count
+
+
 def test_result_module_renders_selected_channel_average_metrics_from_judgment_payload(qapp):
     module = _make_module()
     _set_selected_channel(module, 1)
@@ -271,6 +318,70 @@ def test_result_module_renders_selected_channel_average_metrics_from_judgment_pa
     assert module.lb_spl_metric_value.text() == "66.7 dB"
     assert module.lb_loudness_metric_label.text() == "平均响度"
     assert module.lb_loudness_metric_value.text() == "50.0 phon"
+
+
+def test_result_module_renders_average_metrics_from_production_serialized_judgment_result(
+    qapp,
+    monkeypatch,
+):
+    module = _make_module()
+    _set_selected_channel(module, 0)
+    channel_config = {
+        "channel_index": 0,
+        "spl_weighting": "Z",
+        "spl_time_constant": 0.125,
+        "spl_lower_limit": 0.0,
+        "spl_upper_limit": 200.0,
+        "loudness_unit": "sone",
+        "loudness_lower_limit": 0.0,
+        "loudness_upper_limit": 60.0,
+        "fft_band_limits": [],
+        "fft_golden_mode": "off",
+        "fft_show_golden_overlay": False,
+        "oct_weighting": "Z",
+        "oct_band_limits": [],
+        "oct_golden_mode": "off",
+        "oct_show_golden_overlay": False,
+    }
+    config = {
+        "config_id": 101,
+        "analysis_duration": 1.0,
+        "analysis_window_offset_ms": 0,
+        "selected_channels": [0],
+        "channels": [channel_config],
+    }
+    monkeypatch.setattr(
+        dsp,
+        "compute_loudness_trace",
+        lambda *args, **kwargs: ([0.0, 0.5], [1.0, 3.0], 3.0),
+    )
+    engine = JudgmentEngine(SimpleNamespace(resolve_binding=lambda _config_id: None))
+    target_pressure = 20e-6 * 10 ** (50.0 / 20.0)
+    buffer = np.full((1000, 1), target_pressure, dtype=np.float64)
+    judgment_payload = asdict(
+        engine.judge(
+            config,
+            buffer,
+            1000.0,
+            mic_cal={},
+            audio_file_path="/tmp/test.wav",
+        )
+    )
+    serialized_channel = judgment_payload["channel_results"][0]
+    assert serialized_channel["spl_average_db"] == pytest.approx(50.0, abs=0.01)
+    assert serialized_channel["loudness_average_sone"] == pytest.approx(2.0)
+
+    module.services.config_service = SimpleNamespace(load_config=lambda _cid: config)
+    module.services.bus.factory_state_changed.emit(_state("reviewing", displayed_config_id=101))
+    module.services.bus.factory_review_changed.emit(
+        _make_review_payload(
+            judgment_payload=judgment_payload,
+            summary_payload=_summary_payload(overall_status="pass"),
+        )
+    )
+
+    assert module.lb_spl_metric_value.text() == "50.0 dB"
+    assert module.lb_loudness_metric_value.text() == "2.00 sone"
 
 
 @pytest.mark.parametrize("config_service_available", [False, True])

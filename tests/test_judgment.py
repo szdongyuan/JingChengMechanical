@@ -1,6 +1,7 @@
 """Tests for JudgmentEngine limit checks and verdict logic."""
 from __future__ import annotations
 
+from dataclasses import asdict
 import logging
 from pathlib import Path
 
@@ -152,6 +153,40 @@ class TestLimitChecks:
         assert result.channel_results[0].loudness_max_sone == 8.0
         assert result.channel_results[0].loudness_pass is True
 
+    def test_serialized_channel_judgment_contains_average_metrics(self, monkeypatch):
+        engine = self._make_engine()
+        sample_rate = 1000.0
+        calibrated_pressure = 20e-6 * 10 ** (60.0 / 20.0)
+        raw_pressure = calibrated_pressure / 2.0
+        buffer = np.full((int(sample_rate * 3.0), 1), raw_pressure, dtype=np.float64)
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    spl_lower_limit=0.0,
+                    spl_upper_limit=200.0,
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            dsp,
+            "compute_loudness_trace",
+            lambda *args, **kwargs: ([0.0, 1.0, 2.0], [1.0, float("nan"), 5.0], 5.0),
+        )
+
+        result = engine.judge(
+            config,
+            buffer,
+            sample_rate,
+            mic_cal={"In1": {"deviation_value": "2.0"}},
+            audio_file_path="/tmp/test.wav",
+        )
+        serialized_channel = asdict(result)["channel_results"][0]
+
+        assert serialized_channel["spl_average_db"] == pytest.approx(60.0, abs=0.01)
+        assert serialized_channel["loudness_average_sone"] == pytest.approx(3.0)
+        assert serialized_channel["loudness_max_sone"] == pytest.approx(5.0)
+
     def test_judgment_uses_phon_limits_via_conversion_helpers(self, monkeypatch):
         engine = self._make_engine()
         sample_rate = 44100.0
@@ -192,6 +227,23 @@ class TestLimitChecks:
         assert result.channel_results[0].loudness_available is False
         assert result.channel_results[0].loudness_error_message == "loudness backend unavailable"
         assert result.limit_pass is False
+
+    def test_loudness_average_is_none_when_backend_errors(self, monkeypatch):
+        engine = self._make_engine()
+        sample_rate = 44100.0
+        buffer = np.zeros((int(sample_rate * 3.0), 1))
+        config = _make_config()
+
+        def _raising_backend_error(*args, **kwargs):
+            raise RuntimeError("loudness backend unavailable")
+
+        monkeypatch.setattr(dsp, "compute_loudness_trace", _raising_backend_error)
+
+        result = engine.judge(config, buffer, sample_rate, mic_cal={}, audio_file_path="/tmp/test.wav")
+
+        assert result.channel_results[0].spl_average_db is not None
+        assert result.channel_results[0].loudness_average_sone is None
+        assert result.channel_results[0].loudness_available is False
 
     def test_judgment_preserves_loudness_failure_contract_when_segmented_backend_errors(self, monkeypatch):
         engine = self._make_engine()
