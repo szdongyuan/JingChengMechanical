@@ -29,6 +29,7 @@ _REF_PRESSURE_DB = 20.0 * np.log10(_REF_PRESSURE)
 _DEFAULT_LOUDNESS_UNIT = "sone"
 _DEFAULT_LOUDNESS_LOWER_LIMIT = 0.0
 _DEFAULT_LOUDNESS_UPPER_LIMIT = 60.0
+_SPL_CHUNK_DURATION_SEC = 0.05
 logger = logging.getLogger(__name__)
 
 
@@ -151,27 +152,115 @@ class JudgmentEngine:
             sensitivity = self._get_sensitivity(mic_cal, ch_idx)
             sig = dsp.apply_mic_calibration(sig, sensitivity)
 
-            # SPL check
-            spl_db = float(dsp.compute_spl(
-                sig, sample_rate,
-                ch_cfg.get("spl_weighting", "Z"),
-                ch_cfg.get("spl_time_constant", 0.125),
-            ))
-            spl_lo = ch_cfg.get("spl_lower_limit", 0.0)
-            spl_hi = ch_cfg.get("spl_upper_limit", 100.0)
-            spl_pass = bool(spl_lo <= spl_db <= spl_hi)
+            # SPL checks
+            spl_weighting = ch_cfg.get("spl_weighting", "Z")
+            spl_time_constant = ch_cfg.get("spl_time_constant", 0.125)
+            spl_lower, spl_upper = self._enabled_bounds(
+                ch_cfg,
+                lower_enabled_key="spl_lower_enabled",
+                lower_value_key="spl_lower_limit",
+                upper_enabled_key="spl_upper_enabled",
+                upper_value_key="spl_upper_limit",
+            )
+            spl_average_lower, spl_average_upper = self._enabled_bounds(
+                ch_cfg,
+                lower_enabled_key="spl_average_lower_enabled",
+                lower_value_key="spl_average_lower_limit",
+                upper_enabled_key="spl_average_upper_enabled",
+                upper_value_key="spl_average_upper_limit",
+            )
+            spl_constrained = self._has_constraint(spl_lower, spl_upper)
+            spl_average_constrained = self._has_constraint(spl_average_lower, spl_average_upper)
+            spl_db: float | None = None
+            spl_min_db: float | None = None
+            spl_max_db: float | None = None
+            spl_average_db: float | None = None
+            spl_pass: bool | None = True
+            spl_average_pass: bool | None = True
+            spl_trace_available = False
+            spl_trace_error_message: str | None = None
+            spl_average_available = False
+            spl_average_error_message: str | None = None
+            try:
+                spl_db = float(dsp.compute_spl(
+                    sig,
+                    sample_rate,
+                    spl_weighting,
+                    spl_time_constant,
+                ))
+                _, spl_trace_db = dsp.compute_spl_trace(
+                    sig,
+                    sample_rate,
+                    spl_weighting,
+                    spl_time_constant,
+                    chunk_duration=_SPL_CHUNK_DURATION_SEC,
+                )
+                trace_values = spl_trace_db or [spl_db]
+                spl_min_db, spl_max_db = self._value_bounds(trace_values)
+                spl_trace_available = True
+                spl_pass = self._values_pass_limits(trace_values, spl_lower, spl_upper)
+            except Exception as exc:
+                spl_trace_error_message = str(exc) or exc.__class__.__name__
+                spl_pass = None if spl_constrained else True
+            try:
+                spl_average_db = float(dsp.compute_spl_leq(sig, sample_rate, spl_weighting))
+                spl_average_available = True
+                spl_average_pass = self._values_pass_limits(
+                    [spl_average_db],
+                    spl_average_lower,
+                    spl_average_upper,
+                )
+            except Exception as exc:
+                spl_average_error_message = str(exc) or exc.__class__.__name__
+                spl_average_pass = None if spl_average_constrained else True
 
+            loudness_min_sone: float | None = None
             loudness_max_sone: float | None = None
-            loudness_pass: bool | None = None
+            loudness_average_sone: float | None = None
+            loudness_pass: bool | None = True
+            loudness_average_pass: bool | None = True
             loudness_available = False
             loudness_error_message: str | None = None
+            loudness_lower, loudness_upper = self._loudness_limits_sone(
+                ch_cfg,
+                lower_enabled_key="loudness_lower_enabled",
+                lower_value_key="loudness_lower_limit",
+                upper_enabled_key="loudness_upper_enabled",
+                upper_value_key="loudness_upper_limit",
+            )
+            loudness_average_lower, loudness_average_upper = self._loudness_limits_sone(
+                ch_cfg,
+                lower_enabled_key="loudness_average_lower_enabled",
+                lower_value_key="loudness_average_lower_limit",
+                upper_enabled_key="loudness_average_upper_enabled",
+                upper_value_key="loudness_average_upper_limit",
+            )
+            loudness_constrained = self._has_constraint(loudness_lower, loudness_upper)
+            loudness_average_constrained = self._has_constraint(
+                loudness_average_lower,
+                loudness_average_upper,
+            )
             try:
-                _, _, loudness_max_sone = dsp.compute_loudness_trace(sig, sample_rate)
-                loudness_lo, loudness_hi = self._loudness_limits_sone(ch_cfg)
-                loudness_pass = bool(loudness_lo <= loudness_max_sone <= loudness_hi)
+                _, loudness_values_sone, loudness_max_sone = dsp.compute_loudness_trace(sig, sample_rate)
+                loudness_min_sone, loudness_trace_max_sone = self._value_bounds(loudness_values_sone)
+                if loudness_trace_max_sone is not None:
+                    loudness_max_sone = loudness_trace_max_sone
+                loudness_average_sone = self._mean_value(loudness_values_sone)
+                loudness_pass = self._values_pass_limits(
+                    loudness_values_sone,
+                    loudness_lower,
+                    loudness_upper,
+                )
+                loudness_average_pass = self._values_pass_limits(
+                    [loudness_average_sone] if loudness_average_sone is not None else [],
+                    loudness_average_lower,
+                    loudness_average_upper,
+                )
                 loudness_available = True
             except Exception as exc:
                 loudness_error_message = str(exc) or exc.__class__.__name__
+                loudness_pass = None if loudness_constrained else True
+                loudness_average_pass = None if loudness_average_constrained else True
 
             # FFT band checks
             fft_bands, fft_available, fft_error_message = self._check_fft_bands(
@@ -196,8 +285,10 @@ class JudgmentEngine:
             )
 
             ch_pass = (
-                spl_pass
+                spl_pass is True
+                and spl_average_pass is True
                 and loudness_pass is True
+                and loudness_average_pass is True
                 and fft_available
                 and octave_available
                 and all(b.passed for b in fft_bands)
@@ -210,8 +301,19 @@ class JudgmentEngine:
                 channel_index=ch_idx,
                 spl_db=spl_db,
                 spl_pass=spl_pass,
+                spl_min_db=spl_min_db,
+                spl_max_db=spl_max_db,
+                spl_average_db=spl_average_db,
+                spl_average_pass=spl_average_pass,
+                spl_trace_available=spl_trace_available,
+                spl_trace_error_message=spl_trace_error_message,
+                spl_average_available=spl_average_available,
+                spl_average_error_message=spl_average_error_message,
+                loudness_min_sone=loudness_min_sone,
                 loudness_max_sone=loudness_max_sone,
+                loudness_average_sone=loudness_average_sone,
                 loudness_pass=loudness_pass,
+                loudness_average_pass=loudness_average_pass,
                 loudness_available=loudness_available,
                 loudness_error_message=loudness_error_message,
                 fft_available=fft_available,
@@ -537,13 +639,94 @@ class JudgmentEngine:
         return levels - _REF_PRESSURE_DB
 
     @staticmethod
-    def _loudness_limits_sone(channel_config: dict) -> tuple[float, float]:
+    def _loudness_limits_sone(
+        channel_config: dict,
+        *,
+        lower_enabled_key: str = "loudness_lower_enabled",
+        lower_value_key: str = "loudness_lower_limit",
+        upper_enabled_key: str = "loudness_upper_enabled",
+        upper_value_key: str = "loudness_upper_limit",
+    ) -> tuple[float | None, float | None]:
+        lower, upper = JudgmentEngine._enabled_bounds(
+            channel_config,
+            lower_enabled_key=lower_enabled_key,
+            lower_value_key=lower_value_key,
+            upper_enabled_key=upper_enabled_key,
+            upper_value_key=upper_value_key,
+        )
         unit = channel_config.get("loudness_unit", _DEFAULT_LOUDNESS_UNIT)
-        lower = float(channel_config.get("loudness_lower_limit", _DEFAULT_LOUDNESS_LOWER_LIMIT))
-        upper = float(channel_config.get("loudness_upper_limit", _DEFAULT_LOUDNESS_UPPER_LIMIT))
         if unit == "phon":
-            return dsp.phon_to_sone(lower), dsp.phon_to_sone(upper)
-        return max(lower, 0.0), max(upper, 0.0)
+            return (
+                dsp.phon_to_sone(lower) if lower is not None else None,
+                dsp.phon_to_sone(upper) if upper is not None else None,
+            )
+        return (
+            max(lower, 0.0) if lower is not None else None,
+            max(upper, 0.0) if upper is not None else None,
+        )
+
+    @staticmethod
+    def _enabled_bounds(
+        channel_config: dict,
+        *,
+        lower_enabled_key: str,
+        lower_value_key: str,
+        upper_enabled_key: str,
+        upper_value_key: str,
+    ) -> tuple[float | None, float | None]:
+        lower = (
+            JudgmentEngine._coerce_limit(channel_config.get(lower_value_key), -np.inf)
+            if channel_config.get(lower_enabled_key) is True
+            else None
+        )
+        upper = (
+            JudgmentEngine._coerce_limit(channel_config.get(upper_value_key), np.inf)
+            if channel_config.get(upper_enabled_key) is True
+            else None
+        )
+        return lower, upper
+
+    @staticmethod
+    def _has_constraint(lower: float | None, upper: float | None) -> bool:
+        return lower is not None or upper is not None
+
+    @staticmethod
+    def _coerce_limit(value, default: float) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if not np.isfinite(numeric):
+            return float(default)
+        return numeric
+
+    @staticmethod
+    def _value_bounds(values) -> tuple[float | None, float | None]:
+        value_array = np.asarray(values, dtype=np.float64).reshape(-1)
+        value_array = value_array[~np.isnan(value_array)]
+        if value_array.size == 0:
+            return None, None
+        return float(np.min(value_array)), float(np.max(value_array))
+
+    @staticmethod
+    def _values_pass_limits(values, lower: float | None, upper: float | None) -> bool:
+        value_array = np.asarray(values, dtype=np.float64).reshape(-1)
+        value_array = value_array[~np.isnan(value_array)]
+        if value_array.size == 0:
+            return False
+        if lower is not None and np.isfinite(lower) and np.any(value_array < lower):
+            return False
+        if upper is not None and np.isfinite(upper) and np.any(value_array > upper):
+            return False
+        return True
+
+    @staticmethod
+    def _mean_value(values) -> float | None:
+        value_array = np.asarray(values, dtype=np.float64).reshape(-1)
+        value_array = value_array[np.isfinite(value_array)]
+        if value_array.size == 0:
+            return None
+        return float(np.mean(value_array))
 
     def _run_ai(self, config: dict, audio_file_path: str) -> tuple[bool | None, float | None]:
         """Validate AI binding and return (None, None) — actual call deferred to TestSession.

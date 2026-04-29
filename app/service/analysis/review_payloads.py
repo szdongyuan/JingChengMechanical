@@ -11,7 +11,9 @@ from app.service.analysis.judgment import _runtime_channel_defaults
 
 _SUMMARY_ROW_DEFS = (
     ("spl", "SPL"),
+    ("spl_average", "平均SPL"),
     ("loudness", "Loudness"),
+    ("loudness_average", "平均Loudness"),
     ("fft", "FFT"),
     ("octave", "倍频程"),
     ("ai", "AI分析"),
@@ -51,7 +53,22 @@ def build_summary_payload(
         selected_channels=selected_channels,
         ai_review=ai_review,
     )
+    spl_row, spl_error_message = _build_spl_row(
+        selected_channels=selected_channels,
+        channel_configs=channel_configs,
+        channel_results=channel_results,
+    )
+    spl_average_row, spl_average_error_message = _build_spl_average_row(
+        selected_channels=selected_channels,
+        channel_configs=channel_configs,
+        channel_results=channel_results,
+    )
     loudness_row, loudness_error_message = _build_loudness_row(
+        selected_channels=selected_channels,
+        channel_configs=channel_configs,
+        channel_results=channel_results,
+    )
+    loudness_average_row, loudness_average_error_message = _build_loudness_average_row(
         selected_channels=selected_channels,
         channel_configs=channel_configs,
         channel_results=channel_results,
@@ -79,12 +96,10 @@ def build_summary_payload(
         channel_results=channel_results,
     )
     rows = [
-        _build_spl_row(
-            selected_channels=selected_channels,
-            channel_configs=channel_configs,
-            channel_results=channel_results,
-        ),
+        spl_row,
+        spl_average_row,
         loudness_row,
+        loudness_average_row,
         fft_row,
         octave_row,
         ai_row,
@@ -96,7 +111,10 @@ def build_summary_payload(
         "error_message": (
             _normalize_error_message(
                 error_message,
+                spl_error_message,
+                spl_average_error_message,
                 loudness_error_message,
+                loudness_average_error_message,
                 fft_error_message,
                 octave_error_message,
                 ai_error_message,
@@ -230,35 +248,127 @@ def _build_spl_row(
     selected_channels: tuple[int, ...],
     channel_configs: dict[int, dict],
     channel_results: dict[int, dict],
-) -> dict:
+) -> tuple[dict, str | None]:
     candidates = []
     for channel_index in selected_channels:
         channel_config = _effective_channel_config(channel_configs, channel_index)
-        lower = _coerce_bound(channel_config.get("spl_lower_limit"))
-        upper = _coerce_bound(channel_config.get("spl_upper_limit"))
+        lower, upper = _enabled_bounds(
+            channel_config,
+            lower_enabled_key="spl_lower_enabled",
+            lower_value_key="spl_lower_limit",
+            upper_enabled_key="spl_upper_enabled",
+            upper_value_key="spl_upper_limit",
+        )
         if not _has_constraint(lower, upper):
             continue
         channel_result = channel_results.get(channel_index)
         if not isinstance(channel_result, dict):
-            continue
+            return _build_constrained_no_result_row("spl", "SPL", channel_index=channel_index), None
+        if channel_result.get("spl_trace_available") is not True:
+            return (
+                _build_constrained_no_result_row("spl", "SPL", channel_index=channel_index),
+                _normalize_error_message(channel_result.get("spl_trace_error_message")),
+            )
+        if not isinstance(channel_result.get("spl_pass"), bool):
+            return (
+                _build_constrained_no_result_row("spl", "SPL", channel_index=channel_index),
+                _normalize_error_message(channel_result.get("spl_trace_error_message")),
+            )
         actual = _coerce_number(channel_result.get("spl_db"))
         if actual is None:
-            continue
-        deviation = _compute_deviation(actual=actual, lower=lower, upper=upper)
+            return (
+                _build_constrained_no_result_row("spl", "SPL", channel_index=channel_index),
+                _normalize_error_message(channel_result.get("spl_trace_error_message")),
+            )
+        lower_actual = _coerce_measurement(channel_result.get("spl_min_db"))
+        upper_actual = _coerce_measurement(channel_result.get("spl_max_db"))
+        if lower_actual is None:
+            lower_actual = actual
+        if upper_actual is None:
+            upper_actual = actual
+        deviation = _compute_range_deviation(
+            lower_actual=lower_actual,
+            upper_actual=upper_actual,
+            lower=lower,
+            upper=upper,
+        )
         candidates.append(
             {
                 "deviation_value": deviation,
                 "channel_index": channel_index,
+                "passed": channel_result["spl_pass"],
             }
         )
     if not candidates:
-        return _build_unconstrained_row("spl", "SPL")
-    return _build_row_from_candidate(
-        item_key="spl",
-        label="SPL",
-        candidate=_worst_candidate(candidates),
-        unit="dB",
-        constrained=True,
+        return _build_unconstrained_row("spl", "SPL"), None
+    return (
+        _build_pass_row_from_candidate(
+            item_key="spl",
+            label="SPL",
+            candidate=_worst_candidate(candidates),
+            unit="dB",
+            constrained=True,
+        ),
+        None,
+    )
+
+
+def _build_spl_average_row(
+    *,
+    selected_channels: tuple[int, ...],
+    channel_configs: dict[int, dict],
+    channel_results: dict[int, dict],
+) -> tuple[dict, str | None]:
+    candidates = []
+    for channel_index in selected_channels:
+        channel_config = _effective_channel_config(channel_configs, channel_index)
+        lower, upper = _enabled_bounds(
+            channel_config,
+            lower_enabled_key="spl_average_lower_enabled",
+            lower_value_key="spl_average_lower_limit",
+            upper_enabled_key="spl_average_upper_enabled",
+            upper_value_key="spl_average_upper_limit",
+        )
+        if not _has_constraint(lower, upper):
+            continue
+        channel_result = channel_results.get(channel_index)
+        if not isinstance(channel_result, dict):
+            return _build_constrained_no_result_row("spl_average", "平均SPL", channel_index=channel_index), None
+        if channel_result.get("spl_average_available") is not True:
+            return (
+                _build_constrained_no_result_row("spl_average", "平均SPL", channel_index=channel_index),
+                _normalize_error_message(channel_result.get("spl_average_error_message")),
+            )
+        if not isinstance(channel_result.get("spl_average_pass"), bool):
+            return (
+                _build_constrained_no_result_row("spl_average", "平均SPL", channel_index=channel_index),
+                _normalize_error_message(channel_result.get("spl_average_error_message")),
+            )
+        actual = _coerce_number(channel_result.get("spl_average_db"))
+        deviation = _compute_deviation(actual=actual, lower=lower, upper=upper)
+        if deviation is None:
+            return (
+                _build_constrained_no_result_row("spl_average", "平均SPL", channel_index=channel_index),
+                _normalize_error_message(channel_result.get("spl_average_error_message")),
+            )
+        candidates.append(
+            {
+                "deviation_value": deviation,
+                "channel_index": channel_index,
+                "passed": channel_result["spl_average_pass"],
+            }
+        )
+    if not candidates:
+        return _build_unconstrained_row("spl_average", "平均SPL"), None
+    return (
+        _build_pass_row_from_candidate(
+            item_key="spl_average",
+            label="平均SPL",
+            candidate=_worst_candidate(candidates),
+            unit="dB",
+            constrained=True,
+        ),
+        None,
     )
 
 
@@ -365,6 +475,17 @@ def _build_loudness_row(
 
     candidates = []
     for channel_index in selected_channels:
+        channel_config = _effective_channel_config(channel_configs, channel_index)
+        unit = _normalize_loudness_unit(channel_config.get("loudness_unit"))
+        lower_limit, upper_limit = _enabled_bounds(
+            channel_config,
+            lower_enabled_key="loudness_lower_enabled",
+            lower_value_key="loudness_lower_limit",
+            upper_enabled_key="loudness_upper_enabled",
+            upper_value_key="loudness_upper_limit",
+        )
+        if not _has_constraint(lower_limit, upper_limit):
+            continue
         channel_result = channel_results.get(channel_index)
         if not isinstance(channel_result, dict):
             return _build_constrained_no_result_row("loudness", "Loudness", channel_index=channel_index), None
@@ -380,17 +501,120 @@ def _build_loudness_row(
                 _normalize_error_message(channel_result.get("loudness_error_message")),
             )
 
-        actual_sone = _coerce_number(channel_result.get("loudness_max_sone"))
-        if actual_sone is None:
+        actual_max_sone = _coerce_number(channel_result.get("loudness_max_sone"))
+        if actual_max_sone is None:
             return (
                 _build_constrained_no_result_row("loudness", "Loudness", channel_index=channel_index),
                 _normalize_error_message(channel_result.get("loudness_error_message")),
             )
+        actual_min_sone = _coerce_number(channel_result.get("loudness_min_sone"))
+        if actual_min_sone is None:
+            actual_min_sone = actual_max_sone
 
+        lower_sone, upper_sone = _loudness_limits_sone(lower_limit, upper_limit, unit)
+        deviation_sone = _compute_range_deviation_raw(
+            lower_actual=actual_min_sone,
+            upper_actual=actual_max_sone,
+            lower=lower_sone,
+            upper=upper_sone,
+        )
+        min_display = _loudness_value_in_unit(actual_min_sone, unit)
+        max_display = _loudness_value_in_unit(actual_max_sone, unit)
+        display_deviation = _compute_range_deviation_raw(
+            lower_actual=min_display,
+            upper_actual=max_display,
+            lower=lower_limit,
+            upper=upper_limit,
+        )
+        if deviation_sone is None or display_deviation is None:
+            return _build_constrained_no_result_row("loudness", "Loudness", channel_index=channel_index), None
+
+        candidates.append(
+            {
+                "ranking_deviation_value": deviation_sone,
+                "display_deviation_value": display_deviation,
+                "channel_index": channel_index,
+                "unit": unit,
+                "passed": channel_result["loudness_pass"],
+            }
+        )
+
+    if not candidates:
+        return _build_unconstrained_row("loudness", "Loudness"), None
+
+    candidate = _worst_loudness_candidate(candidates)
+    return (
+        _build_row(
+            item_key="loudness",
+            label="Loudness",
+            deviation_value=_normalize_deviation(candidate["display_deviation_value"]),
+            channel_index=candidate["channel_index"],
+            status="OK" if candidate["passed"] else "NG",
+            constrained=True,
+            unit=candidate["unit"],
+        ),
+        None,
+    )
+
+
+def _build_loudness_average_row(
+    *,
+    selected_channels: tuple[int, ...],
+    channel_configs: dict[int, dict],
+    channel_results: dict[int, dict],
+) -> tuple[dict, str | None]:
+    if not selected_channels:
+        return _build_unconstrained_row("loudness_average", "平均Loudness"), None
+
+    candidates = []
+    for channel_index in selected_channels:
         channel_config = _effective_channel_config(channel_configs, channel_index)
         unit = _normalize_loudness_unit(channel_config.get("loudness_unit"))
-        lower_limit = _coerce_bound(channel_config.get("loudness_lower_limit"))
-        upper_limit = _coerce_bound(channel_config.get("loudness_upper_limit"))
+        lower_limit, upper_limit = _enabled_bounds(
+            channel_config,
+            lower_enabled_key="loudness_average_lower_enabled",
+            lower_value_key="loudness_average_lower_limit",
+            upper_enabled_key="loudness_average_upper_enabled",
+            upper_value_key="loudness_average_upper_limit",
+        )
+        if not _has_constraint(lower_limit, upper_limit):
+            continue
+        channel_result = channel_results.get(channel_index)
+        if not isinstance(channel_result, dict):
+            return _build_constrained_no_result_row(
+                "loudness_average",
+                "平均Loudness",
+                channel_index=channel_index,
+            ), None
+        if channel_result.get("loudness_available") is not True:
+            return (
+                _build_constrained_no_result_row(
+                    "loudness_average",
+                    "平均Loudness",
+                    channel_index=channel_index,
+                ),
+                _normalize_error_message(channel_result.get("loudness_error_message")),
+            )
+        if not isinstance(channel_result.get("loudness_average_pass"), bool):
+            return (
+                _build_constrained_no_result_row(
+                    "loudness_average",
+                    "平均Loudness",
+                    channel_index=channel_index,
+                ),
+                _normalize_error_message(channel_result.get("loudness_error_message")),
+            )
+
+        actual_sone = _coerce_number(channel_result.get("loudness_average_sone"))
+        if actual_sone is None:
+            return (
+                _build_constrained_no_result_row(
+                    "loudness_average",
+                    "平均Loudness",
+                    channel_index=channel_index,
+                ),
+                _normalize_error_message(channel_result.get("loudness_error_message")),
+            )
         lower_sone, upper_sone = _loudness_limits_sone(lower_limit, upper_limit, unit)
         deviation_sone = _compute_deviation_raw(
             actual=actual_sone,
@@ -404,7 +628,11 @@ def _build_loudness_row(
             upper=upper_limit,
         )
         if deviation_sone is None or display_deviation is None:
-            return _build_constrained_no_result_row("loudness", "Loudness", channel_index=channel_index), None
+            return _build_constrained_no_result_row(
+                "loudness_average",
+                "平均Loudness",
+                channel_index=channel_index,
+            ), None
 
         candidates.append(
             {
@@ -412,18 +640,21 @@ def _build_loudness_row(
                 "display_deviation_value": display_deviation,
                 "channel_index": channel_index,
                 "unit": unit,
-                "loudness_pass": channel_result["loudness_pass"],
+                "passed": channel_result["loudness_average_pass"],
             }
         )
+
+    if not candidates:
+        return _build_unconstrained_row("loudness_average", "平均Loudness"), None
 
     candidate = _worst_loudness_candidate(candidates)
     return (
         _build_row(
-            item_key="loudness",
-            label="Loudness",
+            item_key="loudness_average",
+            label="平均Loudness",
             deviation_value=_normalize_deviation(candidate["display_deviation_value"]),
             channel_index=candidate["channel_index"],
-            status="OK" if candidate["loudness_pass"] else "NG",
+            status=_status_from_deviation(candidate["display_deviation_value"]),
             constrained=True,
             unit=candidate["unit"],
         ),
@@ -503,6 +734,25 @@ def _build_row_from_candidate(
     )
 
 
+def _build_pass_row_from_candidate(
+    *,
+    item_key: str,
+    label: str,
+    candidate: dict,
+    unit: str | None,
+    constrained: bool,
+) -> dict:
+    return _build_row(
+        item_key=item_key,
+        label=label,
+        deviation_value=candidate["deviation_value"],
+        channel_index=candidate["channel_index"],
+        status="OK" if candidate["passed"] else "NG",
+        constrained=constrained,
+        unit=unit,
+    )
+
+
 def _build_unconstrained_row(item_key: str, label: str) -> dict:
     return _build_row(
         item_key=item_key,
@@ -577,7 +827,7 @@ def _worst_candidate(candidates: list[dict]) -> dict:
 def _worst_loudness_candidate(candidates: list[dict]) -> dict:
     failing_candidates = [
         candidate for candidate in candidates
-        if candidate["loudness_pass"] is False
+        if candidate["passed"] is False
     ]
     ranked_candidates = failing_candidates or candidates
     return max(ranked_candidates, key=lambda candidate: candidate["ranking_deviation_value"])
@@ -611,10 +861,60 @@ def _compute_deviation(
     lower: float | None,
     upper: float | None,
 ) -> float | None:
-    deviation = _compute_deviation_raw(actual=actual, lower=lower, upper=upper)
+    deviation = _compute_range_deviation_raw(
+        lower_actual=actual,
+        upper_actual=actual,
+        lower=lower,
+        upper=upper,
+    )
     if deviation is None:
         return None
     return _normalize_deviation(deviation)
+
+
+def _compute_range_deviation(
+    *,
+    lower_actual: float | None,
+    upper_actual: float | None,
+    lower: float | None,
+    upper: float | None,
+) -> float | None:
+    deviation = _compute_range_deviation_raw(
+        lower_actual=lower_actual,
+        upper_actual=upper_actual,
+        lower=lower,
+        upper=upper,
+    )
+    if deviation is None:
+        return None
+    return _normalize_deviation(deviation)
+
+
+def _compute_range_deviation_raw(
+    *,
+    lower_actual: float | None,
+    upper_actual: float | None,
+    lower: float | None,
+    upper: float | None,
+) -> float | None:
+    lower_deviation = _compute_deviation_raw(
+        actual=lower_actual,
+        lower=lower,
+        upper=None,
+    )
+    upper_deviation = _compute_deviation_raw(
+        actual=upper_actual,
+        lower=None,
+        upper=upper,
+    )
+    deviations = [
+        deviation
+        for deviation in (lower_deviation, upper_deviation)
+        if deviation is not None
+    ]
+    if not deviations:
+        return None
+    return max(deviations)
 
 
 def _compute_deviation_raw(
@@ -645,7 +945,10 @@ def _compute_deviation_raw(
 def _format_deviation(value: float | None, *, unit: str | None) -> str:
     if value is None:
         return "--"
-    formatted = f"{value:g}"
+    if math.isinf(value):
+        formatted = "∞" if value > 0 else "-∞"
+    else:
+        formatted = f"{value:g}"
     if unit:
         return f"{formatted} {unit}"
     return formatted
@@ -680,11 +983,34 @@ def _coerce_number(value) -> float | None:
     return None
 
 
+def _coerce_measurement(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        numeric = float(value)
+        if not math.isnan(numeric):
+            return numeric
+    return None
+
+
 def _coerce_bound(value) -> float | None:
     coerced = _coerce_number(value)
     if coerced is None:
         return None
     return coerced
+
+
+def _enabled_bounds(
+    channel_config: dict,
+    *,
+    lower_enabled_key: str,
+    lower_value_key: str,
+    upper_enabled_key: str,
+    upper_value_key: str,
+) -> tuple[float | None, float | None]:
+    lower = _coerce_bound(channel_config.get(lower_value_key)) if channel_config.get(lower_enabled_key) is True else None
+    upper = _coerce_bound(channel_config.get(upper_value_key)) if channel_config.get(upper_enabled_key) is True else None
+    return lower, upper
 
 
 def _has_constraint(lower: float | None, upper: float | None) -> bool:
@@ -802,35 +1128,42 @@ def _build_golden_bundle_loader(
 
 
 def _build_spl_chart(*, signal: np.ndarray, sample_rate: float, channel_config: dict) -> dict:
-    chunk_samples = max(1, int(round(sample_rate * _SPL_CHUNK_DURATION_SEC)))
-    times_sec: list[float] = []
-    values_db: list[float] = []
     weighting = str(channel_config.get("spl_weighting", "Z") or "Z")
     try:
         time_constant = float(channel_config.get("spl_time_constant", 0.125) or 0.125)
     except (TypeError, ValueError):
         time_constant = 0.125
 
-    for start in range(0, int(signal.size), chunk_samples):
-        chunk = signal[start : start + chunk_samples]
-        if chunk.size < chunk_samples:
+    raw_times_sec, raw_values_db = dsp.compute_spl_trace(
+        signal,
+        sample_rate,
+        weighting,
+        time_constant,
+        chunk_duration=_SPL_CHUNK_DURATION_SEC,
+    )
+    times_sec = []
+    values_db = []
+    for end_time, value in zip(raw_times_sec, raw_values_db):
+        normalized_time = _normalize_chart_number(end_time)
+        normalized_value = _normalize_chart_number(value)
+        if normalized_time is None or normalized_value is None:
             continue
-        value = _normalize_chart_number(
-            dsp.compute_spl(chunk, sample_rate, weighting, time_constant)
-        )
-        if value is None:
-            continue
-        end_time = _normalize_chart_number((start + chunk.size) / sample_rate)
-        if end_time is None:
-            continue
-        times_sec.append(end_time)
-        values_db.append(value)
+        times_sec.append(normalized_time)
+        values_db.append(normalized_value)
 
     return {
         "times_sec": times_sec,
         "values_db": values_db,
-        "lower_limit_db": _normalize_chart_number(channel_config.get("spl_lower_limit")),
-        "upper_limit_db": _normalize_chart_number(channel_config.get("spl_upper_limit")),
+        "lower_limit_db": (
+            _normalize_chart_number(channel_config.get("spl_lower_limit"))
+            if channel_config.get("spl_lower_enabled") is True
+            else None
+        ),
+        "upper_limit_db": (
+            _normalize_chart_number(channel_config.get("spl_upper_limit"))
+            if channel_config.get("spl_upper_enabled") is True
+            else None
+        ),
     }
 
 
@@ -849,8 +1182,16 @@ def _build_loudness_chart(*, signal: np.ndarray, sample_rate: float, channel_con
         "times_sec": _normalize_chart_list(normalized_times),
         "values": _normalize_chart_list(normalized_values),
         "unit": unit,
-        "lower_limit": _normalize_chart_number(channel_config.get("loudness_lower_limit")),
-        "upper_limit": _normalize_chart_number(channel_config.get("loudness_upper_limit")),
+        "lower_limit": (
+            _normalize_chart_number(channel_config.get("loudness_lower_limit"))
+            if channel_config.get("loudness_lower_enabled") is True
+            else None
+        ),
+        "upper_limit": (
+            _normalize_chart_number(channel_config.get("loudness_upper_limit"))
+            if channel_config.get("loudness_upper_enabled") is True
+            else None
+        ),
     }
 
 

@@ -14,14 +14,22 @@ from app.service.ai_service import AiService
 
 @pytest.fixture
 def ai_service():
-    return AiService()
+    service = AiService()
+    try:
+        yield service
+    finally:
+        service.shutdown()
 
 
 @pytest.fixture
-def full_setup():
+def full_setup(tmp_path):
     cfg = TestConfigTable.create(config_name="PF Test")
     tc = AiToolchainTable.create(
-        toolchain_id="pf-tc", display_name="TC PF", version="1", entrypoint="echo"
+        toolchain_id="pf-tc",
+        display_name="TC PF",
+        version="1",
+        entrypoint="echo",
+        package_dir=str(tmp_path),
     )
     TestConfigAiBindingTable.create(
         config=cfg, toolchain=tc, enabled=True, params_json="{}"
@@ -38,7 +46,11 @@ class TestPreflightCheck:
     def test_not_enabled(self, ai_service):
         cfg = TestConfigTable.create(config_name="Disabled")
         tc = AiToolchainTable.create(
-            toolchain_id="dis-tc", display_name="D", version="1", entrypoint="e"
+            toolchain_id="dis-tc",
+            display_name="D",
+            version="1",
+            entrypoint="e",
+            package_dir=os.getcwd(),
         )
         TestConfigAiBindingTable.create(config=cfg, toolchain=tc, enabled=False)
         result = ai_service.preflight_check(cfg.config_id, [{"audio_path": "/tmp/a.wav"}])
@@ -55,20 +67,40 @@ class TestPreflightCheck:
         cfg = TestConfigTable.create(config_name="TCOff")
         tc = AiToolchainTable.create(
             toolchain_id="off-tc", display_name="Off", version="1",
-            entrypoint="e", enabled=False,
+            entrypoint="e", package_dir=os.getcwd(), enabled=False,
         )
         TestConfigAiBindingTable.create(config=cfg, toolchain=tc, enabled=True)
         result = ai_service.preflight_check(cfg.config_id, [{"audio_path": "/tmp/a.wav"}])
         assert result["status"] == "not_configured"
 
+    def test_preflight_error_when_package_dir_is_missing(self, ai_service, tmp_path):
+        cfg = TestConfigTable.create(config_name="MissingPackageDir")
+        missing_dir = tmp_path / "missing-package"
+        tc = AiToolchainTable.create(
+            toolchain_id="missing-pkg-tc",
+            display_name="Missing Package TC",
+            version="1",
+            entrypoint="e",
+            package_dir=str(missing_dir),
+        )
+        TestConfigAiBindingTable.create(config=cfg, toolchain=tc, enabled=True)
+
+        result = ai_service.preflight_check(cfg.config_id, [{"audio_path": "/tmp/a.wav"}])
+
+        assert result["status"] == "preflight_error"
+        assert "package_dir" in result["error"]
+
     def test_preflight_error_invalid_params_json(self, ai_service):
         cfg = TestConfigTable.create(config_name="BadJSON")
         tc = AiToolchainTable.create(
-            toolchain_id="bj-tc", display_name="BJ", version="1", entrypoint="e"
+            toolchain_id="bj-tc",
+            display_name="BJ",
+            version="1",
+            entrypoint="e",
+            package_dir=os.getcwd(),
+            params_json="not json",
         )
-        TestConfigAiBindingTable.create(
-            config=cfg, toolchain=tc, enabled=True, params_json="not json"
-        )
+        TestConfigAiBindingTable.create(config=cfg, toolchain=tc, enabled=True)
         result = ai_service.preflight_check(cfg.config_id, [{"audio_path": "/tmp/a.wav"}])
         assert result["status"] == "preflight_error"
 

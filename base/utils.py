@@ -158,6 +158,15 @@ def get_mac_address():
     raise Exception("No MAC address found")
 
 
+def asset_path(*parts: str) -> str:
+    """打包或源码运行下定位 assets/ 目录中的资源。"""
+    if getattr(sys, "frozen", False):
+        bundle_dir = getattr(sys, "_MEIPASS", None) or os.path.dirname(sys.executable)
+    else:
+        bundle_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    return os.path.join(bundle_dir, "assets", *parts)
+
+
 def get_config_path(filename):
     """
     获取配置文件路径，兼容打包与源码运行

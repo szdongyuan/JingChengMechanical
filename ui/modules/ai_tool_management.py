@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import json
+import os
+
 from PyQt6.QtCore import QRegularExpression, Qt
 from PyQt6.QtGui import QRegularExpressionValidator
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QListWidget,
@@ -15,6 +20,8 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -30,7 +37,7 @@ class _LargeIntegerEditor(QLineEdit):
         self._suffix = ""
         self._single_step = 1
         self._minimum = 0
-        self.setAlignment(Qt.AlignmentFlag.AlignRight)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft)
         self.setValidator(
             QRegularExpressionValidator(
                 QRegularExpression(r"(?:0|[1-9]\d*)?"),
@@ -66,6 +73,7 @@ class AiToolManagementModule(QWidget):
         super().__init__()
         self.services = services
         self._toolchain_rows: dict[str, dict] = {}
+        self._draft_payload: dict | None = None
         self._current_toolchain_id: str | None = None
         self._editor_snapshot: dict | None = None
         self._is_new_draft = False
@@ -137,8 +145,11 @@ class AiToolManagementModule(QWidget):
         form_lay.setHorizontalSpacing(10)
         form_lay.setVerticalSpacing(8)
 
-        self.ed_toolchain_id = QLineEdit()
-        form_lay.addRow("工具链标识", self.ed_toolchain_id)
+        self.lb_toolchain_id_value = QLabel("-")
+        self.lb_toolchain_id_value.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        form_lay.addRow("内部标识", self.lb_toolchain_id_value)
 
         self.ed_display_name = QLineEdit()
         form_lay.addRow("显示名称", self.ed_display_name)
@@ -150,12 +161,55 @@ class AiToolManagementModule(QWidget):
         self.ed_entrypoint.setMaximumHeight(80)
         form_lay.addRow("入口命令", self.ed_entrypoint)
 
+        self.package_dir_row = QWidget()
+        self.package_dir_row.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
+        )
+        package_dir_lay = QHBoxLayout(self.package_dir_row)
+        package_dir_lay.setContentsMargins(0, 0, 0, 0)
+        package_dir_lay.setSpacing(8)
+        package_dir_lay.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        self.ed_package_dir = QLineEdit()
+        self.btn_browse_package_dir = QPushButton("浏览")
+        package_dir_lay.addWidget(
+            self.ed_package_dir,
+            1,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+        package_dir_lay.addWidget(
+            self.btn_browse_package_dir,
+            0,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+        form_lay.addRow("AI 包目录", self.package_dir_row)
+
+        self.timeout_row = QWidget()
+        self.timeout_row.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
+        )
+        timeout_lay = QHBoxLayout(self.timeout_row)
+        timeout_lay.setContentsMargins(0, 0, 0, 0)
+        timeout_lay.setSpacing(6)
+        timeout_lay.setAlignment(Qt.AlignmentFlag.AlignVCenter)
         self.spin_timeout = _LargeIntegerEditor()
         self.spin_timeout.setRange(0, 2_147_483_647)
         self.spin_timeout.setSingleStep(1000)
-        self.spin_timeout.setSuffix(" ms")
         self.spin_timeout.setValue(30000)
-        form_lay.addRow("默认超时", self.spin_timeout)
+        self.lb_timeout_unit = QLabel("ms")
+        timeout_lay.addWidget(
+            self.spin_timeout,
+            0,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+        timeout_lay.addWidget(
+            self.lb_timeout_unit,
+            0,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+        timeout_lay.addStretch(1)
+        form_lay.addRow("默认超时", self.timeout_row)
 
         self.chk_enabled = QCheckBox("启用")
         form_lay.addRow("状态", self.chk_enabled)
@@ -165,19 +219,27 @@ class AiToolManagementModule(QWidget):
         self.combo_execution_mode.addItem("单次进程", "oneshot_process")
         form_lay.addRow("执行模式", self.combo_execution_mode)
 
+        self.txt_params_json = QPlainTextEdit()
+        self.txt_params_json.setPlaceholderText('{"key": "value"}')
+        self.txt_params_json.setMaximumHeight(100)
+        form_lay.addRow("参数(JSON)", self.txt_params_json)
+
         self.txt_description = QPlainTextEdit()
         self.txt_description.setMaximumHeight(100)
         form_lay.addRow("描述", self.txt_description)
 
-        self.runtime_helper = QLabel(
-            "protocol_version = 1（固定）；推荐使用 resident_process 以复用预加载模型；"
-            "oneshot_process 适用于仍使用基于文件 CLI 的工具链。"
-        )
-        self.runtime_helper.setObjectName("Muted")
-        self.runtime_helper.setWordWrap(True)
-        form_lay.addRow("运行时说明", self.runtime_helper)
+        scroll_content = QWidget()
+        scroll_lay = QVBoxLayout(scroll_content)
+        scroll_lay.setContentsMargins(0, 0, 0, 0)
+        scroll_lay.setSpacing(10)
+        scroll_lay.addWidget(form_host)
+        scroll_lay.addStretch(1)
 
-        detail_lay.addWidget(form_host)
+        self.detail_scroll = QScrollArea()
+        self.detail_scroll.setWidgetResizable(True)
+        self.detail_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.detail_scroll.setWidget(scroll_content)
+        detail_lay.addWidget(self.detail_scroll, 1)
 
         save_row = QWidget()
         save_lay = QHBoxLayout(save_row)
@@ -190,22 +252,53 @@ class AiToolManagementModule(QWidget):
 
         self.right_lay.addWidget(self.detail, 1)
         root.addWidget(right, 1)
+        self._apply_fixed_row_heights()
 
     def _connect_signals(self):
         self.btn_new.clicked.connect(self._on_new)
         self.btn_delete.clicked.connect(self._on_delete)
         self.btn_save.clicked.connect(self._on_save)
         self.toolchain_list.currentItemChanged.connect(self._on_item_changed)
-        self.ed_toolchain_id.textChanged.connect(self._on_editor_changed)
         self.ed_display_name.textChanged.connect(self._on_editor_changed)
         self.ed_version.textChanged.connect(self._on_editor_changed)
         self.ed_entrypoint.textChanged.connect(self._on_editor_changed)
+        self.ed_package_dir.textChanged.connect(self._on_editor_changed)
         self.spin_timeout.textChanged.connect(self._on_editor_changed)
         self.chk_enabled.toggled.connect(self._on_editor_changed)
         self.combo_execution_mode.currentIndexChanged.connect(self._on_editor_changed)
+        self.txt_params_json.textChanged.connect(self._on_editor_changed)
         self.txt_description.textChanged.connect(self._on_editor_changed)
+        self.btn_browse_package_dir.clicked.connect(self._browse_package_dir)
 
-    def _refresh_list(self, selected_toolchain_id: str | None = None):
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._apply_fixed_row_heights()
+
+    def _apply_fixed_row_heights(self):
+        self.ed_package_dir.ensurePolished()
+        self.btn_browse_package_dir.ensurePolished()
+        package_dir_height = max(
+            self.ed_package_dir.sizeHint().height(),
+            self.btn_browse_package_dir.sizeHint().height(),
+        )
+        self.ed_package_dir.setFixedHeight(package_dir_height)
+        self.btn_browse_package_dir.setFixedHeight(package_dir_height)
+        self.package_dir_row.setFixedHeight(package_dir_height)
+
+        self.spin_timeout.ensurePolished()
+        self.lb_timeout_unit.ensurePolished()
+        timeout_row_height = max(
+            self.spin_timeout.sizeHint().height(),
+            self.lb_timeout_unit.sizeHint().height(),
+        )
+        self.timeout_row.setFixedHeight(timeout_row_height)
+
+    def _refresh_list(
+        self,
+        selected_toolchain_id: str | None = None,
+        *,
+        auto_select_first: bool = True,
+    ):
         rows = sorted(
             self.services.ai_service.list_toolchains(),
             key=lambda row: row["toolchain_id"],
@@ -217,20 +310,29 @@ class AiToolManagementModule(QWidget):
 
         self.toolchain_list.blockSignals(True)
         self.toolchain_list.clear()
+        if self._draft_payload is not None:
+            item = QListWidgetItem(
+                self._format_list_text(self._draft_payload, draft=True)
+            )
+            item.setData(
+                Qt.ItemDataRole.UserRole,
+                self._draft_payload["toolchain_id"],
+            )
+            self.toolchain_list.addItem(item)
         for row in rows:
             item = QListWidgetItem(self._format_list_text(row))
             item.setData(Qt.ItemDataRole.UserRole, row["toolchain_id"])
             self.toolchain_list.addItem(item)
         self.toolchain_list.blockSignals(False)
 
-        has_items = bool(rows)
-        should_show_detail = has_items or self._is_new_draft
+        has_items = bool(rows) or self._draft_payload is not None
+        should_show_detail = has_items
         self.empty_label.setVisible(not should_show_detail)
         self.detail.setVisible(should_show_detail)
 
         if selected_toolchain_id is not None:
             self._select_toolchain(selected_toolchain_id)
-        elif has_items and not self._is_new_draft:
+        elif auto_select_first and rows and self._draft_payload is None:
             self.toolchain_list.setCurrentRow(0)
         else:
             self._update_action_state()
@@ -242,9 +344,11 @@ class AiToolManagementModule(QWidget):
             "display_name": "",
             "version": "",
             "entrypoint": "",
+            "package_dir": "",
             "default_timeout_ms": 30000,
             "enabled": True,
             "execution_mode": _DEFAULT_EXECUTION_MODE,
+            "params_json": "{}",
             "description": "",
         }
 
@@ -259,21 +363,108 @@ class AiToolManagementModule(QWidget):
                 "display_name": row.get("display_name", ""),
                 "version": row.get("version", ""),
                 "entrypoint": row.get("entrypoint", ""),
+                "package_dir": row.get("package_dir", ""),
                 "default_timeout_ms": int(row.get("default_timeout_ms") or 0),
                 "enabled": bool(row.get("enabled", True)),
                 "execution_mode": row.get("execution_mode", _DEFAULT_EXECUTION_MODE),
+                "params_json": row.get("params_json", "{}"),
                 "description": row.get("description", ""),
             }
         )
         return payload
 
     @staticmethod
-    def _format_list_text(row: dict) -> str:
+    def _format_list_text(row: dict, *, draft: bool = False) -> str:
+        display_name = (row.get("display_name") or "").strip()
+        if draft and not display_name:
+            display_name = "未命名工具链"
+        elif not display_name:
+            display_name = row.get("toolchain_id", "")
         version = row.get("version") or "-"
-        text = f'{row["display_name"]} ({version}) - {row["toolchain_id"]}'
+        text = f'{display_name} ({version}) - {row["toolchain_id"]}'
         if not row.get("enabled", True):
             text = f"{text} [禁用]"
+        if draft:
+            text = f"{text} [未保存]"
         return text
+
+    def _build_draft_payload(self, display_name: str) -> dict:
+        generated_id_prefix = self.services.ai_service.generated_toolchain_prefix(
+            display_name
+        )
+        toolchain_id = self.services.ai_service.generate_toolchain_id_from_prefix(
+            generated_id_prefix
+        )
+        payload = self._empty_draft_payload()
+        payload.update(
+            {
+                "toolchain_id": toolchain_id,
+                "generated_id_prefix": generated_id_prefix,
+                "display_name": display_name,
+            }
+        )
+        return payload
+
+    def _load_draft(self):
+        if self._draft_payload is None:
+            return
+        self._current_toolchain_id = self._draft_payload["toolchain_id"]
+        self._is_new_draft = True
+        self._editor_snapshot = self._normalize_editor_payload(self._draft_payload)
+        self._set_editor_payload(self._draft_payload)
+        self.empty_label.setVisible(False)
+        self.detail.setVisible(True)
+        self._update_action_state()
+
+    def _remove_draft(self, *, auto_select_first: bool = False):
+        self._draft_payload = None
+        self._is_new_draft = False
+        self._current_toolchain_id = None
+        self._editor_snapshot = None
+        self._refresh_list(auto_select_first=auto_select_first)
+        if auto_select_first:
+            return
+        self._clear_selection()
+        self._clear_editor()
+        self.detail.setVisible(False)
+        self.empty_label.setVisible(self.toolchain_list.count() == 0)
+        self._update_action_state()
+
+    def _update_draft_list_item(self):
+        if self._draft_payload is None:
+            return
+        draft_toolchain_id = self._draft_payload["toolchain_id"]
+        for index in range(self.toolchain_list.count()):
+            item = self.toolchain_list.item(index)
+            if item.data(Qt.ItemDataRole.UserRole) == draft_toolchain_id:
+                item.setText(self._format_list_text(self._draft_payload, draft=True))
+                return
+        self._refresh_list(selected_toolchain_id=draft_toolchain_id)
+
+    def _sync_draft_from_editor(self):
+        if not self._is_new_draft or self._draft_payload is None:
+            return
+        updated_payload = dict(self._draft_payload)
+        updated_payload.update(self._collect_payload())
+        self._draft_payload = updated_payload
+        self._update_draft_list_item()
+
+    def _ensure_draft_toolchain_id_available(self):
+        if not self._is_new_draft or self._draft_payload is None:
+            return
+        toolchain_id = self._draft_payload["toolchain_id"]
+        if self.services.ai_service.get_toolchain(toolchain_id) is None:
+            return
+        generated_id_prefix = self._draft_payload.get("generated_id_prefix")
+        if not generated_id_prefix:
+            return
+        regenerated_id = self.services.ai_service.generate_toolchain_id_from_prefix(
+            generated_id_prefix
+        )
+        self._draft_payload["toolchain_id"] = regenerated_id
+        self._current_toolchain_id = regenerated_id
+        self.lb_toolchain_id_value.setText(regenerated_id)
+        self._refresh_list(selected_toolchain_id=regenerated_id)
 
     def _select_toolchain(self, toolchain_id: str):
         for index in range(self.toolchain_list.count()):
@@ -289,11 +480,18 @@ class AiToolManagementModule(QWidget):
             self._update_action_state()
             return
         toolchain_id = current.data(Qt.ItemDataRole.UserRole)
-        if toolchain_id == self._current_toolchain_id and not self._is_new_draft:
+        if toolchain_id == self._current_toolchain_id:
             self._update_action_state()
             return
         if not self._resolve_pending_editor_action("switch"):
             self._restore_selection()
+            return
+        if (
+            self._draft_payload is not None
+            and toolchain_id == self._draft_payload["toolchain_id"]
+        ):
+            self._set_selection_by_toolchain_id(toolchain_id)
+            self._load_draft()
             return
         row = self._toolchain_rows.get(toolchain_id)
         if row is None:
@@ -315,18 +513,30 @@ class AiToolManagementModule(QWidget):
     def _set_editor_payload(self, row: dict):
         self._suspend_editor_change_tracking = True
         try:
-            self.ed_toolchain_id.setText(row.get("toolchain_id", ""))
+            self.lb_toolchain_id_value.setText(row.get("toolchain_id") or "-")
             self.ed_display_name.setText(row.get("display_name", ""))
             self.ed_version.setText(row.get("version", ""))
             self.ed_entrypoint.setPlainText(row.get("entrypoint", ""))
+            self.ed_package_dir.setText(row.get("package_dir", ""))
             self.spin_timeout.setValue(int(row.get("default_timeout_ms") or 0))
             self.chk_enabled.setChecked(bool(row.get("enabled", True)))
             self._set_execution_mode(
                 row.get("execution_mode", _DEFAULT_EXECUTION_MODE)
             )
+            self.txt_params_json.setPlainText(row.get("params_json", "{}"))
             self.txt_description.setPlainText(row.get("description", ""))
         finally:
             self._suspend_editor_change_tracking = False
+
+    def _browse_package_dir(self):
+        start_dir = self.ed_package_dir.text().strip() or os.getcwd()
+        selected_dir = QFileDialog.getExistingDirectory(
+            self,
+            "选择 AI 包目录",
+            start_dir,
+        )
+        if selected_dir:
+            self.ed_package_dir.setText(selected_dir)
 
     def _set_execution_mode(self, execution_mode: str):
         index = self.combo_execution_mode.findData(execution_mode)
@@ -340,14 +550,25 @@ class AiToolManagementModule(QWidget):
     def _on_new(self):
         if not self._resolve_pending_editor_action("new"):
             return
-        self._current_toolchain_id = None
-        self._editor_snapshot = self._empty_draft_payload()
+        display_name, ok = QInputDialog.getText(
+            self,
+            "新建 AI 工具链",
+            "请输入显示名称：",
+        )
+        if not ok:
+            self._update_action_state()
+            return
+        display_name = display_name.strip()
+        if not display_name:
+            QMessageBox.warning(self, "创建失败", "显示名称不能为空")
+            self._update_action_state()
+            return
+        self._draft_payload = self._build_draft_payload(display_name)
+        self._current_toolchain_id = self._draft_payload["toolchain_id"]
+        self._editor_snapshot = self._normalize_editor_payload(self._draft_payload)
         self._is_new_draft = True
-        self._clear_selection()
-        self._clear_editor()
-        self.empty_label.setVisible(False)
-        self.detail.setVisible(True)
-        self._update_action_state()
+        self._refresh_list(selected_toolchain_id=self._current_toolchain_id)
+        self._load_draft()
 
     def _on_delete(self):
         toolchain_id = self._current_toolchain_id
@@ -382,15 +603,22 @@ class AiToolManagementModule(QWidget):
         self._emit_ai_toolchains_changed()
 
     def _collect_payload(self) -> dict:
+        toolchain_id = ""
+        if self._is_new_draft and self._draft_payload is not None:
+            toolchain_id = self._draft_payload.get("toolchain_id", "")
+        elif self._current_toolchain_id is not None:
+            toolchain_id = self._current_toolchain_id
         return {
-            "toolchain_id": self.ed_toolchain_id.text(),
+            "toolchain_id": toolchain_id,
             "display_name": self.ed_display_name.text(),
             "version": self.ed_version.text(),
             "entrypoint": self.ed_entrypoint.toPlainText(),
+            "package_dir": self.ed_package_dir.text(),
             "default_timeout_ms": self.spin_timeout.value(),
             "enabled": self.chk_enabled.isChecked(),
             "execution_mode": self.combo_execution_mode.currentData()
             or _DEFAULT_EXECUTION_MODE,
+            "params_json": self.txt_params_json.toPlainText(),
             "description": self.txt_description.toPlainText(),
         }
 
@@ -401,9 +629,11 @@ class AiToolManagementModule(QWidget):
             "display_name": payload["display_name"].strip(),
             "version": payload["version"].strip(),
             "entrypoint": payload["entrypoint"].strip(),
+            "package_dir": payload["package_dir"].strip(),
             "default_timeout_ms": payload["default_timeout_ms"],
             "enabled": payload["enabled"],
             "execution_mode": payload["execution_mode"],
+            "params_json": payload["params_json"].strip() or "{}",
             "description": payload["description"].strip(),
         }
 
@@ -414,8 +644,18 @@ class AiToolManagementModule(QWidget):
             or not payload["entrypoint"]
         ):
             raise ValueError("工具链标识、显示名称和入口命令不能为空")
+        if not payload["package_dir"]:
+            raise ValueError("AI 包目录不能为空")
+        if not os.path.isdir(payload["package_dir"]):
+            raise ValueError("AI 包目录必须是已存在的目录")
         if payload["default_timeout_ms"] <= 0:
             raise ValueError("默认超时必须大于 0")
+        try:
+            params = json.loads(payload["params_json"])
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError(f"参数(JSON) 格式无效：{exc}") from exc
+        if not isinstance(params, dict):
+            raise ValueError("参数(JSON) 必须是对象")
         duplicate = payload["toolchain_id"] in self._toolchain_rows
         if duplicate and payload["toolchain_id"] != self._current_toolchain_id:
             raise ValueError("工具链标识已存在")
@@ -425,10 +665,19 @@ class AiToolManagementModule(QWidget):
 
     def _save_current_editor(self) -> bool:
         payload = self._collect_save_payload()
+        if self._is_new_draft and self._draft_payload is not None:
+            self._ensure_draft_toolchain_id_available()
+            payload = self._collect_save_payload()
+            generated_id_prefix = self._draft_payload.get("generated_id_prefix")
+            if generated_id_prefix:
+                payload["generated_id_prefix"] = generated_id_prefix
         try:
             self._validate_payload(payload)
+            original_toolchain_id = (
+                None if self._is_new_draft else self._current_toolchain_id
+            )
             saved_toolchain_id = self.services.ai_service.save_toolchain(
-                self._current_toolchain_id,
+                original_toolchain_id,
                 payload,
             )
         except ValueError as exc:
@@ -439,6 +688,7 @@ class AiToolManagementModule(QWidget):
             return False
 
         self._current_toolchain_id = saved_toolchain_id
+        self._draft_payload = None
         self._is_new_draft = False
         self._refresh_list(selected_toolchain_id=saved_toolchain_id)
         persisted_row = self._toolchain_rows.get(saved_toolchain_id)
@@ -459,14 +709,17 @@ class AiToolManagementModule(QWidget):
     def _on_editor_changed(self, *_args):
         if self._suspend_editor_change_tracking:
             return
+        self._sync_draft_from_editor()
         self._update_action_state()
 
     def _has_active_editor(self) -> bool:
-        return self._is_new_draft or self._current_toolchain_id is not None
+        return self._draft_payload is not None or self._current_toolchain_id is not None
 
     def _is_dirty(self) -> bool:
         if not self._has_active_editor():
             return False
+        if self._is_new_draft and self._draft_payload is not None:
+            return True
         snapshot = self._editor_snapshot or self._empty_draft_payload()
         return self._collect_payload() != snapshot
 
@@ -537,6 +790,9 @@ class AiToolManagementModule(QWidget):
         if decision == "cancel":
             return False
         if decision == "discard":
+            if self._is_new_draft and self._draft_payload is not None:
+                self._remove_draft()
+                return True
             self._restore_snapshot()
             return True
         if decision == "save":

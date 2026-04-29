@@ -193,6 +193,8 @@ def test_connect_bootstraps_execution_mode_default_to_resident_process(monkeypat
         toolchain_columns = _table_columns(tmp_db, "ai_toolchain_table")
 
         assert toolchain_columns["execution_mode"][4] == "'resident_process'"
+        assert "package_dir" in toolchain_columns
+        assert "params_json" in toolchain_columns
         tmp_db.execute_sql(
             """
             INSERT INTO ai_toolchain_table (
@@ -200,6 +202,7 @@ def test_connect_bootstraps_execution_mode_default_to_resident_process(monkeypat
                 display_name,
                 version,
                 entrypoint,
+                package_dir,
                 protocol_version,
                 default_timeout_ms,
                 enabled,
@@ -211,6 +214,7 @@ def test_connect_bootstraps_execution_mode_default_to_resident_process(monkeypat
                 'Bootstrapped Toolchain',
                 '',
                 'python bootstrapped.py',
+                'D:/bootstrap/package',
                 1,
                 30000,
                 1,
@@ -223,11 +227,11 @@ def test_connect_bootstraps_execution_mode_default_to_resident_process(monkeypat
 
         assert tmp_db.execute_sql(
             """
-            SELECT execution_mode
+            SELECT execution_mode, package_dir, params_json
             FROM ai_toolchain_table
             WHERE toolchain_id = 'bootstrapped-toolchain'
             """
-        ).fetchone() == ("resident_process",)
+        ).fetchone() == ("resident_process", "D:/bootstrap/package", "{}")
 
 
 def test_connect_bootstraps_ai_binding_table_without_score_threshold(monkeypatch):
@@ -488,8 +492,20 @@ def test_connect_migrates_legacy_config_tables_and_preserves_extra_columns(
         assert {
             "fft_nfft",
             "loudness_unit",
+            "spl_lower_enabled",
+            "spl_upper_enabled",
+            "spl_average_lower_enabled",
+            "spl_average_lower_limit",
+            "spl_average_upper_enabled",
+            "spl_average_upper_limit",
+            "loudness_lower_enabled",
+            "loudness_upper_enabled",
             "loudness_lower_limit",
             "loudness_upper_limit",
+            "loudness_average_lower_enabled",
+            "loudness_average_lower_limit",
+            "loudness_average_upper_enabled",
+            "loudness_average_upper_limit",
             "golden_sample_path",
             "golden_sample_label",
             "golden_sample_source_channel",
@@ -522,11 +538,23 @@ def test_connect_migrates_legacy_config_tables_and_preserves_extra_columns(
                 "stft_overlap": 0.5,
                 "spl_weighting": "A",
                 "spl_time_constant": 0.125,
+                "spl_lower_enabled": False,
+                "spl_upper_enabled": False,
                 "spl_upper_limit": 85.0,
                 "spl_lower_limit": 40.0,
+                "spl_average_lower_enabled": False,
+                "spl_average_lower_limit": 40.0,
+                "spl_average_upper_enabled": False,
+                "spl_average_upper_limit": 85.0,
                 "loudness_unit": "sone",
+                "loudness_lower_enabled": False,
+                "loudness_upper_enabled": False,
                 "loudness_lower_limit": 0.0,
                 "loudness_upper_limit": 60.0,
+                "loudness_average_lower_enabled": False,
+                "loudness_average_lower_limit": 0.0,
+                "loudness_average_upper_enabled": False,
+                "loudness_average_upper_limit": 60.0,
                 "fft_band_limits": [],
                 "oct_weighting": "A",
                 "oct_band_limits": [],
@@ -1285,16 +1313,18 @@ def test_connect_migrates_missing_execution_mode_column_to_resident_process(
             "protocol_version",
             "execution_mode",
             "description",
+            "package_dir",
+            "params_json",
             "legacy_source",
         } <= set(toolchain_columns)
         assert toolchain_columns["execution_mode"][4] == "'resident_process'"
         assert tmp_db.execute_sql(
             """
-            SELECT protocol_version, execution_mode, description, legacy_source
+            SELECT protocol_version, execution_mode, description, package_dir, params_json, legacy_source
             FROM ai_toolchain_table
             WHERE toolchain_id = 'legacy-toolchain'
             """
-        ).fetchone() == (1, "resident_process", "", "keep")
+        ).fetchone() == (1, "resident_process", "", "", "{}", "keep")
 
         execution_columns = _table_columns(tmp_db, "ai_execution_table")
         assert {
@@ -1386,10 +1416,12 @@ def test_connect_does_not_rewrite_existing_supported_execution_modes(monkeypatch
 
         columns = _table_columns(tmp_db, "ai_toolchain_table")
         assert "description" in columns
+        assert "package_dir" in columns
+        assert "params_json" in columns
         assert tmp_db.execute_sql(
             """
-            SELECT execution_mode, description, legacy_source
+            SELECT execution_mode, description, package_dir, params_json, legacy_source
             FROM ai_toolchain_table
             WHERE toolchain_id = 'existing-toolchain'
             """
-        ).fetchone() == ("oneshot_process", "", "keep")
+        ).fetchone() == ("oneshot_process", "", "", "{}", "keep")

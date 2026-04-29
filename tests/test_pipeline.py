@@ -4,8 +4,12 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from app.service.analysis.pipeline import AnalysisPipeline
-from app.service.analysis.frames import StftFrame, SplFrame, OctaveFrame, FftFrame
+from app.service.analysis.pipeline import (
+    _LIVE_LOUDNESS_THROTTLE_SEC,
+    _LIVE_LOUDNESS_WINDOW_SEC,
+    AnalysisPipeline,
+)
+from app.service.analysis.frames import FftFrame, LoudnessFrame, OctaveFrame, SplFrame, StftFrame
 
 
 def _make_config(**overrides) -> dict:
@@ -151,6 +155,101 @@ class TestAnalysisPipeline:
             captured_fft_inputs[1],
             np.array([2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], dtype=np.float64),
         )
+
+    def test_process_chunk_returns_throttled_loudness_frame(self, monkeypatch):
+        calls = []
+
+        def fake_compute_loudness_trace(signal, sample_rate):
+            calls.append(np.asarray(signal, dtype=np.float64).copy())
+            return [0.0, 0.1], [1.25, 2.5], 2.5
+
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_loudness_trace",
+            fake_compute_loudness_trace,
+        )
+
+        p = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(),
+            sample_rate=100.0,
+        )
+
+        first = p.process_chunk(np.ones(50, dtype=np.float32), elapsed_time=0.25)
+        second = p.process_chunk(np.ones(50, dtype=np.float32), elapsed_time=0.40)
+        third = p.process_chunk(np.ones(50, dtype=np.float32), elapsed_time=0.50)
+        fourth = p.process_chunk(np.ones(50, dtype=np.float32), elapsed_time=0.75)
+
+        assert isinstance(first["loudness"], LoudnessFrame)
+        assert first["loudness"].time == pytest.approx(0.25)
+        assert first["loudness"].loudness_sone == pytest.approx(2.5)
+        assert second["loudness"] is None
+        assert isinstance(third["loudness"], LoudnessFrame)
+        assert third["loudness"].time == pytest.approx(0.50)
+        assert isinstance(fourth["loudness"], LoudnessFrame)
+        assert fourth["loudness"].time == pytest.approx(0.75)
+        assert len(calls) == 3
+
+    def test_process_chunk_can_skip_live_loudness_backend_while_maintaining_buffer(
+        self,
+        monkeypatch,
+    ):
+        calls = []
+
+        def fake_compute_loudness_trace(signal, sample_rate):
+            calls.append(np.asarray(signal, dtype=np.float64).copy())
+            return [0.0], [1.0], 1.0
+
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_loudness_trace",
+            fake_compute_loudness_trace,
+        )
+
+        p = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(),
+            sample_rate=100.0,
+        )
+
+        skipped = p.process_chunk(
+            np.ones(75, dtype=np.float32),
+            elapsed_time=0.5,
+            compute_loudness=False,
+        )
+        emitted = p.process_chunk(
+            np.ones(25, dtype=np.float32),
+            elapsed_time=1.0,
+            compute_loudness=True,
+        )
+
+        assert skipped["loudness"] is None
+        assert isinstance(emitted["loudness"], LoudnessFrame)
+        assert len(calls) == 1
+        assert p._loudness_buffer.size == 50
+        np.testing.assert_array_equal(calls[0], np.ones(50, dtype=np.float64))
+
+    def test_live_loudness_throttle_is_quarter_second_and_window_is_half_second(self):
+        assert _LIVE_LOUDNESS_THROTTLE_SEC == pytest.approx(0.25)
+        assert _LIVE_LOUDNESS_WINDOW_SEC == pytest.approx(0.5)
+
+    def test_process_chunk_suppresses_live_loudness_backend_errors(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_loudness_trace",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("backend down")),
+        )
+        p = AnalysisPipeline(channel_index=0, channel_config=_make_config(), sample_rate=100.0)
+        result = p.process_chunk(np.ones(100, dtype=np.float32), elapsed_time=1.0)
+        assert result["loudness"] is None
+
+    def test_reset_clears_live_loudness_buffer_and_throttle(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_loudness_trace",
+            lambda signal, sample_rate: ([0.0], [3.0], 3.0),
+        )
+        p = AnalysisPipeline(channel_index=0, channel_config=_make_config(), sample_rate=100.0)
+        p.process_chunk(np.ones(100, dtype=np.float32), elapsed_time=1.0)
+        p.reset()
+        assert p._loudness_buffer.size == 0
+        assert p._last_live_loudness_emit_time == 0.0
 
     def test_reset_clears_buffer(self):
         p = AnalysisPipeline(channel_index=0, channel_config=_make_config(),

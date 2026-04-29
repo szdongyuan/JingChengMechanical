@@ -38,11 +38,18 @@ def test_service_container_has_ai_service():
     assert "AiService" in source
 
 
+def test_service_container_has_config_package_service():
+    source = inspect.getsource(mod.ServiceContainer.__post_init__)
+    assert "config_package_service" in source
+    assert "ConfigPackageService" in source
+
+
 def test_analysis_signals_exist():
     """All analysis kernel signals should be defined on EventBus."""
     for name in (
         "stft_updated",
         "spl_updated",
+        "loudness_updated",
         "octave_updated",
         "fft_updated",
         "recording_progress",
@@ -77,6 +84,7 @@ def test_analysis_frame_signals_include_run_id_contract():
 
     assert _normalized_signal_argument_types(EventBus.stft_updated) == expected_argument_types
     assert _normalized_signal_argument_types(EventBus.spl_updated) == expected_argument_types
+    assert _normalized_signal_argument_types(EventBus.loudness_updated) == expected_argument_types
     assert _normalized_signal_argument_types(EventBus.octave_updated) == expected_argument_types
     assert _normalized_signal_argument_types(EventBus.fft_updated) == expected_argument_types
 
@@ -84,6 +92,7 @@ def test_analysis_frame_signals_include_run_id_contract():
 
     assert _normalized_signal_argument_types(EventBus.stft_updated) == expected_argument_types
     assert _normalized_signal_argument_types(EventBus.spl_updated) == expected_argument_types
+    assert _normalized_signal_argument_types(EventBus.loudness_updated) == expected_argument_types
     assert _normalized_signal_argument_types(EventBus.octave_updated) == expected_argument_types
     assert _normalized_signal_argument_types(EventBus.fft_updated) == expected_argument_types
 
@@ -105,9 +114,27 @@ def test_factory_mode_signals_exist():
         "factory_runtime_reanalysis_completed",
         "factory_state_changed",
         "factory_review_changed",
+        "factory_display_channel_changed",
         "factory_display_reset",
     ):
         assert hasattr(EventBus, name), f"Missing factory signal: {name}"
+
+
+def test_factory_display_channel_changed_signal_contract():
+    expected_argument_types = ("int", "int")
+
+    assert (
+        _normalized_signal_argument_types(EventBus.factory_display_channel_changed)
+        == expected_argument_types
+    )
+
+    bus = EventBus()
+    received = []
+    bus.factory_display_channel_changed.connect(lambda config_id, channel: received.append((config_id, channel)))
+
+    bus.factory_display_channel_changed.emit(101, 2)
+
+    assert received == [(101, 2)]
 
 
 def test_factory_runtime_payload_contract_includes_run_id():
@@ -423,3 +450,27 @@ def test_service_container_shutdown_closes_db_when_ai_shutdown_raises(monkeypatc
         services.shutdown()
 
     assert calls == ["ai_shutdown", "db_close"]
+
+
+def test_service_container_wires_config_package_service(monkeypatch):
+    monkeypatch.setattr(mod.DbConnectionService, "connect", lambda self: None)
+    monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
+    monkeypatch.setattr(mod, "InputCalibrationService", MagicMock(return_value=MagicMock()))
+    config_service = MagicMock()
+    ai_service = MagicMock()
+    config_package_service = MagicMock()
+    monkeypatch.setattr(mod, "ConfigService", MagicMock(return_value=config_service))
+    monkeypatch.setattr(mod, "AiService", MagicMock(return_value=ai_service))
+    monkeypatch.setattr(
+        mod,
+        "ConfigPackageService",
+        MagicMock(return_value=config_package_service),
+    )
+
+    services = mod.ServiceContainer()
+
+    mod.ConfigPackageService.assert_called_once_with(
+        config_service=config_service,
+        ai_service=ai_service,
+    )
+    assert services.config_package_service is config_package_service

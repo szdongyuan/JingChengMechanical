@@ -13,11 +13,23 @@ def _make_config(*, fft_limits=True, octave_limits=True):
         return {
             "channel_index": channel_index,
             "fft_nfft": 4096,
+            "spl_lower_enabled": True,
             "spl_lower_limit": 40.0,
+            "spl_upper_enabled": True,
             "spl_upper_limit": 80.0,
+            "spl_average_lower_enabled": True,
+            "spl_average_lower_limit": 40.0,
+            "spl_average_upper_enabled": True,
+            "spl_average_upper_limit": 80.0,
             "loudness_unit": "sone",
+            "loudness_lower_enabled": True,
             "loudness_lower_limit": 0.0,
+            "loudness_upper_enabled": True,
             "loudness_upper_limit": 10.0,
+            "loudness_average_lower_enabled": True,
+            "loudness_average_lower_limit": 0.0,
+            "loudness_average_upper_enabled": True,
+            "loudness_average_upper_limit": 10.0,
             "fft_band_limits": (
                 [{"freq": 1000.0, "lower": 40.0, "upper": 60.0}]
                 if fft_limits
@@ -49,8 +61,19 @@ def _make_judgment_payload():
                 "channel_index": 0,
                 "spl_db": 77.0,
                 "spl_pass": True,
+                "spl_min_db": 45.0,
+                "spl_max_db": 77.0,
+                "spl_average_db": 60.0,
+                "spl_average_pass": True,
+                "spl_trace_available": True,
+                "spl_trace_error_message": None,
+                "spl_average_available": True,
+                "spl_average_error_message": None,
+                "loudness_min_sone": 2.0,
                 "loudness_max_sone": 7.0,
+                "loudness_average_sone": 4.0,
                 "loudness_pass": True,
+                "loudness_average_pass": True,
                 "loudness_available": True,
                 "loudness_error_message": None,
                 "fft_available": True,
@@ -80,8 +103,19 @@ def _make_judgment_payload():
                 "channel_index": 1,
                 "spl_db": 86.0,
                 "spl_pass": False,
+                "spl_min_db": 45.0,
+                "spl_max_db": 86.0,
+                "spl_average_db": 84.0,
+                "spl_average_pass": False,
+                "spl_trace_available": True,
+                "spl_trace_error_message": None,
+                "spl_average_available": True,
+                "spl_average_error_message": None,
+                "loudness_min_sone": 2.0,
                 "loudness_max_sone": 12.0,
+                "loudness_average_sone": 9.0,
                 "loudness_pass": False,
+                "loudness_average_pass": False,
                 "loudness_available": True,
                 "loudness_error_message": None,
                 "fft_available": True,
@@ -277,7 +311,15 @@ def test_build_summary_payload_uses_worst_case_deviation_across_channels():
 
     assert summary["overall_status"] == "fail"
     assert summary["overall_label"] == "FAIL"
-    assert [row["label"] for row in summary["rows"]] == ["SPL", "Loudness", "FFT", "倍频程", "AI分析"]
+    assert [row["label"] for row in summary["rows"]] == [
+        "SPL",
+        "平均SPL",
+        "Loudness",
+        "平均Loudness",
+        "FFT",
+        "倍频程",
+        "AI分析",
+    ]
     assert summary["rows"][0]["label"] == "SPL"
     assert summary["rows"][0]["item_key"] == "spl"
     assert summary["rows"][0]["deviation_value"] == 6.0
@@ -288,6 +330,26 @@ def test_build_summary_payload_uses_worst_case_deviation_across_channels():
     assert summary["rows"][0]["constrained"] is True
 
 
+def test_build_summary_payload_uses_spl_min_for_lower_limit_deviation():
+    judgment_payload = _make_single_channel_judgment_payload(
+        spl_db=60.0,
+        spl_min_db=35.0,
+        spl_max_db=62.0,
+        spl_pass=False,
+    )
+
+    summary = build_summary_payload(
+        config=_make_single_channel_config(spl_lower_limit=40.0, spl_upper_limit=80.0),
+        judgment_payload=judgment_payload,
+    )
+
+    spl_row = summary["rows"][0]
+    assert summary["overall_status"] == "fail"
+    assert spl_row["deviation_value"] == 5.0
+    assert spl_row["deviation_display"] == "5 dB"
+    assert spl_row["status"] == "NG"
+
+
 def test_build_summary_payload_handles_bounded_pass_margin_and_exact_boundary():
     summary = build_summary_payload(
         config=_make_config(),
@@ -295,21 +357,31 @@ def test_build_summary_payload_handles_bounded_pass_margin_and_exact_boundary():
         ai_review={"status": "success", "threshold": 0.8, "score": 0.93},
     )
 
-    assert summary["rows"][1]["label"] == "Loudness"
-    assert summary["rows"][1]["deviation_value"] == 2.0
-    assert summary["rows"][1]["deviation_display"] == "2 sone"
+    assert summary["rows"][1]["label"] == "平均SPL"
+    assert summary["rows"][1]["deviation_value"] == 4.0
+    assert summary["rows"][1]["deviation_display"] == "4 dB"
     assert summary["rows"][1]["channel_label"] == "CH2"
     assert summary["rows"][1]["status"] == "NG"
-    assert summary["rows"][2]["label"] == "FFT"
-    assert summary["rows"][2]["deviation_value"] == -3.0
-    assert summary["rows"][2]["deviation_display"] == "-3 dB"
-    assert summary["rows"][2]["channel_label"] == "CH1"
-    assert summary["rows"][2]["status"] == "OK"
-    assert summary["rows"][3]["label"] == "倍频程"
-    assert summary["rows"][3]["deviation_value"] == 0.0
-    assert summary["rows"][3]["deviation_display"] == "0 dB"
-    assert summary["rows"][3]["channel_label"] == "CH1"
+    assert summary["rows"][2]["label"] == "Loudness"
+    assert summary["rows"][2]["deviation_value"] == 2.0
+    assert summary["rows"][2]["deviation_display"] == "2 sone"
+    assert summary["rows"][2]["channel_label"] == "CH2"
+    assert summary["rows"][2]["status"] == "NG"
+    assert summary["rows"][3]["label"] == "平均Loudness"
+    assert summary["rows"][3]["deviation_value"] == -1.0
+    assert summary["rows"][3]["deviation_display"] == "-1 sone"
+    assert summary["rows"][3]["channel_label"] == "CH2"
     assert summary["rows"][3]["status"] == "OK"
+    assert summary["rows"][4]["label"] == "FFT"
+    assert summary["rows"][4]["deviation_value"] == -3.0
+    assert summary["rows"][4]["deviation_display"] == "-3 dB"
+    assert summary["rows"][4]["channel_label"] == "CH1"
+    assert summary["rows"][4]["status"] == "OK"
+    assert summary["rows"][5]["label"] == "倍频程"
+    assert summary["rows"][5]["deviation_value"] == 0.0
+    assert summary["rows"][5]["deviation_display"] == "0 dB"
+    assert summary["rows"][5]["channel_label"] == "CH1"
+    assert summary["rows"][5]["status"] == "OK"
 
 
 def test_build_summary_payload_uses_ai_threshold_for_numeric_success():
@@ -377,8 +449,17 @@ def test_build_summary_payload_renders_unconstrained_rows_and_scoreless_success_
                     "channel_index": 0,
                     "spl_db": 70.0,
                     "spl_pass": True,
+                    "spl_min_db": 45.0,
+                    "spl_max_db": 70.0,
+                    "spl_average_db": 60.0,
+                    "spl_average_pass": True,
+                    "spl_trace_available": True,
+                    "spl_average_available": True,
+                    "loudness_min_sone": 2.0,
                     "loudness_max_sone": 5.0,
+                    "loudness_average_sone": 4.0,
                     "loudness_pass": True,
+                    "loudness_average_pass": True,
                     "loudness_available": True,
                     "loudness_error_message": None,
                     "fft_band_results": [],
@@ -388,8 +469,17 @@ def test_build_summary_payload_renders_unconstrained_rows_and_scoreless_success_
                     "channel_index": 1,
                     "spl_db": 71.0,
                     "spl_pass": True,
+                    "spl_min_db": 45.0,
+                    "spl_max_db": 71.0,
+                    "spl_average_db": 61.0,
+                    "spl_average_pass": True,
+                    "spl_trace_available": True,
+                    "spl_average_available": True,
+                    "loudness_min_sone": 2.0,
                     "loudness_max_sone": 6.0,
+                    "loudness_average_sone": 5.0,
                     "loudness_pass": True,
+                    "loudness_average_pass": True,
                     "loudness_available": True,
                     "loudness_error_message": None,
                     "fft_band_results": [],
@@ -401,23 +491,23 @@ def test_build_summary_payload_renders_unconstrained_rows_and_scoreless_success_
     )
 
     assert summary["overall_status"] == "no_result"
-    assert summary["rows"][1]["label"] == "Loudness"
-    assert summary["rows"][1]["status"] == "OK"
-    assert summary["rows"][1]["constrained"] is True
-    assert summary["rows"][2]["label"] == "FFT"
-    assert summary["rows"][2]["deviation_value"] is None
-    assert summary["rows"][2]["deviation_display"] == "--"
-    assert summary["rows"][2]["channel_index"] is None
-    assert summary["rows"][2]["channel_label"] == "--"
+    assert summary["rows"][2]["label"] == "Loudness"
     assert summary["rows"][2]["status"] == "OK"
-    assert summary["rows"][2]["constrained"] is False
-    assert summary["rows"][3]["label"] == "倍频程"
-    assert summary["rows"][3]["status"] == "OK"
-    assert summary["rows"][3]["deviation_display"] == "--"
-    assert summary["rows"][4]["label"] == "AI分析"
+    assert summary["rows"][2]["constrained"] is True
+    assert summary["rows"][4]["label"] == "FFT"
+    assert summary["rows"][4]["deviation_value"] is None
+    assert summary["rows"][4]["deviation_display"] == "--"
+    assert summary["rows"][4]["channel_index"] is None
     assert summary["rows"][4]["channel_label"] == "--"
-    assert summary["rows"][4]["status"] == "无结果"
-    assert summary["rows"][4]["constrained"] is True
+    assert summary["rows"][4]["status"] == "OK"
+    assert summary["rows"][4]["constrained"] is False
+    assert summary["rows"][5]["label"] == "倍频程"
+    assert summary["rows"][5]["status"] == "OK"
+    assert summary["rows"][5]["deviation_display"] == "--"
+    assert summary["rows"][6]["label"] == "AI分析"
+    assert summary["rows"][6]["channel_label"] == "--"
+    assert summary["rows"][6]["status"] == "无结果"
+    assert summary["rows"][6]["constrained"] is True
 
 
 @pytest.mark.parametrize("status", ["not_enabled", "not_configured", "disabled", "skipped"])
@@ -532,20 +622,20 @@ def test_build_summary_payload_marks_configured_octave_with_non_finite_actual_as
     assert summary["overall_status"] == "no_result"
     assert summary["overall_label"] == "无结果"
     assert summary["error_message"] == "分析结果不可用"
-    assert summary["rows"][3]["label"] == "倍频程"
-    assert summary["rows"][3]["deviation_value"] is None
-    assert summary["rows"][3]["deviation_display"] == "--"
-    assert summary["rows"][3]["channel_index"] is None
-    assert summary["rows"][3]["channel_label"] == "--"
-    assert summary["rows"][3]["status"] == "无结果"
-    assert summary["rows"][3]["constrained"] is True
+    assert summary["rows"][5]["label"] == "倍频程"
+    assert summary["rows"][5]["deviation_value"] is None
+    assert summary["rows"][5]["deviation_display"] == "--"
+    assert summary["rows"][5]["channel_index"] is None
+    assert summary["rows"][5]["channel_label"] == "--"
+    assert summary["rows"][5]["status"] == "无结果"
+    assert summary["rows"][5]["constrained"] is True
 
 
 @pytest.mark.parametrize(
     ("config_key", "result_key", "row_index", "label"),
     [
-        ("fft_band_limits", "fft_band_results", 2, "FFT"),
-        ("oct_band_limits", "oct_band_results", 3, "倍频程"),
+        ("fft_band_limits", "fft_band_results", 4, "FFT"),
+        ("oct_band_limits", "oct_band_results", 5, "倍频程"),
     ],
 )
 def test_build_summary_payload_marks_mixed_usable_and_non_finite_band_rows_as_no_result(
@@ -590,8 +680,8 @@ def test_build_summary_payload_marks_mixed_usable_and_non_finite_band_rows_as_no
 @pytest.mark.parametrize(
     ("config_key", "result_key", "row_index", "label"),
     [
-        ("fft_band_limits", "fft_band_results", 2, "FFT"),
-        ("oct_band_limits", "oct_band_results", 3, "倍频程"),
+        ("fft_band_limits", "fft_band_results", 4, "FFT"),
+        ("oct_band_limits", "oct_band_results", 5, "倍频程"),
     ],
 )
 def test_build_summary_payload_marks_mixed_usable_and_missing_band_rows_as_no_result(
@@ -651,13 +741,261 @@ def test_build_summary_payload_keeps_nearest_bin_fft_band_results_as_normal_row(
     assert summary["overall_status"] == "pass"
     assert summary["overall_label"] == "PASS"
     assert summary["error_message"] is None
-    assert summary["rows"][2]["label"] == "FFT"
-    assert summary["rows"][2]["deviation_value"] == -1.0
-    assert summary["rows"][2]["deviation_display"] == "-1 dB"
-    assert summary["rows"][2]["channel_index"] == 0
-    assert summary["rows"][2]["channel_label"] == "CH1"
-    assert summary["rows"][2]["status"] == "OK"
-    assert summary["rows"][2]["constrained"] is True
+    assert summary["rows"][4]["label"] == "FFT"
+    assert summary["rows"][4]["deviation_value"] == -1.0
+    assert summary["rows"][4]["deviation_display"] == "-1 dB"
+    assert summary["rows"][4]["channel_index"] == 0
+    assert summary["rows"][4]["channel_label"] == "CH1"
+    assert summary["rows"][4]["status"] == "OK"
+    assert summary["rows"][4]["constrained"] is True
+
+
+def test_build_summary_payload_orders_rows_and_marks_unconstrained_average_rows_ok():
+    summary = build_summary_payload(
+        config=_make_single_channel_config(
+            spl_average_lower_enabled=False,
+            spl_average_upper_enabled=False,
+            loudness_average_lower_enabled=False,
+            loudness_average_upper_enabled=False,
+            fft_band_limits=[],
+            oct_band_limits=[],
+        ),
+        judgment_payload=_make_single_channel_judgment_payload(
+            spl_db=70.0,
+            spl_min_db=45.0,
+            spl_max_db=70.0,
+            spl_pass=True,
+            spl_trace_available=True,
+            spl_average_db=None,
+            spl_average_pass=True,
+            spl_average_available=False,
+            spl_average_error_message="average spl unavailable",
+            loudness_min_sone=2.0,
+            loudness_max_sone=5.0,
+            loudness_average_sone=None,
+            loudness_pass=True,
+            loudness_average_pass=True,
+            loudness_available=True,
+            loudness_error_message="loudness backend unavailable",
+            fft_band_results=[],
+            oct_band_results=[],
+        ),
+        ai_review={"status": "not_enabled"},
+    )
+
+    assert [row["item_key"] for row in summary["rows"]] == [
+        "spl",
+        "spl_average",
+        "loudness",
+        "loudness_average",
+        "fft",
+        "octave",
+        "ai",
+    ]
+    assert summary["rows"][1]["label"] == "平均SPL"
+    assert summary["rows"][1]["status"] == "OK"
+    assert summary["rows"][1]["deviation_display"] == "--"
+    assert summary["rows"][1]["channel_label"] == "--"
+    assert summary["rows"][3]["label"] == "平均Loudness"
+    assert summary["rows"][3]["status"] == "OK"
+    assert summary["rows"][5]["deviation_display"] == "--"
+    assert summary["rows"][5]["channel_label"] == "--"
+    assert summary["overall_status"] == "pass"
+
+
+def test_build_summary_payload_marks_first_selected_blocking_average_row_no_result():
+    summary = build_summary_payload(
+        config={
+            "config_id": 101,
+            "selected_channels": [1, 0],
+            "channels": [
+                {
+                    "channel_index": 0,
+                    "spl_lower_enabled": False,
+                    "spl_upper_enabled": False,
+                    "spl_average_lower_enabled": True,
+                    "spl_average_lower_limit": 40.0,
+                    "spl_average_upper_enabled": True,
+                    "spl_average_upper_limit": 80.0,
+                    "loudness_unit": "sone",
+                    "loudness_lower_enabled": False,
+                    "loudness_upper_enabled": False,
+                    "loudness_average_lower_enabled": False,
+                    "loudness_average_upper_enabled": False,
+                    "fft_band_limits": [],
+                    "oct_band_limits": [],
+                },
+                {
+                    "channel_index": 1,
+                    "spl_lower_enabled": False,
+                    "spl_upper_enabled": False,
+                    "spl_average_lower_enabled": True,
+                    "spl_average_lower_limit": 40.0,
+                    "spl_average_upper_enabled": True,
+                    "spl_average_upper_limit": 80.0,
+                    "loudness_unit": "sone",
+                    "loudness_lower_enabled": False,
+                    "loudness_upper_enabled": False,
+                    "loudness_average_lower_enabled": False,
+                    "loudness_average_upper_enabled": False,
+                    "fft_band_limits": [],
+                    "oct_band_limits": [],
+                },
+            ],
+        },
+        judgment_payload={
+            "overall": "不合格",
+            "limit_pass": False,
+            "ai_pass": None,
+            "ai_score": None,
+            "analysis_window": (1.0, 3.0),
+            "channel_results": [
+                {
+                    "channel_index": 0,
+                    "spl_pass": True,
+                    "spl_trace_available": True,
+                    "spl_average_db": None,
+                    "spl_average_pass": None,
+                    "spl_average_available": False,
+                    "spl_average_error_message": "ch0 average spl missing",
+                    "loudness_available": True,
+                    "fft_band_results": [],
+                    "oct_band_results": [],
+                },
+                {
+                    "channel_index": 1,
+                    "spl_pass": True,
+                    "spl_trace_available": True,
+                    "spl_average_db": None,
+                    "spl_average_pass": None,
+                    "spl_average_available": False,
+                    "spl_average_error_message": "ch1 average spl missing",
+                    "loudness_available": True,
+                    "fft_band_results": [],
+                    "oct_band_results": [],
+                },
+            ],
+        },
+        ai_review={"status": "not_enabled"},
+    )
+
+    assert summary["overall_status"] == "no_result"
+    assert summary["error_message"] == "ch1 average spl missing"
+    assert summary["rows"][1]["item_key"] == "spl_average"
+    assert summary["rows"][1]["status"] == "无结果"
+    assert summary["rows"][1]["deviation_display"] == "--"
+    assert summary["rows"][1]["channel_index"] == 1
+    assert summary["rows"][1]["channel_label"] == "CH2"
+
+
+def test_build_summary_payload_uses_enabled_bounds_for_average_deviation_rules():
+    summary = build_summary_payload(
+        config={
+            "config_id": 101,
+            "selected_channels": [0, 1, 2, 3, 4],
+            "channels": [
+                {
+                    "channel_index": 0,
+                    "spl_lower_enabled": False,
+                    "spl_upper_enabled": False,
+                    "spl_average_lower_enabled": True,
+                    "spl_average_lower_limit": 50.0,
+                    "spl_average_upper_enabled": False,
+                    "loudness_unit": "sone",
+                    "loudness_lower_enabled": False,
+                    "loudness_upper_enabled": False,
+                    "loudness_average_lower_enabled": False,
+                    "loudness_average_upper_enabled": False,
+                    "fft_band_limits": [],
+                    "oct_band_limits": [],
+                },
+                {
+                    "channel_index": 1,
+                    "spl_lower_enabled": False,
+                    "spl_upper_enabled": False,
+                    "spl_average_lower_enabled": False,
+                    "spl_average_upper_enabled": True,
+                    "spl_average_upper_limit": 60.0,
+                    "loudness_unit": "sone",
+                    "loudness_lower_enabled": False,
+                    "loudness_upper_enabled": False,
+                    "loudness_average_lower_enabled": False,
+                    "loudness_average_upper_enabled": False,
+                    "fft_band_limits": [],
+                    "oct_band_limits": [],
+                },
+                {
+                    "channel_index": 2,
+                    "spl_lower_enabled": False,
+                    "spl_upper_enabled": False,
+                    "spl_average_lower_enabled": True,
+                    "spl_average_lower_limit": 45.0,
+                    "spl_average_upper_enabled": True,
+                    "spl_average_upper_limit": 55.0,
+                    "loudness_unit": "sone",
+                    "loudness_lower_enabled": False,
+                    "loudness_upper_enabled": False,
+                    "loudness_average_lower_enabled": False,
+                    "loudness_average_upper_enabled": False,
+                    "fft_band_limits": [],
+                    "oct_band_limits": [],
+                },
+                {
+                    "channel_index": 3,
+                    "spl_lower_enabled": False,
+                    "spl_upper_enabled": False,
+                    "spl_average_lower_enabled": True,
+                    "spl_average_lower_limit": 45.0,
+                    "spl_average_upper_enabled": True,
+                    "spl_average_upper_limit": 55.0,
+                    "loudness_unit": "sone",
+                    "loudness_lower_enabled": False,
+                    "loudness_upper_enabled": False,
+                    "loudness_average_lower_enabled": False,
+                    "loudness_average_upper_enabled": False,
+                    "fft_band_limits": [],
+                    "oct_band_limits": [],
+                },
+                {
+                    "channel_index": 4,
+                    "spl_lower_enabled": False,
+                    "spl_upper_enabled": False,
+                    "spl_average_lower_enabled": True,
+                    "spl_average_lower_limit": 45.0,
+                    "spl_average_upper_enabled": True,
+                    "spl_average_upper_limit": 55.0,
+                    "loudness_unit": "sone",
+                    "loudness_lower_enabled": False,
+                    "loudness_upper_enabled": False,
+                    "loudness_average_lower_enabled": False,
+                    "loudness_average_upper_enabled": False,
+                    "fft_band_limits": [],
+                    "oct_band_limits": [],
+                },
+            ],
+        },
+        judgment_payload={
+            "overall": "不合格",
+            "limit_pass": False,
+            "ai_pass": None,
+            "ai_score": None,
+            "analysis_window": (1.0, 3.0),
+            "channel_results": [
+                {"channel_index": 0, "spl_average_db": 48.0, "spl_average_pass": False, "spl_average_available": True, "loudness_available": True, "fft_band_results": [], "oct_band_results": []},
+                {"channel_index": 1, "spl_average_db": 63.0, "spl_average_pass": False, "spl_average_available": True, "loudness_available": True, "fft_band_results": [], "oct_band_results": []},
+                {"channel_index": 2, "spl_average_db": 45.0, "spl_average_pass": True, "spl_average_available": True, "loudness_available": True, "fft_band_results": [], "oct_band_results": []},
+                {"channel_index": 3, "spl_average_db": 61.0, "spl_average_pass": False, "spl_average_available": True, "loudness_available": True, "fft_band_results": [], "oct_band_results": []},
+                {"channel_index": 4, "spl_average_db": 50.0, "spl_average_pass": True, "spl_average_available": True, "loudness_available": True, "fft_band_results": [], "oct_band_results": []},
+            ],
+        },
+        ai_review={"status": "not_enabled"},
+    )
+
+    assert summary["rows"][1]["item_key"] == "spl_average"
+    assert summary["rows"][1]["status"] == "NG"
+    assert summary["rows"][1]["channel_index"] == 3
+    assert summary["rows"][1]["deviation_value"] == 6.0
+    assert summary["rows"][1]["deviation_display"] == "6 dB"
 
 
 def test_build_summary_payload_uses_canonical_sone_ranking_for_loudness_but_displays_in_selected_channel_unit():
@@ -668,21 +1006,37 @@ def test_build_summary_payload_uses_canonical_sone_ranking_for_loudness_but_disp
             "channels": [
                 {
                     "channel_index": 0,
+                    "spl_lower_enabled": True,
                     "spl_lower_limit": 40.0,
+                    "spl_upper_enabled": True,
                     "spl_upper_limit": 80.0,
+                    "loudness_lower_enabled": True,
                     "loudness_unit": "sone",
                     "loudness_lower_limit": 0.0,
+                    "loudness_upper_enabled": True,
                     "loudness_upper_limit": 6.0,
+                    "loudness_average_lower_enabled": True,
+                    "loudness_average_lower_limit": 0.0,
+                    "loudness_average_upper_enabled": True,
+                    "loudness_average_upper_limit": 6.0,
                     "fft_band_limits": [],
                     "oct_band_limits": [],
                 },
                 {
                     "channel_index": 1,
+                    "spl_lower_enabled": True,
                     "spl_lower_limit": 40.0,
+                    "spl_upper_enabled": True,
                     "spl_upper_limit": 80.0,
                     "loudness_unit": "phon",
+                    "loudness_lower_enabled": True,
                     "loudness_lower_limit": 20.0,
+                    "loudness_upper_enabled": True,
                     "loudness_upper_limit": 40.0,
+                    "loudness_average_lower_enabled": True,
+                    "loudness_average_lower_limit": 20.0,
+                    "loudness_average_upper_enabled": True,
+                    "loudness_average_upper_limit": 40.0,
                     "fft_band_limits": [],
                     "oct_band_limits": [],
                 },
@@ -699,8 +1053,12 @@ def test_build_summary_payload_uses_canonical_sone_ranking_for_loudness_but_disp
                     "channel_index": 0,
                     "spl_db": 70.0,
                     "spl_pass": True,
+                    "spl_trace_available": True,
+                    "spl_average_available": True,
                     "loudness_max_sone": 6.5,
+                    "loudness_average_sone": 6.5,
                     "loudness_pass": False,
+                    "loudness_average_pass": False,
                     "loudness_available": True,
                     "loudness_error_message": None,
                     "fft_band_results": [],
@@ -710,8 +1068,12 @@ def test_build_summary_payload_uses_canonical_sone_ranking_for_loudness_but_disp
                     "channel_index": 1,
                     "spl_db": 70.0,
                     "spl_pass": True,
+                    "spl_trace_available": True,
+                    "spl_average_available": True,
                     "loudness_max_sone": 2.0,
+                    "loudness_average_sone": 2.0,
                     "loudness_pass": False,
+                    "loudness_average_pass": False,
                     "loudness_available": True,
                     "loudness_error_message": None,
                     "fft_band_results": [],
@@ -722,12 +1084,35 @@ def test_build_summary_payload_uses_canonical_sone_ranking_for_loudness_but_disp
         ai_review={"status": "not_enabled"},
     )
 
-    assert summary["rows"][1]["label"] == "Loudness"
-    assert summary["rows"][1]["channel_index"] == 1
-    assert summary["rows"][1]["channel_label"] == "CH2"
-    assert summary["rows"][1]["status"] == "NG"
-    assert summary["rows"][1]["deviation_value"] == pytest.approx(10.0)
-    assert summary["rows"][1]["deviation_display"] == "10 phon"
+    assert summary["rows"][2]["label"] == "Loudness"
+    assert summary["rows"][2]["channel_index"] == 1
+    assert summary["rows"][2]["channel_label"] == "CH2"
+    assert summary["rows"][2]["status"] == "NG"
+    assert summary["rows"][2]["deviation_value"] == pytest.approx(10.0)
+    assert summary["rows"][2]["deviation_display"] == "10 phon"
+
+
+def test_build_summary_payload_uses_loudness_min_for_lower_limit_deviation():
+    summary = build_summary_payload(
+        config=_make_single_channel_config(
+            loudness_unit="sone",
+            loudness_lower_limit=5.0,
+            loudness_upper_limit=10.0,
+        ),
+        judgment_payload=_make_single_channel_judgment_payload(
+            loudness_min_sone=1.0,
+            loudness_max_sone=8.0,
+            loudness_pass=False,
+            loudness_available=True,
+        ),
+        ai_review={"status": "not_enabled"},
+    )
+
+    loudness_row = summary["rows"][2]
+    assert summary["overall_status"] == "fail"
+    assert loudness_row["deviation_value"] == 4.0
+    assert loudness_row["deviation_display"] == "4 sone"
+    assert loudness_row["status"] == "NG"
 
 
 def test_build_summary_payload_marks_loudness_row_no_result_from_serialized_judgment():
@@ -744,8 +1129,14 @@ def test_build_summary_payload_marks_loudness_row_no_result_from_serialized_judg
                     "channel_index": 0,
                     "spl_db": 70.0,
                     "spl_pass": True,
+                    "spl_trace_available": True,
+                    "spl_average_db": 60.0,
+                    "spl_average_pass": True,
+                    "spl_average_available": True,
                     "loudness_max_sone": 5.0,
+                    "loudness_average_sone": 4.0,
                     "loudness_pass": True,
+                    "loudness_average_pass": True,
                     "loudness_available": True,
                     "loudness_error_message": None,
                     "fft_band_results": [],
@@ -755,8 +1146,14 @@ def test_build_summary_payload_marks_loudness_row_no_result_from_serialized_judg
                     "channel_index": 1,
                     "spl_db": 72.0,
                     "spl_pass": True,
+                    "spl_trace_available": True,
+                    "spl_average_db": 61.0,
+                    "spl_average_pass": True,
+                    "spl_average_available": True,
                     "loudness_max_sone": None,
+                    "loudness_average_sone": None,
                     "loudness_pass": None,
+                    "loudness_average_pass": None,
                     "loudness_available": False,
                     "loudness_error_message": "MoSQITo unavailable",
                     "fft_band_results": [],
@@ -770,10 +1167,10 @@ def test_build_summary_payload_marks_loudness_row_no_result_from_serialized_judg
     assert summary["overall_status"] == "no_result"
     assert summary["overall_label"] == "无结果"
     assert summary["error_message"] == "MoSQITo unavailable"
-    assert summary["rows"][1]["label"] == "Loudness"
-    assert summary["rows"][1]["deviation_display"] == "--"
-    assert summary["rows"][1]["status"] == "无结果"
-    assert summary["rows"][1]["constrained"] is True
+    assert summary["rows"][2]["label"] == "Loudness"
+    assert summary["rows"][2]["deviation_display"] == "--"
+    assert summary["rows"][2]["status"] == "无结果"
+    assert summary["rows"][4]["constrained"] is True
 
 
 def test_build_summary_payload_preserves_loudness_partial_no_result_after_backend_failure_serialization():
@@ -790,8 +1187,14 @@ def test_build_summary_payload_preserves_loudness_partial_no_result_after_backen
                     "channel_index": 0,
                     "spl_db": 70.0,
                     "spl_pass": True,
+                    "spl_trace_available": True,
+                    "spl_average_db": 60.0,
+                    "spl_average_pass": True,
+                    "spl_average_available": True,
                     "loudness_max_sone": 5.0,
+                    "loudness_average_sone": 4.0,
                     "loudness_pass": True,
+                    "loudness_average_pass": True,
                     "loudness_available": True,
                     "loudness_error_message": None,
                     "fft_band_results": [],
@@ -801,8 +1204,14 @@ def test_build_summary_payload_preserves_loudness_partial_no_result_after_backen
                     "channel_index": 1,
                     "spl_db": 72.0,
                     "spl_pass": True,
+                    "spl_trace_available": True,
+                    "spl_average_db": 61.0,
+                    "spl_average_pass": True,
+                    "spl_average_available": True,
                     "loudness_max_sone": None,
+                    "loudness_average_sone": None,
                     "loudness_pass": None,
+                    "loudness_average_pass": None,
                     "loudness_available": False,
                     "loudness_error_message": "backend failed",
                     "fft_band_results": [],
@@ -814,7 +1223,7 @@ def test_build_summary_payload_preserves_loudness_partial_no_result_after_backen
     )
 
     assert summary["overall_status"] == "no_result"
-    assert summary["rows"][1]["status"] == "无结果"
+    assert summary["rows"][2]["status"] == "无结果"
     assert summary["error_message"] == "backend failed"
 
 
@@ -826,11 +1235,19 @@ def test_build_summary_payload_keeps_loudness_row_ng_when_serialized_loudness_pa
             "channels": [
                 {
                     "channel_index": 0,
+                    "spl_lower_enabled": True,
                     "spl_lower_limit": 40.0,
+                    "spl_upper_enabled": True,
                     "spl_upper_limit": 80.0,
                     "loudness_unit": "sone",
+                    "loudness_lower_enabled": True,
                     "loudness_lower_limit": 0.0,
+                    "loudness_upper_enabled": True,
                     "loudness_upper_limit": 10.0,
+                    "loudness_average_lower_enabled": True,
+                    "loudness_average_lower_limit": 0.0,
+                    "loudness_average_upper_enabled": True,
+                    "loudness_average_upper_limit": 10.0,
                     "fft_band_limits": [],
                     "oct_band_limits": [],
                 }
@@ -847,8 +1264,14 @@ def test_build_summary_payload_keeps_loudness_row_ng_when_serialized_loudness_pa
                     "channel_index": 0,
                     "spl_db": 70.0,
                     "spl_pass": True,
+                    "spl_trace_available": True,
+                    "spl_average_db": 60.0,
+                    "spl_average_pass": True,
+                    "spl_average_available": True,
                     "loudness_max_sone": 5.0,
+                    "loudness_average_sone": 5.0,
                     "loudness_pass": False,
+                    "loudness_average_pass": False,
                     "loudness_available": True,
                     "loudness_error_message": None,
                     "fft_band_results": [],
@@ -862,11 +1285,11 @@ def test_build_summary_payload_keeps_loudness_row_ng_when_serialized_loudness_pa
     assert summary["overall_status"] == "fail"
     assert summary["overall_label"] == "FAIL"
     assert summary["error_message"] is None
-    assert summary["rows"][1]["label"] == "Loudness"
-    assert summary["rows"][1]["deviation_value"] == -5.0
-    assert summary["rows"][1]["deviation_display"] == "-5 sone"
-    assert summary["rows"][1]["status"] == "NG"
-    assert summary["rows"][1]["channel_label"] == "CH1"
+    assert summary["rows"][2]["label"] == "Loudness"
+    assert summary["rows"][2]["deviation_value"] == -5.0
+    assert summary["rows"][2]["deviation_display"] == "-5 sone"
+    assert summary["rows"][2]["status"] == "NG"
+    assert summary["rows"][2]["channel_label"] == "CH1"
 
 
 def test_build_summary_payload_ranks_loudness_using_unrounded_raw_canonical_deviation():
@@ -877,21 +1300,37 @@ def test_build_summary_payload_ranks_loudness_using_unrounded_raw_canonical_devi
             "channels": [
                 {
                     "channel_index": 0,
+                    "spl_lower_enabled": True,
                     "spl_lower_limit": 40.0,
+                    "spl_upper_enabled": True,
                     "spl_upper_limit": 80.0,
                     "loudness_unit": "sone",
+                    "loudness_lower_enabled": True,
                     "loudness_lower_limit": 0.0,
+                    "loudness_upper_enabled": True,
                     "loudness_upper_limit": 10.0,
+                    "loudness_average_lower_enabled": True,
+                    "loudness_average_lower_limit": 0.0,
+                    "loudness_average_upper_enabled": True,
+                    "loudness_average_upper_limit": 10.0,
                     "fft_band_limits": [],
                     "oct_band_limits": [],
                 },
                 {
                     "channel_index": 1,
+                    "spl_lower_enabled": True,
                     "spl_lower_limit": 40.0,
+                    "spl_upper_enabled": True,
                     "spl_upper_limit": 80.0,
                     "loudness_unit": "sone",
+                    "loudness_lower_enabled": True,
                     "loudness_lower_limit": 0.0,
+                    "loudness_upper_enabled": True,
                     "loudness_upper_limit": 10.0,
+                    "loudness_average_lower_enabled": True,
+                    "loudness_average_lower_limit": 0.0,
+                    "loudness_average_upper_enabled": True,
+                    "loudness_average_upper_limit": 10.0,
                     "fft_band_limits": [],
                     "oct_band_limits": [],
                 },
@@ -908,8 +1347,14 @@ def test_build_summary_payload_ranks_loudness_using_unrounded_raw_canonical_devi
                     "channel_index": 0,
                     "spl_db": 70.0,
                     "spl_pass": True,
+                    "spl_trace_available": True,
+                    "spl_average_db": 60.0,
+                    "spl_average_pass": True,
+                    "spl_average_available": True,
                     "loudness_max_sone": 9.9999994,
+                    "loudness_average_sone": 9.9999994,
                     "loudness_pass": True,
+                    "loudness_average_pass": True,
                     "loudness_available": True,
                     "loudness_error_message": None,
                     "fft_band_results": [],
@@ -919,8 +1364,14 @@ def test_build_summary_payload_ranks_loudness_using_unrounded_raw_canonical_devi
                     "channel_index": 1,
                     "spl_db": 70.0,
                     "spl_pass": True,
+                    "spl_trace_available": True,
+                    "spl_average_db": 60.0,
+                    "spl_average_pass": True,
+                    "spl_average_available": True,
                     "loudness_max_sone": 9.99999949,
+                    "loudness_average_sone": 9.99999949,
                     "loudness_pass": True,
+                    "loudness_average_pass": True,
                     "loudness_available": True,
                     "loudness_error_message": None,
                     "fft_band_results": [],
@@ -932,15 +1383,97 @@ def test_build_summary_payload_ranks_loudness_using_unrounded_raw_canonical_devi
     )
 
     assert summary["overall_status"] == "pass"
-    assert summary["rows"][1]["label"] == "Loudness"
-    assert summary["rows"][1]["channel_index"] == 1
-    assert summary["rows"][1]["channel_label"] == "CH2"
-    assert summary["rows"][1]["deviation_value"] == -1e-06
-    assert summary["rows"][1]["deviation_display"] == "-1e-06 sone"
-    assert summary["rows"][1]["status"] == "OK"
+    assert summary["rows"][2]["label"] == "Loudness"
+    assert summary["rows"][2]["channel_index"] == 1
+    assert summary["rows"][2]["channel_label"] == "CH2"
+    assert summary["rows"][2]["deviation_value"] == -1e-06
+    assert summary["rows"][2]["deviation_display"] == "-1e-06 sone"
+    assert summary["rows"][4]["status"] == "OK"
 
 
-def test_build_summary_payload_renders_five_no_result_rows_for_full_no_result():
+def test_build_summary_payload_uses_canonical_sone_ranking_for_average_loudness_but_displays_in_selected_channel_unit():
+    summary = build_summary_payload(
+        config={
+            "config_id": 101,
+            "selected_channels": [0, 1],
+            "channels": [
+                {
+                    "channel_index": 0,
+                    "spl_lower_enabled": False,
+                    "spl_upper_enabled": False,
+                    "spl_average_lower_enabled": False,
+                    "spl_average_upper_enabled": False,
+                    "loudness_unit": "sone",
+                    "loudness_lower_enabled": False,
+                    "loudness_upper_enabled": False,
+                    "loudness_average_lower_enabled": True,
+                    "loudness_average_lower_limit": 0.0,
+                    "loudness_average_upper_enabled": True,
+                    "loudness_average_upper_limit": 6.0,
+                    "fft_band_limits": [],
+                    "oct_band_limits": [],
+                },
+                {
+                    "channel_index": 1,
+                    "spl_lower_enabled": False,
+                    "spl_upper_enabled": False,
+                    "spl_average_lower_enabled": False,
+                    "spl_average_upper_enabled": False,
+                    "loudness_unit": "phon",
+                    "loudness_lower_enabled": False,
+                    "loudness_upper_enabled": False,
+                    "loudness_average_lower_enabled": True,
+                    "loudness_average_lower_limit": 20.0,
+                    "loudness_average_upper_enabled": True,
+                    "loudness_average_upper_limit": 40.0,
+                    "fft_band_limits": [],
+                    "oct_band_limits": [],
+                },
+            ],
+        },
+        judgment_payload={
+            "overall": "不合格",
+            "limit_pass": False,
+            "ai_pass": None,
+            "ai_score": None,
+            "analysis_window": (1.0, 3.0),
+            "channel_results": [
+                {
+                    "channel_index": 0,
+                    "spl_trace_available": True,
+                    "spl_average_available": True,
+                    "loudness_average_sone": 6.5,
+                    "loudness_average_pass": False,
+                    "loudness_available": True,
+                    "loudness_error_message": None,
+                    "fft_band_results": [],
+                    "oct_band_results": [],
+                },
+                {
+                    "channel_index": 1,
+                    "spl_trace_available": True,
+                    "spl_average_available": True,
+                    "loudness_average_sone": 2.0,
+                    "loudness_average_pass": False,
+                    "loudness_available": True,
+                    "loudness_error_message": None,
+                    "fft_band_results": [],
+                    "oct_band_results": [],
+                },
+            ],
+        },
+        ai_review={"status": "not_enabled"},
+    )
+
+    assert summary["rows"][3]["label"] == "平均Loudness"
+    assert summary["rows"][3]["channel_index"] == 1
+    assert summary["rows"][3]["channel_label"] == "CH2"
+    assert summary["rows"][3]["status"] == "NG"
+    assert summary["rows"][3]["deviation_value"] == pytest.approx(10.0)
+    assert summary["rows"][3]["deviation_display"] == "10 phon"
+
+
+def test_build_summary_payload_renders_seven_no_result_rows_for_full_no_result():
     summary = build_summary_payload(
         config=_make_config(),
         judgment_payload=None,
@@ -950,8 +1483,25 @@ def test_build_summary_payload_renders_five_no_result_rows_for_full_no_result():
     assert summary["overall_status"] == "no_result"
     assert summary["overall_label"] == "无结果"
     assert summary["error_message"] == "analysis window not fully captured"
-    assert [row["label"] for row in summary["rows"]] == ["SPL", "Loudness", "FFT", "倍频程", "AI分析"]
-    assert len(summary["rows"]) == 5
+    assert [row["item_key"] for row in summary["rows"]] == [
+        "spl",
+        "spl_average",
+        "loudness",
+        "loudness_average",
+        "fft",
+        "octave",
+        "ai",
+    ]
+    assert [row["label"] for row in summary["rows"]] == [
+        "SPL",
+        "平均SPL",
+        "Loudness",
+        "平均Loudness",
+        "FFT",
+        "倍频程",
+        "AI分析",
+    ]
+    assert len(summary["rows"]) == 7
     assert all(row["status"] == "无结果" for row in summary["rows"])
     assert all(row["deviation_display"] == "--" for row in summary["rows"])
     assert all(row["channel_label"] == "--" for row in summary["rows"])
@@ -960,8 +1510,8 @@ def test_build_summary_payload_renders_five_no_result_rows_for_full_no_result():
 @pytest.mark.parametrize(
     ("config_key", "result_key", "available_key", "error_key", "row_index", "label"),
     [
-        ("fft_band_limits", "fft_band_results", "fft_available", "fft_error_message", 2, "FFT"),
-        ("oct_band_limits", "oct_band_results", "octave_available", "octave_error_message", 3, "倍频程"),
+        ("fft_band_limits", "fft_band_results", "fft_available", "fft_error_message", 4, "FFT"),
+        ("oct_band_limits", "oct_band_results", "octave_available", "octave_error_message", 5, "倍频程"),
     ],
 )
 def test_build_summary_payload_treats_serialized_band_availability_as_authoritative_no_result(
@@ -1161,6 +1711,36 @@ def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch
         "actual_db": 57.0,
         "passed": False,
     }
+
+
+def test_build_chart_payload_emits_null_limits_when_spl_and_loudness_bounds_are_disabled(monkeypatch):
+    _patch_basic_chart_backends(monkeypatch)
+
+    payload = build_chart_payload(
+        buffer=np.full((200, 1), 0.1, dtype=np.float32),
+        config=_make_single_channel_config(
+            spl_lower_enabled=False,
+            spl_upper_enabled=False,
+            loudness_lower_enabled=False,
+            loudness_upper_enabled=False,
+            fft_band_limits=[],
+            oct_band_limits=[],
+        ),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.0, 2.0),
+        judgment_payload=_make_single_channel_judgment_payload(
+            spl_trace_available=True,
+            loudness_available=True,
+            fft_band_results=[],
+            oct_band_results=[],
+        ),
+    )
+
+    assert payload[0]["spl"]["lower_limit_db"] is None
+    assert payload[0]["spl"]["upper_limit_db"] is None
+    assert payload[0]["loudness"]["lower_limit"] is None
+    assert payload[0]["loudness"]["upper_limit"] is None
 
 
 def test_build_chart_payload_spl_omits_trailing_partial_tail_for_a_weighted_series():

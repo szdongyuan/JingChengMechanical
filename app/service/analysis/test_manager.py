@@ -39,6 +39,12 @@ class TestManager(QObject):
         self._canceled_factory_start_requests: set[str] = set()
         self._analyzing_sessions: set[int] = set()
         self._accepted_factory_stops: set[int] = set()
+        self._live_loudness_channel_by_config_id: dict[int, int] = {}
+
+        display_channel_signal = getattr(self._bus, "factory_display_channel_changed", None)
+        connect = getattr(display_channel_signal, "connect", None)
+        if callable(connect):
+            connect(self._on_factory_display_channel_changed)
 
     def start(self, workorder: dict, *, on_start_accepted=None) -> bool:
         """Start a test for the config_id in the workorder."""
@@ -112,6 +118,7 @@ class TestManager(QObject):
 
         session._sample_rate = recorder._sample_rate
         session._setup_pipelines()
+        self._apply_stored_live_loudness_channel(session, config)
 
         session._chunk_conn = session._on_chunk
         session._done_lambda = lambda cid=config_id: self._on_recording_done(cid)
@@ -211,6 +218,59 @@ class TestManager(QObject):
             f"[TestManager] started config={config_id}, workorder={session_workorder}"
         )
         return True
+
+    def _on_factory_display_channel_changed(self, config_id, channel_index) -> None:
+        normalized_config_id = self._as_non_bool_int(config_id)
+        normalized_channel = self._as_non_bool_int(channel_index)
+        if normalized_config_id is None or normalized_channel is None:
+            return
+
+        self._live_loudness_channel_by_config_id[normalized_config_id] = normalized_channel
+        session = self._sessions.get(normalized_config_id)
+        if session is None:
+            return
+        if not self._channel_is_selected_for_session(session, normalized_channel):
+            return
+        setter = getattr(session, "set_live_loudness_channel_index", None)
+        if callable(setter):
+            setter(normalized_channel)
+
+    def _apply_stored_live_loudness_channel(self, session, config: dict) -> None:
+        stored_channel = self._live_loudness_channel_by_config_id.get(
+            self._as_non_bool_int(config.get("config_id"))
+        )
+        if stored_channel is None:
+            return
+        if stored_channel not in self._selected_channels(config):
+            return
+        setter = getattr(session, "set_live_loudness_channel_index", None)
+        if callable(setter):
+            setter(stored_channel)
+
+    @staticmethod
+    def _channel_is_selected_for_session(session, channel_index: int) -> bool:
+        config = getattr(session, "_config", None)
+        if not isinstance(config, dict):
+            return False
+        return channel_index in TestManager._selected_channels(config)
+
+    @staticmethod
+    def _selected_channels(config: dict) -> set[int]:
+        selected_channels = set()
+        for channel in config.get("selected_channels", []) or ():
+            normalized_channel = TestManager._as_non_bool_int(channel)
+            if normalized_channel is not None:
+                selected_channels.add(normalized_channel)
+        return selected_channels
+
+    @staticmethod
+    def _as_non_bool_int(value) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     def cancel_pending_start(self, *, request_id: str, config_id: int | None = None) -> bool:
         if not request_id:

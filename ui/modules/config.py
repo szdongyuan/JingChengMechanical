@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
 )
 
 from model.plc_table import PlcTable
+from ui.popups import config_package_dialogs
 from ui.popups.golden_sample_import_dialog import GoldenSampleImportDialog
 from ui.widgets.cards import Card
 from ui.widgets.collapsible_group_box import CollapsibleGroupBox
@@ -76,6 +77,109 @@ class _NoWheelPlainTextEdit(QPlainTextEdit):
 
     def wheelEvent(self, event: QWheelEvent):
         event.ignore()
+
+
+def _numeric_value(data: dict | None, key: str) -> float:
+    value = data.get(key, _LIMIT_DEFAULTS[key]) if data else _LIMIT_DEFAULTS[key]
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else _LIMIT_DEFAULTS[key]
+
+
+def _checked_value(data: dict | None, key: str) -> bool:
+    return bool(data.get(key, _LIMIT_DEFAULTS[key])) if data else bool(_LIMIT_DEFAULTS[key])
+
+
+def _create_limit_spinbox(
+    *,
+    object_name: str,
+    value: float,
+    minimum: float,
+    maximum: float,
+    decimals: int = 1,
+    suffix: str = "",
+) -> _NoWheelSpinBox:
+    spinbox = _NoWheelSpinBox()
+    spinbox.setObjectName(object_name)
+    spinbox.setRange(minimum, maximum)
+    spinbox.setDecimals(decimals)
+    if suffix:
+        spinbox.setSuffix(suffix)
+    spinbox.setValue(float(value))
+    return spinbox
+
+
+def _create_limit_checkbox(*, object_name: str, checked: bool, label: str) -> QCheckBox:
+    checkbox = QCheckBox(label)
+    checkbox.setObjectName(object_name)
+    checkbox.setChecked(bool(checked))
+    return checkbox
+
+
+def _create_limit_row(
+    *,
+    data: dict | None,
+    lower_enabled_key: str,
+    lower_value_key: str,
+    upper_enabled_key: str,
+    upper_value_key: str,
+    minimum: float,
+    maximum: float,
+    decimals: int = 1,
+    suffix: str = "",
+) -> QWidget:
+    row = QWidget()
+    layout = QHBoxLayout(row)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(8)
+    lower_enabled = _create_limit_checkbox(
+        object_name=lower_enabled_key,
+        checked=_checked_value(data, lower_enabled_key),
+        label="下限",
+    )
+    lower_value = _create_limit_spinbox(
+        object_name=lower_value_key,
+        value=_numeric_value(data, lower_value_key),
+        minimum=minimum,
+        maximum=maximum,
+        decimals=decimals,
+        suffix=suffix,
+    )
+    upper_enabled = _create_limit_checkbox(
+        object_name=upper_enabled_key,
+        checked=_checked_value(data, upper_enabled_key),
+        label="上限",
+    )
+    upper_value = _create_limit_spinbox(
+        object_name=upper_value_key,
+        value=_numeric_value(data, upper_value_key),
+        minimum=minimum,
+        maximum=maximum,
+        decimals=decimals,
+        suffix=suffix,
+    )
+    for widget in (lower_enabled, lower_value, upper_enabled, upper_value):
+        layout.addWidget(widget)
+    layout.addStretch(1)
+    return row
+
+
+_LIMIT_DEFAULTS = {
+    "spl_lower_enabled": False,
+    "spl_lower_limit": 40.0,
+    "spl_upper_enabled": False,
+    "spl_upper_limit": 85.0,
+    "spl_average_lower_enabled": False,
+    "spl_average_lower_limit": 40.0,
+    "spl_average_upper_enabled": False,
+    "spl_average_upper_limit": 85.0,
+    "loudness_lower_enabled": False,
+    "loudness_lower_limit": 0.0,
+    "loudness_upper_enabled": False,
+    "loudness_upper_limit": 60.0,
+    "loudness_average_lower_enabled": False,
+    "loudness_average_lower_limit": 0.0,
+    "loudness_average_upper_enabled": False,
+    "loudness_average_upper_limit": 60.0,
+}
 
 
 class _FloatDelegate(QStyledItemDelegate):
@@ -140,8 +244,12 @@ class ConfigModule(QWidget):
         self.btn_new.setObjectName("Primary")
         self.btn_delete = QPushButton("删除")
         self.btn_delete.setObjectName("Danger")
+        self.btn_import = QPushButton("导入")
+        self.btn_export = QPushButton("导出")
         btn_lay.addWidget(self.btn_new)
         btn_lay.addWidget(self.btn_delete)
+        btn_lay.addWidget(self.btn_import)
+        btn_lay.addWidget(self.btn_export)
         left_lay.addWidget(btn_row)
 
         self.config_list = QListWidget()
@@ -279,10 +387,6 @@ class ConfigModule(QWidget):
         self.spin_ai_timeout.setValue(0)
         ab_lay.addRow("超时(ms)", self.spin_ai_timeout)
 
-        self.txt_ai_params = _NoWheelPlainTextEdit()
-        self.txt_ai_params.setPlaceholderText('{"key": "value"}')
-        self.txt_ai_params.setMaximumHeight(80)
-        ab_lay.addRow("参数(JSON)", self.txt_ai_params)
 
         scroll_lay.addWidget(Card("AI 工具链绑定", ai_bind_form))
 
@@ -363,6 +467,8 @@ class ConfigModule(QWidget):
     def _connect_signals(self):
         self.btn_new.clicked.connect(self._on_new)
         self.btn_delete.clicked.connect(self._on_delete)
+        self.btn_import.clicked.connect(self._on_import_package)
+        self.btn_export.clicked.connect(self._on_export_package)
         self.btn_save.clicked.connect(self._on_save)
         self.config_list.currentItemChanged.connect(self._on_item_changed)
         self.combo_input_dev.currentIndexChanged.connect(self._on_input_device_changed)
@@ -372,7 +478,6 @@ class ConfigModule(QWidget):
         self.chk_ai_enabled.toggled.connect(self._mark_ai_binding_dirty)
         self.combo_ai_toolchain.currentIndexChanged.connect(self._mark_ai_binding_dirty)
         self.spin_ai_timeout.valueChanged.connect(self._mark_ai_binding_dirty)
-        self.txt_ai_params.textChanged.connect(self._mark_ai_binding_dirty)
         self.services.bus.refresh_channels.connect(self._on_hardware_changed)
         ai_toolchains_changed = getattr(
             self.services.bus,
@@ -403,11 +508,12 @@ class ConfigModule(QWidget):
 
         for dev in devices:
             hostapi_idx = dev.get("hostapi", 0)
-            api_name = hostapi_names.get(hostapi_idx, "N/A")
-            label = f"{dev.get('name', '?')} ({api_name})"
+            hostapi_value = hostapi_names.get(hostapi_idx, "N/A")
+            hostapi_display = "未知" if hostapi_value == "N/A" else hostapi_value
+            label = f"{dev.get('name', '?')} ({hostapi_display})"
             dev_info = {
                 "name": dev.get("name", ""),
-                "hostapi": api_name,
+                "hostapi": hostapi_value,
                 "default_samplerate": dev.get("default_samplerate"),
                 "max_input_channels": dev.get("max_input_channels", 0),
                 "max_output_channels": dev.get("max_output_channels", 0),
@@ -835,9 +941,9 @@ class ConfigModule(QWidget):
     def _on_import_golden_sample(self, channel_index: int) -> None:
         source_path, _ = QFileDialog.getOpenFileName(
             self,
-            "选择 Golden Sample WAV",
+            "选择黄金样本 WAV",
             "",
-            "WAV Files (*.wav)",
+            "WAV 文件 (*.wav)",
         )
         if not source_path:
             return
@@ -878,13 +984,13 @@ class ConfigModule(QWidget):
     # ── Channel tab building ────────────────────────────────
 
     def _build_channel_tabs(self, channel_indices: list[int], channel_data: list[dict] | None = None):
-        # Clear previous tab buttons and stretch
+        # Remove previous tab buttons and stretch
         while self._channel_tab_bar_lay.count():
             item = self._channel_tab_bar_lay.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
         self._channel_tab_buttons = []
-        # Clear stack
+        # Remove stack widgets
         while self.channel_stack.count():
             w = self.channel_stack.widget(0)
             self.channel_stack.removeWidget(w)
@@ -908,7 +1014,7 @@ class ConfigModule(QWidget):
 
         for page_idx, ch_idx in enumerate(channel_indices):
             ch = ch_data_map.get(ch_idx)
-            btn = QPushButton(f"In{ch_idx + 1} (通道 {ch_idx + 1})")
+            btn = QPushButton(f"输入{ch_idx + 1}（通道 {ch_idx + 1}）")
             btn.setCheckable(True)
             btn.clicked.connect(lambda _checked, idx=page_idx: self._on_channel_tab_clicked(idx))
             self._channel_tab_bar_lay.addWidget(btn)
@@ -967,8 +1073,8 @@ class ConfigModule(QWidget):
         stft.add_widget(stft_form)
         lay.addWidget(stft)
 
-        # SPL section
-        spl = CollapsibleGroupBox("SPL 参数", section_id="spl")
+        # Sound pressure section
+        spl = CollapsibleGroupBox("声压级参数", section_id="spl")
         spl_form = QWidget()
         sp_lay = QFormLayout(spl_form)
         sp_lay.setContentsMargins(0, 0, 0, 0)
@@ -992,32 +1098,39 @@ class ConfigModule(QWidget):
         spin_tc.setValue(data.get("spl_time_constant", 0.125) if data else 0.125)
         sp_lay.addRow("时间常数", spin_tc)
 
-        spin_lo = _NoWheelSpinBox()
-        spin_lo.setObjectName("spl_lower_limit")
-        spin_lo.setRange(-200.0, 200.0)
-        spin_lo.setSuffix(" dB")
-        spin_lo.setValue(data.get("spl_lower_limit", 40.0) if data else 40.0)
-        sp_lay.addRow("SPL 下限", spin_lo)
-
-        spin_hi = _NoWheelSpinBox()
-        spin_hi.setObjectName("spl_upper_limit")
-        spin_hi.setRange(-200.0, 200.0)
-        spin_hi.setSuffix(" dB")
-        spin_hi.setValue(data.get("spl_upper_limit", 85.0) if data else 85.0)
-        sp_lay.addRow("SPL 上限", spin_hi)
-
-        # 下限 < 上限 实时约束
-        spin_lo.valueChanged.connect(
-            lambda v: spin_hi.setValue(max(spin_hi.value(), v + 0.1))
+        sp_lay.addRow(
+            "声压级",
+            _create_limit_row(
+                data=data,
+                lower_enabled_key="spl_lower_enabled",
+                lower_value_key="spl_lower_limit",
+                upper_enabled_key="spl_upper_enabled",
+                upper_value_key="spl_upper_limit",
+                minimum=-200.0,
+                maximum=200.0,
+                decimals=1,
+                suffix=" dB",
+            ),
         )
-        spin_hi.valueChanged.connect(
-            lambda v: spin_lo.setValue(min(spin_lo.value(), v - 0.1))
+        sp_lay.addRow(
+            "平均声压级",
+            _create_limit_row(
+                data=data,
+                lower_enabled_key="spl_average_lower_enabled",
+                lower_value_key="spl_average_lower_limit",
+                upper_enabled_key="spl_average_upper_enabled",
+                upper_value_key="spl_average_upper_limit",
+                minimum=-200.0,
+                maximum=200.0,
+                decimals=1,
+                suffix=" dB",
+            ),
         )
 
         spl.add_widget(spl_form)
         lay.addWidget(spl)
 
-        loudness = CollapsibleGroupBox("响度 参数", section_id="loudness")
+        loudness = CollapsibleGroupBox("响度参数", section_id="loudness")
         loudness_form = QWidget()
         loud_lay = QFormLayout(loudness_form)
         loud_lay.setContentsMargins(0, 0, 0, 0)
@@ -1032,29 +1145,38 @@ class ConfigModule(QWidget):
         combo_loudness_unit.setCurrentIndex(idx if idx >= 0 else 0)
         loud_lay.addRow("单位", combo_loudness_unit)
 
-        spin_loudness_lo = _NoWheelSpinBox()
-        spin_loudness_lo.setObjectName("loudness_lower_limit")
-        spin_loudness_lo.setRange(0.0, 999999.0)
-        spin_loudness_lo.setDecimals(3)
-        spin_loudness_lo.setValue(
-            data.get("loudness_lower_limit", 0.0) if data else 0.0
+        loud_lay.addRow(
+            "响度",
+            _create_limit_row(
+                data=data,
+                lower_enabled_key="loudness_lower_enabled",
+                lower_value_key="loudness_lower_limit",
+                upper_enabled_key="loudness_upper_enabled",
+                upper_value_key="loudness_upper_limit",
+                minimum=0.0,
+                maximum=999999.0,
+                decimals=3,
+            ),
         )
-        loud_lay.addRow("响度下限", spin_loudness_lo)
-
-        spin_loudness_hi = _NoWheelSpinBox()
-        spin_loudness_hi.setObjectName("loudness_upper_limit")
-        spin_loudness_hi.setRange(0.0, 999999.0)
-        spin_loudness_hi.setDecimals(3)
-        spin_loudness_hi.setValue(
-            data.get("loudness_upper_limit", 60.0) if data else 60.0
+        loud_lay.addRow(
+            "平均响度",
+            _create_limit_row(
+                data=data,
+                lower_enabled_key="loudness_average_lower_enabled",
+                lower_value_key="loudness_average_lower_limit",
+                upper_enabled_key="loudness_average_upper_enabled",
+                upper_value_key="loudness_average_upper_limit",
+                minimum=0.0,
+                maximum=999999.0,
+                decimals=3,
+            ),
         )
-        loud_lay.addRow("响度上限", spin_loudness_hi)
 
         loudness.add_widget(loudness_form)
         lay.addWidget(loudness)
 
         golden_section = CollapsibleGroupBox(
-            "Golden Sample",
+            "黄金样本",
             section_id="golden_sample",
         )
         golden_form = QWidget()
@@ -1087,17 +1209,17 @@ class ConfigModule(QWidget):
         golden_buttons_layout.setContentsMargins(0, 0, 0, 0)
         golden_buttons_layout.setSpacing(6)
 
-        btn_import = QPushButton("Import WAV...")
+        btn_import = QPushButton("导入 WAV...")
         btn_import.setObjectName("golden_sample_import_button")
         btn_import.clicked.connect(lambda _checked=False, idx=ch_index: self._on_import_golden_sample(idx))
         golden_buttons_layout.addWidget(btn_import)
 
-        btn_replace = QPushButton("Replace WAV...")
+        btn_replace = QPushButton("替换 WAV...")
         btn_replace.setObjectName("golden_sample_replace_button")
         btn_replace.clicked.connect(lambda _checked=False, idx=ch_index: self._on_import_golden_sample(idx))
         golden_buttons_layout.addWidget(btn_replace)
 
-        btn_clear = QPushButton("Clear")
+        btn_clear = QPushButton("清除")
         btn_clear.setObjectName("golden_sample_clear_button")
         btn_clear.clicked.connect(lambda _checked=False, current=container: self._on_clear_golden_binding(current))
         golden_buttons_layout.addWidget(btn_clear)
@@ -1133,17 +1255,17 @@ class ConfigModule(QWidget):
 
         fft_mode = _NoWheelComboBox()
         fft_mode.setObjectName("fft_golden_mode")
-        fft_mode.addItem("Off", "off")
-        fft_mode.addItem("Absolute", "absolute")
-        fft_mode.addItem("Delta", "delta")
+        fft_mode.addItem("关闭", "off")
+        fft_mode.addItem("绝对值", "absolute")
+        fft_mode.addItem("差值", "delta")
         fft_mode_index = fft_mode.findData(data.get("fft_golden_mode", "off") if data else "off")
         fft_mode.setCurrentIndex(fft_mode_index if fft_mode_index >= 0 else 0)
-        fft_controls_form.addRow("Golden mode", fft_mode)
+        fft_controls_form.addRow("黄金样本模式", fft_mode)
 
-        fft_overlay = QCheckBox("Show golden curve")
+        fft_overlay = QCheckBox("显示黄金曲线")
         fft_overlay.setObjectName("fft_show_golden_overlay")
         fft_overlay.setChecked(bool(data.get("fft_show_golden_overlay", False)) if data else False)
-        fft_controls_form.addRow("Golden curve", fft_overlay)
+        fft_controls_form.addRow("黄金曲线", fft_overlay)
         fft_layout.addWidget(fft_controls)
 
         fft_mode.currentIndexChanged.connect(
@@ -1177,16 +1299,16 @@ class ConfigModule(QWidget):
         ow_lay.addRow("计权模式", combo_oct_w)
         oct_mode = _NoWheelComboBox()
         oct_mode.setObjectName("oct_golden_mode")
-        oct_mode.addItem("Off", "off")
-        oct_mode.addItem("Absolute", "absolute")
-        oct_mode.addItem("Delta", "delta")
+        oct_mode.addItem("关闭", "off")
+        oct_mode.addItem("绝对值", "absolute")
+        oct_mode.addItem("差值", "delta")
         oct_mode_index = oct_mode.findData(data.get("oct_golden_mode", "off") if data else "off")
         oct_mode.setCurrentIndex(oct_mode_index if oct_mode_index >= 0 else 0)
-        ow_lay.addRow("Golden mode", oct_mode)
-        oct_overlay = QCheckBox("Show golden curve")
+        ow_lay.addRow("黄金样本模式", oct_mode)
+        oct_overlay = QCheckBox("显示黄金曲线")
         oct_overlay.setObjectName("oct_show_golden_overlay")
         oct_overlay.setChecked(bool(data.get("oct_show_golden_overlay", False)) if data else False)
-        ow_lay.addRow("Golden curve", oct_overlay)
+        ow_lay.addRow("黄金曲线", oct_overlay)
         of_lay.addWidget(oct_w_row)
 
         oct_mode.currentIndexChanged.connect(
@@ -1200,6 +1322,7 @@ class ConfigModule(QWidget):
         of_lay.addWidget(oct_table)
         oct_section.add_widget(oct_form)
         lay.addWidget(oct_section)
+        lay.addStretch(1)
 
         self._apply_golden_mode_state(fft_mode, fft_overlay)
         self._apply_golden_mode_state(oct_mode, oct_overlay)
@@ -1293,18 +1416,14 @@ class ConfigModule(QWidget):
         binding = binding or {}
         toolchain_id = binding.get("toolchain_id")
         timeout_ms = binding.get("timeout_ms")
-        params_json = binding.get("params_json")
         if toolchain_id == "":
             toolchain_id = None
         if not isinstance(timeout_ms, int) or timeout_ms <= 0:
             timeout_ms = None
-        if not isinstance(params_json, str):
-            params_json = ""
         return {
             "enabled": bool(binding.get("enabled", False)),
             "toolchain_id": toolchain_id,
             "timeout_ms": timeout_ms,
-            "params_json": params_json.strip() or "{}",
         }
 
     def _capture_ai_binding_editor_state(self) -> dict:
@@ -1355,7 +1474,6 @@ class ConfigModule(QWidget):
             idx = self.combo_ai_toolchain.findData(binding["toolchain_id"])
             self.combo_ai_toolchain.setCurrentIndex(idx if idx >= 0 else 0)
             self.spin_ai_timeout.setValue(binding["timeout_ms"] or 0)
-            self.txt_ai_params.setPlainText(binding["params_json"])
         self._loaded_ai_binding_state = binding
         self._ai_binding_dirty = False
 
@@ -1425,7 +1543,8 @@ class ConfigModule(QWidget):
                     combo.setCurrentIndex(i)
                     return
 
-        label = f"{name} ({hostapi}) (设备不可用)"
+        hostapi_display = "未知" if hostapi == "N/A" else hostapi
+        label = f"{name} ({hostapi_display}) (设备不可用)"
         dev_info = {
             "name": name,
             "hostapi": hostapi,
@@ -1450,7 +1569,7 @@ class ConfigModule(QWidget):
 
         max_ch = dev_info.get("max_input_channels", 0)
         for i in range(max_ch):
-            cb = QCheckBox(f"In{i + 1}")
+            cb = QCheckBox(f"输入{i + 1}")
             cb.toggled.connect(self._on_channel_selection_changed)
             row, col = divmod(i, 6)
             self._channel_check_layout.addWidget(cb, row, col)
@@ -1477,11 +1596,22 @@ class ConfigModule(QWidget):
         spin_tc = container.findChild(QDoubleSpinBox, "spl_time_constant")
         ch["spl_time_constant"] = spin_tc.value() if spin_tc else 0.125
 
-        spin_lo = container.findChild(QDoubleSpinBox, "spl_lower_limit")
-        ch["spl_lower_limit"] = spin_lo.value() if spin_lo else 40.0
-
-        spin_hi = container.findChild(QDoubleSpinBox, "spl_upper_limit")
-        ch["spl_upper_limit"] = spin_hi.value() if spin_hi else 85.0
+        self._collect_limit_fields(
+            container,
+            ch,
+            enabled_fields=(
+                "spl_lower_enabled",
+                "spl_upper_enabled",
+                "spl_average_lower_enabled",
+                "spl_average_upper_enabled",
+            ),
+            value_fields=(
+                "spl_lower_limit",
+                "spl_upper_limit",
+                "spl_average_lower_limit",
+                "spl_average_upper_limit",
+            ),
+        )
 
         combo_loudness_unit = container.findChild(QComboBox, "loudness_unit")
         ch["loudness_unit"] = (
@@ -1490,18 +1620,21 @@ class ConfigModule(QWidget):
             else "sone"
         )
 
-        spin_loudness_lo = container.findChild(
-            QDoubleSpinBox, "loudness_lower_limit"
-        )
-        ch["loudness_lower_limit"] = (
-            spin_loudness_lo.value() if spin_loudness_lo else 0.0
-        )
-
-        spin_loudness_hi = container.findChild(
-            QDoubleSpinBox, "loudness_upper_limit"
-        )
-        ch["loudness_upper_limit"] = (
-            spin_loudness_hi.value() if spin_loudness_hi else 60.0
+        self._collect_limit_fields(
+            container,
+            ch,
+            enabled_fields=(
+                "loudness_lower_enabled",
+                "loudness_upper_enabled",
+                "loudness_average_lower_enabled",
+                "loudness_average_upper_enabled",
+            ),
+            value_fields=(
+                "loudness_lower_limit",
+                "loudness_upper_limit",
+                "loudness_average_lower_limit",
+                "loudness_average_upper_limit",
+            ),
         )
 
         combo_oct_w = container.findChild(QComboBox, "oct_weighting")
@@ -1522,6 +1655,21 @@ class ConfigModule(QWidget):
         ch["oct_band_limits"] = self._read_band_table(container, "oct_band_table")
         ch["ai_config"] = {}
         return ch
+
+    def _collect_limit_fields(
+        self,
+        container: QWidget,
+        channel: dict,
+        *,
+        enabled_fields: tuple[str, ...],
+        value_fields: tuple[str, ...],
+    ) -> None:
+        for field in enabled_fields:
+            checkbox = container.findChild(QCheckBox, field)
+            channel[field] = checkbox.isChecked() if checkbox else bool(_LIMIT_DEFAULTS[field])
+        for field in value_fields:
+            spinbox = container.findChild(QDoubleSpinBox, field)
+            channel[field] = spinbox.value() if spinbox else float(_LIMIT_DEFAULTS[field])
 
     def _collect_data(self) -> dict:
         input_dev = self.combo_input_dev.currentData()
@@ -1578,7 +1726,6 @@ class ConfigModule(QWidget):
             "enabled": self.chk_ai_enabled.isChecked(),
             "toolchain_id": tc_id,
             "timeout_ms": timeout if timeout > 0 else None,
-            "params_json": self.txt_ai_params.toPlainText().strip() or "{}",
         }
 
     @staticmethod
@@ -1643,6 +1790,7 @@ class ConfigModule(QWidget):
         self.empty_label.setVisible(not has_items)
         self.detail.setVisible(has_items)
         self.btn_delete.setEnabled(has_items)
+        self.btn_export.setEnabled(has_items)
         self.btn_save.setEnabled(has_items)
 
         if has_items:
@@ -1701,6 +1849,69 @@ class ConfigModule(QWidget):
         self._current_config_id = None
         self._refresh_list()
 
+    def _on_export_package(self):
+        current = self.config_list.currentItem()
+        if current is None:
+            QMessageBox.warning(self, "导出失败", "请选择要导出的配置。")
+            return
+
+        config_id = current.data(Qt.ItemDataRole.UserRole)
+        config_name = current.text()
+        options = config_package_dialogs.choose_export_options(self)
+        if options is None:
+            return
+        target_path = config_package_dialogs.choose_dy_export_path(
+            self,
+            default_name=config_name,
+        )
+        if not target_path:
+            return
+
+        try:
+            self.services.config_package_service.export_package(
+                config_id=config_id,
+                target_path=target_path,
+                options=options,
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
+            return
+
+        QMessageBox.information(self, "导出成功", f"配置包已导出：{target_path}")
+
+    def _on_import_package(self):
+        source_path = config_package_dialogs.choose_dy_import_path(self)
+        if not source_path:
+            return
+
+        try:
+            preview = self.services.config_package_service.inspect_package(source_path)
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", str(e))
+            return
+
+        decision = config_package_dialogs.choose_import_decision(self, preview)
+        if decision is None:
+            return
+
+        try:
+            result = self.services.config_package_service.import_package(
+                source_path,
+                decision,
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "导入失败", str(e))
+            return
+
+        if result.status in {"created", "overwritten"} and result.config_id is not None:
+            self._refresh_list()
+            self._select_config_by_id(result.config_id)
+
+        if result.warnings:
+            QMessageBox.warning(self, "导入提示", "\n".join(result.warnings))
+        if result.info_message:
+            QMessageBox.information(self, "导入提示", result.info_message)
+
     def _on_save(self):
         if self._current_config_id is None:
             return
@@ -1717,18 +1928,6 @@ class ConfigModule(QWidget):
         try:
             # Validate AI binding before saving anything
             ai_data = self._collect_ai_binding()
-            params_text = ai_data.get("params_json", "{}")
-            try:
-                import json as _json
-                parsed = _json.loads(params_text)
-                if not isinstance(parsed, dict):
-                    raise ValueError("JSON 必须是对象")
-            except (ValueError, _json.JSONDecodeError) as e:
-                self._finalize_failed_save(
-                    message_title="AI 配置错误",
-                    message_text=f"参数(JSON) 格式无效：{e}",
-                )
-                return
             try:
                 self._validate_ai_binding_selection(ai_data)
             except ValueError as e:

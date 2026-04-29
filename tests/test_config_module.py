@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib
 import os
 from contextlib import contextmanager
 from contextlib import nullcontext
@@ -12,19 +13,26 @@ from scipy.io import wavfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import Qt, qInstallMessageHandler
+from PyQt6.QtCore import QPoint, Qt, qInstallMessageHandler
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
+    QDialogButtonBox,
     QLabel,
     QPushButton,
     QWidget,
 )
 
 from app.service.config_service import ConfigService
+from app.service.config_package_service import (
+    ConfigPackageExportOptions,
+    ConfigPackageImportDecision,
+    ConfigPackageImportResult,
+    ConfigPackagePreview,
+)
 from app.service.golden_sample_service import GoldenSampleService
 from model.channel_config_table import ChannelConfigTable
 from model.plc_table import PlcTable
@@ -192,9 +200,77 @@ class _AiServiceStub:
         return 1
 
 
+class _ConfigPackageServiceStub:
+    def __init__(
+        self,
+        *,
+        preview: ConfigPackagePreview | None = None,
+        import_result: ConfigPackageImportResult | None = None,
+        export_error: Exception | None = None,
+        inspect_error: Exception | None = None,
+        import_error: Exception | None = None,
+        on_import=None,
+    ):
+        self.preview = preview or ConfigPackagePreview(
+            config_name="ImportedCfg",
+            contents={
+                "config": True,
+                "golden_samples": False,
+                "ai_toolchain": False,
+                "ai_package": False,
+            },
+            config_conflict=False,
+            ai_toolchain_id=None,
+            ai_conflict=False,
+            config_action_options=("create",),
+            default_config_action="create",
+            ai_action_options=(),
+            default_ai_action=None,
+            warnings=(),
+        )
+        self.import_result = import_result or ConfigPackageImportResult(
+            status="created",
+            config_id=101,
+            config_name=self.preview.config_name,
+            ai_binding_status="no_ai_metadata",
+        )
+        self.export_error = export_error
+        self.inspect_error = inspect_error
+        self.import_error = import_error
+        self.on_import = on_import
+        self.export_calls = []
+        self.inspect_calls = []
+        self.import_calls = []
+
+    def export_package(self, *, config_id: int, target_path: str, options):
+        self.export_calls.append(
+            {
+                "config_id": config_id,
+                "target_path": target_path,
+                "options": options,
+            }
+        )
+        if self.export_error is not None:
+            raise self.export_error
+
+    def inspect_package(self, path: str):
+        self.inspect_calls.append(path)
+        if self.inspect_error is not None:
+            raise self.inspect_error
+        return self.preview
+
+    def import_package(self, path: str, decision):
+        self.import_calls.append((path, decision))
+        if self.import_error is not None:
+            raise self.import_error
+        if callable(self.on_import):
+            self.on_import(path, decision)
+        return self.import_result
+
+
 class _HardwareServiceStub:
     def __init__(self, devices: list[dict] | None = None, hostapis: list[dict] | None = None):
-        self._devices = devices or [
+        self._devices = devices if devices is not None else [
             {
                 "name": "Mic 1",
                 "hostapi": 0,
@@ -210,7 +286,7 @@ class _HardwareServiceStub:
                 "max_output_channels": 2,
             },
         ]
-        self._hostapis = hostapis or [{"name": "ASIO"}, {"name": "WASAPI"}]
+        self._hostapis = hostapis if hostapis is not None else [{"name": "ASIO"}, {"name": "WASAPI"}]
 
     def set_devices(self, devices: list[dict], hostapis: list[dict] | None = None):
         self._devices = devices
@@ -247,6 +323,7 @@ def _make_module(
     binding: dict | None = None,
     config_service: _ConfigServiceStub | None = None,
     ai_service: _AiServiceStub | None = None,
+    config_package_service: _ConfigPackageServiceStub | None = None,
     hardware_service: _HardwareServiceStub | None = None,
     bus=None,
 ) -> ConfigModule:
@@ -258,6 +335,7 @@ def _make_module(
     services = SimpleNamespace(
         config_service=config_service or _ConfigServiceStub(),
         ai_service=ai_service or _AiServiceStub(binding=binding),
+        config_package_service=config_package_service or _ConfigPackageServiceStub(),
         hss_service=hardware_service or _HardwareServiceStub(),
         bus=services_bus,
     )
@@ -367,18 +445,54 @@ def _detail_payload(
     }
 
 
+def _package_preview(
+    *,
+    config_name: str = "ImportedCfg",
+    config_conflict: bool = False,
+    ai_toolchain_id: str | None = None,
+    ai_conflict: bool = False,
+    config_action_options: tuple[str, ...] = ("create",),
+    default_config_action: str = "create",
+    ai_action_options: tuple[str, ...] = (),
+    default_ai_action: str | None = None,
+    golden_samples: bool = False,
+    ai_toolchain: bool = False,
+    ai_package: bool = False,
+    warnings: tuple[str, ...] = (),
+) -> ConfigPackagePreview:
+    return ConfigPackagePreview(
+        config_name=config_name,
+        contents={
+            "config": True,
+            "golden_samples": golden_samples,
+            "ai_toolchain": ai_toolchain,
+            "ai_package": ai_package,
+        },
+        config_conflict=config_conflict,
+        ai_toolchain_id=ai_toolchain_id,
+        ai_conflict=ai_conflict,
+        config_action_options=config_action_options,
+        default_config_action=default_config_action,
+        ai_action_options=ai_action_options,
+        default_ai_action=default_ai_action,
+        warnings=warnings,
+    )
+
+
 def _field_label_text(container: QWidget, object_name: str) -> str | None:
     field = container.findChild(QWidget, object_name)
     assert field is not None
-    parent = field.parentWidget()
+    current = field
+    parent = current.parentWidget()
     while parent is not None:
         layout = parent.layout()
         if isinstance(layout, QFormLayout):
-            row, _role = layout.getWidgetPosition(field)
+            row, _role = layout.getWidgetPosition(current)
             if row >= 0:
                 label_item = layout.itemAt(row, QFormLayout.ItemRole.LabelRole)
                 label = label_item.widget() if label_item else None
                 return label.text() if isinstance(label, QLabel) else None
+        current = parent
         parent = parent.parentWidget()
     return None
 
@@ -432,7 +546,6 @@ def test_config_module_renders_plc_selector_from_plc_table(qapp):
             "toolchain_id": "tc-1",
             "timeout_ms": 1000,
             "analysis_window_offset_ms": 900,
-            "params_json": '{"legacy": true}',
         }
     )
     module._populate_detail(_detail_payload([]))
@@ -610,6 +723,7 @@ def test_collect_ai_binding_does_not_include_analysis_window_offset(qapp):
     ai_data = module._collect_ai_binding()
 
     assert "analysis_window_offset_ms" not in ai_data
+    assert "params_json" not in ai_data
 
 
 def test_on_save_keeps_main_config_analysis_offset_out_of_ai_binding_payload(
@@ -647,7 +761,6 @@ def test_on_save_keeps_main_config_analysis_offset_out_of_ai_binding_payload(
                 "enabled": False,
                 "toolchain_id": None,
                 "timeout_ms": None,
-                "params_json": "{}",
             },
         )
     ]
@@ -686,7 +799,6 @@ def test_on_save_persists_allow_incomplete_recording_analysis_without_touching_a
                 "enabled": False,
                 "toolchain_id": None,
                 "timeout_ms": None,
-                "params_json": "{}",
             },
         )
     ]
@@ -703,7 +815,6 @@ def test_ai_toolchains_changed_refreshes_clean_binding_editor(qapp):
             "enabled": True,
             "toolchain_id": "tc-1",
             "timeout_ms": 1000,
-            "params_json": '{"mode": "v1"}',
         }
     )
     ai_service.enabled_toolchains = [
@@ -715,7 +826,6 @@ def test_ai_toolchains_changed_refreshes_clean_binding_editor(qapp):
         "enabled": True,
         "toolchain_id": "tc-2",
         "timeout_ms": 2000,
-        "params_json": '{"mode": "v2"}',
     }
     ai_service.enabled_toolchains = [
         {"toolchain_id": "tc-2", "display_name": "Toolchain 2", "version": "2"},
@@ -725,7 +835,6 @@ def test_ai_toolchains_changed_refreshes_clean_binding_editor(qapp):
 
     assert module.combo_ai_toolchain.currentData() == "tc-2"
     assert module.spin_ai_timeout.value() == 2000
-    assert module.txt_ai_params.toPlainText() == '{"mode": "v2"}'
 
 
 def test_ai_toolchains_changed_preserves_dirty_local_ai_edits(qapp):
@@ -739,7 +848,6 @@ def test_ai_toolchains_changed_preserves_dirty_local_ai_edits(qapp):
             "enabled": True,
             "toolchain_id": "tc-1",
             "timeout_ms": 1000,
-            "params_json": '{"mode": "server"}',
         }
     )
     ai_service.enabled_toolchains = [
@@ -758,12 +866,10 @@ def test_ai_toolchains_changed_preserves_dirty_local_ai_edits(qapp):
         module.combo_ai_toolchain.findData("tc-local")
     )
     module.spin_ai_timeout.setValue(9000)
-    module.txt_ai_params.setPlainText('{"mode": "local"}')
     ai_service._binding = {
         "enabled": True,
         "toolchain_id": "tc-2",
         "timeout_ms": 2000,
-        "params_json": '{"mode": "server-v2"}',
     }
     ai_service.enabled_toolchains = [
         {
@@ -778,7 +884,6 @@ def test_ai_toolchains_changed_preserves_dirty_local_ai_edits(qapp):
 
     assert module.combo_ai_toolchain.currentData() == "tc-local"
     assert module.spin_ai_timeout.value() == 9000
-    assert module.txt_ai_params.toPlainText() == '{"mode": "local"}'
 
 
 def test_ai_toolchains_changed_reloads_after_local_ai_edits_revert_to_clean_state(qapp):
@@ -792,7 +897,6 @@ def test_ai_toolchains_changed_reloads_after_local_ai_edits_revert_to_clean_stat
             "enabled": True,
             "toolchain_id": "tc-1",
             "timeout_ms": 1000,
-            "params_json": '{"mode": "v1"}',
         }
     )
     ai_service.enabled_toolchains = [
@@ -807,17 +911,14 @@ def test_ai_toolchains_changed_reloads_after_local_ai_edits_revert_to_clean_stat
         module.combo_ai_toolchain.findData("tc-local")
     )
     module.spin_ai_timeout.setValue(9000)
-    module.txt_ai_params.setPlainText('{"mode": "local"}')
 
     module.combo_ai_toolchain.setCurrentIndex(module.combo_ai_toolchain.findData("tc-1"))
     module.spin_ai_timeout.setValue(1000)
-    module.txt_ai_params.setPlainText('{"mode": "v1"}')
 
     ai_service._binding = {
         "enabled": True,
         "toolchain_id": "tc-2",
         "timeout_ms": 2000,
-        "params_json": '{"mode": "v2"}',
     }
     ai_service.enabled_toolchains = [
         {"toolchain_id": "tc-2", "display_name": "Toolchain 2", "version": "2"},
@@ -827,7 +928,6 @@ def test_ai_toolchains_changed_reloads_after_local_ai_edits_revert_to_clean_stat
 
     assert module.combo_ai_toolchain.currentData() == "tc-2"
     assert module.spin_ai_timeout.value() == 2000
-    assert module.txt_ai_params.toPlainText() == '{"mode": "v2"}'
 
 
 def test_unavailable_toolchain_loaded_binding_injects_unavailable_toolchain_option(qapp):
@@ -836,7 +936,6 @@ def test_unavailable_toolchain_loaded_binding_injects_unavailable_toolchain_opti
             "enabled": True,
             "toolchain_id": "disabled-tc",
             "timeout_ms": 1000,
-            "params_json": '{"mode": "v1"}',
         }
     )
     ai_service.enabled_toolchains = []
@@ -905,7 +1004,6 @@ def test_ai_toolchains_changed_keeps_dirty_renamed_stale_toolchain_until_save(
             "enabled": True,
             "toolchain_id": "tc-old",
             "timeout_ms": 1000,
-            "params_json": '{"mode": "v1"}',
         }
     )
     ai_service.enabled_toolchains = [
@@ -918,12 +1016,11 @@ def test_ai_toolchains_changed_keeps_dirty_renamed_stale_toolchain_until_save(
     )
     module._current_config_id = 1
     module._populate_ai_binding(1)
-    module.txt_ai_params.setPlainText('{"mode": "draft"}')
+    module.spin_ai_timeout.setValue(1500)
     ai_service._binding = {
         "enabled": True,
         "toolchain_id": "tc-new",
         "timeout_ms": 2000,
-        "params_json": '{"mode": "v2"}',
     }
     ai_service.enabled_toolchains = [
         {"toolchain_id": "tc-new", "display_name": "Toolchain New", "version": "2"},
@@ -933,7 +1030,6 @@ def test_ai_toolchains_changed_keeps_dirty_renamed_stale_toolchain_until_save(
     bus.ai_toolchains_changed.emit()
 
     assert module.combo_ai_toolchain.currentData() == "tc-old"
-    assert module.txt_ai_params.toPlainText() == '{"mode": "draft"}'
 
     module._on_save()
 
@@ -1026,6 +1122,130 @@ def test_on_save_preserves_selected_channel_and_collapsed_sections_and_shows_suc
     assert infos[-1][-2:] == ("保存成功", "配置保存成功！")
 
 
+def test_channel_section_layout_does_not_stretch_after_repeated_collapses(qapp):
+    loaded = {
+        7: _detail_payload([_channel_payload(0)], config_id=7, config_name="Cfg1"),
+    }
+    module = _make_module(config_service=_ConfigServiceStub(loaded_configs=loaded))
+    module.resize(1600, 1200)
+    module.show()
+    qapp.processEvents()
+
+    container = module._channel_containers[0]
+    boxes = {
+        box.section_id(): box
+        for box in container.findChildren(CollapsibleGroupBox)
+    }
+    baseline = {
+        key: boxes[key].sizeHint().height()
+        for key in ("loudness", "golden_sample", "fft", "octave")
+    }
+
+    for _ in range(5):
+        boxes["stft"].set_expanded(False)
+        qapp.processEvents()
+        boxes["spl"].set_expanded(False)
+        qapp.processEvents()
+        boxes["stft"].set_expanded(True)
+        qapp.processEvents()
+        boxes["spl"].set_expanded(True)
+        qapp.processEvents()
+
+    boxes["stft"].set_expanded(False)
+    qapp.processEvents()
+    boxes["spl"].set_expanded(False)
+    qapp.processEvents()
+
+    assert boxes["stft"].height() == boxes["stft"].sizeHint().height()
+    assert boxes["spl"].height() == boxes["spl"].sizeHint().height()
+    for key, expected_height in baseline.items():
+        assert boxes[key].height() == expected_height
+        assert boxes[key].height() == boxes[key].sizeHint().height()
+
+
+def test_channel_section_layout_preserves_scroll_reachability_in_short_viewport(qapp):
+    loaded = {
+        7: _detail_payload([_channel_payload(0)], config_id=7, config_name="Cfg1"),
+    }
+    module = _make_module(config_service=_ConfigServiceStub(loaded_configs=loaded))
+    module.resize(900, 700)
+    module.show()
+    qapp.processEvents()
+
+    container = module._channel_containers[0]
+    boxes = {
+        box.section_id(): box
+        for box in container.findChildren(CollapsibleGroupBox)
+    }
+    scroll_bar = module.detail_scroll.verticalScrollBar()
+
+    assert scroll_bar.maximum() > 0
+
+    module.detail_scroll.ensureWidgetVisible(boxes["octave"], 0, 0)
+    qapp.processEvents()
+
+    top_in_viewport = boxes["octave"].mapTo(
+        module.detail_scroll.viewport(),
+        QPoint(0, 0),
+    ).y()
+    bottom_in_viewport = boxes["octave"].mapTo(
+        module.detail_scroll.viewport(),
+        QPoint(0, boxes["octave"].height()),
+    ).y()
+
+    assert top_in_viewport >= 0
+    assert bottom_in_viewport <= module.detail_scroll.viewport().height()
+
+
+def test_on_save_preserves_collapsed_section_geometry_in_tall_viewport(
+    qapp, monkeypatch
+):
+    loaded = {
+        7: _detail_payload([_channel_payload(0)], config_id=7, config_name="Cfg1"),
+    }
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        config_changed=_SignalStub(),
+    )
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service, bus=bus)
+    module.resize(1600, 1200)
+    module.show()
+    qapp.processEvents()
+
+    container = module._channel_containers[0]
+    boxes = {
+        box.section_id(): box
+        for box in container.findChildren(CollapsibleGroupBox)
+    }
+    boxes["stft"].set_expanded(False)
+    qapp.processEvents()
+    boxes["spl"].set_expanded(False)
+    qapp.processEvents()
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    monkeypatch.setattr("ui.modules.config.QMessageBox.information", lambda *args: None)
+
+    module._on_save()
+    qapp.processEvents()
+
+    restored = module._channel_containers[0]
+    restored_boxes = {
+        box.section_id(): box
+        for box in restored.findChildren(CollapsibleGroupBox)
+    }
+
+    assert restored_boxes["stft"].is_expanded() is False
+    assert restored_boxes["spl"].is_expanded() is False
+    assert restored_boxes["stft"].height() == restored_boxes["stft"].sizeHint().height()
+    assert restored_boxes["spl"].height() == restored_boxes["spl"].sizeHint().height()
+    for key in ("loudness", "golden_sample", "fft", "octave"):
+        assert restored_boxes[key].height() == restored_boxes[key].sizeHint().height()
+
+
 def test_on_save_falls_back_to_first_available_channel_when_selected_channel_disappears(
     qapp, monkeypatch
 ):
@@ -1088,6 +1308,55 @@ def test_on_save_falls_back_to_first_available_channel_when_selected_channel_dis
     module._on_save()
 
     assert module.channel_stack.currentWidget().property("channel_index") == 0
+
+
+def test_unknown_host_api_device_displays_chinese_fallback_but_collects_na(qapp):
+    hardware_service = _HardwareServiceStub(
+        devices=[
+            {
+                "name": "Mic Unknown",
+                "hostapi": 99,
+                "default_samplerate": 48000,
+                "max_input_channels": 1,
+                "max_output_channels": 0,
+            }
+        ],
+        hostapis=[],
+    )
+    module = _make_module(hardware_service=hardware_service)
+    module._populate_detail(
+        {
+            **_detail_payload([_channel_payload(0)]),
+            "input_device_name": "Mic Unknown",
+            "input_device_hostapi": "N/A",
+            "output_device_name": None,
+            "output_device_hostapi": None,
+            "selected_channels": [0],
+        }
+    )
+
+    assert "未知" in module.combo_input_dev.currentText()
+    assert module._collect_data()["input_device_hostapi"] == "N/A"
+
+
+def test_unavailable_saved_host_api_displays_chinese_fallback_but_collects_na(qapp):
+    hardware_service = _HardwareServiceStub(devices=[], hostapis=[])
+    module = _make_module(hardware_service=hardware_service)
+    module._populate_detail(
+        {
+            **_detail_payload([_channel_payload(0)]),
+            "input_device_name": "Missing Mic",
+            "input_device_hostapi": "N/A",
+            "input_device_samplerate": 48000,
+            "output_device_name": None,
+            "output_device_hostapi": None,
+            "selected_channels": [0],
+        }
+    )
+
+    assert "未知" in module.combo_input_dev.currentText()
+    assert "N/A" not in module.combo_input_dev.currentText()
+    assert module._collect_data()["input_device_hostapi"] == "N/A"
 
 
 def test_on_save_keeps_no_channel_state_when_reloaded_editor_has_no_channels(
@@ -1357,12 +1626,27 @@ def test_populate_detail_renders_golden_summary_and_controls(qapp):
     assert "500" in start_ms.text()
     assert "3000" in duration_ms.text()
     assert "有效" in status.text()
-    assert import_button.text() == "Import WAV..."
-    assert replace_button.text() == "Replace WAV..."
-    assert clear_button.text() == "Clear"
-    assert fft_mode.currentText() == "Absolute"
+    assert module._channel_tab_buttons[0].text() == "输入1（通道 1）"
+    assert module._channel_checkboxes[0].text() == "输入1"
+    assert _ancestor_group_title(import_button) == "黄金样本"
+    assert _ancestor_group_title(container.findChild(QDoubleSpinBox, "spl_time_constant")) == "声压级参数"
+    assert _field_label_text(container, "spl_lower_limit") == "声压级"
+    assert _field_label_text(container, "spl_average_lower_limit") == "平均声压级"
+    assert _ancestor_group_title(container.findChild(QComboBox, "loudness_unit")) == "响度参数"
+    assert import_button.text() == "导入 WAV..."
+    assert replace_button.text() == "替换 WAV..."
+    assert clear_button.text() == "清除"
+    assert fft_mode.currentText() == "绝对值"
+    assert fft_mode.currentData() == "absolute"
+    assert _field_label_text(container, "fft_golden_mode") == "黄金样本模式"
+    assert _field_label_text(container, "fft_show_golden_overlay") == "黄金曲线"
+    assert fft_overlay.text() == "显示黄金曲线"
     assert fft_overlay.isChecked() is True
-    assert oct_mode.currentText() == "Delta"
+    assert oct_mode.currentText() == "差值"
+    assert oct_mode.currentData() == "delta"
+    assert _field_label_text(container, "oct_golden_mode") == "黄金样本模式"
+    assert _field_label_text(container, "oct_show_golden_overlay") == "黄金曲线"
+    assert oct_overlay.text() == "显示黄金曲线"
     assert oct_overlay.isChecked() is False
     assert oct_overlay.isEnabled() is False
 
@@ -1383,7 +1667,7 @@ def test_delta_mode_disables_overlay_checkbox(qapp, mode_name, overlay_name):
     checkbox = container.findChild(QCheckBox, overlay_name)
 
     checkbox.setChecked(True)
-    combo.setCurrentText("Delta")
+    combo.setCurrentText("差值")
 
     assert checkbox.isChecked() is False
     assert checkbox.isEnabled() is False
@@ -1466,7 +1750,7 @@ def test_analysis_duration_change_marks_binding_invalid_without_rewriting_golden
     module.spin_analysis.setValue(2.0)
     qapp.processEvents()
 
-    assert fft_mode.currentText() == "Absolute"
+    assert fft_mode.currentText() == "绝对值"
     assert fft_overlay.isChecked() is True
     assert "无效" in status.text()
     assert "分析时长" in status.text()
@@ -1630,7 +1914,7 @@ def test_validation_failure_discards_staged_file_and_keeps_committed_binding_aut
     assert config_service.golden_sample_service.discarded_paths == [str(staged_path)]
 
 
-def test_invalid_ai_json_discards_staged_file_and_keeps_committed_binding_authoritative(
+def test_invalid_ai_binding_selection_discards_staged_file_and_keeps_committed_binding_authoritative(
     qapp,
     tmp_path,
     monkeypatch,
@@ -1640,7 +1924,8 @@ def test_invalid_ai_json_discards_staged_file_and_keeps_committed_binding_author
     module = _make_module(config_service=config_service)
     module._current_config_id = 7
     module._populate_detail(_detail_payload([committed]))
-    module.txt_ai_params.setPlainText("{invalid")
+    module.chk_ai_enabled.setChecked(True)
+    module.combo_ai_toolchain.setCurrentIndex(0)
     staged_path = tmp_path / "staged.wav"
     staged_path.write_bytes(b"wav")
     module._golden_editor_state[0] = _staged_golden_binding(
@@ -1658,7 +1943,7 @@ def test_invalid_ai_json_discards_staged_file_and_keeps_committed_binding_author
 
     data = module._collect_data()
 
-    assert any("参数(JSON) 格式无效" in str(args[-1]) for args in warnings)
+    assert any("AI" in str(args[-1]) for args in warnings)
     assert data["channels"][0]["golden_sample_path"] == committed["golden_sample_path"]
     assert data["channels"][0]["golden_sample_label"] == committed["golden_sample_label"]
     assert data["golden_editor_state"] == {}
@@ -2148,3 +2433,309 @@ def test_post_commit_reload_failure_keeps_new_authoritative_cleared_binding(
     assert editor_channel["golden_sample_path"] is None
     assert editor_channel["golden_sample_label"] is None
     assert editor_data["golden_editor_state"] == {}
+
+
+def test_import_export_buttons_render_on_config_list_actions(qapp):
+    module = _make_module()
+
+    assert module.btn_import.text() == "导入"
+    assert module.btn_export.text() == "导出"
+
+
+def test_import_export_warns_when_export_without_selected_config(qapp, monkeypatch):
+    module = _make_module()
+    module._current_config_id = None
+    module.config_list.clear()
+
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module._on_export_package()
+
+    assert any("请选择" in str(args[-1]) for args in warnings)
+
+
+def test_dy_package_export_dialog_disables_ai_package_without_toolchain(qapp):
+    dialogs = importlib.import_module("ui.popups.config_package_dialogs")
+    dialog = dialogs.ConfigPackageExportDialog()
+    buttons = dialog.findChild(QDialogButtonBox)
+
+    assert dialog.chk_include_ai_package.isEnabled() is False
+    assert dialog.chk_include_ai_package.isChecked() is False
+    assert buttons.button(QDialogButtonBox.StandardButton.Ok).text() == "确定"
+    assert buttons.button(QDialogButtonBox.StandardButton.Cancel).text() == "取消"
+
+    dialog.chk_include_ai_toolchain.setChecked(True)
+    dialog.chk_include_ai_package.setChecked(True)
+
+    assert dialog.chk_include_ai_package.isEnabled() is True
+    assert dialog.chk_include_ai_package.isChecked() is True
+
+    dialog.chk_include_ai_toolchain.setChecked(False)
+
+    assert dialog.chk_include_ai_package.isEnabled() is False
+    assert dialog.chk_include_ai_package.isChecked() is False
+
+
+def test_dy_package_export_flow_uses_dy_filter_and_suffix(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    dialogs = importlib.import_module("ui.popups.config_package_dialogs")
+    captured = {}
+
+    def _fake_get_save_file_name(parent, title, default_name, selected_filter):
+        captured["title"] = title
+        captured["default_name"] = default_name
+        captured["filter"] = selected_filter
+        return str(tmp_path / "exported_config"), selected_filter
+
+    monkeypatch.setattr(
+        dialogs.QFileDialog,
+        "getSaveFileName",
+        staticmethod(_fake_get_save_file_name),
+    )
+
+    chosen = dialogs.choose_dy_export_path(None, default_name="Cfg1")
+
+    assert captured["filter"] == "DY 配置包 (*.dy)"
+    assert chosen == str(tmp_path / "exported_config.dy")
+
+
+def test_import_export_export_flow_collects_options_and_calls_package_service(
+    qapp,
+    tmp_path,
+    monkeypatch,
+):
+    config_service = _ConfigServiceStub(
+        loaded_configs={
+            7: _detail_payload([], config_id=7, config_name="Cfg1"),
+        }
+    )
+    package_service = _ConfigPackageServiceStub()
+    module = _make_module(
+        config_service=config_service,
+        config_package_service=package_service,
+    )
+    options = ConfigPackageExportOptions(
+        include_golden_samples=True,
+        include_ai_toolchain=True,
+        include_ai_package=False,
+    )
+    option_prompts = []
+    path_prompts = []
+    infos = []
+
+    monkeypatch.setattr(
+        "ui.modules.config.config_package_dialogs.choose_export_options",
+        lambda parent: option_prompts.append(parent) or options,
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.config_package_dialogs.choose_dy_export_path",
+        lambda parent, default_name: (
+            path_prompts.append((parent, default_name))
+            or str(tmp_path / "Cfg1.dy")
+        ),
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.information",
+        lambda *args: infos.append(args),
+    )
+
+    module._on_export_package()
+
+    assert option_prompts == [module]
+    assert path_prompts == [(module, "Cfg1")]
+    assert package_service.export_calls == [
+        {
+            "config_id": 7,
+            "target_path": str(tmp_path / "Cfg1.dy"),
+            "options": options,
+        }
+    ]
+    assert any("Cfg1.dy" in str(args[-1]) for args in infos)
+
+
+def test_dy_package_metadata_only_ai_conflict_uses_required_actions_and_default(
+    qapp,
+    monkeypatch,
+):
+    dialogs = importlib.import_module("ui.popups.config_package_dialogs")
+    preview = _package_preview(
+        config_name="ImportedCfg",
+        ai_toolchain_id="tc-1",
+        ai_conflict=True,
+        ai_action_options=("use_existing_toolchain", "clear_binding", "cancel"),
+        default_ai_action="use_existing_toolchain",
+        golden_samples=True,
+        ai_toolchain=True,
+        ai_package=False,
+    )
+    captured = {}
+
+    def _fake_exec(self):
+        captured["buttons"] = [button.text() for button in self.buttons()]
+        captured["default"] = self.defaultButton().text()
+        captured["text"] = self.text()
+        self._clicked_button = next(
+            button for button in self.buttons() if button.text() == "使用旧工具链"
+        )
+        return 0
+
+    monkeypatch.setattr(dialogs.QMessageBox, "exec", _fake_exec)
+    monkeypatch.setattr(
+        dialogs.QMessageBox,
+        "clickedButton",
+        lambda self: getattr(self, "_clicked_button", None),
+    )
+
+    decision = dialogs.choose_import_decision(None, preview)
+
+    assert captured["buttons"] == ["使用旧工具链", "清空 AI 绑定", "取消"]
+    assert captured["default"] == "使用旧工具链"
+    assert "源配置名称：ImportedCfg" in captured["text"]
+    assert "包含黄金样本：是" in captured["text"]
+    assert "包含 AI 工具链：是" in captured["text"]
+    assert "包含 AI 包：否" in captured["text"]
+    assert decision == ConfigPackageImportDecision(
+        config_action="create",
+        ai_action="use_existing_toolchain",
+    )
+
+
+def test_import_export_import_flow_inspects_imports_refreshes_and_selects_config(
+    qapp,
+    monkeypatch,
+):
+    config_service = _ConfigServiceStub(
+        loaded_configs={
+            7: _detail_payload([], config_id=7, config_name="ExistingCfg"),
+        }
+    )
+    preview = _package_preview(
+        config_name="ImportedCfg",
+        ai_toolchain_id="tc-1",
+        ai_conflict=True,
+        ai_action_options=("use_existing_toolchain", "clear_binding", "cancel"),
+        default_ai_action="use_existing_toolchain",
+        golden_samples=True,
+        ai_toolchain=True,
+        ai_package=False,
+    )
+    import_result = ConfigPackageImportResult(
+        status="created",
+        config_id=8,
+        config_name="ImportedCfg",
+        ai_binding_status="used_existing_toolchain",
+        warnings=("AI 绑定已沿用旧工具链。",),
+        info_message="导入完成。",
+    )
+    package_service = _ConfigPackageServiceStub(
+        preview=preview,
+        import_result=import_result,
+        on_import=lambda _path, _decision: config_service._loaded_configs.__setitem__(
+            8,
+            _detail_payload([], config_id=8, config_name="ImportedCfg"),
+        ),
+    )
+    module = _make_module(
+        config_service=config_service,
+        config_package_service=package_service,
+    )
+    chosen_decisions = []
+    infos = []
+    warnings = []
+
+    monkeypatch.setattr(
+        "ui.modules.config.config_package_dialogs.choose_dy_import_path",
+        lambda parent: "D:/packages/imported.dy",
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.config_package_dialogs.choose_import_decision",
+        lambda parent, incoming_preview: (
+            chosen_decisions.append(incoming_preview)
+            or ConfigPackageImportDecision(
+                config_action="create",
+                ai_action="use_existing_toolchain",
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.information",
+        lambda *args: infos.append(args),
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module._on_import_package()
+
+    assert package_service.inspect_calls == ["D:/packages/imported.dy"]
+    assert package_service.import_calls == [
+        (
+            "D:/packages/imported.dy",
+            ConfigPackageImportDecision(
+                config_action="create",
+                ai_action="use_existing_toolchain",
+            ),
+        )
+    ]
+    assert chosen_decisions == [preview]
+    assert module.config_list.currentItem().data(Qt.ItemDataRole.UserRole) == 8
+    assert any("AI 绑定已沿用旧工具链。" in str(args[-1]) for args in warnings)
+    assert any("导入完成。" in str(args[-1]) for args in infos)
+
+
+def test_import_export_kept_existing_config_shows_info_message(qapp, monkeypatch):
+    preview = _package_preview(
+        config_name="ExistingCfg",
+        config_conflict=True,
+        config_action_options=("overwrite", "use_existing_config", "cancel"),
+        default_config_action="use_existing_config",
+    )
+    package_service = _ConfigPackageServiceStub(
+        preview=preview,
+        import_result=ConfigPackageImportResult(
+            status="kept_existing",
+            config_id=7,
+            config_name="ExistingCfg",
+            ai_binding_status="unchanged",
+            info_message="保留现有配置。",
+        ),
+    )
+    module = _make_module(config_package_service=package_service)
+    infos = []
+
+    monkeypatch.setattr(
+        "ui.modules.config.config_package_dialogs.choose_dy_import_path",
+        lambda parent: "D:/packages/existing.dy",
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.config_package_dialogs.choose_import_decision",
+        lambda parent, incoming_preview: ConfigPackageImportDecision(
+            config_action="use_existing_config",
+            ai_action="create",
+        ),
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.information",
+        lambda *args: infos.append(args),
+    )
+
+    module._on_import_package()
+
+    assert package_service.import_calls == [
+        (
+            "D:/packages/existing.dy",
+            ConfigPackageImportDecision(
+                config_action="use_existing_config",
+                ai_action="create",
+            ),
+        )
+    ]
+    assert any("保留现有配置。" in str(args[-1]) for args in infos)

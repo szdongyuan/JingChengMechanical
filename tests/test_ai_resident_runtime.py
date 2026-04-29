@@ -451,6 +451,72 @@ def test_launches_entrypoint_exactly_as_stored_without_extra_flags(
     assert ai_result["env_value"] == "inherited-value"
 
 
+def test_analyze_uses_package_dir_as_process_cwd(
+    tmp_path: Path, runtime, monkeypatch
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    package_dir = tmp_path / "package-a"
+    other_cwd = tmp_path / "other-cwd"
+    package_dir.mkdir()
+    other_cwd.mkdir()
+    monkeypatch.chdir(other_cwd)
+    entrypoint = _entrypoint(script_path, "launch-introspect")
+
+    result = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        package_dir=str(package_dir),
+        request_id="req-1",
+        request_payload=_request_payload("req-1", include_launch_details=True),
+        artifacts_dir=str(tmp_path / "artifacts"),
+        timeout_ms=1000,
+    )
+
+    ai_result = result["response_payload"]["ai_result"]
+
+    assert result["module_status"] == "success"
+    assert ai_result["cwd"] == str(package_dir)
+
+
+def test_package_dir_change_restarts_cached_process(
+    tmp_path: Path, runtime
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    package_dir_a = tmp_path / "package-a"
+    package_dir_b = tmp_path / "package-b"
+    package_dir_a.mkdir()
+    package_dir_b.mkdir()
+    entrypoint = _entrypoint(script_path, "launch-introspect")
+
+    first = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        package_dir=str(package_dir_a),
+        request_id="req-1",
+        request_payload=_request_payload("req-1", include_launch_details=True),
+        artifacts_dir=str(tmp_path / "artifacts-1"),
+        timeout_ms=1000,
+    )
+    second = runtime.analyze(
+        toolchain_id="tc-1",
+        entrypoint=entrypoint,
+        package_dir=str(package_dir_b),
+        request_id="req-2",
+        request_payload=_request_payload("req-2", include_launch_details=True),
+        artifacts_dir=str(tmp_path / "artifacts-2"),
+        timeout_ms=1000,
+    )
+
+    first_ai_result = first["response_payload"]["ai_result"]
+    second_ai_result = second["response_payload"]["ai_result"]
+
+    assert first["module_status"] == "success"
+    assert second["module_status"] == "success"
+    assert first_ai_result["cwd"] == str(package_dir_a)
+    assert second_ai_result["cwd"] == str(package_dir_b)
+    assert second["process_instance_id"] != first["process_instance_id"]
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows-specific entrypoint parsing")
 def test_windows_entrypoint_preserves_embedded_quotes_and_trailing_backslashes(
     tmp_path: Path, runtime

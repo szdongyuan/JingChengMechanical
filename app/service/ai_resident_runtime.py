@@ -76,6 +76,7 @@ def _slice_utf8_text(text: str, start_offset: int) -> str:
 class _ResidentProcess:
     toolchain_id: str
     entrypoint: str
+    package_dir: str | None
     process: subprocess.Popen[str]
     instance_id: int
     stdout_items: deque[object] = field(default_factory=deque)
@@ -436,7 +437,9 @@ class ResidentToolchainRuntime:
         request_payload: dict,
         artifacts_dir: str,
         timeout_ms: int,
+        package_dir: str | None = None,
     ) -> dict:
+        package_dir = package_dir or None
         started_at = _now_iso()
         started_mono = time.monotonic()
         lease = self._try_acquire_lease(toolchain_id)
@@ -477,6 +480,7 @@ class ResidentToolchainRuntime:
                     cached_process, _ = self._acquire_process(
                         toolchain_id,
                         entrypoint,
+                        package_dir=package_dir,
                         deadline=deadline,
                     )
                 except TimeoutError:
@@ -812,13 +816,16 @@ class ResidentToolchainRuntime:
         toolchain_id: str,
         entrypoint: str,
         *,
+        package_dir: str | None = None,
         deadline: float | None = None,
     ) -> tuple[_ResidentProcess, bool]:
         stale_process = None
         with self._cache_lock:
             cached_process = self._processes.get(toolchain_id)
             if cached_process is not None and (
-                cached_process.entrypoint != entrypoint or cached_process.needs_restart()
+                cached_process.entrypoint != entrypoint
+                or cached_process.package_dir != package_dir
+                or cached_process.needs_restart()
             ):
                 stale_process = self._processes.pop(toolchain_id)
                 cached_process = None
@@ -830,7 +837,14 @@ class ResidentToolchainRuntime:
             if deadline is not None:
                 self._remaining_timeout(deadline)
 
-        created = self._start_process(toolchain_id, entrypoint)
+        if package_dir is None:
+            created = self._start_process(toolchain_id, entrypoint)
+        else:
+            created = self._start_process(
+                toolchain_id,
+                entrypoint,
+                package_dir=package_dir,
+            )
         try:
             self._settle_startup_stderr(created, deadline=deadline)
         except Exception:
@@ -840,7 +854,13 @@ class ResidentToolchainRuntime:
             self._processes[toolchain_id] = created
         return created, True
 
-    def _start_process(self, toolchain_id: str, entrypoint: str) -> _ResidentProcess:
+    def _start_process(
+        self,
+        toolchain_id: str,
+        entrypoint: str,
+        *,
+        package_dir: str | None = None,
+    ) -> _ResidentProcess:
         cmd = _split_entrypoint(entrypoint)
         process = subprocess.Popen(
             cmd,
@@ -851,6 +871,7 @@ class ResidentToolchainRuntime:
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            cwd=package_dir or None,
         )
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise RuntimeError("Resident process stdio pipes are unavailable")
@@ -858,6 +879,7 @@ class ResidentToolchainRuntime:
         cached_process = _ResidentProcess(
             toolchain_id=toolchain_id,
             entrypoint=entrypoint,
+            package_dir=package_dir,
             process=process,
             instance_id=next(self._instance_ids),
         )

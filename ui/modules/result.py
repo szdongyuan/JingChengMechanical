@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import math
 import re
+import time
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
@@ -13,6 +15,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app.service.analysis import dsp
 from app.services_container import FactoryControllerState, FactoryReviewPayload
 
 
@@ -25,20 +28,44 @@ _DISPLAY_LABEL_MAP = {
     "Octave": "倍频程",
 }
 _CHANNEL_LABEL_RE = re.compile(r"CH(\d+)", flags=re.IGNORECASE)
+_SPL_METRIC_UI_THROTTLE_SEC = 0.25
 
 
 class ResultModule(QWidget):
     module_id = "result"
-    _ROW_LABELS = ("声压级", "响度", "FFT频谱", "倍频程", "AI分析")
+    _ROW_LABELS = (
+        "声压级",
+        "平均声压级",
+        "响度",
+        "平均响度",
+        "FFT频谱",
+        "倍频程",
+        "AI分析",
+    )
     _DISPLAY_PRESERVING_PHASES = frozenset(
         {"running", "analyzing", "reanalyzing", "stopped"}
     )
+    _LIVE_METRIC_PHASES = frozenset({"running", "analyzing"})
+    _AVERAGE_METRIC_PHASES = frozenset({"reviewing", "stopped"})
 
     def __init__(self, services):
         super().__init__()
         self.services = services
         self._factory_state = getattr(services.factory_mode, "state", FactoryControllerState())
         self._review_payload = getattr(services.factory_mode, "review_payload", FactoryReviewPayload())
+        self.selected_display_channel_provider = None
+        self._current_live_run_id: str | None = None
+        self._live_spl_by_key: dict[tuple[int, str, int], float] = {}
+        self._live_loudness_by_key: dict[tuple[int, str, int], float] = {}
+        self._last_spl_repaint_time_by_key: dict[tuple[int, str, int], float] = {}
+        self._last_spl_repaint_source_by_key: dict[tuple[int, str, int], str] = {}
+        self._metric_channel_cache_key: tuple[int | None, int | None] | None = None
+        self._metric_selected_channel_index: int | None = None
+        self._metric_loudness_unit: str | None = None
+        self._metric_channel_valid = False
+        self._metric_config_load_failed = False
+        self._displayed_config_selected_channels_cache_key: int | None = None
+        self._displayed_config_selected_channel_indexes: frozenset[int] = frozenset()
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -61,6 +88,22 @@ class ResultModule(QWidget):
         top_lay.addStretch(1)
         top_lay.addWidget(self.lb_overall)
         lay.addWidget(top)
+
+        metrics = QWidget()
+        metrics_lay = QHBoxLayout(metrics)
+        metrics_lay.setContentsMargins(0, 0, 0, 0)
+        metrics_lay.setSpacing(8)
+
+        spl_metric = self._create_metric_badge("声压级", "--")
+        self.lb_spl_metric_label = spl_metric["label"]
+        self.lb_spl_metric_value = spl_metric["value"]
+        metrics_lay.addWidget(spl_metric["widget"], 1)
+
+        loudness_metric = self._create_metric_badge("响度", "--")
+        self.lb_loudness_metric_label = loudness_metric["label"]
+        self.lb_loudness_metric_value = loudness_metric["value"]
+        metrics_lay.addWidget(loudness_metric["widget"], 1)
+        lay.addWidget(metrics)
 
         self.empty_state = QWidget()
         self.empty_state.setObjectName("EmptyState")
@@ -113,6 +156,41 @@ class ResultModule(QWidget):
             self.services.bus.factory_review_changed.connect(self._on_factory_review_changed)
         if hasattr(self.services.bus, "factory_display_reset"):
             self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
+        if hasattr(self.services.bus, "spl_updated"):
+            self.services.bus.spl_updated.connect(self._on_spl_updated)
+        if hasattr(self.services.bus, "loudness_updated"):
+            self.services.bus.loudness_updated.connect(self._on_loudness_updated)
+        if hasattr(self.services.bus, "factory_runtime_start_accepted"):
+            self.services.bus.factory_runtime_start_accepted.connect(
+                self._on_factory_runtime_start_accepted
+            )
+        if hasattr(self.services.bus, "factory_runtime_analyzing_entered"):
+            self.services.bus.factory_runtime_analyzing_entered.connect(
+                self._on_factory_runtime_analyzing_entered
+            )
+
+    @staticmethod
+    def _create_metric_badge(label_text: str, value_text: str) -> dict[str, QWidget | QLabel]:
+        badge = QWidget()
+        badge.setObjectName("ResultMetricBadge")
+        badge.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        badge.setMinimumHeight(58)
+
+        lay = QVBoxLayout(badge)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(2)
+
+        label = QLabel(label_text)
+        label.setObjectName("ResultMetricLabel")
+        label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(label)
+
+        value = QLabel(value_text)
+        value.setObjectName("ResultMetricValue")
+        value.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(value)
+
+        return {"widget": badge, "label": label, "value": value}
 
     def _set_cell(self, row: int, column: int, text: str) -> None:
         item = QTableWidgetItem(text)
@@ -150,11 +228,13 @@ class ResultModule(QWidget):
         self._set_badge("-", "unknown")
         self._set_error_message(None)
         self._set_placeholder_rows()
+        self._refresh_metric_display()
 
     def _show_in_progress(self) -> None:
         self._set_badge("分析中", "unknown")
         self._set_error_message(None)
         self._set_placeholder_rows()
+        self._refresh_metric_display()
 
     def _render_summary(self, summary_payload: dict) -> None:
         overall_status = summary_payload.get("overall_status")
@@ -182,6 +262,7 @@ class ResultModule(QWidget):
                 self._display_channel(row_payload.get("channel_label"), "-"),
                 self._text_or_default(row_payload.get("status"), "-"),
             )
+        self._refresh_metric_display()
 
     def _refresh_display(self) -> None:
         summary_payload = getattr(self._review_payload, "summary_payload", None)
@@ -200,11 +281,20 @@ class ResultModule(QWidget):
             and getattr(self._review_payload, "summary_payload", None) is None
         )
 
+    def refresh_selected_display_channel(self) -> None:
+        self._refresh_metric_channel_cache(force=True)
+        self._refresh_metric_display()
+
     def _on_factory_state_changed(self, state) -> None:
+        previous_config_id = self._displayed_config_id()
         if isinstance(state, FactoryControllerState):
             self._factory_state = state
         else:
             self._factory_state = FactoryControllerState()
+        if self._displayed_config_id() != previous_config_id:
+            self._current_live_run_id = None
+            self._clear_live_metric_values_for_config(previous_config_id)
+            self._clear_metric_channel_cache()
         self._refresh_display()
 
     def _on_factory_review_changed(self, review) -> None:
@@ -216,7 +306,444 @@ class ResultModule(QWidget):
 
     def _on_factory_display_reset(self, _reason: str) -> None:
         self._review_payload = FactoryReviewPayload()
+        self._current_live_run_id = None
+        self._clear_all_live_metric_values()
+        self._clear_metric_channel_cache()
         self._show_empty()
+
+    def _on_factory_runtime_start_accepted(self, payload) -> None:
+        if not self._payload_config_matches_display(payload):
+            return
+        run_id = self._payload_run_id(payload)
+        if run_id is None:
+            return
+        self._current_live_run_id = run_id
+        self._clear_live_metric_values_for_config(
+            self._payload_config_id(payload),
+            keep_run_id=run_id,
+        )
+        self._refresh_metric_display()
+
+    def _on_factory_runtime_analyzing_entered(self, payload) -> None:
+        if not self._payload_config_matches_display(payload):
+            return
+        run_id = self._payload_run_id(payload)
+        if run_id is None:
+            return
+        if self._current_live_run_id is None:
+            self._current_live_run_id = run_id
+        elif self._current_live_run_id != run_id:
+            self._current_live_run_id = run_id
+            self._clear_live_metric_values_for_config(
+                self._payload_config_id(payload),
+                keep_run_id=run_id,
+            )
+        self._refresh_metric_display()
+
+    def _on_spl_updated(self, config_id, run_id, channel_idx, frame) -> None:
+        key = self._live_frame_key(config_id, run_id, channel_idx)
+        if key is None:
+            return
+        value = getattr(frame, "spl_db", None)
+        is_current_key = self._current_metric_key() == key
+        if not self._is_finite_number(value):
+            self._live_spl_by_key.pop(key, None)
+            self._last_spl_repaint_time_by_key.pop(key, None)
+            self._last_spl_repaint_source_by_key.pop(key, None)
+            if is_current_key:
+                self._render_live_spl_metric()
+            return
+        self._live_spl_by_key[key] = float(value)
+        if not is_current_key:
+            return
+        repaint_source, repaint_time = self._spl_metric_repaint_clock(frame)
+        if self._should_repaint_spl_metric(key, repaint_source, repaint_time):
+            self._last_spl_repaint_time_by_key[key] = repaint_time
+            self._last_spl_repaint_source_by_key[key] = repaint_source
+            self._render_live_spl_metric()
+
+    def _on_loudness_updated(self, config_id, run_id, channel_idx, frame) -> None:
+        key = self._live_frame_key(config_id, run_id, channel_idx)
+        if key is None:
+            return
+        value = getattr(frame, "loudness_sone", None)
+        is_current_key = self._current_metric_key() == key
+        if not self._is_finite_number(value):
+            self._live_loudness_by_key.pop(key, None)
+            if is_current_key:
+                self._render_live_loudness_metric()
+            return
+        self._live_loudness_by_key[key] = float(value)
+        if is_current_key:
+            self._render_live_loudness_metric()
+
+    def _refresh_metric_display(self) -> None:
+        phase = getattr(self._factory_state, "run_phase", None)
+        if phase in self._AVERAGE_METRIC_PHASES:
+            if (
+                self._review_payload_matches_display()
+                and isinstance(getattr(self._review_payload, "judgment_payload", None), dict)
+            ):
+                self._render_average_metrics()
+            else:
+                self._set_metric_values("平均声压级", "--", "平均响度", "--")
+            return
+        if phase in self._LIVE_METRIC_PHASES:
+            self._render_live_metrics()
+            return
+        self._set_metric_values("声压级", "--", "响度", "--")
+
+    def _render_live_metrics(self) -> None:
+        key = self._current_metric_key()
+        unit = self._metric_loudness_unit
+        spl_text = "--"
+        loudness_text = "--"
+        if key is not None and unit is not None:
+            spl_text = self._format_spl_db(self._live_spl_by_key.get(key))
+            loudness_text = self._format_loudness(
+                self._live_loudness_by_key.get(key),
+                unit,
+            )
+        self._set_metric_values("声压级", spl_text, "响度", loudness_text)
+
+    def _render_live_spl_metric(self) -> None:
+        key = self._current_metric_key()
+        spl_text = "--"
+        if key is not None:
+            spl_text = self._format_spl_db(self._live_spl_by_key.get(key))
+        self.lb_spl_metric_label.setText("声压级")
+        self.lb_spl_metric_value.setText(spl_text)
+
+    def _render_live_loudness_metric(self) -> None:
+        key = self._current_metric_key()
+        unit = self._metric_loudness_unit
+        loudness_text = "--"
+        if key is not None and unit is not None:
+            loudness_text = self._format_loudness(
+                self._live_loudness_by_key.get(key),
+                unit,
+            )
+        self.lb_loudness_metric_label.setText("响度")
+        self.lb_loudness_metric_value.setText(loudness_text)
+
+    def _render_average_metrics(self) -> None:
+        channel_result = self._selected_channel_result()
+        unit = self._metric_loudness_unit
+        spl_text = "--"
+        loudness_text = "--"
+        if channel_result is not None and unit is not None:
+            spl_text = self._format_spl_db(channel_result.get("spl_average_db"))
+            loudness_text = self._format_loudness(
+                channel_result.get("loudness_average_sone"),
+                unit,
+            )
+        self._set_metric_values("平均声压级", spl_text, "平均响度", loudness_text)
+
+    def _set_metric_values(
+        self,
+        spl_label: str,
+        spl_value: str,
+        loudness_label: str,
+        loudness_value: str,
+    ) -> None:
+        self.lb_spl_metric_label.setText(spl_label)
+        self.lb_spl_metric_value.setText(spl_value)
+        self.lb_loudness_metric_label.setText(loudness_label)
+        self.lb_loudness_metric_value.setText(loudness_value)
+
+    def _selected_channel_result(self) -> dict | None:
+        if not self._review_payload_matches_display():
+            return None
+        if not self._ensure_metric_channel_cache():
+            return None
+        selected_channel = self._metric_selected_channel_index
+        if selected_channel is None:
+            return None
+        judgment_payload = getattr(self._review_payload, "judgment_payload", None)
+        if not isinstance(judgment_payload, dict):
+            return None
+        channel_results = judgment_payload.get("channel_results")
+        if not isinstance(channel_results, list):
+            return None
+        for channel_result in channel_results:
+            if not isinstance(channel_result, dict):
+                continue
+            if self._as_int(channel_result.get("channel_index")) == selected_channel:
+                return channel_result
+        return None
+
+    def _current_metric_key(self) -> tuple[int, str, int] | None:
+        config_id = self._displayed_config_id()
+        run_id = self._current_live_run_id
+        if not self._ensure_metric_channel_cache():
+            return None
+        channel_index = self._metric_selected_channel_index
+        if config_id is None or run_id is None or channel_index is None:
+            return None
+        return (config_id, run_id, channel_index)
+
+    def _live_frame_key(self, config_id, run_id, channel_idx) -> tuple[int, str, int] | None:
+        if getattr(self._factory_state, "run_phase", None) not in self._LIVE_METRIC_PHASES:
+            return None
+        if self._current_live_run_id is None or run_id != self._current_live_run_id:
+            return None
+        displayed_config_id = self._displayed_config_id()
+        if self._as_int(config_id) != displayed_config_id:
+            return None
+        channel_index = self._as_int(channel_idx)
+        if displayed_config_id is None or channel_index is None:
+            return None
+        selected_channel = self._selected_channel_index()
+        if channel_index == selected_channel:
+            if not self._ensure_metric_channel_cache():
+                return None
+        elif not self._channel_is_selected_for_displayed_config(channel_index):
+            return None
+        return (displayed_config_id, self._current_live_run_id, channel_index)
+
+    def _channel_is_selected_for_displayed_config(self, channel_index: int) -> bool:
+        if not self._ensure_displayed_config_selected_channel_metadata():
+            return False
+        return channel_index in self._displayed_config_selected_channel_indexes
+
+    def _should_repaint_spl_metric(
+        self,
+        key: tuple[int, str, int],
+        repaint_source: str,
+        repaint_time: float,
+    ) -> bool:
+        last_repaint_time = self._last_spl_repaint_time_by_key.get(key)
+        last_repaint_source = self._last_spl_repaint_source_by_key.get(key)
+        if last_repaint_time is None:
+            return True
+        if self.lb_spl_metric_value.text() == "--":
+            return True
+        if last_repaint_source != repaint_source:
+            return True
+        return repaint_time - last_repaint_time >= _SPL_METRIC_UI_THROTTLE_SEC
+
+    def _spl_metric_repaint_clock(self, frame) -> tuple[str, float]:
+        frame_time = getattr(frame, "time", None)
+        if self._is_finite_number(frame_time):
+            return "frame", float(frame_time)
+        return "monotonic", float(time.monotonic())
+
+    def _review_payload_matches_display(self) -> bool:
+        return self._review_payload.displayed_config_id == self._displayed_config_id()
+
+    def _payload_config_matches_display(self, payload) -> bool:
+        payload_config_id = self._as_int(getattr(payload, "config_id", None))
+        if payload_config_id is None:
+            return False
+        return payload_config_id == self._displayed_config_id()
+
+    def _displayed_config_id(self) -> int | None:
+        return self._as_int(getattr(self._factory_state, "displayed_config_id", None))
+
+    def _selected_channel_index(self) -> int | None:
+        provider = self.selected_display_channel_provider
+        if not callable(provider):
+            return None
+        return self._as_int(provider())
+
+    def _ensure_metric_channel_cache(self) -> bool:
+        key = (self._displayed_config_id(), self._selected_channel_index())
+        if key != self._metric_channel_cache_key:
+            self._refresh_metric_channel_cache(force=True)
+        return self._metric_channel_valid
+
+    def _refresh_metric_channel_cache(self, *, force: bool = False) -> None:
+        config_id = self._displayed_config_id()
+        selected_channel = self._selected_channel_index()
+        key = (config_id, selected_channel)
+        if not force and key == self._metric_channel_cache_key:
+            return
+
+        self._metric_channel_cache_key = key
+        self._metric_selected_channel_index = selected_channel
+        self._metric_loudness_unit = None
+        self._metric_channel_valid = False
+        self._metric_config_load_failed = False
+
+        if config_id is None or selected_channel is None:
+            self._clear_displayed_config_selected_channel_metadata()
+            return
+
+        config = self._load_config(config_id)
+        selected_channel_indexes = self._refresh_displayed_config_selected_channel_metadata(
+            config_id,
+            config,
+        )
+        if config is None:
+            self._metric_config_load_failed = True
+            return
+        if selected_channel not in selected_channel_indexes:
+            return
+        channels = config.get("channels") if isinstance(config, dict) else None
+        if isinstance(channels, list):
+            for channel in channels:
+                if not isinstance(channel, dict):
+                    continue
+                if self._as_int(channel.get("channel_index")) == selected_channel:
+                    self._metric_loudness_unit = self._normalize_loudness_unit(
+                        channel.get("loudness_unit")
+                    )
+                    self._metric_channel_valid = True
+                    return
+
+    def _ensure_displayed_config_selected_channel_metadata(self) -> bool:
+        config_id = self._displayed_config_id()
+        if config_id is None:
+            return False
+        if self._displayed_config_selected_channels_cache_key != config_id:
+            config = self._load_config(config_id)
+            self._refresh_displayed_config_selected_channel_metadata(config_id, config)
+        return self._displayed_config_selected_channels_cache_key == config_id
+
+    def _refresh_displayed_config_selected_channel_metadata(
+        self,
+        config_id: int,
+        config: dict | None,
+    ) -> frozenset[int]:
+        selected_channels = config.get("selected_channels") if isinstance(config, dict) else None
+        if not isinstance(selected_channels, list):
+            selected_channel_indexes = frozenset()
+        else:
+            selected_channel_indexes = frozenset(
+                channel_index
+                for channel_index in (self._as_int(channel) for channel in selected_channels)
+                if channel_index is not None
+            )
+        self._displayed_config_selected_channels_cache_key = config_id
+        self._displayed_config_selected_channel_indexes = selected_channel_indexes
+        return selected_channel_indexes
+
+    def _clear_displayed_config_selected_channel_metadata(self) -> None:
+        self._displayed_config_selected_channels_cache_key = None
+        self._displayed_config_selected_channel_indexes = frozenset()
+
+    @staticmethod
+    def _normalize_loudness_unit(value) -> str:
+        unit = str(value or "sone").strip().lower()
+        return unit if unit in {"sone", "phon"} else "sone"
+
+    def _load_config(self, config_id: int | None) -> dict | None:
+        if config_id is None:
+            return None
+        config_service = getattr(self.services, "config_service", None)
+        load_config = getattr(config_service, "load_config", None)
+        if not callable(load_config):
+            return None
+        try:
+            config = load_config(config_id)
+        except Exception:
+            return None
+        return config if isinstance(config, dict) else None
+
+    def _clear_live_run(self) -> None:
+        self._current_live_run_id = None
+        self._clear_all_live_metric_values()
+
+    def _clear_all_live_metric_values(self) -> None:
+        self._live_spl_by_key.clear()
+        self._live_loudness_by_key.clear()
+        self._last_spl_repaint_time_by_key.clear()
+        self._last_spl_repaint_source_by_key.clear()
+
+    def _clear_live_metric_values_for_config(
+        self,
+        config_id: int | None,
+        *,
+        keep_run_id: str | None = None,
+    ) -> None:
+        if config_id is None:
+            return
+        for cache in (
+            self._live_spl_by_key,
+            self._live_loudness_by_key,
+            self._last_spl_repaint_time_by_key,
+            self._last_spl_repaint_source_by_key,
+        ):
+            for key in list(cache):
+                if key[0] != config_id:
+                    continue
+                if keep_run_id is not None and key[1] == keep_run_id:
+                    continue
+                del cache[key]
+
+    def _clear_current_run_live_metric_values(self) -> None:
+        config_id = self._displayed_config_id()
+        run_id = self._current_live_run_id
+        if config_id is None or run_id is None:
+            return
+        for cache in (
+            self._live_spl_by_key,
+            self._live_loudness_by_key,
+            self._last_spl_repaint_time_by_key,
+            self._last_spl_repaint_source_by_key,
+        ):
+            for key in list(cache):
+                if key[0] == config_id and key[1] == run_id:
+                    del cache[key]
+
+    def _clear_metric_channel_cache(self) -> None:
+        self._metric_channel_cache_key = None
+        self._metric_selected_channel_index = None
+        self._metric_loudness_unit = None
+        self._metric_channel_valid = False
+        self._metric_config_load_failed = False
+        self._clear_displayed_config_selected_channel_metadata()
+
+    @staticmethod
+    def _payload_run_id(payload) -> str | None:
+        run_id = getattr(payload, "run_id", None)
+        if run_id is None:
+            return None
+        text = str(run_id)
+        return text if text else None
+
+    def _payload_config_id(self, payload) -> int | None:
+        return self._as_int(getattr(payload, "config_id", None))
+
+    @staticmethod
+    def _as_int(value) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _is_finite_number(value) -> bool:
+        try:
+            return math.isfinite(float(value))
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _format_spl_db(value) -> str:
+        if not ResultModule._is_finite_number(value):
+            return "--"
+        return f"{float(value):.1f} dB"
+
+    @staticmethod
+    def _format_loudness(value_sone, unit: str) -> str:
+        if not ResultModule._is_finite_number(value_sone):
+            return "--"
+        value = float(value_sone)
+        normalized_unit = str(unit or "sone").strip().lower()
+        if normalized_unit == "phon":
+            try:
+                phon_value = float(dsp.sone_to_phon(value))
+            except (TypeError, ValueError, OverflowError):
+                return "--"
+            if not math.isfinite(phon_value):
+                return "--"
+            return f"{phon_value:.1f} phon"
+        if value < 10.0:
+            return f"{value:.2f} sone"
+        return f"{value:.1f} sone"
 
     @staticmethod
     def _text_or_default(value, default: str | None) -> str | None:

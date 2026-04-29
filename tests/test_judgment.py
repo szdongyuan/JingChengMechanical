@@ -1,6 +1,7 @@
 """Tests for JudgmentEngine limit checks and verdict logic."""
 from __future__ import annotations
 
+from dataclasses import asdict
 import logging
 from pathlib import Path
 
@@ -52,11 +53,23 @@ def _make_channel_config(idx, **overrides) -> dict:
         "stft_overlap": 0.5,
         "spl_weighting": "Z",
         "spl_time_constant": 0.125,
+        "spl_lower_enabled": True,
+        "spl_upper_enabled": True,
         "spl_upper_limit": 85.0,
         "spl_lower_limit": 40.0,
+        "spl_average_lower_enabled": False,
+        "spl_average_lower_limit": 40.0,
+        "spl_average_upper_enabled": False,
+        "spl_average_upper_limit": 85.0,
         "loudness_unit": "sone",
+        "loudness_lower_enabled": True,
+        "loudness_upper_enabled": True,
         "loudness_lower_limit": 0.0,
         "loudness_upper_limit": 60.0,
+        "loudness_average_lower_enabled": False,
+        "loudness_average_lower_limit": 0.0,
+        "loudness_average_upper_enabled": False,
+        "loudness_average_upper_limit": 60.0,
         "fft_band_limits": [],
         "golden_sample_path": None,
         "golden_sample_label": None,
@@ -152,6 +165,40 @@ class TestLimitChecks:
         assert result.channel_results[0].loudness_max_sone == 8.0
         assert result.channel_results[0].loudness_pass is True
 
+    def test_serialized_channel_judgment_contains_average_metrics(self, monkeypatch):
+        engine = self._make_engine()
+        sample_rate = 1000.0
+        calibrated_pressure = 20e-6 * 10 ** (60.0 / 20.0)
+        raw_pressure = calibrated_pressure / 2.0
+        buffer = np.full((int(sample_rate * 3.0), 1), raw_pressure, dtype=np.float64)
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    spl_lower_limit=0.0,
+                    spl_upper_limit=200.0,
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            dsp,
+            "compute_loudness_trace",
+            lambda *args, **kwargs: ([0.0, 1.0, 2.0], [1.0, float("nan"), 5.0], 5.0),
+        )
+
+        result = engine.judge(
+            config,
+            buffer,
+            sample_rate,
+            mic_cal={"In1": {"deviation_value": "2.0"}},
+            audio_file_path="/tmp/test.wav",
+        )
+        serialized_channel = asdict(result)["channel_results"][0]
+
+        assert serialized_channel["spl_average_db"] == pytest.approx(60.0, abs=0.01)
+        assert serialized_channel["loudness_average_sone"] == pytest.approx(3.0)
+        assert serialized_channel["loudness_max_sone"] == pytest.approx(5.0)
+
     def test_judgment_uses_phon_limits_via_conversion_helpers(self, monkeypatch):
         engine = self._make_engine()
         sample_rate = 44100.0
@@ -169,12 +216,38 @@ class TestLimitChecks:
         monkeypatch.setattr(
             dsp,
             "compute_loudness_trace",
-            lambda *args, **kwargs: ([0.0, 1.0], [4.0, 8.0], 8.0),
+            lambda *args, **kwargs: ([0.0, 1.0], [6.0, 8.0], 8.0),
         )
 
         result = engine.judge(config, buffer, sample_rate, mic_cal={}, audio_file_path="/tmp/test.wav")
 
         assert result.channel_results[0].loudness_pass is True
+
+    def test_loudness_fails_when_any_trace_value_is_below_lower_limit(self, monkeypatch):
+        engine = self._make_engine()
+        sample_rate = 44100.0
+        buffer = np.zeros((int(sample_rate * 3.0), 1))
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    loudness_unit="sone",
+                    loudness_lower_limit=5.0,
+                    loudness_upper_limit=10.0,
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            dsp,
+            "compute_loudness_trace",
+            lambda *args, **kwargs: ([0.0, 1.0], [1.0, 8.0], 8.0),
+        )
+
+        result = engine.judge(config, buffer, sample_rate, mic_cal={}, audio_file_path="/tmp/test.wav")
+
+        channel_result = result.channel_results[0]
+        assert channel_result.loudness_pass is False
+        assert result.limit_pass is False
 
     def test_judgment_marks_loudness_unavailable_when_backend_errors(self, monkeypatch):
         engine = self._make_engine()
@@ -192,6 +265,23 @@ class TestLimitChecks:
         assert result.channel_results[0].loudness_available is False
         assert result.channel_results[0].loudness_error_message == "loudness backend unavailable"
         assert result.limit_pass is False
+
+    def test_loudness_average_is_none_when_backend_errors(self, monkeypatch):
+        engine = self._make_engine()
+        sample_rate = 44100.0
+        buffer = np.zeros((int(sample_rate * 3.0), 1))
+        config = _make_config()
+
+        def _raising_backend_error(*args, **kwargs):
+            raise RuntimeError("loudness backend unavailable")
+
+        monkeypatch.setattr(dsp, "compute_loudness_trace", _raising_backend_error)
+
+        result = engine.judge(config, buffer, sample_rate, mic_cal={}, audio_file_path="/tmp/test.wav")
+
+        assert result.channel_results[0].spl_average_db is not None
+        assert result.channel_results[0].loudness_average_sone is None
+        assert result.channel_results[0].loudness_available is False
 
     def test_judgment_preserves_loudness_failure_contract_when_segmented_backend_errors(self, monkeypatch):
         engine = self._make_engine()
@@ -231,6 +321,31 @@ class TestLimitChecks:
         result = engine.judge(config, buf, sr, mic_cal={},
                               audio_file_path="/tmp/test.wav")
         assert result.channel_results[0].spl_pass is False
+
+    def test_spl_fails_when_any_chunk_is_below_lower_limit(self):
+        engine = self._make_engine()
+        sr = 44100.0
+        quiet_samples = int(sr * 0.5)
+        loud_samples = int(sr * 2.5)
+        t = np.arange(loud_samples) / sr
+        loud = (20e-6 * 10 ** (60 / 20)) * np.sin(2 * np.pi * 1000 * t)
+        quiet = np.full(quiet_samples, 20e-6 * 10 ** (20 / 20))
+        buf = np.concatenate([quiet, loud]).reshape(-1, 1)
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    spl_lower_limit=40.0,
+                    spl_upper_limit=80.0,
+                )
+            ]
+        )
+
+        result = engine.judge(config, buf, sr, mic_cal={}, audio_file_path="/tmp/test.wav")
+
+        channel_result = result.channel_results[0]
+        assert channel_result.spl_pass is False
+        assert result.limit_pass is False
 
     def test_fft_band_limit_pass(self):
         engine = self._make_engine()
@@ -1279,6 +1394,105 @@ class TestMissingChannelConfig:
                               audio_file_path="/tmp/test.wav")
         # Should still analyze channel 0 using defaults, not skip it
         assert len(result.channel_results) == 1
+
+
+class TestOptionalLimitSwitches:
+    def test_all_spl_and_loudness_bounds_disabled_do_not_fail_limits(self, monkeypatch):
+        mock_ai = MagicMock()
+        mock_ai.resolve_binding.return_value = None
+        engine = JudgmentEngine(mock_ai)
+        sr = 44100.0
+        t = np.arange(int(sr * 3.0)) / sr
+        sig = 10.0 * np.sin(2 * np.pi * 1000 * t)
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    spl_lower_enabled=False,
+                    spl_upper_enabled=False,
+                    spl_average_lower_enabled=False,
+                    spl_average_upper_enabled=False,
+                    loudness_lower_enabled=False,
+                    loudness_upper_enabled=False,
+                    loudness_average_lower_enabled=False,
+                    loudness_average_upper_enabled=False,
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            dsp,
+            "compute_loudness_trace",
+            lambda *args, **kwargs: ([0.0, 1.0], [100.0, 200.0], 200.0),
+        )
+
+        result = engine.judge(config, sig.reshape(-1, 1), sr, mic_cal={}, audio_file_path="/tmp/test.wav")
+
+        channel = result.channel_results[0]
+        assert channel.spl_pass is True
+        assert channel.spl_average_pass is True
+        assert channel.loudness_pass is True
+        assert channel.loudness_average_pass is True
+        assert result.limit_pass is True
+
+    def test_average_spl_upper_bound_uses_leq(self):
+        mock_ai = MagicMock()
+        mock_ai.resolve_binding.return_value = None
+        engine = JudgmentEngine(mock_ai)
+        sr = 44100.0
+        t = np.arange(int(sr * 3.0)) / sr
+        amplitude = 20e-6 * 10 ** (70 / 20) * np.sqrt(2)
+        sig = amplitude * np.sin(2 * np.pi * 1000 * t)
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    spl_lower_enabled=False,
+                    spl_upper_enabled=False,
+                    spl_average_upper_enabled=True,
+                    spl_average_upper_limit=65.0,
+                    loudness_lower_enabled=False,
+                    loudness_upper_enabled=False,
+                )
+            ]
+        )
+
+        result = engine.judge(config, sig.reshape(-1, 1), sr, mic_cal={}, audio_file_path="/tmp/test.wav")
+
+        channel = result.channel_results[0]
+        assert channel.spl_average_db == pytest.approx(70.0, abs=0.2)
+        assert channel.spl_average_pass is False
+        assert result.limit_pass is False
+
+    def test_average_loudness_upper_bound_uses_trace_mean(self, monkeypatch):
+        mock_ai = MagicMock()
+        mock_ai.resolve_binding.return_value = None
+        engine = JudgmentEngine(mock_ai)
+        sr = 44100.0
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    spl_lower_enabled=False,
+                    spl_upper_enabled=False,
+                    loudness_lower_enabled=False,
+                    loudness_upper_enabled=False,
+                    loudness_average_upper_enabled=True,
+                    loudness_average_upper_limit=4.0,
+                )
+            ]
+        )
+        monkeypatch.setattr(
+            dsp,
+            "compute_loudness_trace",
+            lambda *args, **kwargs: ([0.0, 1.0], [2.0, 8.0], 8.0),
+        )
+
+        result = engine.judge(config, np.zeros((int(sr * 3.0), 1)), sr, mic_cal={}, audio_file_path="/tmp/test.wav")
+
+        channel = result.channel_results[0]
+        assert channel.loudness_average_sone == pytest.approx(5.0)
+        assert channel.loudness_average_pass is False
+        assert result.limit_pass is False
 
 
 class TestRunAiDeferral:

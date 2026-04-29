@@ -65,6 +65,7 @@ class TestSession:
         self._attach_pending: bool = False
         self._pending_attach_chunks: list[tuple[np.ndarray, int]] = []
         self._on_session_done_cb: Callable[[int], Any] | None = None
+        self._live_loudness_channel_index: int | None = None
 
         # Connection refs set by TestManager for signal disconnection
         self._chunk_conn: Callable | None = None
@@ -76,6 +77,7 @@ class TestSession:
     def _setup_pipelines(self):
         """Create one AnalysisPipeline per selected channel."""
         selected = self._config.get("selected_channels", [])
+        self._live_loudness_channel_index = self._first_selected_channel(selected)
         channels_cfg = {ch["channel_index"]: ch for ch in self._config.get("channels", [])}
         self._pipelines = []
         for ch_idx in selected:
@@ -91,6 +93,24 @@ class TestSession:
                     mic_sensitivity=sensitivity,
                 )
             )
+
+    def set_live_loudness_channel_index(self, channel_index: int | None):
+        if channel_index is None:
+            self._live_loudness_channel_index = None
+            return
+        normalized_channel = self._as_non_bool_int(channel_index)
+        if normalized_channel is None:
+            return
+        selected_channels = {
+            selected
+            for selected in (
+                self._as_non_bool_int(channel)
+                for channel in self._config.get("selected_channels", [])
+            )
+            if selected is not None
+        }
+        if normalized_channel in selected_channels:
+            self._live_loudness_channel_index = normalized_channel
 
     def prepare_for_attach(self):
         """Buffer chunks until the recorder-owned attach boundary is known."""
@@ -156,12 +176,23 @@ class TestSession:
             else:
                 continue
 
-            result = pipeline.process_chunk(mono, elapsed)
+            result = pipeline.process_chunk(
+                mono,
+                elapsed,
+                compute_loudness=(ch_idx == self._live_loudness_channel_index),
+            )
 
             for stft_frame in result["stft_frames"]:
                 self._bus.stft_updated.emit(self.config_id, frame_run_id, ch_idx, stft_frame)
             if result["spl"] is not None:
                 self._bus.spl_updated.emit(self.config_id, frame_run_id, ch_idx, result["spl"])
+            if result.get("loudness") is not None:
+                self._bus.loudness_updated.emit(
+                    self.config_id,
+                    frame_run_id,
+                    ch_idx,
+                    result["loudness"],
+                )
             if result["octave"] is not None:
                 self._bus.octave_updated.emit(self.config_id, frame_run_id, ch_idx, result["octave"])
             if result["fft"] is not None:
@@ -533,6 +564,23 @@ class TestSession:
                 return float(value)
             return None
         return None
+
+    @staticmethod
+    def _first_selected_channel(selected_channels) -> int | None:
+        for channel in selected_channels or ():
+            normalized = TestSession._as_non_bool_int(channel)
+            if normalized is not None:
+                return normalized
+        return None
+
+    @staticmethod
+    def _as_non_bool_int(value) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
 
     @staticmethod
     def _coerce_ai_channel_index(value) -> int | None:

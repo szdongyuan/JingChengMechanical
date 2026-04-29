@@ -48,7 +48,7 @@ class GoldenSampleImportDialog(QDialog):
         self._syncing_start = False
         self._validation_error: str | None = None
 
-        self.setWindowTitle("Golden Sample Import")
+        self.setWindowTitle("导入黄金样本")
         self.resize(920, 640)
         self.setModal(True)
 
@@ -74,19 +74,19 @@ class GoldenSampleImportDialog(QDialog):
 
         self._sample_rate_value = QLabel("-")
         self._sample_rate_value.setObjectName("file_sample_rate_value")
-        summary_form.addRow("Sample rate", self._sample_rate_value)
+        summary_form.addRow("采样率", self._sample_rate_value)
 
         self._channel_count_value = QLabel("-")
         self._channel_count_value.setObjectName("file_channel_count_value")
-        summary_form.addRow("Channels", self._channel_count_value)
+        summary_form.addRow("通道数", self._channel_count_value)
 
         self._total_duration_value = QLabel("-")
         self._total_duration_value.setObjectName("file_total_duration_value")
-        summary_form.addRow("Total duration", self._total_duration_value)
+        summary_form.addRow("总时长", self._total_duration_value)
 
         self._required_duration_value = QLabel("-")
         self._required_duration_value.setObjectName("required_golden_duration_value")
-        summary_form.addRow("Required duration", self._required_duration_value)
+        summary_form.addRow("所需时长", self._required_duration_value)
         root.addWidget(summary)
 
         controls = QWidget(self)
@@ -100,19 +100,19 @@ class GoldenSampleImportDialog(QDialog):
         self._source_channel_selector.currentIndexChanged.connect(
             self._refresh_waveform_preview
         )
-        controls_form.addRow("Source channel", self._source_channel_selector)
+        controls_form.addRow("源通道", self._source_channel_selector)
 
         self._start_ms_spin = QSpinBox(self)
         self._start_ms_spin.setObjectName("start_ms_spin")
         self._start_ms_spin.setRange(0, 0)
         self._start_ms_spin.setSuffix(" ms")
         self._start_ms_spin.valueChanged.connect(self._on_start_ms_changed)
-        controls_form.addRow("Start", self._start_ms_spin)
+        controls_form.addRow("起点", self._start_ms_spin)
 
         self._end_ms_display = QLineEdit(self)
         self._end_ms_display.setObjectName("end_ms_display")
         self._end_ms_display.setReadOnly(True)
-        controls_form.addRow("End", self._end_ms_display)
+        controls_form.addRow("终点", self._end_ms_display)
         root.addWidget(controls)
 
         self._plot_widget = pg.PlotWidget(self)
@@ -121,8 +121,8 @@ class GoldenSampleImportDialog(QDialog):
         self._plot_widget.hideButtons()
         self._plot_widget.setBackground("w")
         self._plot_widget.showGrid(x=True, y=True, alpha=0.18)
-        self._plot_widget.setLabel("bottom", "Time", units="s")
-        self._plot_widget.setLabel("left", "Amplitude")
+        self._plot_widget.setLabel("bottom", "时间", units="s")
+        self._plot_widget.setLabel("left", "幅值")
         self._waveform_curve = self._plot_widget.plot(pen=pg.mkPen(color="#2563eb", width=1.5))
         root.addWidget(self._plot_widget, 1)
 
@@ -143,6 +143,8 @@ class GoldenSampleImportDialog(QDialog):
             self,
         )
         self._buttons.setObjectName("dialog_buttons")
+        self._buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
+        self._buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         self._buttons.accepted.connect(self._on_confirm)
         self._buttons.rejected.connect(self.reject)
         footer_layout.addWidget(self._buttons)
@@ -231,7 +233,7 @@ class GoldenSampleImportDialog(QDialog):
             self._configure_region()
 
         self._update_end_time()
-        self._validation_message.setText(self._validation_error or "Ready")
+        self._validation_message.setText(self._validation_error or "就绪")
         self._buttons.button(QDialogButtonBox.StandardButton.Ok).setEnabled(
             self._validation_error is None
         )

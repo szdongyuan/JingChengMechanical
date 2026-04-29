@@ -253,13 +253,9 @@ class GoldenSampleService:
                 ):
                     raise ValueError("黄金样本暂存文件不存在或不可读")
 
-                config_dir = os.path.join(self.managed_root(), f"config_{config_id}")
-                os.makedirs(config_dir, exist_ok=True)
-                committed_path = os.path.abspath(
-                    os.path.join(
-                        config_dir,
-                        f"channel_{channel_index}_{uuid.uuid4().hex}.wav",
-                    )
+                committed_path = self._build_committed_path(
+                    config_id=config_id,
+                    channel_index=channel_index,
                 )
                 shutil.copy2(staged.staged_path, committed_path)
                 promoted_paths.append(committed_path)
@@ -277,6 +273,40 @@ class GoldenSampleService:
             self.rollback_promoted_samples(promoted_paths)
             raise
         return promoted
+
+    def restore_imported_sample(
+        self,
+        config_id: int,
+        channel_index: int,
+        source_path: str,
+        metadata: dict,
+    ) -> dict:
+        committed_path = self._build_committed_path(
+            config_id=config_id,
+            channel_index=channel_index,
+        )
+        try:
+            shutil.copy2(source_path, committed_path)
+            restored = self._normalize_imported_metadata(
+                source_path=source_path,
+                committed_path=committed_path,
+                metadata=metadata,
+            )
+            analysis_duration = (
+                restored["golden_sample_num_samples"]
+                / float(restored["golden_sample_sample_rate"])
+            )
+            errors = self.validate_committed_binding(
+                channel_config=restored,
+                analysis_duration=analysis_duration,
+                sample_rate=restored["golden_sample_sample_rate"],
+            )
+            if errors:
+                raise ValueError("\n".join(errors))
+            return restored
+        except Exception:
+            self.cleanup_paths([committed_path])
+            raise
 
     def discard_staged_samples(self, staged_paths: list[str]) -> None:
         managed_staged_paths = [
@@ -333,6 +363,81 @@ class GoldenSampleService:
             round(int(num_samples) * 1000 / float(sample_rate)),
         )
 
+    def _build_committed_path(self, *, config_id: int, channel_index: int) -> str:
+        config_dir = os.path.join(self.managed_root(), f"config_{config_id}")
+        os.makedirs(config_dir, exist_ok=True)
+        return os.path.abspath(
+            os.path.join(
+                config_dir,
+                f"channel_{channel_index}_{uuid.uuid4().hex}.wav",
+            )
+        )
+
+    def _normalize_imported_metadata(
+        self,
+        *,
+        source_path: str,
+        committed_path: str,
+        metadata: dict,
+    ) -> dict:
+        if not isinstance(metadata, dict):
+            raise ValueError("黄金样本导入元数据无效")
+
+        normalized = {
+            "golden_sample_path": committed_path,
+            "golden_sample_label": self._normalize_import_text(
+                metadata.get("golden_sample_label"),
+                fallback=metadata.get("label"),
+                default=os.path.basename(source_path),
+            ),
+            "golden_sample_source_channel": self._metadata_value(
+                metadata,
+                "golden_sample_source_channel",
+                "source_channel",
+            ),
+            "golden_sample_start_sample": self._metadata_value(
+                metadata,
+                "golden_sample_start_sample",
+                "start_sample",
+            ),
+            "golden_sample_num_samples": self._metadata_value(
+                metadata,
+                "golden_sample_num_samples",
+                "num_samples",
+            ),
+            "golden_sample_start_ms": self._metadata_value(
+                metadata,
+                "golden_sample_start_ms",
+                "start_ms",
+            ),
+            "golden_sample_duration_ms": self._metadata_value(
+                metadata,
+                "golden_sample_duration_ms",
+                "duration_ms",
+            ),
+            "golden_sample_sample_rate": self._metadata_value(
+                metadata,
+                "golden_sample_sample_rate",
+                "sample_rate",
+            ),
+        }
+        self._validate_imported_metadata(normalized)
+        return normalized
+
+    def _validate_imported_metadata(self, metadata: dict) -> None:
+        if not self._is_non_negative_int(metadata.get("golden_sample_source_channel")):
+            raise ValueError("黄金样本源通道必须大于等于 0")
+        if not self._is_non_negative_int(metadata.get("golden_sample_start_sample")):
+            raise ValueError("黄金样本起始采样点必须大于等于 0")
+        if not self._is_positive_int(metadata.get("golden_sample_num_samples")):
+            raise ValueError("黄金样本长度必须大于 0")
+        if not self._is_non_negative_int(metadata.get("golden_sample_start_ms")):
+            raise ValueError("黄金样本起始时间元数据无效")
+        if not self._is_non_negative_int(metadata.get("golden_sample_duration_ms")):
+            raise ValueError("黄金样本时长元数据无效")
+        if not self._is_positive_number(metadata.get("golden_sample_sample_rate")):
+            raise ValueError("黄金样本采样率无效")
+
     def _is_within_root(self, path: str) -> bool:
         root = os.path.realpath(self.managed_root())
         candidate = os.path.realpath(os.path.abspath(str(path)))
@@ -352,3 +457,19 @@ class GoldenSampleService:
     @staticmethod
     def _is_positive_number(value) -> bool:
         return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
+
+    @staticmethod
+    def _metadata_value(metadata: dict, primary: str, fallback: str):
+        if primary in metadata:
+            return metadata.get(primary)
+        return metadata.get(fallback)
+
+    @staticmethod
+    def _normalize_import_text(value, *, fallback=None, default: str | None = None) -> str | None:
+        for candidate in (value, fallback, default):
+            if candidate is None:
+                continue
+            text = str(candidate).strip()
+            if text:
+                return text
+        return None

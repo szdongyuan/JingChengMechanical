@@ -128,6 +128,97 @@ def test_promote_staged_samples_leaves_no_committed_files_when_a_stage_is_invali
     assert list((tmp_path / "managed").rglob("*.wav")) == []
 
 
+def test_restore_imported_sample_copies_wav_into_committed_dir_and_validates(tmp_path):
+    svc = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    source_path, _ = _write_temp_wav(tmp_path / "package" / "channel_0.wav")
+
+    restored = svc.restore_imported_sample(
+        config_id=17,
+        channel_index=0,
+        source_path=str(source_path),
+        metadata=_binding(
+            source_path,
+            num_samples=144_000,
+        ),
+    )
+    restored_path = Path(restored["golden_sample_path"])
+
+    assert restored_path.exists()
+    assert restored_path != source_path
+    assert restored_path.name.startswith("channel_0_")
+    assert restored_path.resolve().is_relative_to(
+        (tmp_path / "managed" / "config_17").resolve()
+    )
+    assert restored["golden_sample_label"] == "gold.wav"
+    assert restored["golden_sample_source_channel"] == 1
+    assert svc.validate_committed_binding(
+        channel_config=restored,
+        analysis_duration=3.0,
+        sample_rate=48_000.0,
+    ) == []
+
+
+def test_restore_imported_sample_rolls_back_copied_file_on_validation_failure(tmp_path):
+    svc = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    source_path, _ = _write_temp_wav(tmp_path / "package" / "channel_0.wav")
+    metadata = _binding(source_path)
+    metadata["golden_sample_sample_rate"] = 44_100.0
+
+    with pytest.raises(ValueError, match="黄金样本"):
+        svc.restore_imported_sample(
+            config_id=17,
+            channel_index=0,
+            source_path=str(source_path),
+            metadata=metadata,
+        )
+
+    assert list((tmp_path / "managed").rglob("*.wav")) == []
+    assert source_path.exists()
+
+
+@pytest.mark.parametrize(
+    ("mutate", "expected_fragment"),
+    [
+        (
+            lambda metadata: metadata.__setitem__("golden_sample_sample_rate", 0),
+            "采样率",
+        ),
+        (
+            lambda metadata: metadata.__setitem__("golden_sample_sample_rate", "bad"),
+            "采样率",
+        ),
+        (
+            lambda metadata: metadata.pop("golden_sample_num_samples"),
+            "长度",
+        ),
+        (
+            lambda metadata: metadata.__setitem__("golden_sample_num_samples", "bad"),
+            "长度",
+        ),
+    ],
+)
+def test_restore_imported_sample_normalizes_invalid_metadata_to_value_error(
+    tmp_path,
+    mutate,
+    expected_fragment,
+):
+    svc = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    source_path, _ = _write_temp_wav(tmp_path / "package" / "channel_0.wav")
+    metadata = _binding(source_path)
+    mutate(metadata)
+
+    with pytest.raises(ValueError, match=expected_fragment):
+        svc.restore_imported_sample(
+            config_id=17,
+            channel_index=0,
+            source_path=str(source_path),
+            metadata=metadata,
+        )
+
+    assert list((tmp_path / "managed").rglob("*.wav")) == []
+    assert source_path.exists()
+
+
 def test_discard_staged_samples_only_deletes_managed_staged_files(tmp_path):
     svc = GoldenSampleService(root_dir=str(tmp_path / "managed"))
     managed_staged_path, _ = _write_temp_wav(tmp_path / "managed" / "staged" / "clip.wav")

@@ -6,6 +6,7 @@ from PyQt6.QtCore import QObject, pyqtSignal
 from app.service.ai_service import AiService
 from app.service.audio_data_service import AudioDataService
 from app.service.analysis.test_manager import TestManager
+from app.service.config_package_service import ConfigPackageService
 from app.service.config_service import ConfigService
 from app.service.db_connection_service import DbConnectionService
 from app.service.factory_selection_settings import FactorySelectionSettings
@@ -196,6 +197,7 @@ class EventBus(QObject):
     # Real-time analysis frames (~20 Hz per channel)
     stft_updated = pyqtSignal(int, str, int, object)     # config_id, run_id, channel_idx, StftFrame
     spl_updated = pyqtSignal(int, str, int, object)      # config_id, run_id, channel_idx, SplFrame
+    loudness_updated = pyqtSignal(int, str, int, object)  # config_id, run_id, channel_idx, LoudnessFrame
     octave_updated = pyqtSignal(int, str, int, object)   # config_id, run_id, channel_idx, OctaveFrame
     fft_updated = pyqtSignal(int, str, int, object)      # config_id, run_id, channel_idx, FftFrame
 
@@ -220,6 +222,7 @@ class EventBus(QObject):
     factory_runtime_reanalysis_completed = pyqtSignal(object)     # FactoryReviewPayload
     factory_state_changed = pyqtSignal(object)              # FactoryControllerState
     factory_review_changed = pyqtSignal(object)             # FactoryReviewPayload
+    factory_display_channel_changed = pyqtSignal(int, int)  # config_id, channel_index
     factory_display_reset = pyqtSignal(str)                 # reset reason
 
 
@@ -247,6 +250,10 @@ class ServiceContainer:
         self.audio_data_service = AudioDataService()
 
         self.ai_service = AiService()
+        self.config_package_service = ConfigPackageService(
+            config_service=self.config_service,
+            ai_service=self.ai_service,
+        )
         self.factory_selection_settings = FactorySelectionSettings()
 
         from app.service.factory_mode_controller import FactoryModeController

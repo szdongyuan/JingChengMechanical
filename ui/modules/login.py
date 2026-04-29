@@ -57,7 +57,7 @@ class LoginWindow(QWidget):
         root.setContentsMargins(28, 24, 28, 24)
         root.setSpacing(16)
 
-        title = QLabel("精成电机")
+        title = QLabel("智能电机检测")
         title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title.setStyleSheet("font-size: 20px; font-weight: 700;")
 

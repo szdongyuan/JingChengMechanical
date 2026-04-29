@@ -16,12 +16,17 @@ class AiToolchainTable(BaseModel):
     display_name = TextField()
     version = TextField(default="")
     entrypoint = TextField()
+    package_dir = TextField()
     protocol_version = IntegerField(default=1)
     execution_mode = TextField(
         default="resident_process",
         constraints=[SQL("DEFAULT 'resident_process'")],
     )
     default_timeout_ms = IntegerField(default=30000)
+    params_json = TextField(
+        default="{}",
+        constraints=[SQL("DEFAULT '{}'")],
+    )
     enabled = BooleanField(default=True)
     description = TextField(default="")
     created_time = TextField(default=now_str)

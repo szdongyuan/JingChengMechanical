@@ -53,6 +53,7 @@ class CollapsibleGroupBox(QWidget):
     def set_expanded(self, expanded: bool) -> None:
         self._expanded = bool(expanded)
         self._content.setVisible(self._expanded)
+        self.updateGeometry()
         arrow = "▼" if self._expanded else "►"
         self._header.setText(f"{arrow} {self._title}")
 

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import QMetaObject, Qt
-from PyQt6.QtGui import QAction, QCloseEvent
+import os
+
+from PyQt6.QtCore import QMetaObject, QSize, Qt
+from PyQt6.QtGui import QAction, QCloseEvent, QIcon, QPainter, QPixmap
+from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
@@ -14,6 +17,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from base.utils import asset_path
 
 from app.services_container import FactoryControllerState, FactoryReviewPayload
 from consts.style import APP_QSS
@@ -46,11 +51,11 @@ ROLE_PERMISSIONS = {
         "actions": {"切换用户", "添加用户", "删除用户", "修改密码"},
     },
     "工程师": {
-        "tabs": {"测试", "数据管理", "配置", "AI工具管理", "硬件"},
+        "tabs": {"测试", "配置", "AI工具管理", "硬件"},
         "actions": {"切换用户", "修改密码"},
     },
     "操作员": {
-        "tabs": {"测试"},
+        "tabs": {"测试", "硬件"},
         "actions": {"切换用户", "修改密码"},
     },
 }
@@ -60,6 +65,9 @@ class MainWindow(QMainWindow):
     _TEST_PAGE_INDEX = 0
     _DISPLAY_CHANNEL_PHASES = frozenset(
         {"running", "analyzing", "reviewing", "reanalyzing", "stopped"}
+    )
+    _COMMITTED_CHART_CHANNEL_PHASES = frozenset(
+        {"reviewing", "reanalyzing", "stopped"}
     )
 
     def __init__(self, services):
@@ -78,11 +86,15 @@ class MainWindow(QMainWindow):
         self._factory_state = getattr(factory_mode, "state", FactoryControllerState())
         self._review_payload = getattr(factory_mode, "review_payload", FactoryReviewPayload())
         self.display_channel_by_config_id: dict[int, int] = {}
+        self._last_selected_display_channel: int | None = None
         self._current_main_tab_index = self._TEST_PAGE_INDEX
         self._pending_guarded_tab_index: int | None = None
         self._reverting_main_tab_change = False
 
-        self.setWindowTitle("精成电机")
+        self.setWindowTitle("智能电机检测")
+        icon_path = asset_path("logo.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
         self.setStyleSheet(APP_QSS)
 
         # root 空白根容器
@@ -120,14 +132,18 @@ class MainWindow(QMainWindow):
             self.show_login_window(close_main_window=True, window_title="登录")
 
     def show_login_window(self, close_main_window=False, window_title="登录"):
+        self.setEnabled(False)
+
         def on_login_success(username: str, role: str):
             self.current_user_name = username
             self.current_user_role = role
+            self.setEnabled(True)
             self.set_role()
             self.raise_()
             self.activateWindow()
 
         def on_login_cancel():
+            self.setEnabled(True)
             if close_main_window:
                 self.close()
 
@@ -160,6 +176,37 @@ class MainWindow(QMainWindow):
         lay = QHBoxLayout(topbar)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
+
+        brand = QWidget()
+        brand_lay = QHBoxLayout(brand)
+        brand_lay.setContentsMargins(2, 0, 10, 0)
+        brand_lay.setSpacing(8)
+
+        brand_icon = QLabel()
+        brand_pixmap = QPixmap(28, 28)
+        brand_pixmap.fill(Qt.GlobalColor.transparent)
+        svg_path = asset_path("logo.svg")
+        if os.path.exists(svg_path):
+            renderer = QSvgRenderer(svg_path)
+            painter = QPainter(brand_pixmap)
+            renderer.render(painter)
+            painter.end()
+            brand_icon.setPixmap(brand_pixmap)
+        brand_icon.setFixedSize(QSize(28, 28))
+        brand_lay.addWidget(brand_icon)
+
+        brand_text = QLabel("智能电机检测")
+        brand_text.setStyleSheet("font-size: 14px; font-weight: 700; color: #0f172a; letter-spacing: 1px;")
+        brand_lay.addWidget(brand_text)
+        lay.addWidget(brand)
+
+        sep = QWidget()
+        sep.setFixedWidth(1)
+        sep.setFixedHeight(22)
+        sep.setStyleSheet("background: #cbd5e1;")
+        lay.addSpacing(4)
+        lay.addWidget(sep)
+        lay.addSpacing(8)
 
         group = QButtonGroup(self)
         group.setExclusive(True)
@@ -243,11 +290,10 @@ class MainWindow(QMainWindow):
                 start_button.setEnabled(False)
             if stop_button is not None:
                 stop_button.setEnabled(bool(self.current_user_name))
-        #
-        # if hasattr(self, "plc_settings_card"):
-        #     plc_allowed = self.current_user_role in {"管理员", "工程师"}
-        #     self.plc_settings_card.setEnabled(plc_allowed)
-        #     self.plc_settings_card.setToolTip("" if plc_allowed else "暂无权限操作 PLC 设置")
+        if hasattr(self, "plc_settings_card"):
+            plc_allowed = self.current_user_role in {"管理员", "工程师"}
+            self.plc_settings_card.setEnabled(plc_allowed)
+            self.plc_settings_card.setToolTip("" if plc_allowed else "暂无权限操作 PLC 设置")
 
         if hasattr(self, "tab"):
             self._sync_topbar_selection(self.tab.currentIndex())
@@ -265,7 +311,7 @@ class MainWindow(QMainWindow):
 
         # 左侧栏
         left = QWidget()
-        left.setFixedWidth(420)
+        left.setFixedWidth(480)
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
         left_lay.setSpacing(5)
@@ -443,7 +489,7 @@ class MainWindow(QMainWindow):
         return self.display_channel_by_config_id.get(config_id)
 
     def _attach_analysis_channel_providers(self) -> None:
-        for module in (self.stft, self.loudness, self.spl, self.spectrum, self.octave):
+        for module in (self.result, self.stft, self.loudness, self.spl, self.spectrum, self.octave):
             module.selected_display_channel_provider = self.current_display_channel_index
         for module in (self.loudness, self.spl, self.spectrum, self.octave):
             module.selected_display_channel_sync = self._sync_selected_display_channel
@@ -596,17 +642,23 @@ class MainWindow(QMainWindow):
         if config_id is None:
             return
 
+        selected_channels = self._selected_channels_for_config(config_id)
+        if channel_index not in selected_channels:
+            return
+
+        self._last_selected_display_channel = channel_index
         self.display_channel_by_config_id[config_id] = channel_index
         self.analysis_toolbar.set_current_channel(channel_index)
         self.analysis_toolbar.set_context_label_text(
             self._build_analysis_toolbar_context(config_id, channel_index)
         )
+        self._emit_factory_display_channel_changed(config_id, channel_index)
 
         if refresh_modules:
             self._refresh_analysis_display_modules()
 
     def _refresh_analysis_display_modules(self) -> None:
-        for module in (self.stft, self.loudness, self.spl, self.spectrum, self.octave):
+        for module in (self.stft, self.loudness, self.spl, self.spectrum, self.octave, self.result):
             refresh = getattr(module, "refresh_selected_display_channel", None)
             if callable(refresh):
                 refresh()
@@ -620,6 +672,8 @@ class MainWindow(QMainWindow):
             config_id is None
             or self._factory_state.run_phase not in self._DISPLAY_CHANNEL_PHASES
         ):
+            if config_id is not None:
+                self.display_channel_by_config_id.pop(config_id, None)
             self.analysis_toolbar.set_available_channels([])
             self.analysis_toolbar.set_context_label_text("")
             self.analysis_toolbar.hide()
@@ -627,6 +681,7 @@ class MainWindow(QMainWindow):
 
         channels = self._resolve_display_channels(config_id)
         if not channels:
+            self.display_channel_by_config_id.pop(config_id, None)
             self.analysis_toolbar.set_available_channels([])
             self.analysis_toolbar.set_context_label_text("")
             self.analysis_toolbar.hide()
@@ -634,6 +689,7 @@ class MainWindow(QMainWindow):
 
         current_channel = self._resolve_current_display_channel(config_id, channels)
         if current_channel is None:
+            self.display_channel_by_config_id.pop(config_id, None)
             self.analysis_toolbar.set_available_channels([])
             self.analysis_toolbar.set_context_label_text("")
             self.analysis_toolbar.hide()
@@ -646,16 +702,20 @@ class MainWindow(QMainWindow):
             self._build_analysis_toolbar_context(config_id, current_channel)
         )
         self.analysis_toolbar.show()
+        self._emit_factory_display_channel_changed(config_id, current_channel)
+
+    def _emit_factory_display_channel_changed(
+        self,
+        config_id: int,
+        channel_index: int,
+    ) -> None:
+        signal = getattr(self.services.bus, "factory_display_channel_changed", None)
+        emit = getattr(signal, "emit", None)
+        if callable(emit):
+            emit(config_id, channel_index)
 
     def _resolve_display_channels(self, config_id: int) -> list[int]:
-        selected_channels = self._selected_channels_for_config(config_id)
-        if selected_channels:
-            return selected_channels
-
-        if self._factory_state.run_phase in {"reviewing", "reanalyzing", "stopped"}:
-            return self._chart_payload_channels_for_config(config_id)
-
-        return []
+        return self._selected_channels_for_config(config_id)
 
     def _resolve_current_display_channel(
         self,
@@ -665,21 +725,23 @@ class MainWindow(QMainWindow):
         if not channels:
             return None
 
-        remembered_channel = self.display_channel_by_config_id.get(config_id)
-        review_channels = self._chart_payload_channels_for_config(config_id)
-        if (
-            remembered_channel is not None
-            and review_channels
-            and remembered_channel not in review_channels
-        ):
-            for review_channel in review_channels:
-                if review_channel in channels:
-                    return review_channel
+        remembered_channel = self._last_selected_display_channel
+        review_channels = []
+        if self._factory_state.run_phase in self._COMMITTED_CHART_CHANNEL_PHASES:
+            review_channels = self._chart_payload_channels_for_config(config_id)
 
         if remembered_channel in channels:
-            return remembered_channel
+            candidate_channel = remembered_channel
+        else:
+            candidate_channel = channels[0]
 
-        return channels[0]
+        if review_channels and candidate_channel not in review_channels:
+            for channel in channels:
+                if channel in review_channels:
+                    return channel
+            return None
+
+        return candidate_channel
 
     def _selected_channels_for_config(self, config_id: int) -> list[int]:
         config_service = getattr(self.services, "config_service", None)

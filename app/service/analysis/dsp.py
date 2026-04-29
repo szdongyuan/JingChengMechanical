@@ -107,17 +107,7 @@ def compute_spl(signal: np.ndarray, sample_rate: float,
     if sig.size == 0:
         return -np.inf
 
-    if weighting in ("A", "C"):
-        n = sig.size
-        freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
-        spectrum = np.fft.rfft(sig)
-        if weighting == "A":
-            gains_db = a_weighting(freqs)
-        else:
-            gains_db = c_weighting(freqs)
-        gains_linear = 10.0 ** (gains_db / 20.0)
-        spectrum *= gains_linear
-        sig = np.fft.irfft(spectrum, n=n)
+    sig = _apply_spl_frequency_weighting(sig, sample_rate, weighting)
 
     alpha = 1.0 - np.exp(-1.0 / (sample_rate * time_constant))
     sq = sig ** 2
@@ -130,6 +120,78 @@ def compute_spl(signal: np.ndarray, sample_rate: float,
     if rms <= 0:
         return -np.inf
     return 20.0 * np.log10(rms / _REF_PRESSURE)
+
+
+def compute_spl_leq(signal: np.ndarray, sample_rate: float, weighting: str) -> float:
+    """Compute equivalent continuous SPL (Leq) over a full signal."""
+    sig = np.asarray(signal, dtype=np.float64).reshape(-1)
+    if sig.size == 0:
+        return -np.inf
+    sample_rate = float(sample_rate)
+    if sample_rate <= 0.0:
+        raise ValueError("sample_rate must be positive")
+    sig = _apply_spl_frequency_weighting(sig, sample_rate, weighting)
+    mean_square = float(np.mean(sig ** 2))
+    if mean_square <= 0.0:
+        return -np.inf
+    return float(10.0 * np.log10(mean_square / (_REF_PRESSURE ** 2)))
+
+
+def compute_spl_trace(
+    signal: np.ndarray,
+    sample_rate: float,
+    weighting: str,
+    time_constant: float,
+    *,
+    chunk_duration: float = 0.05,
+) -> tuple[list[float], list[float]]:
+    """Compute chunked weighted SPL values across a signal.
+
+    The returned values keep the same SPL calculation as ``compute_spl`` while
+    preserving time-local extrema for limit checks and charts.
+    """
+    sig = np.asarray(signal, dtype=np.float64).reshape(-1)
+    if sig.size == 0:
+        return [], []
+    sample_rate = float(sample_rate)
+    if sample_rate <= 0.0:
+        raise ValueError("sample_rate must be positive")
+    chunk_duration = float(chunk_duration)
+    if chunk_duration <= 0.0:
+        raise ValueError("chunk_duration must be positive")
+
+    chunk_samples = max(1, int(round(sample_rate * chunk_duration)))
+    times_sec: list[float] = []
+    values_db: list[float] = []
+    for start in range(0, int(sig.size), chunk_samples):
+        chunk = sig[start : start + chunk_samples]
+        if chunk.size < chunk_samples:
+            continue
+        times_sec.append(float((start + chunk.size) / sample_rate))
+        values_db.append(float(compute_spl(chunk, sample_rate, weighting, time_constant)))
+
+    return times_sec, values_db
+
+
+def _apply_spl_frequency_weighting(
+    signal: np.ndarray,
+    sample_rate: float,
+    weighting: str,
+) -> np.ndarray:
+    sig = np.asarray(signal, dtype=np.float64)
+    if sig.size == 0 or weighting not in ("A", "C"):
+        return sig
+
+    n = sig.size
+    freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+    spectrum = np.fft.rfft(sig)
+    if weighting == "A":
+        gains_db = a_weighting(freqs)
+    else:
+        gains_db = c_weighting(freqs)
+    gains_linear = 10.0 ** (gains_db / 20.0)
+    spectrum *= gains_linear
+    return np.fft.irfft(spectrum, n=n)
 
 
 @lru_cache(maxsize=1)

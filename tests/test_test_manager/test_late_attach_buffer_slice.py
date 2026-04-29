@@ -581,7 +581,7 @@ class TestLateAttachBufferSlice:
             def __init__(self, live_values):
                 self._live_values = live_values
 
-            def process_chunk(self, mono, elapsed):
+            def process_chunk(self, mono, elapsed, compute_loudness=True):
                 self._live_values.append(float(mono[0]))
                 return {"stft_frames": [], "stft": None, "spl": None, "octave": None, "fft": None}
 
@@ -749,7 +749,7 @@ class TestLateAttachBufferSlice:
         class FakePipeline:
             channel_index = 0
 
-            def process_chunk(self, mono, elapsed):
+            def process_chunk(self, mono, elapsed, compute_loudness=True):
                 return {"stft_frames": [], "stft": None, "spl": None, "octave": None, "fft": None}
 
         class FakeAttachSnapshot:
@@ -912,7 +912,7 @@ class TestLateAttachBufferSlice:
             def __init__(self, elapsed_values):
                 self._elapsed_values = elapsed_values
 
-            def process_chunk(self, mono, elapsed):
+            def process_chunk(self, mono, elapsed, compute_loudness=True):
                 self._elapsed_values.append(elapsed)
                 return {"stft_frames": [], "stft": None, "spl": None, "octave": None, "fft": None}
 

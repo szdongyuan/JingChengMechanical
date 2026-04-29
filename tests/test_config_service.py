@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from scipy.io import wavfile
 
-from app.service.config_service import ConfigService
+from app.service.config_service import ConfigService, _GOLDEN_BINDING_FIELDS
 from app.service.golden_sample_service import GoldenSampleService
 from model.channel_config_table import ChannelConfigTable
 from model.plc_table import PlcTable
@@ -38,8 +38,20 @@ def _channel_payload(channel_index: int) -> dict:
         "stft_overlap": 0.5,
         "spl_weighting": "A",
         "spl_time_constant": 0.125,
+        "spl_lower_enabled": False,
+        "spl_upper_enabled": False,
         "spl_upper_limit": 85.0,
         "spl_lower_limit": 40.0,
+        "spl_average_lower_enabled": False,
+        "spl_average_lower_limit": 40.0,
+        "spl_average_upper_enabled": False,
+        "spl_average_upper_limit": 85.0,
+        "loudness_lower_enabled": False,
+        "loudness_upper_enabled": False,
+        "loudness_average_lower_enabled": False,
+        "loudness_average_lower_limit": 0.0,
+        "loudness_average_upper_enabled": False,
+        "loudness_average_upper_limit": 60.0,
         "fft_band_limits": [],
         "oct_weighting": "A",
         "oct_band_limits": [],
@@ -70,6 +82,8 @@ def _channel_payload_with_loudness(
     payload.update(
         {
             "loudness_unit": unit,
+            "loudness_lower_enabled": True,
+            "loudness_upper_enabled": True,
             "loudness_lower_limit": lower,
             "loudness_upper_limit": upper,
         }
@@ -498,6 +512,249 @@ def test_save_and_load_config_round_trips_allow_incomplete_recording_analysis():
     assert row.allow_incomplete_recording_analysis is True
 
 
+def test_reserve_import_config_id_returns_unused_local_id():
+    svc = _service()
+    ConfigTable.create(config_name="Existing")
+
+    reserved_id = svc.reserve_import_config_id()
+
+    assert isinstance(reserved_id, int)
+    assert reserved_id > 0
+    assert not ConfigTable.select().where(ConfigTable.config_id == reserved_id).exists()
+
+
+def test_create_imported_config_uses_reserved_id_and_clears_plc_id():
+    svc = _service()
+    plc = PlcTable.create(plc_name="PLC A")
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    source.update(
+        {
+            "plc_id": plc.id,
+            "created_time": "2000-01-01 00:00:00",
+            "updated_time": "2000-01-01 00:00:00",
+            "input_device_name": "Imported Mic",
+            "input_device_hostapi": "Imported API",
+            "input_device_samplerate": 96_000.0,
+            "output_device_name": "Imported Speaker",
+            "output_device_hostapi": "Imported Output API",
+            "output_device_samplerate": 48_000.0,
+        }
+    )
+    reserved_id = svc.reserve_import_config_id()
+
+    new_id = svc.create_imported_config(source, reserved_config_id=reserved_id)
+    loaded = svc.load_config(new_id)
+    row = ConfigTable.get_by_id(new_id)
+
+    assert new_id == reserved_id
+    assert new_id != 999
+    assert loaded["config_name"] == "Imported"
+    assert loaded["plc_id"] is None
+    assert row.plc_id is None
+    assert row.created_time != "2000-01-01 00:00:00"
+    assert row.updated_time != "2000-01-01 00:00:00"
+    assert loaded["input_device_name"] == "Imported Mic"
+    assert loaded["input_device_hostapi"] == "Imported API"
+    assert loaded["input_device_samplerate"] == 96_000.0
+    assert loaded["output_device_name"] == "Imported Speaker"
+    assert loaded["output_device_hostapi"] == "Imported Output API"
+    assert loaded["output_device_samplerate"] == 48_000.0
+
+
+def test_overwrite_imported_config_keeps_local_id_and_clears_plc_id():
+    svc = _service()
+    local_plc = PlcTable.create(plc_name="Local PLC")
+    source_plc = PlcTable.create(plc_name="Source PLC")
+    local_id = ConfigTable.create(
+        config_name="Imported",
+        plc=local_plc,
+        input_device_name="Local Mic",
+    ).config_id
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    source.update(
+        {
+            "plc_id": source_plc.id,
+            "input_device_name": "Source Mic",
+            "input_device_hostapi": "Source API",
+            "input_device_samplerate": 44_100.0,
+        }
+    )
+
+    saved_id = svc.overwrite_imported_config(local_id, source)
+    loaded = svc.load_config(local_id)
+
+    assert saved_id == local_id
+    assert loaded["config_id"] == local_id
+    assert loaded["plc_id"] is None
+    assert loaded["input_device_name"] == "Source Mic"
+    assert loaded["input_device_hostapi"] == "Source API"
+    assert loaded["input_device_samplerate"] == 44_100.0
+
+
+def test_imported_config_omitted_golden_assets_clear_bindings_and_modes(tmp_path):
+    svc = _service(tmp_path / "managed")
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[
+            _channel_payload_with_golden(
+                0,
+                **_golden_binding(tmp_path / "source-machine.wav"),
+                fft_golden_mode="absolute",
+                fft_show_golden_overlay=True,
+                oct_golden_mode="delta",
+            )
+        ],
+        selected_channels=[0],
+    )
+    reserved_id = svc.reserve_import_config_id()
+
+    new_id = svc.create_imported_config(source, reserved_config_id=reserved_id)
+    channel = svc.load_config(new_id)["channels"][0]
+
+    for key in _GOLDEN_BINDING_FIELDS:
+        assert channel[key] is None
+    assert channel["fft_golden_mode"] == "off"
+    assert channel["fft_show_golden_overlay"] is False
+    assert channel["oct_golden_mode"] == "off"
+    assert channel["oct_show_golden_overlay"] is False
+
+
+def test_imported_config_omitted_golden_assets_clear_existing_local_managed_binding(
+    tmp_path,
+):
+    svc = _service(tmp_path / "managed")
+    existing_local = _write_temp_wav(tmp_path / "managed" / "config_99" / "gold.wav")
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[
+            _channel_payload_with_golden(
+                0,
+                **_golden_binding(existing_local),
+                fft_golden_mode="absolute",
+                fft_show_golden_overlay=True,
+                oct_golden_mode="delta",
+                oct_show_golden_overlay=False,
+            )
+        ],
+        selected_channels=[0],
+    )
+    reserved_id = svc.reserve_import_config_id()
+
+    new_id = svc.create_imported_config(source, reserved_config_id=reserved_id)
+    channel = svc.load_config(new_id)["channels"][0]
+
+    for key in _GOLDEN_BINDING_FIELDS:
+        assert channel[key] is None
+    assert channel["fft_golden_mode"] == "off"
+    assert channel["fft_show_golden_overlay"] is False
+    assert channel["oct_golden_mode"] == "off"
+    assert channel["oct_show_golden_overlay"] is False
+    assert existing_local.exists()
+
+
+def test_create_imported_config_failure_does_not_delete_payload_only_managed_file(
+    tmp_path,
+):
+    svc = _service(tmp_path / "managed")
+    existing_local = _write_temp_wav(tmp_path / "managed" / "config_99" / "gold.wav")
+    ConfigTable.create(config_name="Imported")
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[
+            _channel_payload_with_golden(
+                0,
+                **_golden_binding(existing_local),
+                fft_golden_mode="absolute",
+            )
+        ],
+        selected_channels=[0],
+    )
+    reserved_id = svc.reserve_import_config_id()
+
+    with pytest.raises(ValueError, match="已存在"):
+        svc.create_imported_config(source, reserved_config_id=reserved_id)
+
+    assert existing_local.exists()
+    assert list((tmp_path / "managed").rglob("*.wav")) == [existing_local]
+
+
+def test_create_imported_config_validation_failure_rolls_back_explicit_restored_asset(
+    tmp_path,
+):
+    svc = _service(tmp_path / "managed")
+    restored_path = _write_temp_wav(tmp_path / "managed" / "config_42" / "restored.wav")
+    source = _config_payload(
+        999,
+        config_name="   ",
+        channels=[
+            _channel_payload_with_golden(
+                0,
+                fft_golden_mode="absolute",
+            )
+        ],
+        selected_channels=[0],
+    )
+    reserved_id = svc.reserve_import_config_id()
+
+    with pytest.raises(ValueError, match="配置名称不能为空"):
+        svc.create_imported_config(
+            source,
+            reserved_config_id=reserved_id,
+            golden_asset_paths_by_channel={
+                0: _golden_binding(restored_path),
+            },
+        )
+
+    assert not restored_path.exists()
+    assert list((tmp_path / "managed").rglob("*.wav")) == []
+
+
+def test_overwrite_imported_config_rollback_preserves_old_golden_binding(
+    tmp_path,
+    monkeypatch,
+):
+    svc = _service(tmp_path / "managed")
+    config_id = ConfigTable.create(config_name="Imported").config_id
+    old_path = _write_temp_wav(tmp_path / "managed" / "config_1" / "old.wav")
+    ChannelConfigTable.create(
+        config=config_id,
+        **_channel_payload_with_golden(0, **_golden_binding(old_path)),
+    )
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+
+    def _fail_create(*args, **kwargs):
+        raise RuntimeError("db exploded")
+
+    monkeypatch.setattr(ChannelConfigTable, "create", _fail_create)
+
+    with pytest.raises(RuntimeError, match="db exploded"):
+        svc.overwrite_imported_config(config_id, source)
+
+    loaded = svc.load_config(config_id)
+
+    assert loaded["channels"][0]["golden_sample_path"] == str(old_path)
+    assert old_path.exists()
+    assert list((tmp_path / "managed").rglob("*.wav")) == [old_path]
+
+
 def test_legacy_fallback_infers_selected_channels():
     svc = _service()
     cfg = ConfigTable.create(config_name="Cfg1", selected_channels="[]")
@@ -691,6 +948,55 @@ def test_validate_rejects_loudness_lower_limit_not_less_than_upper():
     )
 
     assert any("响度下限必须小于上限" in err for err in errors)
+
+
+def test_validate_ignores_disabled_invalid_limit_values():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel.update(
+        {
+            "spl_lower_enabled": False,
+            "spl_upper_enabled": False,
+            "spl_lower_limit": "not-number",
+            "spl_upper_limit": "also-not-number",
+            "loudness_lower_enabled": False,
+            "loudness_upper_enabled": False,
+            "loudness_lower_limit": -10.0,
+            "loudness_upper_limit": -1.0,
+        }
+    )
+
+    errors = svc.validate(
+        {
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "scan_triggers_test": False,
+            "selected_channels": [0],
+            "channels": [channel],
+        }
+    )
+
+    assert errors == []
+
+
+def test_validate_rejects_non_boolean_limit_enable_flags():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["spl_lower_enabled"] = "yes"
+
+    errors = svc.validate(
+        {
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "scan_triggers_test": False,
+            "selected_channels": [0],
+            "channels": [channel],
+        }
+    )
+
+    assert any("SPL 下限启用必须为布尔值" in err for err in errors)
 
 
 def test_validate_rejects_negative_analysis_window_offset():

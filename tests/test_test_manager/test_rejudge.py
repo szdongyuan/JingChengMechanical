@@ -104,7 +104,7 @@ class TestTestManagerRejudge:
         assert payload.judgment_payload is None
         assert payload.summary_payload["overall_status"] == "no_result"
         assert payload.summary_payload["error_message"] == "no session for config 99"
-        assert len(payload.summary_payload["rows"]) == 5
+        assert len(payload.summary_payload["rows"]) == 7
         assert all(row["status"] == "无结果" for row in payload.summary_payload["rows"])
         assert payload.chart_payload is None
         bus.test_finished.emit.assert_not_called()

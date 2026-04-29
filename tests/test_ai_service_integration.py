@@ -313,8 +313,10 @@ def _run_threshold_analysis(
         display_name="Threshold TC",
         version="0.1.0",
         entrypoint=f"{sys.executable} {_write_threshold_toolchain_script(tmp_path, extra_payload=response_extra)}",
+        package_dir=str(tmp_path),
         default_timeout_ms=10000,
         execution_mode="oneshot_process",
+        params_json=json.dumps(request_params),
     )
     TestConfigAiBindingTable.create(
         config=cfg,
@@ -352,6 +354,7 @@ class TestRunAiAnalysis:
             display_name="Fake TC",
             version="0.1.0",
             entrypoint=f"{sys.executable} {fake_toolchain_script}",
+            package_dir=str(tmp_path),
             default_timeout_ms=10000,
             execution_mode="oneshot_process",
         )
@@ -392,6 +395,7 @@ class TestRunAiAnalysis:
             display_name="Window TC",
             version="0.1.0",
             entrypoint=f"{sys.executable} {fake_toolchain_script}",
+            package_dir=str(tmp_path),
             default_timeout_ms=10000,
             execution_mode="oneshot_process",
         )
@@ -506,6 +510,7 @@ class TestRunAiAnalysis:
             display_name="Replace TC",
             version="1",
             entrypoint=f"{sys.executable} {fake_toolchain_script}",
+            package_dir=str(tmp_path),
             default_timeout_ms=10000,
             execution_mode="oneshot_process",
         )
@@ -556,6 +561,7 @@ class TestRunAiAnalysis:
             toolchain_id="vm-tc",
             display_name="VM TC", version="1",
             entrypoint=f"{sys.executable} {fake_toolchain_script}",
+            package_dir=str(tmp_path),
             default_timeout_ms=10000,
             execution_mode="oneshot_process",
         )
@@ -610,6 +616,7 @@ with open(resp_path, "w") as f:
             toolchain_id="bad-resp-tc",
             display_name="Bad Resp TC", version="1",
             entrypoint=f"{sys.executable} {bad_script}",
+            package_dir=str(tmp_path),
             default_timeout_ms=10000,
             execution_mode="oneshot_process",
         )
@@ -639,6 +646,7 @@ with open(resp_path, "w") as f:
             toolchain_id="dis-tc-int",
             display_name="Dis TC Int", version="1",
             entrypoint="this_should_not_run",
+            package_dir=str(tmp_path),
             default_timeout_ms=10000,
             execution_mode="oneshot_process",
         )
@@ -666,6 +674,7 @@ with open(resp_path, "w") as f:
             toolchain_id="fas-tc",
             display_name="FAS TC", version="1",
             entrypoint=f"{sys.executable} {fake_toolchain_script}",
+            package_dir=str(tmp_path),
             default_timeout_ms=10000,
             execution_mode="oneshot_process",
         )
@@ -740,8 +749,10 @@ with open(resp_path, "w") as f:
             display_name="Resident Success TC",
             version="1.0",
             entrypoint=_resident_entrypoint(script_path),
+            package_dir=str(tmp_path),
             default_timeout_ms=1000,
             execution_mode="resident_process",
+            params_json=json.dumps({"behavior": "success"}),
         )
         TestConfigAiBindingTable.create(
             config=cfg,
@@ -796,8 +807,10 @@ with open(resp_path, "w") as f:
             display_name="Resident Error TC",
             version="1.0",
             entrypoint=_resident_entrypoint(script_path),
+            package_dir=str(tmp_path),
             default_timeout_ms=1000,
             execution_mode="resident_process",
+            params_json=json.dumps({"behavior": "error"}),
         )
         TestConfigAiBindingTable.create(
             config=cfg,
@@ -832,8 +845,10 @@ with open(resp_path, "w") as f:
             display_name="Resident Malformed TC",
             version="1.0",
             entrypoint=_resident_entrypoint(script_path),
+            package_dir=str(tmp_path),
             default_timeout_ms=1000,
             execution_mode="resident_process",
+            params_json=json.dumps({"behavior": "malformed_json"}),
         )
         TestConfigAiBindingTable.create(
             config=cfg,
@@ -865,8 +880,10 @@ with open(resp_path, "w") as f:
             display_name="Resident Timeout TC",
             version="1.0",
             entrypoint=_resident_entrypoint(script_path),
+            package_dir=str(tmp_path),
             default_timeout_ms=1000,
             execution_mode="resident_process",
+            params_json=json.dumps({"behavior": "timeout", "sleep_s": 0.3}),
         )
         TestConfigAiBindingTable.create(
             config=cfg,
@@ -894,16 +911,24 @@ with open(resp_path, "w") as f:
     ):
         cfg = TestConfigTable.create(config_name="Resident Busy")
         script_path = _write_resident_toolchain_script(tmp_path)
+        started_file = tmp_path / "resident-started.txt"
+        release_file = tmp_path / "resident-release.txt"
         tc = AiToolchainTable.create(
             toolchain_id="resident-busy-tc",
             display_name="Resident Busy TC",
             version="1.0",
             entrypoint=_resident_entrypoint(script_path),
+            package_dir=str(tmp_path),
             default_timeout_ms=5000,
             execution_mode="resident_process",
+            params_json=json.dumps(
+                {
+                    "behavior": "block",
+                    "started_file": str(started_file),
+                    "release_file": str(release_file),
+                }
+            ),
         )
-        started_file = tmp_path / "resident-started.txt"
-        release_file = tmp_path / "resident-release.txt"
         TestConfigAiBindingTable.create(
             config=cfg,
             toolchain=tc,

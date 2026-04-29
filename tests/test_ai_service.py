@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -50,6 +52,7 @@ def _toolchain_payload(**overrides):
         "display_name": "Motor AI",
         "version": "1.0",
         "entrypoint": "python motor_ai.py",
+        "package_dir": os.getcwd(),
         "default_timeout_ms": 30000,
         "enabled": True,
         "description": "",
@@ -89,6 +92,7 @@ def toolchain():
         display_name="Motor AI",
         version="1.0",
         entrypoint="python motor_ai.py",
+        package_dir=os.getcwd(),
         default_timeout_ms=30000,
     )
 
@@ -111,6 +115,7 @@ class TestToolchainRegistry:
             display_name="Disabled",
             version="2",
             entrypoint="disabled.py",
+            package_dir=os.getcwd(),
             enabled=False,
         )
 
@@ -124,6 +129,7 @@ class TestToolchainRegistry:
             display_name="Disabled",
             version="1",
             entrypoint="x",
+            package_dir=os.getcwd(),
             enabled=False,
         )
         assert ai_service.list_enabled_toolchains() == []
@@ -152,6 +158,207 @@ class TestToolchainRegistry:
 
 
 class TestToolchainRegistryCrud:
+    def test_generate_toolchain_id_uses_ascii_prefix_and_random_suffix(
+        self, ai_service, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ai_service_module,
+            "secrets",
+            SimpleNamespace(token_hex=lambda n: "a1b2c3d4"),
+            raising=False,
+        )
+
+        generated = ai_service.generate_toolchain_id("  Mötör AI ++  ")
+
+        assert generated == "motor_ai_a1b2c3d4"
+        assert len(generated) <= 33
+        assert generated.isascii()
+
+    def test_generate_toolchain_id_falls_back_for_non_ascii_display_name(
+        self, ai_service, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ai_service_module,
+            "secrets",
+            SimpleNamespace(token_hex=lambda n: "11112222"),
+            raising=False,
+        )
+
+        generated = ai_service.generate_toolchain_id("电机异音")
+
+        assert generated == "toolchain_11112222"
+
+    def test_generate_toolchain_id_regenerates_when_persisted_id_collides(
+        self, ai_service, monkeypatch, tmp_path
+    ):
+        package_dir = tmp_path / "pkg"
+        package_dir.mkdir()
+        AiToolchainTable.create(
+            toolchain_id="motor_ai_aaaabbbb",
+            display_name="Existing",
+            version="1.0",
+            entrypoint="python main.py",
+            package_dir=str(package_dir),
+            protocol_version=1,
+            execution_mode="resident_process",
+            default_timeout_ms=30000,
+            enabled=True,
+            description="",
+        )
+        suffixes = iter(["aaaabbbb", "ccccdddd"])
+        monkeypatch.setattr(
+            ai_service_module.secrets,
+            "token_hex",
+            lambda n: next(suffixes),
+        )
+
+        assert ai_service.generate_toolchain_id("Motor AI") == "motor_ai_ccccdddd"
+
+    def test_generate_toolchain_id_from_prefix_reuses_original_prefix(
+        self, ai_service, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ai_service_module.secrets,
+            "token_hex",
+            lambda n: "9999aaaa",
+        )
+
+        assert ai_service.generate_toolchain_id_from_prefix("motor_ai") == "motor_ai_9999aaaa"
+
+    def test_save_generated_draft_retries_once_when_create_id_collides(
+        self, ai_service, monkeypatch, tmp_path
+    ):
+        from peewee import IntegrityError
+
+        package_dir = tmp_path / "pkg"
+        package_dir.mkdir()
+        original_create = AiToolchainTable.create
+        calls = {"count": 0}
+
+        def create_with_one_collision(**kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise IntegrityError(
+                    "UNIQUE constraint failed: ai_toolchain_table.toolchain_id"
+                )
+            return original_create(**kwargs)
+
+        monkeypatch.setattr(
+            ai_service_module.secrets,
+            "token_hex",
+            lambda n: "11112222",
+        )
+        monkeypatch.setattr(AiToolchainTable, "create", create_with_one_collision)
+
+        saved_id = ai_service.save_toolchain(
+            None,
+            _toolchain_payload(
+                toolchain_id="motor_ai_aaaabbbb",
+                display_name="Motor AI",
+                package_dir=str(package_dir),
+                generated_id_prefix="motor_ai",
+            ),
+        )
+
+        assert saved_id == "motor_ai_11112222"
+        assert calls["count"] == 2
+
+    def test_save_explicit_create_id_collision_without_generated_prefix_does_not_retry(
+        self, ai_service, monkeypatch, tmp_path
+    ):
+        from peewee import IntegrityError
+
+        package_dir = tmp_path / "pkg"
+        package_dir.mkdir()
+        calls = {"count": 0}
+
+        def always_raise_id_integrity(**_kwargs):
+            calls["count"] += 1
+            raise IntegrityError(
+                "UNIQUE constraint failed: ai_toolchain_table.toolchain_id"
+            )
+
+        monkeypatch.setattr(AiToolchainTable, "create", always_raise_id_integrity)
+
+        with pytest.raises(IntegrityError, match="toolchain_id"):
+            ai_service.save_toolchain(
+                None,
+                _toolchain_payload(
+                    toolchain_id="motor_ai_aaaabbbb",
+                    display_name="Motor AI",
+                    package_dir=str(package_dir),
+                ),
+            )
+
+        assert calls["count"] == 1
+
+    def test_save_generated_draft_does_not_retry_non_id_integrity_errors(
+        self, ai_service, monkeypatch, tmp_path
+    ):
+        from peewee import IntegrityError
+
+        package_dir = tmp_path / "pkg"
+        package_dir.mkdir()
+        calls = {"count": 0}
+
+        def always_raise_non_id_integrity(**_kwargs):
+            calls["count"] += 1
+            raise IntegrityError(
+                "NOT NULL constraint failed: ai_toolchain_table.display_name"
+            )
+
+        monkeypatch.setattr(AiToolchainTable, "create", always_raise_non_id_integrity)
+
+        with pytest.raises(IntegrityError, match="display_name"):
+            ai_service.save_toolchain(
+                None,
+                _toolchain_payload(
+                    toolchain_id="motor_ai_aaaabbbb",
+                    display_name="Motor AI",
+                    package_dir=str(package_dir),
+                    generated_id_prefix="motor_ai",
+                ),
+            )
+
+        assert calls["count"] == 1
+
+    def test_save_toolchain_rejects_missing_package_dir(self, ai_service):
+        with pytest.raises(ValueError, match="package_dir"):
+            ai_service.save_toolchain(
+                None,
+                _toolchain_payload(package_dir=""),
+            )
+
+    def test_save_toolchain_rejects_non_directory_package_dir(
+        self, ai_service, tmp_path
+    ):
+        missing = tmp_path / "missing"
+
+        with pytest.raises(ValueError, match="package_dir"):
+            ai_service.save_toolchain(
+                None,
+                _toolchain_payload(package_dir=str(missing)),
+            )
+
+    def test_save_toolchain_round_trips_package_dir(self, ai_service, tmp_path):
+        package_dir = tmp_path / "tool"
+        package_dir.mkdir()
+
+        saved_id = ai_service.save_toolchain(
+            None,
+            _toolchain_payload(
+                toolchain_id="roundtrip-ai",
+                display_name="Roundtrip AI",
+                package_dir=str(package_dir),
+            ),
+        )
+
+        row = ai_service.get_toolchain(saved_id)
+
+        assert row is not None
+        assert row.package_dir == str(package_dir)
+        assert ai_service.list_toolchains()[0]["package_dir"] == str(package_dir)
+
     def test_save_toolchain_defaults_execution_mode_to_resident_process(
         self, ai_service
     ):
@@ -327,6 +534,29 @@ class TestToolchainRegistryCrud:
             ai_service.save_toolchain(
                 None,
                 _toolchain_payload(default_timeout_ms=timeout_ms),
+            )
+
+    def test_save_toolchain_persists_params_json(self, ai_service):
+        ai_service.save_toolchain(
+            None,
+            _toolchain_payload(
+                toolchain_id="param-ai",
+                params_json='{ "threshold": 0.7 }',
+            ),
+        )
+
+        row = AiToolchainTable.get_by_id("param-ai")
+
+        assert row.params_json == '{"threshold":0.7}'
+
+    @pytest.mark.parametrize("params_json", ["{invalid", "[]"])
+    def test_save_toolchain_rejects_invalid_params_json(
+        self, ai_service, params_json
+    ):
+        with pytest.raises(ValueError, match="params_json"):
+            ai_service.save_toolchain(
+                None,
+                _toolchain_payload(params_json=params_json),
             )
 
     def test_save_toolchain_rename_rewrites_all_binding_rows_but_not_history(
@@ -845,16 +1075,41 @@ class TestToolchainRegistryCrud:
 
 
 class TestRunAiAnalysisRouting:
+    def test_execute_toolchain_runs_with_package_dir_cwd(
+        self, ai_service, tmp_path, monkeypatch
+    ):
+        package_dir = tmp_path / "pkg"
+        package_dir.mkdir()
+        captured = {}
+
+        def _run(cmd, **kwargs):
+            captured["cwd"] = kwargs.get("cwd")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", _run)
+
+        ai_service.execute_toolchain(
+            entrypoint="python main.py",
+            package_dir=str(package_dir),
+            request_json_path="request.json",
+            response_json_path="response.json",
+            artifacts_dir="artifacts",
+            timeout_ms=30000,
+        )
+
+        assert captured["cwd"] == str(package_dir)
+
     def test_run_ai_analysis_routes_resident_process_through_runtime(
         self, ai_service, config, toolchain, tmp_path, monkeypatch
     ):
         toolchain.execution_mode = "resident_process"
+        toolchain.params_json = '{"resident":true}'
         toolchain.save()
         AiBindingTable.create(
             config=config,
             toolchain=toolchain,
             enabled=True,
-            params_json='{"resident": true}',
+            params_json='{"binding": true}',
         )
         segments = _analysis_segments(tmp_path)
         resident_calls = []
@@ -902,6 +1157,8 @@ class TestRunAiAnalysisRouting:
         assert resident_calls[0]["toolchain_id"] == "motor-ai"
         assert resident_calls[0]["request_id"] == result["request_id"]
         assert resident_calls[0]["request_payload"]["toolchain_id"] == "motor-ai"
+        assert resident_calls[0]["request_payload"]["params"] == {"resident": True}
+        assert resident_calls[0]["package_dir"] == toolchain.package_dir
         assert resident_calls[0]["artifacts_dir"] == result["artifacts_dir"]
 
     def test_run_ai_analysis_routes_oneshot_process_through_execute_toolchain(
@@ -927,6 +1184,7 @@ class TestRunAiAnalysisRouting:
         def _execute(
             *,
             entrypoint: str,
+            package_dir: str,
             request_json_path: str,
             response_json_path: str,
             artifacts_dir: str,
@@ -935,6 +1193,7 @@ class TestRunAiAnalysisRouting:
             execute_calls.append(
                 {
                     "entrypoint": entrypoint,
+                    "package_dir": package_dir,
                     "request_json_path": request_json_path,
                     "response_json_path": response_json_path,
                     "artifacts_dir": artifacts_dir,
@@ -975,6 +1234,7 @@ class TestRunAiAnalysisRouting:
         )
 
         assert result["module_status"] == "success"
+        assert execute_calls[0]["package_dir"] == toolchain.package_dir
         assert execute_calls[0]["request_json_path"] == result["request_json_path"]
         assert execute_calls[0]["response_json_path"] == result["response_json_path"]
 
@@ -1175,6 +1435,22 @@ class TestBindingResolver:
         binding = ai_service.resolve_binding(config.config_id)
         assert "score_threshold" not in binding
 
+    def test_resolve_binding_uses_toolchain_params_not_binding_params(
+        self, ai_service, config, toolchain
+    ):
+        toolchain.params_json = '{"toolchain":true}'
+        toolchain.save()
+        AiBindingTable.create(
+            config=config,
+            toolchain=toolchain,
+            enabled=True,
+            params_json='{"binding":true}',
+        )
+
+        binding = ai_service.resolve_binding(config.config_id)
+
+        assert binding["params_json"] == '{"toolchain":true}'
+
     def test_resolve_binding_with_null_toolchain(self, ai_service):
         """Binding with no toolchain should still be resolvable."""
         cfg = ConfigTable.create(config_name="NullTC")
@@ -1186,7 +1462,9 @@ class TestBindingResolver:
 
 
 class TestBindingCrud:
-    def test_save_creates_new_binding(self, ai_service, config, toolchain):
+    def test_save_creates_new_binding_ignores_binding_params(
+        self, ai_service, config, toolchain
+    ):
         bid = ai_service.save_binding(config.config_id, {
             "enabled": True,
             "toolchain_id": "motor-ai",
@@ -1195,9 +1473,11 @@ class TestBindingCrud:
         })
         assert bid > 0
         binding = ai_service.resolve_binding(config.config_id)
+        row = AiBindingTable.get(AiBindingTable.config == config.config_id)
         assert binding["enabled"] is True
         assert binding["timeout_ms"] == 5000
-        assert binding["params_json"] == '{"k": "v"}'
+        assert binding["params_json"] == "{}"
+        assert row.params_json == "{}"
 
     def test_save_binding_creates_row_when_legacy_binding_offset_column_is_not_null(
         self, ai_service, config, toolchain
@@ -1220,7 +1500,7 @@ class TestBindingCrud:
             (binding_id,),
         ).fetchone()
 
-        assert row == (1, "motor-ai", 0, '{"k": "v"}')
+        assert row == (1, "motor-ai", 0, "{}")
 
     def test_save_binding_ignores_analysis_window_offset_ms(
         self, ai_service, config, toolchain

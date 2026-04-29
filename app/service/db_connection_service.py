@@ -68,9 +68,21 @@ class DbConnectionService:
             "channel_config_table",
             [
                 ("fft_nfft", "INTEGER NOT NULL DEFAULT 4096"),
+                ("spl_lower_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                ("spl_upper_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                ("spl_average_lower_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                ("spl_average_lower_limit", "REAL NOT NULL DEFAULT 40"),
+                ("spl_average_upper_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                ("spl_average_upper_limit", "REAL NOT NULL DEFAULT 85"),
                 ("loudness_unit", "TEXT DEFAULT 'sone'"),
+                ("loudness_lower_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                ("loudness_upper_enabled", "INTEGER NOT NULL DEFAULT 0"),
                 ("loudness_lower_limit", "REAL DEFAULT 0"),
                 ("loudness_upper_limit", "REAL DEFAULT 60"),
+                ("loudness_average_lower_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                ("loudness_average_lower_limit", "REAL NOT NULL DEFAULT 0"),
+                ("loudness_average_upper_enabled", "INTEGER NOT NULL DEFAULT 0"),
+                ("loudness_average_upper_limit", "REAL NOT NULL DEFAULT 60"),
                 ("golden_sample_path", "TEXT DEFAULT NULL"),
                 ("golden_sample_label", "TEXT DEFAULT NULL"),
                 ("golden_sample_source_channel", "INTEGER DEFAULT NULL"),
@@ -92,6 +104,8 @@ class DbConnectionService:
                 ("protocol_version", "INTEGER NOT NULL DEFAULT 1"),
                 ("execution_mode", "TEXT NOT NULL DEFAULT 'resident_process'"),
                 ("description", "TEXT NOT NULL DEFAULT ''"),
+                ("package_dir", "TEXT NOT NULL DEFAULT ''"),
+                ("params_json", "TEXT NOT NULL DEFAULT '{}'"),
             ],
         )
         self._ensure_columns(
@@ -120,6 +134,7 @@ class DbConnectionService:
         )
         self._backfill_channel_fft_defaults()
         self._backfill_channel_loudness_defaults()
+        self._backfill_channel_limit_switch_defaults()
         self._ensure_ai_binding_indexes()
 
     def _ensure_columns(self, table_name: str, columns: list[tuple[str, str]]):
@@ -343,6 +358,39 @@ class DbConnectionService:
                 loudness_unit IS NULL
                 OR loudness_lower_limit IS NULL
                 OR loudness_upper_limit IS NULL
+            """
+        )
+
+    def _backfill_channel_limit_switch_defaults(self):
+        channel_columns = self._get_table_columns("channel_config_table")
+        assignments = []
+        conditions = []
+        defaults = {
+            "spl_lower_enabled": 0,
+            "spl_upper_enabled": 0,
+            "spl_average_lower_enabled": 0,
+            "spl_average_lower_limit": 40,
+            "spl_average_upper_enabled": 0,
+            "spl_average_upper_limit": 85,
+            "loudness_lower_enabled": 0,
+            "loudness_upper_enabled": 0,
+            "loudness_average_lower_enabled": 0,
+            "loudness_average_lower_limit": 0,
+            "loudness_average_upper_enabled": 0,
+            "loudness_average_upper_limit": 60,
+        }
+        for column_name, default_value in defaults.items():
+            if column_name not in channel_columns:
+                continue
+            assignments.append(f"{column_name} = COALESCE({column_name}, {default_value})")
+            conditions.append(f"{column_name} IS NULL")
+        if not assignments:
+            return
+        db.execute_sql(
+            f"""
+            UPDATE channel_config_table
+            SET {", ".join(assignments)}
+            WHERE {" OR ".join(conditions)}
             """
         )
 

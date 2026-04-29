@@ -9,15 +9,18 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
+import secrets
 import shlex
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 
-from peewee import DoesNotExist
+from peewee import DoesNotExist, IntegrityError
 
 from app.service.ai_resident_runtime import ResidentToolchainRuntime
 from model.ai_toolchain_table import AiToolchainTable
@@ -31,6 +34,9 @@ _SUPPORTED_EXECUTION_MODES = {
     "resident_process",
     "oneshot_process",
 }
+_GENERATED_TOOLCHAIN_PREFIX_FALLBACK = "toolchain"
+_GENERATED_TOOLCHAIN_PREFIX_MAX_LEN = 24
+_GENERATED_TOOLCHAIN_RANDOM_HEX_LEN = 8
 
 _TZ8 = timezone(timedelta(hours=8))
 
@@ -148,6 +154,52 @@ class AiService:
             raise ValueError(f"{field_name} must not be empty")
         return normalized
 
+    @classmethod
+    def generated_toolchain_prefix(cls, display_name: str) -> str:
+        value = display_name.strip().lower()
+        value = unicodedata.normalize("NFKD", value)
+        value = value.encode("ascii", "ignore").decode("ascii")
+        value = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
+        if not value:
+            return _GENERATED_TOOLCHAIN_PREFIX_FALLBACK
+        value = value[:_GENERATED_TOOLCHAIN_PREFIX_MAX_LEN].strip("_")
+        return value or _GENERATED_TOOLCHAIN_PREFIX_FALLBACK
+
+    def generate_toolchain_id_from_prefix(self, prefix: str) -> str:
+        normalized_prefix = self.generated_toolchain_prefix(prefix)
+        while True:
+            suffix = secrets.token_hex(_GENERATED_TOOLCHAIN_RANDOM_HEX_LEN // 2)
+            toolchain_id = f"{normalized_prefix}_{suffix}"
+            if self.get_toolchain(toolchain_id) is None:
+                return toolchain_id
+
+    def generate_toolchain_id(self, display_name: str) -> str:
+        return self.generate_toolchain_id_from_prefix(
+            self.generated_toolchain_prefix(display_name)
+        )
+
+    @staticmethod
+    def _is_toolchain_id_uniqueness_error(exc: IntegrityError) -> bool:
+        message = str(exc).lower()
+        if "toolchain_id" not in message:
+            return False
+        return "unique" in message or "primary key" in message
+
+    @staticmethod
+    def _normalize_params_json(value) -> str:
+        if value is None:
+            value = "{}"
+        if not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False)
+        normalized = value.strip() or "{}"
+        try:
+            parsed = json.loads(normalized)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("params_json must be valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("params_json must be a JSON object")
+        return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+
     def _normalize_toolchain_payload(
         self, original_toolchain_id: str | None, data: dict
     ) -> dict:
@@ -182,15 +234,36 @@ class AiService:
             "description": self._normalize_toolchain_text(
                 data.get("description", ""), "description", allow_empty=True
             ),
+            "params_json": self._normalize_params_json(data.get("params_json", "{}")),
             "enabled": bool(data.get("enabled", True)),
             "protocol_version": _SUPPORTED_PROTOCOL_VERSION,
             "execution_mode": execution_mode,
         }
 
+        package_dir = data.get("package_dir")
+        if not isinstance(package_dir, str):
+            raise ValueError("package_dir must be a string")
+        package_dir = package_dir.strip()
+        if not package_dir:
+            raise ValueError("package_dir must not be empty")
+        package_dir = os.path.abspath(package_dir)
+        if not os.path.isdir(package_dir):
+            raise ValueError("package_dir must be an existing directory")
+        normalized["package_dir"] = package_dir
+
         timeout_ms = data.get("default_timeout_ms")
         if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int) or timeout_ms <= 0:
             raise ValueError("default_timeout_ms must be a positive integer")
         normalized["default_timeout_ms"] = timeout_ms
+
+        generated_id_prefix = data.get("generated_id_prefix")
+        if generated_id_prefix is not None:
+            if not isinstance(generated_id_prefix, str):
+                raise ValueError("generated_id_prefix must be a string")
+            if generated_id_prefix.strip():
+                normalized["generated_id_prefix"] = self.generated_toolchain_prefix(
+                    generated_id_prefix
+                )
 
         existing = self.get_toolchain(normalized["toolchain_id"])
         if existing is not None and normalized["toolchain_id"] != original_toolchain_id:
@@ -249,15 +322,29 @@ class AiService:
         )
         with mutation_lease:
             normalized = self._normalize_toolchain_payload(original_toolchain_id, data)
+            generated_id_prefix = normalized.pop("generated_id_prefix", None)
             timestamp = now_str()
 
             with database.atomic():
                 if original_toolchain_id is None:
-                    row = AiToolchainTable.create(
+                    create_payload = {
                         **normalized,
-                        created_time=timestamp,
-                        updated_time=timestamp,
-                    )
+                        "created_time": timestamp,
+                        "updated_time": timestamp,
+                    }
+                    try:
+                        row = AiToolchainTable.create(**create_payload)
+                    except IntegrityError as exc:
+                        if (
+                            generated_id_prefix is None
+                            or not self._is_toolchain_id_uniqueness_error(exc)
+                        ):
+                            raise
+                        normalized["toolchain_id"] = self.generate_toolchain_id_from_prefix(
+                            generated_id_prefix
+                        )
+                        create_payload["toolchain_id"] = normalized["toolchain_id"]
+                        row = AiToolchainTable.create(**create_payload)
                     return row.toolchain_id
 
                 assert existing is not None
@@ -266,7 +353,9 @@ class AiService:
                     existing.display_name = normalized["display_name"]
                     existing.version = normalized["version"]
                     existing.entrypoint = normalized["entrypoint"]
+                    existing.package_dir = normalized["package_dir"]
                     existing.default_timeout_ms = normalized["default_timeout_ms"]
+                    existing.params_json = normalized["params_json"]
                     existing.enabled = normalized["enabled"]
                     existing.description = normalized["description"]
                     existing.protocol_version = _SUPPORTED_PROTOCOL_VERSION
@@ -332,7 +421,7 @@ class AiService:
             "toolchain_id": tc_id,
             "timeout_ms": binding.timeout_ms,
             "effective_timeout_ms": effective_timeout,
-            "params_json": binding.params_json,
+            "params_json": tc.params_json if tc is not None else "{}",
         }
 
     # ── Binding CRUD (for config UI) ────────────────────────
@@ -363,7 +452,7 @@ class AiService:
                 data.get("toolchain_id"),
                 data.get("timeout_ms"),
                 0,
-                data.get("params_json", "{}"),
+                "{}",
                 now_str(),
             ),
         )
@@ -384,7 +473,7 @@ class AiService:
                 existing.enabled = data.get("enabled", False)
                 existing.toolchain_id = data.get("toolchain_id")
                 existing.timeout_ms = data.get("timeout_ms")
-                existing.params_json = data.get("params_json", "{}")
+                existing.params_json = "{}"
                 from consts.time_consts import now_str
                 existing.updated_time = now_str()
                 existing.save()
@@ -397,7 +486,7 @@ class AiService:
                     enabled=data.get("enabled", False),
                     toolchain=data.get("toolchain_id"),
                     timeout_ms=data.get("timeout_ms"),
-                    params_json=data.get("params_json", "{}"),
+                    params_json="{}",
                 )
                 return row.binding_id
 
@@ -442,14 +531,19 @@ class AiService:
                 "status": "not_configured",
                 "error": "Toolchain not found or disabled",
             }
+        if not getattr(tc, "package_dir", "").strip() or not os.path.isdir(tc.package_dir):
+            return {
+                "status": "preflight_error",
+                "error": "Toolchain package_dir is missing or invalid",
+            }
 
         # Validate params_json
         try:
-            json.loads(binding["params_json"])
-        except (json.JSONDecodeError, TypeError):
+            self._normalize_params_json(binding["params_json"])
+        except ValueError as exc:
             return {
                 "status": "preflight_error",
-                "error": "params_json is not valid JSON",
+                "error": str(exc),
             }
 
         # Validate segments
@@ -498,11 +592,13 @@ class AiService:
 
     def execute_toolchain(
         self,
+        *,
         entrypoint: str,
         request_json_path: str,
         response_json_path: str,
         artifacts_dir: str,
         timeout_ms: int,
+        package_dir: str | None = None,
     ) -> dict:
         """Execute external toolchain process. Returns execution envelope dict."""
         started_at = _now_iso()
@@ -521,6 +617,7 @@ class AiService:
                 capture_output=True,
                 text=True,
                 timeout=timeout_ms / 1000.0,
+                cwd=package_dir or None,
             )
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             finished_at = _now_iso()
@@ -690,6 +787,7 @@ class AiService:
             resident_result = self._resident_runtime.analyze(
                 toolchain_id=toolchain.toolchain_id,
                 entrypoint=toolchain.entrypoint,
+                package_dir=toolchain.package_dir,
                 request_id=request_id,
                 request_payload=request_data,
                 artifacts_dir=artifacts_dir,
@@ -752,6 +850,7 @@ class AiService:
 
         exec_result = self.execute_toolchain(
             entrypoint=toolchain.entrypoint,
+            package_dir=toolchain.package_dir,
             request_json_path=request_json_path,
             response_json_path=response_json_path,
             artifacts_dir=artifacts_dir,

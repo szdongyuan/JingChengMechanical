@@ -496,7 +496,7 @@ class DataManagementModule(QWidget):
             if item is not None and item.checkState() == Qt.CheckState.Checked:
                 selected.append(record)
         return selected
-    
+
     def _export_selected_rows(self) -> None:
         records = self._selected_records()
         if not records:
