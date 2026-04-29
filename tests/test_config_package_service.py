@@ -63,11 +63,23 @@ def _channel_payload(channel_index: int) -> dict:
         "stft_overlap": 0.5,
         "spl_weighting": "A",
         "spl_time_constant": 0.125,
+        "spl_lower_enabled": False,
+        "spl_upper_enabled": False,
         "spl_upper_limit": 85.0,
         "spl_lower_limit": 40.0,
+        "spl_average_lower_enabled": False,
+        "spl_average_lower_limit": 40.0,
+        "spl_average_upper_enabled": False,
+        "spl_average_upper_limit": 85.0,
         "loudness_unit": "sone",
+        "loudness_lower_enabled": False,
+        "loudness_upper_enabled": False,
         "loudness_lower_limit": 0.0,
         "loudness_upper_limit": 60.0,
+        "loudness_average_lower_enabled": False,
+        "loudness_average_lower_limit": 0.0,
+        "loudness_average_upper_enabled": False,
+        "loudness_average_upper_limit": 60.0,
         "fft_band_limits": [],
         "oct_weighting": "A",
         "oct_band_limits": [],
@@ -177,6 +189,7 @@ def _toolchain_payload(package_dir: Path, **overrides) -> dict:
         "enabled": True,
         "description": "portable",
         "execution_mode": "resident_process",
+        "params_json": "{}",
     }
     payload.update(overrides)
     return payload
@@ -214,7 +227,6 @@ def _bind_toolchain(
             "enabled": binding_enabled,
             "toolchain_id": toolchain_id,
             "timeout_ms": None,
-            "params_json": "{}",
         },
     )
     return toolchain_id
@@ -237,7 +249,6 @@ def _package_entries(
             "enabled": include_ai_metadata,
             "toolchain_id": "motor-ai" if include_ai_metadata else None,
             "timeout_ms": None,
-            "params_json": "{}",
         }
     config_payload = {
         "config": config_root,
@@ -274,6 +285,7 @@ def _package_entries(
             "default_timeout_ms": 30_000,
             "enabled": True,
             "description": "portable",
+            "params_json": "{}",
             "source_package_dir": "D:/source-machine/motor-ai",
             **({"package_archive_path": "ai/package"} if include_ai_package else {}),
         }
@@ -322,11 +334,15 @@ def test_export_writes_manifest_and_single_config_payload(tmp_path: Path, servic
     assert isinstance(manifest["exported_at"], str)
     assert manifest["contents"]["config"] is True
     assert payload["config"]["config_name"] == "Cfg1"
+    channel = payload["config"]["channels"][0]
+    assert channel["spl_lower_enabled"] is False
+    assert channel["spl_average_upper_limit"] == 85.0
+    assert channel["loudness_average_upper_enabled"] is False
+    assert channel["loudness_average_upper_limit"] == 60.0
     assert payload["ai_binding"] == {
         "enabled": False,
         "toolchain_id": None,
         "timeout_ms": None,
-        "params_json": "{}",
     }
 
 
@@ -366,7 +382,12 @@ def test_export_includes_ai_toolchain_metadata(tmp_path: Path, services: SimpleN
     package_dir = tmp_path / "package"
     package_dir.mkdir()
     (package_dir / "main.py").write_text("print('ok')\n", encoding="utf-8")
-    _bind_toolchain(services, config_id=config_id, package_dir=package_dir)
+    _bind_toolchain(
+        services,
+        config_id=config_id,
+        package_dir=package_dir,
+        params_json='{"exported":true}',
+    )
     target = tmp_path / "toolchain.dy"
 
     services.config_package_service.export_package(
@@ -391,8 +412,10 @@ def test_export_includes_ai_toolchain_metadata(tmp_path: Path, services: SimpleN
         "default_timeout_ms",
         "enabled",
         "description",
+        "params_json",
         "source_package_dir",
     }
+    assert toolchain["params_json"] == '{"exported":true}'
     assert toolchain["source_package_dir"] == str(package_dir)
     assert "package_dir" not in toolchain
 
@@ -751,7 +774,7 @@ def test_inspect_package_rejects_case_insensitive_collisions_on_windows(tmp_path
         ({"contents": {"config": True, "golden_samples": False, "ai_toolchain": False, "ai_package": True}}, {}, "ai_package"),
         (
             {"contents": {"config": True, "golden_samples": False, "ai_toolchain": True, "ai_package": True}},
-            {"ai/toolchain.json": {"toolchain_id": "motor-ai", "display_name": "Motor AI", "version": "1.0", "entrypoint": "python main.py", "protocol_version": 1, "execution_mode": "resident_process", "default_timeout_ms": 30000, "enabled": True, "description": "portable", "source_package_dir": "D:/source-machine"}},
+            {"ai/toolchain.json": {"toolchain_id": "motor-ai", "display_name": "Motor AI", "version": "1.0", "entrypoint": "python main.py", "protocol_version": 1, "execution_mode": "resident_process", "default_timeout_ms": 30000, "enabled": True, "description": "portable", "params_json": "{}", "source_package_dir": "D:/source-machine"}},
             "package_archive_path",
         ),
     ],
@@ -926,7 +949,11 @@ def test_inspect_package_reports_config_and_runnable_ai_conflicts(
     services.ai_service.save_toolchain(None, _toolchain_payload(local_package_dir))
     path = _write_package(
         tmp_path / "runnable.dy",
-        _package_entries(include_ai_metadata=True, include_ai_package=True),
+        _package_entries(
+            include_ai_metadata=True,
+            include_ai_package=True,
+            toolchain_overrides={"params_json": '{ "imported": true }'},
+        ),
     )
 
     preview = services.config_package_service.inspect_package(str(path))
@@ -1109,6 +1136,46 @@ def test_import_package_overwrites_existing_config_and_keeps_local_id(
     assert loaded["output_device_samplerate"] == 48_000.0
 
 
+def test_import_package_round_trips_limit_switch_fields(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    imported_config = _config_payload(999, config_name="Imported")
+    imported_config["channels"][0].update(
+        {
+            "spl_lower_enabled": True,
+            "spl_lower_limit": 45.0,
+            "spl_upper_enabled": False,
+            "spl_average_upper_enabled": True,
+            "spl_average_upper_limit": 78.0,
+            "loudness_lower_enabled": True,
+            "loudness_lower_limit": 2.5,
+            "loudness_average_upper_enabled": True,
+            "loudness_average_upper_limit": 9.5,
+        }
+    )
+    path = _write_package(
+        tmp_path / "limits.dy",
+        _package_entries(config_payload=imported_config),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    channel = services.config_service.load_config(result.config_id)["channels"][0]
+    assert channel["spl_lower_enabled"] is True
+    assert channel["spl_lower_limit"] == 45.0
+    assert channel["spl_upper_enabled"] is False
+    assert channel["spl_average_upper_enabled"] is True
+    assert channel["spl_average_upper_limit"] == 78.0
+    assert channel["loudness_lower_enabled"] is True
+    assert channel["loudness_lower_limit"] == 2.5
+    assert channel["loudness_average_upper_enabled"] is True
+    assert channel["loudness_average_upper_limit"] == 9.5
+
+
 def test_import_package_overwrite_rollback_preserves_old_golden_binding(
     tmp_path: Path,
     services: SimpleNamespace,
@@ -1247,7 +1314,11 @@ def test_import_package_runnable_ai_create_restores_managed_package_dir(
     monkeypatch.setattr(config_package_module, "base_dir", str(tmp_path))
     path = _write_package(
         tmp_path / "runnable.dy",
-        _package_entries(include_ai_metadata=True, include_ai_package=True),
+        _package_entries(
+            include_ai_metadata=True,
+            include_ai_package=True,
+            toolchain_overrides={"params_json": '{ "imported": true }'},
+        ),
     )
 
     result = services.config_package_service.import_package(
@@ -1260,7 +1331,9 @@ def test_import_package_runnable_ai_create_restores_managed_package_dir(
 
     assert result.ai_binding_status == "created_toolchain"
     assert binding["toolchain_id"] == "motor-ai"
+    assert binding["params_json"] == '{"imported":true}'
     assert toolchain is not None
+    assert toolchain.params_json == '{"imported":true}'
     assert Path(toolchain.package_dir).is_dir()
     assert toolchain.package_dir.startswith(str(tmp_path / "data" / "ai_toolchains"))
     assert (Path(toolchain.package_dir) / "main.py").read_text(encoding="utf-8") == "print('ok')\n"
@@ -1558,7 +1631,6 @@ def test_import_package_without_ai_metadata_clears_binding_without_mutating_loca
                 "enabled": True,
                 "toolchain_id": "motor-ai",
                 "timeout_ms": None,
-                "params_json": "{}",
             },
         ),
     )

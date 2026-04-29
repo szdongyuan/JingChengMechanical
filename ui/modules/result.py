@@ -33,7 +33,15 @@ _SPL_METRIC_UI_THROTTLE_SEC = 0.25
 
 class ResultModule(QWidget):
     module_id = "result"
-    _ROW_LABELS = ("声压级", "响度", "FFT频谱", "倍频程", "AI分析")
+    _ROW_LABELS = (
+        "声压级",
+        "平均声压级",
+        "响度",
+        "平均响度",
+        "FFT频谱",
+        "倍频程",
+        "AI分析",
+    )
     _DISPLAY_PRESERVING_PHASES = frozenset(
         {"running", "analyzing", "reanalyzing", "stopped"}
     )

@@ -19,7 +19,7 @@ from app.service.config_package_service import (
     ConfigPackagePreview,
 )
 
-DY_PACKAGE_FILTER = "DY Packages (*.dy)"
+DY_PACKAGE_FILTER = "DY 配置包 (*.dy)"
 
 _ACTION_LABELS = {
     "import": "导入",
@@ -61,6 +61,8 @@ class ConfigPackageExportDialog(QDialog):
         )
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确定")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         root.addWidget(buttons)
 
         self.chk_include_ai_toolchain.toggled.connect(
@@ -162,7 +164,7 @@ def choose_import_decision(
         ai_text = f"{preview_text}\n\n检测到 AI 工具链冲突，请选择处理方式。"
         if "overwrite" in preview.ai_action_options:
             ai_text += (
-                "\n覆盖 AI 工具链可能影响绑定到同一 toolchain_id 的其他配置。"
+                "\n覆盖 AI 工具链可能影响绑定到同一工具链 ID 的其他配置。"
             )
         ai_action = _ask_action_choice(
             parent,

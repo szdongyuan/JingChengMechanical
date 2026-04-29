@@ -454,6 +454,7 @@ def test_selecting_row_populates_execution_mode_and_timeout_unit(qapp):
                 enabled=False,
                 description="updated registry entry",
                 execution_mode="oneshot_process",
+                params_json='{"mode":"v2"}',
             )
         ]
     )
@@ -477,6 +478,7 @@ def test_selecting_row_populates_execution_mode_and_timeout_unit(qapp):
     assert module.lb_timeout_unit.isVisible() is True
     assert module.chk_enabled.isChecked() is False
     assert module.txt_description.toPlainText() == "updated registry entry"
+    assert module.txt_params_json.toPlainText() == '{"mode":"v2"}'
     assert module.combo_execution_mode.currentData() == "oneshot_process"
 
 
@@ -512,6 +514,41 @@ def test_package_dir_browse_populates_editor_and_marks_dirty(qapp, tmp_path, mon
 
     assert module.ed_package_dir.text() == str(selected_dir)
     assert module._is_dirty() is True
+
+
+def test_save_persists_json_params(qapp, monkeypatch):
+    module, service, _bus = _make_module(toolchains=[])
+    _show(module, qapp)
+
+    _create_draft(module, qapp, monkeypatch, name="Motor AI")
+    module.ed_entrypoint.setPlainText("python motor_ai.py")
+    module.ed_package_dir.setText(os.getcwd())
+    module.txt_params_json.setPlainText('{"threshold":0.7}')
+
+    module.btn_save.click()
+
+    assert service.saved_requests[-1][1]["params_json"] == '{"threshold":0.7}'
+
+
+def test_invalid_json_params_block_save(qapp, monkeypatch):
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.ai_tool_management.QMessageBox.warning",
+        lambda *args: warnings.append(args[1:3]),
+    )
+    module, service, _bus = _make_module(toolchains=[])
+    _show(module, qapp)
+
+    _create_draft(module, qapp, monkeypatch, name="Motor AI")
+    module.ed_entrypoint.setPlainText("python motor_ai.py")
+    module.ed_package_dir.setText(os.getcwd())
+    module.txt_params_json.setPlainText("[]")
+
+    module.btn_save.click()
+
+    assert service.saved_requests == []
+    assert warnings[0][0] in {"保存失败", "淇濆瓨澶辫触"}
+    assert "参数(JSON)" in warnings[0][1]
 
 
 def test_save_persists_selected_execution_mode(qapp, monkeypatch):
@@ -994,6 +1031,7 @@ def test_busy_save_error_shows_user_warning(qapp, monkeypatch):
                 "enabled": True,
                 "description": "",
                 "execution_mode": "resident_process",
+                "params_json": "{}",
                 "generated_id_prefix": "motor_ai",
             },
         )

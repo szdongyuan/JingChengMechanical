@@ -13,13 +13,26 @@ from ui.widgets.analysis_charts import (
 from ._support import _assert_x_range, _assert_xy_range, _show_widget
 
 
-def _assert_left_axis_hidden_bottom_visible(widget) -> None:
-    assert widget.plot_item.getAxis("left").isVisible() is False
+def _assert_left_axis_title_hidden_ticks_visible(widget) -> None:
+    left_axis = widget.plot_item.getAxis("left")
+    assert left_axis.isVisible() is True
+    assert left_axis.labelText == ""
+    assert left_axis.style.get("showValues") is True
+    assert left_axis.style.get("tickLength") not in (None, 0)
+    assert left_axis.tickStrings([0.0, 1.0], 1.0, 1.0) == ["0", "1"]
     assert widget.plot_item.getAxis("bottom").isVisible() is True
 
 
 def _assert_left_axis_visible(widget) -> None:
     assert widget.plot_item.getAxis("left").isVisible() is True
+
+
+def _assert_default_left_axis_label_refresh_visible(widget) -> None:
+    widget.plot_item.setLabel("left", "Refreshed", units="dB")
+    left_axis = widget.plot_item.getAxis("left")
+    assert left_axis.isVisible() is True
+    assert left_axis.labelText == "Refreshed"
+    assert left_axis.style.get("showValues") is True
 
 
 @pytest.mark.parametrize(
@@ -69,12 +82,12 @@ def test_chart_widgets_keep_left_axis_visible_by_default(qapp, widget_cls):
     "widget_cls",
     (LineChartWidget, FftLineChartWidget, OctaveBarChartWidget, StftImageChartWidget),
 )
-def test_chart_widgets_can_hide_only_left_axis_when_opted_in(qapp, widget_cls):
-    widget = widget_cls(hide_left_axis=True)
+def test_chart_widgets_can_hide_only_left_axis_title_when_opted_in(qapp, widget_cls):
+    widget = widget_cls(hide_left_axis_label=True)
 
     try:
         _show_widget(widget, qapp)
-        _assert_left_axis_hidden_bottom_visible(widget)
+        _assert_left_axis_title_hidden_ticks_visible(widget)
     finally:
         widget.close()
 
@@ -83,18 +96,18 @@ def test_chart_widgets_can_hide_only_left_axis_when_opted_in(qapp, widget_cls):
     "widget_cls",
     (LineChartWidget, FftLineChartWidget, OctaveBarChartWidget, StftImageChartWidget),
 )
-def test_opted_in_chart_widgets_keep_left_axis_hidden_after_left_label_refresh(
+def test_opted_in_chart_widgets_keep_left_axis_title_hidden_after_left_label_refresh(
     qapp,
     widget_cls,
 ):
-    widget = widget_cls(hide_left_axis=True)
+    widget = widget_cls(hide_left_axis_label=True)
 
     try:
         _show_widget(widget, qapp)
         widget.plot_item.setLabel("left", "Refreshed", units="dB")
         qapp.processEvents()
 
-        _assert_left_axis_hidden_bottom_visible(widget)
+        _assert_left_axis_title_hidden_ticks_visible(widget)
     finally:
         widget.close()
 
@@ -112,20 +125,19 @@ def test_default_chart_widgets_keep_normal_left_label_refresh_behavior(
     try:
         _show_widget(widget, qapp)
         widget.plot_item.hideAxis("left")
-        widget.plot_item.setLabel("left", "Refreshed", units="dB")
+        _assert_default_left_axis_label_refresh_visible(widget)
         qapp.processEvents()
 
-        _assert_left_axis_visible(widget)
         assert widget.plot_item.getAxis("bottom").isVisible() is True
     finally:
         widget.close()
 
 
-def test_left_axis_hiding_preserves_zero_based_ranges(qapp):
-    line = LineChartWidget(hide_left_axis=True)
-    fft = FftLineChartWidget(hide_left_axis=True)
-    octave = OctaveBarChartWidget(hide_left_axis=True)
-    stft = StftImageChartWidget(hide_left_axis=True)
+def test_left_axis_title_hiding_preserves_zero_based_ranges(qapp):
+    line = LineChartWidget(hide_left_axis_label=True)
+    fft = FftLineChartWidget(hide_left_axis_label=True)
+    octave = OctaveBarChartWidget(hide_left_axis_label=True)
+    stft = StftImageChartWidget(hide_left_axis_label=True)
 
     try:
         for widget in (line, fft, octave, stft):
@@ -153,7 +165,7 @@ def test_left_axis_hiding_preserves_zero_based_ranges(qapp):
         _assert_x_range(octave, (-0.5, 1.5))
         _assert_xy_range(stft, (0.0, 1.0), (0.0, 200.0))
         for widget in (line, fft, octave, stft):
-            _assert_left_axis_hidden_bottom_visible(widget)
+            _assert_left_axis_title_hidden_ticks_visible(widget)
     finally:
         line.close()
         fft.close()

@@ -316,6 +316,7 @@ def _run_threshold_analysis(
         package_dir=str(tmp_path),
         default_timeout_ms=10000,
         execution_mode="oneshot_process",
+        params_json=json.dumps(request_params),
     )
     TestConfigAiBindingTable.create(
         config=cfg,
@@ -751,6 +752,7 @@ with open(resp_path, "w") as f:
             package_dir=str(tmp_path),
             default_timeout_ms=1000,
             execution_mode="resident_process",
+            params_json=json.dumps({"behavior": "success"}),
         )
         TestConfigAiBindingTable.create(
             config=cfg,
@@ -808,6 +810,7 @@ with open(resp_path, "w") as f:
             package_dir=str(tmp_path),
             default_timeout_ms=1000,
             execution_mode="resident_process",
+            params_json=json.dumps({"behavior": "error"}),
         )
         TestConfigAiBindingTable.create(
             config=cfg,
@@ -845,6 +848,7 @@ with open(resp_path, "w") as f:
             package_dir=str(tmp_path),
             default_timeout_ms=1000,
             execution_mode="resident_process",
+            params_json=json.dumps({"behavior": "malformed_json"}),
         )
         TestConfigAiBindingTable.create(
             config=cfg,
@@ -879,6 +883,7 @@ with open(resp_path, "w") as f:
             package_dir=str(tmp_path),
             default_timeout_ms=1000,
             execution_mode="resident_process",
+            params_json=json.dumps({"behavior": "timeout", "sleep_s": 0.3}),
         )
         TestConfigAiBindingTable.create(
             config=cfg,
@@ -906,6 +911,8 @@ with open(resp_path, "w") as f:
     ):
         cfg = TestConfigTable.create(config_name="Resident Busy")
         script_path = _write_resident_toolchain_script(tmp_path)
+        started_file = tmp_path / "resident-started.txt"
+        release_file = tmp_path / "resident-release.txt"
         tc = AiToolchainTable.create(
             toolchain_id="resident-busy-tc",
             display_name="Resident Busy TC",
@@ -914,9 +921,14 @@ with open(resp_path, "w") as f:
             package_dir=str(tmp_path),
             default_timeout_ms=5000,
             execution_mode="resident_process",
+            params_json=json.dumps(
+                {
+                    "behavior": "block",
+                    "started_file": str(started_file),
+                    "release_file": str(release_file),
+                }
+            ),
         )
-        started_file = tmp_path / "resident-started.txt"
-        release_file = tmp_path / "resident-release.txt"
         TestConfigAiBindingTable.create(
             config=cfg,
             toolchain=tc,

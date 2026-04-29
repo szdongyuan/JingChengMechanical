@@ -98,10 +98,9 @@ class TestPreflightCheck:
             version="1",
             entrypoint="e",
             package_dir=os.getcwd(),
+            params_json="not json",
         )
-        TestConfigAiBindingTable.create(
-            config=cfg, toolchain=tc, enabled=True, params_json="not json"
-        )
+        TestConfigAiBindingTable.create(config=cfg, toolchain=tc, enabled=True)
         result = ai_service.preflight_check(cfg.config_id, [{"audio_path": "/tmp/a.wav"}])
         assert result["status"] == "preflight_error"
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 
 from PyQt6.QtCore import QRegularExpression, Qt
@@ -218,6 +219,11 @@ class AiToolManagementModule(QWidget):
         self.combo_execution_mode.addItem("单次进程", "oneshot_process")
         form_lay.addRow("执行模式", self.combo_execution_mode)
 
+        self.txt_params_json = QPlainTextEdit()
+        self.txt_params_json.setPlaceholderText('{"key": "value"}')
+        self.txt_params_json.setMaximumHeight(100)
+        form_lay.addRow("参数(JSON)", self.txt_params_json)
+
         self.txt_description = QPlainTextEdit()
         self.txt_description.setMaximumHeight(100)
         form_lay.addRow("描述", self.txt_description)
@@ -260,6 +266,7 @@ class AiToolManagementModule(QWidget):
         self.spin_timeout.textChanged.connect(self._on_editor_changed)
         self.chk_enabled.toggled.connect(self._on_editor_changed)
         self.combo_execution_mode.currentIndexChanged.connect(self._on_editor_changed)
+        self.txt_params_json.textChanged.connect(self._on_editor_changed)
         self.txt_description.textChanged.connect(self._on_editor_changed)
         self.btn_browse_package_dir.clicked.connect(self._browse_package_dir)
 
@@ -341,6 +348,7 @@ class AiToolManagementModule(QWidget):
             "default_timeout_ms": 30000,
             "enabled": True,
             "execution_mode": _DEFAULT_EXECUTION_MODE,
+            "params_json": "{}",
             "description": "",
         }
 
@@ -359,6 +367,7 @@ class AiToolManagementModule(QWidget):
                 "default_timeout_ms": int(row.get("default_timeout_ms") or 0),
                 "enabled": bool(row.get("enabled", True)),
                 "execution_mode": row.get("execution_mode", _DEFAULT_EXECUTION_MODE),
+                "params_json": row.get("params_json", "{}"),
                 "description": row.get("description", ""),
             }
         )
@@ -514,6 +523,7 @@ class AiToolManagementModule(QWidget):
             self._set_execution_mode(
                 row.get("execution_mode", _DEFAULT_EXECUTION_MODE)
             )
+            self.txt_params_json.setPlainText(row.get("params_json", "{}"))
             self.txt_description.setPlainText(row.get("description", ""))
         finally:
             self._suspend_editor_change_tracking = False
@@ -608,6 +618,7 @@ class AiToolManagementModule(QWidget):
             "enabled": self.chk_enabled.isChecked(),
             "execution_mode": self.combo_execution_mode.currentData()
             or _DEFAULT_EXECUTION_MODE,
+            "params_json": self.txt_params_json.toPlainText(),
             "description": self.txt_description.toPlainText(),
         }
 
@@ -622,6 +633,7 @@ class AiToolManagementModule(QWidget):
             "default_timeout_ms": payload["default_timeout_ms"],
             "enabled": payload["enabled"],
             "execution_mode": payload["execution_mode"],
+            "params_json": payload["params_json"].strip() or "{}",
             "description": payload["description"].strip(),
         }
 
@@ -638,6 +650,12 @@ class AiToolManagementModule(QWidget):
             raise ValueError("AI 包目录必须是已存在的目录")
         if payload["default_timeout_ms"] <= 0:
             raise ValueError("默认超时必须大于 0")
+        try:
+            params = json.loads(payload["params_json"])
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError(f"参数(JSON) 格式无效：{exc}") from exc
+        if not isinstance(params, dict):
+            raise ValueError("参数(JSON) 必须是对象")
         duplicate = payload["toolchain_id"] in self._toolchain_rows
         if duplicate and payload["toolchain_id"] != self._current_toolchain_id:
             raise ValueError("工具链标识已存在")

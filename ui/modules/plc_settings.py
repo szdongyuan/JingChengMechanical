@@ -568,6 +568,19 @@ class PlcSettingsModule(QWidget):
         self._emit_plc_changed()
         return True
 
+    def _emit_plc_changed(self) -> None:
+        plc_changed = getattr(self.services.bus, "plc_changed", None)
+        if plc_changed is not None:
+            plc_changed.emit()
+
+    def _set_connect_failure_label(self, row_id, message):
+        failure_label = f"连接失败: {message}" if message else "连接失败"
+        self._connect_failure_labels[row_id] = failure_label
+        return failure_label
+
+    def _clear_connect_failure_label(self, row_id):
+        self._connect_failure_labels.pop(row_id, None)
+
     def set_lb_text(self, row_id):
         failure_label = self._connect_failure_labels.get(row_id)
         if failure_label is not None:

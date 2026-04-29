@@ -24,11 +24,23 @@ _CHANNEL_DEFAULTS = {
     "stft_overlap": 0.5,
     "spl_weighting": "A",
     "spl_time_constant": 0.125,
+    "spl_lower_enabled": False,
+    "spl_upper_enabled": False,
     "spl_lower_limit": 40.0,
     "spl_upper_limit": 85.0,
+    "spl_average_lower_enabled": False,
+    "spl_average_lower_limit": 40.0,
+    "spl_average_upper_enabled": False,
+    "spl_average_upper_limit": 85.0,
     "loudness_unit": "sone",
+    "loudness_lower_enabled": False,
+    "loudness_upper_enabled": False,
     "loudness_lower_limit": 0.0,
     "loudness_upper_limit": 60.0,
+    "loudness_average_lower_enabled": False,
+    "loudness_average_lower_limit": 0.0,
+    "loudness_average_upper_enabled": False,
+    "loudness_average_upper_limit": 60.0,
     "fft_band_limits": "[]",
     "oct_weighting": "A",
     "oct_band_limits": "[]",
@@ -46,6 +58,53 @@ _CHANNEL_DEFAULTS = {
     "oct_golden_mode": "off",
     "oct_show_golden_overlay": False,
 }
+
+_CHANNEL_LIMIT_GROUPS = (
+    (
+        "SPL",
+        "spl_lower_enabled",
+        "spl_lower_limit",
+        "spl_upper_enabled",
+        "spl_upper_limit",
+        False,
+    ),
+    (
+        "平均SPL",
+        "spl_average_lower_enabled",
+        "spl_average_lower_limit",
+        "spl_average_upper_enabled",
+        "spl_average_upper_limit",
+        False,
+    ),
+    (
+        "响度",
+        "loudness_lower_enabled",
+        "loudness_lower_limit",
+        "loudness_upper_enabled",
+        "loudness_upper_limit",
+        True,
+    ),
+    (
+        "平均响度",
+        "loudness_average_lower_enabled",
+        "loudness_average_lower_limit",
+        "loudness_average_upper_enabled",
+        "loudness_average_upper_limit",
+        True,
+    ),
+)
+
+_CHANNEL_LIMIT_ENABLED_FIELDS = tuple(
+    field
+    for _label, lower_enabled, _lower_value, upper_enabled, _upper_value, _non_negative in _CHANNEL_LIMIT_GROUPS
+    for field in (lower_enabled, upper_enabled)
+)
+
+_CHANNEL_LIMIT_VALUE_FIELDS = tuple(
+    field
+    for _label, _lower_enabled, lower_value, _upper_enabled, upper_value, _non_negative in _CHANNEL_LIMIT_GROUPS
+    for field in (lower_value, upper_value)
+)
 
 _GOLDEN_BINDING_FIELDS = (
     "golden_sample_path",
@@ -157,10 +216,46 @@ class ConfigService:
                     "stft_overlap": ch.stft_overlap,
                     "spl_weighting": ch.spl_weighting,
                     "spl_time_constant": ch.spl_time_constant,
+                    "spl_lower_enabled": bool(
+                        getattr(ch, "spl_lower_enabled", _CHANNEL_DEFAULTS["spl_lower_enabled"])
+                    ),
+                    "spl_upper_enabled": bool(
+                        getattr(ch, "spl_upper_enabled", _CHANNEL_DEFAULTS["spl_upper_enabled"])
+                    ),
                     "spl_upper_limit": ch.spl_upper_limit,
                     "spl_lower_limit": ch.spl_lower_limit,
+                    "spl_average_lower_enabled": bool(
+                        getattr(
+                            ch,
+                            "spl_average_lower_enabled",
+                            _CHANNEL_DEFAULTS["spl_average_lower_enabled"],
+                        )
+                    ),
+                    "spl_average_lower_limit": getattr(
+                        ch,
+                        "spl_average_lower_limit",
+                        _CHANNEL_DEFAULTS["spl_average_lower_limit"],
+                    ),
+                    "spl_average_upper_enabled": bool(
+                        getattr(
+                            ch,
+                            "spl_average_upper_enabled",
+                            _CHANNEL_DEFAULTS["spl_average_upper_enabled"],
+                        )
+                    ),
+                    "spl_average_upper_limit": getattr(
+                        ch,
+                        "spl_average_upper_limit",
+                        _CHANNEL_DEFAULTS["spl_average_upper_limit"],
+                    ),
                     "loudness_unit": ch.loudness_unit
                     or _CHANNEL_DEFAULTS["loudness_unit"],
+                    "loudness_lower_enabled": bool(
+                        getattr(ch, "loudness_lower_enabled", _CHANNEL_DEFAULTS["loudness_lower_enabled"])
+                    ),
+                    "loudness_upper_enabled": bool(
+                        getattr(ch, "loudness_upper_enabled", _CHANNEL_DEFAULTS["loudness_upper_enabled"])
+                    ),
                     "loudness_lower_limit": (
                         ch.loudness_lower_limit
                         if ch.loudness_lower_limit is not None
@@ -170,6 +265,30 @@ class ConfigService:
                         ch.loudness_upper_limit
                         if ch.loudness_upper_limit is not None
                         else _CHANNEL_DEFAULTS["loudness_upper_limit"]
+                    ),
+                    "loudness_average_lower_enabled": bool(
+                        getattr(
+                            ch,
+                            "loudness_average_lower_enabled",
+                            _CHANNEL_DEFAULTS["loudness_average_lower_enabled"],
+                        )
+                    ),
+                    "loudness_average_lower_limit": getattr(
+                        ch,
+                        "loudness_average_lower_limit",
+                        _CHANNEL_DEFAULTS["loudness_average_lower_limit"],
+                    ),
+                    "loudness_average_upper_enabled": bool(
+                        getattr(
+                            ch,
+                            "loudness_average_upper_enabled",
+                            _CHANNEL_DEFAULTS["loudness_average_upper_enabled"],
+                        )
+                    ),
+                    "loudness_average_upper_limit": getattr(
+                        ch,
+                        "loudness_average_upper_limit",
+                        _CHANNEL_DEFAULTS["loudness_average_upper_limit"],
                     ),
                     "fft_band_limits": self._parse_json(ch.fft_band_limits, []),
                     "oct_weighting": ch.oct_weighting,
@@ -583,35 +702,12 @@ class ConfigService:
             tc = ch.get("spl_time_constant", 0)
             if not isinstance(tc, (int, float)) or isinstance(tc, bool) or tc <= 0:
                 errors.append(f"{prefix}: SPL 时间常数必须大于 0")
-            sl = ch.get("spl_lower_limit", 0)
-            su = ch.get("spl_upper_limit", 0)
-            if not isinstance(sl, (int, float)) or isinstance(sl, bool):
-                errors.append(f"{prefix}: SPL 下限必须为数值")
-            elif not isinstance(su, (int, float)) or isinstance(su, bool):
-                errors.append(f"{prefix}: SPL 上限必须为数值")
-            elif sl >= su:
-                errors.append(f"{prefix}: SPL 下限必须小于上限")
             loudness_unit = ch.get(
                 "loudness_unit", _CHANNEL_DEFAULTS["loudness_unit"]
             )
             if loudness_unit not in _VALID_LOUDNESS_UNITS:
                 errors.append(f"{prefix}: 响度单位无效")
-            loudness_lower = ch.get(
-                "loudness_lower_limit", _CHANNEL_DEFAULTS["loudness_lower_limit"]
-            )
-            loudness_upper = ch.get(
-                "loudness_upper_limit", _CHANNEL_DEFAULTS["loudness_upper_limit"]
-            )
-            if not self._is_numeric(loudness_lower):
-                errors.append(f"{prefix}: 响度下限必须为数值")
-            elif loudness_lower < 0:
-                errors.append(f"{prefix}: 响度下限必须大于等于 0")
-            elif not self._is_numeric(loudness_upper):
-                errors.append(f"{prefix}: 响度上限必须为数值")
-            elif loudness_upper < 0:
-                errors.append(f"{prefix}: 响度上限必须大于等于 0")
-            elif loudness_lower >= loudness_upper:
-                errors.append(f"{prefix}: 响度下限必须小于上限")
+            errors.extend(self._validate_channel_limit_groups(prefix, ch))
             if ch.get("oct_weighting") not in _VALID_WEIGHTING:
                 errors.append(f"{prefix}: 倍频程计权模式无效")
 
@@ -674,6 +770,57 @@ class ConfigService:
                     errors.append("分析窗起始偏移加分析时长不能超过录音时长")
 
         return errors
+
+    def _validate_channel_limit_groups(self, prefix: str, channel: dict) -> list[str]:
+        errors: list[str] = []
+        for (
+            label,
+            lower_enabled_key,
+            lower_value_key,
+            upper_enabled_key,
+            upper_value_key,
+            non_negative,
+        ) in _CHANNEL_LIMIT_GROUPS:
+            lower_label = self._limit_bound_label(label, "下限")
+            upper_label = self._limit_bound_label(label, "上限")
+            lower_enabled = channel.get(lower_enabled_key, _CHANNEL_DEFAULTS[lower_enabled_key])
+            upper_enabled = channel.get(upper_enabled_key, _CHANNEL_DEFAULTS[upper_enabled_key])
+            if not isinstance(lower_enabled, bool):
+                errors.append(f"{prefix}: {lower_label}启用必须为布尔值")
+            if not isinstance(upper_enabled, bool):
+                errors.append(f"{prefix}: {upper_label}启用必须为布尔值")
+            lower_value = channel.get(lower_value_key, _CHANNEL_DEFAULTS[lower_value_key])
+            upper_value = channel.get(upper_value_key, _CHANNEL_DEFAULTS[upper_value_key])
+            lower_valid = True
+            upper_valid = True
+            if lower_enabled is True:
+                if not self._is_numeric(lower_value):
+                    errors.append(f"{prefix}: {lower_label}必须为数值")
+                    lower_valid = False
+                elif non_negative and lower_value < 0:
+                    errors.append(f"{prefix}: {lower_label}必须大于等于 0")
+                    lower_valid = False
+            if upper_enabled is True:
+                if not self._is_numeric(upper_value):
+                    errors.append(f"{prefix}: {upper_label}必须为数值")
+                    upper_valid = False
+                elif non_negative and upper_value < 0:
+                    errors.append(f"{prefix}: {upper_label}必须大于等于 0")
+                    upper_valid = False
+            if (
+                lower_enabled is True
+                and upper_enabled is True
+                and lower_valid
+                and upper_valid
+                and lower_value >= upper_value
+            ):
+                errors.append(f"{prefix}: {lower_label}必须小于上限")
+        return errors
+
+    @staticmethod
+    def _limit_bound_label(label: str, bound: str) -> str:
+        separator = " " if "SPL" in label else ""
+        return f"{label}{separator}{bound}"
 
     def _validate_golden_channel(
         self,
@@ -896,6 +1043,14 @@ class ConfigService:
                 "spl_time_constant",
                 _CHANNEL_DEFAULTS["spl_time_constant"],
             ),
+            "spl_lower_enabled": channel.get(
+                "spl_lower_enabled",
+                _CHANNEL_DEFAULTS["spl_lower_enabled"],
+            ),
+            "spl_upper_enabled": channel.get(
+                "spl_upper_enabled",
+                _CHANNEL_DEFAULTS["spl_upper_enabled"],
+            ),
             "spl_upper_limit": channel.get(
                 "spl_upper_limit",
                 _CHANNEL_DEFAULTS["spl_upper_limit"],
@@ -904,9 +1059,33 @@ class ConfigService:
                 "spl_lower_limit",
                 _CHANNEL_DEFAULTS["spl_lower_limit"],
             ),
+            "spl_average_lower_enabled": channel.get(
+                "spl_average_lower_enabled",
+                _CHANNEL_DEFAULTS["spl_average_lower_enabled"],
+            ),
+            "spl_average_lower_limit": channel.get(
+                "spl_average_lower_limit",
+                _CHANNEL_DEFAULTS["spl_average_lower_limit"],
+            ),
+            "spl_average_upper_enabled": channel.get(
+                "spl_average_upper_enabled",
+                _CHANNEL_DEFAULTS["spl_average_upper_enabled"],
+            ),
+            "spl_average_upper_limit": channel.get(
+                "spl_average_upper_limit",
+                _CHANNEL_DEFAULTS["spl_average_upper_limit"],
+            ),
             "loudness_unit": channel.get(
                 "loudness_unit",
                 _CHANNEL_DEFAULTS["loudness_unit"],
+            ),
+            "loudness_lower_enabled": channel.get(
+                "loudness_lower_enabled",
+                _CHANNEL_DEFAULTS["loudness_lower_enabled"],
+            ),
+            "loudness_upper_enabled": channel.get(
+                "loudness_upper_enabled",
+                _CHANNEL_DEFAULTS["loudness_upper_enabled"],
             ),
             "loudness_lower_limit": channel.get(
                 "loudness_lower_limit",
@@ -915,6 +1094,22 @@ class ConfigService:
             "loudness_upper_limit": channel.get(
                 "loudness_upper_limit",
                 _CHANNEL_DEFAULTS["loudness_upper_limit"],
+            ),
+            "loudness_average_lower_enabled": channel.get(
+                "loudness_average_lower_enabled",
+                _CHANNEL_DEFAULTS["loudness_average_lower_enabled"],
+            ),
+            "loudness_average_lower_limit": channel.get(
+                "loudness_average_lower_limit",
+                _CHANNEL_DEFAULTS["loudness_average_lower_limit"],
+            ),
+            "loudness_average_upper_enabled": channel.get(
+                "loudness_average_upper_enabled",
+                _CHANNEL_DEFAULTS["loudness_average_upper_enabled"],
+            ),
+            "loudness_average_upper_limit": channel.get(
+                "loudness_average_upper_limit",
+                _CHANNEL_DEFAULTS["loudness_average_upper_limit"],
             ),
             "fft_band_limits": deepcopy(channel.get("fft_band_limits", [])),
             "oct_weighting": channel.get(
@@ -946,58 +1141,67 @@ class ConfigService:
         else:
             for field in _GOLDEN_BINDING_FIELDS:
                 normalized[field] = restored_binding.get(field)
+        self._normalize_channel_limit_storage(normalized)
         return normalized
 
     def _channel_db_values(self, channel: dict) -> dict:
+        normalized_channel = dict(channel)
+        self._normalize_channel_limit_storage(normalized_channel)
         return {
-            "channel_index": channel["channel_index"],
-            "stft_nfft": channel["stft_nfft"],
-            "fft_nfft": channel.get("fft_nfft", _CHANNEL_DEFAULTS["fft_nfft"]),
-            "stft_overlap": channel["stft_overlap"],
-            "spl_weighting": channel["spl_weighting"],
-            "spl_time_constant": channel["spl_time_constant"],
-            "spl_upper_limit": channel["spl_upper_limit"],
-            "spl_lower_limit": channel["spl_lower_limit"],
-            "loudness_unit": channel.get(
+            "channel_index": normalized_channel["channel_index"],
+            "stft_nfft": normalized_channel["stft_nfft"],
+            "fft_nfft": normalized_channel.get("fft_nfft", _CHANNEL_DEFAULTS["fft_nfft"]),
+            "stft_overlap": normalized_channel["stft_overlap"],
+            "spl_weighting": normalized_channel["spl_weighting"],
+            "spl_time_constant": normalized_channel["spl_time_constant"],
+            "spl_lower_enabled": normalized_channel["spl_lower_enabled"],
+            "spl_upper_enabled": normalized_channel["spl_upper_enabled"],
+            "spl_upper_limit": normalized_channel["spl_upper_limit"],
+            "spl_lower_limit": normalized_channel["spl_lower_limit"],
+            "spl_average_lower_enabled": normalized_channel["spl_average_lower_enabled"],
+            "spl_average_lower_limit": normalized_channel["spl_average_lower_limit"],
+            "spl_average_upper_enabled": normalized_channel["spl_average_upper_enabled"],
+            "spl_average_upper_limit": normalized_channel["spl_average_upper_limit"],
+            "loudness_unit": normalized_channel.get(
                 "loudness_unit", _CHANNEL_DEFAULTS["loudness_unit"]
             ),
-            "loudness_lower_limit": channel.get(
-                "loudness_lower_limit",
-                _CHANNEL_DEFAULTS["loudness_lower_limit"],
-            ),
-            "loudness_upper_limit": channel.get(
-                "loudness_upper_limit",
-                _CHANNEL_DEFAULTS["loudness_upper_limit"],
-            ),
-            "fft_band_limits": json.dumps(channel["fft_band_limits"]),
-            "oct_weighting": channel["oct_weighting"],
-            "oct_band_limits": json.dumps(channel["oct_band_limits"]),
-            "ai_config": json.dumps(channel.get("ai_config", {})),
+            "loudness_lower_enabled": normalized_channel["loudness_lower_enabled"],
+            "loudness_upper_enabled": normalized_channel["loudness_upper_enabled"],
+            "loudness_lower_limit": normalized_channel["loudness_lower_limit"],
+            "loudness_upper_limit": normalized_channel["loudness_upper_limit"],
+            "loudness_average_lower_enabled": normalized_channel["loudness_average_lower_enabled"],
+            "loudness_average_lower_limit": normalized_channel["loudness_average_lower_limit"],
+            "loudness_average_upper_enabled": normalized_channel["loudness_average_upper_enabled"],
+            "loudness_average_upper_limit": normalized_channel["loudness_average_upper_limit"],
+            "fft_band_limits": json.dumps(normalized_channel["fft_band_limits"]),
+            "oct_weighting": normalized_channel["oct_weighting"],
+            "oct_band_limits": json.dumps(normalized_channel["oct_band_limits"]),
+            "ai_config": json.dumps(normalized_channel.get("ai_config", {})),
             "golden_sample_path": self._normalize_optional_text(
-                channel.get("golden_sample_path")
+                normalized_channel.get("golden_sample_path")
             ),
             "golden_sample_label": self._normalize_optional_text(
-                channel.get("golden_sample_label")
+                normalized_channel.get("golden_sample_label")
             ),
-            "golden_sample_source_channel": channel.get("golden_sample_source_channel"),
-            "golden_sample_start_sample": channel.get("golden_sample_start_sample"),
-            "golden_sample_num_samples": channel.get("golden_sample_num_samples"),
-            "golden_sample_start_ms": channel.get("golden_sample_start_ms"),
-            "golden_sample_duration_ms": channel.get("golden_sample_duration_ms"),
-            "golden_sample_sample_rate": channel.get("golden_sample_sample_rate"),
-            "fft_golden_mode": channel.get(
+            "golden_sample_source_channel": normalized_channel.get("golden_sample_source_channel"),
+            "golden_sample_start_sample": normalized_channel.get("golden_sample_start_sample"),
+            "golden_sample_num_samples": normalized_channel.get("golden_sample_num_samples"),
+            "golden_sample_start_ms": normalized_channel.get("golden_sample_start_ms"),
+            "golden_sample_duration_ms": normalized_channel.get("golden_sample_duration_ms"),
+            "golden_sample_sample_rate": normalized_channel.get("golden_sample_sample_rate"),
+            "fft_golden_mode": normalized_channel.get(
                 "fft_golden_mode",
                 _CHANNEL_DEFAULTS["fft_golden_mode"],
             ),
-            "fft_show_golden_overlay": channel.get(
+            "fft_show_golden_overlay": normalized_channel.get(
                 "fft_show_golden_overlay",
                 _CHANNEL_DEFAULTS["fft_show_golden_overlay"],
             ),
-            "oct_golden_mode": channel.get(
+            "oct_golden_mode": normalized_channel.get(
                 "oct_golden_mode",
                 _CHANNEL_DEFAULTS["oct_golden_mode"],
             ),
-            "oct_show_golden_overlay": channel.get(
+            "oct_show_golden_overlay": normalized_channel.get(
                 "oct_show_golden_overlay",
                 _CHANNEL_DEFAULTS["oct_show_golden_overlay"],
             ),
@@ -1079,6 +1283,16 @@ class ConfigService:
         channel["fft_show_golden_overlay"] = False
         channel["oct_golden_mode"] = "off"
         channel["oct_show_golden_overlay"] = False
+
+    def _normalize_channel_limit_storage(self, channel: dict) -> None:
+        for field in _CHANNEL_LIMIT_ENABLED_FIELDS:
+            channel[field] = channel.get(field, _CHANNEL_DEFAULTS[field]) is True
+        for field in _CHANNEL_LIMIT_VALUE_FIELDS:
+            value = channel.get(field, _CHANNEL_DEFAULTS[field])
+            if self._is_numeric(value):
+                channel[field] = float(value)
+            else:
+                channel[field] = float(_CHANNEL_DEFAULTS[field])
 
     @staticmethod
     def _parse_json(text: str, default):

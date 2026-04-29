@@ -536,6 +536,29 @@ class TestToolchainRegistryCrud:
                 _toolchain_payload(default_timeout_ms=timeout_ms),
             )
 
+    def test_save_toolchain_persists_params_json(self, ai_service):
+        ai_service.save_toolchain(
+            None,
+            _toolchain_payload(
+                toolchain_id="param-ai",
+                params_json='{ "threshold": 0.7 }',
+            ),
+        )
+
+        row = AiToolchainTable.get_by_id("param-ai")
+
+        assert row.params_json == '{"threshold":0.7}'
+
+    @pytest.mark.parametrize("params_json", ["{invalid", "[]"])
+    def test_save_toolchain_rejects_invalid_params_json(
+        self, ai_service, params_json
+    ):
+        with pytest.raises(ValueError, match="params_json"):
+            ai_service.save_toolchain(
+                None,
+                _toolchain_payload(params_json=params_json),
+            )
+
     def test_save_toolchain_rename_rewrites_all_binding_rows_but_not_history(
         self, ai_service, config, toolchain
     ):
@@ -1080,12 +1103,13 @@ class TestRunAiAnalysisRouting:
         self, ai_service, config, toolchain, tmp_path, monkeypatch
     ):
         toolchain.execution_mode = "resident_process"
+        toolchain.params_json = '{"resident":true}'
         toolchain.save()
         AiBindingTable.create(
             config=config,
             toolchain=toolchain,
             enabled=True,
-            params_json='{"resident": true}',
+            params_json='{"binding": true}',
         )
         segments = _analysis_segments(tmp_path)
         resident_calls = []
@@ -1133,6 +1157,7 @@ class TestRunAiAnalysisRouting:
         assert resident_calls[0]["toolchain_id"] == "motor-ai"
         assert resident_calls[0]["request_id"] == result["request_id"]
         assert resident_calls[0]["request_payload"]["toolchain_id"] == "motor-ai"
+        assert resident_calls[0]["request_payload"]["params"] == {"resident": True}
         assert resident_calls[0]["package_dir"] == toolchain.package_dir
         assert resident_calls[0]["artifacts_dir"] == result["artifacts_dir"]
 
@@ -1410,6 +1435,22 @@ class TestBindingResolver:
         binding = ai_service.resolve_binding(config.config_id)
         assert "score_threshold" not in binding
 
+    def test_resolve_binding_uses_toolchain_params_not_binding_params(
+        self, ai_service, config, toolchain
+    ):
+        toolchain.params_json = '{"toolchain":true}'
+        toolchain.save()
+        AiBindingTable.create(
+            config=config,
+            toolchain=toolchain,
+            enabled=True,
+            params_json='{"binding":true}',
+        )
+
+        binding = ai_service.resolve_binding(config.config_id)
+
+        assert binding["params_json"] == '{"toolchain":true}'
+
     def test_resolve_binding_with_null_toolchain(self, ai_service):
         """Binding with no toolchain should still be resolvable."""
         cfg = ConfigTable.create(config_name="NullTC")
@@ -1421,7 +1462,9 @@ class TestBindingResolver:
 
 
 class TestBindingCrud:
-    def test_save_creates_new_binding(self, ai_service, config, toolchain):
+    def test_save_creates_new_binding_ignores_binding_params(
+        self, ai_service, config, toolchain
+    ):
         bid = ai_service.save_binding(config.config_id, {
             "enabled": True,
             "toolchain_id": "motor-ai",
@@ -1430,9 +1473,11 @@ class TestBindingCrud:
         })
         assert bid > 0
         binding = ai_service.resolve_binding(config.config_id)
+        row = AiBindingTable.get(AiBindingTable.config == config.config_id)
         assert binding["enabled"] is True
         assert binding["timeout_ms"] == 5000
-        assert binding["params_json"] == '{"k": "v"}'
+        assert binding["params_json"] == "{}"
+        assert row.params_json == "{}"
 
     def test_save_binding_creates_row_when_legacy_binding_offset_column_is_not_null(
         self, ai_service, config, toolchain
@@ -1455,7 +1500,7 @@ class TestBindingCrud:
             (binding_id,),
         ).fetchone()
 
-        assert row == (1, "motor-ai", 0, '{"k": "v"}')
+        assert row == (1, "motor-ai", 0, "{}")
 
     def test_save_binding_ignores_analysis_window_offset_ms(
         self, ai_service, config, toolchain

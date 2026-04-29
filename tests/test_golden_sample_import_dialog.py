@@ -10,7 +10,16 @@ from scipy.io import wavfile
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
-from PyQt6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QLabel, QLineEdit, QSpinBox
+from PyQt6.QtWidgets import (
+    QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFormLayout,
+    QLabel,
+    QLineEdit,
+    QSpinBox,
+    QWidget,
+)
 
 from app.service.golden_sample_service import GoldenSampleService
 from ui.popups.golden_sample_import_dialog import GoldenSampleImportDialog
@@ -57,6 +66,45 @@ def _dialog(
         config_sample_rate=config_sample_rate,
         golden_sample_service=GoldenSampleService(root_dir=str(tmp_path / "managed")),
     )
+
+
+def _field_label_text(container: QWidget, object_name: str) -> str | None:
+    field = container.findChild(QWidget, object_name)
+    assert field is not None
+    parent = field.parentWidget()
+    while parent is not None:
+        layout = parent.layout()
+        if isinstance(layout, QFormLayout):
+            row, _role = layout.getWidgetPosition(field)
+            if row >= 0:
+                label_item = layout.itemAt(row, QFormLayout.ItemRole.LabelRole)
+                label = label_item.widget() if label_item else None
+                return label.text() if isinstance(label, QLabel) else None
+        parent = parent.parentWidget()
+    return None
+
+
+def test_dialog_renders_translated_visible_labels(qapp, tmp_path):
+    wav_path, _ = _write_temp_wav(tmp_path / "source.wav", duration_sec=4.0, channels=2)
+    dialog = _dialog(
+        tmp_path,
+        wav_path=wav_path,
+        analysis_duration=3.0,
+        config_sample_rate=48_000.0,
+    )
+
+    assert dialog.windowTitle() == "导入黄金样本"
+    assert _field_label_text(dialog, "file_sample_rate_value") == "采样率"
+    assert _field_label_text(dialog, "file_channel_count_value") == "通道数"
+    assert _field_label_text(dialog, "file_total_duration_value") == "总时长"
+    assert _field_label_text(dialog, "required_golden_duration_value") == "所需时长"
+    assert _field_label_text(dialog, "source_channel_selector") == "源通道"
+    assert _field_label_text(dialog, "start_ms_spin") == "起点"
+    assert _field_label_text(dialog, "end_ms_display") == "终点"
+    assert dialog.findChild(QLabel, "validation_message").text() == "就绪"
+    button_box = dialog.findChild(QDialogButtonBox, "dialog_buttons")
+    assert button_box.button(QDialogButtonBox.StandardButton.Ok).text() == "确定"
+    assert button_box.button(QDialogButtonBox.StandardButton.Cancel).text() == "取消"
 
 
 @pytest.mark.parametrize("analysis_duration", [None, 0.0, -1.0])

@@ -38,8 +38,20 @@ def _channel_payload(channel_index: int) -> dict:
         "stft_overlap": 0.5,
         "spl_weighting": "A",
         "spl_time_constant": 0.125,
+        "spl_lower_enabled": False,
+        "spl_upper_enabled": False,
         "spl_upper_limit": 85.0,
         "spl_lower_limit": 40.0,
+        "spl_average_lower_enabled": False,
+        "spl_average_lower_limit": 40.0,
+        "spl_average_upper_enabled": False,
+        "spl_average_upper_limit": 85.0,
+        "loudness_lower_enabled": False,
+        "loudness_upper_enabled": False,
+        "loudness_average_lower_enabled": False,
+        "loudness_average_lower_limit": 0.0,
+        "loudness_average_upper_enabled": False,
+        "loudness_average_upper_limit": 60.0,
         "fft_band_limits": [],
         "oct_weighting": "A",
         "oct_band_limits": [],
@@ -70,6 +82,8 @@ def _channel_payload_with_loudness(
     payload.update(
         {
             "loudness_unit": unit,
+            "loudness_lower_enabled": True,
+            "loudness_upper_enabled": True,
             "loudness_lower_limit": lower,
             "loudness_upper_limit": upper,
         }
@@ -934,6 +948,55 @@ def test_validate_rejects_loudness_lower_limit_not_less_than_upper():
     )
 
     assert any("响度下限必须小于上限" in err for err in errors)
+
+
+def test_validate_ignores_disabled_invalid_limit_values():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel.update(
+        {
+            "spl_lower_enabled": False,
+            "spl_upper_enabled": False,
+            "spl_lower_limit": "not-number",
+            "spl_upper_limit": "also-not-number",
+            "loudness_lower_enabled": False,
+            "loudness_upper_enabled": False,
+            "loudness_lower_limit": -10.0,
+            "loudness_upper_limit": -1.0,
+        }
+    )
+
+    errors = svc.validate(
+        {
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "scan_triggers_test": False,
+            "selected_channels": [0],
+            "channels": [channel],
+        }
+    )
+
+    assert errors == []
+
+
+def test_validate_rejects_non_boolean_limit_enable_flags():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["spl_lower_enabled"] = "yes"
+
+    errors = svc.validate(
+        {
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "scan_triggers_test": False,
+            "selected_channels": [0],
+            "channels": [channel],
+        }
+    )
+
+    assert any("SPL 下限启用必须为布尔值" in err for err in errors)
 
 
 def test_validate_rejects_negative_analysis_window_offset():

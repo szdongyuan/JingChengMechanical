@@ -185,6 +185,21 @@ class AiService:
             return False
         return "unique" in message or "primary key" in message
 
+    @staticmethod
+    def _normalize_params_json(value) -> str:
+        if value is None:
+            value = "{}"
+        if not isinstance(value, str):
+            value = json.dumps(value, ensure_ascii=False)
+        normalized = value.strip() or "{}"
+        try:
+            parsed = json.loads(normalized)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise ValueError("params_json must be valid JSON") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("params_json must be a JSON object")
+        return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
+
     def _normalize_toolchain_payload(
         self, original_toolchain_id: str | None, data: dict
     ) -> dict:
@@ -219,6 +234,7 @@ class AiService:
             "description": self._normalize_toolchain_text(
                 data.get("description", ""), "description", allow_empty=True
             ),
+            "params_json": self._normalize_params_json(data.get("params_json", "{}")),
             "enabled": bool(data.get("enabled", True)),
             "protocol_version": _SUPPORTED_PROTOCOL_VERSION,
             "execution_mode": execution_mode,
@@ -339,6 +355,7 @@ class AiService:
                     existing.entrypoint = normalized["entrypoint"]
                     existing.package_dir = normalized["package_dir"]
                     existing.default_timeout_ms = normalized["default_timeout_ms"]
+                    existing.params_json = normalized["params_json"]
                     existing.enabled = normalized["enabled"]
                     existing.description = normalized["description"]
                     existing.protocol_version = _SUPPORTED_PROTOCOL_VERSION
@@ -404,7 +421,7 @@ class AiService:
             "toolchain_id": tc_id,
             "timeout_ms": binding.timeout_ms,
             "effective_timeout_ms": effective_timeout,
-            "params_json": binding.params_json,
+            "params_json": tc.params_json if tc is not None else "{}",
         }
 
     # ── Binding CRUD (for config UI) ────────────────────────
@@ -435,7 +452,7 @@ class AiService:
                 data.get("toolchain_id"),
                 data.get("timeout_ms"),
                 0,
-                data.get("params_json", "{}"),
+                "{}",
                 now_str(),
             ),
         )
@@ -456,7 +473,7 @@ class AiService:
                 existing.enabled = data.get("enabled", False)
                 existing.toolchain_id = data.get("toolchain_id")
                 existing.timeout_ms = data.get("timeout_ms")
-                existing.params_json = data.get("params_json", "{}")
+                existing.params_json = "{}"
                 from consts.time_consts import now_str
                 existing.updated_time = now_str()
                 existing.save()
@@ -469,7 +486,7 @@ class AiService:
                     enabled=data.get("enabled", False),
                     toolchain=data.get("toolchain_id"),
                     timeout_ms=data.get("timeout_ms"),
-                    params_json=data.get("params_json", "{}"),
+                    params_json="{}",
                 )
                 return row.binding_id
 
@@ -522,11 +539,11 @@ class AiService:
 
         # Validate params_json
         try:
-            json.loads(binding["params_json"])
-        except (json.JSONDecodeError, TypeError):
+            self._normalize_params_json(binding["params_json"])
+        except ValueError as exc:
             return {
                 "status": "preflight_error",
-                "error": "params_json is not valid JSON",
+                "error": str(exc),
             }
 
         # Validate segments

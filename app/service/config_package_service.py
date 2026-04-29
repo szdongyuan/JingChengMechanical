@@ -50,6 +50,7 @@ _TOOLCHAIN_METADATA_FIELDS = (
     "default_timeout_ms",
     "enabled",
     "description",
+    "params_json",
     "source_package_dir",
 )
 _OPTIONAL_TOOLCHAIN_METADATA_FIELDS = ("package_archive_path",)
@@ -620,6 +621,7 @@ class ConfigPackageService:
             "default_timeout_ms": metadata["default_timeout_ms"],
             "enabled": metadata["enabled"],
             "description": metadata["description"],
+            "params_json": metadata["params_json"],
             "package_dir": package_dir,
         }
         original_toolchain_id = (
@@ -640,9 +642,6 @@ class ConfigPackageService:
         clear_binding: bool,
     ) -> dict:
         source = imported_binding if isinstance(imported_binding, dict) else {}
-        params_json = source.get("params_json", "{}")
-        if not isinstance(params_json, str):
-            params_json = json.dumps(params_json, ensure_ascii=False)
         timeout_ms = source.get("timeout_ms")
         if isinstance(timeout_ms, bool) or not isinstance(timeout_ms, int):
             timeout_ms = None
@@ -654,7 +653,6 @@ class ConfigPackageService:
             "enabled": enabled,
             "toolchain_id": toolchain_id,
             "timeout_ms": timeout_ms,
-            "params_json": params_json,
         }
 
     def _upsert_imported_toolchain_row(self, normalized_toolchain: dict) -> None:
@@ -673,6 +671,7 @@ class ConfigPackageService:
         existing.entrypoint = normalized_toolchain["entrypoint"]
         existing.package_dir = normalized_toolchain["package_dir"]
         existing.default_timeout_ms = normalized_toolchain["default_timeout_ms"]
+        existing.params_json = normalized_toolchain["params_json"]
         existing.enabled = normalized_toolchain["enabled"]
         existing.description = normalized_toolchain["description"]
         existing.protocol_version = normalized_toolchain["protocol_version"]
@@ -723,7 +722,7 @@ class ConfigPackageService:
                 enabled=binding["enabled"],
                 toolchain=binding["toolchain_id"],
                 timeout_ms=binding["timeout_ms"],
-                params_json=binding["params_json"],
+                params_json="{}",
                 updated_time=timestamp,
             )
             return
@@ -731,7 +730,7 @@ class ConfigPackageService:
         existing.enabled = binding["enabled"]
         existing.toolchain = binding["toolchain_id"]
         existing.timeout_ms = binding["timeout_ms"]
-        existing.params_json = binding["params_json"]
+        existing.params_json = "{}"
         existing.updated_time = timestamp
         existing.save()
 
@@ -1075,6 +1074,7 @@ class ConfigPackageService:
             "entrypoint",
             "execution_mode",
             "description",
+            "params_json",
             "source_package_dir",
         ):
             if not isinstance(metadata.get(key), str):
@@ -1098,6 +1098,7 @@ class ConfigPackageService:
             or metadata["default_timeout_ms"] <= 0
         ):
             raise ValueError("ai/toolchain.json default_timeout_ms must be positive integer")
+        self._ai_service._normalize_params_json(metadata["params_json"])
         package_archive_path = metadata.get("package_archive_path")
         if ai_package_included:
             if not isinstance(package_archive_path, str) or not package_archive_path.strip():
@@ -1135,6 +1136,9 @@ class ConfigPackageService:
             "toolchain_id",
             allow_empty=False,
         )
+        normalized["params_json"] = self._ai_service._normalize_params_json(
+            metadata.get("params_json")
+        )
         package_archive_path = normalized.get("package_archive_path")
         if isinstance(package_archive_path, str) and package_archive_path.strip():
             normalized["package_archive_path"] = self._normalize_archive_name(package_archive_path)
@@ -1146,13 +1150,11 @@ class ConfigPackageService:
                 "enabled": False,
                 "toolchain_id": None,
                 "timeout_ms": None,
-                "params_json": "{}",
             }
         return {
             "enabled": bool(binding.get("enabled", False)),
             "toolchain_id": binding.get("toolchain_id"),
             "timeout_ms": binding.get("timeout_ms"),
-            "params_json": binding.get("params_json", "{}"),
         }
 
     def _collect_golden_assets(
@@ -1232,6 +1234,9 @@ class ConfigPackageService:
             "default_timeout_ms": getattr(toolchain, "default_timeout_ms"),
             "enabled": bool(getattr(toolchain, "enabled", True)),
             "description": getattr(toolchain, "description"),
+            "params_json": self._ai_service._normalize_params_json(
+                getattr(toolchain, "params_json", "{}")
+            ),
             "source_package_dir": source_package_dir,
         }
         if include_package:

@@ -14,6 +14,7 @@ from app.service.analysis.dsp import (
     compute_loudness_trace,
     compute_octave_bands,
     compute_spl,
+    compute_spl_leq,
     compute_stft,
     phon_to_sone,
     sone_to_phon,
@@ -141,6 +142,16 @@ class TestComputeSpl:
         sig = np.zeros(44100)
         spl = compute_spl(sig, 44100.0, weighting="Z", time_constant=0.125)
         assert spl < -50
+
+    def test_compute_spl_leq_matches_rms_contract(self):
+        sr = 44100.0
+        t = np.arange(int(sr * 1.0)) / sr
+        sig = 0.5 * np.sqrt(2.0) * np.sin(2 * np.pi * 1000 * t)
+
+        spl = compute_spl_leq(sig, sr, weighting="Z")
+
+        expected = 20 * np.log10(0.5 / 20e-6)
+        assert spl == pytest.approx(expected, abs=0.1)
 
 
 class TestLoudnessHelpers:

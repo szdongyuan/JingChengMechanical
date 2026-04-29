@@ -59,12 +59,21 @@ class BandResult:
 class ChannelJudgment:
     """Judgment result for a single channel."""
     channel_index: int
-    spl_db: float
-    spl_pass: bool
+    spl_db: float | None
+    spl_pass: bool | None
+    spl_min_db: float | None = None
+    spl_max_db: float | None = None
     spl_average_db: float | None = None
+    spl_average_pass: bool | None = None
+    spl_trace_available: bool = True
+    spl_trace_error_message: str | None = None
+    spl_average_available: bool = True
+    spl_average_error_message: str | None = None
+    loudness_min_sone: float | None = None
     loudness_max_sone: float | None = None
     loudness_average_sone: float | None = None
     loudness_pass: bool | None = None
+    loudness_average_pass: bool | None = None
     loudness_available: bool = False
     loudness_error_message: str | None = None
     fft_available: bool = True

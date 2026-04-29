@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import QMetaObject, Qt
-from PyQt6.QtGui import QAction, QCloseEvent
+import os
+
+from PyQt6.QtCore import QMetaObject, QSize, Qt
+from PyQt6.QtGui import QAction, QCloseEvent, QIcon, QPainter, QPixmap
+from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
@@ -14,6 +17,8 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from base.utils import asset_path
 
 from app.services_container import FactoryControllerState, FactoryReviewPayload
 from consts.style import APP_QSS
@@ -86,7 +91,10 @@ class MainWindow(QMainWindow):
         self._pending_guarded_tab_index: int | None = None
         self._reverting_main_tab_change = False
 
-        self.setWindowTitle("精成电机")
+        self.setWindowTitle("智能电机检测")
+        icon_path = asset_path("logo.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
         self.setStyleSheet(APP_QSS)
 
         # root 空白根容器
@@ -168,6 +176,37 @@ class MainWindow(QMainWindow):
         lay = QHBoxLayout(topbar)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(8)
+
+        brand = QWidget()
+        brand_lay = QHBoxLayout(brand)
+        brand_lay.setContentsMargins(2, 0, 10, 0)
+        brand_lay.setSpacing(8)
+
+        brand_icon = QLabel()
+        brand_pixmap = QPixmap(28, 28)
+        brand_pixmap.fill(Qt.GlobalColor.transparent)
+        svg_path = asset_path("logo.svg")
+        if os.path.exists(svg_path):
+            renderer = QSvgRenderer(svg_path)
+            painter = QPainter(brand_pixmap)
+            renderer.render(painter)
+            painter.end()
+            brand_icon.setPixmap(brand_pixmap)
+        brand_icon.setFixedSize(QSize(28, 28))
+        brand_lay.addWidget(brand_icon)
+
+        brand_text = QLabel("智能电机检测")
+        brand_text.setStyleSheet("font-size: 14px; font-weight: 700; color: #0f172a; letter-spacing: 1px;")
+        brand_lay.addWidget(brand_text)
+        lay.addWidget(brand)
+
+        sep = QWidget()
+        sep.setFixedWidth(1)
+        sep.setFixedHeight(22)
+        sep.setStyleSheet("background: #cbd5e1;")
+        lay.addSpacing(4)
+        lay.addWidget(sep)
+        lay.addSpacing(8)
 
         group = QButtonGroup(self)
         group.setExclusive(True)
@@ -315,7 +354,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.analysis_toolbar, 0, 1, 1, 2)
 
         self.spectrum = SpectrumModule(self.services)
-        grid.addWidget(Card("FFT频谱（声压级dB）", self.spectrum), 1, 2)
+        grid.addWidget(Card("FFT频谱（dB）", self.spectrum), 1, 2)
 
         self.stft = StftModule(self.services)
         grid.addWidget(Card("STFT时频图（频率Hz，幅值dB）", self.stft), 1, 1)
@@ -330,7 +369,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(Card("声压级（dB）", self.spl), 2, 1)
 
         self.octave = OctaveModule(self.services)
-        grid.addWidget(Card("倍频程（声压级dB）", self.octave), 2, 2)
+        grid.addWidget(Card("倍频程（dB）", self.octave), 2, 2)
 
         self._attach_analysis_channel_providers()
 
