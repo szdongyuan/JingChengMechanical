@@ -51,11 +51,11 @@ ROLE_PERMISSIONS = {
         "actions": {"切换用户", "添加用户", "删除用户", "修改密码"},
     },
     "工程师": {
-        "tabs": {"测试", "配置", "AI工具管理", "硬件"},
+        "tabs": {"测试", "数据管理", "配置", "AI工具管理", "硬件"},
         "actions": {"切换用户", "修改密码"},
     },
     "操作员": {
-        "tabs": {"测试", "硬件"},
+        "tabs": {"测试"},
         "actions": {"切换用户", "修改密码"},
     },
 }
@@ -132,18 +132,14 @@ class MainWindow(QMainWindow):
             self.show_login_window(close_main_window=True, window_title="登录")
 
     def show_login_window(self, close_main_window=False, window_title="登录"):
-        self.setEnabled(False)
-
         def on_login_success(username: str, role: str):
             self.current_user_name = username
             self.current_user_role = role
-            self.setEnabled(True)
             self.set_role()
             self.raise_()
             self.activateWindow()
 
         def on_login_cancel():
-            self.setEnabled(True)
             if close_main_window:
                 self.close()
 
@@ -290,10 +286,10 @@ class MainWindow(QMainWindow):
                 start_button.setEnabled(False)
             if stop_button is not None:
                 stop_button.setEnabled(bool(self.current_user_name))
-        if hasattr(self, "plc_settings_card"):
-            plc_allowed = self.current_user_role in {"管理员", "工程师"}
-            self.plc_settings_card.setEnabled(plc_allowed)
-            self.plc_settings_card.setToolTip("" if plc_allowed else "暂无权限操作 PLC 设置")
+        # if hasattr(self, "plc_settings_card"):
+        #     plc_allowed = self.current_user_role in {"管理员", "工程师"}
+        #     self.plc_settings_card.setEnabled(plc_allowed)
+        #     self.plc_settings_card.setToolTip("" if plc_allowed else "暂无权限操作 PLC 设置")
 
         if hasattr(self, "tab"):
             self._sync_topbar_selection(self.tab.currentIndex())
@@ -311,7 +307,7 @@ class MainWindow(QMainWindow):
 
         # 左侧栏
         left = QWidget()
-        left.setFixedWidth(480)
+        left.setFixedWidth(420)
         left_lay = QVBoxLayout(left)
         left_lay.setContentsMargins(0, 0, 0, 0)
         left_lay.setSpacing(5)
