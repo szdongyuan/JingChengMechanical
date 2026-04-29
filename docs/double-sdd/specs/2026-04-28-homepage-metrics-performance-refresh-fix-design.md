@@ -18,7 +18,7 @@ The existing summary rows, judgment behavior, charts, and persisted config remai
 2. `MainWindow` announces the resolved display channel through the event bus whenever it is initially resolved or changed by the user.
 3. `TestManager`/`TestSession` use that announced channel to decide which pipeline is allowed to run live loudness. Other channel pipelines keep their rolling loudness buffers but skip the expensive backend call.
 4. If no display-channel announcement has been received for a running config, the session falls back to the first selected channel.
-5. Live loudness refresh target is faster than before: throttle at `0.5s` with a `0.5s` rolling buffer.
+5. Live loudness refresh target is faster than before: throttle at `0.25s` with a `0.5s` rolling buffer.
 6. SPL frames continue to be emitted at the existing cadence for charts and other consumers, but `ResultModule` throttles only the metric-badge UI update to about `4 Hz`.
 7. `ResultModule` keeps per-config/run/channel live metric caches. Channel switching must not clear the whole current-run cache; it should display cached values for the newly selected channel when available.
 8. New run, displayed-config change, factory reset, and reanalysis start still clear inappropriate stale values.
@@ -32,7 +32,7 @@ In scope:
 - Add a display-channel event bus signal.
 - Route display-channel changes from `MainWindow` to `TestManager` and active `TestSession`.
 - Add an optional live-loudness compute flag to `AnalysisPipeline.process_chunk()`.
-- Reduce live loudness throttle/window constants.
+- Reduce live loudness throttle while preserving the rolling window constant.
 - Add metric-badge SPL UI throttling in `ResultModule`.
 - Preserve per-channel live metric caches across channel switches within the same config/run.
 - Add focused regression tests for CPU gating, refresh behavior, channel switching, and analysis-window averages.
@@ -73,7 +73,7 @@ Out of scope:
 - Accepts `compute_loudness: bool = True` for backward compatibility.
 - Always maintains the rolling loudness buffer after calibration.
 - Calls `dsp.compute_loudness_trace()` only when `compute_loudness` is true and the throttle allows it.
-- Uses `_LIVE_LOUDNESS_THROTTLE_SEC = 0.5` and `_LIVE_LOUDNESS_WINDOW_SEC = 0.5`.
+- Uses `_LIVE_LOUDNESS_THROTTLE_SEC = 0.25` and `_LIVE_LOUDNESS_WINDOW_SEC = 0.5`.
 
 `ResultModule`:
 

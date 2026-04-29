@@ -25,7 +25,7 @@
 - Modify `app/service/analysis/test_session.py`
   - Store live loudness channel and pass per-pipeline `compute_loudness`.
 - Modify `app/service/analysis/pipeline.py`
-  - Add `compute_loudness` argument and reduce loudness throttle/window.
+  - Add `compute_loudness` argument and reduce loudness throttle while preserving the rolling window.
 - Modify `ui/modules/result.py`
   - Keep per-channel live caches on channel switch and throttle SPL badge repaint only.
 - Modify tests:
@@ -60,7 +60,7 @@ Add/extend tests to prove:
 - `TestSession._setup_pipelines()` defaults live loudness channel to the first selected channel.
 - `TestSession._process_chunk()` passes `compute_loudness=True` only for the current live loudness channel.
 - `AnalysisPipeline.process_chunk(..., compute_loudness=False)` does not call `dsp.compute_loudness_trace()` but still maintains the rolling loudness buffer.
-- Live loudness throttle/window are `0.5s`.
+- Live loudness throttle is `0.25s`; the rolling window remains `0.5s`.
 
 - [ ] **Step 2: Run focused failing tests**
 

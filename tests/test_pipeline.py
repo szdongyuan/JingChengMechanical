@@ -174,18 +174,19 @@ class TestAnalysisPipeline:
             sample_rate=100.0,
         )
 
-        first = p.process_chunk(np.ones(50, dtype=np.float32), elapsed_time=0.5)
-        second = p.process_chunk(np.ones(50, dtype=np.float32), elapsed_time=0.75)
-        third = p.process_chunk(np.ones(50, dtype=np.float32), elapsed_time=1.0)
-        fourth = p.process_chunk(np.ones(50, dtype=np.float32), elapsed_time=1.5)
+        first = p.process_chunk(np.ones(50, dtype=np.float32), elapsed_time=0.25)
+        second = p.process_chunk(np.ones(50, dtype=np.float32), elapsed_time=0.40)
+        third = p.process_chunk(np.ones(50, dtype=np.float32), elapsed_time=0.50)
+        fourth = p.process_chunk(np.ones(50, dtype=np.float32), elapsed_time=0.75)
 
         assert isinstance(first["loudness"], LoudnessFrame)
-        assert first["loudness"].time == pytest.approx(0.5)
+        assert first["loudness"].time == pytest.approx(0.25)
         assert first["loudness"].loudness_sone == pytest.approx(2.5)
         assert second["loudness"] is None
         assert isinstance(third["loudness"], LoudnessFrame)
-        assert third["loudness"].time == pytest.approx(1.0)
+        assert third["loudness"].time == pytest.approx(0.50)
         assert isinstance(fourth["loudness"], LoudnessFrame)
+        assert fourth["loudness"].time == pytest.approx(0.75)
         assert len(calls) == 3
 
     def test_process_chunk_can_skip_live_loudness_backend_while_maintaining_buffer(
@@ -226,8 +227,8 @@ class TestAnalysisPipeline:
         assert p._loudness_buffer.size == 50
         np.testing.assert_array_equal(calls[0], np.ones(50, dtype=np.float64))
 
-    def test_live_loudness_throttle_and_window_are_half_second(self):
-        assert _LIVE_LOUDNESS_THROTTLE_SEC == pytest.approx(0.5)
+    def test_live_loudness_throttle_is_quarter_second_and_window_is_half_second(self):
+        assert _LIVE_LOUDNESS_THROTTLE_SEC == pytest.approx(0.25)
         assert _LIVE_LOUDNESS_WINDOW_SEC == pytest.approx(0.5)
 
     def test_process_chunk_suppresses_live_loudness_backend_errors(self, monkeypatch):

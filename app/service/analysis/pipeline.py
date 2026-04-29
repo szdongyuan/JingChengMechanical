@@ -14,7 +14,7 @@ from app.service.analysis.frames import FftFrame, LoudnessFrame, OctaveFrame, Sp
 from app.service.analysis import dsp
 
 
-_LIVE_LOUDNESS_THROTTLE_SEC = 0.5
+_LIVE_LOUDNESS_THROTTLE_SEC = 0.25
 _LIVE_LOUDNESS_WINDOW_SEC = 0.5
 
 
