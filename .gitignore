@@ -4,14 +4,7 @@ log/
 .claude/
 .superpowers/
 rules/
+docs/
 image.png
 .worktrees
 data/
-build/
-dist/
-release_packages/
-.codex/
-.agents
-.double-sdd
-.pytest_cache
-jc-model-packaging-skill/

@@ -9,7 +9,6 @@ a = Analysis(
     binaries=[],
     datas=[
         ('data', 'data'),
-        ('assets', 'assets'),
     ],
     hiddenimports=[],
     hookspath=[],
@@ -29,8 +28,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='智能电机检测',
-    icon='assets/logo.ico',
+    name='精成电机',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
