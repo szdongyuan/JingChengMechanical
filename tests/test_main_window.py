@@ -131,7 +131,6 @@ class _ChannelProbeModule(_StubModule):
     def current_title(self) -> str:
         return "响度"
 
-
 class _RefreshProbeResultModule(_StubModule):
     def __init__(self, services=None):
         super().__init__(services)
@@ -140,7 +139,6 @@ class _RefreshProbeResultModule(_StubModule):
 
     def refresh_selected_display_channel(self) -> None:
         self.refresh_selected_display_channel_calls += 1
-
 
 class _FakeLoginWindow:
     def __init__(
@@ -650,6 +648,38 @@ def test_hardware_page_includes_plc_settings_card_alongside_existing_hardware_co
     }
 
     assert {"设备选择", "通道选择", "输入校准", "PLC设置"} <= card_titles
+
+
+def test_initial_no_login_state_disables_plc_settings_card(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+
+    assert window.plc_settings_card.isEnabled() is False
+    assert window.plc_settings_card.toolTip() == "暂无权限操作 PLC 设置"
+
+
+@pytest.mark.parametrize("role", ["管理员", "工程师"])
+def test_admin_and_engineer_roles_can_use_plc_settings_card(qapp, monkeypatch, role):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    window.current_user_name = "user"
+    window.current_user_role = role
+    window.set_role()
+
+    assert window.plc_settings_card.isEnabled() is True
+    assert window.plc_settings_card.toolTip() == ""
+
+
+def test_operator_role_cannot_use_plc_settings_card(qapp, monkeypatch):
+    window, _ = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    window.current_user_name = "operator"
+    window.current_user_role = "操作员"
+    window.set_role()
+
+    assert window.plc_settings_card.isEnabled() is False
+    assert window.plc_settings_card.toolTip() == "暂无权限操作 PLC 设置"
 
 
 def test_closing_main_window_stops_plc_cleanup_before_shared_shutdown_and_camera(

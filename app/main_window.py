@@ -290,7 +290,6 @@ class MainWindow(QMainWindow):
                 start_button.setEnabled(False)
             if stop_button is not None:
                 stop_button.setEnabled(bool(self.current_user_name))
-
         if hasattr(self, "plc_settings_card"):
             plc_allowed = self.current_user_role in {"管理员", "工程师"}
             self.plc_settings_card.setEnabled(plc_allowed)
@@ -801,7 +800,6 @@ class MainWindow(QMainWindow):
                     )
                 except Exception:
                     pass
-
             for plc_thread in getattr(self.services, "plc_threads", {}).values():
                 if plc_thread is None:
                     continue

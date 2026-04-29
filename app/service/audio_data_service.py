@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import zipfile
 
-from peewee import Model, SqliteDatabase
+from peewee import Model, SqliteDatabase, fn
 
 from base.utils import normalize_path
 from model.audio_data_table import AudioDataTable
@@ -14,10 +14,39 @@ class AudioDataService:
         # 查询：返回 audio_data_table 的字段顺序，给 UI 生成表头用。
         return list(AudioDataTable._meta.sorted_field_names)
 
-    def list_records(self) -> list[dict[str, object]]:
+    def list_records(self, filters: dict[str, object] | None = None) -> list[dict[str, object]]:
         # 查询：读取音频表数据，按创建时间倒序给数据管理页展示。
-        query = AudioDataTable.select().order_by(AudioDataTable.record_date.desc()).dicts()
+        query = AudioDataTable.select()
+        query = self._apply_filters(query, filters)
+        query = query.order_by(AudioDataTable.record_date.desc()).dicts()
         return list(query)
+
+    def list_product_models(self) -> list[str]:
+        # 查询：返回所有产品型号，给筛选下拉框使用。
+        query = (
+            AudioDataTable.select(AudioDataTable.product_model)
+            .where(AudioDataTable.product_model != "")
+            .distinct()
+            .order_by(AudioDataTable.product_model)
+            .tuples()
+        )
+        return [row[0] for row in query if row and row[0]]
+
+    def record_date_bounds(self) -> tuple[str | None, str | None]:
+        # 查询：返回最早和最晚时间，用于筛选输入提示。
+        earliest = (
+            AudioDataTable.select(AudioDataTable.record_date)
+            .order_by(AudioDataTable.record_date.asc())
+            .first()
+        )
+        latest = (
+            AudioDataTable.select(AudioDataTable.record_date)
+            .order_by(AudioDataTable.record_date.desc())
+            .first()
+        )
+        min_value = earliest.record_date[:19] if earliest and earliest.record_date else None
+        max_value = latest.record_date[:19] if latest and latest.record_date else None
+        return min_value, max_value
 
     def export_zip(self, target_path: str, records: list[dict[str, object]]) -> None:
         # 导出/保存：生成 zip 包，里面包含 1 个 db 和分类后的音频文件。
@@ -89,6 +118,51 @@ class AudioDataService:
         if label == "NG":
             return "NG"
         return "not_labeled"
+
+    def _apply_filters(self, query, filters: dict[str, object] | None):
+        if not filters:
+            return query
+
+        record_datetime = fn.datetime(
+            fn.replace(fn.Substr(AudioDataTable.record_date, 1, 19), "T", " ")
+        )
+
+        product_model = str(filters.get("product_model") or "").strip()
+        if product_model and product_model != "ALL":
+            query = query.where(AudioDataTable.product_model == product_model)
+
+        barcode = str(filters.get("barcode") or "").strip()
+        if barcode:
+            query = query.where(AudioDataTable.barcode.contains(barcode))
+
+        start_time = str(filters.get("start_time") or "").strip()
+        if start_time:
+            query = query.where(record_datetime >= fn.datetime(start_time))
+
+        end_time = str(filters.get("end_time") or "").strip()
+        if end_time:
+            query = query.where(record_datetime <= fn.datetime(end_time))
+
+        labels = filters.get("labels") or []
+        normalized_labels = {str(label).strip() for label in labels if str(label).strip()}
+        if normalized_labels and normalized_labels != {"OK", "NG", "not_labeled"}:
+            conditions = []
+            if "OK" in normalized_labels:
+                conditions.append(AudioDataTable.labels == "OK")
+            if "NG" in normalized_labels:
+                conditions.append(AudioDataTable.labels == "NG")
+            if "not_labeled" in normalized_labels:
+                conditions.append(
+                    (AudioDataTable.labels.is_null(True))
+                    | (AudioDataTable.labels == "")
+                    | (AudioDataTable.labels == "not_labeled")
+                )
+            if conditions:
+                label_condition = conditions[0]
+                for condition in conditions[1:]:
+                    label_condition |= condition
+                query = query.where(label_condition)
+        return query
 
     @staticmethod
     def _build_export_model(target_db: SqliteDatabase):

@@ -5,11 +5,19 @@ from datetime import datetime
 
 import sounddevice as sd
 from scipy.io import wavfile
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QDateTime, Qt
 from PyQt6.QtWidgets import (
+    QCalendarWidget,
+    QCheckBox,
+    QComboBox,
+    QDateTimeEdit,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QStyle,
@@ -21,6 +29,231 @@ from PyQt6.QtWidgets import (
 
 from consts.running_consts import base_dir
 from base.utils import format_datetime_display, normalize_path
+
+
+class AudioDataFilterDialog(QDialog):
+    def __init__(
+        self,
+        *,
+        product_models: list[str],
+        current_filters: dict[str, object],
+        min_time: str | None,
+        max_time: str | None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("条件筛选")
+        self.resize(360, 220)
+        self.setStyleSheet(
+            """
+            QDialog {
+                background: #f8fafc;
+            }
+            QLabel {
+                color: #111827;
+            }
+            QCheckBox {
+                color: #111827;
+            }
+            QCalendarWidget QWidget {
+                background: #ffffff;
+                color: #111827;
+            }
+            QCalendarWidget QToolButton {
+                background: #ffffff;
+                color: #111827;
+                border: 1px solid #d1d5db;
+                border-radius: 4px;
+                padding: 4px 8px;
+            }
+            QCalendarWidget QAbstractItemView:enabled {
+                background: #ffffff;
+                color: #111827;
+                selection-background-color: #dbeafe;
+                selection-color: #111827;
+            }
+            """
+        )
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(12)
+        form.setVerticalSpacing(10)
+
+        self.combo_product_model = QComboBox()
+        self.combo_product_model.addItem("ALL")
+        for model in product_models:
+            self.combo_product_model.addItem(model)
+        selected_model = str(current_filters.get("product_model") or "ALL")
+        index = self.combo_product_model.findText(selected_model)
+        self.combo_product_model.setCurrentIndex(max(0, index))
+
+        self.cb_enable_time_range = QCheckBox("启用时间范围")
+        self.dt_start_time = QDateTimeEdit()
+        self.dt_end_time = QDateTimeEdit()
+        for edit in (self.dt_start_time, self.dt_end_time):
+            edit.setCalendarPopup(True)
+            edit.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+            self._setup_calendar_popup(edit)
+
+        self._init_datetime_range(
+            start_value=str(current_filters.get("start_time") or ""),
+            end_value=str(current_filters.get("end_time") or ""),
+            min_time=min_time,
+            max_time=max_time,
+        )
+
+        time_row = QHBoxLayout()
+        time_row.setContentsMargins(0, 0, 0, 0)
+        time_row.setSpacing(8)
+        time_row.addWidget(self.cb_enable_time_range)
+        time_row.addWidget(self.dt_start_time)
+        time_row.addWidget(QLabel("-"))
+        time_row.addWidget(self.dt_end_time)
+
+        self.ed_barcode = QLineEdit(str(current_filters.get("barcode") or ""))
+        self.ed_barcode.setPlaceholderText("SN码模糊匹配，不写则全部")
+
+        labels = set(current_filters.get("labels") or ["OK", "NG", "not_labeled"])
+        self.cb_ok = QCheckBox("OK")
+        self.cb_ng = QCheckBox("NG")
+        self.cb_not_labeled = QCheckBox("未标记")
+        self.cb_ok.setChecked("OK" in labels)
+        self.cb_ng.setChecked("NG" in labels)
+        self.cb_not_labeled.setChecked("not_labeled" in labels)
+
+        label_row = QHBoxLayout()
+        label_row.setContentsMargins(0, 0, 0, 0)
+        label_row.setSpacing(16)
+        label_row.addWidget(self.cb_ok)
+        label_row.addWidget(self.cb_ng)
+        label_row.addWidget(self.cb_not_labeled)
+        label_row.addStretch(1)
+
+        form.addRow("产品型号", self.combo_product_model)
+        form.addRow("时间", time_row)
+        form.addRow("SN码", self.ed_barcode)
+        form.addRow("标签", label_row)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept_filters)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _init_datetime_range(
+        self,
+        *,
+        start_value: str,
+        end_value: str,
+        min_time: str | None,
+        max_time: str | None,
+    ) -> None:
+        start_dt = self._parse_datetime(start_value) or self._parse_datetime(min_time) or QDateTime.currentDateTime()
+        end_dt = self._parse_datetime(end_value) or self._parse_datetime(max_time) or QDateTime.currentDateTime()
+        self.dt_start_time.setDateTime(start_dt)
+        self.dt_end_time.setDateTime(end_dt)
+        enabled = bool(start_value.strip() and end_value.strip()) if start_value or end_value else False
+        self.cb_enable_time_range.setChecked(enabled)
+        self.dt_start_time.setEnabled(enabled)
+        self.dt_end_time.setEnabled(enabled)
+        self.cb_enable_time_range.toggled.connect(self.dt_start_time.setEnabled)
+        self.cb_enable_time_range.toggled.connect(self.dt_end_time.setEnabled)
+
+    @staticmethod
+    def _parse_datetime(value: str | None) -> QDateTime | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        dt = QDateTime.fromString(text, "yyyy-MM-dd HH:mm:ss")
+        if dt.isValid():
+            return dt
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+        return QDateTime(parsed)
+
+    @staticmethod
+    def _setup_calendar_popup(edit: QDateTimeEdit) -> None:
+        calendar = edit.calendarWidget()
+        if not calendar:
+            return
+        calendar.setMinimumSize(360, 260)
+        calendar.setGridVisible(True)
+        calendar.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+        calendar.setHorizontalHeaderFormat(QCalendarWidget.HorizontalHeaderFormat.ShortDayNames)
+        calendar.setStyleSheet(
+            """
+            QCalendarWidget QWidget {
+                background: #ffffff;
+                color: #111827;
+            }
+            QCalendarWidget QToolButton {
+                min-width: 56px;
+                background: #ffffff;
+                color: #111827;
+                border: 1px solid #d1d5db;
+                border-radius: 4px;
+                padding: 4px 8px;
+            }
+            QCalendarWidget QMenu {
+                background: #ffffff;
+                color: #111827;
+            }
+            QCalendarWidget QSpinBox {
+                min-width: 72px;
+                color: #111827;
+                background: #ffffff;
+                selection-background-color: #dbeafe;
+            }
+            QCalendarWidget QAbstractItemView:enabled {
+                background: #ffffff;
+                color: #111827;
+                selection-background-color: #dbeafe;
+                selection-color: #111827;
+            }
+            """
+        )
+
+    def _accept_filters(self) -> None:
+        if self.cb_enable_time_range.isChecked():
+            start_dt = self.dt_start_time.dateTime()
+            end_dt = self.dt_end_time.dateTime()
+            if start_dt > end_dt:
+                QMessageBox.warning(self, "提示", "开始时间不能晚于结束时间")
+                return
+        self.accept()
+
+    def filters(self) -> dict[str, object]:
+        labels = []
+        if self.cb_ok.isChecked():
+            labels.append("OK")
+        if self.cb_ng.isChecked():
+            labels.append("NG")
+        if self.cb_not_labeled.isChecked():
+            labels.append("not_labeled")
+        return {
+            "product_model": self.combo_product_model.currentText(),
+            "start_time": (
+                self.dt_start_time.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+                if self.cb_enable_time_range.isChecked()
+                else ""
+            ),
+            "end_time": (
+                self.dt_end_time.dateTime().toString("yyyy-MM-dd HH:mm:ss")
+                if self.cb_enable_time_range.isChecked()
+                else ""
+            ),
+            "barcode": self.ed_barcode.text().strip(),
+            "labels": labels,
+        }
 
 
 class DataManagementModule(QWidget):
@@ -58,6 +291,13 @@ class DataManagementModule(QWidget):
         # 列名和记录都直接从 audio_data_table 动态读取，避免手写表头。
         self._column_names: list[str] = []
         self._records: list[dict[str, object]] = []
+        self._filters: dict[str, object] = {
+            "product_model": "ALL",
+            "start_time": "",
+            "end_time": "",
+            "barcode": "",
+            "labels": ["OK", "NG", "not_labeled"],
+        }
 
         self._build_ui()
         self.refresh_table()
@@ -74,12 +314,14 @@ class DataManagementModule(QWidget):
         toolbar_layout.setSpacing(8)
 
         self.btn_refresh = QPushButton("刷新")
+        self.btn_filter = QPushButton("条件筛选")
         self.btn_select_all = QPushButton("全选")
         self.btn_select_all.setCheckable(True)
         self.btn_export = QPushButton("打包导出")
         self.lb_selected = QLabel("已选 0 条")
 
         toolbar_layout.addWidget(self.btn_refresh)
+        toolbar_layout.addWidget(self.btn_filter)
         toolbar_layout.addWidget(self.btn_select_all)
         toolbar_layout.addWidget(self.btn_export)
         toolbar_layout.addStretch(1)
@@ -96,6 +338,7 @@ class DataManagementModule(QWidget):
         layout.addWidget(self.table, 1)
 
         self.btn_refresh.clicked.connect(self.refresh_table)
+        self.btn_filter.clicked.connect(self._show_filter_dialog)
         self.btn_select_all.clicked.connect(self._toggle_select_all)
         self.btn_export.clicked.connect(self._export_selected_rows)
         self.table.itemChanged.connect(lambda _item: self._update_selected_count())
@@ -106,8 +349,23 @@ class DataManagementModule(QWidget):
         self._column_names = [
             name for name in service.list_column_names() if name != "config_content"
         ]
-        self._records = service.list_records()
+        self._records = service.list_records(self._filters)
         self._render_table()
+
+    def _show_filter_dialog(self) -> None:
+        service = self.services.audio_data_service
+        min_time, max_time = service.record_date_bounds()
+        dialog = AudioDataFilterDialog(
+            product_models=service.list_product_models(),
+            current_filters=self._filters,
+            min_time=min_time,
+            max_time=max_time,
+            parent=self,
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self._filters = dialog.filters()
+        self.refresh_table()
 
     def _render_table(self) -> None:
         # 左边一列勾选，右边一列操作，中间字段按中文表头显示。

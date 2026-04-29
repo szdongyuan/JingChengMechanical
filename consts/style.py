@@ -224,12 +224,24 @@ QTableWidget {
   border-radius: 10px;
   gridline-color: #e5e7eb;
 }
+QTableWidget:disabled,
+QTableView:disabled {
+  background: #f8fafc;
+  color: #94a3b8;
+  gridline-color: #e5e7eb;
+  selection-background-color: #e5e7eb;
+  selection-color: #94a3b8;
+}
 QHeaderView::section {
   background: #f1f5f9;
   padding: 6px 8px;
   border: 0px;
   color: #334155;
   font-weight: 700;
+}
+QHeaderView::section:disabled {
+  background: #f1f5f9;
+  color: #94a3b8;
 }
 QTableView::item { padding: 6px 8px; }
 """

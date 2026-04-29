@@ -1529,15 +1529,15 @@ def test_result_module_translates_average_row_labels_at_ui_boundary(qapp):
     module = _make_module()
     module.services.bus.factory_state_changed.emit(_state("reviewing", displayed_config_id=101))
     payload = _summary_payload(overall_status="pass")
-    payload["rows"][0]["label"] = "平均SPL"
-    payload["rows"][1]["label"] = "平均Loudness"
+    payload["rows"][1]["label"] = "平均SPL"
+    payload["rows"][3]["label"] = "平均Loudness"
 
     module.services.bus.factory_review_changed.emit(
         _make_review_payload(summary_payload=payload)
     )
 
-    assert _table_value(module, 0, 0) == "平均声压级"
-    assert _table_value(module, 1, 0) == "平均响度"
+    assert _table_value(module, 1, 0) == "平均声压级"
+    assert _table_value(module, 3, 0) == "平均响度"
 
 
 def test_result_module_translates_english_octave_row_label(qapp):
