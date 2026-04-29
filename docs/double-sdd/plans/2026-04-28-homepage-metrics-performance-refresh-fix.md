@@ -86,7 +86,7 @@ Implement:
   - `set_live_loudness_channel_index(channel_index: int | None)`.
   - default first selected channel in `_setup_pipelines()`.
   - per-pipeline `compute_loudness=(ch_idx == self._live_loudness_channel_index)`.
-- In `AnalysisPipeline.process_chunk()`, add keyword-only or optional `compute_loudness: bool = True`, skip `_maybe_compute_live_loudness()` when false, and set loudness constants to `0.5`.
+- In `AnalysisPipeline.process_chunk()`, add keyword-only or optional `compute_loudness: bool = True`, skip `_maybe_compute_live_loudness()` when false, and set `_LIVE_LOUDNESS_THROTTLE_SEC` to `0.25` and `_LIVE_LOUDNESS_WINDOW_SEC` to `0.5`.
 
 - [ ] **Step 4: Re-run focused tests**
 
