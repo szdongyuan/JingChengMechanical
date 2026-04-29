@@ -1,3 +1,10 @@
+import os
+
+from consts.running_consts import base_dir
+
+
+_COMBO_CHEVRON_PATH = os.path.join(base_dir, "consts", "combo_chevron.svg").replace("\\", "/")
+
 APP_QSS = """
 /* Base */
 QMainWindow { background: #f3f5f8; }
@@ -128,11 +135,17 @@ QComboBox {
   color: #111827;
   border: 1px solid #e5e7eb;
   border-radius: 8px;
-  padding: 6px 10px;
+  padding: 6px 28px 6px 10px;
 }
 QComboBox::drop-down {
   border: 0px;
   width: 28px;
+}
+QComboBox::down-arrow {
+  image: url("__COMBO_CHEVRON_PATH__");
+  width: 8px;
+  height: 5px;
+  margin-right: 10px;
 }
 QComboBox QAbstractItemView {
   background: #ffffff;
@@ -202,6 +215,18 @@ QPushButton#Fail {
   border: 1px solid #ef4444;
   color: white;
 }
+QPushButton#TablePlayButton {
+  border-radius: 4px;
+  padding: 0px;
+}
+QPushButton#TablePlayButton:hover {
+  background: #f8fafc;
+}
+QPushButton#TablePlayButton:pressed {
+  background: #e2e8f0;
+  padding-top: 1px;
+  padding-left: 1px;
+}
 
 /* Tables */
 QTableWidget {
@@ -230,4 +255,4 @@ QHeaderView::section:disabled {
   color: #94a3b8;
 }
 QTableView::item { padding: 6px 8px; }
-"""
+""".replace("__COMBO_CHEVRON_PATH__", _COMBO_CHEVRON_PATH)

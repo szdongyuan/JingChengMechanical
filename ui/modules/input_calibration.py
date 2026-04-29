@@ -86,8 +86,8 @@ class InputCalibrationModule(QWidget):
         result_lay.setSpacing(10)
 
         self.combo_channel = QComboBox()
-        # 太窄会把 “In1” 截成 “In”
-        self.combo_channel.setFixedWidth(70)
+        # 给文字和右侧箭头留出空间，避免焦点光标挤出来。
+        self.combo_channel.setFixedWidth(84)
 
         # 声压偏差：最终校准结果（标准声压 - 测得平均 SPL），用于展示与写入 mic_calibration.json
         self.deviation_lineedit = QLineEdit()

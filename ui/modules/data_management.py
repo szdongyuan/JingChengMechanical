@@ -405,6 +405,7 @@ class DataManagementModule(QWidget):
 
                 # 每一行单独放一个播放按钮，按该行 file_path 播放。
                 play_button = QPushButton()
+                play_button.setObjectName("TablePlayButton")
                 play_button.setIcon(
                     self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
                 )

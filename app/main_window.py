@@ -400,7 +400,7 @@ class MainWindow(QMainWindow):
         main_lay.setSpacing(12)
 
         cal = InputCalibrationModule(self.services)
-        cal_card = Card("输入校准", cal)
+        cal_card = Card("麦克风输入校准", cal)
 
         channel = ChannelSelectModule(self.services)
         channel_card = Card("通道选择", channel)
