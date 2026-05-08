@@ -58,6 +58,8 @@ class VideoModule(QWidget):
         self.camera_thread = None
 
         self.init_ui()
+        if hasattr(self.services.bus, "factory_display_reset"):
+            self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
         self.start_camera()
 
     def init_ui(self):
@@ -137,6 +139,13 @@ class VideoModule(QWidget):
     def set_text(self, message):
         self.lb.clear()
         self.lb.setText(f'{message}, 点击 <a href="retry" style="color:#2563eb;text-decoration:none;">重试</a>')
+
+    def _show_empty_placeholder(self) -> None:
+        self.lb.clear()
+        self.lb.setText("暂无画面")
+
+    def _on_factory_display_reset(self, _reason: str) -> None:
+        self._show_empty_placeholder()
 
     def refresh_camera(self, _link=None):
         self.start_camera()
