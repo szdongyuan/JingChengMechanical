@@ -265,6 +265,7 @@ class DataManagementModule(QWidget):
         "sample_rate": "采样率",
         "record_date": "创建时间",
         "labels": "标签结果",
+        "label_source": "判定来源",
         "barcode": "SN码",
         "analyse_config": "分析配置",
         "config_content": "配置内容",
@@ -277,6 +278,7 @@ class DataManagementModule(QWidget):
         "sample_rate": 80,
         "record_date": 170,
         "labels": 90,
+        "label_source": 90,
         "barcode": 90,
         "analyse_config": 120,
         "config_content": 180,
@@ -391,10 +393,7 @@ class DataManagementModule(QWidget):
 
                 for column_index, column_name in enumerate(self._column_names, start=1):
                     value = record.get(column_name)
-                    if column_name == "record_date":
-                        text = format_datetime_display(value)
-                    else:
-                        text = "" if value is None else str(value)
+                    text = self._display_cell_text(column_name, value)
                     item = QTableWidgetItem(text)
                     item.setFlags(
                         Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable
@@ -423,6 +422,19 @@ class DataManagementModule(QWidget):
         self.table.resizeRowsToContents()
         self._apply_table_widths()
         self._update_selected_count()
+
+    @staticmethod
+    def _display_cell_text(column_name: str, value: object) -> str:
+        if column_name == "record_date":
+            return format_datetime_display(value)
+        if column_name == "label_source":
+            text = "" if value is None else str(value).strip()
+            if text == "auto":
+                return "自动"
+            if text == "manual":
+                return "人工"
+            return text
+        return "" if value is None else str(value)
 
     def _apply_table_widths(self) -> None:
         keys = ["__select__", *self._column_names, "__action__"]

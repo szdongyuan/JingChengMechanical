@@ -9,6 +9,7 @@ import math
 import os
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -21,6 +22,13 @@ from app.service.analysis.pipeline import AnalysisPipeline
 from model.audio_data_table import AudioDataTable
 
 _TZ8 = timezone(timedelta(hours=8))
+
+
+@dataclass(frozen=True)
+class ManualLabelUpdateResult:
+    success: bool
+    message: str = ""
+    audio_data_id: str | None = None
 
 
 class TestSession:
@@ -279,6 +287,7 @@ class TestSession:
 
         if label_value is not None:
             update_payload["labels"] = label_value
+            update_payload["label_source"] = "auto"
 
         try:
             updated = (
@@ -297,6 +306,35 @@ class TestSession:
                 f"[TestSession] WARNING: failed to persist audio result metadata "
                 f"for audio_data_id={self._audio_data_id}: {exc}"
             )
+
+    def apply_manual_label(self, label: str) -> ManualLabelUpdateResult:
+        normalized = self._normalize_manual_label(label)
+        if normalized is None:
+            return ManualLabelUpdateResult(False, "无效判定结果")
+        if not self._audio_data_id:
+            return ManualLabelUpdateResult(False, "当前测试没有已保存的音频记录")
+
+        try:
+            updated = (
+                AudioDataTable
+                .update(labels=normalized, label_source="manual")
+                .where(AudioDataTable.audio_data_id == self._audio_data_id)
+                .execute()
+            )
+        except Exception as exc:
+            self._bus.log.emit(
+                f"[TestSession] WARNING: failed to persist manual judgment "
+                f"for audio_data_id={self._audio_data_id}: {exc}"
+            )
+            return ManualLabelUpdateResult(
+                False,
+                f"保存人工判定失败：{exc}",
+                self._audio_data_id,
+            )
+
+        if updated != 1:
+            return ManualLabelUpdateResult(False, "当前测试音频记录不存在", self._audio_data_id)
+        return ManualLabelUpdateResult(True, "", self._audio_data_id)
 
     def _run_ai(self, result: JudgmentResult) -> JudgmentResult:
         """Patch AI result into judgment when an enabled binding exists."""
@@ -563,6 +601,13 @@ class TestSession:
             if math.isfinite(value):
                 return float(value)
             return None
+        return None
+
+    @staticmethod
+    def _normalize_manual_label(label: str) -> str | None:
+        text = str(label or "").strip().upper()
+        if text in {"OK", "NG"}:
+            return text
         return None
 
     @staticmethod

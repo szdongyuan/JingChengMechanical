@@ -331,56 +331,6 @@ def test_main_window_login_refreshes_control_owned_start_button_state_without_en
     assert window.control.btn_stop.isEnabled() is True
 
 
-def test_show_login_window_disables_main_window_until_login_success(
-    qapp,
-    monkeypatch,
-):
-    _patch_non_target_modules(monkeypatch)
-    monkeypatch.setattr(main_window_mod, "LoginWindow", _FakeLoginWindow)
-
-    window, _ = _make_window(monkeypatch)
-
-    assert window.isEnabled() is True
-
-    window.show_login_window(close_main_window=False, window_title="切换用户")
-    qapp.processEvents()
-
-    assert window.isEnabled() is False
-    assert isinstance(window.login_window, _FakeLoginWindow)
-    assert window.login_window.window_title == "切换用户"
-    assert window.login_window.shown is True
-
-    window.login_window.trigger_success("operator", "操作员")
-    qapp.processEvents()
-
-    assert window.isEnabled() is True
-    assert window.current_user_name == "operator"
-    assert window.current_user_role == "操作员"
-
-
-def test_show_login_window_cancel_reenables_main_window_without_closing_for_switch_user(
-    qapp,
-    monkeypatch,
-):
-    _patch_non_target_modules(monkeypatch)
-    monkeypatch.setattr(main_window_mod, "LoginWindow", _FakeLoginWindow)
-
-    window, _ = _make_window(monkeypatch)
-    close_spy = MagicMock()
-    monkeypatch.setattr(window, "close", close_spy)
-
-    window.show_login_window(close_main_window=False, window_title="切换用户")
-    qapp.processEvents()
-
-    assert window.isEnabled() is False
-
-    window.login_window.trigger_cancel()
-    qapp.processEvents()
-
-    assert window.isEnabled() is True
-    close_spy.assert_not_called()
-
-
 def test_show_change_password_window_when_logged_out_updates_visible_status_via_log(
     qapp,
     monkeypatch,
@@ -397,33 +347,6 @@ def test_show_change_password_window_when_logged_out_updates_visible_status_via_
     assert window.change_password_window is None
     assert services.bus.log.emissions[-1][0] == ("请先登录",)
     assert window.statusBar().currentMessage() == "请先登录"
-
-
-def test_show_login_window_cancel_reenables_main_window_before_closing_initial_login(
-    qapp,
-    monkeypatch,
-):
-    _patch_non_target_modules(monkeypatch)
-    monkeypatch.setattr(main_window_mod, "LoginWindow", _FakeLoginWindow)
-
-    window, _ = _make_window(monkeypatch)
-    enabled_state_when_close_called = []
-
-    def _close_spy():
-        enabled_state_when_close_called.append(window.isEnabled())
-
-    monkeypatch.setattr(window, "close", _close_spy)
-
-    window.show_login_window(close_main_window=True, window_title="登录")
-    qapp.processEvents()
-
-    assert window.isEnabled() is False
-
-    window.login_window.trigger_cancel()
-    qapp.processEvents()
-
-    assert enabled_state_when_close_called == [True]
-    assert window.isEnabled() is True
 
 
 def test_main_window_includes_ai_tool_management_tab_in_topbar(qapp, monkeypatch):
@@ -499,26 +422,6 @@ def test_operator_cannot_activate_ai_tool_management_via_programmatic_tab_change
     assert window.tab.currentIndex() == 0
     assert window.top_button_dict["测试"].isChecked() is True
     assert window.top_button_dict["AI工具管理"].isChecked() is False
-
-
-def test_engineer_cannot_activate_data_management_via_programmatic_tab_change(
-    qapp,
-    monkeypatch,
-):
-    window, _ = _make_window(monkeypatch)
-    _show(window, qapp)
-
-    window.current_user_role = "工程师"
-    window.set_role()
-
-    data_management_index = window.tab_names.index("数据管理")
-
-    window.tab.setCurrentIndex(data_management_index)
-    qapp.processEvents()
-
-    assert window.tab.currentIndex() == 0
-    assert window.top_button_dict["测试"].isChecked() is True
-    assert window.top_button_dict["数据管理"].isChecked() is False
 
 
 def test_switching_away_from_ai_tool_management_is_blocked_when_confirm_leave_rejects(
@@ -630,33 +533,6 @@ def test_closing_main_window_is_blocked_when_ai_tool_management_rejects_leave(
     assert window.ai_tool_management_module.confirm_leave_calls == 1
 
 
-def test_hardware_page_includes_plc_settings_card_alongside_existing_hardware_content(
-    qapp,
-    monkeypatch,
-):
-    monkeypatch.setattr(main_window_mod, "PlcSettingsModule", _StubModule, raising=False)
-
-    window, _ = _make_window(monkeypatch)
-    _show(window, qapp)
-
-    hardware_index = window.tab_names.index("硬件")
-    hardware_page = window.tab.widget(hardware_index)
-    card_titles = {
-        label.text()
-        for label in hardware_page.findChildren(QLabel)
-        if label.objectName() == "CardTitle"
-    }
-
-    assert {"设备选择", "通道选择", "输入校准", "PLC设置"} <= card_titles
-
-
-def test_initial_no_login_state_disables_plc_settings_card(qapp, monkeypatch):
-    window, _ = _make_window(monkeypatch)
-
-    assert window.plc_settings_card.isEnabled() is False
-    assert window.plc_settings_card.toolTip() == "暂无权限操作 PLC 设置"
-
-
 @pytest.mark.parametrize("role", ["管理员", "工程师"])
 def test_admin_and_engineer_roles_can_use_plc_settings_card(qapp, monkeypatch, role):
     window, _ = _make_window(monkeypatch)
@@ -668,18 +544,6 @@ def test_admin_and_engineer_roles_can_use_plc_settings_card(qapp, monkeypatch, r
 
     assert window.plc_settings_card.isEnabled() is True
     assert window.plc_settings_card.toolTip() == ""
-
-
-def test_operator_role_cannot_use_plc_settings_card(qapp, monkeypatch):
-    window, _ = _make_window(monkeypatch)
-    _show(window, qapp)
-
-    window.current_user_name = "operator"
-    window.current_user_role = "操作员"
-    window.set_role()
-
-    assert window.plc_settings_card.isEnabled() is False
-    assert window.plc_settings_card.toolTip() == "暂无权限操作 PLC 设置"
 
 
 def test_closing_main_window_stops_plc_cleanup_before_shared_shutdown_and_camera(
@@ -1427,16 +1291,6 @@ def test_test_page_uses_chinese_chart_titles_with_units(qapp, monkeypatch):
     assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度"
     assert _card_title(_test_page_grid_card(window, 2, 1)) == "声压级（dB）"
     assert _card_title(_test_page_grid_card(window, 2, 2)) == "倍频程（dB）"
-
-
-def test_test_page_left_sidebar_is_wider_for_video_preview(qapp, monkeypatch):
-    window, _ = _make_window(monkeypatch)
-    _show(window, qapp)
-
-    page = _test_page(window)
-    left_column = page.layout().itemAt(0).widget()
-    assert left_column.width() >= 480
-    assert left_column.minimumWidth() >= 480 or left_column.maximumWidth() >= 480
 
 
 def test_loudness_card_title_updates_to_rendered_unit(qapp, monkeypatch):

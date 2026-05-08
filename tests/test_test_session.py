@@ -794,6 +794,7 @@ class TestTestSessionJudgment:
         assert result.overall == "不合格"
         rec = AudioDataTable.get_by_id(session._audio_data_id)
         assert rec.labels == "NG"
+        assert rec.label_source == "auto"
         assert rec.analyse_config == "Config A"
         snapshot = json.loads(rec.config_content)
         assert snapshot["config_name"] == "Config A"
@@ -820,6 +821,7 @@ class TestTestSessionJudgment:
 
         rec = AudioDataTable.get_by_id(session._audio_data_id)
         assert rec.labels == "OK"
+        assert rec.label_source == "auto"
         assert rec.analyse_config == "Config A"
 
     def test_run_judgment_updates_saved_audio_row_to_ng(self, tmp_path):
@@ -843,6 +845,7 @@ class TestTestSessionJudgment:
 
         rec = AudioDataTable.get_by_id(session._audio_data_id)
         assert rec.labels == "NG"
+        assert rec.label_source == "auto"
         assert rec.analyse_config == "Config A"
 
     def test_run_judgment_keeps_flow_when_audio_row_update_affects_zero_rows(
@@ -951,8 +954,139 @@ class TestTestSessionJudgment:
 
         rec = AudioDataTable.get_by_id(session._audio_data_id)
         assert rec.labels is None
+        assert rec.label_source is None
         assert any(
             "unexpected judgment overall" in call.args[0]
+            for call in bus.log.emit.call_args_list
+        )
+
+    def test_apply_manual_label_overwrites_saved_audio_row_to_manual_ok(self, tmp_path):
+        bus = _make_mock_bus()
+        session = TestSession(
+            config=_make_config(config_name="Config A"),
+            bus=bus,
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={"sn": "SN-1", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        path = session._save_wav(np.zeros((100, 1), dtype=np.float32), 44100)
+        AudioDataTable.update(labels="NG", label_source="auto").where(
+            AudioDataTable.audio_data_id == session._audio_data_id
+        ).execute()
+
+        result = session.apply_manual_label("OK")
+
+        rec = AudioDataTable.get_by_id(session._audio_data_id)
+        assert result.success is True
+        assert result.message == ""
+        assert result.audio_data_id == session._audio_data_id
+        assert rec.labels == "OK"
+        assert rec.label_source == "manual"
+        assert rec.file_path == path
+
+    def test_apply_manual_label_overwrites_saved_audio_row_to_manual_ng(self, tmp_path):
+        bus = _make_mock_bus()
+        session = TestSession(
+            config=_make_config(config_name="Config A"),
+            bus=bus,
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={"sn": "SN-1", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._save_wav(np.zeros((100, 1), dtype=np.float32), 44100)
+        AudioDataTable.update(labels="OK", label_source="auto").where(
+            AudioDataTable.audio_data_id == session._audio_data_id
+        ).execute()
+
+        result = session.apply_manual_label("NG")
+
+        rec = AudioDataTable.get_by_id(session._audio_data_id)
+        assert result.success is True
+        assert result.message == ""
+        assert result.audio_data_id == session._audio_data_id
+        assert rec.labels == "NG"
+        assert rec.label_source == "manual"
+
+    def test_apply_manual_label_rejects_missing_audio_data_id(self, tmp_path):
+        session = TestSession(
+            config=_make_config(),
+            bus=_make_mock_bus(),
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={},
+            audio_dir=str(tmp_path),
+        )
+
+        result = session.apply_manual_label("OK")
+
+        assert result.success is False
+        assert "没有已保存的音频记录" in result.message
+        assert result.audio_data_id is None
+
+    def test_apply_manual_label_rejects_missing_database_row(self, tmp_path):
+        session = TestSession(
+            config=_make_config(),
+            bus=_make_mock_bus(),
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={},
+            audio_dir=str(tmp_path),
+        )
+        session._audio_data_id = "missing-audio-id"
+
+        result = session.apply_manual_label("NG")
+
+        assert result.success is False
+        assert "音频记录不存在" in result.message
+        assert result.audio_data_id == "missing-audio-id"
+
+    def test_apply_manual_label_rejects_invalid_label(self, tmp_path):
+        session = TestSession(
+            config=_make_config(),
+            bus=_make_mock_bus(),
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={},
+            audio_dir=str(tmp_path),
+        )
+        session._save_wav(np.zeros((100, 1), dtype=np.float32), 44100)
+
+        result = session.apply_manual_label("BAD")
+
+        rec = AudioDataTable.get_by_id(session._audio_data_id)
+        assert result.success is False
+        assert "无效判定" in result.message
+        assert result.audio_data_id is None
+        assert rec.labels is None
+        assert rec.label_source is None
+
+    def test_apply_manual_label_reports_update_exception(self, tmp_path, monkeypatch):
+        bus = _make_mock_bus()
+        session = TestSession(
+            config=_make_config(),
+            bus=bus,
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={},
+            audio_dir=str(tmp_path),
+        )
+        session._save_wav(np.zeros((100, 1), dtype=np.float32), 44100)
+
+        def _raise_update(**_kwargs):
+            raise RuntimeError("boom")
+
+        monkeypatch.setattr(AudioDataTable, "update", _raise_update)
+
+        result = session.apply_manual_label("OK")
+
+        assert result.success is False
+        assert "保存人工判定失败" in result.message
+        assert "boom" in result.message
+        assert result.audio_data_id == session._audio_data_id
+        assert any(
+            "failed to persist manual judgment" in call.args[0]
             for call in bus.log.emit.call_args_list
         )
 

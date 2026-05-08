@@ -16,7 +16,7 @@ from app.service.analysis import dsp
 from app.service.analysis.audio_monitor import AudioMonitor
 from app.service.analysis.audio_recorder import AudioRecorder
 from app.service.analysis.review_payloads import build_chart_payload, build_summary_payload
-from app.service.analysis.test_session import TestSession
+from app.service.analysis.test_session import ManualLabelUpdateResult, TestSession
 from consts.running_consts import base_dir
 
 
@@ -37,6 +37,7 @@ class TestManager(QObject):
         self._shared_recorders: dict[str, AudioRecorder] = {}
         self._pending_factory_starts: dict[str, int] = {}
         self._canceled_factory_start_requests: set[str] = set()
+        self._last_start_error: str | None = None
         self._analyzing_sessions: set[int] = set()
         self._accepted_factory_stops: set[int] = set()
         self._live_loudness_channel_by_config_id: dict[int, int] = {}
@@ -46,8 +47,13 @@ class TestManager(QObject):
         if callable(connect):
             connect(self._on_factory_display_channel_changed)
 
+    def last_start_error(self) -> str | None:
+        return self._last_start_error
+
     def start(self, workorder: dict, *, on_start_accepted=None) -> bool:
         """Start a test for the config_id in the workorder."""
+        self._clear_last_start_error()
+        request_id = self._get_factory_start_request_id(workorder)
         config_id = workorder.get("config_id")
         if config_id is None:
             config_name = workorder.get("config", "")
@@ -58,9 +64,11 @@ class TestManager(QObject):
                         break
         if config_id is None:
             self._bus.log.emit("[TestManager] ERROR: could not resolve config_id from workorder")
-            return False
+            return self._fail_start_before_acceptance(
+                request_id,
+                "无法解析启动配置，请重新选择配置。",
+            )
 
-        request_id = self._get_factory_start_request_id(workorder)
         if request_id is not None:
             self._pending_factory_starts[request_id] = config_id
 
@@ -72,15 +80,41 @@ class TestManager(QObject):
             config = self._services.config_service.load_config(config_id)
         except Exception as exc:
             self._bus.log.emit(f"[TestManager] ERROR loading config {config_id}: {exc}")
-            self._clear_pending_factory_start(request_id)
-            return False
+            return self._fail_start_before_acceptance(
+                request_id,
+                f"配置加载失败：{exc}",
+            )
 
-        device_info = self._services.hss_service.load_io_devices()
+        try:
+            device_info = self._services.hss_service.load_io_devices()
+        except Exception as exc:
+            self._bus.log.emit(f"[TestManager] ERROR loading input hardware: {exc}")
+            return self._fail_start_before_acceptance(
+                request_id,
+                f"读取硬件配置失败：{exc}",
+            )
+
+        hardware_error = self._saved_input_hardware_error(device_info)
+        if hardware_error is not None:
+            self._bus.log.emit(f"[TestManager] ERROR {hardware_error}")
+            return self._fail_start_before_acceptance(request_id, hardware_error)
+
+        if self._config_input_device_fields_missing(config):
+            self._bus.log.emit(
+                f"[TestManager] ERROR config {config_id} missing input device fields"
+            )
+            return self._fail_start_before_acceptance(
+                request_id,
+                "配置未选择输入设备，请先在「配置」页面选择输入设备并保存。",
+            )
+
         mic_cal = device_info.get("mic_cal", {})
+        if not isinstance(mic_cal, dict):
+            mic_cal = {}
         audio_dir = os.path.join(base_dir, "data", "audio")
 
         device_key = self._device_key(config)
-        input_info = device_info.get("input", {})
+        input_info = device_info["input"]
         config_sr = float(config.get("input_device_samplerate", 44100))
         device_sr = float(input_info.get("samplerate", config_sr))
         if config_sr != device_sr:
@@ -89,94 +123,97 @@ class TestManager(QObject):
                 f"from device {device_sr}, using device rate"
             )
         sample_rate = device_sr
-        n_channels = int(input_info.get("channel_count", 1))
+        n_channels = self._positive_int_value(input_info.get("channel_count"))
+        if n_channels is None:
+            return self._fail_start_before_acceptance(
+                request_id,
+                "输入硬件配置无效，请重新保存硬件设备。",
+            )
         record_duration = config.get("record_duration", 5.0)
         session_workorder = dict(workorder)
         session_workorder["factory_run_id"] = self._new_factory_run_id()
 
-        session = TestSession(
-            config=config,
-            bus=self._bus,
-            ai_service=self._services.ai_service,
-            mic_cal=mic_cal,
-            workorder=session_workorder,
-            audio_dir=audio_dir,
-        )
-        session._on_session_done_cb = self._on_session_done
-
-        if device_key in self._shared_recorders:
-            recorder = self._shared_recorders[device_key]
-        else:
-            recorder = AudioRecorder(
-                device_name=config.get("input_device_name", ""),
-                hostapi=config.get("input_device_hostapi", ""),
-                sample_rate=sample_rate,
-                n_channels=n_channels,
-                record_duration=record_duration,
-            )
-            self._shared_recorders[device_key] = recorder
-
-        session._sample_rate = recorder._sample_rate
-        session._setup_pipelines()
-        self._apply_stored_live_loudness_channel(session, config)
-
-        session._chunk_conn = session._on_chunk
-        session._done_lambda = lambda cid=config_id: self._on_recording_done(cid)
-        session._error_lambda = lambda msg, cid=config_id: self._on_error(cid, msg)
-        prepare_for_attach = getattr(session, "prepare_for_attach", None)
-        if callable(prepare_for_attach):
-            prepare_for_attach()
-        recorder.chunk_ready.connect(session._chunk_conn)
-        attach_snapshot = recorder.attach_session(record_duration=record_duration)
-        session.attach_to_recorder(
-            chunk_index=attach_snapshot.chunk_index,
-            snapshot=attach_snapshot,
-        )
-        recorder.recording_done.connect(session._done_lambda)
-        recorder.error_occurred.connect(session._error_lambda)
-
-        self._sessions[config_id] = session
-        self._recorders[config_id] = recorder
-
-        output_name = config.get("output_device_name")
-        if output_name:
-            output_sr = float(config.get("output_device_samplerate", sample_rate))
-            monitor = AudioMonitor(
-                device_name=config.get("output_device_name", ""),
-                hostapi=config.get("output_device_hostapi", ""),
-                sample_rate=output_sr,
-                monitor_channel=config.get("selected_channels", [0])[0],
-            )
-            session._monitor_lambda = lambda data, idx, m=monitor: m.feed(data)
-            session._monitor_error_lambda = lambda msg, cid=config_id: self._on_error(cid, msg)
-            recorder.chunk_ready.connect(session._monitor_lambda)
-            monitor.error_occurred.connect(session._monitor_error_lambda)
-            self._monitors[config_id] = monitor
+        session = None
+        recorder = None
+        monitor = None
 
         try:
+            session = TestSession(
+                config=config,
+                bus=self._bus,
+                ai_service=self._services.ai_service,
+                mic_cal=mic_cal,
+                workorder=session_workorder,
+                audio_dir=audio_dir,
+            )
+            session._on_session_done_cb = self._on_session_done
+
+            if device_key in self._shared_recorders:
+                recorder = self._shared_recorders[device_key]
+            else:
+                recorder = AudioRecorder(
+                    device_name=config.get("input_device_name", ""),
+                    hostapi=config.get("input_device_hostapi", ""),
+                    sample_rate=sample_rate,
+                    n_channels=n_channels,
+                    record_duration=record_duration,
+                )
+                self._shared_recorders[device_key] = recorder
+
+            session._sample_rate = recorder._sample_rate
+            session._setup_pipelines()
+            self._apply_stored_live_loudness_channel(session, config)
+
+            session._chunk_conn = session._on_chunk
+            session._done_lambda = lambda cid=config_id: self._on_recording_done(cid)
+            session._error_lambda = lambda msg, cid=config_id: self._on_error(cid, msg)
+            prepare_for_attach = getattr(session, "prepare_for_attach", None)
+            if callable(prepare_for_attach):
+                prepare_for_attach()
+            recorder.chunk_ready.connect(session._chunk_conn)
+            attach_snapshot = recorder.attach_session(record_duration=record_duration)
+            session.attach_to_recorder(
+                chunk_index=attach_snapshot.chunk_index,
+                snapshot=attach_snapshot,
+            )
+            recorder.recording_done.connect(session._done_lambda)
+            recorder.error_occurred.connect(session._error_lambda)
+
+            self._sessions[config_id] = session
+            self._recorders[config_id] = recorder
+
+            output_name = config.get("output_device_name")
+            if output_name:
+                output_sr = float(config.get("output_device_samplerate", sample_rate))
+                monitor = AudioMonitor(
+                    device_name=config.get("output_device_name", ""),
+                    hostapi=config.get("output_device_hostapi", ""),
+                    sample_rate=output_sr,
+                    monitor_channel=config.get("selected_channels", [0])[0],
+                )
+                session._monitor_lambda = lambda data, idx, m=monitor: m.feed(data)
+                session._monitor_error_lambda = lambda msg, cid=config_id: self._on_error(cid, msg)
+                recorder.chunk_ready.connect(session._monitor_lambda)
+                monitor.error_occurred.connect(session._monitor_error_lambda)
+                self._monitors[config_id] = monitor
+
             if mon := self._monitors.get(config_id):
                 mon.start()
-        except Exception as exc:
-            self._bus.log.emit(f"[TestManager] ERROR starting config {config_id}: {exc}")
-            self._stop_one(config_id, silent=True)
-            self._clear_pending_factory_start(request_id)
-            return False
 
-        if self._factory_start_canceled(request_id):
-            self._stop_one(config_id, silent=True)
-            self._clear_pending_factory_start(request_id)
-            return False
-
-        if callable(on_start_accepted):
-            try:
-                on_start_accepted(session_workorder["factory_run_id"])
-            except Exception as exc:
-                self._bus.log.emit(
-                    f"[TestManager] ERROR accepting start for config {config_id}: {exc}"
-                )
-                self._stop_one(config_id, silent=True)
+            if self._factory_start_canceled(request_id):
+                self._cleanup_failed_start_setup(config_id, session, recorder, monitor)
                 self._clear_pending_factory_start(request_id)
                 return False
+
+            if callable(on_start_accepted):
+                on_start_accepted(session_workorder["factory_run_id"])
+        except Exception as exc:
+            self._bus.log.emit(f"[TestManager] ERROR starting config {config_id}: {exc}")
+            self._cleanup_failed_start_setup(config_id, session, recorder, monitor)
+            return self._fail_start_before_acceptance(
+                request_id,
+                f"启动失败：{exc}",
+            )
 
         if self._factory_start_canceled(request_id):
             self._stop_one(config_id, silent=True)
@@ -209,9 +246,11 @@ class TestManager(QObject):
             if prior_completed_session is not None and config_id not in self._completed_sessions:
                 self._completed_sessions[config_id] = prior_completed_session
             self._clear_pending_factory_start(request_id)
+            self._clear_last_start_error()
             return True
 
         self._clear_pending_factory_start(request_id)
+        self._clear_last_start_error()
         self._bus.test_started.emit(config_id)
         self._bus.status.emit("Recording...")
         self._bus.log.emit(
@@ -378,12 +417,124 @@ class TestManager(QObject):
                 self._bus.log.emit(f"[TestManager] stopped config={config_id}")
                 self._bus.status.emit("Stopped")
 
+    def _cleanup_failed_start_setup(
+        self,
+        config_id: int,
+        session=None,
+        recorder=None,
+        monitor=None,
+    ) -> None:
+        registered_session = self._sessions.pop(config_id, None)
+        registered_recorder = self._recorders.pop(config_id, None)
+        registered_monitor = self._monitors.pop(config_id, None)
+
+        cleanup_session = registered_session or session
+        cleanup_recorder = registered_recorder or recorder
+        cleanup_monitor = registered_monitor or monitor
+
+        if cleanup_session is not None and cleanup_recorder is not None:
+            try:
+                self._disconnect_session_signals(
+                    cleanup_session,
+                    cleanup_recorder,
+                    cleanup_monitor,
+                )
+            except Exception as exc:
+                self._bus.log.emit(
+                    f"[TestManager] ERROR cleaning failed start signals for "
+                    f"config={config_id}: {exc}"
+                )
+
+        if cleanup_monitor is not None:
+            try:
+                cleanup_monitor.stop()
+                cleanup_monitor.wait(1000)
+            except Exception as exc:
+                self._bus.log.emit(
+                    f"[TestManager] ERROR cleaning failed start monitor for "
+                    f"config={config_id}: {exc}"
+                )
+
+        if cleanup_recorder is not None:
+            try:
+                self._stop_recorder_if_unused(cleanup_recorder)
+            except Exception as exc:
+                self._bus.log.emit(
+                    f"[TestManager] ERROR cleaning failed start recorder for "
+                    f"config={config_id}: {exc}"
+                )
+                self._discard_shared_recorder(cleanup_recorder)
+
     @staticmethod
     def _get_factory_start_request_id(workorder: dict) -> str | None:
         request_id = workorder.get("factory_start_request_id")
         if not request_id:
             return None
         return str(request_id)
+
+    def _clear_last_start_error(self) -> None:
+        self._last_start_error = None
+
+    def _fail_start_before_acceptance(self, request_id: str | None, message: str) -> bool:
+        self._last_start_error = message
+        self._clear_pending_factory_start(request_id)
+        return False
+
+    @classmethod
+    def _config_input_device_fields_missing(cls, config: dict) -> bool:
+        if not isinstance(config, dict):
+            return True
+        if not cls._non_empty_text(config.get("input_device_name")):
+            return True
+        if not cls._non_empty_text(config.get("input_device_hostapi")):
+            return True
+        return not cls._positive_float(config.get("input_device_samplerate"))
+
+    @classmethod
+    def _saved_input_hardware_error(cls, device_info) -> str | None:
+        missing_message = "未配置输入硬件，请先在「硬件」页面保存输入设备。"
+        invalid_message = "输入硬件配置无效，请重新保存硬件设备。"
+        if not isinstance(device_info, dict) or not device_info:
+            return missing_message
+        if "input" not in device_info:
+            return missing_message
+        input_info = device_info.get("input")
+        if not isinstance(input_info, dict):
+            return missing_message
+        if not cls._positive_float(input_info.get("samplerate")):
+            return invalid_message
+        if cls._positive_int_value(input_info.get("channel_count")) is None:
+            return invalid_message
+        return None
+
+    @staticmethod
+    def _non_empty_text(value) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    @staticmethod
+    def _positive_float(value) -> bool:
+        if isinstance(value, bool):
+            return False
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return False
+        return bool(np.isfinite(numeric) and numeric > 0)
+
+    @staticmethod
+    def _positive_int_value(value) -> int | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(numeric):
+            return None
+        integer = int(numeric)
+        if integer <= 0 or numeric != integer:
+            return None
+        return integer
 
     def _factory_start_canceled(self, request_id: str | None) -> bool:
         return bool(request_id) and request_id in self._canceled_factory_start_requests
@@ -398,6 +549,43 @@ class TestManager(QObject):
         if config_id is not None:
             return config_id in self._sessions
         return len(self._sessions) > 0
+
+    def apply_manual_judgment(
+        self,
+        *,
+        config_id: int,
+        run_id: str | None,
+        label: str,
+    ) -> ManualLabelUpdateResult:
+        if config_id in self._sessions or config_id in self._analyzing_sessions:
+            return ManualLabelUpdateResult(False, "测试仍在进行中，无法人工判定")
+
+        session = self._completed_sessions.get(config_id)
+        if session is None:
+            return ManualLabelUpdateResult(False, "当前没有可判定的测试结果")
+        if run_id:
+            session_run_id = self._factory_run_id(session)
+            if not session_run_id or session_run_id != run_id:
+                return ManualLabelUpdateResult(False, "当前测试结果已过期，请重新测试")
+        apply_manual_label = getattr(session, "apply_manual_label", None)
+        if not callable(apply_manual_label):
+            return ManualLabelUpdateResult(False, "当前测试不支持人工判定")
+
+        result = apply_manual_label(label)
+        if not getattr(result, "success", False):
+            message = str(getattr(result, "message", "") or "保存人工判定失败")
+            return ManualLabelUpdateResult(
+                False,
+                message,
+                getattr(result, "audio_data_id", None),
+            )
+
+        audio_data_id = getattr(result, "audio_data_id", None)
+        self._bus.log.emit(
+            f"[TestManager] manual judgment saved: config={config_id}, "
+            f"label={label}"
+        )
+        return ManualLabelUpdateResult(True, "", audio_data_id)
 
     def rejudge(self, config_id: int, start_sec: float, end_sec: float):
         """Re-run judgment on a user-selected window."""
@@ -972,7 +1160,13 @@ class TestManager(QObject):
     def _emit_factory_runtime_stopped(self, config_id: int, session) -> bool:
         self._analyzing_sessions.discard(config_id)
         self._accepted_factory_stops.discard(config_id)
-        self._sessions.pop(config_id, None)
+        completed_session = self._sessions.pop(config_id, None)
+        if (
+            completed_session is not None
+            and getattr(completed_session, "_audio_data_id", None)
+            and callable(getattr(completed_session, "apply_manual_label", None))
+        ):
+            self._completed_sessions[config_id] = completed_session
         stopped_payload = self._make_factory_runtime_stopped_payload(config_id, session)
         if stopped_payload is not None:
             self._emit_optional_signal(

@@ -3,6 +3,7 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.test_manager import TestManager
@@ -10,9 +11,17 @@ from app.service.analysis.test_manager import TestManager
 from ._support import (
     _DummySignal,
     _FakeSession,
+    _factory_runtime_config,
     _mock_bus,
     _mock_services,
 )
+
+
+def _start_config(**overrides):
+    config = _factory_runtime_config()
+    config["output_device_name"] = None
+    config.update(overrides)
+    return config
 
 
 class TestTestManagerStartStop:
@@ -49,6 +58,203 @@ class TestTestManagerStartStop:
             assert mgr.is_running(config_id=1) is True
             bus.test_started.emit.assert_called_with(1)
             mgr.stop(config_id=1)
+
+    def test_start_missing_workorder_config_id_sets_visible_start_error(self):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            services.config_service.list_configs.return_value = []
+            mgr = TestManager(bus, services)
+
+            accepted = mgr.start({})
+
+            assert accepted is False
+            assert mgr.last_start_error() == "无法解析启动配置，请重新选择配置。"
+            bus.test_started.emit.assert_not_called()
+
+    def test_start_config_load_failure_sets_visible_start_error(self):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            services.config_service.load_config.side_effect = RuntimeError(
+                "config db unavailable"
+            )
+            mgr = TestManager(bus, services)
+
+            accepted = mgr.start({"config_id": 1})
+
+            assert accepted is False
+            assert mgr.last_start_error() == "配置加载失败：config db unavailable"
+            bus.test_started.emit.assert_not_called()
+
+    def test_start_missing_saved_input_hardware_sets_visible_start_error(self):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            services.config_service.load_config.return_value = _start_config()
+            services.hss_service.load_io_devices.return_value = {}
+            mgr = TestManager(bus, services)
+            accepted_callbacks = []
+
+            accepted = mgr.start({"config_id": 1}, on_start_accepted=accepted_callbacks.append)
+
+            assert accepted is False
+            assert accepted_callbacks == []
+            assert mgr.last_start_error() == "未配置输入硬件，请先在「硬件」页面保存输入设备。"
+            bus.test_started.emit.assert_not_called()
+
+    def test_start_hardware_load_failure_sets_visible_start_error(self):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            services.config_service.load_config.return_value = _start_config()
+            services.hss_service.load_io_devices.side_effect = RuntimeError(
+                "device db unavailable"
+            )
+            mgr = TestManager(bus, services)
+
+            accepted = mgr.start({"config_id": 1})
+
+            assert accepted is False
+            assert mgr.last_start_error() == "读取硬件配置失败：device db unavailable"
+            bus.test_started.emit.assert_not_called()
+
+    @pytest.mark.parametrize(
+            "input_payload",
+            [
+                {"name": "Mic", "type": "MME", "samplerate": "0", "channel_count": "1"},
+                {"name": "Mic", "type": "MME", "samplerate": "44100", "channel_count": "0"},
+                {"name": "Mic", "type": "MME", "samplerate": "44100", "channel_count": "abc"},
+                {"name": "Mic", "type": "MME", "samplerate": "44100", "channel_count": "inf"},
+            ],
+        )
+    def test_start_invalid_saved_input_hardware_sets_visible_start_error(
+            self,
+            input_payload,
+        ):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            services.config_service.load_config.return_value = _start_config()
+            services.hss_service.load_io_devices.return_value = {
+                "input": input_payload,
+                "mic_cal": {},
+            }
+            mgr = TestManager(bus, services)
+
+            assert mgr.start({"config_id": 1}) is False
+            assert mgr.last_start_error() == "输入硬件配置无效，请重新保存硬件设备。"
+            bus.test_started.emit.assert_not_called()
+
+    def test_start_normalizes_integral_numeric_saved_input_channel_count_and_cleans_pending_start(
+            self,
+            monkeypatch,
+        ):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            services.config_service.load_config.return_value = _start_config()
+            services.hss_service.load_io_devices.return_value = {
+                "input": {
+                    "name": "Mic",
+                    "type": "MME",
+                    "samplerate": "44100",
+                    "channel_count": "1.0",
+                },
+                "mic_cal": {},
+            }
+
+            class FakeRecorder:
+                instances = []
+
+                def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+                    self._sample_rate = sample_rate
+                    self._n_channels = n_channels
+                    self._record_duration = record_duration
+                    self._buffer = np.zeros(
+                        (int(sample_rate * record_duration), n_channels),
+                        dtype=np.float32,
+                    )
+                    self.chunk_ready = _DummySignal()
+                    self.recording_done = _DummySignal()
+                    self.error_occurred = _DummySignal()
+                    self._running = False
+                    FakeRecorder.instances.append(self)
+
+                def isRunning(self):
+                    return self._running
+
+                def start(self):
+                    self._running = True
+
+                def stop(self):
+                    self._running = False
+
+                def wait(self, timeout):
+                    return True
+
+                def attach_session(self, *, record_duration):
+                    return MagicMock(chunk_index=0, sample_index=0)
+
+                def get_buffer_from(self, snapshot):
+                    return self._buffer
+
+            monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
+            monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
+
+            mgr = TestManager(bus, services)
+            request_id = "req-normalized-channel-count"
+
+            accepted = mgr.start(
+                {
+                    "config_id": 1,
+                    "sn": "SN1",
+                    "factory_start_request_id": request_id,
+                },
+            )
+
+            assert accepted is True
+            assert FakeRecorder.instances[0]._n_channels == 1
+            assert mgr.last_start_error() is None
+            assert mgr._pending_factory_starts == {}
+            bus.test_started.emit.assert_called_once_with(1)
+            mgr.stop(config_id=1)
+
+    @pytest.mark.parametrize(
+            ("field", "value"),
+            [
+                ("input_device_name", ""),
+                ("input_device_hostapi", " "),
+                ("input_device_samplerate", "0"),
+                ("input_device_samplerate", "abc"),
+            ],
+        )
+    def test_start_missing_config_input_device_fields_sets_visible_start_error(
+            self,
+            field,
+            value,
+        ):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            config = _start_config()
+            config[field] = value
+            services.config_service.load_config.return_value = config
+            mgr = TestManager(bus, services)
+
+            assert mgr.start({"config_id": 1}) is False
+            assert mgr.last_start_error() == "配置未选择输入设备，请先在「配置」页面选择输入设备并保存。"
+            bus.test_started.emit.assert_not_called()
+
+    def test_start_absent_config_input_device_fields_sets_visible_start_error(self):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            config = _start_config()
+            for field in (
+                "input_device_name",
+                "input_device_hostapi",
+                "input_device_samplerate",
+            ):
+                config.pop(field, None)
+            services.config_service.load_config.return_value = config
+            mgr = TestManager(bus, services)
+
+            assert mgr.start({"config_id": 1}) is False
+            assert mgr.last_start_error() == "配置未选择输入设备，请先在「配置」页面选择输入设备并保存。"
+            bus.test_started.emit.assert_not_called()
 
     def test_start_monitor_failure_before_acceptance_preserves_completed_session_and_cleans_up(
             self,
@@ -164,6 +370,7 @@ class TestTestManagerStartStop:
                 accepted = exc
 
             assert accepted is False
+            assert mgr.last_start_error() == "启动失败：monitor boom"
             assert accepted_run_ids == []
             assert mgr._completed_sessions[1] is prior_session
             assert mgr.is_running(config_id=1) is False
@@ -173,6 +380,78 @@ class TestTestManagerStartStop:
             assert FakeMonitor.instances[0].stop_calls == 1
             bus.factory_runtime_aborted.emit.assert_not_called()
             bus.test_started.emit.assert_not_called()
+
+    def test_start_output_sample_rate_setup_failure_before_acceptance_cleans_partial_runtime(
+            self,
+            monkeypatch,
+        ):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            services.config_service.load_config.return_value = _start_config(
+                output_device_name="Speaker",
+                output_device_hostapi="MME",
+                output_device_samplerate="bad",
+            )
+
+            class FakeRecorder:
+                instances = []
+
+                def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+                    self._sample_rate = sample_rate
+                    self._n_channels = n_channels
+                    self._record_duration = record_duration
+                    self._buffer = np.zeros(
+                        (int(sample_rate * record_duration), n_channels),
+                        dtype=np.float32,
+                    )
+                    self.chunk_ready = _DummySignal()
+                    self.recording_done = _DummySignal()
+                    self.error_occurred = _DummySignal()
+                    self._running = False
+                    self.stop_calls = 0
+                    FakeRecorder.instances.append(self)
+
+                def isRunning(self):
+                    return self._running
+
+                def start(self):
+                    raise AssertionError("recorder should not start before acceptance")
+
+                def stop(self):
+                    self.stop_calls += 1
+                    self._running = False
+
+                def wait(self, timeout):
+                    return True
+
+                def attach_session(self, *, record_duration):
+                    return MagicMock(chunk_index=0, sample_index=0)
+
+                def get_buffer_from(self, snapshot):
+                    return self._buffer
+
+            monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
+            monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
+
+            mgr = TestManager(bus, services)
+            accepted_run_ids: list[str] = []
+
+            accepted = mgr.start(
+                {"config_id": 1, "sn": "SN1"},
+                on_start_accepted=accepted_run_ids.append,
+            )
+
+            assert accepted is False
+            assert mgr.last_start_error().startswith("启动失败：")
+            assert "bad" in mgr.last_start_error()
+            assert accepted_run_ids == []
+            bus.test_started.emit.assert_not_called()
+            bus.factory_runtime_aborted.emit.assert_not_called()
+            assert mgr.is_running(config_id=1) is False
+            assert mgr._recorders == {}
+            assert mgr._monitors == {}
+            assert mgr._shared_recorders == {}
+            assert FakeRecorder.instances[0].stop_calls == 1
 
     def test_start_calls_on_start_accepted_with_factory_run_id_before_recorder_start_and_before_test_started(
             self,
@@ -296,6 +575,67 @@ class TestTestManagerStartStop:
             assert 1 not in mgr._completed_sessions
             assert FakeRecorder.instances[0]._running is True
 
+    def test_start_on_start_accepted_exception_sets_visible_start_error(
+            self,
+            monkeypatch,
+        ):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            services.config_service.load_config.return_value = _start_config()
+
+            class FakeRecorder:
+                instances = []
+
+                def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+                    self._sample_rate = sample_rate
+                    self._n_channels = n_channels
+                    self._record_duration = record_duration
+                    self._buffer = np.zeros(
+                        (int(sample_rate * record_duration), n_channels),
+                        dtype=np.float32,
+                    )
+                    self.chunk_ready = _DummySignal()
+                    self.recording_done = _DummySignal()
+                    self.error_occurred = _DummySignal()
+                    self._running = False
+                    FakeRecorder.instances.append(self)
+
+                def isRunning(self):
+                    return self._running
+
+                def start(self):
+                    self._running = True
+
+                def stop(self):
+                    self._running = False
+
+                def wait(self, timeout):
+                    return True
+
+                def attach_session(self, *, record_duration):
+                    return MagicMock(chunk_index=0, sample_index=0)
+
+                def get_buffer_from(self, snapshot):
+                    return self._buffer
+
+            monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
+            monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
+
+            mgr = TestManager(bus, services)
+
+            def on_start_accepted(_run_id):
+                raise RuntimeError("accept failed")
+
+            accepted = mgr.start(
+                {"config_id": 1, "sn": "SN1"},
+                on_start_accepted=on_start_accepted,
+            )
+
+            assert accepted is False
+            assert mgr.last_start_error() == "启动失败：accept failed"
+            assert mgr.is_running(config_id=1) is False
+            bus.test_started.emit.assert_not_called()
+
     def test_start_can_be_canceled_by_request_id_after_backend_session_exists_but_before_recorder_start(
             self,
             monkeypatch,
@@ -399,6 +739,7 @@ class TestTestManagerStartStop:
             )
 
             assert accepted is False
+            assert mgr.last_start_error() is None
             assert events == ["accepted"]
             assert mgr.is_running(config_id=1) is False
             assert 1 not in mgr._recorders
@@ -508,6 +849,7 @@ class TestTestManagerStartStop:
             )
 
             assert accepted is False
+            assert mgr.last_start_error() is None
             assert accepted_snapshots == [
                 {
                     "completed_session": prior_session,
