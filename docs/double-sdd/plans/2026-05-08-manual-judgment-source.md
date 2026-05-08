@@ -78,6 +78,9 @@ Spec: `docs/double-sdd/specs/2026-05-08-manual-judgment-source-design.md`
   - The live camera preview is not per-unit result imagery.
   - Manual judgment reset must not clear, stop, start, refresh, or otherwise disturb `VideoModule`.
 
+- Create `tests/test_video_module.py`.
+  - Cover the inverse regression: with a fake `CameraThread` and local `ui.modules.video.cv2` patch, manual judgment display reset preserves a populated preview and the original camera thread without stop/restart/refresh.
+
 ## Task 1: Data Model And Data Management Source Display
 
 **Files:**
@@ -1145,8 +1148,9 @@ git commit -m "feat(factory-ui): apply manual judgment buttons"
 **Files:**
 - Modify: `ui/modules/workorder.py`
 - Modify: `tests/test_workorder_module.py`
+- Create: `tests/test_video_module.py`
 
-`VideoModule` is intentionally excluded from this task. The live camera preview is not per-unit test result imagery, so manual judgment reset must not clear, stop, start, refresh, or otherwise disturb it.
+`VideoModule` production behavior is intentionally excluded from this task. The live camera preview is not per-unit test result imagery, so manual judgment reset must not clear, stop, start, refresh, or otherwise disturb it. Add inverse regression coverage in `tests/test_video_module.py` to prove that invariant.
 
 - [ ] **Step 1: Write failing workorder tests**
 
@@ -1231,10 +1235,26 @@ pytest tests/test_workorder_module.py -q
 
 Expected: PASS.
 
+- [ ] **Step 4a: Write video non-reset regression test**
+
+Create `tests/test_video_module.py` with a fake `CameraThread`, a local `ui.modules.video.cv2` monkeypatch, and a bus exposing `factory_display_reset` and `log`. Instantiate `VideoModule`, render a frame with `module.update_frame(frame)`, then emit both `manual_judgment_ok` and `manual_judgment_ng`.
+
+Assert the preview remains populated, text is not changed to `暂无画面`, `module.camera_thread` is the same object, the fake thread was not stopped, and no second fake thread was created or started.
+
+- [ ] **Step 4b: Run video regression test**
+
+Run:
+
+```bash
+pytest tests/test_video_module.py -q
+```
+
+Expected: PASS. The same test should fail against the old reset-clearing implementation.
+
 - [ ] **Step 5: Commit**
 
 ```bash
-git add ui/modules/workorder.py tests/test_workorder_module.py
+git add ui/modules/workorder.py tests/test_workorder_module.py tests/test_video_module.py
 git commit -m "feat(factory-ui): clear per-unit state after manual judgment"
 ```
 
@@ -1249,7 +1269,7 @@ git commit -m "feat(factory-ui): clear per-unit state after manual judgment"
 Run:
 
 ```bash
-pytest tests/test_audio_data_service.py tests/test_data_management_module.py tests/test_test_session.py tests/test_test_manager/test_manual_judgment.py tests/test_factory_mode_controller/test_manual_judgment.py tests/test_control_module.py tests/test_workorder_module.py -q
+pytest tests/test_audio_data_service.py tests/test_data_management_module.py tests/test_test_session.py tests/test_test_manager/test_manual_judgment.py tests/test_factory_mode_controller/test_manual_judgment.py tests/test_control_module.py tests/test_workorder_module.py tests/test_video_module.py -q
 ```
 
 Expected: PASS.

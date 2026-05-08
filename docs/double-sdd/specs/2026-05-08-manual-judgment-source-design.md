@@ -245,7 +245,7 @@ Add focused tests for:
 5. Manual judgment can update a partial saved row after early stop.
 6. Manual judgment is rejected with visible feedback when there is no saved row/current session.
 7. Manual judgment is rejected in busy phases and does not clear display.
-8. Successful manual judgment clears SN, clears analysis/result/chart/STFT display, returns to ready/not-ready through existing reset signals, and leaves the live camera preview untouched.
+8. Successful manual judgment clears SN, clears analysis/result/chart/STFT display, returns to ready/not-ready through existing reset signals, and leaves the live camera preview untouched. Cover this with a `tests/test_video_module.py` regression that proves manual judgment display reset does not clear, stop, start, refresh, or otherwise disturb `VideoModule`.
 9. Data management displays `label_source` as `判定来源`, mapping `auto` to `自动`, `manual` to `人工`, blank to blank.
 
 ## Verification
@@ -254,6 +254,7 @@ Targeted commands:
 
 - `pytest tests/test_control_module.py`
 - `pytest tests/test_workorder_module.py`
+- `pytest tests/test_video_module.py`
 - `pytest tests/test_test_manager tests/test_test_session.py`
 - `pytest tests/test_data_management_module.py tests/test_audio_data_service.py`
 
