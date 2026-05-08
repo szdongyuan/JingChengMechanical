@@ -50,6 +50,31 @@ def test_apply_manual_judgment_allows_saved_no_result_session():
     session.apply_manual_label.assert_called_once_with("NG")
 
 
+def test_apply_manual_judgment_rejects_active_recording_session():
+    mgr, _bus = _make_manager()
+    session = _SessionStub(result=_ManualResult(True), audio_data_id="audio-1")
+    mgr._sessions[101] = session
+
+    result = mgr.apply_manual_judgment(config_id=101, run_id="run-1", label="OK")
+
+    assert result.success is False
+    assert "测试仍在进行中" in result.message
+    session.apply_manual_label.assert_not_called()
+
+
+def test_apply_manual_judgment_rejects_active_analyzing_session():
+    mgr, _bus = _make_manager()
+    session = _SessionStub(result=_ManualResult(True), audio_data_id="audio-1")
+    mgr._completed_sessions[101] = session
+    mgr._analyzing_sessions.add(101)
+
+    result = mgr.apply_manual_judgment(config_id=101, run_id="run-1", label="NG")
+
+    assert result.success is False
+    assert "测试仍在进行中" in result.message
+    session.apply_manual_label.assert_not_called()
+
+
 def test_apply_manual_judgment_rejects_missing_session():
     mgr, _bus = _make_manager()
 

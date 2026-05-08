@@ -557,7 +557,10 @@ class TestManager(QObject):
         run_id: str | None,
         label: str,
     ) -> ManualLabelUpdateResult:
-        session = self._sessions.get(config_id) or self._completed_sessions.get(config_id)
+        if config_id in self._sessions or config_id in self._analyzing_sessions:
+            return ManualLabelUpdateResult(False, "测试仍在进行中，无法人工判定")
+
+        session = self._completed_sessions.get(config_id)
         if session is None:
             return ManualLabelUpdateResult(False, "当前没有可判定的测试结果")
         if run_id:
