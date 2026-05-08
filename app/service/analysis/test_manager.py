@@ -16,7 +16,7 @@ from app.service.analysis import dsp
 from app.service.analysis.audio_monitor import AudioMonitor
 from app.service.analysis.audio_recorder import AudioRecorder
 from app.service.analysis.review_payloads import build_chart_payload, build_summary_payload
-from app.service.analysis.test_session import TestSession
+from app.service.analysis.test_session import ManualLabelUpdateResult, TestSession
 from consts.running_consts import base_dir
 
 
@@ -549,6 +549,40 @@ class TestManager(QObject):
         if config_id is not None:
             return config_id in self._sessions
         return len(self._sessions) > 0
+
+    def apply_manual_judgment(
+        self,
+        *,
+        config_id: int,
+        run_id: str | None,
+        label: str,
+    ) -> ManualLabelUpdateResult:
+        session = self._sessions.get(config_id) or self._completed_sessions.get(config_id)
+        if session is None:
+            return ManualLabelUpdateResult(False, "当前没有可判定的测试结果")
+        if run_id:
+            session_run_id = self._factory_run_id(session)
+            if not session_run_id or session_run_id != run_id:
+                return ManualLabelUpdateResult(False, "当前测试结果已过期，请重新测试")
+        apply_manual_label = getattr(session, "apply_manual_label", None)
+        if not callable(apply_manual_label):
+            return ManualLabelUpdateResult(False, "当前测试不支持人工判定")
+
+        result = apply_manual_label(label)
+        if not getattr(result, "success", False):
+            message = str(getattr(result, "message", "") or "保存人工判定失败")
+            return ManualLabelUpdateResult(
+                False,
+                message,
+                getattr(result, "audio_data_id", None),
+            )
+
+        audio_data_id = getattr(result, "audio_data_id", None)
+        self._bus.log.emit(
+            f"[TestManager] manual judgment saved: config={config_id}, "
+            f"label={label}"
+        )
+        return ManualLabelUpdateResult(True, "", audio_data_id)
 
     def rejudge(self, config_id: int, start_sec: float, end_sec: float):
         """Re-run judgment on a user-selected window."""
@@ -1123,7 +1157,13 @@ class TestManager(QObject):
     def _emit_factory_runtime_stopped(self, config_id: int, session) -> bool:
         self._analyzing_sessions.discard(config_id)
         self._accepted_factory_stops.discard(config_id)
-        self._sessions.pop(config_id, None)
+        completed_session = self._sessions.pop(config_id, None)
+        if (
+            completed_session is not None
+            and getattr(completed_session, "_audio_data_id", None)
+            and callable(getattr(completed_session, "apply_manual_label", None))
+        ):
+            self._completed_sessions[config_id] = completed_session
         stopped_payload = self._make_factory_runtime_stopped_payload(config_id, session)
         if stopped_payload is not None:
             self._emit_optional_signal(
