@@ -35,6 +35,7 @@ class _BusStub:
         self.config_changed = _SignalStub()
         self.factory_state_changed = _SignalStub()
         self.factory_selection_notice = _SignalStub()
+        self.factory_display_reset = _SignalStub()
         self.current_workorder_payload = {}
 
 
@@ -496,6 +497,35 @@ def test_workorder_restore_keeps_sn_and_model_empty(qapp):
     }
     assert module.ed_sn.text() == ""
     assert module.ed_model.text() == ""
+
+
+@pytest.mark.parametrize("reason", ["manual_judgment_ok", "manual_judgment_ng"])
+def test_manual_judgment_reset_clears_sn_and_publishes_blank_payload(qapp, reason):
+    module, services = _make_module(saved_selected_ids=(101,))
+    module.ed_sn.setText("SN-OLD")
+    module.ed_model.setText("MODEL-KEEP")
+    services.bus.workorder_changed.emissions.clear()
+
+    services.bus.factory_display_reset.emit(reason)
+
+    assert module.ed_sn.text() == ""
+    assert module.ed_model.text() == "MODEL-KEEP"
+    assert module.value()["selected_config_ids"] == (101,)
+    assert services.bus.current_workorder_payload == {
+        "sn": "",
+        "model": "MODEL-KEEP",
+        "selected_config_ids": (101,),
+    }
+    assert services.bus.workorder_changed.emissions[-1][0][0]["sn"] == ""
+
+
+def test_non_manual_display_reset_preserves_sn(qapp):
+    module, services = _make_module(saved_selected_ids=(101,))
+    module.ed_sn.setText("SN-KEEP")
+
+    services.bus.factory_display_reset.emit("selection_changed")
+
+    assert module.ed_sn.text() == "SN-KEEP"
 
 
 @pytest.mark.parametrize(

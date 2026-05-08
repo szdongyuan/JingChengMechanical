@@ -165,6 +165,9 @@ def _make_config(
         "record_duration": 5.0,
         "analysis_duration": 2.0,
         "analysis_window_offset_ms": 0,
+        "input_device_name": "Mic",
+        "input_device_hostapi": "MME",
+        "input_device_samplerate": 100,
         "plc_id": plc_id,
         "scan_triggers_test": scan_triggers_test,
     }

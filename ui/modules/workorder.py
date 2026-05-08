@@ -76,6 +76,8 @@ class WorkOrderModule(QWidget):
             self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
         if hasattr(self.services.bus, "factory_selection_notice"):
             self.services.bus.factory_selection_notice.connect(self._on_factory_selection_notice)
+        if hasattr(self.services.bus, "factory_display_reset"):
+            self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
 
         self._reload_config_options()
         self._restore_startup_selection()
@@ -111,6 +113,15 @@ class WorkOrderModule(QWidget):
     def _on_factory_state_changed(self, state) -> None:
         if isinstance(state, FactoryControllerState):
             self._sync_factory_state(state)
+
+    def _on_factory_display_reset(self, reason: str) -> None:
+        if reason not in {"manual_judgment_ok", "manual_judgment_ng"}:
+            return
+        if self.ed_sn.text() == "":
+            self._publish_workorder(force=True)
+            return
+        self.ed_sn.clear()
+        self._publish_workorder(force=True)
 
     def _sync_factory_state(
         self,

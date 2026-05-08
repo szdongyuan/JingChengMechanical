@@ -235,6 +235,52 @@ def test_blocked_plc_and_scan_start_emit_factory_start_blocked_while_idle():
     assert [payload.trigger_source for payload in blocked_payloads] == ["plc", "scan"]
 
 
+@pytest.mark.parametrize(
+    ("trigger_kind", "expected_config_id"),
+    [
+        ("plc", 202),
+        ("scan", 202),
+    ],
+)
+def test_external_trigger_backend_start_failure_emits_factory_start_blocked_reason(
+    trigger_kind,
+    expected_config_id,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    blocked_payloads: list[object] = []
+    bus.factory_start_blocked.connect(blocked_payloads.append)
+    services = _make_services(
+        (
+            _make_config(101, plc_id=11, scan_triggers_test=False),
+            _make_config(202, plc_id=22, scan_triggers_test=True),
+        )
+    )
+    services.test.start.return_value = False
+    services.test.last_start_error.return_value = "输入硬件配置无效，请重新保存硬件设备。"
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+
+    if trigger_kind == "plc":
+        accepted = controller.handle_plc_event(
+            services_mod.FactoryPlcIngressPayload(plc_id=22)
+        )
+    else:
+        accepted = controller.handle_scan_event(
+            services_mod.FactoryScanIngressPayload(scan_text="SN-1")
+        )
+
+    assert accepted is False
+    _assert_start_called_with(
+        services,
+        {"config_id": expected_config_id},
+        expected_trigger_source=trigger_kind,
+    )
+    assert len(blocked_payloads) == 1
+    assert blocked_payloads[0].reason == "输入硬件配置无效，请重新保存硬件设备。"
+    assert blocked_payloads[0].trigger_source == trigger_kind
+
+
 def test_busy_external_triggers_do_not_emit_factory_start_blocked():
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()

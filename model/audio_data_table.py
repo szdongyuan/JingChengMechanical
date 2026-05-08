@@ -16,6 +16,7 @@ class AudioDataTable(BaseModel):
     sample_rate = IntegerField() # 采样率
     record_date = TextField() # 创建时间
     labels = TextField(null=True) # 标签结果
+    label_source = TextField(null=True) # 判定来源：auto/manual
     barcode = TextField(null=True) # SN码
     analyse_config = TextField(null=True) # 分析配置
     config_content = TextField(null=True) # 配置快照
