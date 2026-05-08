@@ -141,6 +141,79 @@ class TestTestManagerStartStop:
             assert mgr.last_start_error() == "输入硬件配置无效，请重新保存硬件设备。"
             bus.test_started.emit.assert_not_called()
 
+    def test_start_normalizes_integral_numeric_saved_input_channel_count_and_cleans_pending_start(
+            self,
+            monkeypatch,
+        ):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            services.config_service.load_config.return_value = _start_config()
+            services.hss_service.load_io_devices.return_value = {
+                "input": {
+                    "name": "Mic",
+                    "type": "MME",
+                    "samplerate": "44100",
+                    "channel_count": "1.0",
+                },
+                "mic_cal": {},
+            }
+
+            class FakeRecorder:
+                instances = []
+
+                def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+                    self._sample_rate = sample_rate
+                    self._n_channels = n_channels
+                    self._record_duration = record_duration
+                    self._buffer = np.zeros(
+                        (int(sample_rate * record_duration), n_channels),
+                        dtype=np.float32,
+                    )
+                    self.chunk_ready = _DummySignal()
+                    self.recording_done = _DummySignal()
+                    self.error_occurred = _DummySignal()
+                    self._running = False
+                    FakeRecorder.instances.append(self)
+
+                def isRunning(self):
+                    return self._running
+
+                def start(self):
+                    self._running = True
+
+                def stop(self):
+                    self._running = False
+
+                def wait(self, timeout):
+                    return True
+
+                def attach_session(self, *, record_duration):
+                    return MagicMock(chunk_index=0, sample_index=0)
+
+                def get_buffer_from(self, snapshot):
+                    return self._buffer
+
+            monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
+            monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
+
+            mgr = TestManager(bus, services)
+            request_id = "req-normalized-channel-count"
+
+            accepted = mgr.start(
+                {
+                    "config_id": 1,
+                    "sn": "SN1",
+                    "factory_start_request_id": request_id,
+                },
+            )
+
+            assert accepted is True
+            assert FakeRecorder.instances[0]._n_channels == 1
+            assert mgr.last_start_error() is None
+            assert mgr._pending_factory_starts == {}
+            bus.test_started.emit.assert_called_once_with(1)
+            mgr.stop(config_id=1)
+
     @pytest.mark.parametrize(
             ("field", "value"),
             [

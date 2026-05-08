@@ -123,7 +123,12 @@ class TestManager(QObject):
                 f"from device {device_sr}, using device rate"
             )
         sample_rate = device_sr
-        n_channels = int(input_info.get("channel_count", 1))
+        n_channels = self._positive_int_value(input_info.get("channel_count"))
+        if n_channels is None:
+            return self._fail_start_before_acceptance(
+                request_id,
+                "输入硬件配置无效，请重新保存硬件设备。",
+            )
         record_duration = config.get("record_duration", 5.0)
         session_workorder = dict(workorder)
         session_workorder["factory_run_id"] = self._new_factory_run_id()
@@ -479,11 +484,6 @@ class TestManager(QObject):
     def _config_input_device_fields_missing(cls, config: dict) -> bool:
         if not isinstance(config, dict):
             return True
-        input_field_names = (
-            "input_device_name",
-            "input_device_hostapi",
-            "input_device_samplerate",
-        )
         if not cls._non_empty_text(config.get("input_device_name")):
             return True
         if not cls._non_empty_text(config.get("input_device_hostapi")):
@@ -503,7 +503,7 @@ class TestManager(QObject):
             return missing_message
         if not cls._positive_float(input_info.get("samplerate")):
             return invalid_message
-        if not cls._positive_int(input_info.get("channel_count")):
+        if cls._positive_int_value(input_info.get("channel_count")) is None:
             return invalid_message
         return None
 
@@ -522,17 +522,19 @@ class TestManager(QObject):
         return bool(np.isfinite(numeric) and numeric > 0)
 
     @staticmethod
-    def _positive_int(value) -> bool:
+    def _positive_int_value(value) -> int | None:
         if isinstance(value, bool):
-            return False
+            return None
         try:
             numeric = float(value)
         except (TypeError, ValueError):
-            return False
+            return None
         if not np.isfinite(numeric):
-            return False
+            return None
         integer = int(numeric)
-        return bool(integer > 0 and numeric == integer)
+        if integer <= 0 or numeric != integer:
+            return None
+        return integer
 
     def _factory_start_canceled(self, request_id: str | None) -> bool:
         return bool(request_id) and request_id in self._canceled_factory_start_requests
