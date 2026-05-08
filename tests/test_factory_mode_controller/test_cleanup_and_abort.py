@@ -6,7 +6,6 @@ from unittest.mock import MagicMock
 import numpy as np
 import pytest
 import app.services_container as services_mod
-from PyQt6.QtWidgets import QApplication
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.test_manager import TestManager
 from app.services_container import EventBus
@@ -24,14 +23,6 @@ from ._support import (
     _make_services,
     _run_id_for,
 )
-
-
-@pytest.fixture
-def qapp():
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication([])
-    return app
 
 
 def _make_stopped_payload(
@@ -352,7 +343,6 @@ def test_factory_mode_controller_real_manager_auto_completion_gates_start_readin
     ],
 )
 def test_factory_mode_controller_rechecks_start_readiness_after_cleanup_settled_signal(
-    qapp,
     signal_name,
     review_kwargs,
 ):
@@ -394,9 +384,6 @@ def test_factory_mode_controller_rechecks_start_readiness_after_cleanup_settled_
     assert controller.state.run_phase == "reviewing"
     assert controller.state.start_ready is False
     assert controller.state.start_ready_reason == "当前测试运行中"
-
-    for _ in range(5):
-        qapp.processEvents()
 
     assert controller.state.run_phase == "reviewing"
     assert controller.state.start_ready is False
