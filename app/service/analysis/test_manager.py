@@ -37,6 +37,7 @@ class TestManager(QObject):
         self._shared_recorders: dict[str, AudioRecorder] = {}
         self._pending_factory_starts: dict[str, int] = {}
         self._canceled_factory_start_requests: set[str] = set()
+        self._last_start_error: str | None = None
         self._analyzing_sessions: set[int] = set()
         self._accepted_factory_stops: set[int] = set()
         self._live_loudness_channel_by_config_id: dict[int, int] = {}
@@ -46,8 +47,13 @@ class TestManager(QObject):
         if callable(connect):
             connect(self._on_factory_display_channel_changed)
 
+    def last_start_error(self) -> str | None:
+        return self._last_start_error
+
     def start(self, workorder: dict, *, on_start_accepted=None) -> bool:
         """Start a test for the config_id in the workorder."""
+        self._clear_last_start_error()
+        request_id = self._get_factory_start_request_id(workorder)
         config_id = workorder.get("config_id")
         if config_id is None:
             config_name = workorder.get("config", "")
@@ -58,9 +64,11 @@ class TestManager(QObject):
                         break
         if config_id is None:
             self._bus.log.emit("[TestManager] ERROR: could not resolve config_id from workorder")
-            return False
+            return self._fail_start_before_acceptance(
+                request_id,
+                "无法解析启动配置，请重新选择配置。",
+            )
 
-        request_id = self._get_factory_start_request_id(workorder)
         if request_id is not None:
             self._pending_factory_starts[request_id] = config_id
 
@@ -72,15 +80,41 @@ class TestManager(QObject):
             config = self._services.config_service.load_config(config_id)
         except Exception as exc:
             self._bus.log.emit(f"[TestManager] ERROR loading config {config_id}: {exc}")
-            self._clear_pending_factory_start(request_id)
-            return False
+            return self._fail_start_before_acceptance(
+                request_id,
+                f"配置加载失败：{exc}",
+            )
 
-        device_info = self._services.hss_service.load_io_devices()
+        try:
+            device_info = self._services.hss_service.load_io_devices()
+        except Exception as exc:
+            self._bus.log.emit(f"[TestManager] ERROR loading input hardware: {exc}")
+            return self._fail_start_before_acceptance(
+                request_id,
+                f"读取硬件配置失败：{exc}",
+            )
+
+        hardware_error = self._saved_input_hardware_error(device_info)
+        if hardware_error is not None:
+            self._bus.log.emit(f"[TestManager] ERROR {hardware_error}")
+            return self._fail_start_before_acceptance(request_id, hardware_error)
+
+        if self._config_input_device_fields_missing(config):
+            self._bus.log.emit(
+                f"[TestManager] ERROR config {config_id} missing input device fields"
+            )
+            return self._fail_start_before_acceptance(
+                request_id,
+                "配置未选择输入设备，请先在「配置」页面选择输入设备并保存。",
+            )
+
         mic_cal = device_info.get("mic_cal", {})
+        if not isinstance(mic_cal, dict):
+            mic_cal = {}
         audio_dir = os.path.join(base_dir, "data", "audio")
 
         device_key = self._device_key(config)
-        input_info = device_info.get("input", {})
+        input_info = device_info["input"]
         config_sr = float(config.get("input_device_samplerate", 44100))
         device_sr = float(input_info.get("samplerate", config_sr))
         if config_sr != device_sr:
@@ -159,8 +193,10 @@ class TestManager(QObject):
         except Exception as exc:
             self._bus.log.emit(f"[TestManager] ERROR starting config {config_id}: {exc}")
             self._stop_one(config_id, silent=True)
-            self._clear_pending_factory_start(request_id)
-            return False
+            return self._fail_start_before_acceptance(
+                request_id,
+                f"启动失败：{exc}",
+            )
 
         if self._factory_start_canceled(request_id):
             self._stop_one(config_id, silent=True)
@@ -175,8 +211,10 @@ class TestManager(QObject):
                     f"[TestManager] ERROR accepting start for config {config_id}: {exc}"
                 )
                 self._stop_one(config_id, silent=True)
-                self._clear_pending_factory_start(request_id)
-                return False
+                return self._fail_start_before_acceptance(
+                    request_id,
+                    f"启动失败：{exc}",
+                )
 
         if self._factory_start_canceled(request_id):
             self._stop_one(config_id, silent=True)
@@ -209,9 +247,11 @@ class TestManager(QObject):
             if prior_completed_session is not None and config_id not in self._completed_sessions:
                 self._completed_sessions[config_id] = prior_completed_session
             self._clear_pending_factory_start(request_id)
+            self._clear_last_start_error()
             return True
 
         self._clear_pending_factory_start(request_id)
+        self._clear_last_start_error()
         self._bus.test_started.emit(config_id)
         self._bus.status.emit("Recording...")
         self._bus.log.emit(
@@ -384,6 +424,73 @@ class TestManager(QObject):
         if not request_id:
             return None
         return str(request_id)
+
+    def _clear_last_start_error(self) -> None:
+        self._last_start_error = None
+
+    def _fail_start_before_acceptance(self, request_id: str | None, message: str) -> bool:
+        self._last_start_error = message
+        self._clear_pending_factory_start(request_id)
+        return False
+
+    @classmethod
+    def _config_input_device_fields_missing(cls, config: dict) -> bool:
+        if not isinstance(config, dict):
+            return True
+        input_field_names = (
+            "input_device_name",
+            "input_device_hostapi",
+            "input_device_samplerate",
+        )
+        if not any(field_name in config for field_name in input_field_names):
+            return False
+        if not cls._non_empty_text(config.get("input_device_name")):
+            return True
+        if not cls._non_empty_text(config.get("input_device_hostapi")):
+            return True
+        return not cls._positive_float(config.get("input_device_samplerate"))
+
+    @classmethod
+    def _saved_input_hardware_error(cls, device_info) -> str | None:
+        missing_message = "未配置输入硬件，请先在「硬件」页面保存输入设备。"
+        invalid_message = "输入硬件配置无效，请重新保存硬件设备。"
+        if not isinstance(device_info, dict) or not device_info:
+            return missing_message
+        if "input" not in device_info:
+            return missing_message
+        input_info = device_info.get("input")
+        if not isinstance(input_info, dict):
+            return missing_message
+        if not cls._positive_float(input_info.get("samplerate")):
+            return invalid_message
+        if not cls._positive_int(input_info.get("channel_count")):
+            return invalid_message
+        return None
+
+    @staticmethod
+    def _non_empty_text(value) -> bool:
+        return isinstance(value, str) and bool(value.strip())
+
+    @staticmethod
+    def _positive_float(value) -> bool:
+        if isinstance(value, bool):
+            return False
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return False
+        return bool(np.isfinite(numeric) and numeric > 0)
+
+    @staticmethod
+    def _positive_int(value) -> bool:
+        if isinstance(value, bool):
+            return False
+        try:
+            numeric = float(value)
+            integer = int(numeric)
+        except (TypeError, ValueError):
+            return False
+        return bool(np.isfinite(numeric) and integer > 0 and numeric == integer)
 
     def _factory_start_canceled(self, request_id: str | None) -> bool:
         return bool(request_id) and request_id in self._canceled_factory_start_requests

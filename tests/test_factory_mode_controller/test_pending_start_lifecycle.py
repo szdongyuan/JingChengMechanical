@@ -1174,6 +1174,50 @@ def test_factory_mode_controller_failed_start_preserves_review_context():
     assert states == []
 
 
+def test_factory_mode_controller_failed_start_emits_backend_reason_and_preserves_review_context():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    blocked_payloads: list[object] = []
+    reset_reasons: list[str] = []
+    reviews: list[object] = []
+    states: list[object] = []
+    bus.factory_start_blocked.connect(blocked_payloads.append)
+    bus.factory_display_reset.connect(reset_reasons.append)
+    bus.factory_review_changed.connect(reviews.append)
+    bus.factory_state_changed.connect(states.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    services.test.start.return_value = False
+    services.test.last_start_error.return_value = "未配置输入硬件，请先在「硬件」页面保存输入设备。"
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+    original_review_payload = _enter_reviewing_state(
+        controller,
+        bus,
+        config_id=202,
+        trigger_source="plc",
+    )
+
+    blocked_payloads.clear()
+    reset_reasons.clear()
+    reviews.clear()
+    states.clear()
+
+    accepted = controller.start_manual({"sn": "SN-1"})
+
+    assert accepted is False
+    assert len(blocked_payloads) == 1
+    assert blocked_payloads[0].reason == "未配置输入硬件，请先在「硬件」页面保存输入设备。"
+    assert blocked_payloads[0].trigger_source == "manual"
+    assert controller.state.active_config_id is None
+    assert controller.state.displayed_config_id == 202
+    assert controller.state.run_phase == "reviewing"
+    assert controller.state.trigger_source == "plc"
+    assert controller.review_payload == original_review_payload
+    assert reset_reasons == []
+    assert reviews == []
+    assert states == []
+
+
 def test_factory_mode_controller_start_exception_preserves_review_context_and_clears_pending_start():
     controller_mod = _load_factory_mode_controller_module()
     bus = EventBus()
@@ -1216,3 +1260,115 @@ def test_factory_mode_controller_start_exception_preserves_review_context_and_cl
     assert reset_reasons == []
     assert reviews == []
     assert states == []
+
+
+def test_factory_mode_controller_start_exception_emits_blocked_reason_and_clears_pending_start():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    blocked_payloads: list[object] = []
+    bus.factory_start_blocked.connect(blocked_payloads.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    services.test.start.side_effect = RuntimeError("backend exploded")
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+
+    accepted = controller.start_manual({"sn": "SN-1"})
+
+    assert accepted is False
+    assert controller._pending_start is None
+    assert controller._pending_start_request_id is None
+    assert len(blocked_payloads) == 1
+    assert blocked_payloads[0].reason == "启动失败：backend exploded"
+    assert blocked_payloads[0].trigger_source == "manual"
+
+
+def test_factory_mode_controller_failed_start_after_start_acceptance_signal_error_emits_blocked_reason():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    blocked_payloads: list[object] = []
+    bus.factory_start_blocked.connect(blocked_payloads.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+
+    class FailingAcceptedSignal:
+        def connect(self, _callback):
+            return None
+
+        def emit(self, _payload):
+            raise RuntimeError("accept failed")
+
+    def _start(payload, *, on_start_accepted=None):
+        assert callable(on_start_accepted)
+        try:
+            on_start_accepted(_run_id_for(payload["config_id"]))
+        except RuntimeError as exc:
+            services.test.last_start_error.return_value = f"启动失败：{exc}"
+            return False
+        return True
+
+    bus.factory_runtime_start_accepted = FailingAcceptedSignal()
+    services.test.start.side_effect = _start
+    services.test.last_start_error.return_value = None
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+
+    accepted = controller.start_manual({"sn": "SN-1"})
+
+    assert accepted is False
+    assert len(blocked_payloads) == 1
+    assert blocked_payloads[0].reason == "启动失败：accept failed"
+    assert blocked_payloads[0].trigger_source == "manual"
+    assert controller._pending_start is None
+    assert controller._pending_start_request_id is None
+
+
+def test_factory_mode_controller_backend_false_after_runtime_acceptance_does_not_emit_blocked_start():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    blocked_payloads: list[object] = []
+    bus.factory_start_blocked.connect(blocked_payloads.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+
+    def _start(payload, *, on_start_accepted=None):
+        assert callable(on_start_accepted)
+        on_start_accepted(_run_id_for(payload["config_id"]))
+        return False
+
+    services.test.start.side_effect = _start
+    services.test.last_start_error.return_value = None
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+
+    accepted = controller.start_manual({"sn": "SN-1"})
+
+    assert accepted is False
+    assert blocked_payloads == []
+    assert controller.state.active_config_id == 101
+    assert controller.state.displayed_config_id == 101
+    assert controller.state.run_phase == "running"
+    assert controller.state.trigger_source == "manual"
+
+
+def test_factory_mode_controller_intentional_pending_start_cancellation_does_not_emit_blocked_start():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    blocked_payloads: list[object] = []
+    bus.factory_start_blocked.connect(blocked_payloads.append)
+    services = _make_services((_make_config(101), _make_config(202)))
+    services.test.cancel_pending_start.return_value = True
+    services.test.last_start_error.return_value = None
+    controller = None
+
+    def _start(_payload, *, on_start_accepted=None):
+        assert controller.stop_active_run() is True
+        return False
+
+    services.test.start.side_effect = _start
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101, 202))
+
+    accepted = controller.start_manual({"sn": "SN-1"})
+
+    assert accepted is False
+    assert blocked_payloads == []
+    assert controller._pending_start is None
+    assert controller._pending_start_request_id is None

@@ -24,6 +24,7 @@ class ControlModule(QWidget):
         self._workorder = dict(getattr(self.services.bus, "current_workorder_payload", {}) or {})
         self._factory_state = getattr(services.factory_mode, "state", FactoryControllerState())
         self._blocked_start_dialog = None
+        self._blocked_start_dialog_source: str | None = None
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -56,6 +57,8 @@ class ControlModule(QWidget):
             self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
         if hasattr(self.services.bus, "factory_start_blocked"):
             self.services.bus.factory_start_blocked.connect(self._on_factory_start_blocked)
+        if hasattr(self.services.bus, "factory_runtime_aborted"):
+            self.services.bus.factory_runtime_aborted.connect(self._on_factory_runtime_aborted)
         self.btn_start.clicked.connect(self._start)
         self.btn_stop.clicked.connect(self._stop)
         self.btn_pass.clicked.connect(lambda: self.services.bus.log.emit("Manual judgment: PASS"))
@@ -79,7 +82,19 @@ class ControlModule(QWidget):
         reason = reason.strip()
         if not reason:
             return
-        self._show_or_update_blocked_start_dialog(reason)
+        self._show_or_update_blocked_start_dialog(reason, source="blocked_start")
+
+    def _on_factory_runtime_aborted(self, payload) -> None:
+        error_message = getattr(payload, "error_message", None)
+        if not isinstance(error_message, str):
+            return
+        error_message = error_message.strip()
+        if not error_message:
+            return
+        self._show_or_update_blocked_start_dialog(
+            f"启动失败：{error_message}",
+            source="runtime_abort",
+        )
 
     def _start(self):
         if not self.btn_start.isEnabled():
@@ -121,13 +136,16 @@ class ControlModule(QWidget):
     def _sync_blocked_start_dialog(self) -> None:
         if self._blocked_start_dialog is None:
             return
+        if self._blocked_start_dialog_source != "blocked_start":
+            return
         reason = self._current_idle_blocking_reason()
         if not reason:
             self._close_blocked_start_dialog()
             return
         self._update_blocked_start_dialog(reason)
 
-    def _show_or_update_blocked_start_dialog(self, reason: str) -> None:
+    def _show_or_update_blocked_start_dialog(self, reason: str, *, source: str) -> None:
+        self._blocked_start_dialog_source = source
         if self._blocked_start_dialog is None:
             dialog = self._create_blocked_start_dialog()
             self._configure_blocked_start_dialog(dialog)
@@ -177,6 +195,7 @@ class ControlModule(QWidget):
     def _close_blocked_start_dialog(self) -> None:
         dialog = self._blocked_start_dialog
         self._blocked_start_dialog = None
+        self._blocked_start_dialog_source = None
         if dialog is None:
             return
         close_dialog = getattr(dialog, "close", None)
@@ -185,4 +204,5 @@ class ControlModule(QWidget):
 
     def _on_blocked_start_dialog_finished(self, *_args) -> None:
         self._blocked_start_dialog = None
+        self._blocked_start_dialog_source = None
 

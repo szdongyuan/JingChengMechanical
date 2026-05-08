@@ -10,7 +10,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
-from app.services_container import FactoryControllerState, FactoryStartBlockedPayload
+from app.services_container import (
+    FactoryControllerState,
+    FactoryRuntimeAbortPayload,
+    FactoryStartBlockedPayload,
+)
 from ui.modules.control import ControlModule
 from ui.modules.workorder import WorkOrderModule
 
@@ -35,6 +39,7 @@ class _BusStub:
         self.config_changed = _SignalStub()
         self.factory_state_changed = _SignalStub()
         self.factory_start_blocked = _SignalStub()
+        self.factory_runtime_aborted = _SignalStub()
         self.factory_selection_notice = _SignalStub()
         self.log = _SignalStub()
         self.current_workorder_payload = {}
@@ -192,6 +197,24 @@ def _idle_blocked_state(
         selection_ready_reason=reason,
         start_ready=False,
         start_ready_reason=reason,
+    )
+
+
+def _ready_state() -> FactoryControllerState:
+    return FactoryControllerState(
+        selected_config_ids=(101,),
+        run_phase="armed",
+        selection_ready=True,
+        start_ready=True,
+    )
+
+
+def _runtime_abort_payload(error_message: str | None):
+    return FactoryRuntimeAbortPayload(
+        config_id=101,
+        run_id="run-101",
+        trigger_source="manual",
+        error_message=error_message,
     )
 
 
@@ -461,3 +484,73 @@ def test_blocked_external_trigger_signal_uses_same_modal_flow(qapp, monkeypatch,
 
     assert recorder.open_count == 1
     assert recorder.latest_text == "配置加载失败"
+
+
+def test_runtime_abort_with_error_opens_start_failure_dialog(qapp, monkeypatch):
+    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
+
+    services.bus.factory_runtime_aborted.emit(
+        FactoryRuntimeAbortPayload(
+            config_id=101,
+            run_id="run-101",
+            trigger_source="manual",
+            error_message="Device not found: Mic (MME)",
+        )
+    )
+
+    assert recorder.open_count == 1
+    assert recorder.latest_text == "启动失败：Device not found: Mic (MME)"
+
+
+def test_runtime_abort_without_error_does_not_open_start_failure_dialog(qapp, monkeypatch):
+    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
+
+    services.bus.factory_runtime_aborted.emit(_runtime_abort_payload(None))
+
+    assert recorder.open_count == 0
+    assert recorder.latest_text == ""
+
+
+def test_runtime_abort_dialog_does_not_close_when_factory_state_becomes_ready(qapp, monkeypatch):
+    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
+
+    services.bus.factory_runtime_aborted.emit(_runtime_abort_payload("Device lost"))
+    services.bus.factory_state_changed.emit(_ready_state())
+
+    assert recorder.open_count == 1
+    assert recorder.latest_text == "启动失败：Device lost"
+    assert recorder.close_count == 0
+    assert recorder.was_closed is False
+
+
+def test_later_blocked_start_dialog_reenables_ready_state_auto_close(qapp, monkeypatch):
+    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
+
+    services.bus.factory_runtime_aborted.emit(_runtime_abort_payload("Device lost"))
+    services.bus.factory_start_blocked.emit(
+        FactoryStartBlockedPayload(reason="配置加载失败", trigger_source="manual")
+    )
+    services.bus.factory_state_changed.emit(_ready_state())
+
+    assert recorder.open_count == 1
+    assert recorder.latest_text == "配置加载失败"
+    assert recorder.close_count == 1
+    assert recorder.was_closed is True
+
+
+def test_runtime_abort_replaces_blocked_start_dialog_and_disables_ready_state_auto_close(
+    qapp,
+    monkeypatch,
+):
+    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
+
+    services.bus.factory_start_blocked.emit(
+        FactoryStartBlockedPayload(reason="配置加载失败", trigger_source="manual")
+    )
+    services.bus.factory_runtime_aborted.emit(_runtime_abort_payload("Device lost"))
+    services.bus.factory_state_changed.emit(_ready_state())
+
+    assert recorder.open_count == 1
+    assert recorder.latest_text == "启动失败：Device lost"
+    assert recorder.close_count == 0
+    assert recorder.was_closed is False

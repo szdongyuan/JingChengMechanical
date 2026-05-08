@@ -535,8 +535,10 @@ class FactoryModeController(QObject):
         payload["factory_start_request_id"] = request_id
         self._pending_start = (config_id, trigger_source)
         self._pending_start_request_id = request_id
+        runtime_start_accepted = False
 
         def _on_start_accepted(run_id: str) -> None:
+            nonlocal runtime_start_accepted
             if not self._matches_pending_start_request(
                 config_id=config_id,
                 trigger_source=trigger_source,
@@ -551,6 +553,7 @@ class FactoryModeController(QObject):
             self._dispatching_runtime_start_accepted_payload = accepted_payload
             try:
                 self.bus.factory_runtime_start_accepted.emit(accepted_payload)
+                runtime_start_accepted = True
             finally:
                 if self._dispatching_runtime_start_accepted_payload is accepted_payload:
                     self._dispatching_runtime_start_accepted_payload = None
@@ -564,9 +567,16 @@ class FactoryModeController(QObject):
                     start_accepted = bool(
                         start(payload, on_start_accepted=_on_start_accepted)
                     )
-                except Exception:
+                except Exception as exc:
+                    explicit_reason = self._last_backend_start_error(test_manager)
                     self._pending_start = None
                     self._pending_start_request_id = None
+                    if runtime_start_accepted:
+                        return False
+                    self._emit_start_blocked_reason(
+                        explicit_reason or f"启动失败：{exc}",
+                        trigger_source,
+                    )
                     return False
             else:
                 start_accepted = False
@@ -574,8 +584,26 @@ class FactoryModeController(QObject):
             _on_start_accepted(self._make_fallback_run_id(config_id))
 
         if not start_accepted:
+            explicit_reason = self._last_backend_start_error(test_manager)
+            pending_matches_request = self._matches_pending_start_request(
+                config_id=config_id,
+                trigger_source=trigger_source,
+                request_id=request_id,
+            )
+            request_canceled_or_stale = not pending_matches_request and explicit_reason is None
             self._pending_start = None
             self._pending_start_request_id = None
+            if runtime_start_accepted:
+                return False
+            if explicit_reason is not None:
+                self._emit_start_blocked_reason(explicit_reason, trigger_source)
+                return False
+            if request_canceled_or_stale:
+                return False
+            self._emit_start_blocked_reason(
+                "启动失败，请检查硬件配置和日志。",
+                trigger_source,
+            )
             return False
 
         if self._pending_start is not None:
@@ -798,6 +826,9 @@ class FactoryModeController(QObject):
         reason = self._state.start_ready_reason
         if reason is None:
             return False
+        return self._emit_start_blocked_reason(reason, trigger_source)
+
+    def _emit_start_blocked_reason(self, reason: str, trigger_source: str) -> bool:
         self.bus.factory_start_blocked.emit(
             FactoryStartBlockedPayload(
                 reason=reason,
@@ -805,6 +836,20 @@ class FactoryModeController(QObject):
             )
         )
         return False
+
+    @staticmethod
+    def _last_backend_start_error(test_manager) -> str | None:
+        last_start_error = getattr(test_manager, "last_start_error", None)
+        if not callable(last_start_error):
+            return None
+        try:
+            reason = last_start_error()
+        except Exception:
+            return None
+        if not isinstance(reason, str):
+            return None
+        reason = reason.strip()
+        return reason or None
 
     def _emit_state(self) -> None:
         self.bus.factory_state_changed.emit(self._state)
