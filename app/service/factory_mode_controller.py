@@ -6,6 +6,7 @@ from dataclasses import replace
 from PyQt6.QtCore import QObject
 
 from app.service.analysis.review_payloads import build_summary_payload
+from app.service.analysis.test_session import ManualLabelUpdateResult
 from app.services_container import (
     FactoryControllerState,
     FactoryPlcIngressPayload,
@@ -38,6 +39,7 @@ class FactoryModeController(QObject):
         self.services = services
         self._state = FactoryControllerState()
         self._review_payload = FactoryReviewPayload()
+        self._stopped_review_payload: FactoryReviewPayload | None = None
         self._pending_start: tuple[int, str] | None = None
         self._pending_start_request_id: str | None = None
         self._dispatching_runtime_start_accepted_payload: FactoryRuntimeStartPayload | None = None
@@ -216,6 +218,43 @@ class FactoryModeController(QObject):
     def clear_display_state(self, reason: str) -> None:
         self.clear_for_next_run(reason)
 
+    def apply_manual_judgment(self, label: str) -> ManualLabelUpdateResult:
+        normalized = str(label or "").strip().upper()
+        if normalized not in {"OK", "NG"}:
+            return ManualLabelUpdateResult(False, "无效判定结果")
+        if (
+            self._pending_start is not None
+            or self._state.run_phase in self._BLOCKED_START_PHASES
+        ):
+            return ManualLabelUpdateResult(False, "测试仍在进行中，无法人工判定")
+
+        config_id = self._state.displayed_config_id
+        if config_id is None:
+            return ManualLabelUpdateResult(False, "当前没有可判定的测试结果")
+
+        run_id = self._manual_judgment_run_id(config_id)
+        test_manager = getattr(self.services, "test", None)
+        apply_manual_judgment = getattr(test_manager, "apply_manual_judgment", None)
+        if not callable(apply_manual_judgment):
+            return ManualLabelUpdateResult(False, "当前测试不支持人工判定")
+
+        result = apply_manual_judgment(
+            config_id=config_id,
+            run_id=run_id,
+            label=normalized,
+        )
+        if not getattr(result, "success", False):
+            message = str(getattr(result, "message", "") or "保存人工判定失败")
+            return ManualLabelUpdateResult(
+                False,
+                message,
+                getattr(result, "audio_data_id", None),
+            )
+
+        reason = "manual_judgment_ok" if normalized == "OK" else "manual_judgment_ng"
+        self.clear_for_next_run(reason)
+        return ManualLabelUpdateResult(True, "", getattr(result, "audio_data_id", None))
+
     def handle_plc_event(self, payload: FactoryPlcIngressPayload) -> bool:
         self._last_plc_ingress = payload
         if self._start_feedback_is_busy():
@@ -351,6 +390,12 @@ class FactoryModeController(QObject):
 
         self._owned_runtime_config_id = None
         self._owned_runtime_run_id = None
+        self._stopped_review_payload = replace(
+            self._review_payload,
+            displayed_config_id=payload.config_id,
+            run_id=payload.run_id,
+            trigger_source=payload.trigger_source,
+        )
         self._state = self._state_with_readiness(
             replace(
                 self._state,
@@ -617,6 +662,7 @@ class FactoryModeController(QObject):
         if trigger_source is None:
             trigger_source = self._state.trigger_source
 
+        self._stopped_review_payload = None
         self._review_payload = replace(payload, trigger_source=trigger_source)
         self._state = self._state_with_readiness(
             replace(
@@ -629,6 +675,15 @@ class FactoryModeController(QObject):
         )
         self.bus.factory_review_changed.emit(self._review_payload)
         self._emit_state()
+
+    def _manual_judgment_run_id(self, config_id: int) -> str | None:
+        if (
+            self._state.run_phase == "stopped"
+            and self._stopped_review_payload is not None
+            and self._stopped_review_payload.displayed_config_id == config_id
+        ):
+            return self._stopped_review_payload.run_id
+        return self._review_payload.run_id
 
     def _load_selected_configs(self, selected_config_ids: tuple[int, ...]) -> dict[int, dict]:
         config_service = getattr(self.services, "config_service", None)
@@ -806,6 +861,7 @@ class FactoryModeController(QObject):
         self._owned_runtime_run_id = None
         self._owned_reanalysis_config_id = None
         self._owned_reanalysis_run_id = None
+        self._stopped_review_payload = None
         self._apply_deferred_selection_refresh()
         self._review_payload = FactoryReviewPayload()
         self._state = self._state_with_readiness(
