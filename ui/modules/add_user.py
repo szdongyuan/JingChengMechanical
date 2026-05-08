@@ -19,7 +19,6 @@ from ui.modules.login import encrypt_password
 
 
 ROLE_MAP = {
-    "管理员": "Admin",
     "工程师": "Engineer",
     "操作员": "Operator",
 }
@@ -59,7 +58,7 @@ class AddUserWindow(QWidget):
         role_label.setFixedWidth(44)
         role_row.addWidget(role_label)
         self.role_combo = QComboBox()
-        self.role_combo.addItems(["管理员", "工程师", "操作员"])
+        self.role_combo.addItems(["工程师", "操作员"])
         self.role_combo.setMinimumHeight(34)
         role_row.addWidget(self.role_combo, 1)
         root.addLayout(role_row)
@@ -123,15 +122,9 @@ class AddUserWindow(QWidget):
             return
 
         db_role = ROLE_MAP.get(role_text)
-        if db_role == "Admin":
-            has_admin = (
-                UsersTable.select()
-                .where(UsersTable.access_level == "Admin")
-                .exists()
-            )
-            if has_admin:
-                QMessageBox.warning(self, "提示", "管理员账号只允许一个。")
-                return
+        if not db_role:
+            QMessageBox.warning(self, "提示", "请选择有效权限。")
+            return
 
         try:
             UsersTable.create(
