@@ -442,8 +442,6 @@ class TestManager(QObject):
             "input_device_hostapi",
             "input_device_samplerate",
         )
-        if not any(field_name in config for field_name in input_field_names):
-            return False
         if not cls._non_empty_text(config.get("input_device_name")):
             return True
         if not cls._non_empty_text(config.get("input_device_hostapi")):

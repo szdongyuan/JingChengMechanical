@@ -165,6 +165,23 @@ class TestTestManagerStartStop:
             assert mgr.last_start_error() == "配置未选择输入设备，请先在「配置」页面选择输入设备并保存。"
             bus.test_started.emit.assert_not_called()
 
+    def test_start_absent_config_input_device_fields_sets_visible_start_error(self):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            config = _start_config()
+            for field in (
+                "input_device_name",
+                "input_device_hostapi",
+                "input_device_samplerate",
+            ):
+                config.pop(field, None)
+            services.config_service.load_config.return_value = config
+            mgr = TestManager(bus, services)
+
+            assert mgr.start({"config_id": 1}) is False
+            assert mgr.last_start_error() == "配置未选择输入设备，请先在「配置」页面选择输入设备并保存。"
+            bus.test_started.emit.assert_not_called()
+
     def test_start_monitor_failure_before_acceptance_preserves_completed_session_and_cleans_up(
             self,
             monkeypatch,
