@@ -107,6 +107,9 @@ class _FactoryModeStub:
         self.state = initial_state or FactoryControllerState()
         self.start_manual = MagicMock(return_value=True)
         self.stop_active_run = MagicMock(return_value=True)
+        self.apply_manual_judgment = MagicMock(
+            return_value=SimpleNamespace(success=True, message="")
+        )
 
     def restore_selection(
         self,
@@ -269,6 +272,57 @@ def test_control_panel_renders_only_two_button_rows_with_updated_spacing_and_but
     assert module.btn_stop.minimumHeight() == 36
     assert module.btn_pass.minimumHeight() == 36
     assert module.btn_fail.minimumHeight() == 36
+
+
+def test_manual_pass_click_applies_manual_ok(qapp):
+    module, services = _make_module()
+
+    module.btn_pass.click()
+
+    services.factory_mode.apply_manual_judgment.assert_called_once_with("OK")
+    assert services.bus.log.emissions[-1][0][0] == "Manual judgment: PASS"
+
+
+def test_manual_fail_click_applies_manual_ng(qapp):
+    module, services = _make_module()
+
+    module.btn_fail.click()
+
+    services.factory_mode.apply_manual_judgment.assert_called_once_with("NG")
+    assert services.bus.log.emissions[-1][0][0] == "Manual judgment: FAIL"
+
+
+def test_manual_judgment_failure_shows_warning(qapp, monkeypatch):
+    module, services = _make_module()
+    services.factory_mode.apply_manual_judgment.return_value = SimpleNamespace(
+        success=False,
+        message="当前没有可判定的测试结果",
+    )
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.control.QMessageBox.warning",
+        lambda parent, title, message: warnings.append((title, message)),
+    )
+
+    module.btn_pass.click()
+
+    assert warnings == [("人工判定失败", "当前没有可判定的测试结果")]
+    assert services.bus.log.emissions == []
+
+
+def test_manual_judgment_missing_controller_method_shows_warning(qapp, monkeypatch):
+    module, services = _make_module()
+    services.factory_mode.apply_manual_judgment = None
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.control.QMessageBox.warning",
+        lambda parent, title, message: warnings.append((title, message)),
+    )
+
+    module.btn_pass.click()
+
+    assert warnings == [("人工判定失败", "当前测试不支持人工判定")]
+    assert services.bus.log.emissions == []
 
 
 def test_start_uses_live_workorder_payload_from_current_workorder_module(qapp):

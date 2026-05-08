@@ -61,8 +61,8 @@ class ControlModule(QWidget):
             self.services.bus.factory_runtime_aborted.connect(self._on_factory_runtime_aborted)
         self.btn_start.clicked.connect(self._start)
         self.btn_stop.clicked.connect(self._stop)
-        self.btn_pass.clicked.connect(lambda: self.services.bus.log.emit("Manual judgment: PASS"))
-        self.btn_fail.clicked.connect(lambda: self.services.bus.log.emit("Manual judgment: FAIL"))
+        self.btn_pass.clicked.connect(lambda: self._apply_manual_judgment("OK"))
+        self.btn_fail.clicked.connect(lambda: self._apply_manual_judgment("NG"))
         self._sync_start_state()
 
     def _on_workorder(self, wo: dict):
@@ -109,6 +109,33 @@ class ControlModule(QWidget):
         stop_active_run = getattr(factory_mode, "stop_active_run", None)
         if callable(stop_active_run):
             stop_active_run()
+
+    def _apply_manual_judgment(self, label: str) -> None:
+        normalized = str(label or "").strip().upper()
+        if normalized == "OK":
+            log_message = "Manual judgment: PASS"
+        elif normalized == "NG":
+            log_message = "Manual judgment: FAIL"
+        else:
+            self._show_manual_judgment_warning("无效判定结果")
+            return
+
+        factory_mode = getattr(self.services, "factory_mode", None)
+        apply_manual_judgment = getattr(factory_mode, "apply_manual_judgment", None)
+        if not callable(apply_manual_judgment):
+            self._show_manual_judgment_warning("当前测试不支持人工判定")
+            return
+
+        result = apply_manual_judgment(normalized)
+        if not getattr(result, "success", False):
+            message = str(getattr(result, "message", "") or "保存人工判定失败")
+            self._show_manual_judgment_warning(message)
+            return
+
+        self.services.bus.log.emit(log_message)
+
+    def _show_manual_judgment_warning(self, message: str) -> None:
+        QMessageBox.warning(self, "人工判定失败", message)
 
     def _sync_start_state(self) -> None:
         self.btn_start.setEnabled(not self._start_click_disabled())
