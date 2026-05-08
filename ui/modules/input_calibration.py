@@ -101,7 +101,7 @@ class InputCalibrationModule(QWidget):
         self.save_button.setMinimumHeight(34)
         self.save_button.setObjectName("Primary")
 
-        # 第一行：声压偏差 + 值s
+        # 第一行：声压偏差 + 值
         row_dev_lay = QHBoxLayout()
         row_dev_lay.setContentsMargins(0, 0, 0, 0)
         row_dev_lay.setSpacing(14)
