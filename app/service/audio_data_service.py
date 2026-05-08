@@ -174,6 +174,7 @@ class AudioDataService:
             sample_rate = AudioDataTable.sample_rate.clone()
             record_date = AudioDataTable.record_date.clone()
             labels = AudioDataTable.labels.clone()
+            label_source = AudioDataTable.label_source.clone()
             barcode = AudioDataTable.barcode.clone()
             analyse_config = AudioDataTable.analyse_config.clone()
             config_content = AudioDataTable.config_content.clone()
