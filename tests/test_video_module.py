@@ -57,6 +57,10 @@ def qapp():
 @pytest.mark.parametrize("reason", ["manual_judgment_ok", "selection_changed"])
 def test_video_module_clears_pixmap_on_display_reset(qapp, monkeypatch, reason):
     monkeypatch.setattr("ui.modules.video.CameraThread", _FakeCameraThread)
+    monkeypatch.setattr(
+        "ui.modules.video.cv2",
+        SimpleNamespace(COLOR_BGR2RGB=1, cvtColor=lambda frame, _code: frame),
+    )
     bus = SimpleNamespace(factory_display_reset=_SignalStub(), log=_SignalStub())
     module = VideoModule(SimpleNamespace(bus=bus))
     camera_thread = module.camera_thread
