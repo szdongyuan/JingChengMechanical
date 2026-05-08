@@ -1,16 +1,30 @@
+import os
 import sys
 from PyInstaller.utils.hooks import collect_submodules
+
+snap7_dll = os.path.join(
+    sys.prefix,
+    "Lib",
+    "site-packages",
+    "snap7",
+    "lib",
+    "snap7.dll",
+)
+
+binaries = []
+if os.path.exists(snap7_dll):
+    binaries.append((snap7_dll, "snap7/lib"))
 
 block_cipher = None
 
 a = Analysis(
     ['main.py'],
     pathex=['.'],
-    binaries=[],
+    binaries=binaries,
     datas=[
         ('data', 'data'),
     ],
-    hiddenimports=[],
+    hiddenimports=collect_submodules('snap7'),
     hookspath=[],
     runtime_hooks=[],
     excludes=[],
