@@ -74,12 +74,9 @@ Spec: `docs/double-sdd/specs/2026-05-08-manual-judgment-source-design.md`
 - Modify `tests/test_workorder_module.py`
   - Cover manual reset clearing SN and non-manual reset preserving SN.
 
-- Modify `ui/modules/video.py`
-  - Subscribe to `factory_display_reset`.
-  - Clear stale pixmap and show `暂无画面`.
-
-- Create `tests/test_video_module.py`
-  - Use a fake camera thread so tests do not open hardware.
+- Do not add manual-reset behavior to `ui/modules/video.py`.
+  - The live camera preview is not per-unit result imagery.
+  - Manual judgment reset must not clear, stop, start, refresh, or otherwise disturb `VideoModule`.
 
 ## Task 1: Data Model And Data Management Source Display
 
@@ -1143,13 +1140,13 @@ git add ui/modules/control.py tests/test_control_module.py
 git commit -m "feat(factory-ui): apply manual judgment buttons"
 ```
 
-## Task 6: SN And Video Reset After Successful Manual Judgment
+## Task 6: SN Reset After Successful Manual Judgment
 
 **Files:**
 - Modify: `ui/modules/workorder.py`
 - Modify: `tests/test_workorder_module.py`
-- Modify: `ui/modules/video.py`
-- Create: `tests/test_video_module.py`
+
+`VideoModule` is intentionally excluded from this task. The live camera preview is not per-unit test result imagery, so manual judgment reset must not clear, stop, start, refresh, or otherwise disturb it.
 
 - [ ] **Step 1: Write failing workorder tests**
 
@@ -1190,93 +1187,17 @@ def test_non_manual_display_reset_preserves_sn(qapp):
     assert module.ed_sn.text() == "SN-KEEP"
 ```
 
-- [ ] **Step 2: Write failing video tests**
-
-Create `tests/test_video_module.py`:
-
-```python
-from __future__ import annotations
-
-import os
-from types import SimpleNamespace
-
-import numpy as np
-import pytest
-
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-
-from PyQt6.QtWidgets import QApplication
-
-from ui.modules.video import VideoModule
-
-
-class _SignalStub:
-    def __init__(self):
-        self._callbacks = []
-        self.emissions = []
-
-    def connect(self, callback):
-        self._callbacks.append(callback)
-
-    def emit(self, *args, **kwargs):
-        self.emissions.append((args, kwargs))
-        for callback in list(self._callbacks):
-            callback(*args, **kwargs)
-
-
-class _FakeCameraThread:
-    def __init__(self, *_args, **_kwargs):
-        self.frame_ready = _SignalStub()
-        self.opened = _SignalStub()
-        self.failed = _SignalStub()
-        self.disconnected = _SignalStub()
-        self.started = False
-        self.stopped = False
-
-    def start(self):
-        self.started = True
-
-    def stop(self):
-        self.stopped = True
-
-    def wait(self):
-        return True
-
-
-@pytest.fixture(scope="session")
-def qapp():
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication([])
-    return app
-
-
-def test_video_module_clears_pixmap_on_display_reset(qapp, monkeypatch):
-    monkeypatch.setattr("ui.modules.video.CameraThread", _FakeCameraThread)
-    bus = SimpleNamespace(factory_display_reset=_SignalStub(), log=_SignalStub())
-    module = VideoModule(SimpleNamespace(bus=bus))
-    frame = np.zeros((8, 8, 3), dtype=np.uint8)
-    module.update_frame(frame)
-
-    assert module.lb.pixmap() is not None
-
-    bus.factory_display_reset.emit("manual_judgment_ok")
-
-    assert module.lb.pixmap() is None
-    assert module.lb.text() == "暂无画面"
-```
-
-- [ ] **Step 3: Run failing tests**
+- [ ] **Step 2: Run failing tests**
 
 Run:
 
 ```bash
-pytest tests/test_workorder_module.py tests/test_video_module.py -q
+pytest tests/test_workorder_module.py -q
 ```
 
-Expected: FAIL because modules do not subscribe to reset.
+Expected: FAIL because `WorkOrderModule` does not subscribe to reset.
 
-- [ ] **Step 4: Implement workorder reset**
+- [ ] **Step 3: Implement workorder reset**
 
 In `ui/modules/workorder.py`, connect in `__init__`:
 
@@ -1300,42 +1221,20 @@ def _on_factory_display_reset(self, reason: str) -> None:
 
 Guard against duplicate emissions if `textChanged` already published; tests should accept at least the final emission with blank SN.
 
-- [ ] **Step 5: Implement video reset**
-
-In `ui/modules/video.py`, connect after `init_ui()`:
-
-```python
-if hasattr(self.services.bus, "factory_display_reset"):
-    self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
-```
-
-Add:
-
-```python
-def _show_empty_placeholder(self) -> None:
-    self.lb.clear()
-    self.lb.setText("暂无画面")
-
-def _on_factory_display_reset(self, _reason: str) -> None:
-    self._show_empty_placeholder()
-```
-
-Keep `set_text` for camera failures unchanged.
-
-- [ ] **Step 6: Run tests**
+- [ ] **Step 4: Run tests**
 
 Run:
 
 ```bash
-pytest tests/test_workorder_module.py tests/test_video_module.py -q
+pytest tests/test_workorder_module.py -q
 ```
 
 Expected: PASS.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 5: Commit**
 
 ```bash
-git add ui/modules/workorder.py tests/test_workorder_module.py ui/modules/video.py tests/test_video_module.py
+git add ui/modules/workorder.py tests/test_workorder_module.py
 git commit -m "feat(factory-ui): clear per-unit state after manual judgment"
 ```
 
@@ -1350,7 +1249,7 @@ git commit -m "feat(factory-ui): clear per-unit state after manual judgment"
 Run:
 
 ```bash
-pytest tests/test_audio_data_service.py tests/test_data_management_module.py tests/test_test_session.py tests/test_test_manager/test_manual_judgment.py tests/test_factory_mode_controller/test_manual_judgment.py tests/test_control_module.py tests/test_workorder_module.py tests/test_video_module.py -q
+pytest tests/test_audio_data_service.py tests/test_data_management_module.py tests/test_test_session.py tests/test_test_manager/test_manual_judgment.py tests/test_factory_mode_controller/test_manual_judgment.py tests/test_control_module.py tests/test_workorder_module.py -q
 ```
 
 Expected: PASS.

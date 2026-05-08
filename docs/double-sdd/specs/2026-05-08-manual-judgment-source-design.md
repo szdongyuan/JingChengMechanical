@@ -34,7 +34,7 @@ Relevant existing behavior:
 4. Keep one test mapped to one audio data record; manual judgment must update the existing row, not create a second record.
 5. Allow manual OK/NG when the current test has a saved audio data row, even if automatic analysis failed or produced no result.
 6. Reject manual OK/NG when there is no current saved audio data row or when the test is still active.
-7. After successful manual OK/NG, clear the per-unit SN and analysis/video display and return to the ready/no-active-test state.
+7. After successful manual OK/NG, clear the per-unit SN and analysis/result/chart/STFT display and return to the ready/no-active-test state.
 8. Avoid legacy-data migration burden during development.
 
 ## Non-Goals
@@ -135,7 +135,7 @@ Replace the current OK/NG log-only behavior with a manual judgment action:
 2. On success:
    - keep a clear log entry for the action
    - reset the factory display state using the existing display reset contract
-   - clear per-unit SN and stale image/display data
+   - clear per-unit SN and stale analysis/result/chart/STFT display data
 3. On failure:
    - show a modal warning with the failure reason
    - keep the current page state unchanged
@@ -163,7 +163,7 @@ On successful manual OK/NG:
 - Preserve selected factory configs.
 - Publish/cache the updated workorder payload with blank SN.
 - Clear analysis result/chart/STFT state through `factory_display_reset`.
-- Clear video/image preview stale pixmap and show the empty placeholder.
+- Keep the live camera preview unchanged. Manual judgment reset must not clear, stop, start, refresh, or otherwise disturb `VideoModule`.
 - Return the factory controller to `armed` if selected configs are ready, otherwise `not_ready`.
 
 ## Component Responsibilities
@@ -215,11 +215,11 @@ Responds to successful manual judgment display resets:
 
 ### `VideoModule`
 
-Responds to display resets:
+Owns only the live camera preview:
 
-- Subscribe to `factory_display_reset`.
-- Clear the preview pixmap and show the existing empty placeholder.
-- Do not start/stop/reopen cameras as part of reset.
+- Do not subscribe to `factory_display_reset`.
+- Do not clear the preview pixmap or show the empty placeholder because of manual judgment reset.
+- Do not start, stop, reopen, or refresh cameras as part of manual judgment reset.
 
 ## Compatibility / Migration
 
@@ -245,7 +245,7 @@ Add focused tests for:
 5. Manual judgment can update a partial saved row after early stop.
 6. Manual judgment is rejected with visible feedback when there is no saved row/current session.
 7. Manual judgment is rejected in busy phases and does not clear display.
-8. Successful manual judgment clears SN, clears analysis/video display, and returns to ready/not-ready through existing reset signals.
+8. Successful manual judgment clears SN, clears analysis/result/chart/STFT display, returns to ready/not-ready through existing reset signals, and leaves the live camera preview untouched.
 9. Data management displays `label_source` as `判定来源`, mapping `auto` to `自动`, `manual` to `人工`, blank to blank.
 
 ## Verification
