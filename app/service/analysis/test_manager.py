@@ -128,93 +128,87 @@ class TestManager(QObject):
         session_workorder = dict(workorder)
         session_workorder["factory_run_id"] = self._new_factory_run_id()
 
-        session = TestSession(
-            config=config,
-            bus=self._bus,
-            ai_service=self._services.ai_service,
-            mic_cal=mic_cal,
-            workorder=session_workorder,
-            audio_dir=audio_dir,
-        )
-        session._on_session_done_cb = self._on_session_done
-
-        if device_key in self._shared_recorders:
-            recorder = self._shared_recorders[device_key]
-        else:
-            recorder = AudioRecorder(
-                device_name=config.get("input_device_name", ""),
-                hostapi=config.get("input_device_hostapi", ""),
-                sample_rate=sample_rate,
-                n_channels=n_channels,
-                record_duration=record_duration,
-            )
-            self._shared_recorders[device_key] = recorder
-
-        session._sample_rate = recorder._sample_rate
-        session._setup_pipelines()
-        self._apply_stored_live_loudness_channel(session, config)
-
-        session._chunk_conn = session._on_chunk
-        session._done_lambda = lambda cid=config_id: self._on_recording_done(cid)
-        session._error_lambda = lambda msg, cid=config_id: self._on_error(cid, msg)
-        prepare_for_attach = getattr(session, "prepare_for_attach", None)
-        if callable(prepare_for_attach):
-            prepare_for_attach()
-        recorder.chunk_ready.connect(session._chunk_conn)
-        attach_snapshot = recorder.attach_session(record_duration=record_duration)
-        session.attach_to_recorder(
-            chunk_index=attach_snapshot.chunk_index,
-            snapshot=attach_snapshot,
-        )
-        recorder.recording_done.connect(session._done_lambda)
-        recorder.error_occurred.connect(session._error_lambda)
-
-        self._sessions[config_id] = session
-        self._recorders[config_id] = recorder
-
-        output_name = config.get("output_device_name")
-        if output_name:
-            output_sr = float(config.get("output_device_samplerate", sample_rate))
-            monitor = AudioMonitor(
-                device_name=config.get("output_device_name", ""),
-                hostapi=config.get("output_device_hostapi", ""),
-                sample_rate=output_sr,
-                monitor_channel=config.get("selected_channels", [0])[0],
-            )
-            session._monitor_lambda = lambda data, idx, m=monitor: m.feed(data)
-            session._monitor_error_lambda = lambda msg, cid=config_id: self._on_error(cid, msg)
-            recorder.chunk_ready.connect(session._monitor_lambda)
-            monitor.error_occurred.connect(session._monitor_error_lambda)
-            self._monitors[config_id] = monitor
+        session = None
+        recorder = None
+        monitor = None
 
         try:
+            session = TestSession(
+                config=config,
+                bus=self._bus,
+                ai_service=self._services.ai_service,
+                mic_cal=mic_cal,
+                workorder=session_workorder,
+                audio_dir=audio_dir,
+            )
+            session._on_session_done_cb = self._on_session_done
+
+            if device_key in self._shared_recorders:
+                recorder = self._shared_recorders[device_key]
+            else:
+                recorder = AudioRecorder(
+                    device_name=config.get("input_device_name", ""),
+                    hostapi=config.get("input_device_hostapi", ""),
+                    sample_rate=sample_rate,
+                    n_channels=n_channels,
+                    record_duration=record_duration,
+                )
+                self._shared_recorders[device_key] = recorder
+
+            session._sample_rate = recorder._sample_rate
+            session._setup_pipelines()
+            self._apply_stored_live_loudness_channel(session, config)
+
+            session._chunk_conn = session._on_chunk
+            session._done_lambda = lambda cid=config_id: self._on_recording_done(cid)
+            session._error_lambda = lambda msg, cid=config_id: self._on_error(cid, msg)
+            prepare_for_attach = getattr(session, "prepare_for_attach", None)
+            if callable(prepare_for_attach):
+                prepare_for_attach()
+            recorder.chunk_ready.connect(session._chunk_conn)
+            attach_snapshot = recorder.attach_session(record_duration=record_duration)
+            session.attach_to_recorder(
+                chunk_index=attach_snapshot.chunk_index,
+                snapshot=attach_snapshot,
+            )
+            recorder.recording_done.connect(session._done_lambda)
+            recorder.error_occurred.connect(session._error_lambda)
+
+            self._sessions[config_id] = session
+            self._recorders[config_id] = recorder
+
+            output_name = config.get("output_device_name")
+            if output_name:
+                output_sr = float(config.get("output_device_samplerate", sample_rate))
+                monitor = AudioMonitor(
+                    device_name=config.get("output_device_name", ""),
+                    hostapi=config.get("output_device_hostapi", ""),
+                    sample_rate=output_sr,
+                    monitor_channel=config.get("selected_channels", [0])[0],
+                )
+                session._monitor_lambda = lambda data, idx, m=monitor: m.feed(data)
+                session._monitor_error_lambda = lambda msg, cid=config_id: self._on_error(cid, msg)
+                recorder.chunk_ready.connect(session._monitor_lambda)
+                monitor.error_occurred.connect(session._monitor_error_lambda)
+                self._monitors[config_id] = monitor
+
             if mon := self._monitors.get(config_id):
                 mon.start()
+
+            if self._factory_start_canceled(request_id):
+                self._cleanup_failed_start_setup(config_id, session, recorder, monitor)
+                self._clear_pending_factory_start(request_id)
+                return False
+
+            if callable(on_start_accepted):
+                on_start_accepted(session_workorder["factory_run_id"])
         except Exception as exc:
             self._bus.log.emit(f"[TestManager] ERROR starting config {config_id}: {exc}")
-            self._stop_one(config_id, silent=True)
+            self._cleanup_failed_start_setup(config_id, session, recorder, monitor)
             return self._fail_start_before_acceptance(
                 request_id,
                 f"启动失败：{exc}",
             )
-
-        if self._factory_start_canceled(request_id):
-            self._stop_one(config_id, silent=True)
-            self._clear_pending_factory_start(request_id)
-            return False
-
-        if callable(on_start_accepted):
-            try:
-                on_start_accepted(session_workorder["factory_run_id"])
-            except Exception as exc:
-                self._bus.log.emit(
-                    f"[TestManager] ERROR accepting start for config {config_id}: {exc}"
-                )
-                self._stop_one(config_id, silent=True)
-                return self._fail_start_before_acceptance(
-                    request_id,
-                    f"启动失败：{exc}",
-                )
 
         if self._factory_start_canceled(request_id):
             self._stop_one(config_id, silent=True)
@@ -418,6 +412,54 @@ class TestManager(QObject):
                 self._bus.log.emit(f"[TestManager] stopped config={config_id}")
                 self._bus.status.emit("Stopped")
 
+    def _cleanup_failed_start_setup(
+        self,
+        config_id: int,
+        session=None,
+        recorder=None,
+        monitor=None,
+    ) -> None:
+        registered_session = self._sessions.pop(config_id, None)
+        registered_recorder = self._recorders.pop(config_id, None)
+        registered_monitor = self._monitors.pop(config_id, None)
+
+        cleanup_session = registered_session or session
+        cleanup_recorder = registered_recorder or recorder
+        cleanup_monitor = registered_monitor or monitor
+
+        if cleanup_session is not None and cleanup_recorder is not None:
+            try:
+                self._disconnect_session_signals(
+                    cleanup_session,
+                    cleanup_recorder,
+                    cleanup_monitor,
+                )
+            except Exception as exc:
+                self._bus.log.emit(
+                    f"[TestManager] ERROR cleaning failed start signals for "
+                    f"config={config_id}: {exc}"
+                )
+
+        if cleanup_monitor is not None:
+            try:
+                cleanup_monitor.stop()
+                cleanup_monitor.wait(1000)
+            except Exception as exc:
+                self._bus.log.emit(
+                    f"[TestManager] ERROR cleaning failed start monitor for "
+                    f"config={config_id}: {exc}"
+                )
+
+        if cleanup_recorder is not None:
+            try:
+                self._stop_recorder_if_unused(cleanup_recorder)
+            except Exception as exc:
+                self._bus.log.emit(
+                    f"[TestManager] ERROR cleaning failed start recorder for "
+                    f"config={config_id}: {exc}"
+                )
+                self._discard_shared_recorder(cleanup_recorder)
+
     @staticmethod
     def _get_factory_start_request_id(workorder: dict) -> str | None:
         request_id = workorder.get("factory_start_request_id")
@@ -485,10 +527,12 @@ class TestManager(QObject):
             return False
         try:
             numeric = float(value)
-            integer = int(numeric)
         except (TypeError, ValueError):
             return False
-        return bool(np.isfinite(numeric) and integer > 0 and numeric == integer)
+        if not np.isfinite(numeric):
+            return False
+        integer = int(numeric)
+        return bool(integer > 0 and numeric == integer)
 
     def _factory_start_canceled(self, request_id: str | None) -> bool:
         return bool(request_id) and request_id in self._canceled_factory_start_requests

@@ -121,6 +121,7 @@ class TestTestManagerStartStop:
                 {"name": "Mic", "type": "MME", "samplerate": "0", "channel_count": "1"},
                 {"name": "Mic", "type": "MME", "samplerate": "44100", "channel_count": "0"},
                 {"name": "Mic", "type": "MME", "samplerate": "44100", "channel_count": "abc"},
+                {"name": "Mic", "type": "MME", "samplerate": "44100", "channel_count": "inf"},
             ],
         )
     def test_start_invalid_saved_input_hardware_sets_visible_start_error(
@@ -306,6 +307,78 @@ class TestTestManagerStartStop:
             assert FakeMonitor.instances[0].stop_calls == 1
             bus.factory_runtime_aborted.emit.assert_not_called()
             bus.test_started.emit.assert_not_called()
+
+    def test_start_output_sample_rate_setup_failure_before_acceptance_cleans_partial_runtime(
+            self,
+            monkeypatch,
+        ):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            services.config_service.load_config.return_value = _start_config(
+                output_device_name="Speaker",
+                output_device_hostapi="MME",
+                output_device_samplerate="bad",
+            )
+
+            class FakeRecorder:
+                instances = []
+
+                def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+                    self._sample_rate = sample_rate
+                    self._n_channels = n_channels
+                    self._record_duration = record_duration
+                    self._buffer = np.zeros(
+                        (int(sample_rate * record_duration), n_channels),
+                        dtype=np.float32,
+                    )
+                    self.chunk_ready = _DummySignal()
+                    self.recording_done = _DummySignal()
+                    self.error_occurred = _DummySignal()
+                    self._running = False
+                    self.stop_calls = 0
+                    FakeRecorder.instances.append(self)
+
+                def isRunning(self):
+                    return self._running
+
+                def start(self):
+                    raise AssertionError("recorder should not start before acceptance")
+
+                def stop(self):
+                    self.stop_calls += 1
+                    self._running = False
+
+                def wait(self, timeout):
+                    return True
+
+                def attach_session(self, *, record_duration):
+                    return MagicMock(chunk_index=0, sample_index=0)
+
+                def get_buffer_from(self, snapshot):
+                    return self._buffer
+
+            monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
+            monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
+
+            mgr = TestManager(bus, services)
+            accepted_run_ids: list[str] = []
+
+            accepted = mgr.start(
+                {"config_id": 1, "sn": "SN1"},
+                on_start_accepted=accepted_run_ids.append,
+            )
+
+            assert accepted is False
+            assert mgr.last_start_error().startswith("启动失败：")
+            assert "bad" in mgr.last_start_error()
+            assert accepted_run_ids == []
+            bus.test_started.emit.assert_not_called()
+            bus.factory_runtime_aborted.emit.assert_not_called()
+            assert mgr.is_running(config_id=1) is False
+            assert mgr._recorders == {}
+            assert mgr._monitors == {}
+            assert mgr._shared_recorders == {}
+            assert FakeRecorder.instances[0].stop_calls == 1
 
     def test_start_calls_on_start_accepted_with_factory_run_id_before_recorder_start_and_before_test_started(
             self,
