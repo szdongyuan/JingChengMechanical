@@ -292,7 +292,6 @@ def _make_window(
 
 
 def _show(window, qapp):
-    window.login_shown = True
     window.resize(1440, 900)
     window.show()
     qapp.processEvents()

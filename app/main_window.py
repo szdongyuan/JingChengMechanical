@@ -81,7 +81,6 @@ class MainWindow(QMainWindow):
         self.change_password_window = None
         self.add_user_window = None
         self.delete_user_window = None
-        self.login_shown = False
         factory_mode = getattr(self.services, "factory_mode", None)
         self._factory_state = getattr(factory_mode, "state", FactoryControllerState())
         self._review_payload = getattr(factory_mode, "review_payload", FactoryReviewPayload())
@@ -124,12 +123,6 @@ class MainWindow(QMainWindow):
         self._sync_analysis_toolbar()
         self._refresh_analysis_display_modules()
         self.set_role()
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        if not self.login_shown:
-            self.login_shown = True
-            self.show_login_window(close_main_window=True, window_title="登录")
 
     def show_login_window(self, close_main_window=False, window_title="登录"):
         def on_login_success(username: str, role: str):
