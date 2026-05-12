@@ -6,10 +6,27 @@ import zipfile
 from peewee import Model, SqliteDatabase, fn
 
 from base.utils import normalize_path
+from consts.time_consts import now_str
 from model.audio_data_table import AudioDataTable
 
 
 class AudioDataService:
+    def today_statistics(self):
+        # record_date 格式如 2026-04-29T11:11:32.813876+08:00，前 10 位是日期。
+        today = now_str()[:10]
+        today_condition = fn.Substr(AudioDataTable.record_date, 1, 10) == today
+        return {
+            "total": AudioDataTable.select().where(today_condition).count(),
+            "ok": AudioDataTable.select().where(
+                today_condition,
+                AudioDataTable.labels == "OK",
+            ).count(),
+            "ng": AudioDataTable.select().where(
+                today_condition,
+                AudioDataTable.labels == "NG",
+            ).count(),
+        }
+
     def list_column_names(self) -> list[str]:
         # 查询：返回 audio_data_table 的字段顺序，给 UI 生成表头用。
         return list(AudioDataTable._meta.sorted_field_names)

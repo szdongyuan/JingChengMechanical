@@ -33,6 +33,7 @@ from ui.modules.spl import SplModule
 from ui.modules.octave import OctaveModule
 from ui.modules.result import ResultModule
 from ui.modules.video import VideoModule
+from ui.modules.today_statistics import TodayStatisticsModule
 from ui.modules.hardware import HardwareModule
 from ui.modules.data_management import DataManagementModule
 from ui.modules.input_calibration import InputCalibrationModule
@@ -306,13 +307,20 @@ class MainWindow(QMainWindow):
         left_lay.setSpacing(5)
 
         self.workorder = WorkOrderModule(self.services)
-        left_lay.addWidget(Card("工单输入", self.workorder), 2)
+        left_lay.addWidget(Card("工单输入", self.workorder), 1)
 
         self.control = ControlModule(self.services)
-        left_lay.addWidget(Card("控制面板", self.control), 1)
+        left_lay.addWidget(Card("控制面板", self.control))
+
+        self.today_statistics = TodayStatisticsModule(self.services)
+        self.today_statistics_card = Card("今日数据统计", self.today_statistics)
+        self.today_statistics_card.setFixedHeight(108)
+        left_lay.addWidget(self.today_statistics_card)
 
         self.video = VideoModule(self.services)
-        left_lay.addWidget(Card("视频预览", self.video))
+        self.video_card = Card("视频预览", self.video)
+        self.video_card.setMinimumHeight(270)
+        left_lay.addWidget(self.video_card)
 
         content_lay.addWidget(left)
 
