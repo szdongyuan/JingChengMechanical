@@ -38,6 +38,21 @@ class AudioDataService:
         query = query.order_by(AudioDataTable.record_date.desc()).dicts()
         return list(query)
 
+    def delete_record(self, audio_data_id: object) -> None:
+        record_id = str(audio_data_id or "").strip()
+        if not record_id:
+            raise ValueError("缺少 audio_id")
+
+        record = AudioDataTable.get_or_none(AudioDataTable.audio_data_id == record_id)
+        if record is None:
+            raise ValueError("数据不存在")
+
+        file_path = normalize_path(record.file_path)
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+
+        record.delete_instance()
+
     def list_product_models(self) -> list[str]:
         # 查询：返回所有产品型号，给筛选下拉框使用。
         query = (

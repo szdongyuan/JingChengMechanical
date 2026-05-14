@@ -110,7 +110,7 @@ class AddUserWindow(QWidget):
         role_text = self.role_combo.currentText()
 
         if not username or not password or not confirm_password:
-            QMessageBox.warning(self, "提示", "请填写完整。")
+            QMessageBox.warning(self, "提示", "请填写完整。              ")
             return
 
         if password != confirm_password:
@@ -118,12 +118,12 @@ class AddUserWindow(QWidget):
             return
 
         if UsersTable.select().where(UsersTable.user_name == username).exists():
-            QMessageBox.warning(self, "提示", "账号已存在。")
+            QMessageBox.warning(self, "提示", "账号已存在。              ")
             return
 
         db_role = ROLE_MAP.get(role_text)
         if not db_role:
-            QMessageBox.warning(self, "提示", "请选择有效权限。")
+            QMessageBox.warning(self, "提示", "请选择有效权限。              ")
             return
 
         try:
@@ -138,5 +138,5 @@ class AddUserWindow(QWidget):
             QMessageBox.warning(self, "提示", f"保存失败：{exc}")
             return
 
-        QMessageBox.information(self, "提示", "添加用户成功。")
+        QMessageBox.information(self, "提示", "添加用户成功。              ")
         self.close()

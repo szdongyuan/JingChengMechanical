@@ -261,7 +261,7 @@ class PlcSettingsModule(QWidget):
             self._emit_plc_changed()
             self.on_combo_changed()
             self.services.bus.log.emit(f"PLC {row.id} 保存成功")
-            QMessageBox.information(self, "成功", f"PLC {row.id} 保存成功")
+            QMessageBox.information(self, "成功", f"PLC {row.id}      配置保存成功!")
         except Exception as exc:
             self.services.bus.log.emit(f"保存 PLC 配置失败: {exc}")
             QMessageBox.warning(self, "提示", f"保存 PLC 配置失败: {exc}")
