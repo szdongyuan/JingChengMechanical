@@ -182,6 +182,9 @@ class TestReviewPayloadEmission:
             "factory_run_id": "run-1",
         }
         session._audio_file_path = "captured.wav"
+        session._last_loudness_trace_cache = {
+            0: {"times_sec": [0.25], "values_sone": [4.0], "max_sone": 4.0}
+        }
         session.last_ai_review = {
             "status": "success",
             "threshold": 0.8,
@@ -235,6 +238,7 @@ class TestReviewPayloadEmission:
         assert calls["chart"]["config"] == session._config
         assert calls["chart"]["sample_rate"] == 100.0
         assert calls["chart"]["analysis_window"] == (1.0, 3.0)
+        assert calls["chart"]["loudness_trace_cache"] is session._last_loudness_trace_cache
         assert calls["chart"]["judgment_payload"] == {
             "overall": "合格",
             "limit_pass": True,
@@ -612,6 +616,72 @@ class TestReviewPayloadEmission:
         assert payload.chart_payload == expected_chart
         assert payload.no_result is False
         assert payload.error_message is None
+
+    def test_rejudge_chart_payload_rebuild_uses_selected_buffer_and_real_channel_map(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        mock_session = MagicMock()
+        mock_session.config_id = 1
+        mock_session._workorder = {
+            "trigger_source": "manual",
+            "factory_run_id": "run-1",
+        }
+        mock_session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+            "selected_channels": [3],
+            "channels": [{"channel_index": 3}],
+        }
+        mock_session._buffer = np.full((500, 1), 0.37, dtype=np.float32)
+        mock_session._sample_rate = 100.0
+        mock_session._audio_file_path = "captured.wav"
+        mock_session._real_to_logical_channel = {3: 0}
+        mock_session.last_ai_review = None
+        mock_session.rejudge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+            analysis_window=(1.0, 3.0),
+            channel_results=[
+                ChannelJudgment(
+                    channel_index=3,
+                    spl_db=70.0,
+                    spl_pass=True,
+                    loudness_available=False,
+                )
+            ],
+        )
+        chart_calls = {}
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_summary_payload",
+            lambda **kwargs: {"overall_status": "pass", "rows": []},
+            raising=False,
+        )
+
+        def fake_build_chart_payload(**kwargs):
+            chart_calls["kwargs"] = kwargs
+            return {3: {"spl": {"values_db": [37.0]}}}
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_chart_payload",
+            fake_build_chart_payload,
+            raising=False,
+        )
+        mgr._completed_sessions[1] = mock_session
+
+        mgr.rejudge(config_id=1, start_sec=1.0, end_sec=3.0)
+
+        assert chart_calls["kwargs"]["buffer"] is mock_session._buffer
+        assert chart_calls["kwargs"]["channel_column_map"] == {3: 0}
+        payload = bus.factory_runtime_reanalysis_completed.emit.call_args.args[0]
+        assert sorted(payload.chart_payload) == [3]
+        assert payload.no_result is False
 
     def test_rejudge_failure_emits_full_no_result_summary_without_chart_payload(self, monkeypatch):
         bus = _mock_bus()

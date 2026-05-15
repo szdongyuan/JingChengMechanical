@@ -128,7 +128,6 @@ class LoudnessModule(QWidget):
                 values,
                 lower_limit=loudness_payload.get("lower_limit"),
                 upper_limit=loudness_payload.get("upper_limit"),
-                y_axis_mode="data_focus",
             )
         except (TypeError, ValueError):
             self._clear_plot()

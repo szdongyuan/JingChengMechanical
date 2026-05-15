@@ -18,6 +18,7 @@ from app.service.golden_sample_service import GoldenSampleService
 
 
 _REF_DB = 20.0 * np.log10(20e-6)
+_REAL_COMPUTE_LOUDNESS_TRACE = dsp.compute_loudness_trace
 
 
 @pytest.fixture(autouse=True)
@@ -115,6 +116,18 @@ def _golden_binding(path: Path | str, *, sample_rate: float = 48_000.0) -> dict:
     }
 
 
+def _stable_calibrator_signal(
+    *,
+    sample_rate: float = 44100.0,
+    duration_sec: float = 3.0,
+    freq_hz: float = 1000.0,
+    spl_db: float = 94.0,
+) -> tuple[np.ndarray, float]:
+    amplitude = np.sqrt(2.0) * 20e-6 * (10.0 ** (spl_db / 20.0))
+    times = np.arange(int(sample_rate * duration_sec), dtype=np.float64) / sample_rate
+    return amplitude * np.sin(2.0 * np.pi * freq_hz * times), sample_rate
+
+
 class TestLimitChecks:
     def _make_engine(self, *, golden_sample_service=None):
         mock_ai = MagicMock()
@@ -140,6 +153,73 @@ class TestLimitChecks:
         assert len(result.channel_results) == 1
         assert result.channel_results[0].spl_pass is True
 
+    def test_stable_calibrator_spl_trace_passes_narrow_limits(self):
+        engine = self._make_engine()
+        signal, sample_rate = _stable_calibrator_signal()
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    spl_lower_limit=93.8,
+                    spl_upper_limit=94.2,
+                )
+            ]
+        )
+
+        result = engine.judge(
+            config,
+            signal.reshape(-1, 1),
+            sample_rate,
+            mic_cal={},
+            audio_file_path="/tmp/test.wav",
+        )
+
+        channel_result = result.channel_results[0]
+        assert channel_result.spl_trace_available is True
+        assert channel_result.spl_pass is True
+        assert channel_result.spl_min_db is not None
+        assert channel_result.spl_max_db is not None
+        assert channel_result.spl_max_db - channel_result.spl_min_db <= 0.10
+
+    def test_stable_calibrator_loudness_uses_corrected_zwtv_trace(self, monkeypatch):
+        monkeypatch.setattr(dsp, "compute_loudness_trace", _REAL_COMPUTE_LOUDNESS_TRACE)
+        engine = self._make_engine()
+        signal, sample_rate = _stable_calibrator_signal(sample_rate=48000.0)
+        config = _make_config(
+            input_device_samplerate=sample_rate,
+            channels=[
+                _make_channel_config(
+                    0,
+                    spl_upper_limit=120.0,
+                    loudness_unit="phon",
+                    loudness_lower_limit=93.0,
+                    loudness_upper_limit=95.0,
+                    loudness_average_lower_enabled=True,
+                    loudness_average_lower_limit=93.0,
+                    loudness_average_upper_enabled=True,
+                    loudness_average_upper_limit=95.0,
+                )
+            ],
+        )
+
+        result = engine.judge(
+            config,
+            signal.reshape(-1, 1),
+            sample_rate,
+            mic_cal={},
+            audio_file_path="/tmp/test.wav",
+        )
+
+        channel = result.channel_results[0]
+        max_phon = dsp.sone_to_phon(channel.loudness_max_sone)
+        average_phon = dsp.sone_to_phon(channel.loudness_average_sone)
+        assert max_phon == pytest.approx(94.0, abs=0.75)
+        assert average_phon == pytest.approx(94.0, abs=0.75)
+        assert max_phon < 95.0
+        assert average_phon < 95.0
+        assert channel.loudness_pass is True
+        assert channel.loudness_average_pass is True
+
     def test_judgment_uses_loudness_max_sone_for_pass_fail(self, monkeypatch):
         engine = self._make_engine()
         sample_rate = 44100.0
@@ -164,6 +244,40 @@ class TestLimitChecks:
 
         assert result.channel_results[0].loudness_max_sone == 8.0
         assert result.channel_results[0].loudness_pass is True
+
+    def test_judgment_stores_loudness_trace_in_internal_cache(self, monkeypatch):
+        engine = self._make_engine()
+        sample_rate = 44100.0
+        buffer = np.zeros((int(sample_rate * 3.0), 1))
+        cache: dict[int, dict] = {}
+        monkeypatch.setattr(
+            dsp,
+            "compute_loudness_trace",
+            lambda *args, **kwargs: ([0.0, 0.5], [5.0, 8.0], 8.0),
+        )
+
+        result = engine.judge(
+            _make_config(),
+            buffer,
+            sample_rate,
+            mic_cal={},
+            audio_file_path="/tmp/test.wav",
+            loudness_trace_cache=cache,
+        )
+
+        assert cache == {
+            0: {
+                "times_sec": [0.0, 0.5],
+                "values_sone": [5.0, 8.0],
+                "max_sone": 8.0,
+            }
+        }
+        channel = result.channel_results[0]
+        assert channel.loudness_max_sone == 8.0
+        assert not hasattr(channel, "loudness_times_sec")
+        serialized_channel = asdict(result)["channel_results"][0]
+        assert "loudness_times_sec" not in serialized_channel
+        assert "loudness_values_sone" not in serialized_channel
 
     def test_serialized_channel_judgment_contains_average_metrics(self, monkeypatch):
         engine = self._make_engine()
@@ -283,7 +397,7 @@ class TestLimitChecks:
         assert result.channel_results[0].loudness_average_sone is None
         assert result.channel_results[0].loudness_available is False
 
-    def test_judgment_preserves_loudness_failure_contract_when_segmented_backend_errors(self, monkeypatch):
+    def test_judgment_preserves_loudness_failure_contract_when_backend_errors(self, monkeypatch):
         engine = self._make_engine()
         sample_rate = 48000.0
         buffer = np.zeros((int(sample_rate * 3.0), 1))
@@ -1208,6 +1322,52 @@ class TestLimitChecks:
         result = engine.judge(config, buf, sr, mic_cal={}, audio_file_path="/tmp/test.wav")
         assert result.limit_pass is False
         assert result.overall == "不合格"
+
+    def test_selected_channel_mapping_reports_real_channel_and_reads_logical_column(self, monkeypatch):
+        engine = self._make_engine()
+        sr = 100.0
+        selected_buffer = np.full((300, 1), 0.37, dtype=np.float32)
+        config = _make_config(
+            selected_channels=[3],
+            channels=[_make_channel_config(3)],
+            input_device_samplerate=sr,
+        )
+        observed = {}
+
+        def fake_compute_spl(signal, sample_rate, weighting, time_constant):
+            observed["spl_signal"] = np.asarray(signal).copy()
+            return float(np.mean(signal) * 100.0)
+
+        monkeypatch.setattr(dsp, "compute_spl", fake_compute_spl)
+        monkeypatch.setattr(
+            dsp,
+            "compute_spl_trace",
+            lambda signal, *args, **kwargs: ([0.05], [float(np.mean(signal) * 100.0)]),
+        )
+        monkeypatch.setattr(
+            dsp,
+            "compute_spl_leq",
+            lambda signal, *args, **kwargs: float(np.mean(signal) * 100.0),
+        )
+        monkeypatch.setattr(
+            dsp,
+            "compute_loudness_trace",
+            lambda signal, sample_rate: ([0.0], [2.0], 2.0),
+        )
+
+        result = engine.judge(
+            config,
+            selected_buffer,
+            sr,
+            mic_cal={},
+            audio_file_path="/tmp/test.wav",
+            channel_column_map={3: 0},
+        )
+
+        assert len(result.channel_results) == 1
+        assert result.channel_results[0].channel_index == 3
+        assert result.channel_results[0].spl_db == pytest.approx(37.0)
+        np.testing.assert_array_equal(observed["spl_signal"], selected_buffer[:, 0])
 
     def test_mic_calibration_changes_spl(self):
         """Mic calibration should affect the SPL calculation."""

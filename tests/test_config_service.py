@@ -12,6 +12,7 @@ from scipy.io import wavfile
 from app.service.config_service import ConfigService, _GOLDEN_BINDING_FIELDS
 from app.service.golden_sample_service import GoldenSampleService
 from model.channel_config_table import ChannelConfigTable
+from model.device_table import DeviceTable
 from model.plc_table import PlcTable
 from model.test_config_ai_binding_table import (
     TestConfigAiBindingTable as AiBindingTable,
@@ -29,6 +30,47 @@ def _service(golden_root: Path | None = None) -> ConfigService:
     if golden_root is not None:
         golden_service = GoldenSampleService(root_dir=str(golden_root))
     return ConfigService(FakeBus(), golden_sample_service=golden_service)
+
+
+def _recreate_legacy_config_schema_without_monitor_columns() -> None:
+    database = ConfigTable._meta.database
+    database.execute_sql("DROP TABLE IF EXISTS channel_config_table")
+    database.execute_sql("DROP TABLE IF EXISTS test_config_ai_binding_table")
+    database.execute_sql("DROP TABLE IF EXISTS test_config_table")
+    database.execute_sql(
+        """
+        CREATE TABLE test_config_table (
+            config_id INTEGER NOT NULL PRIMARY KEY,
+            config_name TEXT NOT NULL UNIQUE,
+            record_duration REAL NOT NULL DEFAULT 5.0,
+            analysis_duration REAL NOT NULL DEFAULT 3.0,
+            allow_incomplete_recording_analysis INTEGER NOT NULL DEFAULT 0,
+            scan_triggers_test INTEGER NOT NULL DEFAULT 0,
+            plc_id INTEGER,
+            plc_device_key TEXT,
+            plc_device_label TEXT,
+            created_time TEXT NOT NULL DEFAULT 'legacy-created',
+            updated_time TEXT NOT NULL DEFAULT 'legacy-updated',
+            input_device_name TEXT,
+            input_device_hostapi TEXT,
+            input_device_samplerate REAL,
+            output_device_name TEXT,
+            output_device_hostapi TEXT,
+            output_device_samplerate REAL,
+            selected_channels TEXT NOT NULL DEFAULT '[]',
+            analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (plc_id) REFERENCES plc_table (id) ON DELETE SET NULL
+        )
+        """
+    )
+    ChannelConfigTable.create_table(safe=True)
+
+
+def _legacy_config_columns() -> set[str]:
+    cursor = ConfigTable._meta.database.execute_sql(
+        "PRAGMA table_info(test_config_table)"
+    )
+    return {row[1] for row in cursor.fetchall()}
 
 
 def _channel_payload(channel_index: int) -> dict:
@@ -101,6 +143,8 @@ def _config_payload(
     analysis_duration: float = 3.0,
     sample_rate: float = 48_000.0,
     golden_editor_state: dict[int, dict] | None = None,
+    monitor_channel_index: int | None = None,
+    monitor_gain_db: float | None = 0.0,
 ) -> dict:
     channels = channels or []
     if selected_channels is None:
@@ -119,6 +163,8 @@ def _config_payload(
         "output_device_hostapi": "WASAPI",
         "output_device_samplerate": 44_100.0,
         "selected_channels": selected_channels,
+        "monitor_channel_index": monitor_channel_index,
+        "monitor_gain_db": monitor_gain_db,
         "channels": channels,
     }
     if golden_editor_state is not None:
@@ -232,6 +278,8 @@ def test_load_config_returns_hardware_fields_with_cleaned_trigger_model():
         "output_device_hostapi",
         "output_device_samplerate",
         "selected_channels",
+        "monitor_channel_index",
+        "monitor_gain_db",
         "channels",
     }
     assert result["input_device_name"] == "Mic 1"
@@ -243,6 +291,8 @@ def test_load_config_returns_hardware_fields_with_cleaned_trigger_model():
     assert result["plc_id"] is None
     assert result["allow_incomplete_recording_analysis"] is False
     assert result["selected_channels"] == [0, 2]
+    assert result["monitor_channel_index"] == 0
+    assert result["monitor_gain_db"] == 0.0
 
 
 def test_load_config_returns_plc_id_and_not_legacy_plc_text_fields():
@@ -274,6 +324,8 @@ def test_load_config_returns_plc_id_and_not_legacy_plc_text_fields():
         "output_device_hostapi",
         "output_device_samplerate",
         "selected_channels",
+        "monitor_channel_index",
+        "monitor_gain_db",
         "channels",
     }
     assert result["plc_id"] == plc.id
@@ -324,6 +376,8 @@ def test_save_config_persists_hardware_fields():
         "output_device_hostapi",
         "output_device_samplerate",
         "selected_channels",
+        "monitor_channel_index",
+        "monitor_gain_db",
         "channels",
     }
     assert loaded["input_device_name"] == "Mic 1"
@@ -335,7 +389,63 @@ def test_save_config_persists_hardware_fields():
     assert loaded["plc_id"] is None
     assert loaded["allow_incomplete_recording_analysis"] is False
     assert loaded["selected_channels"] == [0, 2]
+    assert loaded["monitor_channel_index"] == 0
+    assert loaded["monitor_gain_db"] == 0.0
     assert row.plc_id is None
+
+
+def test_load_config_defaults_null_monitor_fields_to_selected_channel_and_gain_zero():
+    svc = _service()
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        selected_channels="[2, 0]",
+        monitor_channel_index=None,
+        monitor_gain_db=None,
+    )
+
+    result = svc.load_config(cfg.config_id)
+
+    assert result["monitor_channel_index"] == 2
+    assert result["monitor_gain_db"] == 0.0
+
+
+def test_load_config_defaults_null_monitor_channel_to_zero_when_input_channels_exist():
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="4")
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        selected_channels="[]",
+        monitor_channel_index=None,
+        monitor_gain_db=None,
+    )
+
+    result = svc.load_config(cfg.config_id)
+
+    assert result["monitor_channel_index"] == 0
+    assert result["monitor_gain_db"] == 0.0
+
+
+def test_save_config_persists_monitor_fields_independent_of_selected_channels():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+
+    svc.save_config(
+        _config_payload(
+            config_id,
+            channels=[_channel_payload(0)],
+            selected_channels=[0],
+            monitor_channel_index=2,
+            monitor_gain_db=-12.5,
+        )
+    )
+
+    loaded = svc.load_config(config_id)
+    row = ConfigTable.get_by_id(config_id)
+
+    assert loaded["monitor_channel_index"] == 2
+    assert loaded["monitor_gain_db"] == -12.5
+    assert row.monitor_channel_index == 2
+    assert row.monitor_gain_db == -12.5
 
 
 def test_save_config_persists_plc_id_and_rejects_missing_plc_rows():
@@ -601,6 +711,29 @@ def test_overwrite_imported_config_keeps_local_id_and_clears_plc_id():
     assert loaded["input_device_samplerate"] == 44_100.0
 
 
+def test_prepare_import_payload_preserves_monitor_fields_and_defaults_absent_gain():
+    svc = _service()
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+        monitor_channel_index=3,
+        monitor_gain_db=6.5,
+    )
+    legacy_source = dict(source)
+    legacy_source.pop("monitor_channel_index")
+    legacy_source.pop("monitor_gain_db")
+
+    prepared = svc.prepare_import_payload(source)
+    legacy_prepared = svc.prepare_import_payload(legacy_source)
+
+    assert prepared["monitor_channel_index"] == 3
+    assert prepared["monitor_gain_db"] == 6.5
+    assert legacy_prepared["monitor_channel_index"] is None
+    assert legacy_prepared["monitor_gain_db"] == 0.0
+
+
 def test_imported_config_omitted_golden_assets_clear_bindings_and_modes(tmp_path):
     svc = _service(tmp_path / "managed")
     source = _config_payload(
@@ -766,6 +899,116 @@ def test_legacy_fallback_infers_selected_channels():
     assert result["selected_channels"] == [0, 2]
 
 
+def test_legacy_schema_list_and_load_defaults_monitor_fields_without_columns():
+    svc = _service()
+    _recreate_legacy_config_schema_without_monitor_columns()
+    ConfigTable._meta.database.execute_sql(
+        """
+        INSERT INTO test_config_table (
+            config_id,
+            config_name,
+            record_duration,
+            analysis_duration,
+            scan_triggers_test,
+            selected_channels,
+            input_device_name
+        )
+        VALUES (1, 'Legacy', 5.0, 3.0, 0, '[2, 0]', 'Legacy Mic')
+        """
+    )
+
+    assert "monitor_channel_index" not in _legacy_config_columns()
+    assert "monitor_gain_db" not in _legacy_config_columns()
+    assert svc.list_configs() == [{"config_id": 1, "config_name": "Legacy"}]
+
+    result = svc.load_config(1)
+
+    assert result["config_name"] == "Legacy"
+    assert result["input_device_name"] == "Legacy Mic"
+    assert result["selected_channels"] == [2, 0]
+    assert result["monitor_channel_index"] == 2
+    assert result["monitor_gain_db"] == 0.0
+
+
+def test_legacy_schema_save_and_import_omit_monitor_writes_and_preserve_fields():
+    svc = _service()
+    _recreate_legacy_config_schema_without_monitor_columns()
+    ConfigTable._meta.database.execute_sql(
+        """
+        INSERT INTO test_config_table (
+            config_id,
+            config_name,
+            record_duration,
+            analysis_duration,
+            scan_triggers_test,
+            selected_channels,
+            input_device_name
+        )
+        VALUES (1, 'Legacy Save', 5.0, 3.0, 0, '[0]', 'Before Mic')
+        """
+    )
+
+    save_payload = _config_payload(
+        1,
+        config_name="Legacy Save",
+        channels=[_channel_payload(1)],
+        selected_channels=[1],
+        monitor_channel_index=0,
+        monitor_gain_db=12.0,
+    )
+    save_payload["input_device_name"] = "After Save Mic"
+    save_payload["analysis_window_offset_ms"] = 250
+    svc.save_config(save_payload)
+    saved = svc.load_config(1)
+
+    assert "monitor_channel_index" not in _legacy_config_columns()
+    assert "monitor_gain_db" not in _legacy_config_columns()
+    assert saved["input_device_name"] == "After Save Mic"
+    assert saved["analysis_window_offset_ms"] == 250
+    assert saved["selected_channels"] == [1]
+    assert saved["monitor_channel_index"] == 1
+    assert saved["monitor_gain_db"] == 0.0
+
+    import_payload = _config_payload(
+        999,
+        config_name="Imported Legacy",
+        channels=[_channel_payload(2)],
+        selected_channels=[2],
+        monitor_channel_index=0,
+        monitor_gain_db=6.0,
+    )
+    import_payload["input_device_name"] = "Imported Mic"
+    imported_id = svc.create_imported_config(
+        import_payload,
+        reserved_config_id=svc.reserve_import_config_id(),
+    )
+    imported = svc.load_config(imported_id)
+
+    assert imported["config_name"] == "Imported Legacy"
+    assert imported["input_device_name"] == "Imported Mic"
+    assert imported["selected_channels"] == [2]
+    assert imported["monitor_channel_index"] == 2
+    assert imported["monitor_gain_db"] == 0.0
+
+    overwrite_payload = _config_payload(
+        999,
+        config_name="Imported Legacy",
+        channels=[_channel_payload(3)],
+        selected_channels=[3],
+        monitor_channel_index=0,
+        monitor_gain_db=-18.0,
+    )
+    overwrite_payload["input_device_name"] = "Overwrite Mic"
+    svc.overwrite_imported_config(imported_id, overwrite_payload)
+    overwritten = svc.load_config(imported_id)
+
+    assert overwritten["config_name"] == "Imported Legacy"
+    assert overwritten["input_device_name"] == "Overwrite Mic"
+    assert overwritten["selected_channels"] == [3]
+    assert overwritten["monitor_channel_index"] == 3
+    assert overwritten["monitor_gain_db"] == 0.0
+
+
 def test_load_config_returns_default_loudness_fields_for_channel_rows():
     svc = _service()
     cfg = ConfigTable.create(config_name="Cfg1")
@@ -866,6 +1109,54 @@ def test_validate_device_without_channels_error():
     )
 
     assert "已选择输入设备但未选择任何通道" in errors
+
+
+@pytest.mark.parametrize("monitor_channel_index", [True, "1", 1.5, -1])
+def test_validate_rejects_invalid_monitor_channel(monitor_channel_index):
+    svc = _service()
+    payload = _config_payload(
+        1,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+        monitor_channel_index=monitor_channel_index,
+    )
+
+    errors = svc.validate(payload)
+
+    assert any("监听通道" in err for err in errors)
+
+
+def test_validate_rejects_monitor_channel_outside_input_channel_count():
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="2")
+    payload = _config_payload(
+        1,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+        monitor_channel_index=2,
+    )
+
+    errors = svc.validate(payload)
+
+    assert any("监听通道" in err and "输入通道" in err for err in errors)
+
+
+@pytest.mark.parametrize(
+    "monitor_gain_db",
+    [True, "0", float("nan"), float("inf"), -60.1, 24.1],
+)
+def test_validate_rejects_invalid_monitor_gain(monitor_gain_db):
+    svc = _service()
+    payload = _config_payload(
+        1,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+        monitor_gain_db=monitor_gain_db,
+    )
+
+    errors = svc.validate(payload)
+
+    assert any("监听增益" in err for err in errors)
 
 
 def test_validate_rejects_invalid_loudness_unit():

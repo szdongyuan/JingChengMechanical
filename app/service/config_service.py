@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal
@@ -122,6 +123,28 @@ _VALID_OVERLAP = [0.25, 0.5, 0.75]
 _VALID_WEIGHTING = ["A", "C", "Z"]
 _VALID_LOUDNESS_UNITS = ["sone", "phon"]
 _VALID_GOLDEN_MODES = {"off", "absolute", "delta"}
+MONITOR_GAIN_DEFAULT_DB = 0.0
+MONITOR_GAIN_MIN_DB = -60.0
+MONITOR_GAIN_MAX_DB = 24.0
+_MONITOR_CONFIG_FIELDS = ("monitor_channel_index", "monitor_gain_db")
+_CONFIG_LOAD_FIELD_NAMES = (
+    "config_id",
+    "config_name",
+    "record_duration",
+    "analysis_duration",
+    "analysis_window_offset_ms",
+    "allow_incomplete_recording_analysis",
+    "scan_triggers_test",
+    "plc",
+    "input_device_name",
+    "input_device_hostapi",
+    "input_device_samplerate",
+    "output_device_name",
+    "output_device_hostapi",
+    "output_device_samplerate",
+    "selected_channels",
+    *_MONITOR_CONFIG_FIELDS,
+)
 
 
 @dataclass(frozen=True)
@@ -177,25 +200,44 @@ class ConfigService:
         return list(rows)
 
     def load_config(self, config_id: int) -> dict:
-        cfg = TestConfigTable.get_by_id(config_id)
+        available_columns = self._config_table_columns()
+        fields = [
+            TestConfigTable._meta.fields[field_name]
+            for field_name in _CONFIG_LOAD_FIELD_NAMES
+            if self._config_field_exists(field_name, available_columns)
+        ]
+        cfg = (
+            TestConfigTable.select(*fields)
+            .where(TestConfigTable.config_id == config_id)
+            .dicts()
+            .first()
+        )
+        if cfg is None:
+            raise TestConfigTable.DoesNotExist
+
+        selected_channels = self._parse_json(cfg.get("selected_channels"), [])
         result = {
-            "config_id": cfg.config_id,
-            "config_name": cfg.config_name,
-            "record_duration": cfg.record_duration,
-            "analysis_duration": cfg.analysis_duration,
-            "analysis_window_offset_ms": cfg.analysis_window_offset_ms,
+            "config_id": cfg["config_id"],
+            "config_name": cfg["config_name"],
+            "record_duration": cfg.get("record_duration", 5.0),
+            "analysis_duration": cfg.get("analysis_duration", 3.0),
+            "analysis_window_offset_ms": cfg.get("analysis_window_offset_ms", 0),
             "allow_incomplete_recording_analysis": bool(
-                getattr(cfg, "allow_incomplete_recording_analysis", False)
+                cfg.get("allow_incomplete_recording_analysis", False)
             ),
-            "scan_triggers_test": bool(cfg.scan_triggers_test),
-            "plc_id": cfg.plc_id,
-            "input_device_name": cfg.input_device_name,
-            "input_device_hostapi": cfg.input_device_hostapi,
-            "input_device_samplerate": cfg.input_device_samplerate,
-            "output_device_name": cfg.output_device_name,
-            "output_device_hostapi": cfg.output_device_hostapi,
-            "output_device_samplerate": cfg.output_device_samplerate,
-            "selected_channels": self._parse_json(cfg.selected_channels, []),
+            "scan_triggers_test": bool(cfg.get("scan_triggers_test", False)),
+            "plc_id": cfg.get("plc"),
+            "input_device_name": cfg.get("input_device_name"),
+            "input_device_hostapi": cfg.get("input_device_hostapi"),
+            "input_device_samplerate": cfg.get("input_device_samplerate"),
+            "output_device_name": cfg.get("output_device_name"),
+            "output_device_hostapi": cfg.get("output_device_hostapi"),
+            "output_device_samplerate": cfg.get("output_device_samplerate"),
+            "selected_channels": selected_channels,
+            "monitor_channel_index": None,
+            "monitor_gain_db": self._normalize_monitor_gain(
+                cfg.get("monitor_gain_db")
+            ),
             "channels": [],
         }
         ch_rows = (
@@ -319,6 +361,10 @@ class ConfigService:
             result["selected_channels"] = [
                 ch["channel_index"] for ch in result["channels"]
             ]
+        result["monitor_channel_index"] = self._resolve_monitor_channel_index(
+            cfg.get("monitor_channel_index"),
+            selected_channels=result["selected_channels"],
+        )
         return result
 
     def create_config(self, config_name: str) -> int:
@@ -464,6 +510,9 @@ class ConfigService:
                 and isinstance(channel.get("channel_index"), int)
                 and not isinstance(channel.get("channel_index"), bool)
             ]
+        monitor_gain_db = source.get("monitor_gain_db", MONITOR_GAIN_DEFAULT_DB)
+        if monitor_gain_db is None:
+            monitor_gain_db = MONITOR_GAIN_DEFAULT_DB
 
         return {
             "config_name": str(source.get("config_name", "")).strip(),
@@ -483,6 +532,8 @@ class ConfigService:
             "output_device_hostapi": source.get("output_device_hostapi"),
             "output_device_samplerate": source.get("output_device_samplerate"),
             "selected_channels": selected_channels,
+            "monitor_channel_index": source.get("monitor_channel_index"),
+            "monitor_gain_db": monitor_gain_db,
             "channels": prepared_channels,
         }
 
@@ -664,6 +715,29 @@ class ConfigService:
         sel_ch = data.get("selected_channels", [])
         if input_dev and not sel_ch:
             errors.append("已选择输入设备但未选择任何通道")
+
+        monitor_channel = data.get("monitor_channel_index")
+        if monitor_channel is not None:
+            if (
+                not isinstance(monitor_channel, int)
+                or isinstance(monitor_channel, bool)
+                or monitor_channel < 0
+            ):
+                errors.append("监听通道必须为不小于 0 的整数")
+            else:
+                input_channel_count = self.get_channel_count()
+                if input_channel_count > 0 and monitor_channel >= input_channel_count:
+                    errors.append("监听通道必须小于输入通道数")
+
+        monitor_gain = data.get("monitor_gain_db", MONITOR_GAIN_DEFAULT_DB)
+        if monitor_gain is None:
+            monitor_gain = MONITOR_GAIN_DEFAULT_DB
+        if not self._is_numeric(monitor_gain) or not math.isfinite(float(monitor_gain)):
+            errors.append("监听增益必须为有限数值")
+        elif not MONITOR_GAIN_MIN_DB <= float(monitor_gain) <= MONITOR_GAIN_MAX_DB:
+            errors.append(
+                f"监听增益必须在 {MONITOR_GAIN_MIN_DB:g} 到 {MONITOR_GAIN_MAX_DB:g} dB 之间"
+            )
 
         channels = data.get("channels", [])
         if not isinstance(channels, list):
@@ -1209,7 +1283,7 @@ class ConfigService:
 
     def _config_row_values(self, data: dict) -> dict:
         analysis_window_offset_ms = int(data.get("analysis_window_offset_ms", 0))
-        return {
+        values = {
             "config_name": data["config_name"].strip(),
             "record_duration": data["record_duration"],
             "analysis_duration": data["analysis_duration"],
@@ -1227,6 +1301,52 @@ class ConfigService:
             "output_device_samplerate": data.get("output_device_samplerate"),
             "selected_channels": json.dumps(data.get("selected_channels", [])),
         }
+        available_columns = self._config_table_columns()
+        if self._config_field_exists("monitor_channel_index", available_columns):
+            values["monitor_channel_index"] = data.get("monitor_channel_index")
+        if self._config_field_exists("monitor_gain_db", available_columns):
+            values["monitor_gain_db"] = self._normalize_monitor_gain(
+                data.get("monitor_gain_db", MONITOR_GAIN_DEFAULT_DB)
+            )
+        return values
+
+    @staticmethod
+    def _config_table_columns() -> set[str]:
+        cursor = TestConfigTable._meta.database.execute_sql(
+            f"PRAGMA table_info({TestConfigTable._meta.table_name})"
+        )
+        return {row[1] for row in cursor.fetchall()}
+
+    @staticmethod
+    def _config_field_exists(field_name: str, available_columns: set[str]) -> bool:
+        field = TestConfigTable._meta.fields[field_name]
+        return field.column_name in available_columns
+
+    def _resolve_monitor_channel_index(
+        self,
+        value,
+        *,
+        selected_channels: list,
+    ) -> int | None:
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        for channel_index in selected_channels:
+            if (
+                isinstance(channel_index, int)
+                and not isinstance(channel_index, bool)
+                and channel_index >= 0
+            ):
+                return channel_index
+        if self.get_channel_count() > 0:
+            return 0
+        return None
+
+    def _normalize_monitor_gain(self, value) -> float:
+        if value is None:
+            return MONITOR_GAIN_DEFAULT_DB
+        if self._is_numeric(value) and math.isfinite(float(value)):
+            return float(value)
+        return MONITOR_GAIN_DEFAULT_DB
 
     def _replace_channel_rows(self, *, config_id: int, channels: list[dict]) -> None:
         ChannelConfigTable.delete().where(ChannelConfigTable.config == config_id).execute()

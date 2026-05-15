@@ -134,6 +134,8 @@ def build_chart_payload(
     mic_cal: dict,
     analysis_window: tuple[float, float] | list[float] | None,
     judgment_payload: dict | None = None,
+    channel_column_map: dict[int, int] | None = None,
+    loudness_trace_cache: dict[int, dict] | None = None,
 ) -> dict[int, dict]:
     if not isinstance(buffer, np.ndarray) or buffer.size <= 0:
         return {}
@@ -158,7 +160,11 @@ def build_chart_payload(
     configured_input_sample_rate = config.get("input_device_samplerate")
     payload: dict[int, dict] = {}
     for channel_index in _selected_chart_channels(config, buffer):
-        signal = _extract_channel(window, channel_index)
+        signal = _extract_channel(
+            window,
+            channel_index,
+            channel_column_map=channel_column_map,
+        )
         if signal is None or signal.size <= 0:
             continue
         channel_config = _runtime_channel_config(config, channel_index)
@@ -202,9 +208,11 @@ def build_chart_payload(
         if not isinstance(channel_result, dict) or channel_result.get("loudness_available") is True:
             try:
                 channel_payload["loudness"] = _build_loudness_chart(
+                    channel_index=channel_index,
                     signal=calibrated,
                     sample_rate=sample_rate,
                     channel_config=channel_config,
+                    loudness_trace_cache=loudness_trace_cache,
                 )
             except Exception:
                 pass
@@ -1077,12 +1085,30 @@ def _effective_channel_config(channel_configs: dict[int, dict], channel_index: i
     return channel_config
 
 
-def _extract_channel(buffer: np.ndarray, channel_index: int) -> np.ndarray | None:
+def _extract_channel(
+    buffer: np.ndarray,
+    channel_index: int,
+    *,
+    channel_column_map: dict[int, int] | None = None,
+) -> np.ndarray | None:
+    column_index = _buffer_column_for_channel(channel_index, channel_column_map)
     if buffer.ndim == 1:
         return np.asarray(buffer, dtype=np.float64)
-    if channel_index < 0 or channel_index >= buffer.shape[1]:
+    if column_index < 0 or column_index >= buffer.shape[1]:
         return None
-    return np.asarray(buffer[:, channel_index], dtype=np.float64)
+    return np.asarray(buffer[:, column_index], dtype=np.float64)
+
+
+def _buffer_column_for_channel(
+    channel_index: int,
+    channel_column_map: dict[int, int] | None,
+) -> int:
+    if isinstance(channel_column_map, dict) and channel_index in channel_column_map:
+        try:
+            return int(channel_column_map[channel_index])
+        except (TypeError, ValueError):
+            return channel_index
+    return channel_index
 
 
 def _mic_sensitivity(mic_cal: dict, channel_index: int) -> float:
@@ -1167,8 +1193,22 @@ def _build_spl_chart(*, signal: np.ndarray, sample_rate: float, channel_config: 
     }
 
 
-def _build_loudness_chart(*, signal: np.ndarray, sample_rate: float, channel_config: dict) -> dict:
-    times_sec, values_sone, _max_sone = dsp.compute_loudness_trace(signal, sample_rate)
+def _build_loudness_chart(
+    *,
+    channel_index: int,
+    signal: np.ndarray,
+    sample_rate: float,
+    channel_config: dict,
+    loudness_trace_cache: dict[int, dict] | None,
+) -> dict:
+    cached_trace = _valid_loudness_trace_cache_entry(
+        loudness_trace_cache,
+        channel_index,
+    )
+    if cached_trace is None:
+        times_sec, values_sone, _max_sone = dsp.compute_loudness_trace(signal, sample_rate)
+    else:
+        times_sec, values_sone = cached_trace
     unit = _normalize_loudness_unit(channel_config.get("loudness_unit"))
     values = np.asarray(
         [_loudness_value_in_unit(value_sone, unit) for value_sone in values_sone],
@@ -1193,6 +1233,33 @@ def _build_loudness_chart(*, signal: np.ndarray, sample_rate: float, channel_con
             else None
         ),
     }
+
+
+def _valid_loudness_trace_cache_entry(
+    loudness_trace_cache: dict[int, dict] | None,
+    channel_index: int,
+) -> tuple[list[float], list[float]] | None:
+    if not isinstance(loudness_trace_cache, dict):
+        return None
+    entry = loudness_trace_cache.get(channel_index)
+    if not isinstance(entry, dict):
+        return None
+
+    try:
+        times = np.asarray(entry.get("times_sec"), dtype=np.float64).reshape(-1)
+        values = np.asarray(entry.get("values_sone"), dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+
+    if times.size <= 0 or values.size <= 0 or times.size != values.size:
+        return None
+    if not np.all(np.isfinite(times)) or not np.all(np.isfinite(values)):
+        return None
+    if np.any(values < 0.0):
+        return None
+    if times.size > 1 and not np.all(np.diff(times) > 0.0):
+        return None
+    return times.tolist(), values.tolist()
 
 
 def _build_fft_chart(

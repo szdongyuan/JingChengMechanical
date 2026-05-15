@@ -216,6 +216,8 @@ class ConfigModule(QWidget):
         self._ai_binding_dirty = False
         self._loaded_ai_binding_state = self._normalize_ai_binding(None)
         self._suspend_ai_binding_dirty_tracking = False
+        self._monitor_channel_explicit = False
+        self._suspend_monitor_channel_tracking = False
 
         self._init_ui()
         self._connect_signals()
@@ -364,6 +366,18 @@ class ConfigModule(QWidget):
         self._channel_checkboxes = []
         hw_lay.addRow("通道选择", self._channel_check_container)
 
+        self.combo_monitor_channel = _NoWheelComboBox()
+        self.combo_monitor_channel.setObjectName("combo_monitor_channel")
+        hw_lay.addRow("监听通道", self.combo_monitor_channel)
+
+        self.spin_monitor_gain_db = _NoWheelSpinBox()
+        self.spin_monitor_gain_db.setObjectName("spin_monitor_gain_db")
+        self.spin_monitor_gain_db.setRange(-60.0, 24.0)
+        self.spin_monitor_gain_db.setSingleStep(1.0)
+        self.spin_monitor_gain_db.setDecimals(1)
+        self.spin_monitor_gain_db.setSuffix(" dB")
+        hw_lay.addRow("监听增益", self.spin_monitor_gain_db)
+
         scroll_lay.addWidget(Card("硬件设置", hw_form))
 
         # AI binding card (test-level, not per-channel)
@@ -472,6 +486,9 @@ class ConfigModule(QWidget):
         self.btn_save.clicked.connect(self._on_save)
         self.config_list.currentItemChanged.connect(self._on_item_changed)
         self.combo_input_dev.currentIndexChanged.connect(self._on_input_device_changed)
+        self.combo_monitor_channel.currentIndexChanged.connect(
+            self._on_monitor_channel_changed
+        )
         self.spin_analysis.valueChanged.connect(
             lambda _value: self._refresh_all_golden_sections()
         )
@@ -557,6 +574,8 @@ class ConfigModule(QWidget):
     def _on_input_device_changed(self, index):
         """Rebuild channel checkboxes and tabs when input device changes."""
         existing_channel_data = self._current_channel_editor_data()
+        preferred_monitor_channel = self.combo_monitor_channel.currentData()
+        was_monitor_channel_explicit = self._monitor_channel_explicit
         for cb in self._channel_checkboxes:
             cb.deleteLater()
         self._channel_checkboxes = []
@@ -567,16 +586,27 @@ class ConfigModule(QWidget):
         dev_info = self.combo_input_dev.currentData()
         if not dev_info or not isinstance(dev_info, dict):
             self._prune_staged_bindings([])
+            self._rebuild_monitor_channel_options(preferred=None)
+            self._monitor_channel_explicit = False
             self._build_channel_tabs([], None)
             return
 
         max_ch = dev_info.get("max_input_channels", 0)
         for i in range(max_ch):
-            cb = QCheckBox(f"In{i + 1}")
+            cb = QCheckBox(f"输入{i + 1}")
             cb.toggled.connect(self._on_channel_selection_changed)
             row, col = divmod(i, 6)
             self._channel_check_layout.addWidget(cb, row, col)
             self._channel_checkboxes.append(cb)
+
+        self._rebuild_monitor_channel_options(preferred=preferred_monitor_channel)
+        self._monitor_channel_explicit = (
+            was_monitor_channel_explicit
+            and self._is_valid_monitor_channel(
+                preferred_monitor_channel,
+                self._current_input_channel_count(),
+            )
+        )
 
         # Rebuild tabs for ALL channels, not just checked ones
         all_indices = list(range(max_ch))
@@ -586,7 +616,78 @@ class ConfigModule(QWidget):
 
     def _on_channel_selection_changed(self):
         """Channel checkbox toggled — tabs are built by _on_input_device_changed."""
-        pass
+        current = self.combo_monitor_channel.currentData()
+        max_ch = self._current_input_channel_count()
+        if not self._is_valid_monitor_channel(current, max_ch):
+            self._rebuild_monitor_channel_options(preferred=None)
+            return
+        if self._monitor_channel_explicit:
+            return
+        fallback = self._default_monitor_channel(max_ch)
+        if fallback is not None and fallback != current:
+            self._set_monitor_channel_current_data(fallback)
+
+    def _on_monitor_channel_changed(self, _index):
+        if self._suspend_monitor_channel_tracking:
+            return
+        if self.combo_monitor_channel.currentData() is not None:
+            self._monitor_channel_explicit = True
+
+    def _current_input_channel_count(self) -> int:
+        dev_info = self.combo_input_dev.currentData()
+        if not dev_info or not isinstance(dev_info, dict):
+            return 0
+        try:
+            return max(0, int(dev_info.get("max_input_channels", 0)))
+        except (TypeError, ValueError):
+            return 0
+
+    @staticmethod
+    def _is_valid_monitor_channel(value, max_ch: int) -> bool:
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and 0 <= value < max_ch
+        )
+
+    def _default_monitor_channel(self, max_ch: int) -> int | None:
+        for i, cb in enumerate(self._channel_checkboxes):
+            if i >= max_ch:
+                break
+            if cb.isChecked():
+                return i
+        return 0 if max_ch > 0 else None
+
+    def _set_monitor_channel_current_data(self, value: int | None) -> None:
+        self._suspend_monitor_channel_tracking = True
+        self.combo_monitor_channel.blockSignals(True)
+        if value is None:
+            self.combo_monitor_channel.setCurrentIndex(-1)
+        else:
+            index = self.combo_monitor_channel.findData(value)
+            self.combo_monitor_channel.setCurrentIndex(index if index >= 0 else -1)
+        self.combo_monitor_channel.blockSignals(False)
+        self._suspend_monitor_channel_tracking = False
+
+    def _rebuild_monitor_channel_options(self, preferred: int | None = None) -> int | None:
+        max_ch = self._current_input_channel_count()
+        target = (
+            int(preferred)
+            if self._is_valid_monitor_channel(preferred, max_ch)
+            else self._default_monitor_channel(max_ch)
+        )
+
+        self._suspend_monitor_channel_tracking = True
+        self.combo_monitor_channel.blockSignals(True)
+        self.combo_monitor_channel.clear()
+        for i in range(max_ch):
+            self.combo_monitor_channel.addItem(f"输入{i + 1}", i)
+        if target is not None:
+            index = self.combo_monitor_channel.findData(target)
+            self.combo_monitor_channel.setCurrentIndex(index if index >= 0 else -1)
+        self.combo_monitor_channel.blockSignals(False)
+        self._suspend_monitor_channel_tracking = False
+        return target
 
     @staticmethod
     def _empty_golden_binding() -> dict:
@@ -1530,6 +1631,19 @@ class ConfigModule(QWidget):
             cb.setChecked(i in selected)
             cb.blockSignals(False)
 
+        gain_db = data.get("monitor_gain_db", 0.0)
+        if not isinstance(gain_db, (int, float)) or isinstance(gain_db, bool):
+            gain_db = 0.0
+        self.spin_monitor_gain_db.setValue(float(gain_db))
+
+        saved_monitor_channel = data.get("monitor_channel_index")
+        self._monitor_channel_explicit = False
+        self._rebuild_monitor_channel_options(preferred=saved_monitor_channel)
+        self._monitor_channel_explicit = self._is_valid_monitor_channel(
+            saved_monitor_channel,
+            self._current_input_channel_count(),
+        )
+
     def _match_device_combo(self, combo, name, hostapi, samplerate):
         """Match saved device against combo items. Inject unavailable device if not found."""
         if not name:
@@ -1565,6 +1679,7 @@ class ConfigModule(QWidget):
 
         dev_info = self.combo_input_dev.currentData()
         if not dev_info or not isinstance(dev_info, dict):
+            self._rebuild_monitor_channel_options(preferred=None)
             return
 
         max_ch = dev_info.get("max_input_channels", 0)
@@ -1574,6 +1689,9 @@ class ConfigModule(QWidget):
             row, col = divmod(i, 6)
             self._channel_check_layout.addWidget(cb, row, col)
             self._channel_checkboxes.append(cb)
+        self._rebuild_monitor_channel_options(
+            preferred=self.combo_monitor_channel.currentData()
+        )
 
     # ── Data collection ─────────────────────────────────────
 
@@ -1697,6 +1815,10 @@ class ConfigModule(QWidget):
             "output_device_hostapi": output_dev.get("hostapi") if isinstance(output_dev, dict) else None,
             "output_device_samplerate": output_dev.get("default_samplerate") if isinstance(output_dev, dict) else None,
             "selected_channels": selected_channels,
+            "monitor_channel_index": self.combo_monitor_channel.currentData()
+            if self.combo_monitor_channel.count() > 0
+            else None,
+            "monitor_gain_db": float(self.spin_monitor_gain_db.value()),
             "channels": [],
             "golden_editor_state": {},
         }

@@ -4,6 +4,7 @@ Orchestrates: recorder -> pipelines -> judgment -> result.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -18,7 +19,9 @@ from scipy.io import wavfile
 
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.judgment import JudgmentEngine, _runtime_channel_defaults
+from app.service.analysis.live_display_dispatcher import LiveDisplayDispatcher
 from app.service.analysis.pipeline import AnalysisPipeline
+from app.service.analysis.selected_channels import project_selected_channels
 from model.audio_data_table import AudioDataTable
 
 _TZ8 = timezone(timedelta(hours=8))
@@ -58,9 +61,13 @@ class TestSession:
         self._sample_rate: float = float(config.get("input_device_samplerate", 44100))
 
         self._pipelines: list[AnalysisPipeline] = []
+        self._live_display_dispatcher: LiveDisplayDispatcher | None = None
         self._buffer: np.ndarray | None = None
+        self._source_channels: tuple[int, ...] = ()
+        self._real_to_logical_channel: dict[int, int] = {}
         self._judgment: JudgmentEngine = JudgmentEngine(ai_service)
         self._last_result: JudgmentResult | None = None
+        self._last_loudness_trace_cache: dict[int, dict] | None = None
         self._last_ai_review: dict[str, Any] | None = None
         self._audio_file_path: str | None = None
         self._audio_data_id: str | None = None
@@ -84,6 +91,7 @@ class TestSession:
 
     def _setup_pipelines(self):
         """Create one AnalysisPipeline per selected channel."""
+        self.stop_live_display()
         selected = self._config.get("selected_channels", [])
         self._live_loudness_channel_index = self._first_selected_channel(selected)
         channels_cfg = {ch["channel_index"]: ch for ch in self._config.get("channels", [])}
@@ -101,6 +109,11 @@ class TestSession:
                     mic_sensitivity=sensitivity,
                 )
             )
+        self._live_display_dispatcher = LiveDisplayDispatcher(
+            pipelines=self._pipelines,
+            bus=self._bus,
+            config_id=self.config_id,
+        )
 
     def set_live_loudness_channel_index(self, channel_index: int | None):
         if channel_index is None:
@@ -174,37 +187,16 @@ class TestSession:
             else 0.0
         )
         frame_run_id = self._runtime_frame_run_id()
+        sample_end = self._processed_samples_since_attach
+        sample_start = max(0, sample_end - chunk_samples)
 
-        for pipeline in self._pipelines:
-            ch_idx = pipeline.channel_index
-            if chunk.ndim == 2 and ch_idx < chunk.shape[1]:
-                mono = chunk[:, ch_idx]
-            elif chunk.ndim == 1:
-                mono = chunk
-            else:
-                continue
-
-            result = pipeline.process_chunk(
-                mono,
-                elapsed,
-                compute_loudness=(ch_idx == self._live_loudness_channel_index),
-            )
-
-            for stft_frame in result["stft_frames"]:
-                self._bus.stft_updated.emit(self.config_id, frame_run_id, ch_idx, stft_frame)
-            if result["spl"] is not None:
-                self._bus.spl_updated.emit(self.config_id, frame_run_id, ch_idx, result["spl"])
-            if result.get("loudness") is not None:
-                self._bus.loudness_updated.emit(
-                    self.config_id,
-                    frame_run_id,
-                    ch_idx,
-                    result["loudness"],
-                )
-            if result["octave"] is not None:
-                self._bus.octave_updated.emit(self.config_id, frame_run_id, ch_idx, result["octave"])
-            if result["fft"] is not None:
-                self._bus.fft_updated.emit(self.config_id, frame_run_id, ch_idx, result["fft"])
+        self._submit_live_display_chunk(
+            chunk,
+            elapsed,
+            frame_run_id,
+            sample_start=sample_start,
+            sample_end=sample_end,
+        )
 
         self._bus.recording_progress.emit(self.config_id, elapsed)
 
@@ -212,6 +204,55 @@ class TestSession:
             self._finished = True
             if self._on_session_done_cb is not None:
                 self._on_session_done_cb(self.config_id)
+
+    def _submit_live_display_chunk(
+        self,
+        chunk: np.ndarray,
+        elapsed: float,
+        frame_run_id: str,
+        *,
+        sample_start: int | None = None,
+        sample_end: int | None = None,
+    ) -> None:
+        dispatcher = self._live_display_dispatcher
+        if dispatcher is None:
+            return
+        try:
+            submit_kwargs = {
+                "elapsed_time": elapsed,
+                "frame_run_id": frame_run_id,
+                "live_loudness_channel_index": self._live_loudness_channel_index,
+            }
+            submit = dispatcher.submit
+            if self._live_display_submit_accepts_sample_span(submit):
+                submit_kwargs["sample_start"] = sample_start
+                submit_kwargs["sample_end"] = sample_end
+            submit(chunk, **submit_kwargs)
+        except Exception as exc:
+            self._bus.log.emit(
+                f"[TestSession] WARNING: live display submission failed "
+                f"for config={self.config_id}: {exc}"
+            )
+
+    def stop_live_display(self) -> None:
+        dispatcher = self._live_display_dispatcher
+        self._live_display_dispatcher = None
+        if dispatcher is None:
+            return
+        stop = getattr(dispatcher, "stop", None)
+        if callable(stop):
+            stop()
+
+    def capture_recorder_buffer(self, hardware_buffer: np.ndarray, sample_rate: float) -> np.ndarray:
+        view = project_selected_channels(
+            hardware_buffer,
+            self._config.get("selected_channels", []),
+        )
+        self._buffer = view.buffer
+        self._source_channels = view.source_channels
+        self._real_to_logical_channel = view.real_to_logical
+        self._sample_rate = sample_rate
+        return self._buffer
 
     def _run_judgment(self) -> JudgmentResult | None:
         """Run judgment on the recorded buffer."""
@@ -221,13 +262,17 @@ class TestSession:
 
         self._audio_file_path = self._save_wav(self._buffer, self._sample_rate)
 
+        loudness_trace_cache: dict[int, dict] = {}
         result = self._judgment.judge(
             self._config,
             self._buffer,
             self._sample_rate,
             self._mic_cal,
             self._audio_file_path,
+            loudness_trace_cache=loudness_trace_cache,
+            **self._judgment_channel_kwargs(),
         )
+        self._last_loudness_trace_cache = loudness_trace_cache
         result = self._run_ai(result)
         self._last_result = result
         self._persist_audio_result_metadata(result)
@@ -378,11 +423,14 @@ class TestSession:
         default_window_duration_ms = int(self._analysis_duration * 1000)
         final_window_offset_ms = int(analysis_start * 1000)
         final_window_duration_ms = max(0, int((analysis_end - analysis_start) * 1000))
+        channel_metadata = self._ai_segment_channel_metadata()
         segments = [{
             "segment_id": self._audio_data_id,
             "role": "device_1",
             "audio_path": self._audio_file_path,
-            "channels": self._config.get("selected_channels", []),
+            "channels": channel_metadata["channels"],
+            "source_channels": channel_metadata["source_channels"],
+            "channel_map": channel_metadata["channel_map"],
             "duration_ms": final_window_duration_ms or default_window_duration_ms,
             "sample_rate": int(self._sample_rate),
             "metadata": {},
@@ -543,6 +591,7 @@ class TestSession:
         if self._buffer is None or self._audio_file_path is None:
             return None
         self._last_ai_review = None
+        loudness_trace_cache: dict[int, dict] = {}
         result = self._judgment.rejudge(
             self._config,
             self._buffer,
@@ -551,10 +600,89 @@ class TestSession:
             self._audio_file_path,
             start_sec,
             end_sec,
+            loudness_trace_cache=loudness_trace_cache,
+            **self._judgment_channel_kwargs(),
         )
+        self._last_loudness_trace_cache = loudness_trace_cache
         result = self._run_ai(result)
         self._last_result = result
         return result
+
+    def _judgment_channel_kwargs(self) -> dict[str, dict[int, int]]:
+        if self._real_to_logical_channel:
+            return {"channel_column_map": dict(self._real_to_logical_channel)}
+        return {}
+
+    def _ai_segment_channel_metadata(self) -> dict[str, list[Any]]:
+        if self._source_channels:
+            source_channels = list(self._source_channels)
+            logical_channels = [
+                int(self._real_to_logical_channel.get(source, fallback))
+                for fallback, source in enumerate(source_channels)
+            ]
+        elif self._real_to_logical_channel:
+            pairs = sorted(
+                self._real_to_logical_channel.items(),
+                key=lambda item: item[1],
+            )
+            source_channels = [int(source) for source, _ in pairs]
+            logical_channels = [int(logical) for _, logical in pairs]
+        else:
+            source_channels, logical_channels = self._fallback_ai_segment_channels()
+
+        if len(source_channels) != len(logical_channels):
+            source_channels = source_channels[:len(logical_channels)]
+        if len(source_channels) < len(logical_channels):
+            source_channels = list(logical_channels)
+
+        return {
+            "channels": logical_channels,
+            "source_channels": source_channels,
+            "channel_map": [
+                {"logical_channel": logical, "source_channel": source}
+                for logical, source in zip(logical_channels, source_channels)
+            ],
+        }
+
+    def _fallback_ai_segment_channels(self) -> tuple[list[int], list[int]]:
+        selected_channels = self._selected_channels_for_ai_metadata()
+        buffer_channel_count = self._buffer_channel_count()
+
+        if buffer_channel_count <= 0:
+            logical_channels = list(range(len(selected_channels)))
+        elif selected_channels and all(
+            channel < buffer_channel_count for channel in selected_channels
+        ):
+            logical_channels = list(selected_channels)
+        else:
+            logical_channel_count = buffer_channel_count
+            if selected_channels:
+                logical_channel_count = min(buffer_channel_count, len(selected_channels))
+            logical_channels = list(range(logical_channel_count))
+
+        if selected_channels:
+            source_channels = selected_channels[:len(logical_channels)]
+        else:
+            source_channels = list(logical_channels)
+        return source_channels, logical_channels
+
+    def _selected_channels_for_ai_metadata(self) -> list[int]:
+        selected_channels: list[int] = []
+        for channel in self._config.get("selected_channels", []) or ():
+            if isinstance(channel, (bool, np.bool_)):
+                continue
+            if isinstance(channel, (int, np.integer)) and int(channel) >= 0:
+                selected_channels.append(int(channel))
+        return selected_channels
+
+    def _buffer_channel_count(self) -> int:
+        if self._buffer is None:
+            return 0
+        if self._buffer.ndim == 1:
+            return 1
+        if self._buffer.ndim == 2:
+            return int(self._buffer.shape[1])
+        return 0
 
     def _get_or_create_test_run_id(self) -> str:
         """Return the stable AI test_run_id for this session."""
@@ -626,6 +754,20 @@ class TestSession:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _live_display_submit_accepts_sample_span(submit) -> bool:
+        try:
+            signature = inspect.signature(submit)
+        except (TypeError, ValueError):
+            return True
+        parameters = signature.parameters
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            return True
+        return "sample_start" in parameters and "sample_end" in parameters
 
     @staticmethod
     def _coerce_ai_channel_index(value) -> int | None:

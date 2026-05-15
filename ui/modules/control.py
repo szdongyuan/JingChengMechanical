@@ -135,7 +135,7 @@ class ControlModule(QWidget):
         self.services.bus.log.emit(log_message)
 
     def _show_manual_judgment_warning(self, message: str) -> None:
-        QMessageBox.warning(self, "提示", f"人工判定失败：{message}")
+        QMessageBox.warning(self, "人工判定失败", message)
 
     def _sync_start_state(self) -> None:
         self.btn_start.setEnabled(not self._start_click_disabled())
