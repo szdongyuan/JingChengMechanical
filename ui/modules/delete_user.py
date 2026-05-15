@@ -123,8 +123,8 @@ class DeleteUserWindow(QWidget):
             .execute()
         )
         if deleted == 0:
-            QMessageBox.warning(self, "提示", "删除失败。              ")
+            QMessageBox.warning(self, "提示", "删除失败。")
             return
 
-        QMessageBox.information(self, "提示", "删除用户成功。              ")
+        QMessageBox.information(self, "提示", "删除用户成功。")
         self.load_users()

@@ -23,6 +23,9 @@ from app.service.config_package_service import (
 )
 from app.service.config_service import ConfigService
 from app.service.golden_sample_service import GoldenSampleService
+from model.channel_config_table import ChannelConfigTable
+from model.test_config_ai_binding_table import TestConfigAiBindingTable as AiBindingTable
+from model.test_config_table import TestConfigTable as ConfigTable
 
 _TOOLCHAIN_MARKER_NAME = ".jingcheng_toolchain_id"
 
@@ -44,6 +47,41 @@ def _make_services(tmp_path: Path) -> SimpleNamespace:
             ai_service=ai_service,
         ),
     )
+
+
+def _recreate_legacy_config_schema_without_monitor_columns() -> None:
+    database = ConfigTable._meta.database
+    database.execute_sql("DROP TABLE IF EXISTS channel_config_table")
+    database.execute_sql("DROP TABLE IF EXISTS test_config_ai_binding_table")
+    database.execute_sql("DROP TABLE IF EXISTS test_config_table")
+    database.execute_sql(
+        """
+        CREATE TABLE test_config_table (
+            config_id INTEGER NOT NULL PRIMARY KEY,
+            config_name TEXT NOT NULL UNIQUE,
+            record_duration REAL NOT NULL DEFAULT 5.0,
+            analysis_duration REAL NOT NULL DEFAULT 3.0,
+            allow_incomplete_recording_analysis INTEGER NOT NULL DEFAULT 0,
+            scan_triggers_test INTEGER NOT NULL DEFAULT 0,
+            plc_id INTEGER,
+            plc_device_key TEXT,
+            plc_device_label TEXT,
+            created_time TEXT NOT NULL DEFAULT 'legacy-created',
+            updated_time TEXT NOT NULL DEFAULT 'legacy-updated',
+            input_device_name TEXT,
+            input_device_hostapi TEXT,
+            input_device_samplerate REAL,
+            output_device_name TEXT,
+            output_device_hostapi TEXT,
+            output_device_samplerate REAL,
+            selected_channels TEXT NOT NULL DEFAULT '[]',
+            analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (plc_id) REFERENCES plc_table (id) ON DELETE SET NULL
+        )
+        """
+    )
+    ChannelConfigTable.create_table(safe=True)
+    AiBindingTable.create_table(safe=True)
 
 
 @pytest.fixture
@@ -99,7 +137,13 @@ def _channel_payload(channel_index: int) -> dict:
     }
 
 
-def _config_payload(config_id: int, *, config_name: str = "Cfg1") -> dict:
+def _config_payload(
+    config_id: int,
+    *,
+    config_name: str = "Cfg1",
+    monitor_channel_index: int | None = 0,
+    monitor_gain_db: float | None = 0.0,
+) -> dict:
     return {
         "config_id": config_id,
         "config_name": config_name,
@@ -116,6 +160,8 @@ def _config_payload(config_id: int, *, config_name: str = "Cfg1") -> dict:
         "output_device_hostapi": "WASAPI",
         "output_device_samplerate": 44_100.0,
         "selected_channels": [0],
+        "monitor_channel_index": monitor_channel_index,
+        "monitor_gain_db": monitor_gain_db,
         "channels": [_channel_payload(0)],
     }
 
@@ -344,6 +390,33 @@ def test_export_writes_manifest_and_single_config_payload(tmp_path: Path, servic
         "toolchain_id": None,
         "timeout_ms": None,
     }
+
+
+def test_export_writes_monitor_fields_in_config_payload(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    config_id = services.config_service.create_config("CfgMonitor")
+    payload = _config_payload(
+        config_id,
+        config_name="CfgMonitor",
+        monitor_channel_index=2,
+        monitor_gain_db=-9.5,
+    )
+    services.config_service.save_config(payload)
+    target = tmp_path / "monitor.dy"
+
+    services.config_package_service.export_package(
+        config_id=config_id,
+        target_path=str(target),
+        options=ConfigPackageExportOptions(),
+    )
+
+    with zipfile.ZipFile(target) as zf:
+        package_payload = json.loads(zf.read("config/config.json"))
+
+    assert package_payload["config"]["monitor_channel_index"] == 2
+    assert package_payload["config"]["monitor_gain_db"] == -9.5
 
 
 def test_export_includes_selected_golden_samples(tmp_path: Path, services: SimpleNamespace):
@@ -971,6 +1044,36 @@ def test_inspect_package_reports_config_and_runnable_ai_conflicts(
     assert preview.default_ai_action in preview.ai_action_options
 
 
+def test_inspect_package_detects_conflict_with_legacy_schema_missing_monitor_columns(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    _recreate_legacy_config_schema_without_monitor_columns()
+    ConfigTable._meta.database.execute_sql(
+        """
+        INSERT INTO test_config_table (
+            config_id,
+            config_name,
+            record_duration,
+            analysis_duration,
+            scan_triggers_test,
+            selected_channels
+        )
+        VALUES (1, 'Imported', 5.0, 3.0, 0, '[0]')
+        """
+    )
+    path = _write_package(
+        tmp_path / "legacy-conflict.dy",
+        _package_entries(config_payload=_config_payload(999, config_name="Imported")),
+    )
+
+    preview = services.config_package_service.inspect_package(str(path))
+
+    assert preview.config_conflict is True
+    assert preview.config_action_options == ("overwrite", "use_existing_config", "cancel")
+    assert preview.default_config_action == "use_existing_config"
+
+
 def _managed_toolchain_dir_name(toolchain_id: str) -> str:
     digest = hashlib.sha256(toolchain_id.encode("utf-8")).hexdigest()[:16]
     return f"{toolchain_id}_{digest}"
@@ -1174,6 +1277,31 @@ def test_import_package_round_trips_limit_switch_fields(
     assert channel["loudness_lower_limit"] == 2.5
     assert channel["loudness_average_upper_enabled"] is True
     assert channel["loudness_average_upper_limit"] == 9.5
+
+
+def test_import_package_round_trips_monitor_fields(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    imported_config = _config_payload(
+        999,
+        config_name="Imported",
+        monitor_channel_index=2,
+        monitor_gain_db=6.5,
+    )
+    path = _write_package(
+        tmp_path / "monitor.dy",
+        _package_entries(config_payload=imported_config),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    loaded = services.config_service.load_config(result.config_id)
+    assert loaded["monitor_channel_index"] == 2
+    assert loaded["monitor_gain_db"] == 6.5
 
 
 def test_import_package_overwrite_rollback_preserves_old_golden_binding(

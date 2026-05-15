@@ -1,22 +1,42 @@
 import os
 import sys
 from PyQt6.QtGui import QIcon
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from app.main_window import MainWindow
+from app.service.db_connection_service import DatabaseStartupError
 from app.services_container import ServiceContainer
 from base.utils import asset_path
 from ui.modules.login import LoginWindow
 
 
-def main():
-    app = QApplication(sys.argv)
+DATABASE_STARTUP_ERROR_TITLE = "数据库启动失败"
+
+
+def _database_startup_error_message(error: Exception) -> str:
+    return (
+        "数据库文件缺失或不完整，软件无法启动。\n\n"
+        f"错误信息：{error}\n\n"
+        "请复制准备好的 jingchen.db 后重新启动软件。"
+    )
+
+
+def run_app(argv=None) -> int:
+    app = QApplication(sys.argv if argv is None else argv)
 
     icon_path = asset_path("logo.ico")
     if os.path.exists(icon_path):
         app.setWindowIcon(QIcon(icon_path))
 
-    services = ServiceContainer()
+    try:
+        services = ServiceContainer()
+    except DatabaseStartupError as exc:
+        QMessageBox.critical(
+            None,
+            DATABASE_STARTUP_ERROR_TITLE,
+            _database_startup_error_message(exc),
+        )
+        return 1
 
     # 主窗口在登录成功后才创建；用变量持有引用，避免被 Python 回收导致界面消失。
     main_window = None
@@ -42,7 +62,12 @@ def main():
     )
     login_window.show()
 
-    sys.exit(app.exec())
+    return app.exec()
+
+
+def main():
+    sys.exit(run_app())
+
 
 if __name__ == "__main__":
     main()

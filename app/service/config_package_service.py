@@ -346,9 +346,9 @@ class ConfigPackageService:
                     config_errors = self._config_service.validate(prepared_config)
                     if config_errors:
                         raise ValueError("\n".join(config_errors))
-                    if config_action == "create" and TestConfigTable.select().where(
-                        TestConfigTable.config_id == target_config_id
-                    ).exists():
+                    if config_action == "create" and TestConfigTable.select(
+                        TestConfigTable.config_id
+                    ).where(TestConfigTable.config_id == target_config_id).exists():
                         raise ValueError("导入配置 ID 已被占用")
 
                     old_golden_paths = (
@@ -507,7 +507,10 @@ class ConfigPackageService:
         if not normalized:
             return None
         return (
-            TestConfigTable.select()
+            TestConfigTable.select(
+                TestConfigTable.config_id,
+                TestConfigTable.config_name,
+            )
             .where(TestConfigTable.config_name == normalized)
             .first()
         )
@@ -694,7 +697,9 @@ class ConfigPackageService:
             )
             return
 
-        if not TestConfigTable.select().where(TestConfigTable.config_id == config_id).exists():
+        if not TestConfigTable.select(TestConfigTable.config_id).where(
+            TestConfigTable.config_id == config_id
+        ).exists():
             raise ValueError("配置不存在或已被删除")
         (
             TestConfigTable.update(

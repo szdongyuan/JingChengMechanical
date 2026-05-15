@@ -66,6 +66,9 @@ class JudgmentEngine:
         sample_rate: float,
         mic_cal: dict,
         audio_file_path: str,
+        *,
+        channel_column_map: dict[int, int] | None = None,
+        loudness_trace_cache: dict[int, dict] | None = None,
     ) -> JudgmentResult:
         """Run judgment on the configured automatic analysis window.
 
@@ -89,8 +92,17 @@ class JudgmentEngine:
                 "Captured audio does not fully cover the required analysis window "
                 f"({start_sec:.3f}s to {end_sec:.3f}s)"
             )
-        return self._run(config, buffer, sample_rate, mic_cal,
-                         audio_file_path, start_sec, end_sec)
+        return self._run(
+            config,
+            buffer,
+            sample_rate,
+            mic_cal,
+            audio_file_path,
+            start_sec,
+            end_sec,
+            channel_column_map=channel_column_map,
+            loudness_trace_cache=loudness_trace_cache,
+        )
 
     def rejudge(
         self,
@@ -101,13 +113,25 @@ class JudgmentEngine:
         audio_file_path: str,
         start_sec: float,
         end_sec: float,
+        *,
+        channel_column_map: dict[int, int] | None = None,
+        loudness_trace_cache: dict[int, dict] | None = None,
     ) -> JudgmentResult:
         """Re-run judgment on a user-selected window."""
         total_sec = buffer.shape[0] / sample_rate
         start_sec = max(0.0, min(start_sec, total_sec))
         end_sec = max(start_sec, min(end_sec, total_sec))
-        return self._run(config, buffer, sample_rate, mic_cal,
-                         audio_file_path, start_sec, end_sec)
+        return self._run(
+            config,
+            buffer,
+            sample_rate,
+            mic_cal,
+            audio_file_path,
+            start_sec,
+            end_sec,
+            channel_column_map=channel_column_map,
+            loudness_trace_cache=loudness_trace_cache,
+        )
 
     def _run(
         self,
@@ -118,6 +142,9 @@ class JudgmentEngine:
         audio_file_path: str,
         start_sec: float,
         end_sec: float,
+        *,
+        channel_column_map: dict[int, int] | None = None,
+        loudness_trace_cache: dict[int, dict] | None = None,
     ) -> JudgmentResult:
         start_idx = int(start_sec * sample_rate)
         end_idx = int(end_sec * sample_rate)
@@ -140,9 +167,11 @@ class JudgmentEngine:
                 # Spec: use defaults when channel config is missing
                 ch_cfg = _runtime_channel_defaults(ch_idx)
 
+            column_index = self._buffer_column_for_channel(ch_idx, channel_column_map)
+
             # Extract single channel
-            if window.ndim == 2 and ch_idx < window.shape[1]:
-                sig = window[:, ch_idx].copy()
+            if window.ndim == 2 and 0 <= column_index < window.shape[1]:
+                sig = window[:, column_index].copy()
             elif window.ndim == 1:
                 sig = window.copy()
             else:
@@ -241,7 +270,13 @@ class JudgmentEngine:
                 loudness_average_upper,
             )
             try:
-                _, loudness_values_sone, loudness_max_sone = dsp.compute_loudness_trace(sig, sample_rate)
+                times_sec, loudness_values_sone, loudness_max_sone = dsp.compute_loudness_trace(sig, sample_rate)
+                if loudness_trace_cache is not None:
+                    loudness_trace_cache[ch_idx] = {
+                        "times_sec": list(times_sec),
+                        "values_sone": list(loudness_values_sone),
+                        "max_sone": float(loudness_max_sone),
+                    }
                 loudness_min_sone, loudness_trace_max_sone = self._value_bounds(loudness_values_sone)
                 if loudness_trace_max_sone is not None:
                     loudness_max_sone = loudness_trace_max_sone
@@ -258,6 +293,8 @@ class JudgmentEngine:
                 )
                 loudness_available = True
             except Exception as exc:
+                if loudness_trace_cache is not None:
+                    loudness_trace_cache.pop(ch_idx, None)
                 loudness_error_message = str(exc) or exc.__class__.__name__
                 loudness_pass = None if loudness_constrained else True
                 loudness_average_pass = None if loudness_average_constrained else True
@@ -345,6 +382,18 @@ class JudgmentEngine:
             channel_results=channel_results,
             analysis_window=(start_sec, end_sec),
         )
+
+    @staticmethod
+    def _buffer_column_for_channel(
+        channel_index: int,
+        channel_column_map: dict[int, int] | None,
+    ) -> int:
+        if isinstance(channel_column_map, dict) and channel_index in channel_column_map:
+            try:
+                return int(channel_column_map[channel_index])
+            except (TypeError, ValueError):
+                return channel_index
+        return channel_index
 
     def _check_fft_bands(
         self,

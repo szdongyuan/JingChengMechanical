@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 
+from app.service.analysis.selected_channels import project_selected_channels
 from app.service.analysis.test_manager import TestManager
 
 
@@ -30,6 +31,8 @@ class _FakeSession:
         self._sample_rate = None
         self._audio_file_path = None
         self._audio_data_id = None
+        self._source_channels = ()
+        self._real_to_logical_channel = {}
         self.last_ai_review = None
         self._finished = False
         self._attach_snapshot = None
@@ -48,6 +51,17 @@ class _FakeSession:
 
     def _run_judgment(self):
         raise AssertionError("not used in this test")
+
+    def capture_recorder_buffer(self, hardware_buffer, sample_rate):
+        view = project_selected_channels(
+            hardware_buffer,
+            self._config.get("selected_channels", []),
+        )
+        self._buffer = view.buffer
+        self._source_channels = view.source_channels
+        self._real_to_logical_channel = view.real_to_logical
+        self._sample_rate = sample_rate
+        return self._buffer
 
     def _save_wav(self, *args, **kwargs):
         self._audio_file_path = "partial.wav"
@@ -160,11 +174,20 @@ def _make_running_factory_manager(
     class FakeMonitor:
         instances = []
 
-        def __init__(self, *, device_name, hostapi, sample_rate, monitor_channel):
+        def __init__(
+            self,
+            *,
+            device_name,
+            hostapi,
+            sample_rate,
+            monitor_channel,
+            gain_db=0.0,
+        ):
             self.device_name = device_name
             self.hostapi = hostapi
             self.sample_rate = sample_rate
             self.monitor_channel = monitor_channel
+            self.gain_db = gain_db
             self.error_occurred = _DummySignal()
             self.stop_calls = 0
             self.wait_calls = []

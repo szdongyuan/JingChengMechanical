@@ -3,7 +3,7 @@
 Receives raw audio chunks from AudioRecorder.  For each chunk, computes:
 - STFT (when enough samples have accumulated)
 - SPL (every chunk)
-- 1/3-octave bands (every chunk)
+- 1/3-octave bands (when explicitly requested for offline-oriented use)
 - FFT spectrum (once the rolling FFT buffer is primed)
 """
 from __future__ import annotations
@@ -15,7 +15,7 @@ from app.service.analysis import dsp
 
 
 _LIVE_LOUDNESS_THROTTLE_SEC = 0.25
-_LIVE_LOUDNESS_WINDOW_SEC = 0.5
+_LIVE_LOUDNESS_WINDOW_BACKEND_SAMPLES = dsp.LOUDNESS_WINDOW_SAMPLES
 
 
 class AnalysisPipeline:
@@ -41,6 +41,11 @@ class AnalysisPipeline:
         # SPL config
         self._spl_weighting: str = channel_config["spl_weighting"]
         self._spl_tc: float = channel_config["spl_time_constant"]
+        self._spl_detector = dsp.SplDetector(
+            self.sample_rate,
+            self._spl_weighting,
+            self._spl_tc,
+        )
 
         # Octave config
         self._oct_weighting: str = channel_config["oct_weighting"]
@@ -57,6 +62,7 @@ class AnalysisPipeline:
         chunk_mono: np.ndarray,
         elapsed_time: float,
         compute_loudness: bool = True,
+        compute_octave: bool = False,
     ) -> dict:
         """Process one audio chunk and return analysis results.
 
@@ -78,7 +84,9 @@ class AnalysisPipeline:
 
         if sig.size > 0:
             self._loudness_buffer = np.concatenate([self._loudness_buffer, sig])
-            loudness_window_samples = int(round(self.sample_rate * _LIVE_LOUDNESS_WINDOW_SEC))
+            loudness_window_samples = int(round(
+                self.sample_rate * dsp.loudness_window_duration_sec()
+            ))
             if loudness_window_samples > 0 and self._loudness_buffer.size > loudness_window_samples:
                 self._loudness_buffer = self._loudness_buffer[-loudness_window_samples:]
         loudness_frame = (
@@ -88,8 +96,7 @@ class AnalysisPipeline:
         )
 
         # SPL — always computed (even for short chunks)
-        spl_db = dsp.compute_spl(sig, self.sample_rate,
-                                 self._spl_weighting, self._spl_tc)
+        spl_db = self._spl_detector.process(sig)
         spl_frame = SplFrame(time=elapsed_time, spl_db=spl_db,
                              weighting=self._spl_weighting)
 
@@ -111,8 +118,8 @@ class AnalysisPipeline:
                     magnitudes=mag_db,
                 )
 
-        # Octave bands — need enough samples for low-freq resolution
-        if sig.size >= 256:
+        # Octave bands — opt-in; need enough samples for low-freq resolution
+        if compute_octave and sig.size >= 256:
             centers, levels = dsp.compute_octave_bands(sig, self.sample_rate,
                                                        self._oct_weighting)
             octave_frame = OctaveFrame(time=elapsed_time, center_freqs=centers,
@@ -152,10 +159,12 @@ class AnalysisPipeline:
                 )
                 self._latest_stft_frame_sample_index = frame_sample_index
 
-            # Keep only the overlap portion for next chunk
-            keep = int(self._nfft * self._overlap)
-            if keep > 0:
-                self._stft_buffer = self._stft_buffer[-keep:]
+            noverlap = int(self._nfft * self._overlap)
+            hop_samples = self._nfft - noverlap
+            if hop_samples > 0:
+                complete_windows = 1 + (stft_signal.size - self._nfft) // hop_samples
+                next_window_start = complete_windows * hop_samples
+                self._stft_buffer = stft_signal[next_window_start:].copy()
             else:
                 self._stft_buffer = np.array([], dtype=np.float64)
             stft_frame = stft_frames[-1] if stft_frames else None
@@ -172,24 +181,38 @@ class AnalysisPipeline:
         }
 
     def _maybe_compute_live_loudness(self, elapsed_time: float) -> LoudnessFrame | None:
+        loudness_input = self.prepare_live_loudness_input(elapsed_time)
+        if loudness_input is None:
+            return None
+        return self.compute_live_loudness_frame(loudness_input, elapsed_time)
+
+    def prepare_live_loudness_input(self, elapsed_time: float) -> np.ndarray | None:
         if elapsed_time - self._last_live_loudness_emit_time < _LIVE_LOUDNESS_THROTTLE_SEC:
             return None
         if self._loudness_buffer.size == 0 or self.sample_rate <= 0:
             return None
 
         self._last_live_loudness_emit_time = elapsed_time
+        return self._loudness_buffer.copy()
+
+    def compute_live_loudness_frame(
+        self,
+        loudness_input: np.ndarray,
+        elapsed_time: float,
+    ) -> LoudnessFrame | None:
+        sig = np.asarray(loudness_input, dtype=np.float64).reshape(-1)
+        if sig.size == 0 or self.sample_rate <= 0:
+            return None
         try:
-            _times_sec, values_sone, _max_sone = dsp.compute_loudness_trace(
-                self._loudness_buffer,
+            value_sone = float(dsp.compute_loudness_window_sone(
+                sig,
                 self.sample_rate,
-            )
-            values = np.asarray(values_sone, dtype=np.float64).reshape(-1)
-            finite_values = values[np.isfinite(values)]
-            if finite_values.size == 0:
+            ))
+            if not np.isfinite(value_sone):
                 return None
             return LoudnessFrame(
                 time=elapsed_time,
-                loudness_sone=float(finite_values[-1]),
+                loudness_sone=value_sone,
             )
         except Exception:
             return None
@@ -201,3 +224,4 @@ class AnalysisPipeline:
         self._fft_buffer = np.array([], dtype=np.float64)
         self._loudness_buffer = np.array([], dtype=np.float64)
         self._last_live_loudness_emit_time = 0.0
+        self._spl_detector.reset()

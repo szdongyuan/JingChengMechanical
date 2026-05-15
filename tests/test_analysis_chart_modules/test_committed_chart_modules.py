@@ -112,6 +112,8 @@ def test_loudness_module_renders_committed_chart_for_selected_channel(qapp):
     assert module.current_plot_payload()["times_sec"] == [0.0, 1.0]
     assert module.current_plot_payload()["values"] == [43.0, 44.0]
     assert module.current_plot_payload()["unit"] == "phon"
+    assert module.current_plot_payload()["lower_limit"] == 40.0
+    assert module.current_plot_payload()["upper_limit"] == 60.0
     assert module.current_render_channel() == 1
     assert module.plot.plot_item.getAxis("bottom").labelText == "Time (s)"
     _assert_left_axis_title_hidden_ticks_visible(module.plot)
@@ -146,7 +148,7 @@ def test_stft_module_hides_left_axis_title_but_keeps_ticks(qapp):
         module.close()
 
 
-def test_loudness_module_uses_data_focused_y_range_when_default_limits_are_far_away(qapp):
+def test_loudness_module_uses_spl_style_y_range_so_limit_lines_are_visible(qapp):
     services = _make_services(initial_state=_state(101, "reviewing"))
     module = LoudnessModule(services)
     module.selected_display_channel_provider = lambda: 0
@@ -157,7 +159,13 @@ def test_loudness_module_uses_data_focused_y_range_when_default_limits_are_far_a
     )
     qapp.processEvents()
 
-    assert module.plot.plot_item.vb.viewRange()[1] == pytest.approx((1.9, 3.1))
+    y_min, y_max = module.plot.plot_item.vb.viewRange()[1]
+    payload = module.current_plot_payload()
+    assert module.has_committed_plot_data() is True
+    assert payload["lower_limit"] == 0.0
+    assert payload["upper_limit"] == 10.0
+    assert y_min <= 0.0
+    assert y_max >= 10.0
 
 
 def test_spectrum_module_renders_committed_chart_for_selected_channel(qapp):

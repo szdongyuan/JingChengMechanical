@@ -5,14 +5,16 @@ import json
 import os
 import math
 import re
+import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock
 
 import numpy as np
 import pytest
+from scipy.io import wavfile
 
-from app.service.analysis.frames import FftFrame, JudgmentResult, LoudnessFrame, SplFrame, StftFrame
+from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.test_manager import TestManager
 from app.service.analysis.test_session import TestSession
 from app.service.config_service import _CHANNEL_DEFAULTS
@@ -104,6 +106,40 @@ class _FakeRecorder:
 
     def start(self):
         self.started = True
+
+
+class _CapturingLiveDisplayDispatcher:
+    def __init__(self, *, fail: Exception | None = None):
+        self.calls = []
+        self.fail = fail
+        self.stopped = False
+
+    def submit(
+        self,
+        chunk,
+        *,
+        elapsed_time,
+        frame_run_id,
+        live_loudness_channel_index,
+        sample_start=None,
+        sample_end=None,
+    ):
+        self.calls.append(
+            {
+                "chunk": np.asarray(chunk).copy(),
+                "elapsed_time": elapsed_time,
+                "frame_run_id": frame_run_id,
+                "live_loudness_channel_index": live_loudness_channel_index,
+                "sample_start": sample_start,
+                "sample_end": sample_end,
+            }
+        )
+        if self.fail is not None:
+            raise self.fail
+        return True
+
+    def stop(self):
+        self.stopped = True
 
 
 class TestTestManagerDisplayChannelRouting:
@@ -317,7 +353,7 @@ class TestTestSessionProcessing:
 
         assert session._live_loudness_channel_index == 2
 
-    def test_on_chunk_computes_live_loudness_only_for_selected_live_loudness_channel(self):
+    def test_on_chunk_submits_live_loudness_channel_to_display_dispatcher(self):
         bus = _make_mock_bus()
         ai = MagicMock()
         config = _make_config(selected_channels=[0, 1])
@@ -333,36 +369,15 @@ class TestTestSessionProcessing:
             workorder={"factory_run_id": "factory-run-1"},
             audio_dir="/tmp/audio",
         )
-        first_pipeline = MagicMock()
-        first_pipeline.channel_index = 0
-        first_pipeline.process_chunk.return_value = {
-            "stft_frames": [],
-            "stft": None,
-            "spl": None,
-            "loudness": None,
-            "octave": None,
-            "fft": None,
-        }
-        second_pipeline = MagicMock()
-        second_pipeline.channel_index = 1
-        second_pipeline.process_chunk.return_value = {
-            "stft_frames": [],
-            "stft": None,
-            "spl": None,
-            "loudness": LoudnessFrame(time=0.05, loudness_sone=2.0),
-            "octave": None,
-            "fft": None,
-        }
-        session._pipelines = [first_pipeline, second_pipeline]
+        dispatcher = _CapturingLiveDisplayDispatcher()
+        session._live_display_dispatcher = dispatcher
         session.set_live_loudness_channel_index(1)
 
         session._on_chunk(np.ones((2048, 2), dtype=np.float32), 0)
 
-        assert first_pipeline.process_chunk.call_args.kwargs["compute_loudness"] is False
-        assert second_pipeline.process_chunk.call_args.kwargs["compute_loudness"] is True
-        assert bus.loudness_updated.emit.call_args.args[2] == 1
+        assert dispatcher.calls[-1]["live_loudness_channel_index"] == 1
 
-    def test_on_chunk_emits_analysis_signals(self):
+    def test_on_chunk_submits_live_display_work(self):
         bus = _make_mock_bus()
         ai = MagicMock()
         session = TestSession(
@@ -371,11 +386,41 @@ class TestTestSessionProcessing:
             audio_dir="/tmp/audio",
         )
         session._setup_pipelines()
+        dispatcher = _CapturingLiveDisplayDispatcher()
+        session._live_display_dispatcher = dispatcher
         chunk = np.random.randn(2048, 1).astype(np.float32)
-        session._on_chunk(chunk, 0)
-        bus.spl_updated.emit.assert_called()
 
-    def test_on_chunk_emits_analysis_signals_with_factory_run_id(self):
+        session._on_chunk(chunk, 0)
+
+        assert len(dispatcher.calls) == 1
+        np.testing.assert_array_equal(dispatcher.calls[0]["chunk"], chunk)
+
+    def test_on_chunk_submits_live_display_sample_span_metadata(self):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        config = _make_config(input_device_samplerate=1000)
+        session = TestSession(
+            config=config,
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={},
+            audio_dir="/tmp/audio",
+        )
+        dispatcher = _CapturingLiveDisplayDispatcher()
+        session._live_display_dispatcher = dispatcher
+        session.attach_to_recorder(chunk_index=4)
+        chunk = np.ones((100, 1), dtype=np.float32)
+
+        session._on_chunk(chunk, 4)
+        session._on_chunk(chunk, 5)
+
+        assert dispatcher.calls[0]["sample_start"] == 0
+        assert dispatcher.calls[0]["sample_end"] == 100
+        assert dispatcher.calls[1]["sample_start"] == 100
+        assert dispatcher.calls[1]["sample_end"] == 200
+
+    def test_on_chunk_submits_display_work_with_factory_run_id(self):
         bus = _make_mock_bus()
         ai = MagicMock()
         session = TestSession(
@@ -387,117 +432,122 @@ class TestTestSessionProcessing:
             audio_dir="/tmp/audio",
         )
         session._setup_pipelines()
+        dispatcher = _CapturingLiveDisplayDispatcher()
+        session._live_display_dispatcher = dispatcher
 
         chunk = np.random.randn(2048, 1).astype(np.float32)
 
         session._on_chunk(chunk, 0)
 
-        assert bus.spl_updated.emit.call_args.args[0] == 1
-        assert bus.spl_updated.emit.call_args.args[1] == "factory-run-1"
-        assert bus.spl_updated.emit.call_args.args[2] == 0
+        assert dispatcher.calls[0]["frame_run_id"] == "factory-run-1"
 
-    def test_on_chunk_emits_one_stft_signal_per_stft_frame(self):
+    def test_on_chunk_does_not_call_display_dsp_backends_synchronously(self, monkeypatch):
         bus = _make_mock_bus()
         ai = MagicMock()
+        config = _make_config(
+            record_duration=2.0,
+            input_device_samplerate=1000,
+        )
+        config["channels"] = [{
+            **config["channels"][0],
+            "stft_nfft": 8,
+            "fft_nfft": 8,
+        }]
         session = TestSession(
-            config=_make_config(),
+            config=config,
             bus=bus,
             ai_service=ai,
             mic_cal={},
-            workorder={"factory_run_id": "factory-run-1"},
+            workorder={},
             audio_dir="/tmp/audio",
         )
-        frame_a = StftFrame(
-            time=0.0,
-            frequencies=np.array([100.0]),
-            magnitudes=np.array([1.0]),
+        session._setup_pipelines()
+        main_thread_id = threading.get_ident()
+
+        def _forbid_sync(name, value):
+            def _impl(*args, **kwargs):
+                if threading.get_ident() == main_thread_id:
+                    raise AssertionError(f"{name} ran on recorder chunk path")
+                return value
+            return _impl
+
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_spl",
+            _forbid_sync("compute_spl", 60.0),
         )
-        frame_b = StftFrame(
-            time=0.5,
-            frequencies=np.array([100.0]),
-            magnitudes=np.array([2.0]),
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_stft",
+            _forbid_sync(
+                "compute_stft",
+                (
+                    np.array([0.0], dtype=np.float64),
+                    np.array([100.0], dtype=np.float64),
+                    np.array([[1.0]], dtype=np.float64),
+                ),
+            ),
         )
-        fake_pipeline = MagicMock()
-        fake_pipeline.channel_index = 0
-        fake_pipeline.process_chunk.return_value = {
-            "stft_frames": [frame_a, frame_b],
-            "stft": frame_b,
-            "spl": SplFrame(time=0.05, spl_db=60.0, weighting="Z"),
-            "loudness": None,
-            "octave": None,
-            "fft": None,
-        }
-        session._pipelines = [fake_pipeline]
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_fft_spectrum",
+            _forbid_sync(
+                "compute_fft_spectrum",
+                (
+                    np.array([0.0, 100.0], dtype=np.float64),
+                    np.array([0.0, -10.0], dtype=np.float64),
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_octave_bands",
+            _forbid_sync(
+                "compute_octave_bands",
+                (
+                    np.array([125.0], dtype=np.float64),
+                    np.array([55.0], dtype=np.float64),
+                ),
+            ),
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_loudness_trace",
+            _forbid_sync(
+                "compute_loudness_trace",
+                ([0.0], [1.5], 1.5),
+            ),
+        )
 
-        session._on_chunk(np.ones((2048, 1), dtype=np.float32), 0)
+        try:
+            session._on_chunk(np.ones((512, 1), dtype=np.float32), 0)
+        finally:
+            stop_live_display = getattr(session, "stop_live_display", None)
+            if callable(stop_live_display):
+                stop_live_display()
 
-        assert bus.stft_updated.emit.call_count == 2
-        assert bus.stft_updated.emit.call_args_list[0].args == (1, "factory-run-1", 0, frame_a)
-        assert bus.stft_updated.emit.call_args_list[1].args == (1, "factory-run-1", 0, frame_b)
+        bus.recording_progress.emit.assert_called_once()
 
-    def test_on_chunk_re_emits_fft_frame_with_factory_run_id(self):
+    def test_on_chunk_display_submission_failure_does_not_block_progress_or_completion(self):
         bus = _make_mock_bus()
         ai = MagicMock()
+        config = _make_config(record_duration=0.05)
         session = TestSession(
-            config=_make_config(),
+            config=config,
             bus=bus,
             ai_service=ai,
             mic_cal={},
-            workorder={"factory_run_id": "factory-run-1"},
+            workorder={},
             audio_dir="/tmp/audio",
         )
-        fft_frame = FftFrame(
-            time=0.10,
-            frequencies=np.array([0.0, 100.0], dtype=np.float64),
-            magnitudes=np.array([1.0, 2.0], dtype=np.float64),
+        session._live_display_dispatcher = _CapturingLiveDisplayDispatcher(
+            fail=RuntimeError("display busy")
         )
-        fake_pipeline = MagicMock()
-        fake_pipeline.channel_index = 0
-        fake_pipeline.process_chunk.return_value = {
-            "stft_frames": [],
-            "stft": None,
-            "spl": SplFrame(time=0.05, spl_db=60.0, weighting="Z"),
-            "loudness": None,
-            "octave": None,
-            "fft": fft_frame,
-        }
-        session._pipelines = [fake_pipeline]
+        session._on_session_done_cb = MagicMock()
+        chunk = np.ones((int(session._sample_rate * 0.05), 1), dtype=np.float32)
 
-        session._on_chunk(np.ones((2048, 1), dtype=np.float32), 0)
+        session._on_chunk(chunk, 0)
 
-        assert bus.fft_updated.emit.call_args.args == (1, "factory-run-1", 0, fft_frame)
-
-    def test_on_chunk_re_emits_loudness_frame_with_factory_run_id(self):
-        bus = _make_mock_bus()
-        ai = MagicMock()
-        session = TestSession(
-            config=_make_config(),
-            bus=bus,
-            ai_service=ai,
-            mic_cal={},
-            workorder={"factory_run_id": "factory-run-1"},
-            audio_dir="/tmp/audio",
-        )
-        loudness_frame = LoudnessFrame(time=0.10, loudness_sone=2.25)
-        fake_pipeline = MagicMock()
-        fake_pipeline.channel_index = 0
-        fake_pipeline.process_chunk.return_value = {
-            "stft_frames": [],
-            "stft": None,
-            "spl": SplFrame(time=0.05, spl_db=60.0, weighting="Z"),
-            "loudness": loudness_frame,
-            "octave": None,
-            "fft": None,
-        }
-        session._pipelines = [fake_pipeline]
-
-        session._on_chunk(np.ones((2048, 1), dtype=np.float32), 0)
-
-        assert bus.loudness_updated.emit.call_args.args == (
-            1,
-            "factory-run-1",
-            0,
-            loudness_frame,
+        bus.recording_progress.emit.assert_called_once()
+        session._on_session_done_cb.assert_called_once_with(1)
+        assert any(
+            "display busy" in call.args[0]
+            for call in bus.log.emit.call_args_list
         )
 
     def test_on_chunk_notifies_when_session_duration_expires(self):
@@ -544,7 +594,7 @@ class TestTestSessionProcessing:
         bus.recording_progress.emit.assert_any_call(1, 0.1)
         session._on_session_done_cb.assert_called_once_with(1)
 
-    def test_on_chunk_uses_sample_derived_elapsed_for_pipeline_and_progress_at_non_round_sample_rate(self):
+    def test_on_chunk_uses_sample_derived_elapsed_for_display_submission_and_progress_at_non_round_sample_rate(self):
         bus = _make_mock_bus()
         ai = MagicMock()
         config = _make_config()
@@ -557,23 +607,14 @@ class TestTestSessionProcessing:
             workorder={},
             audio_dir="/tmp/audio",
         )
-        fake_pipeline = MagicMock()
-        fake_pipeline.channel_index = 0
-        fake_pipeline.process_chunk.return_value = {
-            "stft_frames": [],
-            "stft": None,
-            "spl": None,
-            "loudness": None,
-            "octave": None,
-            "fft": None,
-        }
-        session._pipelines = [fake_pipeline]
+        dispatcher = _CapturingLiveDisplayDispatcher()
+        session._live_display_dispatcher = dispatcher
         chunk = np.ones((int(22050 * 0.05), 1), dtype=np.float32)
         expected_elapsed = chunk.shape[0] / 22050.0
 
         session._on_chunk(chunk, 0)
 
-        assert fake_pipeline.process_chunk.call_args.args[1] == pytest.approx(expected_elapsed)
+        assert dispatcher.calls[0]["elapsed_time"] == pytest.approx(expected_elapsed)
         assert bus.recording_progress.emit.call_args.args == (1, pytest.approx(expected_elapsed))
 
     def test_on_chunk_completion_clamps_elapsed_to_session_target_after_attach_at_non_round_sample_rate(self):
@@ -590,17 +631,8 @@ class TestTestSessionProcessing:
             workorder={},
             audio_dir="/tmp/audio",
         )
-        fake_pipeline = MagicMock()
-        fake_pipeline.channel_index = 0
-        fake_pipeline.process_chunk.return_value = {
-            "stft_frames": [],
-            "stft": None,
-            "spl": None,
-            "loudness": None,
-            "octave": None,
-            "fft": None,
-        }
-        session._pipelines = [fake_pipeline]
+        dispatcher = _CapturingLiveDisplayDispatcher()
+        session._live_display_dispatcher = dispatcher
         session._on_session_done_cb = MagicMock()
         session.attach_to_recorder(chunk_index=4)
         chunk_window_samples = int(22050 * 0.05)
@@ -618,8 +650,8 @@ class TestTestSessionProcessing:
         session._on_chunk(chunk, 6)
 
         observed_elapsed_values = [
-            call.args[1]
-            for call in fake_pipeline.process_chunk.call_args_list
+            call["elapsed_time"]
+            for call in dispatcher.calls
         ]
         assert observed_elapsed_values == pytest.approx(expected_elapsed_values)
         progress_elapsed_values = [
@@ -661,6 +693,44 @@ class TestTestSessionJudgment:
         result = session._run_judgment()
         assert isinstance(result, JudgmentResult)
         assert result.overall in ("合格", "不合格")
+
+    def test_run_judgment_stores_loudness_trace_cache(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = None
+        session = TestSession(
+            config=_make_config(), bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+        created_caches = []
+
+        def fake_judge(*args, loudness_trace_cache=None, **kwargs):
+            assert loudness_trace_cache == {}
+            created_caches.append(loudness_trace_cache)
+            loudness_trace_cache[0] = {
+                "times_sec": [0.25],
+                "values_sone": [4.0],
+                "max_sone": 4.0,
+            }
+            return JudgmentResult(
+                overall="合格",
+                limit_pass=True,
+                ai_pass=None,
+                ai_score=None,
+                analysis_window=(0.0, 1.0),
+            )
+
+        session._judgment = MagicMock()
+        session._judgment.judge.side_effect = fake_judge
+
+        result = session._run_judgment()
+
+        assert result is session.last_result
+        assert session._last_loudness_trace_cache is created_caches[0]
+        assert session._last_loudness_trace_cache[0]["values_sone"] == [4.0]
 
     def test_run_judgment_required_window_failure_preserves_no_result_session_state(self, tmp_path):
         bus = _make_mock_bus()
@@ -760,6 +830,98 @@ class TestTestSessionJudgment:
         assert result.ai_pass is True
         assert result.ai_score == 0.91
         assert result.overall == "合格"
+
+    def test_run_judgment_ai_segment_uses_projected_single_channel_metadata(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = {"enabled": True}
+        ai.run_ai_analysis.return_value = {
+            "module_status": "success",
+            "ai_label": "PASS",
+            "score": 0.91,
+            "decision_threshold": 0.5,
+            "error_summary": None,
+        }
+        config = _make_config(
+            selected_channels=[3],
+            channels=[{"channel_index": 3}],
+        )
+        session = TestSession(
+            config=config, bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        hardware = np.column_stack(
+            [np.full(20, channel, dtype=np.float32) for channel in range(6)]
+        )
+        session.capture_recorder_buffer(hardware, 100.0)
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+            analysis_window=(0.0, 0.2),
+        )
+
+        session._run_judgment()
+
+        segment = ai.run_ai_analysis.call_args.kwargs["segments"][0]
+        assert segment["segment_id"] == session._audio_data_id
+        assert segment["role"] == "device_1"
+        assert segment["audio_path"] == session._audio_file_path
+        assert segment["channels"] == [0]
+        assert segment["source_channels"] == [3]
+        assert segment["channel_map"] == [
+            {"logical_channel": 0, "source_channel": 3},
+        ]
+        assert segment["duration_ms"] == 200
+        assert segment["sample_rate"] == 100
+        assert segment["metadata"] == {}
+
+    def test_run_judgment_ai_segment_preserves_multi_channel_selected_order(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = {"enabled": True}
+        ai.run_ai_analysis.return_value = {
+            "module_status": "success",
+            "ai_label": "PASS",
+            "score": 0.91,
+            "decision_threshold": 0.5,
+            "error_summary": None,
+        }
+        config = _make_config(
+            selected_channels=[1, 4],
+            channels=[{"channel_index": 1}, {"channel_index": 4}],
+        )
+        session = TestSession(
+            config=config, bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        hardware = np.column_stack(
+            [np.full(20, channel, dtype=np.float32) for channel in range(6)]
+        )
+        session.capture_recorder_buffer(hardware, 100.0)
+        session._judgment = MagicMock()
+        session._judgment.judge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+            analysis_window=(0.0, 0.2),
+        )
+
+        session._run_judgment()
+
+        segment = ai.run_ai_analysis.call_args.kwargs["segments"][0]
+        assert segment["audio_path"] == session._audio_file_path
+        assert segment["channels"] == [0, 1]
+        assert segment["source_channels"] == [1, 4]
+        assert segment["channel_map"] == [
+            {"logical_channel": 0, "source_channel": 1},
+            {"logical_channel": 1, "source_channel": 4},
+        ]
 
     def test_run_judgment_marks_result_failed_when_ai_label_is_fail(self, tmp_path):
         bus = _make_mock_bus()
@@ -1262,6 +1424,7 @@ class TestTestSessionJudgment:
             session._audio_file_path,
             0.1,
             0.5,
+            loudness_trace_cache=ANY,
         )
         ai.run_ai_analysis.assert_called_once()
         assert result is not None
@@ -1269,6 +1432,96 @@ class TestTestSessionJudgment:
         assert result.ai_pass is False
         assert result.ai_score == 0.12
         assert result.overall == "不合格"
+
+    def test_rejudge_replaces_loudness_trace_cache(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = None
+        session = TestSession(
+            config=_make_config(), bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._buffer = np.random.randn(44100, 1).astype(np.float32)
+        session._sample_rate = 44100.0
+        session._audio_file_path = str(tmp_path / "existing.wav")
+        session._audio_data_id = "audio-123"
+        old_cache = {
+            0: {
+                "times_sec": [9.0],
+                "values_sone": [9.0],
+                "max_sone": 9.0,
+            }
+        }
+        session._last_loudness_trace_cache = old_cache
+        created_caches = []
+
+        def fake_rejudge(*args, loudness_trace_cache=None, **kwargs):
+            assert loudness_trace_cache == {}
+            created_caches.append(loudness_trace_cache)
+            loudness_trace_cache[0] = {
+                "times_sec": [0.25],
+                "values_sone": [2.0],
+                "max_sone": 2.0,
+            }
+            return JudgmentResult(
+                overall="合格",
+                limit_pass=True,
+                ai_pass=None,
+                ai_score=None,
+                analysis_window=(0.1, 0.5),
+            )
+
+        session._judgment = MagicMock()
+        session._judgment.rejudge.side_effect = fake_rejudge
+
+        result = session.rejudge(0.1, 0.5)
+
+        assert result is session.last_result
+        assert session._last_loudness_trace_cache is created_caches[0]
+        assert session._last_loudness_trace_cache is not old_cache
+        assert session._last_loudness_trace_cache[0]["values_sone"] == [2.0]
+
+    def test_rejudge_passes_selected_channel_mapping_to_judgment(self, tmp_path):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = None
+        config = _make_config(
+            selected_channels=[3],
+            channels=[{"channel_index": 3}],
+        )
+        session = TestSession(
+            config=config, bus=bus, ai_service=ai,
+            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        hardware = np.column_stack(
+            [np.full(8, channel, dtype=np.float32) for channel in range(6)]
+        )
+        session.capture_recorder_buffer(hardware, 100.0)
+        session._audio_file_path = str(tmp_path / "existing.wav")
+        session._audio_data_id = "audio-123"
+        session._judgment = MagicMock()
+        session._judgment.rejudge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+        )
+
+        session.rejudge(0.1, 0.5)
+
+        session._judgment.rejudge.assert_called_once_with(
+            session._config,
+            session._buffer,
+            session._sample_rate,
+            session._mic_cal,
+            session._audio_file_path,
+            0.1,
+            0.5,
+            channel_column_map={3: 0},
+            loudness_trace_cache=ANY,
+        )
 
     def test_rejudge_uses_same_ai_envelope_normalization_as_run_judgment(self, tmp_path):
         bus = _make_mock_bus()
@@ -1380,6 +1633,53 @@ class TestTestSessionJudgment:
             "final_window_offset_ms": 100,
             "final_window_duration_ms": 400,
         }
+
+    def test_rejudge_ai_segment_falls_back_to_selected_buffer_width_without_projection_metadata(
+        self, tmp_path
+    ):
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        ai.resolve_binding.return_value = {"enabled": True}
+        ai.run_ai_analysis.return_value = {
+            "module_status": "success",
+            "ai_label": "PASS",
+            "score": 0.88,
+            "decision_threshold": 0.5,
+            "error_summary": None,
+        }
+        session = TestSession(
+            config=_make_config(
+                selected_channels=[3],
+                channels=[{"channel_index": 3}],
+            ),
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={"sn": "test", "model": "M"},
+            audio_dir=str(tmp_path),
+        )
+        session._buffer = np.random.randn(100, 1).astype(np.float32)
+        session._sample_rate = 100.0
+        session._audio_file_path = str(tmp_path / "selected.wav")
+        session._audio_data_id = "audio-123"
+        session._judgment = MagicMock()
+        session._judgment.rejudge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+            analysis_window=(0.1, 0.5),
+        )
+
+        session.rejudge(0.1, 0.5)
+
+        segment = ai.run_ai_analysis.call_args.kwargs["segments"][0]
+        assert segment["audio_path"] == session._audio_file_path
+        assert segment["channels"] == [0]
+        assert segment["source_channels"] == [3]
+        assert segment["channel_map"] == [
+            {"logical_channel": 0, "source_channel": 3},
+        ]
 
     def test_repeated_ai_attempts_in_same_session_reuse_test_run_id(self, tmp_path, monkeypatch):
         bus = _make_mock_bus()
@@ -1555,6 +1855,89 @@ class TestTestSessionWavSave:
 
         assert os.path.isabs(path)
         assert os.path.isfile(path)
+
+    def test_capture_recorder_buffer_saves_only_selected_real_channel(self, tmp_path):
+        session = TestSession(
+            config=_make_config(
+                selected_channels=[3],
+                channels=[{"channel_index": 3}],
+            ),
+            bus=_make_mock_bus(),
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={"sn": "SN001", "model": "M1"},
+            audio_dir=str(tmp_path),
+        )
+        sr = 100.0
+        hardware = np.column_stack(
+            [np.full(12, channel, dtype=np.float32) for channel in range(6)]
+        )
+
+        captured = session.capture_recorder_buffer(hardware, sr)
+        path = session._save_wav(session._buffer, session._sample_rate)
+
+        assert captured.shape == (12, 1)
+        np.testing.assert_array_equal(session._buffer[:, 0], hardware[:, 3])
+        assert session._source_channels == (3,)
+        assert session._real_to_logical_channel == {3: 0}
+        saved_sr, saved_data = wavfile.read(path)
+        assert saved_sr == 100
+        assert saved_data.ndim == 1 or saved_data.shape[1] == 1
+        np.testing.assert_allclose(saved_data.reshape(-1), hardware[:, 3])
+
+    def test_capture_recorder_buffer_preserves_selected_channel_order(self, tmp_path):
+        session = TestSession(
+            config=_make_config(
+                selected_channels=[1, 4],
+                channels=[{"channel_index": 1}, {"channel_index": 4}],
+            ),
+            bus=_make_mock_bus(),
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={"sn": "SN001", "model": "M1"},
+            audio_dir=str(tmp_path),
+        )
+        sr = 100.0
+        hardware = np.column_stack(
+            [np.full(12, channel, dtype=np.float32) for channel in range(6)]
+        )
+
+        captured = session.capture_recorder_buffer(hardware, sr)
+        path = session._save_wav(session._buffer, session._sample_rate)
+
+        assert captured.shape == (12, 2)
+        np.testing.assert_array_equal(session._buffer, hardware[:, [1, 4]])
+        assert session._source_channels == (1, 4)
+        assert session._real_to_logical_channel == {1: 0, 4: 1}
+        saved_sr, saved_data = wavfile.read(path)
+        assert saved_sr == 100
+        assert saved_data.shape == (12, 2)
+        np.testing.assert_allclose(saved_data, hardware[:, [1, 4]])
+
+    def test_capture_recorder_buffer_rejects_invalid_selected_channel_before_save_or_analysis(self, tmp_path):
+        session = TestSession(
+            config=_make_config(
+                selected_channels=[3],
+                channels=[{"channel_index": 3}],
+            ),
+            bus=_make_mock_bus(),
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={"sn": "SN001", "model": "M1"},
+            audio_dir=str(tmp_path),
+        )
+        session._save_wav = MagicMock(side_effect=AssertionError("should not save"))
+        session._judgment = MagicMock()
+        hardware = np.zeros((12, 2), dtype=np.float32)
+
+        with pytest.raises(ValueError, match="outside hardware channel range"):
+            session.capture_recorder_buffer(hardware, 100.0)
+
+        assert session._buffer is None
+        assert session._sample_rate == 44100.0
+        assert session._audio_file_path is None
+        session._save_wav.assert_not_called()
+        session._judgment.judge.assert_not_called()
 
 
 class TestScoreThresholdDecision:

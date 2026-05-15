@@ -39,6 +39,8 @@ class TestConfigTable(BaseModel):
     output_device_samplerate = FloatField(null=True)
     selected_channels = TextField(default='[]')
     analysis_window_offset_ms = IntegerField(default=0)
+    monitor_channel_index = IntegerField(null=True, default=None)
+    monitor_gain_db = FloatField(null=True, default=None)
 
     class Meta:
         table_name = "test_config_table"
