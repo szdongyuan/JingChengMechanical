@@ -14,6 +14,20 @@ QWidget {
   color: #111827;
 }
 QMessageBox { background: white; }
+QProgressDialog {
+  background: white;
+  color: #111827;
+}
+QProgressDialog QLabel {
+  color: #111827;
+}
+QProgressDialog QPushButton {
+  background: white;
+  color: #111827;
+  border: 1px solid #d1d5db;
+  border-radius: 8px;
+  padding: 6px 12px;
+}
 
 /* Popups / Dialog-like windows */
 QWidget#LoginWindow,

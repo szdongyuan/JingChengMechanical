@@ -257,11 +257,16 @@ class AudioDataFilterDialog(QDialog):
         }
 
 
+class ExportCanceled(Exception):
+    pass
+
+
 class AudioDataExportThread(QThread):
     # 后台导出线程：避免大量音频写入 zip 时卡住主界面。
     progress_changed = pyqtSignal(int)
     succeeded = pyqtSignal(str, int)
     failed = pyqtSignal(str)
+    canceled = pyqtSignal()
 
     def __init__(self, audio_data_service, target_path: str, records: list[dict[str, object]]):
         super().__init__()
@@ -275,12 +280,22 @@ class AudioDataExportThread(QThread):
             self.audio_data_service.export_zip(
                 self.target_path,
                 self.records,
-                progress_callback=self.progress_changed.emit,
+                progress_callback=self._update_progress,
             )
+        except ExportCanceled:
+            if os.path.exists(self.target_path):
+                os.remove(self.target_path)
+            self.canceled.emit()
+            return
         except Exception as exc:
             self.failed.emit(str(exc))
             return
         self.succeeded.emit(self.target_path, len(self.records))
+
+    def _update_progress(self, value: int) -> None:
+        if self.isInterruptionRequested():
+            raise ExportCanceled()
+        self.progress_changed.emit(value)
 
 
 class DataManagementModule(QWidget):
@@ -444,7 +459,6 @@ class DataManagementModule(QWidget):
                 play_button.clicked.connect(
                     lambda _checked=False, path=record.get("file_path"): self._play_file(path)
                 )
-                self.table.setCellWidget(row_index, len(headers) - 1, play_button)
                 self.table.setCellWidget(row_index, len(headers) - 2, play_button)
 
                 delete_button = QPushButton("×")
@@ -575,11 +589,12 @@ class DataManagementModule(QWidget):
 
         # 导出放到后台线程里执行，主界面只负责显示进度。
         self.btn_export.setEnabled(False)
-        self._export_progress_dialog = QProgressDialog("正在打包...", None, 0, len(records) + 1, self)
+        self._export_progress_dialog = QProgressDialog("正在打包...", "取消", 0, len(records) + 1, self)
         self._export_progress_dialog.setWindowTitle("打包导出")
         self._export_progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        self._export_progress_dialog.setCancelButton(None)
+        self._export_progress_dialog.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
         self._export_progress_dialog.setValue(0)
+        self._export_progress_dialog.canceled.connect(self._cancel_export)
 
         self._export_thread = AudioDataExportThread(
             self.services.audio_data_service,
@@ -590,8 +605,16 @@ class DataManagementModule(QWidget):
         self._export_thread.progress_changed.connect(self._export_progress_dialog.setValue)
         self._export_thread.succeeded.connect(self._on_export_succeeded)
         self._export_thread.failed.connect(self._on_export_failed)
+        self._export_thread.canceled.connect(self._on_export_canceled)
         self._export_thread.finished.connect(self._cleanup_export_thread)
         self._export_thread.start()
+
+    def _cancel_export(self) -> None:
+        if self._export_thread is not None and self._export_thread.isRunning():
+            self._export_thread.requestInterruption()
+        if self._export_progress_dialog is not None:
+            self._export_progress_dialog.setLabelText("正在取消...")
+            self._export_progress_dialog.setCancelButton(None)
 
     def _on_export_succeeded(self, target_path: str, record_count: int) -> None:
         self._finish_export()
@@ -608,9 +631,14 @@ class DataManagementModule(QWidget):
         self._finish_export()
         QMessageBox.warning(self, "导出失败", f"导出失败: {error_message}")
 
+    def _on_export_canceled(self) -> None:
+        self._finish_export()
+        self._emit_log("[DataManagement] 已取消导出")
+
     def _finish_export(self) -> None:
         self.btn_export.setEnabled(True)
         if self._export_progress_dialog is not None:
+            self._export_progress_dialog.blockSignals(True)
             self._export_progress_dialog.close()
             self._export_progress_dialog = None
 
