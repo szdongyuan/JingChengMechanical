@@ -310,6 +310,7 @@ class DataManagementModule(QWidget):
         "analyse_config": 120,
         "config_content": 180,
         "__action__": 60,
+        "__delete__": 80,
     }
 
     def __init__(self, services):
@@ -404,6 +405,7 @@ class DataManagementModule(QWidget):
             "选择",
             *[self.table_header_labels.get(name, name) for name in self._column_names],
             "操作",
+            "删除",
         ]
         self.table.blockSignals(True)
         try:
@@ -443,12 +445,23 @@ class DataManagementModule(QWidget):
                     lambda _checked=False, path=record.get("file_path"): self._play_file(path)
                 )
                 self.table.setCellWidget(row_index, len(headers) - 1, play_button)
+                self.table.setCellWidget(row_index, len(headers) - 2, play_button)
+
+                delete_button = QPushButton("×")
+                delete_button.setObjectName("TableDeleteButton")
+                delete_button.setToolTip("删除该条数据和本地音频")
+                delete_button.setFixedWidth(36)
+                delete_button.clicked.connect(
+                    lambda _checked=False, row=record: self._delete_record(row)
+                )
+                self.table.setCellWidget(row_index, len(headers) - 1, delete_button)
         finally:
             self.table.blockSignals(False)
 
         # 直接按内容展开列宽，显示不下时让表格自己横向滚动。
         self.table.resizeColumnsToContents()
-        self.table.resizeRowsToContents()
+        for row_index in range(self.table.rowCount()):
+            self.table.setRowHeight(row_index, 30)
         self._apply_table_widths()
         self._update_selected_count()
 
@@ -466,7 +479,7 @@ class DataManagementModule(QWidget):
         return "" if value is None else str(value)
 
     def _apply_table_widths(self) -> None:
-        keys = ["__select__", *self._column_names, "__action__"]
+        keys = ["__select__", *self._column_names, "__action__", "__delete__"]
         for column_index, key in enumerate(keys):
             self.table.setColumnWidth(
                 column_index,
@@ -621,6 +634,29 @@ class DataManagementModule(QWidget):
             self._emit_log(f"[DataManagement] 播放音频: {normalized_path}")
         except Exception as exc:
             QMessageBox.warning(self, "提示", f"播放失败: {exc}")
+
+    def _delete_record(self, record: dict[str, object]) -> None:
+        audio_data_id = record.get("audio_data_id")
+        file_path = normalize_path(record.get("file_path"))
+        reply = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定删除这条数据和本地音频吗？\n\n{file_path or ''}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            sd.stop()
+            self.services.audio_data_service.delete_record(audio_data_id)
+        except Exception as exc:
+            QMessageBox.warning(self, "删除失败", f"删除失败: {exc}")
+            return
+
+        self._emit_log(f"[DataManagement] 已删除音频数据: {audio_data_id}")
+        self.refresh_table()
 
     def _apply_current_output_device(self) -> None:
         # 播放模块不自己记设备，直接复用硬件页当前保存的输出设备配置。
