@@ -207,6 +207,9 @@ class StftModule(QWidget):
         self.analyze_button = QPushButton("分析", self.canvas)
         self.analyze_button.clicked.connect(self._begin_reanalysis)
         self.analyze_button.hide()
+        self.replay_button = QPushButton("重放", self.canvas)
+        self.replay_button.clicked.connect(self._replay_selection)
+        self.replay_button.hide()
 
         if hasattr(self.services.bus, "factory_state_changed"):
             self.services.bus.factory_state_changed.connect(
@@ -455,6 +458,89 @@ class StftModule(QWidget):
         if callable(begin_reanalysis):
             begin_reanalysis(validated[0], validated[1])
 
+    def _replay_selection(self):
+        context = self._replay_context()
+        if context is None:
+            return
+
+        test_service = getattr(self.services, "test", None)
+        replay_selection = getattr(test_service, "replay_selection", None)
+        if not callable(replay_selection):
+            self._emit_replay_failure()
+            return
+
+        if not bool(replay_selection(*context)):
+            self._emit_replay_failure()
+
+    def _selected_display_channel(self) -> int | None:
+        provider = self.selected_display_channel_provider
+        if not callable(provider):
+            return None
+
+        try:
+            selected_channel = provider()
+        except Exception:
+            return None
+
+        if isinstance(selected_channel, bool):
+            return None
+        try:
+            return int(selected_channel)
+        except (TypeError, ValueError):
+            return None
+
+    def _replay_context(self) -> tuple[int, str, int, float, float] | None:
+        if (
+            self._factory_state.run_phase not in self._REVIEW_PHASES
+            or self._selected_window is None
+        ):
+            return None
+
+        displayed_config_id = self._factory_state.displayed_config_id
+        if isinstance(displayed_config_id, bool):
+            return None
+        try:
+            config_id = int(displayed_config_id)
+        except (TypeError, ValueError):
+            return None
+
+        run_id = self._display_run_id or self._review_run_id_for_displayed_config()
+        if not isinstance(run_id, str) or not run_id:
+            return None
+
+        display_channel = self._selected_display_channel()
+        if display_channel is None:
+            return None
+
+        validated = self._validated_window(
+            start_sec=self._selected_window[0],
+            end_sec=self._selected_window[1],
+            captured_duration_sec=self._captured_duration_sec(),
+        )
+        if validated is None:
+            return None
+
+        return (config_id, run_id, display_channel, validated[0], validated[1])
+
+    def _can_replay_selection(self) -> bool:
+        context = self._replay_context()
+        if context is None:
+            return False
+
+        test_service = getattr(self.services, "test", None)
+        can_replay_selection = getattr(test_service, "can_replay_selection", None)
+        if not callable(can_replay_selection):
+            return False
+        return bool(can_replay_selection(*context))
+
+    def _emit_replay_failure(self) -> None:
+        bus = getattr(self.services, "bus", None)
+        for signal_name in ("status", "log"):
+            signal = getattr(bus, signal_name, None)
+            emit = getattr(signal, "emit", None)
+            if callable(emit):
+                emit("重放失败")
+
     def _selection_from_review(
         self,
         review: FactoryReviewPayload,
@@ -567,6 +653,8 @@ class StftModule(QWidget):
         button_visible = has_selection and bool(self._review_payload.manual_reanalysis_allowed)
         self.analyze_button.setVisible(button_visible)
         self.analyze_button.setEnabled(button_visible and self._factory_state.run_phase == "reviewing")
+        self.replay_button.setVisible(has_selection)
+        self.replay_button.setEnabled(False)
 
         self._update_selection_cursor()
         if not has_selection:
@@ -576,6 +664,7 @@ class StftModule(QWidget):
         if geometry is None:
             self.selection_box.hide()
             self.analyze_button.hide()
+            self.replay_button.hide()
             return
 
         normalized_window = self._normalized_selection_window(
@@ -585,6 +674,7 @@ class StftModule(QWidget):
         if normalized_window is None:
             self.selection_box.hide()
             self.analyze_button.hide()
+            self.replay_button.hide()
             return
         self._selected_window = normalized_window
 
@@ -596,6 +686,7 @@ class StftModule(QWidget):
         if left_px is None or right_px is None:
             self.selection_box.hide()
             self.analyze_button.hide()
+            self.replay_button.hide()
             return
 
         left = int(
@@ -619,20 +710,59 @@ class StftModule(QWidget):
         width = max(1, right - left + 1)
         self.selection_box.setGeometry(left, plot_rect.top(), width, plot_rect.height())
 
-        if not button_visible:
+        self.replay_button.setEnabled(self._can_replay_selection())
+        self._layout_selection_buttons(
+            left=left,
+            width=width,
+            plot_rect=plot_rect,
+            button_visible=button_visible,
+        )
+
+    def _layout_selection_buttons(
+        self,
+        *,
+        left: int,
+        width: int,
+        plot_rect: QRect,
+        button_visible: bool,
+    ) -> None:
+        buttons = []
+        if button_visible:
+            buttons.append(self.analyze_button)
+        if self.replay_button.isVisible():
+            buttons.append(self.replay_button)
+        if not buttons:
             return
 
-        button_size = self.analyze_button.sizeHint()
-        button_width = max(button_size.width() + 6, 58)
-        button_height = button_size.height()
-        button_x = left + width + 8
-        if button_x + button_width > plot_rect.right() + 1:
-            button_x = max(plot_rect.left(), left - button_width - 8)
-        button_y = max(
-            plot_rect.top(),
-            min(plot_rect.top() + 8, plot_rect.bottom() - button_height + 1),
-        )
-        self.analyze_button.setGeometry(button_x, button_y, button_width, button_height)
+        spacing = 8
+        button_sizes = []
+        for button in buttons:
+            size_hint = button.sizeHint()
+            button_sizes.append((max(size_hint.width() + 6, 58), size_hint.height()))
+
+        total_width = sum(button_width for button_width, _ in button_sizes)
+        total_width += spacing * (len(buttons) - 1)
+        right_group_x = left + width + spacing
+        left_group_x = left - total_width - spacing
+        if right_group_x + total_width - 1 <= plot_rect.right():
+            group_x = right_group_x
+        elif left_group_x >= plot_rect.left():
+            group_x = left_group_x
+        else:
+            latest_group_x = plot_rect.right() - total_width + 1
+            group_x = max(
+                plot_rect.left(),
+                min(left + spacing, latest_group_x),
+            )
+
+        current_x = group_x
+        for button, (button_width, button_height) in zip(buttons, button_sizes):
+            button_y = max(
+                plot_rect.top(),
+                min(plot_rect.top() + 8, plot_rect.bottom() - button_height + 1),
+            )
+            button.setGeometry(current_x, button_y, button_width, button_height)
+            current_x += button_width + spacing
 
     def _update_selection_cursor(self) -> None:
         if self.is_selection_movable():

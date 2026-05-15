@@ -113,10 +113,6 @@ class ChangePasswordWindow(QWidget):
             QMessageBox.warning(self, "提示", "两次输入的新密码不一致。")
             return
 
-        if new_password == old_password:
-            QMessageBox.warning(self, "提示", "新密码和旧密码一致，修改失败。")
-            return
-
         user = (
             UsersTable.select()
             .where(UsersTable.user_name == self.current_user_name)

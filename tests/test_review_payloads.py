@@ -5,7 +5,11 @@ import pytest
 
 from app.service.analysis import dsp
 from app.service.analysis.golden_reference import GoldenReferenceError
-from app.service.analysis.review_payloads import build_chart_payload, build_summary_payload
+from app.service.analysis.review_payloads import (
+    build_chart_payload,
+    build_summary_payload,
+    canonical_channel_label,
+)
 
 
 def _make_config(*, fft_limits=True, octave_limits=True):
@@ -179,6 +183,18 @@ def _make_ai_only_judgment_payload(*, ai_pass, ai_score):
         "analysis_window": (1.0, 3.0),
         "channel_results": [],
     }
+
+
+def _stable_calibrator_signal(
+    *,
+    sample_rate: float = 44100.0,
+    duration_sec: float = 3.0,
+    freq_hz: float = 1000.0,
+    spl_db: float = 94.0,
+) -> tuple[np.ndarray, float]:
+    amplitude = np.sqrt(2.0) * 20e-6 * (10.0 ** (spl_db / 20.0))
+    times = np.arange(int(sample_rate * duration_sec), dtype=np.float64) / sample_rate
+    return amplitude * np.sin(2.0 * np.pi * freq_hz * times), sample_rate
 
 
 class _GoldenCacheStub:
@@ -1713,6 +1729,61 @@ def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch
     }
 
 
+def test_build_chart_payload_maps_real_channel_key_to_selected_logical_column(monkeypatch):
+    ref_db = 20.0 * math.log10(20e-6)
+    selected_buffer = np.full((200, 1), 0.37, dtype=np.float32)
+    config = _make_config(fft_limits=False, octave_limits=False)
+    config["selected_channels"] = [3]
+    config["channels"] = [{
+        **config["channels"][0],
+        "channel_index": 3,
+        "fft_band_limits": [],
+        "oct_band_limits": [],
+    }]
+    observed = {}
+
+    def fake_spl_trace(signal, *args, **kwargs):
+        observed["spl_signal"] = np.asarray(signal).copy()
+        return [0.05], [float(np.mean(signal) * 100.0)]
+
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_spl_trace",
+        fake_spl_trace,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
+        lambda signal, sample_rate, nfft: (
+            np.array([1000.0], dtype=np.float64),
+            np.array([67.0], dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_octave_bands",
+        lambda signal, sample_rate, weighting: (
+            np.array([500.0], dtype=np.float64),
+            np.array([57.0], dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_loudness_trace",
+        lambda signal, sample_rate: ([0.0], [2.0], 2.0),
+    )
+
+    payload = build_chart_payload(
+        buffer=selected_buffer,
+        config=config,
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.0, 2.0),
+        channel_column_map={3: 0},
+    )
+
+    assert sorted(payload) == [3]
+    assert canonical_channel_label(next(iter(payload))) == "CH4"
+    assert payload[3]["spl"]["values_db"] == [37.0]
+    np.testing.assert_array_equal(observed["spl_signal"], selected_buffer[:, 0])
+
+
 def test_build_chart_payload_emits_null_limits_when_spl_and_loudness_bounds_are_disabled(monkeypatch):
     _patch_basic_chart_backends(monkeypatch)
 
@@ -1802,7 +1873,7 @@ def test_build_chart_payload_spl_exact_chunk_boundary_keeps_full_point_count():
     assert len(payload[0]["spl"]["values_db"]) == 2
 
 
-def test_build_chart_payload_spl_shorter_than_one_chunk_returns_empty_series():
+def test_build_chart_payload_spl_shorter_than_one_chunk_returns_one_endpoint():
     sample_rate = 48000.0
     chunk_samples = int(round(sample_rate * 0.05))
     signal = np.full(chunk_samples - 1, 0.1, dtype=np.float32).reshape(-1, 1)
@@ -1819,12 +1890,59 @@ def test_build_chart_payload_spl_shorter_than_one_chunk_returns_empty_series():
         analysis_window=(0.0, signal.shape[0] / sample_rate),
     )
 
-    assert payload[0]["spl"] == {
-        "times_sec": [],
-        "values_db": [],
-        "lower_limit_db": 40.0,
-        "upper_limit_db": 80.0,
-    }
+    assert payload[0]["spl"]["times_sec"] == [round(signal.shape[0] / sample_rate, 6)]
+    assert len(payload[0]["spl"]["values_db"]) == 1
+    assert payload[0]["spl"]["lower_limit_db"] == 40.0
+    assert payload[0]["spl"]["upper_limit_db"] == 80.0
+
+
+def test_build_chart_payload_spl_trace_is_stable_for_1khz_calibrator(monkeypatch):
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_loudness_trace",
+        lambda signal, sample_rate: ([0.0], [2.0], 2.0),
+    )
+    signal, sample_rate = _stable_calibrator_signal()
+
+    payload = build_chart_payload(
+        buffer=signal.reshape(-1, 1),
+        config=_make_single_channel_config(
+            spl_weighting="Z",
+            spl_time_constant=0.125,
+            fft_band_limits=[],
+            oct_band_limits=[],
+        ),
+        sample_rate=sample_rate,
+        mic_cal={},
+        analysis_window=(0.0, signal.size / sample_rate),
+    )
+
+    values_db = np.asarray(payload[0]["spl"]["values_db"][1:], dtype=np.float64)
+    assert values_db.size >= 10
+    assert float(values_db.max() - values_db.min()) <= 0.10
+
+
+def test_build_chart_payload_uses_corrected_loudness_trace_for_calibrator():
+    signal, sample_rate = _stable_calibrator_signal(sample_rate=48000.0)
+    config = _make_config(fft_limits=False, octave_limits=False)
+    config["input_device_samplerate"] = sample_rate
+    config["channels"][0]["loudness_unit"] = "phon"
+    buffer = signal.reshape(-1, 1)
+
+    payload = build_chart_payload(
+        buffer=buffer,
+        config=config,
+        sample_rate=sample_rate,
+        mic_cal={},
+        analysis_window=(0.0, 3.0),
+    )
+
+    loudness = payload[0]["loudness"]
+    assert set(loudness) == {"times_sec", "values", "unit", "lower_limit", "upper_limit"}
+    assert loudness["unit"] == "phon"
+    assert loudness["values"]
+    assert max(loudness["values"]) == pytest.approx(94.0, abs=0.75)
+    assert float(np.mean(loudness["values"])) == pytest.approx(94.0, abs=0.75)
+    assert max(loudness["values"]) < 95.0
 
 
 def test_build_chart_payload_fft_absolute_mode_uses_serialized_markers_and_overlay(
@@ -2236,7 +2354,7 @@ def test_build_chart_payload_reuses_one_golden_bundle_across_fft_and_octave(
     assert cache.ensure_octave_calls == 1
 
 
-def test_build_chart_payload_keeps_loudness_payload_shape_with_segmented_backend(monkeypatch):
+def test_build_chart_payload_keeps_loudness_payload_shape_with_time_varying_trace(monkeypatch):
     ref_db = 20.0 * math.log10(20e-6)
 
     monkeypatch.setattr(
@@ -2282,6 +2400,114 @@ def test_build_chart_payload_keeps_loudness_payload_shape_with_segmented_backend
         "lower_limit": 0.0,
         "upper_limit": 10.0,
     }
+
+
+def test_build_chart_payload_reuses_loudness_trace_cache(monkeypatch):
+    _patch_basic_chart_backends(monkeypatch)
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_loudness_trace",
+        lambda signal, sample_rate: (_ for _ in ()).throw(
+            AssertionError("cache expected")
+        ),
+    )
+
+    payload = build_chart_payload(
+        buffer=np.column_stack(
+            [
+                np.full(200, 0.1, dtype=np.float32),
+                np.full(200, 0.2, dtype=np.float32),
+            ]
+        ),
+        config=_make_config(),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.5, 1.5),
+        loudness_trace_cache={
+            0: {"times_sec": [0.25], "values_sone": [42.0], "max_sone": 42.0},
+            1: {"times_sec": [0.25], "values_sone": [24.0], "max_sone": 24.0},
+        },
+    )
+
+    assert payload[0]["loudness"] == {
+        "times_sec": [0.25],
+        "values": [42.0],
+        "unit": "sone",
+        "lower_limit": 0.0,
+        "upper_limit": 10.0,
+    }
+    assert payload[1]["loudness"]["values"] == [24.0]
+
+
+def test_build_chart_payload_reuses_loudness_trace_cache_with_phon_unit(monkeypatch):
+    _patch_basic_chart_backends(monkeypatch)
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_loudness_trace",
+        lambda signal, sample_rate: (_ for _ in ()).throw(
+            AssertionError("cache expected")
+        ),
+    )
+    config = _make_config()
+    config["channels"][0]["loudness_unit"] = "phon"
+
+    payload = build_chart_payload(
+        buffer=np.column_stack(
+            [
+                np.full(200, 0.1, dtype=np.float32),
+                np.full(200, 0.2, dtype=np.float32),
+            ]
+        ),
+        config=config,
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.5, 1.5),
+        loudness_trace_cache={
+            0: {"times_sec": [0.25], "values_sone": [42.0], "max_sone": 42.0},
+            1: {"times_sec": [0.25], "values_sone": [24.0], "max_sone": 24.0},
+        },
+    )
+
+    assert payload[0]["loudness"]["times_sec"] == [0.25]
+    assert payload[0]["loudness"]["values"] == pytest.approx([dsp.sone_to_phon(42.0)])
+    assert payload[0]["loudness"]["unit"] == "phon"
+    assert payload[0]["loudness"]["lower_limit"] == 0.0
+    assert payload[0]["loudness"]["upper_limit"] == 10.0
+
+
+def test_build_chart_payload_falls_back_when_loudness_trace_cache_is_invalid(monkeypatch):
+    _patch_basic_chart_backends(monkeypatch)
+    config = _make_config()
+    config["selected_channels"] = [0]
+    config["channels"] = [config["channels"][0]]
+    calls = []
+
+    def fake_compute_loudness_trace(signal, sample_rate):
+        calls.append((signal.copy(), sample_rate))
+        return [0.0, 1.0], [2.0, 3.0], 3.0
+
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_loudness_trace",
+        fake_compute_loudness_trace,
+    )
+
+    payload = build_chart_payload(
+        buffer=np.column_stack(
+            [
+                np.full(200, 0.1, dtype=np.float32),
+                np.full(200, 0.2, dtype=np.float32),
+            ]
+        ),
+        config=config,
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.5, 1.5),
+        loudness_trace_cache={
+            0: {"times_sec": [0.25], "values_sone": [42.0, 43.0], "max_sone": 43.0},
+        },
+    )
+
+    assert len(calls) == 1
+    assert payload[0]["loudness"]["times_sec"] == [0.0, 1.0]
+    assert payload[0]["loudness"]["values"] == [2.0, 3.0]
 
 
 def test_build_chart_payload_omits_loudness_for_channel_when_recompute_fails(monkeypatch):

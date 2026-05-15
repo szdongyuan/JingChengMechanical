@@ -1,6 +1,6 @@
-"""Pure stateless DSP functions for the analysis kernel.
+"""DSP functions for the analysis kernel.
 
-All functions operate on numpy arrays and have no side effects.
+Most functions operate on numpy arrays and have no side effects.
 """
 from __future__ import annotations
 
@@ -82,9 +82,57 @@ def _c_weight_linear(f: float) -> float:
 
 
 _REF_PRESSURE = 20e-6
-_LOUDNESS_MIN_SAMPLE_RATE = 48000.0
-_LOUDNESS_NPERSEG = 2048
-_LOUDNESS_NOVERLAP = 1024
+LOUDNESS_BACKEND_SAMPLE_RATE = 48000.0
+LOUDNESS_WINDOW_SAMPLES = 8192
+_LOUDNESS_MIN_SAMPLE_RATE = LOUDNESS_BACKEND_SAMPLE_RATE
+_LOUDNESS_WINDOW_SAMPLES = LOUDNESS_WINDOW_SAMPLES
+_LOUDNESS_HOP_SEC = 0.25
+
+
+def loudness_window_duration_sec() -> float:
+    return LOUDNESS_WINDOW_SAMPLES / LOUDNESS_BACKEND_SAMPLE_RATE
+
+
+class SplDetector:
+    """Stateful exponential pressure-squared SPL detector."""
+
+    def __init__(self, sample_rate: float, weighting: str, time_constant: float):
+        self.sample_rate = float(sample_rate)
+        if self.sample_rate <= 0.0:
+            raise ValueError("sample_rate must be positive")
+        self.weighting = str(weighting or "Z")
+        self.time_constant = float(time_constant)
+        if self.time_constant <= 0.0:
+            raise ValueError("time_constant must be positive")
+        self._alpha = 1.0 - np.exp(-1.0 / (self.sample_rate * self.time_constant))
+        self._mean_square_state: float | None = None
+
+    def process(self, signal: np.ndarray) -> float:
+        sig = np.asarray(signal, dtype=np.float64).reshape(-1)
+        if sig.size == 0:
+            return -np.inf
+
+        weighted = _apply_spl_frequency_weighting(
+            sig,
+            self.sample_rate,
+            self.weighting,
+        ).reshape(-1)
+        squared = weighted ** 2
+        if self._mean_square_state is None:
+            self._mean_square_state = float(np.mean(squared))
+
+        state = float(self._mean_square_state)
+        alpha = self._alpha
+        for sample_square in squared:
+            state = float(alpha * sample_square + (1.0 - alpha) * state)
+        self._mean_square_state = state
+
+        if state <= 0.0:
+            return -np.inf
+        return float(10.0 * np.log10(state / (_REF_PRESSURE ** 2)))
+
+    def reset(self) -> None:
+        self._mean_square_state = None
 
 
 def compute_spl(signal: np.ndarray, sample_rate: float,
@@ -103,23 +151,8 @@ def compute_spl(signal: np.ndarray, sample_rate: float,
     -------
     SPL in dB re 20 µPa
     """
-    sig = np.asarray(signal, dtype=np.float64)
-    if sig.size == 0:
-        return -np.inf
-
-    sig = _apply_spl_frequency_weighting(sig, sample_rate, weighting)
-
-    alpha = 1.0 - np.exp(-1.0 / (sample_rate * time_constant))
-    sq = sig ** 2
-    filtered = np.empty_like(sq)
-    filtered[0] = sq[0]
-    for i in range(1, len(sq)):
-        filtered[i] = alpha * sq[i] + (1.0 - alpha) * filtered[i - 1]
-    rms = np.sqrt(filtered[-1])
-
-    if rms <= 0:
-        return -np.inf
-    return 20.0 * np.log10(rms / _REF_PRESSURE)
+    detector = SplDetector(sample_rate, weighting, time_constant)
+    return detector.process(signal)
 
 
 def compute_spl_leq(signal: np.ndarray, sample_rate: float, weighting: str) -> float:
@@ -145,11 +178,7 @@ def compute_spl_trace(
     *,
     chunk_duration: float = 0.05,
 ) -> tuple[list[float], list[float]]:
-    """Compute chunked weighted SPL values across a signal.
-
-    The returned values keep the same SPL calculation as ``compute_spl`` while
-    preserving time-local extrema for limit checks and charts.
-    """
+    """Compute chunked weighted SPL values across a signal."""
     sig = np.asarray(signal, dtype=np.float64).reshape(-1)
     if sig.size == 0:
         return [], []
@@ -161,14 +190,19 @@ def compute_spl_trace(
         raise ValueError("chunk_duration must be positive")
 
     chunk_samples = max(1, int(round(sample_rate * chunk_duration)))
+    detector = SplDetector(sample_rate, weighting, time_constant)
     times_sec: list[float] = []
     values_db: list[float] = []
-    for start in range(0, int(sig.size), chunk_samples):
+
+    if sig.size < chunk_samples:
+        times_sec.append(float(sig.size / sample_rate))
+        values_db.append(float(detector.process(sig)))
+        return times_sec, values_db
+
+    for start in range(0, int(sig.size) - chunk_samples + 1, chunk_samples):
         chunk = sig[start : start + chunk_samples]
-        if chunk.size < chunk_samples:
-            continue
         times_sec.append(float((start + chunk.size) / sample_rate))
-        values_db.append(float(compute_spl(chunk, sample_rate, weighting, time_constant)))
+        values_db.append(float(detector.process(chunk)))
 
     return times_sec, values_db
 
@@ -197,53 +231,257 @@ def _apply_spl_frequency_weighting(
 @lru_cache(maxsize=1)
 def _load_loudness_backend():
     try:
-        from mosqito.sq_metrics import loudness_zwst_perseg
+        from mosqito.sq_metrics import loudness_zwtv
     except ImportError as exc:
         raise RuntimeError("MoSQITo loudness backend is unavailable") from exc
-    return loudness_zwst_perseg
+    return loudness_zwtv
 
 
-def _compute_loudness_zwst_perseg(signal: np.ndarray, sample_rate: float):
+def _compute_loudness_zwtv(signal: np.ndarray, sample_rate: float):
     backend = _load_loudness_backend()
-    return backend(
-        signal,
+    return backend(signal, int(round(sample_rate)), field_type="free")
+
+
+class _UnsupportedOptimizedLoudnessInput(Exception):
+    """Signal that the cached frequency path should fall back to MoSQITo."""
+
+
+@lru_cache(maxsize=1)
+def _load_loudness_frequency_backend():
+    try:
+        from mosqito.sq_metrics import loudness_zwst_freq
+    except ImportError as exc:
+        raise RuntimeError("MoSQITo loudness backend is unavailable") from exc
+    return _make_cached_loudness_frequency_backend(loudness_zwst_freq)
+
+
+def _make_cached_loudness_frequency_backend(public_backend):
+    def backend(spectrum, freqs, *, field_type="free"):
+        try:
+            return _compute_loudness_zwst_freq_cached(spectrum, freqs, field_type=field_type)
+        except _UnsupportedOptimizedLoudnessInput:
+            return public_backend(spectrum, freqs, field_type=field_type)
+
+    return backend
+
+
+@lru_cache(maxsize=1)
+def _load_loudness_frequency_components():
+    try:
+        from mosqito.sq_metrics.loudness.loudness_zwst._calc_slopes import _calc_slopes
+        from mosqito.sq_metrics.loudness.loudness_zwst._main_loudness import _main_loudness
+        from mosqito.utils import amp2db
+    except ImportError as exc:
+        raise _UnsupportedOptimizedLoudnessInput from exc
+    return _main_loudness, _calc_slopes, amp2db
+
+
+def _compute_loudness_zwst_freq_cached(spectrum, freqs, *, field_type="free"):
+    spectrum_array = np.asarray(spectrum)
+    freqs_array = np.asarray(freqs, dtype=np.float64)
+    one_dimensional_input = spectrum_array.ndim == 1
+    if one_dimensional_input:
+        spectrum_matrix = spectrum_array.reshape(-1, 1)
+    elif spectrum_array.ndim == 2:
+        spectrum_matrix = spectrum_array
+    else:
+        raise _UnsupportedOptimizedLoudnessInput
+
+    if freqs_array.ndim != 1 or freqs_array.size < 2:
+        raise _UnsupportedOptimizedLoudnessInput
+    if spectrum_matrix.shape[0] != freqs_array.size:
+        raise _UnsupportedOptimizedLoudnessInput
+    if not np.all(np.isfinite(freqs_array)):
+        raise _UnsupportedOptimizedLoudnessInput
+    if freqs_array.max() < 24000.0 or freqs_array.min() > 24.0:
+        raise _UnsupportedOptimizedLoudnessInput
+
+    sample_rate = float(freqs_array.max() * 2.0)
+    if round(sample_rate) != int(_LOUDNESS_MIN_SAMPLE_RATE):
+        raise _UnsupportedOptimizedLoudnessInput
+
+    weights = _loudness_third_octave_synthesis_weights(
+        int(spectrum_matrix.shape[0]),
         int(round(sample_rate)),
-        nperseg=_LOUDNESS_NPERSEG,
-        noverlap=_LOUDNESS_NOVERLAP,
     )
+    spec_third = np.sqrt(weights @ (np.abs(spectrum_matrix) ** 2))
+    _main_loudness, _calc_slopes, amp2db = _load_loudness_frequency_components()
+    spec_third_db = amp2db(spec_third.copy(), ref=2e-5)
+    main_loudness = _main_loudness(spec_third_db, field_type)
+    loudness, specific_loudness = _calc_slopes(main_loudness)
+    bark_axis = np.linspace(0.1, 24, int(24 / 0.1))
+    return loudness, specific_loudness, bark_axis
 
 
-def compute_loudness_trace(signal: np.ndarray, sample_rate: float) -> tuple[list[float], list[float], float]:
-    """Compute an ISO 532-1 loudness trace and its maximum in canonical sones."""
+@lru_cache(maxsize=8)
+def _loudness_third_octave_synthesis_weights(
+    freq_count: int,
+    sample_rate: int,
+) -> np.ndarray:
+    if int(sample_rate) != int(_LOUDNESS_MIN_SAMPLE_RATE) or int(freq_count) <= 0:
+        raise _UnsupportedOptimizedLoudnessInput
+    try:
+        from mosqito.sound_level_meter.noct_spectrum._center_freq import _center_freq
+        from mosqito.sound_level_meter.noct_spectrum._filter_bandwidth import _filter_bandwidth
+    except ImportError as exc:
+        raise _UnsupportedOptimizedLoudnessInput from exc
+
+    fc_vec, _fpref = _center_freq(fmin=24, fmax=12600, n=3, G=10, fr=1000)
+    alpha_vec, _f_low, f_high = _filter_bandwidth(fc_vec, n=3)
+    invalid_high = np.asarray(np.where(f_high > sample_rate / 2.0))
+    if any(invalid_high[0]):
+        fc_vec = np.delete(fc_vec, invalid_high)
+
+    weights = []
+    for fc, alpha in zip(fc_vec, alpha_vec, strict=False):
+        w1 = fc / (sample_rate / 2.0) / alpha
+        w2 = fc / (sample_rate / 2.0) * alpha
+        sos = scipy_signal.butter(3, [w1, w2], "bandpass", analog=False, output="sos")
+        _w, response = scipy_signal.sosfreqz(sos, worN=freq_count)
+        weights.append(np.abs(response) ** 2)
+
+    return np.asarray(weights, dtype=np.float64)
+
+
+def _loudness_window_samples(sample_rate: float) -> int:
+    return _LOUDNESS_WINDOW_SAMPLES
+
+
+def _loudness_hop_samples(sample_rate: float) -> int:
+    return max(1, int(round(float(sample_rate) * _LOUDNESS_HOP_SEC)))
+
+
+def _loudness_window_starts(
+    signal_size: int,
+    window_samples: int,
+    hop_samples: int,
+) -> np.ndarray:
+    if signal_size < window_samples:
+        return np.array([0], dtype=np.int64)
+    return np.arange(0, signal_size - window_samples + 1, hop_samples, dtype=np.int64)
+
+
+def _loudness_windows(
+    signal: np.ndarray,
+    starts: np.ndarray,
+    window_samples: int,
+) -> np.ndarray:
+    windows = np.zeros((window_samples, int(starts.size)), dtype=np.float64)
+    for column, start in enumerate(starts):
+        segment = signal[int(start) : int(start) + window_samples]
+        windows[: segment.size, column] = segment
+    return windows
+
+
+def _one_sided_rms_spectrum_matrix(
+    windows: np.ndarray,
+    sample_rate: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    matrix = np.asarray(windows, dtype=np.float64)
+    if matrix.ndim == 1:
+        matrix = matrix.reshape(-1, 1)
+    if matrix.ndim != 2 or matrix.shape[0] <= 0 or matrix.shape[1] <= 0:
+        raise RuntimeError("Loudness spectrum input is empty")
+
+    window_size = int(matrix.shape[0])
+    window = np.hanning(window_size).astype(np.float64)
+    window_rms = float(np.sqrt(np.mean(window ** 2)))
+    if window_rms > 0.0 and np.isfinite(window_rms):
+        matrix = matrix * (window / window_rms)[:, None]
+
+    coeff = np.fft.rfft(matrix, axis=0)
+    mag = np.abs(coeff) / window_size
+    rms_mag = mag.copy()
+    if window_size % 2 == 0:
+        rms_mag[1:-1, :] *= np.sqrt(2.0)
+    else:
+        rms_mag[1:, :] *= np.sqrt(2.0)
+
+    spectrum = rms_mag[1:, :]
+    freqs = np.fft.rfftfreq(window_size, d=1.0 / float(sample_rate))[1:]
+    return spectrum, freqs
+
+
+def _prepare_loudness_signal(
+    signal: np.ndarray,
+    sample_rate: float,
+) -> tuple[np.ndarray, float]:
     sig = np.asarray(signal, dtype=np.float64).reshape(-1)
     if sig.size == 0:
         raise ValueError("Loudness signal is empty")
-    if sample_rate <= 0.0:
+    try:
+        backend_sample_rate = float(sample_rate)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("sample_rate must be positive") from exc
+    if not np.isfinite(backend_sample_rate) or backend_sample_rate <= 0.0:
         raise ValueError("sample_rate must be positive")
 
-    backend_sample_rate = float(sample_rate)
     if backend_sample_rate != _LOUDNESS_MIN_SAMPLE_RATE:
         target_size = max(1, int(round(sig.size * _LOUDNESS_MIN_SAMPLE_RATE / backend_sample_rate)))
         sig = scipy_signal.resample(sig, target_size)
         backend_sample_rate = _LOUDNESS_MIN_SAMPLE_RATE
+    return sig, backend_sample_rate
 
-    actual_duration_sec = sig.size / backend_sample_rate
-    if sig.size < _LOUDNESS_NPERSEG:
-        sig = np.pad(sig, (0, _LOUDNESS_NPERSEG - sig.size))
 
-    values_sone, _, _, times = _compute_loudness_zwst_perseg(sig, backend_sample_rate)
-    values = np.maximum(np.asarray(values_sone, dtype=np.float64).reshape(-1), 0.0)
-    time_axis = np.asarray(times, dtype=np.float64).reshape(-1)
-
-    if values.size == 0 or time_axis.size == 0 or values.size != time_axis.size:
+def _validate_loudness_values(
+    backend_output,
+    expected_count: int,
+) -> np.ndarray:
+    raw_values = backend_output[0] if isinstance(backend_output, tuple) else backend_output
+    values = np.asarray(raw_values, dtype=np.float64).reshape(-1)
+    if values.size == 0 or values.size != expected_count:
         raise RuntimeError("MoSQITo loudness backend returned unusable output")
-    if not np.all(np.isfinite(values)) or not np.all(np.isfinite(time_axis)):
+    if not np.all(np.isfinite(values)):
         raise RuntimeError("MoSQITo loudness backend returned non-finite output")
-    if time_axis.size:
-        time_axis = np.clip(time_axis, 0.0, actual_duration_sec)
+    if np.any(values < 0.0):
+        raise RuntimeError("MoSQITo loudness backend returned values that must be non-negative")
+    return values
+
+
+def _compute_loudness_values_from_windows(
+    windows: np.ndarray,
+    sample_rate: float,
+) -> np.ndarray:
+    spectrum, freqs = _one_sided_rms_spectrum_matrix(windows, sample_rate)
+    backend = _load_loudness_frequency_backend()
+    backend_output = backend(spectrum, freqs, field_type="free")
+    return _validate_loudness_values(backend_output, int(spectrum.shape[1]))
+
+
+def compute_loudness_trace(signal: np.ndarray, sample_rate: float) -> tuple[list[float], list[float], float]:
+    """Compute a rolling frequency-domain loudness trace in canonical sones."""
+    sig, backend_sample_rate = _prepare_loudness_signal(signal, sample_rate)
+    window_samples = _loudness_window_samples(backend_sample_rate)
+    hop_samples = _loudness_hop_samples(backend_sample_rate)
+    starts = _loudness_window_starts(int(sig.size), window_samples, hop_samples)
+    windows = _loudness_windows(sig, starts, window_samples)
+
+    values = _compute_loudness_values_from_windows(windows, backend_sample_rate)
+    if sig.size < window_samples:
+        time_axis = np.array([sig.size / (2.0 * backend_sample_rate)], dtype=np.float64)
+    else:
+        time_axis = (starts.astype(np.float64) + window_samples / 2.0) / backend_sample_rate
+
+    if not np.all(np.isfinite(time_axis)):
+        raise RuntimeError("MoSQITo loudness backend returned non-finite output")
+    if time_axis.size > 1 and not np.all(np.diff(time_axis) > 0.0):
+        raise RuntimeError("MoSQITo loudness backend returned unusable output")
 
     max_sone = float(np.max(values))
     return time_axis.tolist(), values.tolist(), max_sone
+
+
+def compute_loudness_window_sone(signal: np.ndarray, sample_rate: float) -> float:
+    """Compute one short-window frequency-domain loudness estimate in sones."""
+    sig, backend_sample_rate = _prepare_loudness_signal(signal, sample_rate)
+    window_samples = _loudness_window_samples(backend_sample_rate)
+    if sig.size > window_samples:
+        sig = sig[-window_samples:]
+    windows = np.zeros((window_samples, 1), dtype=np.float64)
+    windows[: sig.size, 0] = sig
+
+    values = _compute_loudness_values_from_windows(windows, backend_sample_rate)
+    return float(values[0])
 
 
 def sone_to_phon(value_sone: float) -> float:
@@ -297,6 +535,8 @@ def compute_stft(signal: np.ndarray, sample_rate: float, nfft: int,
         nperseg=actual_nperseg,
         noverlap=noverlap,
         return_onesided=True,
+        boundary=None,
+        padded=False,
     )
     mag = np.abs(zxx)
     mag_db = 20.0 * np.log10(np.maximum(mag, 1e-30))

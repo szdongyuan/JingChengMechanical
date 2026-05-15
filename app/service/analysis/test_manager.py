@@ -5,17 +5,25 @@ API so ControlModule needs zero changes.
 """
 from __future__ import annotations
 
+import inspect
 import os
 import uuid
 from dataclasses import asdict, is_dataclass
+from numbers import Integral
 
 import numpy as np
-from PyQt6.QtCore import QObject
+from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
 
 from app.service.analysis import dsp
 from app.service.analysis.audio_monitor import AudioMonitor
 from app.service.analysis.audio_recorder import AudioRecorder
+from app.service.analysis.monitor_playback import (
+    MONITOR_GAIN_MAX_DB,
+    MONITOR_GAIN_MIN_DB,
+    OneShotReplayPlayer,
+)
 from app.service.analysis.review_payloads import build_chart_payload, build_summary_payload
+from app.service.analysis.selected_channels import normalize_selected_channels
 from app.service.analysis.test_session import ManualLabelUpdateResult, TestSession
 from consts.running_consts import base_dir
 
@@ -24,6 +32,8 @@ class TestManager(QObject):
     """Manages TestSession instances and shared AudioRecorders."""
 
     __test__ = False
+
+    _deferred_monitor_error_occurred = pyqtSignal(int, str)
 
     def __init__(self, bus, services):
         super().__init__()
@@ -41,11 +51,17 @@ class TestManager(QObject):
         self._analyzing_sessions: set[int] = set()
         self._accepted_factory_stops: set[int] = set()
         self._live_loudness_channel_by_config_id: dict[int, int] = {}
+        self._replay_player = OneShotReplayPlayer()
+        self._replay_config_id: int | None = None
 
         display_channel_signal = getattr(self._bus, "factory_display_channel_changed", None)
         connect = getattr(display_channel_signal, "connect", None)
         if callable(connect):
             connect(self._on_factory_display_channel_changed)
+        self._deferred_monitor_error_occurred.connect(
+            self._on_monitor_error,
+            Qt.ConnectionType.QueuedConnection,
+        )
 
     def last_start_error(self) -> str | None:
         return self._last_start_error
@@ -129,6 +145,33 @@ class TestManager(QObject):
                 request_id,
                 "输入硬件配置无效，请重新保存硬件设备。",
             )
+        try:
+            normalized_selected_channels = normalize_selected_channels(
+                config.get("selected_channels", []),
+                hardware_channel_count=n_channels,
+            )
+        except ValueError as exc:
+            self._bus.log.emit(
+                f"[TestManager] ERROR config {config_id} invalid selected_channels: {exc}"
+            )
+            return self._fail_start_before_acceptance(
+                request_id,
+                f"选择的输入通道无效：{exc}",
+            )
+        config = dict(config)
+        config["selected_channels"] = list(normalized_selected_channels)
+        try:
+            resolved_monitor_channel = self._resolve_monitor_channel(
+                config,
+                hardware_channel_count=n_channels,
+            )
+            resolved_monitor_gain_db = self._resolve_monitor_gain_db(config)
+        except ValueError as exc:
+            self._bus.log.emit(
+                f"[TestManager] ERROR config {config_id} invalid monitor controls: {exc}"
+            )
+            return self._fail_start_before_acceptance(request_id, str(exc))
+
         record_duration = config.get("record_duration", 5.0)
         session_workorder = dict(workorder)
         session_workorder["factory_run_id"] = self._new_factory_run_id()
@@ -164,12 +207,33 @@ class TestManager(QObject):
             session._setup_pipelines()
             self._apply_stored_live_loudness_channel(session, config)
 
+            output_name = config.get("output_device_name")
+            if output_name:
+                output_sr = float(config.get("output_device_samplerate", sample_rate))
+                monitor = self._create_audio_monitor(
+                    device_name=config.get("output_device_name", ""),
+                    hostapi=config.get("output_device_hostapi", ""),
+                    sample_rate=output_sr,
+                    monitor_channel=resolved_monitor_channel,
+                    gain_db=resolved_monitor_gain_db,
+                )
+                session._monitor_lambda = lambda data, idx, m=monitor: m.feed(data)
+                session._monitor_error_lambda = (
+                    lambda msg, cid=config_id: self._deferred_monitor_error_occurred.emit(
+                        cid,
+                        msg,
+                    )
+                )
+
             session._chunk_conn = session._on_chunk
             session._done_lambda = lambda cid=config_id: self._on_recording_done(cid)
             session._error_lambda = lambda msg, cid=config_id: self._on_error(cid, msg)
             prepare_for_attach = getattr(session, "prepare_for_attach", None)
             if callable(prepare_for_attach):
                 prepare_for_attach()
+            if monitor is not None:
+                recorder.chunk_ready.connect(session._monitor_lambda)
+                monitor.error_occurred.connect(session._monitor_error_lambda)
             recorder.chunk_ready.connect(session._chunk_conn)
             attach_snapshot = recorder.attach_session(record_duration=record_duration)
             session.attach_to_recorder(
@@ -181,20 +245,7 @@ class TestManager(QObject):
 
             self._sessions[config_id] = session
             self._recorders[config_id] = recorder
-
-            output_name = config.get("output_device_name")
-            if output_name:
-                output_sr = float(config.get("output_device_samplerate", sample_rate))
-                monitor = AudioMonitor(
-                    device_name=config.get("output_device_name", ""),
-                    hostapi=config.get("output_device_hostapi", ""),
-                    sample_rate=output_sr,
-                    monitor_channel=config.get("selected_channels", [0])[0],
-                )
-                session._monitor_lambda = lambda data, idx, m=monitor: m.feed(data)
-                session._monitor_error_lambda = lambda msg, cid=config_id: self._on_error(cid, msg)
-                recorder.chunk_ready.connect(session._monitor_lambda)
-                monitor.error_occurred.connect(session._monitor_error_lambda)
+            if monitor is not None:
                 self._monitors[config_id] = monitor
 
             if mon := self._monitors.get(config_id):
@@ -286,6 +337,93 @@ class TestManager(QObject):
         if callable(setter):
             setter(stored_channel)
 
+    @classmethod
+    def _resolve_monitor_channel(
+        cls,
+        config: dict,
+        *,
+        hardware_channel_count: int,
+    ) -> int:
+        raw_channel = config.get("monitor_channel_index")
+        if raw_channel is None:
+            resolved = None
+            for selected_channel in config.get("selected_channels", []) or ():
+                if isinstance(selected_channel, Integral) and not isinstance(
+                    selected_channel,
+                    (bool, np.bool_),
+                ):
+                    resolved = int(selected_channel)
+                    break
+            if resolved is None and hardware_channel_count > 0:
+                resolved = 0
+        elif isinstance(raw_channel, Integral) and not isinstance(
+            raw_channel,
+            (bool, np.bool_),
+        ):
+            resolved = int(raw_channel)
+        else:
+            raise ValueError("监听通道必须为不小于 0 的整数")
+
+        if resolved is None or resolved < 0:
+            raise ValueError("监听通道必须为不小于 0 的整数")
+        if resolved >= hardware_channel_count:
+            raise ValueError(
+                f"监听通道必须在输入通道范围 0..{hardware_channel_count - 1} 内"
+            )
+        return resolved
+
+    @staticmethod
+    def _resolve_monitor_gain_db(config: dict) -> float:
+        raw_gain = config.get("monitor_gain_db", 0.0)
+        if raw_gain is None:
+            return 0.0
+        if isinstance(raw_gain, (bool, np.bool_, str, bytes)):
+            raise ValueError("监听增益必须为有限数值")
+        try:
+            gain_db = float(raw_gain)
+        except (TypeError, ValueError):
+            raise ValueError("监听增益必须为有限数值") from None
+        if not np.isfinite(gain_db):
+            raise ValueError("监听增益必须为有限数值")
+        if not MONITOR_GAIN_MIN_DB <= gain_db <= MONITOR_GAIN_MAX_DB:
+            raise ValueError(
+                f"监听增益必须在 {MONITOR_GAIN_MIN_DB:g} 到 "
+                f"{MONITOR_GAIN_MAX_DB:g} dB 之间"
+            )
+        return gain_db
+
+    @staticmethod
+    def _create_audio_monitor(
+        *,
+        device_name: str,
+        hostapi: str,
+        sample_rate: float,
+        monitor_channel: int,
+        gain_db: float,
+    ):
+        kwargs = {
+            "device_name": device_name,
+            "hostapi": hostapi,
+            "sample_rate": sample_rate,
+            "monitor_channel": monitor_channel,
+        }
+        if TestManager._call_accepts_keyword(AudioMonitor, "gain_db"):
+            kwargs["gain_db"] = gain_db
+        return AudioMonitor(**kwargs)
+
+    @staticmethod
+    def _call_accepts_keyword(callable_obj, keyword: str) -> bool:
+        try:
+            parameters = inspect.signature(callable_obj).parameters
+        except (TypeError, ValueError):
+            return True
+        if keyword in parameters:
+            return True
+        return any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+
     @staticmethod
     def _channel_is_selected_for_session(session, channel_index: int) -> bool:
         config = getattr(session, "_config", None)
@@ -329,6 +467,7 @@ class TestManager(QObject):
         if config_id is not None:
             self._stop_one(config_id, silent, notify_factory_runtime_abort=True)
         else:
+            self._stop_replay()
             for cid in list(self._sessions.keys()):
                 self._stop_one(cid, silent, notify_factory_runtime_abort=True)
 
@@ -363,54 +502,80 @@ class TestManager(QObject):
         *,
         notify_factory_runtime_abort: bool = False,
     ):
+        self._stop_replay_if_config(config_id)
         session = self._sessions.pop(config_id, None)
         rec = self._recorders.pop(config_id, None)
         mon = self._monitors.pop(config_id, None)
 
         if session is not None and rec is not None:
             self._disconnect_session_signals(session, rec, mon)
+        if session is not None:
+            self._stop_session_live_display_safely(
+                config_id,
+                session,
+                context="stopping",
+            )
 
-        factory_abort_payload = None
-        if (
+        should_notify_factory_abort = (
             notify_factory_runtime_abort
             and session is not None
             and self._factory_run_id(session) is not None
-        ):
-            factory_abort_payload = self._make_factory_runtime_abort_payload(
-                config_id,
-                session,
-                error_message=None,
-            )
+        )
+        factory_abort_error_message = None
 
+        cleanup_errors = []
         try:
             if session is not None and rec is not None and not silent:
-                partial_buf = rec.get_buffer_from(getattr(session, "_attach_snapshot", None))
-                if isinstance(partial_buf, np.ndarray) and partial_buf.size > 0:
-                    session._buffer = partial_buf
-                    session._sample_rate = rec._sample_rate
-                    try:
-                        session._save_wav(partial_buf, rec._sample_rate)
-                    except Exception as exc:
-                        self._bus.log.emit(
-                            f"[TestManager] ERROR saving partial recording for "
-                            f"config={config_id}: {exc}"
+                try:
+                    partial_buf = rec.get_buffer_from(
+                        getattr(session, "_attach_snapshot", None)
+                    )
+                    if isinstance(partial_buf, np.ndarray) and partial_buf.size > 0:
+                        saved_buf = self._capture_session_recorder_buffer(
+                            session,
+                            partial_buf,
+                            rec._sample_rate,
                         )
-                    else:
-                        self._bus.log.emit(
-                            f"[TestManager] saved partial recording for config={config_id}"
-                        )
+                        try:
+                            session._save_wav(saved_buf, rec._sample_rate)
+                        except Exception as exc:
+                            self._bus.log.emit(
+                                f"[TestManager] ERROR saving partial recording for "
+                                f"config={config_id}: {exc}"
+                            )
+                        else:
+                            self._bus.log.emit(
+                                f"[TestManager] saved partial recording for config={config_id}"
+                            )
+                except Exception as exc:
+                    factory_abort_error_message = str(exc)
+                    self._bus.log.emit(
+                        f"[TestManager] ERROR capturing partial recording for "
+                        f"config={config_id}: {exc}"
+                    )
         finally:
-            if mon is not None:
-                mon.stop()
-                mon.wait(1000)
+            cleanup_errors = self._cleanup_monitor_recorder_safely(
+                config_id,
+                mon=mon,
+                rec=rec,
+                context="stopping",
+            )
 
-            if rec is not None:
-                self._stop_recorder_if_unused(rec)
+            self._analyzing_sessions.discard(config_id)
+            self._accepted_factory_stops.discard(config_id)
 
-            if factory_abort_payload is not None:
+            if should_notify_factory_abort:
+                if factory_abort_error_message is None and cleanup_errors:
+                    factory_abort_error_message = "; ".join(
+                        str(error) for error in cleanup_errors
+                    )
                 self._emit_optional_signal(
                     "factory_runtime_aborted",
-                    factory_abort_payload,
+                    self._make_factory_runtime_abort_payload(
+                        config_id,
+                        session,
+                        error_message=factory_abort_error_message,
+                    ),
                 )
 
             if not silent:
@@ -445,10 +610,17 @@ class TestManager(QObject):
                     f"config={config_id}: {exc}"
                 )
 
+        if cleanup_session is not None:
+            self._stop_session_live_display_safely(
+                config_id,
+                cleanup_session,
+                context="failed start",
+            )
+
         if cleanup_monitor is not None:
             try:
                 cleanup_monitor.stop()
-                cleanup_monitor.wait(1000)
+                self._wait_thread_if_not_current(cleanup_monitor, 1000)
             except Exception as exc:
                 self._bus.log.emit(
                     f"[TestManager] ERROR cleaning failed start monitor for "
@@ -587,6 +759,72 @@ class TestManager(QObject):
         )
         return ManualLabelUpdateResult(True, "", audio_data_id)
 
+    def can_replay_selection(
+        self,
+        config_id,
+        run_id,
+        channel_index,
+        start_sec,
+        end_sec,
+    ) -> bool:
+        return self._validate_replay_selection(
+            config_id,
+            run_id,
+            channel_index,
+            start_sec,
+            end_sec,
+            log_failures=False,
+        ) is not None
+
+    def replay_selection(
+        self,
+        config_id,
+        run_id,
+        channel_index,
+        start_sec,
+        end_sec,
+    ) -> bool:
+        replay = self._prepare_replay_selection(
+            config_id,
+            run_id,
+            channel_index,
+            start_sec,
+            end_sec,
+        )
+        if replay is None:
+            return False
+
+        if self._replay_config_id is not None:
+            self._stop_replay()
+
+        player = getattr(self, "_replay_player", None)
+        play = getattr(player, "play", None)
+        if not callable(play):
+            self._log_replay_failure(replay["config_id"], "replay player unavailable")
+            return False
+
+        success = bool(
+            play(
+                replay["segment"],
+                replay["sample_rate"],
+                replay["device_name"],
+                replay["hostapi"],
+                gain_db=replay["gain_db"],
+                error_callback=(
+                    lambda message, cid=replay["config_id"]: self._bus.log.emit(
+                        f"[TestManager] replay error for config={cid}: {message}"
+                    )
+                ),
+            )
+        )
+        if success:
+            self._replay_config_id = replay["config_id"]
+            return True
+
+        self._replay_config_id = None
+        self._log_replay_failure(replay["config_id"], "playback did not start")
+        return False
+
     def rejudge(self, config_id: int, start_sec: float, end_sec: float):
         """Re-run judgment on a user-selected window."""
         session = self._sessions.get(config_id) or self._completed_sessions.get(config_id)
@@ -681,12 +919,37 @@ class TestManager(QObject):
 
             rec = self._recorders.get(config_id)
             mon = self._monitors.get(config_id)
+            capture_error = None
             if rec is not None:
-                session._buffer = rec.get_buffer_from(getattr(session, "_attach_snapshot", None))
-                session._sample_rate = rec._sample_rate
-                self._disconnect_session_signals(session, rec, mon)
+                try:
+                    recorder_buffer = rec.get_buffer_from(
+                        getattr(session, "_attach_snapshot", None)
+                    )
+                    self._capture_session_recorder_buffer(
+                        session,
+                        recorder_buffer,
+                        rec._sample_rate,
+                    )
+                except Exception as exc:
+                    capture_error = exc
+                finally:
+                    self._disconnect_session_signals(session, rec, mon)
 
-            if not self._emit_auto_analysis_review(config_id, session):
+            self._stop_session_live_display_safely(
+                config_id,
+                session,
+                context="recording completion",
+            )
+
+            if capture_error is not None:
+                if not self._emit_auto_analysis_failure_review(
+                    config_id,
+                    session,
+                    capture_error,
+                    context="capture",
+                ):
+                    return
+            elif not self._emit_auto_analysis_review(config_id, session):
                 return
 
             completed_session = self._sessions.pop(config_id, None)
@@ -695,11 +958,12 @@ class TestManager(QObject):
 
             self._recorders.pop(config_id, None)
             mon = self._monitors.pop(config_id, None)
-            if mon is not None:
-                mon.stop()
-                mon.wait(1000)
-            if rec is not None:
-                self._stop_recorder_if_unused(rec)
+            self._cleanup_monitor_recorder_safely(
+                config_id,
+                mon=mon,
+                rec=rec,
+                context="recording completion",
+            )
             if cleanup_settled_payload is not None:
                 self._emit_optional_signal(
                     "factory_runtime_auto_analysis_cleanup_settled",
@@ -722,6 +986,26 @@ class TestManager(QObject):
                 ),
             )
         self._stop_one(config_id, silent=True)
+
+    def _on_monitor_error(self, config_id: int, message: str):
+        if self._is_nonfatal_monitor_diagnostic(message):
+            self._bus.log.emit(
+                f"[TestManager] monitor diagnostic config={config_id}: {message}"
+            )
+            return
+        self._on_error(config_id, message)
+
+    @staticmethod
+    def _is_nonfatal_monitor_diagnostic(message: str) -> bool:
+        if not isinstance(message, str):
+            return False
+        if message in {
+            "Monitoring buffer overflow",
+            "Monitoring queue overflow",
+            "Monitoring output underrun",
+        }:
+            return True
+        return message.startswith("Monitoring output status:")
 
     @staticmethod
     def _new_factory_run_id() -> str:
@@ -988,11 +1272,81 @@ class TestManager(QObject):
         self._bus.status.emit("Idle")
         return True
 
+    def _emit_auto_analysis_failure_review(
+        self,
+        config_id: int,
+        session,
+        error: Exception,
+        *,
+        context: str,
+        allow_accepted_stop: bool = False,
+    ) -> bool:
+        if not self._auto_analysis_review_still_owned(
+            config_id,
+            session,
+            allow_accepted_stop=allow_accepted_stop,
+        ):
+            return False
+
+        payload = self._emit_no_result(
+            config_id,
+            error,
+            context=context,
+            still_owned=lambda: self._auto_analysis_review_still_owned(
+                config_id,
+                session,
+                allow_accepted_stop=allow_accepted_stop,
+            ),
+        )
+        if payload is None:
+            return False
+
+        signal_name = (
+            "factory_runtime_auto_analysis_no_result"
+            if self._is_factory_no_result_error(error)
+            else "factory_runtime_auto_analysis_error"
+        )
+        summary_payload = self._build_summary_payload_for_error(
+            session,
+            error_message=payload["error_summary"],
+        )
+        if not self._auto_analysis_review_still_owned(
+            config_id,
+            session,
+            allow_accepted_stop=allow_accepted_stop,
+        ):
+            return False
+
+        self._emit_optional_signal(
+            signal_name,
+            self._make_factory_review_payload(
+                config_id,
+                session,
+                no_result=True,
+                error_message=payload["error_summary"],
+                summary_payload=summary_payload,
+            ),
+        )
+        if not self._auto_analysis_review_still_owned(
+            config_id,
+            session,
+            allow_accepted_stop=allow_accepted_stop,
+        ):
+            return False
+
+        self._bus.status.emit("Idle")
+        return True
+
     def _stop_recording_with_optional_analysis(self, config_id: int, session) -> bool:
         rec = self._recorders.get(config_id)
         mon = self._monitors.get(config_id)
         if rec is not None:
             self._disconnect_session_signals(session, rec, mon)
+        self._stop_session_live_display_safely(
+            config_id,
+            session,
+            context="factory stop",
+        )
 
         capture = self._capture_partial_stop_buffer(config_id, session, rec)
         try:
@@ -1004,6 +1358,14 @@ class TestManager(QObject):
                 exc,
                 rec=rec,
                 mon=mon,
+            )
+
+        capture_error = capture.get("capture_error")
+        if capture_error is not None:
+            return self._run_stop_triggered_capture_failure(
+                config_id,
+                session,
+                capture_error,
             )
 
         if self._stop_is_analysis_eligible(
@@ -1022,6 +1384,11 @@ class TestManager(QObject):
         mon = self._monitors.get(config_id)
         if rec is not None:
             self._disconnect_session_signals(session, rec, mon)
+        self._stop_session_live_display_safely(
+            config_id,
+            session,
+            context="factory stop",
+        )
 
         try:
             self._stop_factory_runtime_io(config_id, rec=rec, mon=mon)
@@ -1044,6 +1411,7 @@ class TestManager(QObject):
                 "partial_buf": None,
                 "partial_wav_ok": False,
                 "captured_duration_sec": self._captured_duration_sec(session),
+                "capture_error": None,
             }
 
         try:
@@ -1056,11 +1424,27 @@ class TestManager(QObject):
                 "partial_buf": None,
                 "partial_wav_ok": False,
                 "captured_duration_sec": None,
+                "capture_error": None,
             }
 
         if isinstance(partial_buf, np.ndarray):
-            session._buffer = partial_buf
-            session._sample_rate = rec._sample_rate
+            try:
+                partial_buf = self._capture_session_recorder_buffer(
+                    session,
+                    partial_buf,
+                    rec._sample_rate,
+                )
+            except Exception as exc:
+                self._bus.log.emit(
+                    f"[TestManager] ERROR capturing partial recording for "
+                    f"config={config_id}: {exc}"
+                )
+                return {
+                    "partial_buf": None,
+                    "partial_wav_ok": False,
+                    "captured_duration_sec": None,
+                    "capture_error": exc,
+                }
 
         captured_duration_sec = self._captured_duration_sec(session)
         if isinstance(partial_buf, np.ndarray) and partial_buf.size > 0:
@@ -1087,6 +1471,7 @@ class TestManager(QObject):
             "partial_buf": partial_buf,
             "partial_wav_ok": partial_wav_ok,
             "captured_duration_sec": captured_duration_sec,
+            "capture_error": None,
         }
 
     def _stop_is_analysis_eligible(
@@ -1134,13 +1519,50 @@ class TestManager(QObject):
             self._analyzing_sessions.discard(config_id)
             self._accepted_factory_stops.discard(config_id)
 
+    def _run_stop_triggered_capture_failure(
+        self,
+        config_id: int,
+        session,
+        error: Exception,
+    ) -> bool:
+        cleanup_settled_payload = self._make_cleanup_settled_payload(config_id, session)
+        self._analyzing_sessions.add(config_id)
+        self._emit_factory_analyzing_entered(
+            config_id,
+            session,
+            log_message=f"[TestManager] stop-triggered capture failed for config={config_id}: {error}",
+        )
+        try:
+            if not self._emit_auto_analysis_failure_review(
+                config_id,
+                session,
+                error,
+                context="capture",
+                allow_accepted_stop=True,
+            ):
+                return True
+
+            completed_session = self._sessions.pop(config_id, None)
+            if completed_session is not None:
+                self._completed_sessions[config_id] = completed_session
+
+            if cleanup_settled_payload is not None:
+                self._emit_optional_signal(
+                    "factory_runtime_auto_analysis_cleanup_settled",
+                    cleanup_settled_payload,
+                )
+            return True
+        finally:
+            self._analyzing_sessions.discard(config_id)
+            self._accepted_factory_stops.discard(config_id)
+
     def _stop_factory_runtime_io(self, config_id: int, *, rec, mon) -> None:
         cleanup_error = None
 
         try:
             if mon is not None:
                 mon.stop()
-                mon.wait(1000)
+                self._wait_thread_if_not_current(mon, 1000)
         except Exception as exc:
             cleanup_error = exc
 
@@ -1298,6 +1720,7 @@ class TestManager(QObject):
         mic_cal = getattr(session, "_mic_cal", None)
         if not isinstance(mic_cal, dict):
             mic_cal = {}
+        loudness_trace_cache = self._session_loudness_trace_cache(session)
         chart_payload = build_chart_payload(
             buffer=getattr(session, "_buffer", None),
             config=TestManager._session_config(session),
@@ -1305,6 +1728,8 @@ class TestManager(QObject):
             mic_cal=mic_cal,
             analysis_window=analysis_window,
             judgment_payload=judgment_payload,
+            channel_column_map=self._session_channel_column_map(session),
+            loudness_trace_cache=loudness_trace_cache,
         )
         self._warn_loudness_chart_issues(
             session,
@@ -1312,6 +1737,37 @@ class TestManager(QObject):
             chart_payload=chart_payload,
         )
         return chart_payload
+
+    @staticmethod
+    def _capture_session_recorder_buffer(
+        session,
+        hardware_buffer: np.ndarray,
+        sample_rate: float,
+    ) -> np.ndarray:
+        capture_recorder_buffer = getattr(session, "capture_recorder_buffer", None)
+        if callable(capture_recorder_buffer):
+            captured = capture_recorder_buffer(hardware_buffer, sample_rate)
+            if isinstance(captured, np.ndarray):
+                return captured
+        session._buffer = hardware_buffer
+        session._sample_rate = sample_rate
+        return hardware_buffer
+
+    @staticmethod
+    def _session_channel_column_map(session) -> dict[int, int] | None:
+        channel_map = getattr(session, "_real_to_logical_channel", None)
+        if isinstance(channel_map, dict) and channel_map:
+            return dict(channel_map)
+        return None
+
+    @staticmethod
+    def _session_loudness_trace_cache(session) -> dict[int, dict] | None:
+        session_vars = getattr(session, "__dict__", None)
+        if isinstance(session_vars, dict):
+            cache = session_vars.get("_last_loudness_trace_cache")
+        else:
+            cache = getattr(session, "_last_loudness_trace_cache", None)
+        return cache if isinstance(cache, dict) else None
 
     def _warn_loudness_chart_issues(
         self,
@@ -1417,6 +1873,270 @@ class TestManager(QObject):
             return None
         return float(buffer.shape[0]) / sample_rate
 
+    def _prepare_replay_selection(
+        self,
+        config_id,
+        run_id,
+        channel_index,
+        start_sec,
+        end_sec,
+    ) -> dict | None:
+        replay = self._validate_replay_selection(
+            config_id,
+            run_id,
+            channel_index,
+            start_sec,
+            end_sec,
+            log_failures=True,
+        )
+        if replay is None:
+            return None
+
+        segment = self._copy_replay_segment(
+            replay["buffer"],
+            replay["logical_channel"],
+            replay["start_frame"],
+            replay["end_frame"],
+        )
+        if segment.size <= 0:
+            self._log_replay_failure(replay["config_id"], "empty replay segment")
+            return None
+        if not np.all(np.isfinite(segment)):
+            self._log_replay_failure(
+                replay["config_id"],
+                "replay segment contains non-finite samples",
+            )
+            return None
+
+        replay.pop("buffer", None)
+        replay.pop("logical_channel", None)
+        replay.pop("start_frame", None)
+        replay.pop("end_frame", None)
+        replay["segment"] = segment
+        return replay
+
+    def _validate_replay_selection(
+        self,
+        config_id,
+        run_id,
+        channel_index,
+        start_sec,
+        end_sec,
+        *,
+        log_failures: bool,
+    ) -> dict | None:
+        normalized_config_id = self._as_non_bool_int(config_id)
+        if normalized_config_id is None:
+            self._maybe_log_replay_failure(log_failures, config_id, "invalid config id")
+            return None
+
+        session = self._sessions.get(normalized_config_id) or self._completed_sessions.get(
+            normalized_config_id
+        )
+        if session is None:
+            self._maybe_log_replay_failure(
+                log_failures,
+                normalized_config_id,
+                "no replay session",
+            )
+            return None
+
+        if run_id:
+            session_run_id = self._factory_run_id(session)
+            if not session_run_id or session_run_id != run_id:
+                self._maybe_log_replay_failure(
+                    log_failures,
+                    normalized_config_id,
+                    "stale replay request",
+                )
+                return None
+
+        buffer = getattr(session, "_buffer", None)
+        if not isinstance(buffer, np.ndarray) or buffer.size <= 0:
+            self._maybe_log_replay_failure(
+                log_failures,
+                normalized_config_id,
+                "no replay buffer",
+            )
+            return None
+        if buffer.ndim not in (1, 2):
+            self._maybe_log_replay_failure(
+                log_failures,
+                normalized_config_id,
+                "replay buffer must be 1-D or 2-D",
+            )
+            return None
+
+        sample_rate = self._coerce_finite_float(getattr(session, "_sample_rate", None))
+        if sample_rate is None or sample_rate <= 0:
+            self._maybe_log_replay_failure(
+                log_failures,
+                normalized_config_id,
+                "invalid replay sample rate",
+            )
+            return None
+
+        channel_map = getattr(session, "_real_to_logical_channel", None)
+        if not isinstance(channel_map, dict) or not channel_map:
+            self._maybe_log_replay_failure(
+                log_failures,
+                normalized_config_id,
+                "no replay channel map",
+            )
+            return None
+
+        real_channel = self._as_non_bool_int(channel_index)
+        if real_channel is None:
+            self._maybe_log_replay_failure(
+                log_failures,
+                normalized_config_id,
+                "invalid replay channel",
+            )
+            return None
+        logical_channel = self._as_non_bool_int(channel_map.get(real_channel))
+        if logical_channel is None:
+            self._maybe_log_replay_failure(
+                log_failures,
+                normalized_config_id,
+                f"channel CH{real_channel + 1} is not replayable",
+            )
+            return None
+        if logical_channel < 0:
+            self._maybe_log_replay_failure(
+                log_failures,
+                normalized_config_id,
+                "invalid replay channel map",
+            )
+            return None
+        if buffer.ndim == 1:
+            if logical_channel != 0:
+                self._maybe_log_replay_failure(
+                    log_failures,
+                    normalized_config_id,
+                    "replay channel is outside buffer",
+                )
+                return None
+        elif logical_channel >= buffer.shape[1]:
+            self._maybe_log_replay_failure(
+                log_failures,
+                normalized_config_id,
+                "replay channel is outside buffer",
+            )
+            return None
+
+        start = self._coerce_finite_float(start_sec)
+        end = self._coerce_finite_float(end_sec)
+        if start is None or end is None or end <= start:
+            self._maybe_log_replay_failure(
+                log_failures,
+                normalized_config_id,
+                "invalid replay window",
+            )
+            return None
+
+        frame_count = int(buffer.shape[0])
+        duration_sec = float(frame_count) / sample_rate
+        clamped_start = max(0.0, min(start, duration_sec))
+        clamped_end = max(0.0, min(end, duration_sec))
+        if clamped_end <= clamped_start:
+            self._maybe_log_replay_failure(
+                log_failures,
+                normalized_config_id,
+                "empty replay window",
+            )
+            return None
+
+        start_frame = max(0, min(frame_count, int(clamped_start * sample_rate)))
+        end_frame = max(start_frame, min(frame_count, int(clamped_end * sample_rate)))
+        if end_frame <= start_frame:
+            self._maybe_log_replay_failure(
+                log_failures,
+                normalized_config_id,
+                "empty replay window",
+            )
+            return None
+
+        config = getattr(session, "_config", None)
+        if not isinstance(config, dict):
+            config = {}
+        device_name = config.get("output_device_name")
+        if not self._non_empty_text(device_name):
+            self._maybe_log_replay_failure(
+                log_failures,
+                normalized_config_id,
+                "missing replay output device",
+            )
+            return None
+        hostapi = config.get("output_device_hostapi") or ""
+        if not isinstance(hostapi, str):
+            hostapi = str(hostapi)
+
+        try:
+            gain_db = self._resolve_monitor_gain_db(config)
+        except ValueError as exc:
+            self._maybe_log_replay_failure(
+                log_failures,
+                normalized_config_id,
+                str(exc),
+            )
+            return None
+
+        return {
+            "config_id": normalized_config_id,
+            "session": session,
+            "buffer": buffer,
+            "logical_channel": logical_channel,
+            "start_frame": start_frame,
+            "end_frame": end_frame,
+            "sample_rate": sample_rate,
+            "device_name": device_name,
+            "hostapi": hostapi,
+            "gain_db": gain_db,
+        }
+
+    @staticmethod
+    def _copy_replay_segment(
+        buffer: np.ndarray,
+        logical_channel: int,
+        start_frame: int,
+        end_frame: int,
+    ) -> np.ndarray:
+        if buffer.ndim == 1:
+            selected = buffer[start_frame:end_frame]
+        else:
+            selected = buffer[start_frame:end_frame, logical_channel]
+        return np.asarray(selected, dtype=np.float32).copy()
+
+    def _maybe_log_replay_failure(
+        self,
+        should_log: bool,
+        config_id,
+        message: str,
+    ) -> None:
+        if should_log:
+            self._log_replay_failure(config_id, message)
+
+    def _log_replay_failure(self, config_id, message: str) -> None:
+        self._bus.log.emit(
+            f"[TestManager] replay unavailable for config={config_id}: {message}"
+        )
+
+    def _stop_replay_if_config(self, config_id: int) -> None:
+        if self._replay_config_id == config_id:
+            self._stop_replay()
+
+    def _stop_replay(self) -> None:
+        player = getattr(self, "_replay_player", None)
+        stop = getattr(player, "stop", None)
+        if callable(stop):
+            try:
+                stop(wait=True)
+            except TypeError:
+                stop()
+            except Exception as exc:
+                self._bus.log.emit(f"[TestManager] ERROR stopping replay: {exc}")
+        self._replay_config_id = None
+
     @staticmethod
     def _window_from_payload(judgment_payload: dict | None, *, review_window_cls):
         if not isinstance(judgment_payload, dict):
@@ -1471,6 +2191,91 @@ class TestManager(QObject):
         if monitor is not None:
             self._disconnect(monitor.error_occurred, getattr(session, "_monitor_error_lambda", None))
 
+    def _stop_session_live_display_safely(
+        self,
+        config_id: int,
+        session,
+        *,
+        context: str,
+    ) -> None:
+        stop_live_display = getattr(session, "stop_live_display", None)
+        if not callable(stop_live_display):
+            return
+        try:
+            stop_live_display()
+        except Exception as exc:
+            self._bus.log.emit(
+                f"[TestManager] ERROR {context} cleanup live display "
+                f"for config={config_id}: {exc}"
+            )
+
+    def _cleanup_monitor_recorder_safely(
+        self,
+        config_id: int,
+        *,
+        mon=None,
+        rec=None,
+        context: str,
+        excluding_config_id: int | None = None,
+    ) -> list[Exception]:
+        errors: list[Exception] = []
+
+        if mon is not None:
+            self._call_cleanup_safely(
+                errors,
+                config_id=config_id,
+                context=context,
+                action="monitor stop",
+                callback=mon.stop,
+            )
+            self._call_cleanup_safely(
+                errors,
+                config_id=config_id,
+                context=context,
+                action="monitor wait",
+                callback=lambda: self._wait_thread_if_not_current(mon, 1000),
+            )
+
+        if rec is not None and not self._recorder_has_live_owner(
+            rec,
+            excluding_config_id=excluding_config_id,
+        ):
+            self._call_cleanup_safely(
+                errors,
+                config_id=config_id,
+                context=context,
+                action="recorder stop",
+                callback=rec.stop,
+            )
+            self._call_cleanup_safely(
+                errors,
+                config_id=config_id,
+                context=context,
+                action="recorder wait",
+                callback=lambda: self._wait_thread_if_not_current(rec, 3000),
+            )
+            self._discard_shared_recorder(rec)
+
+        return errors
+
+    def _call_cleanup_safely(
+        self,
+        errors: list[Exception],
+        *,
+        config_id: int,
+        context: str,
+        action: str,
+        callback,
+    ) -> None:
+        try:
+            callback()
+        except Exception as exc:
+            errors.append(exc)
+            self._bus.log.emit(
+                f"[TestManager] ERROR {context} cleanup {action} "
+                f"for config={config_id}: {exc}"
+            )
+
     def _recorder_has_live_owner(
         self,
         recorder,
@@ -1488,8 +2293,33 @@ class TestManager(QObject):
             excluding_config_id=excluding_config_id,
         ):
             recorder.stop()
-            recorder.wait(3000)
+            self._wait_thread_if_not_current(recorder, 3000)
             self._discard_shared_recorder(recorder)
+
+    def _wait_thread_if_not_current(self, thread, timeout_ms: int):
+        if self._is_current_thread(thread):
+            return None
+        wait = getattr(thread, "wait", None)
+        if callable(wait):
+            return wait(timeout_ms)
+        return None
+
+    @staticmethod
+    def _is_current_thread(thread) -> bool:
+        is_current_thread = getattr(thread, "isCurrentThread", None)
+        if callable(is_current_thread):
+            try:
+                result = is_current_thread()
+                if isinstance(result, (bool, np.bool_)):
+                    return bool(result)
+            except Exception:
+                pass
+
+        try:
+            current_thread = QThread.currentThread()
+            return current_thread is thread or current_thread == thread
+        except Exception:
+            return False
 
     def _discard_shared_recorder(self, recorder) -> None:
         for key, shared_rec in list(self._shared_recorders.items()):

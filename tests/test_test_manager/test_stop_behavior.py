@@ -8,6 +8,7 @@ from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.test_manager import TestManager
 
 from ._support import (
+    _expected_no_result_payload,
     _make_running_factory_manager,
     _mock_bus,
     _mock_services,
@@ -35,6 +36,7 @@ class TestTestManagerStartStop:
         bus, _, mgr, session, recorder, monitor, partial_buf = _make_running_factory_manager(
             monkeypatch
         )
+        session.stop_live_display = MagicMock()
 
         factory_run_id = session._workorder["factory_run_id"]
 
@@ -58,6 +60,7 @@ class TestTestManagerStartStop:
         assert recorder.wait_calls == [3000]
         assert monitor.stop_calls == 1
         assert monitor.wait_calls == [1000]
+        session.stop_live_display.assert_called_once()
 
     def test_stop_with_bool_from_clicked_stops_all(self):
         bus = _mock_bus()
@@ -124,6 +127,90 @@ class TestTestManagerStartStop:
         assert emission_states[0]["is_running"] is False
         bus.factory_runtime_aborted.emit.assert_not_called()
         bus.status.emit.assert_any_call("Stopped")
+
+    def test_capture_partial_stop_buffer_projects_selected_channels_before_save(
+        self,
+        monkeypatch,
+    ):
+        partial_buf = np.column_stack(
+            [np.full(20, channel, dtype=np.float32) for channel in range(6)]
+        )
+        _, _, mgr, session, recorder, _, _ = _make_running_factory_manager(
+            monkeypatch,
+            partial_buf=partial_buf,
+            sample_rate=100.0,
+        )
+        session._config["selected_channels"] = [1, 4]
+        session._config["channels"] = [{"channel_index": 1}, {"channel_index": 4}]
+
+        capture = mgr._capture_partial_stop_buffer(1, session, recorder)
+
+        np.testing.assert_array_equal(session._buffer, partial_buf[:, [1, 4]])
+        assert session._source_channels == (1, 4)
+        assert session._real_to_logical_channel == {1: 0, 4: 1}
+        assert len(session.saved_wavs) == 1
+        saved_buf, saved_sample_rate = session.saved_wavs[0]
+        np.testing.assert_array_equal(saved_buf, partial_buf[:, [1, 4]])
+        assert saved_sample_rate == 100.0
+        np.testing.assert_array_equal(capture["partial_buf"], partial_buf[:, [1, 4]])
+
+    def test_stop_active_run_projection_failure_emits_no_result_and_cleans_runtime(
+        self,
+        monkeypatch,
+    ):
+        partial_buf = np.column_stack(
+            [np.full(400, channel, dtype=np.float32) for channel in range(2)]
+        )
+        bus, _, mgr, session, recorder, monitor, _ = _make_running_factory_manager(
+            monkeypatch,
+            analysis_duration=2.0,
+            analysis_window_offset_ms=1000,
+            allow_incomplete_recording_analysis=True,
+            partial_buf=partial_buf,
+            sample_rate=100.0,
+        )
+        session._config["selected_channels"] = [3]
+        session._config["channels"] = [{"channel_index": 3}]
+        session._run_judgment = MagicMock(
+            side_effect=AssertionError("projection failure should stop analysis")
+        )
+        expected_error = "selected channel 3 is outside hardware channel range 0..1"
+
+        stopped = mgr.stop_active_run(config_id=1)
+
+        assert stopped is True
+        assert recorder.get_buffer_from_calls == [session._attach_snapshot]
+        session._run_judgment.assert_not_called()
+        assert session._buffer is None
+        assert session.saved_wavs == []
+        bus.test_finished.emit.assert_called_once_with(
+            1,
+            _expected_no_result_payload(expected_error),
+        )
+        bus.result_changed.emit.assert_called_once_with(
+            _expected_no_result_payload(expected_error)
+        )
+        bus.factory_runtime_auto_analysis_no_result.emit.assert_called_once()
+        review_payload = bus.factory_runtime_auto_analysis_no_result.emit.call_args.args[0]
+        assert review_payload.run_id == session._workorder["factory_run_id"]
+        assert review_payload.no_result is True
+        assert review_payload.error_message == expected_error
+        assert review_payload.judgment_payload is None
+        assert review_payload.chart_payload is None
+        bus.factory_runtime_auto_analysis_error.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_cleanup_settled.emit.assert_called_once()
+        bus.factory_runtime_stopped.emit.assert_not_called()
+        bus.factory_runtime_aborted.emit.assert_not_called()
+        assert mgr._sessions == {}
+        assert mgr._recorders == {}
+        assert mgr._monitors == {}
+        assert mgr._analyzing_sessions == set()
+        assert mgr._accepted_factory_stops == set()
+        assert mgr._completed_sessions[1] is session
+        assert recorder.stop_calls == 1
+        assert recorder.wait_calls == [3000]
+        assert monitor.stop_calls == 1
+        assert monitor.wait_calls == [1000]
 
     def test_factory_runtime_stopped_payload_preserves_original_trigger_source(
         self,

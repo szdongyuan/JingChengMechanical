@@ -1,6 +1,8 @@
 """Tests for pure DSP functions."""
 from __future__ import annotations
 
+import time
+
 import numpy as np
 import pytest
 
@@ -15,6 +17,7 @@ from app.service.analysis.dsp import (
     compute_octave_bands,
     compute_spl,
     compute_spl_leq,
+    compute_spl_trace,
     compute_stft,
     phon_to_sone,
     sone_to_phon,
@@ -30,6 +33,80 @@ def _level_for_center(
     idx = np.where(np.isclose(centers, target_freq))[0]
     assert idx.size == 1
     return float(levels[idx[0]])
+
+
+def _stable_calibrator_signal(
+    *,
+    sample_rate: float = 44100.0,
+    duration_sec: float = 3.0,
+    freq_hz: float = 1000.0,
+    spl_db: float = 94.0,
+) -> tuple[np.ndarray, float]:
+    amplitude = np.sqrt(2.0) * 20e-6 * (10.0 ** (spl_db / 20.0))
+    times = np.arange(int(sample_rate * duration_sec), dtype=np.float64) / sample_rate
+    return amplitude * np.sin(2.0 * np.pi * freq_hz * times), sample_rate
+
+
+def _calibrated_sine_signal(
+    *,
+    frequency_hz: float,
+    spl_db: float = 94.0,
+    sample_rate: float = 48000.0,
+    duration_sec: float = 3.0,
+) -> tuple[np.ndarray, float]:
+    times = np.arange(int(sample_rate * duration_sec), dtype=np.float64) / sample_rate
+    amplitude = np.sqrt(2.0) * 20e-6 * (10.0 ** (spl_db / 20.0))
+    return amplitude * np.sin(2.0 * np.pi * frequency_hz * times), sample_rate
+
+
+def _deterministic_multitone_signal(
+    *,
+    sample_rate: float = 48000.0,
+    duration_sec: float = 0.75,
+) -> tuple[np.ndarray, float]:
+    times = np.arange(int(sample_rate * duration_sec), dtype=np.float64) / sample_rate
+    rms = 20e-6 * 10.0 ** (74.0 / 20.0)
+    signal = (
+        0.62 * np.sin(2.0 * np.pi * 125.0 * times)
+        + 0.41 * np.sin(2.0 * np.pi * 1000.0 * times)
+        + 0.29 * np.sin(2.0 * np.pi * 3150.0 * times)
+        + 0.17 * np.sin(2.0 * np.pi * 8000.0 * times)
+    )
+    signal_rms = float(np.sqrt(np.mean(signal ** 2)))
+    return signal * (rms / signal_rms), sample_rate
+
+
+def _loudness_spectrum_for_signal(
+    signal: np.ndarray,
+    sample_rate: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    window_samples = dsp_module._loudness_window_samples(sample_rate)
+    hop_samples = dsp_module._loudness_hop_samples(sample_rate)
+    starts = dsp_module._loudness_window_starts(signal.size, window_samples, hop_samples)
+    windows = dsp_module._loudness_windows(signal, starts, window_samples)
+    return dsp_module._one_sided_rms_spectrum_matrix(windows, sample_rate)
+
+
+def test_loudness_spectrum_helper_returns_one_sided_matrix_shape():
+    sample_rate = 48000.0
+    signal, _ = _calibrated_sine_signal(
+        frequency_hz=998.6,
+        sample_rate=sample_rate,
+        duration_sec=0.75,
+    )
+    window_samples = dsp_module._loudness_window_samples(sample_rate)
+    hop_samples = dsp_module._loudness_hop_samples(sample_rate)
+    starts = dsp_module._loudness_window_starts(signal.size, window_samples, hop_samples)
+    windows = dsp_module._loudness_windows(signal, starts, window_samples)
+
+    spectrum, freqs = dsp_module._one_sided_rms_spectrum_matrix(windows, sample_rate)
+
+    assert spectrum.shape == (window_samples // 2, starts.size)
+    assert freqs.shape == (window_samples // 2,)
+    assert freqs[0] == pytest.approx(sample_rate / window_samples)
+    assert freqs[-1] == pytest.approx(sample_rate / 2.0)
+    assert np.all(np.isfinite(spectrum))
+    assert np.all(spectrum >= 0.0)
 
 
 class TestAWeighting:
@@ -154,12 +231,124 @@ class TestComputeSpl:
         assert spl == pytest.approx(expected, abs=0.1)
 
 
+@pytest.mark.parametrize("weighting", ["A", "C", "Z"])
+def test_compute_spl_trace_is_stable_for_1khz_calibrator(weighting):
+    signal, sample_rate = _stable_calibrator_signal()
+
+    times_sec, values_db = compute_spl_trace(
+        signal,
+        sample_rate,
+        weighting=weighting,
+        time_constant=0.125,
+        chunk_duration=4096 / sample_rate,
+    )
+
+    assert len(times_sec) >= 10
+    stable_values = np.asarray(values_db[1:], dtype=np.float64)
+    assert float(np.max(stable_values) - np.min(stable_values)) <= 0.10
+    assert float(np.mean(stable_values)) == pytest.approx(94.0, abs=0.10)
+
+
+def test_compute_spl_trace_does_not_widen_when_time_constant_increases():
+    signal, sample_rate = _stable_calibrator_signal()
+
+    spans = []
+    for time_constant in (0.035, 0.125, 1.0):
+        _times, values = compute_spl_trace(
+            signal,
+            sample_rate,
+            weighting="Z",
+            time_constant=time_constant,
+            chunk_duration=4096 / sample_rate,
+        )
+        stable = np.asarray(values[1:], dtype=np.float64)
+        spans.append(float(stable.max() - stable.min()))
+
+    assert max(spans) <= 0.10
+
+
+def test_compute_spl_trace_uses_one_continuous_detector(monkeypatch):
+    instances = []
+
+    class FakeDetector:
+        def __init__(self, sample_rate, weighting, time_constant):
+            self.calls = []
+            instances.append(self)
+
+        def process(self, signal):
+            self.calls.append(np.asarray(signal).copy())
+            return float(len(self.calls))
+
+    monkeypatch.setattr("app.service.analysis.dsp.SplDetector", FakeDetector)
+
+    signal = np.ones(1000, dtype=np.float64)
+    _times, values = compute_spl_trace(
+        signal,
+        sample_rate=1000.0,
+        weighting="Z",
+        time_constant=0.125,
+        chunk_duration=0.1,
+    )
+
+    assert len(instances) == 1
+    assert len(instances[0].calls) == len(values)
+    assert values == pytest.approx([float(i) for i in range(1, len(values) + 1)])
+
+
 class TestLoudnessHelpers:
     def test_sone_to_phon_matches_piecewise_contract(self):
         assert sone_to_phon(1.0) == pytest.approx(40.0)
 
     def test_phon_to_sone_clamps_negative_inverse_to_zero(self):
         assert phon_to_sone(0.0) == pytest.approx(0.0)
+
+    def test_compute_loudness_trace_matches_1khz_94db_reference(self):
+        signal, sample_rate = _stable_calibrator_signal(sample_rate=48000.0)
+
+        times_sec, values_sone, max_sone = compute_loudness_trace(signal, sample_rate)
+
+        values = np.asarray(values_sone, dtype=np.float64)
+        assert len(times_sec) == 12
+        assert times_sec[0] == pytest.approx(4096 / 48000.0)
+        assert times_sec[-1] == pytest.approx((132000 + 4096) / 48000.0)
+        assert dsp_module.sone_to_phon(float(np.mean(values))) == pytest.approx(94.0, abs=0.75)
+        assert dsp_module.sone_to_phon(max_sone) == pytest.approx(94.0, abs=0.75)
+        assert dsp_module.sone_to_phon(float(np.mean(values))) < 95.0
+        assert dsp_module.sone_to_phon(max_sone) < 95.0
+        assert float(np.mean(values)) < 45.0
+        assert max_sone < 45.5
+
+    def test_compute_loudness_trace_handles_non_bin_centered_1khz_calibrator(self):
+        signal, sample_rate = _calibrated_sine_signal(frequency_hz=998.6)
+
+        _times_sec, values_sone, max_sone = compute_loudness_trace(signal, sample_rate)
+
+        mean_sone = float(np.mean(np.asarray(values_sone, dtype=np.float64)))
+        mean_phon = dsp_module.sone_to_phon(mean_sone)
+        max_phon = dsp_module.sone_to_phon(max_sone)
+        assert mean_phon == pytest.approx(94.0, abs=0.75)
+        assert max_phon == pytest.approx(94.0, abs=0.75)
+        assert mean_sone < 45.0
+        assert max_sone < 45.5
+
+    def test_compute_loudness_trace_limits_residual_inflation_for_calibrator(self):
+        main, sample_rate = _calibrated_sine_signal(frequency_hz=998.6, spl_db=94.0)
+        residual, _ = _calibrated_sine_signal(
+            frequency_hz=100.0,
+            spl_db=62.0,
+            sample_rate=sample_rate,
+        )
+        signal = main + residual
+
+        _times_sec, values_sone, max_sone = compute_loudness_trace(signal, sample_rate)
+
+        mean_sone = float(np.mean(np.asarray(values_sone, dtype=np.float64)))
+        mean_phon = dsp_module.sone_to_phon(mean_sone)
+        max_phon = dsp_module.sone_to_phon(max_sone)
+        assert mean_phon < 95.5
+        assert max_phon < 95.8
+        assert mean_sone < 47.0
+        assert max_sone < 48.0
 
     def test_compute_loudness_trace_handles_non_native_sample_rate(self):
         sample_rate = 44100.0
@@ -191,68 +380,80 @@ class TestLoudnessHelpers:
             return np.full(target_size, 0.25, dtype=np.float64)
 
         monkeypatch.setattr(dsp_module.scipy_signal, "resample", fake_resample)
-        _install_fake_segmented_backend(
+        _install_fake_frequency_backend(
             monkeypatch,
             calls,
-            values=np.array([1.5, 2.5], dtype=np.float64),
-            times=np.array([0.0, 0.5], dtype=np.float64),
+            values=np.array([1.5], dtype=np.float64),
         )
 
         loudness_times, values_sone, max_sone = compute_loudness_trace(signal, 96000.0)
 
         assert calls["resample"] == {"input_size": 200, "target_size": 100}
         assert calls["backend"] == {
-            "input_size": 2048,
-            "sample_rate": 48000.0,
-            "nperseg": 2048,
-            "noverlap": 1024,
+            "spectrum_shape": (4096, 1),
+            "freqs_shape": (4096,),
+            "field_type": "free",
         }
-        assert loudness_times == [0.0, pytest.approx(100 / 48000.0)]
-        assert values_sone == [1.5, 2.5]
-        assert max_sone == pytest.approx(2.5)
+        assert loudness_times == [pytest.approx(50 / 48000.0)]
+        assert values_sone == [1.5]
+        assert max_sone == pytest.approx(1.5)
 
 
-def _install_fake_segmented_backend(monkeypatch, calls, *, values, times):
-    def fake_backend(signal, sample_rate, *, nperseg=None, noverlap=None):
+def _forbid_time_varying_loudness_backend(monkeypatch):
+    def forbidden_backend_loader():
+        raise AssertionError("ZWTv loudness backend must not be used")
+
+    monkeypatch.setattr(dsp_module, "_load_loudness_backend", forbidden_backend_loader)
+
+
+def _install_fake_frequency_backend(monkeypatch, calls, *, values):
+    def fake_backend(spectrum, freqs, *, field_type="free"):
         calls["backend"] = {
-            "input_size": int(np.asarray(signal).size),
-            "sample_rate": float(sample_rate),
-            "nperseg": nperseg,
-            "noverlap": noverlap,
+            "spectrum_shape": tuple(np.asarray(spectrum).shape),
+            "freqs_shape": tuple(np.asarray(freqs).shape),
+            "field_type": field_type,
         }
-        return values, None, None, times
+        return values, None, None
 
-    monkeypatch.setattr(dsp_module, "_load_loudness_backend", lambda: fake_backend)
+    monkeypatch.setattr(dsp_module, "_load_loudness_frequency_backend", lambda: fake_backend, raising=False)
+    _forbid_time_varying_loudness_backend(monkeypatch)
 
 
-def test_compute_loudness_trace_uses_segmented_backend(monkeypatch):
-    signal = np.linspace(-1.0, 1.0, 4096, dtype=np.float64)
+def test_compute_loudness_trace_uses_frequency_backend(monkeypatch):
     calls = {}
-    _install_fake_segmented_backend(
-        monkeypatch,
-        calls,
-        values=np.array([1.0, 2.0], dtype=np.float64),
-        times=np.array([0.1, 0.2], dtype=np.float64),
-    )
 
-    compute_loudness_trace(signal, 48000.0)
+    def fake_backend(spectrum, freqs, *, field_type="free"):
+        calls["backend"] = {
+            "spectrum_shape": tuple(np.asarray(spectrum).shape),
+            "freqs_shape": tuple(np.asarray(freqs).shape),
+            "field_type": field_type,
+        }
+        return np.array([2.0, 3.0, 4.0]), None, None
 
-    assert calls["backend"] == {
-        "input_size": 4096,
-        "sample_rate": 48000.0,
-        "nperseg": 2048,
-        "noverlap": 1024,
-    }
+    monkeypatch.setattr(dsp_module, "_load_loudness_frequency_backend", lambda: fake_backend, raising=False)
+    _forbid_time_varying_loudness_backend(monkeypatch)
+    signal = np.ones(int(48000 * 0.75), dtype=np.float64)
+
+    times_sec, values_sone, max_sone = compute_loudness_trace(signal, 48000.0)
+
+    assert times_sec == [
+        pytest.approx(4096 / 48000.0),
+        pytest.approx((12000 + 4096) / 48000.0),
+        pytest.approx((24000 + 4096) / 48000.0),
+    ]
+    assert values_sone == [2.0, 3.0, 4.0]
+    assert max_sone == pytest.approx(4.0)
+    assert calls["backend"]["field_type"] == "free"
+    assert calls["backend"]["spectrum_shape"][1] == 3
 
 
 def test_compute_loudness_trace_passes_through_native_48k_without_resample(monkeypatch):
-    signal = np.linspace(-1.0, 1.0, 4096, dtype=np.float64)
+    signal = np.ones(int(48000 * 0.75), dtype=np.float64)
     calls = {}
-    _install_fake_segmented_backend(
+    _install_fake_frequency_backend(
         monkeypatch,
         calls,
-        values=np.array([1.0], dtype=np.float64),
-        times=np.array([0.1], dtype=np.float64),
+        values=np.array([1.0, 2.0, 3.0], dtype=np.float64),
     )
 
     def fake_resample(*args, **kwargs):
@@ -264,17 +465,16 @@ def test_compute_loudness_trace_passes_through_native_48k_without_resample(monke
     compute_loudness_trace(signal, 48000.0)
 
     assert "resample" not in calls
-    assert calls["backend"]["sample_rate"] == 48000.0
+    assert calls["backend"]["spectrum_shape"] == (4096, 3)
 
 
 def test_compute_loudness_trace_normalizes_non_native_sample_rate_before_backend_call(monkeypatch):
-    signal = np.linspace(-1.0, 1.0, 200, dtype=np.float64)
+    signal = np.ones(int(96000 * 0.75), dtype=np.float64)
     calls = {}
-    _install_fake_segmented_backend(
+    _install_fake_frequency_backend(
         monkeypatch,
         calls,
-        values=np.array([1.0], dtype=np.float64),
-        times=np.array([0.1], dtype=np.float64),
+        values=np.array([1.0, 2.0, 3.0], dtype=np.float64),
     )
 
     def fake_resample(values, target_size):
@@ -288,110 +488,194 @@ def test_compute_loudness_trace_normalizes_non_native_sample_rate_before_backend
 
     compute_loudness_trace(signal, 96000.0)
 
-    assert calls["resample"] == {"input_size": 200, "target_size": 100}
-    assert calls["backend"]["sample_rate"] == 48000.0
+    assert calls["resample"] == {"input_size": 72000, "target_size": 36000}
+    assert calls["backend"]["spectrum_shape"] == (4096, 3)
 
 
-def test_compute_loudness_trace_preserves_times_values_and_max(monkeypatch):
-    signal = np.linspace(-1.0, 1.0, 48000, dtype=np.float64)
+def test_compute_loudness_trace_uses_8192_sample_windows_with_250ms_hop(monkeypatch):
     calls = {}
-    _install_fake_segmented_backend(
-        monkeypatch,
-        calls,
-        values=np.array([1.5, 2.5], dtype=np.float64),
-        times=np.array([0.1, 0.2], dtype=np.float64),
-    )
 
-    loudness_times, values_sone, max_sone = compute_loudness_trace(signal, 48000.0)
+    def fake_backend(spectrum, freqs, *, field_type="free"):
+        spectrum = np.asarray(spectrum)
+        calls["backend"] = {
+            "spectrum_shape": tuple(spectrum.shape),
+            "freqs_shape": tuple(np.asarray(freqs).shape),
+            "field_type": field_type,
+        }
+        return np.arange(1, spectrum.shape[1] + 1, dtype=np.float64), None, None
 
-    assert loudness_times == [0.1, 0.2]
-    assert values_sone == [1.5, 2.5]
-    assert max_sone == pytest.approx(2.5)
+    monkeypatch.setattr(dsp_module, "_load_loudness_frequency_backend", lambda: fake_backend, raising=False)
+    _forbid_time_varying_loudness_backend(monkeypatch)
+
+    signal = np.ones(int(48000 * 1.1), dtype=np.float64)
+    times_sec, values_sone, _max_sone = compute_loudness_trace(signal, 48000.0)
+
+    assert times_sec == pytest.approx([
+        4096 / 48000.0,
+        (12000 + 4096) / 48000.0,
+        (24000 + 4096) / 48000.0,
+        (36000 + 4096) / 48000.0,
+    ])
+    assert values_sone == [1.0, 2.0, 3.0, 4.0]
+    assert calls["backend"]["spectrum_shape"] == (4096, 4)
 
 
 def test_compute_loudness_trace_rejects_non_finite_backend_output(monkeypatch):
-    signal = np.linspace(-1.0, 1.0, 4096, dtype=np.float64)
+    signal = np.ones(int(48000 * 0.75), dtype=np.float64)
     calls = {}
-    _install_fake_segmented_backend(
+    _install_fake_frequency_backend(
         monkeypatch,
         calls,
-        values=np.array([1.0, np.nan], dtype=np.float64),
-        times=np.array([0.1, 0.2], dtype=np.float64),
+        values=np.array([1.0, np.nan, 1.0], dtype=np.float64),
     )
 
     with pytest.raises(RuntimeError, match="non-finite output"):
         compute_loudness_trace(signal, 48000.0)
 
 
-@pytest.mark.parametrize("backend_time", [np.inf, -np.inf])
-def test_compute_loudness_trace_rejects_non_finite_backend_timestamps_before_clamp(
-    monkeypatch,
-    backend_time,
-):
-    signal = np.linspace(-1.0, 1.0, 1000, dtype=np.float64)
+def test_compute_loudness_trace_pads_short_signal_to_one_frequency_window(monkeypatch):
+    signal = np.ones(int(48000 * 0.1), dtype=np.float64)
     calls = {}
-    _install_fake_segmented_backend(
+    _install_fake_frequency_backend(
         monkeypatch,
         calls,
-        values=4.0,
-        times=backend_time,
-    )
-
-    with pytest.raises(RuntimeError, match="non-finite output"):
-        compute_loudness_trace(signal, 48000.0)
-
-
-def test_compute_loudness_trace_pads_short_input_and_clamps_time_axis(monkeypatch):
-    signal = np.linspace(-1.0, 1.0, 1000, dtype=np.float64)
-    calls = {}
-    actual_duration_sec = signal.size / 48000.0
-    _install_fake_segmented_backend(
-        monkeypatch,
-        calls,
-        values=4.0,
-        times=0.0213229167,
+        values=np.array([4.0], dtype=np.float64),
     )
 
     loudness_times, values_sone, max_sone = compute_loudness_trace(signal, 48000.0)
 
-    assert calls["backend"]["input_size"] == 2048
-    assert loudness_times == [pytest.approx(actual_duration_sec)]
-    assert values_sone == [pytest.approx(4.0)]
+    assert calls["backend"]["spectrum_shape"] == (4096, 1)
+    assert loudness_times == [pytest.approx(0.05)]
+    assert values_sone == [4.0]
     assert max_sone == pytest.approx(4.0)
 
 
-def test_compute_loudness_trace_normalizes_scalar_one_segment_output(monkeypatch):
-    signal = np.linspace(-1.0, 1.0, 1024, dtype=np.float64)
+def test_compute_loudness_window_sone_matches_1khz_94db_reference():
+    signal, sample_rate = _stable_calibrator_signal(sample_rate=48000.0, duration_sec=0.5)
+
+    value_sone = dsp_module.compute_loudness_window_sone(signal, sample_rate)
+
+    assert dsp_module.sone_to_phon(value_sone) == pytest.approx(94.0, abs=0.75)
+
+
+def test_compute_loudness_window_sone_pads_short_signal(monkeypatch):
+    signal = np.ones(int(48000 * 0.1), dtype=np.float64)
     calls = {}
-    _install_fake_segmented_backend(
+    _install_fake_frequency_backend(
         monkeypatch,
         calls,
-        values=4.0,
-        times=0.0213229167,
+        values=np.array([7.0], dtype=np.float64),
     )
 
-    loudness_times, values_sone, max_sone = compute_loudness_trace(signal, 48000.0)
+    value_sone = dsp_module.compute_loudness_window_sone(signal, 48000.0)
 
-    assert loudness_times == [pytest.approx(0.0213229167)]
-    assert values_sone == [pytest.approx(4.0)]
-    assert max_sone == pytest.approx(4.0)
+    assert calls["backend"]["spectrum_shape"] == (4096, 1)
+    assert value_sone == pytest.approx(7.0)
 
 
-def test_compute_loudness_trace_accepts_exact_2048_sample_one_point_output(monkeypatch):
-    signal = np.linspace(-1.0, 1.0, 2048, dtype=np.float64)
-    calls = {}
-    _install_fake_segmented_backend(
-        monkeypatch,
-        calls,
-        values=4.0,
-        times=0.0213229167,
+def test_compute_loudness_trace_rejects_negative_backend_values(monkeypatch):
+    def fake_backend(_spectrum, _freqs, *, field_type="free"):
+        return np.array([1.0, -0.1, 1.0]), None, None
+
+    monkeypatch.setattr(dsp_module, "_load_loudness_frequency_backend", lambda: fake_backend, raising=False)
+    _forbid_time_varying_loudness_backend(monkeypatch)
+
+    with pytest.raises(RuntimeError, match="non-negative"):
+        compute_loudness_trace(np.ones(int(48000 * 0.75)), 48000.0)
+
+
+def test_default_frequency_backend_matches_public_mosqito_for_supported_spectrum():
+    from mosqito.sq_metrics import loudness_zwst_freq
+
+    sample_rate = 48000.0
+    signal, _ = _deterministic_multitone_signal(sample_rate=sample_rate, duration_sec=0.75)
+    spectrum, freqs = _loudness_spectrum_for_signal(signal, sample_rate)
+
+    optimized_values, optimized_specific, optimized_bark = dsp_module._compute_loudness_zwst_freq_cached(
+        spectrum,
+        freqs,
+        field_type="free",
+    )
+    public_values, public_specific, public_bark = loudness_zwst_freq(
+        spectrum,
+        freqs,
+        field_type="free",
     )
 
-    loudness_times, values_sone, max_sone = compute_loudness_trace(signal, 48000.0)
+    np.testing.assert_allclose(optimized_values, public_values, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(optimized_specific, public_specific, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(optimized_bark, public_bark, rtol=0.0, atol=1e-12)
 
-    assert loudness_times == [pytest.approx(0.0213229167)]
-    assert values_sone == [pytest.approx(4.0)]
-    assert max_sone == pytest.approx(4.0)
+
+def test_cached_frequency_backend_matches_public_mosqito_for_one_window_1d_spectrum():
+    from mosqito.sq_metrics import loudness_zwst_freq
+
+    sample_rate = 48000.0
+    signal, _ = _deterministic_multitone_signal(sample_rate=sample_rate, duration_sec=0.5)
+    spectrum, freqs = _loudness_spectrum_for_signal(signal, sample_rate)
+    spectrum_1d = spectrum[:, 0]
+
+    optimized_values, optimized_specific, optimized_bark = dsp_module._compute_loudness_zwst_freq_cached(
+        spectrum_1d,
+        freqs,
+        field_type="free",
+    )
+    public_values, public_specific, public_bark = loudness_zwst_freq(
+        spectrum_1d,
+        freqs,
+        field_type="free",
+    )
+
+    assert float(optimized_values) == pytest.approx(float(public_values), abs=1e-12)
+    np.testing.assert_allclose(optimized_specific, public_specific, rtol=0.0, atol=1e-12)
+    np.testing.assert_allclose(optimized_bark, public_bark, rtol=0.0, atol=1e-12)
+
+
+def test_cached_frequency_backend_reuses_synthesis_weights(monkeypatch):
+    sample_rate = 48000.0
+    signal, _ = _deterministic_multitone_signal(sample_rate=sample_rate, duration_sec=0.75)
+    spectrum, freqs = _loudness_spectrum_for_signal(signal, sample_rate)
+    original_sosfreqz = dsp_module.scipy_signal.sosfreqz
+    calls = {"sosfreqz": 0}
+
+    def counting_sosfreqz(*args, **kwargs):
+        calls["sosfreqz"] += 1
+        return original_sosfreqz(*args, **kwargs)
+
+    dsp_module._loudness_third_octave_synthesis_weights.cache_clear()
+    monkeypatch.setattr(dsp_module.scipy_signal, "sosfreqz", counting_sosfreqz)
+
+    dsp_module._compute_loudness_zwst_freq_cached(spectrum, freqs, field_type="free")
+    first_count = calls["sosfreqz"]
+    dsp_module._compute_loudness_zwst_freq_cached(spectrum, freqs, field_type="free")
+    second_count = calls["sosfreqz"]
+
+    assert first_count > 0
+    assert second_count == first_count
+
+
+def test_compute_loudness_trace_four_channel_five_second_performance():
+    sample_rate = 48000.0
+    signal, _ = _stable_calibrator_signal(sample_rate=sample_rate, duration_sec=5.0)
+    channels = [signal, signal * 0.5, signal * 0.25, signal * 0.125]
+
+    # Measure steady-state trace generation, not one-time MoSQITo backend/cache setup.
+    compute_loudness_trace(channels[0], sample_rate)
+
+    elapsed_runs = []
+    traces = []
+    for _ in range(3):
+        start = time.perf_counter()
+        traces = [compute_loudness_trace(channel, sample_rate) for channel in channels]
+        elapsed_runs.append(time.perf_counter() - start)
+
+    assert all(trace[1] for trace in traces)
+    assert float(np.median(elapsed_runs)) < 0.75
+
+
+def _stft_high_frequency_mean_db(mag_db, freqs, *, min_freq=5000.0):
+    high = mag_db[np.asarray(freqs) > min_freq, :]
+    return np.mean(high, axis=0)
 
 
 class TestComputeStft:
@@ -424,6 +708,23 @@ class TestComputeStft:
         avg_mag = mag_db.mean(axis=1)
         peak_freq = freqs[np.argmax(avg_mag)]
         assert abs(peak_freq - 1000.0) < 50
+
+    def test_compute_stft_does_not_zero_pad_streaming_boundaries_for_stable_tone(self):
+        sample_rate = 44100.0
+        nfft = 1024
+        overlap = 0.5
+        signal, _ = _stable_calibrator_signal(
+            sample_rate=sample_rate,
+            duration_sec=0.25,
+        )
+
+        times, freqs, mag_db = compute_stft(signal, sample_rate, nfft, overlap)
+
+        high_frequency_mean = _stft_high_frequency_mean_db(mag_db, freqs)
+        tone_bin = int(np.argmin(np.abs(freqs - 1000.0)))
+        tone_peak = np.max(mag_db[tone_bin, :])
+        assert times.size > 0
+        assert float(np.max(high_frequency_mean)) < float(tone_peak) - 80.0
 
     def test_short_signal_does_not_crash(self):
         """Signal shorter than nfft should not raise."""

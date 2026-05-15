@@ -667,9 +667,224 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_id(qapp):
         "output_device_hostapi",
         "output_device_samplerate",
         "selected_channels",
+        "monitor_channel_index",
+        "monitor_gain_db",
         "channels",
         "golden_editor_state",
     }
+
+
+def test_hardware_card_exposes_monitor_controls_and_channel_options(qapp):
+    hardware_service = _HardwareServiceStub(
+        devices=[
+            {
+                "name": "Mic 4",
+                "hostapi": 0,
+                "default_samplerate": 48000,
+                "max_input_channels": 4,
+                "max_output_channels": 0,
+            },
+            {
+                "name": "Speaker 1",
+                "hostapi": 1,
+                "default_samplerate": 44100,
+                "max_input_channels": 0,
+                "max_output_channels": 2,
+            },
+        ]
+    )
+    module = _make_module(hardware_service=hardware_service)
+    module._populate_detail(
+        {
+            **_detail_payload([_channel_payload(i) for i in range(4)]),
+            "input_device_name": "Mic 4",
+            "input_device_hostapi": "ASIO",
+        }
+    )
+
+    assert hasattr(module, "combo_monitor_channel")
+    assert hasattr(module, "spin_monitor_gain_db")
+    assert module.findChild(QComboBox, "combo_monitor_channel") is module.combo_monitor_channel
+    assert module.findChild(QDoubleSpinBox, "spin_monitor_gain_db") is module.spin_monitor_gain_db
+    assert _field_label_text(module, "combo_monitor_channel") == "监听通道"
+    assert _field_label_text(module, "spin_monitor_gain_db") == "监听增益"
+    assert module.combo_monitor_channel.count() == 4
+    assert [module.combo_monitor_channel.itemText(i) for i in range(4)] == [
+        "输入1",
+        "输入2",
+        "输入3",
+        "输入4",
+    ]
+    assert [module.combo_monitor_channel.itemData(i) for i in range(4)] == [0, 1, 2, 3]
+    assert module.spin_monitor_gain_db.minimum() == pytest.approx(-60.0)
+    assert module.spin_monitor_gain_db.maximum() == pytest.approx(24.0)
+    assert module.spin_monitor_gain_db.singleStep() == pytest.approx(1.0)
+    assert module.spin_monitor_gain_db.decimals() == 1
+    assert module.spin_monitor_gain_db.suffix() == " dB"
+
+
+def test_populate_detail_loads_saved_monitor_values(qapp):
+    module = _make_module()
+    payload = _detail_payload([_channel_payload(0), _channel_payload(1)])
+    payload["monitor_channel_index"] = 1
+    payload["monitor_gain_db"] = -3.5
+
+    module._populate_detail(payload)
+
+    assert module.combo_monitor_channel.currentData() == 1
+    assert module.spin_monitor_gain_db.value() == pytest.approx(-3.5)
+
+
+def test_populate_detail_falls_back_monitor_channel_from_selected_channels_then_zero(qapp):
+    module = _make_module()
+    payload = _detail_payload([_channel_payload(0), _channel_payload(1)])
+    payload["selected_channels"] = [1]
+
+    module._populate_detail(payload)
+    assert module.combo_monitor_channel.currentData() == 1
+
+    payload["monitor_channel_index"] = None
+    module._populate_detail(payload)
+    assert module.combo_monitor_channel.currentData() == 1
+
+    payload["monitor_channel_index"] = 99
+    module._populate_detail(payload)
+    assert module.combo_monitor_channel.currentData() == 1
+
+    payload["selected_channels"] = []
+    module._populate_detail(payload)
+    assert module.combo_monitor_channel.currentData() == 0
+
+
+def test_input_device_change_rebuilds_monitor_options_and_preserves_or_falls_back(qapp):
+    hardware_service = _HardwareServiceStub(
+        devices=[
+            {
+                "name": "Mic 4",
+                "hostapi": 0,
+                "default_samplerate": 48000,
+                "max_input_channels": 4,
+                "max_output_channels": 0,
+            },
+            {
+                "name": "Mic 2",
+                "hostapi": 0,
+                "default_samplerate": 48000,
+                "max_input_channels": 2,
+                "max_output_channels": 0,
+            },
+            {
+                "name": "Mic 1",
+                "hostapi": 0,
+                "default_samplerate": 48000,
+                "max_input_channels": 1,
+                "max_output_channels": 0,
+            },
+            {
+                "name": "Speaker 1",
+                "hostapi": 1,
+                "default_samplerate": 44100,
+                "max_input_channels": 0,
+                "max_output_channels": 2,
+            },
+        ]
+    )
+    module = _make_module(hardware_service=hardware_service)
+    payload = {
+        **_detail_payload([_channel_payload(i) for i in range(4)]),
+        "input_device_name": "Mic 4",
+        "input_device_hostapi": "ASIO",
+        "monitor_channel_index": 1,
+    }
+    module._populate_detail(payload)
+
+    mic_2_index = module.combo_input_dev.findText("Mic 2 (ASIO)")
+    module.combo_input_dev.setCurrentIndex(mic_2_index)
+
+    assert module.combo_monitor_channel.count() == 2
+    assert module.combo_monitor_channel.currentData() == 1
+
+    mic_1_index = module.combo_input_dev.findText("Mic 1 (ASIO)")
+    module.combo_input_dev.setCurrentIndex(mic_1_index)
+
+    assert module.combo_monitor_channel.count() == 1
+    assert module.combo_monitor_channel.currentData() == 0
+
+
+def test_analysis_channel_change_updates_default_monitor_but_not_explicit_selection(qapp):
+    hardware_service = _HardwareServiceStub(
+        devices=[
+            {
+                "name": "Mic 3",
+                "hostapi": 0,
+                "default_samplerate": 48000,
+                "max_input_channels": 3,
+                "max_output_channels": 0,
+            },
+            {
+                "name": "Speaker 1",
+                "hostapi": 1,
+                "default_samplerate": 44100,
+                "max_input_channels": 0,
+                "max_output_channels": 2,
+            },
+        ]
+    )
+    module = _make_module(hardware_service=hardware_service)
+    module._populate_detail(
+        {
+            **_detail_payload([_channel_payload(i) for i in range(3)]),
+            "input_device_name": "Mic 3",
+            "input_device_hostapi": "ASIO",
+            "selected_channels": [0],
+        }
+    )
+
+    module._channel_checkboxes[0].setChecked(False)
+    module._channel_checkboxes[1].setChecked(True)
+
+    assert module.combo_monitor_channel.currentData() == 1
+
+    module.combo_monitor_channel.setCurrentIndex(
+        module.combo_monitor_channel.findData(2)
+    )
+    module._channel_checkboxes[1].setChecked(False)
+    module._channel_checkboxes[0].setChecked(True)
+
+    assert module.combo_monitor_channel.currentData() == 2
+
+
+def test_collect_data_includes_monitor_channel_and_gain(qapp):
+    module = _make_module()
+    payload = _detail_payload([_channel_payload(0), _channel_payload(1)])
+    payload["monitor_channel_index"] = 1
+    payload["monitor_gain_db"] = 6.0
+    module._populate_detail(payload)
+
+    data = module._collect_data()
+
+    assert data["monitor_channel_index"] == 1
+    assert isinstance(data["monitor_channel_index"], int)
+    assert data["monitor_gain_db"] == pytest.approx(6.0)
+    assert isinstance(data["monitor_gain_db"], float)
+
+
+def test_collect_data_uses_null_monitor_channel_when_no_input_channels(qapp):
+    hardware_service = _HardwareServiceStub(devices=[], hostapis=[])
+    module = _make_module(hardware_service=hardware_service)
+    module._populate_detail(
+        {
+            **_detail_payload([]),
+            "input_device_name": None,
+            "input_device_hostapi": None,
+            "selected_channels": [],
+        }
+    )
+
+    data = module._collect_data()
+
+    assert data["monitor_channel_index"] is None
+    assert data["monitor_gain_db"] == pytest.approx(0.0)
 
 
 def test_config_module_refreshes_open_selector_after_plc_changed_signal(qapp):

@@ -241,22 +241,6 @@ QPushButton#TablePlayButton:pressed {
   padding-top: 1px;
   padding-left: 1px;
 }
-QPushButton#TableDeleteButton {
-  border-radius: 4px;
-  padding: 0px;
-  color: #ef4444;
-  font-size: 18px;
-  font-weight: 900;
-  line-height: 18px;
-}
-QPushButton#TableDeleteButton:hover {
-  background: #fef2f2;
-}
-QPushButton#TableDeleteButton:pressed {
-  background: #fee2e2;
-  padding-top: 1px;
-  padding-left: 1px;
-}
 
 /* Tables */
 QTableWidget {

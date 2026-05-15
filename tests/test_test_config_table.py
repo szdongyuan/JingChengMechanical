@@ -28,6 +28,8 @@ def test_test_config_table_exposes_nullable_plc_id_field():
         "plc_device_key",
         "plc_device_label",
         "analysis_window_offset_ms",
+        "monitor_channel_index",
+        "monitor_gain_db",
     }
     assert "plc_id" in ConfigTable._meta.columns
 
@@ -46,6 +48,8 @@ def test_test_config_table_exposes_nullable_plc_id_field():
     assert config.plc_device_key is None
     assert config.plc_device_label is None
     assert config.analysis_window_offset_ms == 0
+    assert config.monitor_channel_index is None
+    assert config.monitor_gain_db is None
 
 
 def test_model_defines_allow_incomplete_recording_analysis_with_false_default():

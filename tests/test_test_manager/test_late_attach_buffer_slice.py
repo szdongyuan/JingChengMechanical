@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 
 from app.service.analysis.frames import JudgmentResult
+from app.service.analysis.selected_channels import project_selected_channels
 from app.service.analysis.test_manager import TestManager
 
 from ._support import (
@@ -16,6 +17,35 @@ from ._support import (
     _mock_bus,
     _mock_services,
 )
+
+
+class _InlineDisplayDispatcher:
+    def __init__(self, pipelines):
+        self._pipelines = list(pipelines)
+
+    def submit(
+        self,
+        chunk,
+        *,
+        elapsed_time,
+        frame_run_id,
+        live_loudness_channel_index,
+    ):
+        for pipeline in self._pipelines:
+            channel_index = pipeline.channel_index
+            if chunk.ndim == 2:
+                mono = chunk[:, channel_index]
+            else:
+                mono = chunk
+            pipeline.process_chunk(
+                mono,
+                elapsed_time,
+                compute_loudness=(channel_index == live_loudness_channel_index),
+            )
+        return True
+
+    def stop(self):
+        return None
 
 
 class TestLateAttachBufferSlice:
@@ -32,6 +62,7 @@ class TestLateAttachBufferSlice:
         session.config_id = 1
         session._buffer = None
         session._attach_snapshot = attach_snapshot
+        session.stop_live_display = MagicMock()
         session._run_judgment.return_value = JudgmentResult(
             overall="合格",
             limit_pass=True,
@@ -47,6 +78,251 @@ class TestLateAttachBufferSlice:
         np.testing.assert_array_equal(session._buffer, post_attach)
         assert session._sample_rate == 100.0
         session._run_judgment.assert_called_once_with()
+        session.stop_live_display.assert_called_once()
+
+    def test_on_session_done_projects_selected_channels_before_final_judgment(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        post_attach = np.column_stack(
+            [np.full(10, channel, dtype=np.float32) for channel in range(6)]
+        )
+        attach_snapshot = object()
+        rec = MagicMock()
+        rec.get_buffer_from.return_value = post_attach
+        rec._sample_rate = 100.0
+        observed = {}
+
+        class Session:
+            config_id = 1
+
+            def __init__(self):
+                self._buffer = None
+                self._sample_rate = None
+                self._attach_snapshot = attach_snapshot
+                self._config = {
+                    "analysis_duration": 0.1,
+                    "analysis_window_offset_ms": 0,
+                    "selected_channels": [3],
+                    "channels": [{"channel_index": 3}],
+                }
+                self._workorder = {}
+                self._audio_file_path = "captured.wav"
+                self.last_ai_review = None
+                self._source_channels = ()
+                self._real_to_logical_channel = {}
+
+            def capture_recorder_buffer(self, hardware_buffer, sample_rate):
+                view = project_selected_channels(
+                    hardware_buffer,
+                    self._config["selected_channels"],
+                )
+                self._buffer = view.buffer
+                self._source_channels = view.source_channels
+                self._real_to_logical_channel = view.real_to_logical
+                self._sample_rate = sample_rate
+                return self._buffer
+
+            def _run_judgment(self):
+                observed["buffer"] = self._buffer.copy()
+                observed["map"] = dict(self._real_to_logical_channel)
+                return JudgmentResult(
+                    overall="合格",
+                    limit_pass=True,
+                    ai_pass=None,
+                    ai_score=None,
+                    analysis_window=(0.0, 0.1),
+                )
+
+        session = Session()
+        mgr._sessions[1] = session
+        mgr._recorders[1] = rec
+
+        mgr._on_session_done(1)
+
+        rec.get_buffer_from.assert_called_once_with(attach_snapshot)
+        np.testing.assert_array_equal(session._buffer, post_attach[:, [3]])
+        np.testing.assert_array_equal(observed["buffer"], post_attach[:, [3]])
+        assert observed["map"] == {3: 0}
+
+    def test_on_session_done_projection_failure_emits_no_result_and_cleans_runtime(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        post_attach = np.column_stack(
+            [np.full(10, channel, dtype=np.float32) for channel in range(2)]
+        )
+        attach_snapshot = object()
+        rec = MagicMock()
+        rec.get_buffer_from.return_value = post_attach
+        rec._sample_rate = 100.0
+        mon = MagicMock()
+        expected_error = "selected channel 3 is outside hardware channel range 0..1"
+
+        class Session:
+            config_id = 1
+
+            def __init__(self):
+                self._buffer = None
+                self._sample_rate = None
+                self._attach_snapshot = attach_snapshot
+                self._config = {
+                    "analysis_duration": 0.1,
+                    "analysis_window_offset_ms": 0,
+                    "selected_channels": [3],
+                    "channels": [{"channel_index": 3}],
+                }
+                self._workorder = {
+                    "trigger_source": "scan",
+                    "factory_run_id": "run-1",
+                }
+                self._audio_file_path = None
+                self._audio_data_id = None
+                self.last_ai_review = None
+                self._source_channels = ()
+                self._real_to_logical_channel = {}
+                self._run_judgment = MagicMock(
+                    side_effect=AssertionError("projection failure should stop analysis")
+                )
+
+            def capture_recorder_buffer(self, hardware_buffer, sample_rate):
+                view = project_selected_channels(
+                    hardware_buffer,
+                    self._config["selected_channels"],
+                )
+                self._buffer = view.buffer
+                self._source_channels = view.source_channels
+                self._real_to_logical_channel = view.real_to_logical
+                self._sample_rate = sample_rate
+                return self._buffer
+
+        session = Session()
+        mgr._sessions[1] = session
+        mgr._recorders[1] = rec
+        mgr._monitors[1] = mon
+
+        mgr._on_session_done(1)
+
+        rec.get_buffer_from.assert_called_once_with(attach_snapshot)
+        session._run_judgment.assert_not_called()
+        assert session._buffer is None
+        bus.test_finished.emit.assert_called_once_with(
+            1,
+            _expected_no_result_payload(expected_error),
+        )
+        bus.result_changed.emit.assert_called_once_with(
+            _expected_no_result_payload(expected_error)
+        )
+        bus.factory_runtime_auto_analysis_no_result.emit.assert_called_once()
+        review_payload = bus.factory_runtime_auto_analysis_no_result.emit.call_args.args[0]
+        assert review_payload.run_id == "run-1"
+        assert review_payload.trigger_source == "scan"
+        assert review_payload.no_result is True
+        assert review_payload.error_message == expected_error
+        assert review_payload.judgment_payload is None
+        assert review_payload.chart_payload is None
+        bus.factory_runtime_auto_analysis_error.emit.assert_not_called()
+        assert mgr._sessions == {}
+        assert mgr._recorders == {}
+        assert mgr._monitors == {}
+        assert mgr._analyzing_sessions == set()
+        assert mgr._accepted_factory_stops == set()
+        assert mgr._completed_sessions[1] is session
+        mon.stop.assert_called_once_with()
+        mon.wait.assert_called_once_with(1000)
+        rec.stop.assert_called_once_with()
+        rec.wait.assert_called_once_with(3000)
+
+    def test_on_session_done_projection_failure_attempts_all_cleanup_when_cleanup_raises(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        post_attach = np.column_stack(
+            [np.full(10, channel, dtype=np.float32) for channel in range(2)]
+        )
+        attach_snapshot = object()
+        rec = MagicMock()
+        rec.get_buffer_from.return_value = post_attach
+        rec._sample_rate = 100.0
+        rec.stop.side_effect = RuntimeError("recorder stop exploded")
+        rec.wait.side_effect = RuntimeError("recorder wait exploded")
+        mon = MagicMock()
+        mon.stop.side_effect = RuntimeError("monitor stop exploded")
+        mon.wait.side_effect = RuntimeError("monitor wait exploded")
+        expected_error = "selected channel 3 is outside hardware channel range 0..1"
+
+        class Session:
+            config_id = 1
+
+            def __init__(self):
+                self._buffer = None
+                self._sample_rate = None
+                self._attach_snapshot = attach_snapshot
+                self._config = {
+                    "analysis_duration": 0.1,
+                    "analysis_window_offset_ms": 0,
+                    "selected_channels": [3],
+                    "channels": [{"channel_index": 3}],
+                }
+                self._workorder = {
+                    "trigger_source": "scan",
+                    "factory_run_id": "run-1",
+                }
+                self._audio_file_path = None
+                self._audio_data_id = None
+                self.last_ai_review = None
+                self._source_channels = ()
+                self._real_to_logical_channel = {}
+                self._run_judgment = MagicMock(
+                    side_effect=AssertionError("projection failure should stop analysis")
+                )
+
+            def capture_recorder_buffer(self, hardware_buffer, sample_rate):
+                view = project_selected_channels(
+                    hardware_buffer,
+                    self._config["selected_channels"],
+                )
+                self._buffer = view.buffer
+                self._source_channels = view.source_channels
+                self._real_to_logical_channel = view.real_to_logical
+                self._sample_rate = sample_rate
+                return self._buffer
+
+        session = Session()
+        mgr._sessions[1] = session
+        mgr._recorders[1] = rec
+        mgr._monitors[1] = mon
+
+        mgr._on_session_done(1)
+
+        rec.get_buffer_from.assert_called_once_with(attach_snapshot)
+        session._run_judgment.assert_not_called()
+        assert session._buffer is None
+        bus.test_finished.emit.assert_called_once_with(
+            1,
+            _expected_no_result_payload(expected_error),
+        )
+        bus.result_changed.emit.assert_called_once_with(
+            _expected_no_result_payload(expected_error)
+        )
+        bus.factory_runtime_auto_analysis_no_result.emit.assert_called_once()
+        bus.factory_runtime_auto_analysis_error.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_cleanup_settled.emit.assert_called_once()
+        assert mgr._sessions == {}
+        assert mgr._recorders == {}
+        assert mgr._monitors == {}
+        assert mgr._analyzing_sessions == set()
+        assert mgr._completed_sessions[1] is session
+        mon.stop.assert_called_once_with()
+        mon.wait.assert_called_once_with(1000)
+        rec.stop.assert_called_once_with()
+        rec.wait.assert_called_once_with(3000)
+        log_lines = [call.args[0] for call in bus.log.emit.call_args_list]
+        assert any(expected_error in line for line in log_lines)
+        assert any("monitor stop exploded" in line for line in log_lines)
+        assert any("monitor wait exploded" in line for line in log_lines)
+        assert any("recorder stop exploded" in line for line in log_lines)
+        assert any("recorder wait exploded" in line for line in log_lines)
 
     def test_on_session_done_emits_factory_run_id_on_runtime_payloads(self):
         bus = _mock_bus()
@@ -639,6 +915,7 @@ class TestLateAttachBufferSlice:
         def fake_setup_pipelines(self):
             self._live_chunk_values = []
             self._pipelines = [FakePipeline(self._live_chunk_values)]
+            self._live_display_dispatcher = _InlineDisplayDispatcher(self._pipelines)
 
         def fake_run_judgment(self):
             return JudgmentResult(
@@ -800,6 +1077,7 @@ class TestLateAttachBufferSlice:
 
         def fake_setup_pipelines(self):
             self._pipelines = [FakePipeline()]
+            self._live_display_dispatcher = _InlineDisplayDispatcher(self._pipelines)
 
         def fake_run_judgment(self):
             return JudgmentResult(
@@ -970,6 +1248,7 @@ class TestLateAttachBufferSlice:
         def fake_setup_pipelines(self):
             self._elapsed_values = []
             self._pipelines = [FakePipeline(self._elapsed_values)]
+            self._live_display_dispatcher = _InlineDisplayDispatcher(self._pipelines)
 
         def fake_run_judgment(self):
             return JudgmentResult(
