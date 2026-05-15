@@ -5,7 +5,7 @@ from datetime import datetime
 
 import sounddevice as sd
 from scipy.io import wavfile
-from PyQt6.QtCore import QDateTime, Qt
+from PyQt6.QtCore import QDateTime, QThread, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QCalendarWidget,
     QCheckBox,
@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QStyle,
     QTableWidget,
@@ -256,6 +257,32 @@ class AudioDataFilterDialog(QDialog):
         }
 
 
+class AudioDataExportThread(QThread):
+    # 后台导出线程：避免大量音频写入 zip 时卡住主界面。
+    progress_changed = pyqtSignal(int)
+    succeeded = pyqtSignal(str, int)
+    failed = pyqtSignal(str)
+
+    def __init__(self, audio_data_service, target_path: str, records: list[dict[str, object]]):
+        super().__init__()
+        self.audio_data_service = audio_data_service
+        self.target_path = target_path
+        self.records = list(records)
+
+    def run(self) -> None:
+        try:
+            # progress_callback 会在服务层每写入一项后触发，用来更新进度条。
+            self.audio_data_service.export_zip(
+                self.target_path,
+                self.records,
+                progress_callback=self.progress_changed.emit,
+            )
+        except Exception as exc:
+            self.failed.emit(str(exc))
+            return
+        self.succeeded.emit(self.target_path, len(self.records))
+
+
 class DataManagementModule(QWidget):
     module_id = "data_management"
     table_header_labels = {
@@ -301,6 +328,8 @@ class DataManagementModule(QWidget):
             "barcode": "",
             "labels": ["OK", "NG", "not_labeled"],
         }
+        self._export_thread = None
+        self._export_progress_dialog = None
 
         self._build_ui()
         self.refresh_table()
@@ -543,21 +572,51 @@ class DataManagementModule(QWidget):
         if not target_path.lower().endswith(".zip"):
             target_path += ".zip"
 
-        try:
-            self.services.audio_data_service.export_zip(target_path, records)
-        except Exception as exc:
-            QMessageBox.warning(self, "导出失败", f"导出失败: {exc}")
-            return
+        # 导出放到后台线程里执行，主界面只负责显示进度。
+        self.btn_export.setEnabled(False)
+        self._export_progress_dialog = QProgressDialog("正在打包...", None, 0, len(records) + 1, self)
+        self._export_progress_dialog.setWindowTitle("打包导出")
+        self._export_progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self._export_progress_dialog.setCancelButton(None)
+        self._export_progress_dialog.setValue(0)
 
-        # 导出完成后只提示 zip 路径；zip 内会包含 db 和分类后的音频。
+        self._export_thread = AudioDataExportThread(
+            self.services.audio_data_service,
+            target_path,
+            records,
+        )
+        # 线程发出当前进度值后，直接更新进度条。
+        self._export_thread.progress_changed.connect(self._export_progress_dialog.setValue)
+        self._export_thread.succeeded.connect(self._on_export_succeeded)
+        self._export_thread.failed.connect(self._on_export_failed)
+        self._export_thread.finished.connect(self._cleanup_export_thread)
+        self._export_thread.start()
+
+    def _on_export_succeeded(self, target_path: str, record_count: int) -> None:
+        self._finish_export()
         self._emit_log(
-            f"[DataManagement] 已导出 {len(records)} 条音频数据到 {target_path}"
+            f"[DataManagement] 已导出 {record_count} 条音频数据到 {target_path}"
         )
         QMessageBox.information(
             self,
             "导出成功",
-            f"已导出 {len(records)} 条数据到\n{target_path}",
+            f"已导出 {record_count} 条数据到\n{target_path}",
         )
+
+    def _on_export_failed(self, error_message: str) -> None:
+        self._finish_export()
+        QMessageBox.warning(self, "导出失败", f"导出失败: {error_message}")
+
+    def _finish_export(self) -> None:
+        self.btn_export.setEnabled(True)
+        if self._export_progress_dialog is not None:
+            self._export_progress_dialog.close()
+            self._export_progress_dialog = None
+
+    def _cleanup_export_thread(self) -> None:
+        if self._export_thread is not None:
+            self._export_thread.deleteLater()
+            self._export_thread = None
 
     def _play_file(self, file_path: object) -> None:
         normalized_path = normalize_path(file_path)
