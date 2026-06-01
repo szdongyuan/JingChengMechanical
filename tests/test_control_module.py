@@ -8,7 +8,12 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QDialog
+
+from app.service.analysis.imported_audio import (
+    ImportedAudioAnalysisRequest,
+    ImportedChannelAssignment,
+)
 
 from app.services_container import (
     FactoryControllerState,
@@ -107,6 +112,7 @@ class _FactoryModeStub:
         self.state = initial_state or FactoryControllerState()
         self.start_manual = MagicMock(return_value=True)
         self.stop_active_run = MagicMock(return_value=True)
+        self.analyze_imported_audio = MagicMock(return_value=True)
         self.apply_manual_judgment = MagicMock(
             return_value=SimpleNamespace(success=True, message="")
         )
@@ -249,6 +255,27 @@ def _make_shared_modules(
     return WorkOrderModule(services), ControlModule(services), services
 
 
+def _import_request() -> ImportedAudioAnalysisRequest:
+    return ImportedAudioAnalysisRequest(
+        config_id=101,
+        wav_path="import.wav",
+        assignments=(ImportedChannelAssignment(0, "config", 0),),
+    )
+
+
+class _FakeDialogReturningRequest:
+    def __init__(self, *, configs, default_config_id, parent=None):
+        self.configs = configs
+        self.default_config_id = default_config_id
+        self.parent = parent
+
+    def exec(self):
+        return int(QDialog.DialogCode.Accepted)
+
+    def current_request(self):
+        return _import_request()
+
+
 def _make_module_with_message_box_spy(
     monkeypatch,
     *,
@@ -260,18 +287,196 @@ def _make_module_with_message_box_spy(
     return module, services, recorder
 
 
-def test_control_panel_renders_only_two_button_rows_with_updated_spacing_and_button_heights(
+def test_control_panel_renders_three_button_rows_with_updated_spacing_and_button_heights(
     qapp,
 ):
     module, _ = _make_module()
 
     assert hasattr(module, "lbl_start_reason") is False
-    assert module.layout().count() == 2
+    assert module.layout().count() == 3
     assert module.layout().spacing() == 8
     assert module.btn_start.minimumHeight() == 36
     assert module.btn_stop.minimumHeight() == 36
     assert module.btn_pass.minimumHeight() == 36
     assert module.btn_fail.minimumHeight() == 36
+    assert module.btn_import_audio.minimumHeight() == 36
+
+
+def test_control_module_has_import_audio_button(qapp):
+    module, _ = _make_module()
+
+    assert module.btn_import_audio.text() == "导入音频分析"
+
+
+@pytest.mark.parametrize("run_phase", ["running", "analyzing", "reanalyzing"])
+def test_import_audio_button_is_disabled_for_busy_run_phases(qapp, run_phase):
+    module, _ = _make_module(
+        initial_state=FactoryControllerState(
+            selected_config_ids=(101,),
+            run_phase=run_phase,
+        )
+    )
+
+    assert module.btn_import_audio.isEnabled() is False
+
+
+@pytest.mark.parametrize("busy_reason", ["当前测试运行中", "启动请求处理中"])
+def test_import_audio_button_is_disabled_for_controller_busy_start_reasons(
+    qapp,
+    monkeypatch,
+    busy_reason,
+):
+    module, services = _make_module(
+        initial_state=FactoryControllerState(
+            selected_config_ids=(101,),
+            run_phase="armed",
+            selection_ready=True,
+            start_ready=False,
+            start_ready_reason=busy_reason,
+        )
+    )
+    dialog_created = []
+    warnings = []
+
+    class FakeDialog:
+        def __init__(self, *args, **kwargs):
+            dialog_created.append((args, kwargs))
+
+    monkeypatch.setattr("ui.modules.control.ImportAudioAnalysisDialog", FakeDialog)
+    monkeypatch.setattr(
+        "ui.modules.control.QMessageBox.warning",
+        lambda parent, title, text: warnings.append((title, text)),
+    )
+
+    assert module.btn_import_audio.isEnabled() is False
+
+    module.btn_import_audio.click()
+
+    assert dialog_created == []
+    assert warnings == []
+    services.factory_mode.analyze_imported_audio.assert_not_called()
+
+
+def test_import_audio_requires_selected_config(qapp, monkeypatch):
+    module, services = _make_module(
+        initial_state=FactoryControllerState(selected_config_ids=())
+    )
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.control.QMessageBox.warning",
+        lambda parent, title, text: warnings.append((title, text)),
+    )
+
+    module.btn_import_audio.click()
+
+    services.factory_mode.analyze_imported_audio.assert_not_called()
+    assert warnings == [("导入音频分析", "请先启用一个配置")]
+
+
+def test_import_audio_no_selection_prompt_still_works_when_not_busy(
+    qapp,
+    monkeypatch,
+):
+    module, services = _make_module(
+        initial_state=FactoryControllerState(selected_config_ids=())
+    )
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.control.QMessageBox.warning",
+        lambda parent, title, text: warnings.append((title, text)),
+    )
+
+    assert module.btn_import_audio.isEnabled() is True
+
+    module.btn_import_audio.click()
+
+    services.factory_mode.analyze_imported_audio.assert_not_called()
+    assert warnings == [("导入音频分析", "请先启用一个配置")]
+
+
+def test_import_audio_config_load_failure_shows_warning(qapp, monkeypatch):
+    module, services = _make_module(
+        initial_state=FactoryControllerState(selected_config_ids=(101,))
+    )
+    services.config_service.load_config = MagicMock(side_effect=RuntimeError("missing"))
+    dialog_created = []
+    warnings = []
+
+    class FakeDialog:
+        def __init__(self, *args, **kwargs):
+            dialog_created.append((args, kwargs))
+
+    monkeypatch.setattr("ui.modules.control.ImportAudioAnalysisDialog", FakeDialog)
+    monkeypatch.setattr(
+        "ui.modules.control.QMessageBox.warning",
+        lambda parent, title, text: warnings.append((title, text)),
+    )
+
+    module.btn_import_audio.click()
+
+    assert dialog_created == []
+    services.factory_mode.analyze_imported_audio.assert_not_called()
+    assert warnings == [("导入音频分析", "配置加载失败，无法导入音频分析")]
+
+
+def test_import_audio_with_multiple_configs_requires_dialog_choice(qapp, monkeypatch):
+    module, services = _make_module(
+        initial_state=FactoryControllerState(selected_config_ids=(101, 202))
+    )
+    created = {}
+
+    class FakeDialog:
+        def __init__(self, *, configs, default_config_id, parent=None):
+            created["configs"] = configs
+            created["default_config_id"] = default_config_id
+            created["parent"] = parent
+
+        def exec(self):
+            return int(QDialog.DialogCode.Rejected)
+
+    monkeypatch.setattr("ui.modules.control.ImportAudioAnalysisDialog", FakeDialog)
+
+    module.btn_import_audio.click()
+
+    assert [cfg["config_id"] for cfg in created["configs"]] == [101, 202]
+    assert created["default_config_id"] is None
+    assert created["parent"] is module
+
+
+def test_import_audio_dialog_success_calls_controller(qapp, monkeypatch):
+    module, services = _make_module(
+        initial_state=FactoryControllerState(selected_config_ids=(101,))
+    )
+    monkeypatch.setattr(
+        "ui.modules.control.ImportAudioAnalysisDialog",
+        _FakeDialogReturningRequest,
+    )
+
+    module.btn_import_audio.click()
+
+    services.factory_mode.analyze_imported_audio.assert_called_once_with(
+        _import_request()
+    )
+
+
+def test_import_audio_dialog_controller_rejection_shows_warning(qapp, monkeypatch):
+    module, services = _make_module(
+        initial_state=FactoryControllerState(selected_config_ids=(101,))
+    )
+    services.factory_mode.analyze_imported_audio.return_value = False
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.control.ImportAudioAnalysisDialog",
+        _FakeDialogReturningRequest,
+    )
+    monkeypatch.setattr(
+        "ui.modules.control.QMessageBox.warning",
+        lambda parent, title, text: warnings.append((title, text)),
+    )
+
+    module.btn_import_audio.click()
+
+    assert warnings == [("导入音频分析", "导入音频分析失败，请查看结果区域或日志")]
 
 
 def test_manual_pass_click_applies_manual_ok(qapp):

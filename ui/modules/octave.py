@@ -54,6 +54,9 @@ class OctaveModule(QWidget):
     def current_render_channel(self) -> int | None:
         return self._rendered_channel_index
 
+    def set_vibration_mode(self, enabled: bool) -> None:
+        self.plot.set_vibration_semantics(enabled)
+
     def refresh_selected_display_channel(self) -> None:
         self._refresh_committed_rendering()
 

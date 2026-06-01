@@ -33,6 +33,7 @@ def test_analysis_action_clamps_selection_to_audio_bounds_without_local_reset_ha
     review_event_count = len(services.bus.factory_review_changed.emissions)
     reset_event_count = len(services.bus.factory_display_reset.emissions)
 
+    module.analysis_select_button.click()
     module.move_selection_to_start(9.0)
     module.analyze_button.click()
 
@@ -57,6 +58,7 @@ def test_clicking_analysis_preserves_selection_when_controller_clears_review_the
     )
 
     _emit_reviewing(module, services, payload)
+    module.analysis_select_button.click()
     module.move_selection_to_start(1.25)
     reset_event_count = len(services.bus.factory_display_reset.emissions)
 
@@ -82,9 +84,10 @@ def test_clicking_analysis_preserves_selection_when_controller_clears_review_the
 
     services.factory_mode.begin_reanalysis.assert_called_once_with(1.25, 3.25)
     assert len(services.bus.factory_display_reset.emissions) == reset_event_count
-    assert module.selection_box.isVisible() is True
-    assert module.analyze_button.isVisible() is True
+    assert module.selection_box.isVisible() is False
+    assert module.analyze_button.isVisible() is False
     assert module.analyze_button.isEnabled() is False
+    assert module.analysis_select_button.text() == "取消框选"
     assert module.selected_window == pytest.approx((1.25, 3.25))
 
 
@@ -104,6 +107,7 @@ def test_reanalysis_failure_keeps_box_visible_and_locked_until_reviewing_unlocks
             }
         ),
     )
+    module.analysis_select_button.click()
     module.move_selection_to_start(1.25)
     assert module.selected_window == pytest.approx((1.25, 3.25))
 
@@ -117,8 +121,9 @@ def test_reanalysis_failure_keeps_box_visible_and_locked_until_reviewing_unlocks
 
     module.move_selection_to_start(0.25)
 
-    assert module.selection_box.isVisible() is True
-    assert module.analyze_button.isVisible() is True
+    assert module.selection_box.isVisible() is False
+    assert module.analyze_button.isVisible() is False
+    assert module.analysis_select_button.text() == "取消框选"
     assert module.analyze_button.isEnabled() is False
     assert module.selected_window == pytest.approx((1.25, 3.25))
 
@@ -138,7 +143,9 @@ def test_reanalysis_failure_keeps_box_visible_and_locked_until_reviewing_unlocks
     )
 
     assert module.selection_box.isVisible() is True
-    assert module.analyze_button.isEnabled() is True
+    assert module.analyze_button.isVisible() is True
+    assert module.analysis_select_button.isEnabled() is True
+    assert module.analysis_select_button.text() == "取消框选"
     assert module.selected_window == pytest.approx((1.25, 3.25))
 
     module.move_selection_to_start(0.25)
@@ -162,6 +169,7 @@ def test_reanalysis_success_payload_reseeds_selection_from_controller_window_aft
             }
         ),
     )
+    module.analysis_select_button.click()
     module.move_selection_to_start(1.25)
     assert module.selected_window == pytest.approx((1.25, 3.25))
 
@@ -183,8 +191,9 @@ def test_reanalysis_success_payload_reseeds_selection_from_controller_window_aft
 
     services.bus.factory_review_changed.emit(completion_payload)
 
-    assert module.selection_box.isVisible() is True
-    assert module.analyze_button.isVisible() is True
+    assert module.selection_box.isVisible() is False
+    assert module.analyze_button.isVisible() is False
+    assert module.analysis_select_button.text() == "取消框选"
     assert module.analyze_button.isEnabled() is False
 
     services.bus.factory_state_changed.emit(
@@ -196,7 +205,9 @@ def test_reanalysis_success_payload_reseeds_selection_from_controller_window_aft
     )
 
     assert module.selection_box.isVisible() is True
-    assert module.analyze_button.isEnabled() is True
+    assert module.analyze_button.isVisible() is True
+    assert module.analysis_select_button.isEnabled() is True
+    assert module.analysis_select_button.text() == "取消框选"
     assert module.selected_window == pytest.approx((0.5, 2.5))
 
 
@@ -216,7 +227,7 @@ def test_display_reset_clears_selection_and_hides_manual_controls(qapp):
             }
         ),
     )
-    assert module.selection_box.isVisible() is True
+    assert module.selection_box.isVisible() is False
 
     services.bus.factory_display_reset.emit("next_run_accepted")
 

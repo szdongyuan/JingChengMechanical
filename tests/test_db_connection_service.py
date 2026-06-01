@@ -43,6 +43,11 @@ def _table_columns(tmp_db: SqliteDatabase, table_name: str) -> dict[str, tuple]:
     return {row[1]: row for row in cursor.fetchall()}
 
 
+def _table_column_names(tmp_db: SqliteDatabase, table_name: str) -> list[str]:
+    cursor = tmp_db.execute_sql(f"PRAGMA table_info({table_name})")
+    return [row[1] for row in cursor.fetchall()]
+
+
 def _index_definitions(
     tmp_db: SqliteDatabase,
     table_name: str,
@@ -61,7 +66,47 @@ def _create_sqlite_file(db_path: Path) -> None:
     tmp_db.close()
 
 
+CHANNEL_CONFIG_COLUMN_SQL = {
+    "fft_x_axis_scale": "TEXT NOT NULL DEFAULT 'linear'",
+    "stft_color_scale_enabled": "INTEGER NOT NULL DEFAULT 0",
+    "stft_color_scale_min_db": "REAL NOT NULL DEFAULT -120.0",
+    "stft_color_scale_max_db": "REAL NOT NULL DEFAULT 0.0",
+    "stft_score_enabled": "INTEGER NOT NULL DEFAULT 1",
+    "stft_score_summary_mode": "TEXT NOT NULL DEFAULT 'percentile'",
+    "stft_score_percentile": "REAL NOT NULL DEFAULT 10.0",
+    "stft_score_loudness_reference_sone": "REAL NOT NULL DEFAULT 10.0",
+    "stft_score_modulation_reference": "REAL NOT NULL DEFAULT 0.20",
+    "stft_score_harmonic_ratio_reference": "REAL NOT NULL DEFAULT 0.25",
+    "stft_score_frequency_instability_reference": "REAL NOT NULL DEFAULT 0.05",
+    "stft_score_harmonic_start_order": "INTEGER NOT NULL DEFAULT 2",
+    "stft_score_harmonic_end_order": "INTEGER NOT NULL DEFAULT 100",
+}
+
+
+TEST_CONFIG_COLUMN_SQL = {
+    "vibration_view_channel_index": "INTEGER DEFAULT NULL",
+}
+
+
 def _create_table(tmp_db: SqliteDatabase, table_name: str) -> None:
+    if table_name == "test_config_table":
+        column_sql = ", ".join(
+            f"{name} {definition}"
+            for name, definition in TEST_CONFIG_COLUMN_SQL.items()
+        )
+        tmp_db.execute_sql(
+            f"CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, {column_sql})"
+        )
+        return
+    if table_name == "channel_config_table":
+        column_sql = ", ".join(
+            f"{name} {definition}"
+            for name, definition in CHANNEL_CONFIG_COLUMN_SQL.items()
+        )
+        tmp_db.execute_sql(
+            f"CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, {column_sql})"
+        )
+        return
     tmp_db.execute_sql(f"CREATE TABLE {table_name} (id INTEGER PRIMARY KEY)")
 
 
@@ -197,7 +242,7 @@ def test_connect_existing_partial_database_raises_and_preserves_data(
         check_db.close()
 
 
-def test_connect_existing_prepared_database_does_not_mutate_schema_or_data(
+def test_connect_existing_prepared_database_accepts_required_channel_columns(
     monkeypatch,
     tmp_path,
 ):
@@ -205,6 +250,7 @@ def test_connect_existing_prepared_database_does_not_mutate_schema_or_data(
     tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
     tmp_db.connect()
     _create_runtime_tables(tmp_db)
+    tmp_db.execute_sql("INSERT INTO channel_config_table (id) VALUES (1)")
     tmp_db.execute_sql("DROP TABLE users_table")
     tmp_db.execute_sql(
         "CREATE TABLE users_table (user_id INTEGER PRIMARY KEY, user_name TEXT)"
@@ -216,7 +262,7 @@ def test_connect_existing_prepared_database_does_not_mutate_schema_or_data(
         "CREATE UNIQUE INDEX users_table_user_name ON users_table (user_name)"
     )
     expected_tables = _runtime_table_names(tmp_db)
-    expected_columns = _table_columns(tmp_db, "users_table")
+    expected_user_columns = _table_columns(tmp_db, "users_table")
     expected_indexes = _index_definitions(tmp_db, "users_table")
     tmp_db.close()
     monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
@@ -226,13 +272,131 @@ def test_connect_existing_prepared_database_does_not_mutate_schema_or_data(
 
     assert _runtime_table_names(tmp_db) == expected_tables
     assert expected_tables == EXPECTED_RUNTIME_TABLES
-    assert _table_columns(tmp_db, "users_table") == expected_columns
+    assert _table_columns(tmp_db, "users_table") == expected_user_columns
+    channel_columns = _table_columns(tmp_db, "channel_config_table")
+    assert channel_columns["fft_x_axis_scale"][2] == "TEXT"
+    assert tmp_db.execute_sql(
+        "SELECT fft_x_axis_scale FROM channel_config_table WHERE id = 1"
+    ).fetchone() == ("linear",)
     assert _index_definitions(tmp_db, "users_table") == expected_indexes
     assert tmp_db.execute_sql(
         "SELECT user_id, user_name FROM users_table"
     ).fetchall() == [(7, "operator")]
     assert tmp_db.execute_sql("SELECT COUNT(*) FROM device_table").fetchone() == (0,)
     tmp_db.close()
+
+
+def test_connect_existing_prepared_database_accepts_stft_color_scale_columns(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "jingchen.db"
+    tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    tmp_db.connect()
+    _create_runtime_tables(tmp_db)
+    tmp_db.execute_sql("INSERT INTO channel_config_table (id) VALUES (1)")
+    tmp_db.close()
+    monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    svc_mod.DbConnectionService().connect()
+
+    channel_columns = _table_columns(tmp_db, "channel_config_table")
+    assert channel_columns["stft_color_scale_enabled"][2] == "INTEGER"
+    assert channel_columns["stft_color_scale_min_db"][2] == "REAL"
+    assert channel_columns["stft_color_scale_max_db"][2] == "REAL"
+    row = tmp_db.execute_sql(
+        "SELECT stft_color_scale_enabled, stft_color_scale_min_db, stft_color_scale_max_db "
+        "FROM channel_config_table WHERE id = 1"
+    ).fetchone()
+    assert row == (0, -120.0, 0.0)
+    tmp_db.close()
+
+
+def test_connect_existing_prepared_database_accepts_stft_score_columns(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "jingchen.db"
+    tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    tmp_db.connect()
+    _create_runtime_tables(tmp_db)
+    tmp_db.execute_sql("INSERT INTO channel_config_table (id) VALUES (1)")
+    tmp_db.close()
+    monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    svc_mod.DbConnectionService().connect()
+
+    columns = _table_columns(tmp_db, "channel_config_table")
+    assert columns["stft_score_enabled"][2] == "INTEGER"
+    assert columns["stft_score_summary_mode"][2] == "TEXT"
+    assert columns["stft_score_percentile"][2] == "REAL"
+    row = tmp_db.execute_sql(
+        "SELECT stft_score_enabled, stft_score_summary_mode, "
+        "stft_score_percentile, stft_score_harmonic_start_order, "
+        "stft_score_harmonic_end_order FROM channel_config_table WHERE id = 1"
+    ).fetchone()
+    assert row == (1, "percentile", 10.0, 2, 100)
+    tmp_db.close()
+
+
+def test_connect_rejects_incomplete_channel_config_schema_without_mutating(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "jingchen.db"
+    tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    tmp_db.connect()
+    for table_name in sorted(EXPECTED_RUNTIME_TABLES - {"channel_config_table"}):
+        _create_table(tmp_db, table_name)
+    tmp_db.execute_sql("CREATE TABLE channel_config_table (id INTEGER PRIMARY KEY)")
+    tmp_db.execute_sql("INSERT INTO channel_config_table (id) VALUES (1)")
+    tmp_db.close()
+    monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    with pytest.raises(DatabaseStartupError, match="missing required channel_config_table"):
+        svc_mod.DbConnectionService().connect()
+
+    check_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    check_db.connect()
+    try:
+        assert _table_column_names(check_db, "channel_config_table") == ["id"]
+        assert check_db.execute_sql(
+            "SELECT id FROM channel_config_table"
+        ).fetchall() == [(1,)]
+    finally:
+        check_db.close()
+
+
+def test_connect_rejects_missing_vibration_view_column_without_mutating(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "jingchen.db"
+    tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    tmp_db.connect()
+    for table_name in sorted(EXPECTED_RUNTIME_TABLES - {"test_config_table"}):
+        _create_table(tmp_db, table_name)
+    tmp_db.execute_sql("CREATE TABLE test_config_table (id INTEGER PRIMARY KEY)")
+    tmp_db.execute_sql("INSERT INTO test_config_table (id) VALUES (1)")
+    tmp_db.close()
+    monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    with pytest.raises(DatabaseStartupError, match="missing required test_config_table"):
+        svc_mod.DbConnectionService().connect()
+
+    check_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    check_db.connect()
+    try:
+        assert _table_column_names(check_db, "test_config_table") == ["id"]
+        assert check_db.execute_sql(
+            "SELECT id FROM test_config_table"
+        ).fetchall() == [(1,)]
+    finally:
+        check_db.close()
 
 
 def test_connect_allows_literal_memory_database_and_skips_file_schema_checks(

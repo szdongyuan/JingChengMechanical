@@ -31,7 +31,7 @@ class SpectrumModule(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
 
-        self.plot = FftLineChartWidget(hide_left_axis_label=True)
+        self.plot = FftLineChartWidget()
         lay.addWidget(self.plot, 1)
 
         if hasattr(self.services.bus, "factory_state_changed"):
@@ -53,6 +53,9 @@ class SpectrumModule(QWidget):
 
     def current_render_channel(self) -> int | None:
         return self._rendered_channel_index
+
+    def set_vibration_mode(self, enabled: bool) -> None:
+        self.plot.set_vibration_semantics(enabled)
 
     def refresh_selected_display_channel(self) -> None:
         self._refresh_committed_rendering()
@@ -106,8 +109,13 @@ class SpectrumModule(QWidget):
                 frequencies_hz=frequencies_hz,
                 levels_db=levels_db,
                 limit_bands=fft_payload.get("limit_bands"),
+                limit_envelope=fft_payload.get("limit_envelope"),
                 golden_overlay_levels_db=fft_payload.get("golden_overlay_levels_db"),
                 show_zero_reference=bool(fft_payload.get("show_zero_reference")),
+                x_axis_scale=self._fft_x_axis_scale_for_payload(
+                    fft_payload,
+                    channel_index,
+                ),
             )
         except (TypeError, ValueError):
             self._clear_plot(rendered_channel_index=channel_index)
@@ -115,6 +123,17 @@ class SpectrumModule(QWidget):
 
         self._has_plot_data = True
         self._rendered_channel_index = channel_index
+
+    def _fft_x_axis_scale_for_payload(
+        self,
+        fft_payload: dict,
+        channel_index: int | None,
+    ) -> str:
+        if fft_payload.get("x_axis_scale") == "log":
+            return "log"
+        if fft_payload.get("x_axis_scale") == "linear":
+            return "linear"
+        return self._fft_x_axis_scale_for_channel(channel_index)
 
     def _clear_plot(self, *, rendered_channel_index: int | None = None) -> None:
         self._has_plot_data = False
@@ -126,6 +145,37 @@ class SpectrumModule(QWidget):
             self._factory_state.displayed_config_id is not None
             and self._factory_state.run_phase in self._RENDER_PHASES
         )
+
+    def _load_displayed_config(self) -> dict:
+        config_id = self._factory_state.displayed_config_id
+        if config_id is None:
+            return {}
+
+        config_service = getattr(self.services, "config_service", None)
+        load_config = getattr(config_service, "load_config", None)
+        if not callable(load_config):
+            return {}
+
+        return load_config(config_id)
+
+    def _fft_x_axis_scale_for_channel(self, channel_index: int | None) -> str:
+        if channel_index is None:
+            return "linear"
+
+        try:
+            config = self._load_displayed_config()
+        except Exception:
+            return "linear"
+
+        if not isinstance(config, dict):
+            return "linear"
+
+        for channel in config.get("channels", []):
+            if not isinstance(channel, dict):
+                continue
+            if channel.get("channel_index") == channel_index:
+                return "log" if channel.get("fft_x_axis_scale") == "log" else "linear"
+        return "linear"
 
     def _chart_payload_for_displayed_config(self) -> dict[int, dict]:
         if self._review_payload.displayed_config_id != self._factory_state.displayed_config_id:

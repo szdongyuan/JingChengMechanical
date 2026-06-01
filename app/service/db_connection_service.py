@@ -36,6 +36,24 @@ class DbConnectionService:
             "plc_table",
         }
     )
+    _REQUIRED_CHANNEL_CONFIG_COLUMNS = frozenset(
+        {
+            "fft_x_axis_scale",
+            "stft_color_scale_enabled",
+            "stft_color_scale_min_db",
+            "stft_color_scale_max_db",
+            "stft_score_enabled",
+            "stft_score_summary_mode",
+            "stft_score_percentile",
+            "stft_score_loudness_reference_sone",
+            "stft_score_modulation_reference",
+            "stft_score_harmonic_ratio_reference",
+            "stft_score_frequency_instability_reference",
+            "stft_score_harmonic_start_order",
+            "stft_score_harmonic_end_order",
+        }
+    )
+    _REQUIRED_TEST_CONFIG_COLUMNS = frozenset({"vibration_view_channel_index"})
 
     def connect(self):
         self._ensure_database_file_exists()
@@ -50,6 +68,7 @@ class DbConnectionService:
             raise
         try:
             self._ensure_required_runtime_tables()
+            self._ensure_required_runtime_columns()
         except Exception:
             if not db.is_closed():
                 db.close()
@@ -85,6 +104,37 @@ class DbConnectionService:
                 f"{', '.join(missing_tables)}. "
                 "Copy a prepared database before starting the application."
             )
+
+    def _ensure_required_runtime_columns(self) -> None:
+        if DB_PATH == ":memory:":
+            return
+
+        self._ensure_required_table_columns(
+            "channel_config_table",
+            self._REQUIRED_CHANNEL_CONFIG_COLUMNS,
+        )
+        self._ensure_required_table_columns(
+            "test_config_table",
+            self._REQUIRED_TEST_CONFIG_COLUMNS,
+        )
+
+    def _ensure_required_table_columns(
+        self,
+        table_name: str,
+        required_columns: frozenset[str],
+    ) -> None:
+        missing_columns = sorted(required_columns - self._table_columns(table_name))
+        if missing_columns:
+            raise DatabaseStartupError(
+                "Database schema is incomplete: missing required "
+                f"{table_name} columns: "
+                f"{', '.join(missing_columns)}. "
+                "Copy a prepared database before starting the application."
+            )
+
+    def _table_columns(self, table_name: str) -> set[str]:
+        cursor = db.execute_sql(f"PRAGMA table_info({table_name})")
+        return {row[1] for row in cursor.fetchall()}
 
     def _is_sqlite_file_open_error(self, error: OperationalError) -> bool:
         if DB_PATH == ":memory:":

@@ -3,14 +3,14 @@ from __future__ import annotations
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 from app.services_container import FactoryControllerState, FactoryReviewPayload
-from ui.widgets.analysis_charts import LineChartWidget
+from ui.widgets.analysis_charts import LineChartExportSchema, LineChartWidget
 
 
 class SplModule(QWidget):
     module_id = "spl"
     _RENDER_PHASES = frozenset({"reviewing", "stopped"})
-    _BOTTOM_AXIS_LABEL = "Time (s)"
-    _LEFT_AXIS_LABEL = "SPL (dB)"
+    _BOTTOM_AXIS_LABEL = "时间 (s)"
+    _LEFT_AXIS_LABEL = "声压级 (dB)"
 
     def __init__(self, services):
         super().__init__()
@@ -33,7 +33,10 @@ class SplModule(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
 
-        self.plot = LineChartWidget(hide_left_axis_label=True)
+        self.plot = LineChartWidget(
+            hide_left_axis_label=True,
+            export_schema=LineChartExportSchema.spl(),
+        )
         self._set_axis_labels()
         lay.addWidget(self.plot, 1)
 

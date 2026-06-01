@@ -411,6 +411,12 @@ class TestAnalysisPipeline:
             ),
         )
         monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.downsample_loudness_trace_for_display",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("display trace helper must not be used live")
+            ),
+        )
+        monkeypatch.setattr(
             "app.service.analysis.pipeline.dsp.compute_loudness_window_sone",
             fake_compute_loudness_window_sone,
         )

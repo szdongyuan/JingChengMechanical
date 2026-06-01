@@ -6,7 +6,7 @@ from PyQt6.QtCore import pyqtSignal
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 from app.services_container import FactoryControllerState, FactoryReviewPayload
-from ui.widgets.analysis_charts import LineChartWidget
+from ui.widgets.analysis_charts import LineChartExportSchema, LineChartWidget
 
 
 class LoudnessModule(QWidget):
@@ -37,9 +37,12 @@ class LoudnessModule(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
 
-        self.plot = LineChartWidget(hide_left_axis_label=True)
-        self.plot.plot_item.setLabel("bottom", "Time (s)")
-        self.plot.plot_item.setLabel("left", "Loudness")
+        self.plot = LineChartWidget(
+            hide_left_axis_label=True,
+            export_schema=LineChartExportSchema.loudness(),
+        )
+        self.plot.plot_item.setLabel("bottom", "时间 (s)")
+        self.plot.plot_item.setLabel("left", "响度")
         lay.addWidget(self.plot, 1)
 
         if hasattr(self.services.bus, "factory_state_changed"):
@@ -128,13 +131,14 @@ class LoudnessModule(QWidget):
                 values,
                 lower_limit=loudness_payload.get("lower_limit"),
                 upper_limit=loudness_payload.get("upper_limit"),
+                export_metadata={"unit": unit},
             )
         except (TypeError, ValueError):
             self._clear_plot()
             return
 
-        self.plot.plot_item.setLabel("bottom", "Time (s)")
-        self.plot.plot_item.setLabel("left", f"Loudness ({unit})")
+        self.plot.plot_item.setLabel("bottom", "时间 (s)")
+        self.plot.plot_item.setLabel("left", f"响度 ({unit})")
         self._has_plot_data = True
         self._rendered_channel_index = channel_index
         self._current_payload = {
@@ -151,8 +155,8 @@ class LoudnessModule(QWidget):
         self._rendered_channel_index = None
         self._current_payload = None
         self.plot.clear_data()
-        self.plot.plot_item.setLabel("bottom", "Time (s)")
-        self.plot.plot_item.setLabel("left", "Loudness")
+        self.plot.plot_item.setLabel("bottom", "时间 (s)")
+        self.plot.plot_item.setLabel("left", "响度")
         self._emit_title_for_unit(None)
 
     def _can_render_committed_chart(self) -> bool:

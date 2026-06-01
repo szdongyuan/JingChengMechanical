@@ -24,8 +24,12 @@ _DISPLAY_LABEL_MAP = {
     "平均SPL": "平均声压级",
     "Loudness": "响度",
     "平均Loudness": "平均响度",
-    "FFT": "FFT频谱",
+    "FFT": "频谱",
     "Octave": "倍频程",
+}
+_RESULT_LABEL_MAP = {
+    "PASS": "通过",
+    "FAIL": "不通过",
 }
 _CHANNEL_LABEL_RE = re.compile(r"CH(\d+)", flags=re.IGNORECASE)
 _SPL_METRIC_UI_THROTTLE_SEC = 0.25
@@ -38,7 +42,7 @@ class ResultModule(QWidget):
         "平均声压级",
         "响度",
         "平均响度",
-        "FFT频谱",
+        "频谱",
         "倍频程",
         "AI分析",
     )
@@ -238,7 +242,9 @@ class ResultModule(QWidget):
 
     def _render_summary(self, summary_payload: dict) -> None:
         overall_status = summary_payload.get("overall_status")
-        overall_label = self._text_or_default(summary_payload.get("overall_label"), "-")
+        overall_label = self._display_result_label(
+            self._text_or_default(summary_payload.get("overall_label"), "-")
+        )
         badge_level = {
             "pass": "pass",
             "fail": "fail",
@@ -248,6 +254,13 @@ class ResultModule(QWidget):
         error_message = None
         if overall_status == "no_result":
             error_message = self._text_or_default(summary_payload.get("error_message"), None)
+        warning_message = self._import_warning_message()
+        if warning_message:
+            error_message = (
+                f"{error_message}\n{warning_message}"
+                if error_message
+                else warning_message
+            )
         self._set_error_message(error_message)
 
         rows = summary_payload.get("rows")
@@ -260,9 +273,23 @@ class ResultModule(QWidget):
                 self._display_label(row_payload.get("label"), default_label),
                 self._text_or_default(row_payload.get("deviation_display"), "-"),
                 self._display_channel(row_payload.get("channel_label"), "-"),
-                self._text_or_default(row_payload.get("status"), "-"),
+                self._display_result_label(
+                    self._text_or_default(row_payload.get("status"), "-")
+                ),
             )
         self._refresh_metric_display()
+
+    def _import_warning_message(self) -> str | None:
+        warnings = getattr(self._review_payload, "import_warnings", ()) or ()
+        messages = [
+            message
+            for message in (
+                getattr(warning, "message", "")
+                for warning in warnings
+            )
+            if isinstance(message, str) and message.strip()
+        ]
+        return "\n".join(message.strip() for message in messages[:5]) or None
 
     def _refresh_display(self) -> None:
         summary_payload = getattr(self._review_payload, "summary_payload", None)
@@ -760,6 +787,12 @@ class ResultModule(QWidget):
         if text is None:
             return None
         return _DISPLAY_LABEL_MAP.get(text, text)
+
+    @staticmethod
+    def _display_result_label(value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _RESULT_LABEL_MAP.get(value, value)
 
     @staticmethod
     def _display_channel(value, default: str | None) -> str | None:

@@ -543,6 +543,30 @@ class TestTestManagerStartStop:
             assert _CountingMonitor.instances == []
             bus.test_started.emit.assert_not_called()
 
+    @pytest.mark.parametrize("vibration_view_channel_index", [2, -1, True, "1"])
+    def test_start_rejects_invalid_vibration_view_channel_before_runtime_setup(
+        self,
+        monkeypatch,
+        vibration_view_channel_index,
+    ):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            config = _factory_runtime_config()
+            config["selected_channels"] = [0]
+            config["vibration_view_channel_index"] = vibration_view_channel_index
+            services.config_service.load_config.return_value = config
+            _install_counting_runtime(monkeypatch)
+            mgr = TestManager(bus, services)
+
+            accepted = mgr.start({"config_id": 1, "sn": "SN1"})
+
+            assert accepted is False
+            assert "振动视图通道" in (mgr.last_start_error() or "")
+            assert _CountingSession.instances == []
+            assert _CountingRecorder.instances == []
+            assert _CountingMonitor.instances == []
+            bus.test_started.emit.assert_not_called()
+
     @pytest.mark.parametrize("monitor_gain_db", [float("nan"), float("inf"), -60.1, 24.1, "6"])
     def test_start_rejects_invalid_monitor_gain_before_runtime_setup(
         self,

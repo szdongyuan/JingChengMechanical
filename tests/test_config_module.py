@@ -23,6 +23,8 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QLabel,
     QPushButton,
+    QSpinBox,
+    QTableWidget,
     QWidget,
 )
 
@@ -668,6 +670,7 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_id(qapp):
         "output_device_samplerate",
         "selected_channels",
         "monitor_channel_index",
+        "vibration_view_channel_index",
         "monitor_gain_db",
         "channels",
         "golden_editor_state",
@@ -723,6 +726,50 @@ def test_hardware_card_exposes_monitor_controls_and_channel_options(qapp):
     assert module.spin_monitor_gain_db.suffix() == " dB"
 
 
+def test_hardware_card_exposes_vibration_view_channel_selector(qapp):
+    hardware_service = _HardwareServiceStub(
+        devices=[
+            {
+                "name": "Mic 4",
+                "hostapi": 0,
+                "default_samplerate": 48000,
+                "max_input_channels": 4,
+                "max_output_channels": 0,
+            },
+            {
+                "name": "Speaker 1",
+                "hostapi": 1,
+                "default_samplerate": 44100,
+                "max_input_channels": 0,
+                "max_output_channels": 2,
+            },
+        ]
+    )
+    module = _make_module(hardware_service=hardware_service)
+    payload = _detail_payload([_channel_payload(i) for i in range(4)])
+    payload["input_device_name"] = "Mic 4"
+    payload["selected_channels"] = [0, 2]
+
+    module._populate_detail(payload)
+
+    assert hasattr(module, "combo_vibration_view_channel")
+    assert (
+        module.findChild(QComboBox, "combo_vibration_view_channel")
+        is module.combo_vibration_view_channel
+    )
+    assert _field_label_text(module, "combo_vibration_view_channel") == "振动视图通道"
+    assert [module.combo_vibration_view_channel.itemText(i) for i in range(3)] == [
+        "无",
+        "输入1",
+        "输入3",
+    ]
+    assert [module.combo_vibration_view_channel.itemData(i) for i in range(3)] == [
+        None,
+        0,
+        2,
+    ]
+
+
 def test_populate_detail_loads_saved_monitor_values(qapp):
     module = _make_module()
     payload = _detail_payload([_channel_payload(0), _channel_payload(1)])
@@ -733,6 +780,17 @@ def test_populate_detail_loads_saved_monitor_values(qapp):
 
     assert module.combo_monitor_channel.currentData() == 1
     assert module.spin_monitor_gain_db.value() == pytest.approx(-3.5)
+
+
+def test_populate_detail_loads_saved_vibration_view_channel(qapp):
+    module = _make_module()
+    payload = _detail_payload([_channel_payload(0), _channel_payload(1)])
+    payload["selected_channels"] = [0, 1]
+    payload["vibration_view_channel_index"] = 1
+
+    module._populate_detail(payload)
+
+    assert module.combo_vibration_view_channel.currentData() == 1
 
 
 def test_populate_detail_falls_back_monitor_channel_from_selected_channels_then_zero(qapp):
@@ -869,6 +927,19 @@ def test_collect_data_includes_monitor_channel_and_gain(qapp):
     assert isinstance(data["monitor_gain_db"], float)
 
 
+def test_collect_data_includes_vibration_view_channel(qapp):
+    module = _make_module()
+    payload = _detail_payload([_channel_payload(0), _channel_payload(1)])
+    payload["selected_channels"] = [0, 1]
+    payload["vibration_view_channel_index"] = 1
+    module._populate_detail(payload)
+
+    data = module._collect_data()
+
+    assert data["vibration_view_channel_index"] == 1
+    assert isinstance(data["vibration_view_channel_index"], int)
+
+
 def test_collect_data_uses_null_monitor_channel_when_no_input_channels(qapp):
     hardware_service = _HardwareServiceStub(devices=[], hostapis=[])
     module = _make_module(hardware_service=hardware_service)
@@ -885,6 +956,43 @@ def test_collect_data_uses_null_monitor_channel_when_no_input_channels(qapp):
 
     assert data["monitor_channel_index"] is None
     assert data["monitor_gain_db"] == pytest.approx(0.0)
+
+
+def test_vibration_view_channel_options_follow_selected_channels(qapp):
+    hardware_service = _HardwareServiceStub(
+        devices=[
+            {
+                "name": "Mic 3",
+                "hostapi": 0,
+                "default_samplerate": 48000,
+                "max_input_channels": 3,
+                "max_output_channels": 0,
+            },
+            {
+                "name": "Speaker 1",
+                "hostapi": 1,
+                "default_samplerate": 44100,
+                "max_input_channels": 0,
+                "max_output_channels": 2,
+            },
+        ]
+    )
+    module = _make_module(hardware_service=hardware_service)
+    payload = _detail_payload([_channel_payload(i) for i in range(3)])
+    payload["input_device_name"] = "Mic 3"
+    payload["selected_channels"] = [0, 1]
+    payload["vibration_view_channel_index"] = 1
+    module._populate_detail(payload)
+
+    module._channel_checkboxes[1].setChecked(False)
+    module._channel_checkboxes[2].setChecked(True)
+
+    assert [module.combo_vibration_view_channel.itemData(i) for i in range(3)] == [
+        None,
+        0,
+        2,
+    ]
+    assert module.combo_vibration_view_channel.currentData() is None
 
 
 def test_config_module_refreshes_open_selector_after_plc_changed_signal(qapp):
@@ -1322,6 +1430,7 @@ def test_on_save_preserves_selected_channel_and_collapsed_sections_and_shows_suc
     assert module.config_list.currentItem().data(Qt.ItemDataRole.UserRole) == 7
     assert set(restored_boxes) == {
         "stft",
+        "stft_score",
         "spl",
         "loudness",
         "golden_sample",
@@ -1739,6 +1848,296 @@ def test_collect_data_returns_fft_resolution_from_fft_section(qapp):
     data = module._collect_data()
 
     assert data["channels"][0]["fft_nfft"] == 2048
+
+
+def test_populate_detail_restores_stft_color_scale_controls(qapp):
+    module = _make_module()
+    module._populate_detail(
+        _detail_payload(
+            [
+                _channel_payload(
+                    0,
+                    stft_color_scale_enabled=True,
+                    stft_color_scale_min_db=-95.5,
+                    stft_color_scale_max_db=-12.2,
+                )
+            ]
+        )
+    )
+
+    container = module._channel_containers[0]
+    enabled = container.findChild(QCheckBox, "stft_color_scale_enabled")
+    min_spin = container.findChild(QDoubleSpinBox, "stft_color_scale_min_db")
+    max_spin = container.findChild(QDoubleSpinBox, "stft_color_scale_max_db")
+
+    assert enabled.isChecked() is True
+    assert min_spin.value() == pytest.approx(-95.5)
+    assert max_spin.value() == pytest.approx(-12.2)
+    assert min_spin.isEnabled() is True
+    assert max_spin.isEnabled() is True
+
+
+def test_stft_color_scale_inputs_disable_when_unchecked(qapp):
+    module = _make_module()
+    module._populate_detail(_detail_payload([_channel_payload(0)]))
+
+    container = module._channel_containers[0]
+    enabled = container.findChild(QCheckBox, "stft_color_scale_enabled")
+    min_spin = container.findChild(QDoubleSpinBox, "stft_color_scale_min_db")
+    max_spin = container.findChild(QDoubleSpinBox, "stft_color_scale_max_db")
+
+    assert enabled.isChecked() is False
+    assert min_spin.isEnabled() is False
+    assert max_spin.isEnabled() is False
+
+    enabled.setChecked(True)
+
+    assert min_spin.isEnabled() is True
+    assert max_spin.isEnabled() is True
+
+
+def test_collect_data_includes_stft_color_scale_fields(qapp):
+    module = _make_module()
+    module._populate_detail(_detail_payload([_channel_payload(0)]))
+    container = module._channel_containers[0]
+
+    container.findChild(QCheckBox, "stft_color_scale_enabled").setChecked(True)
+    container.findChild(QDoubleSpinBox, "stft_color_scale_min_db").setValue(-88.0)
+    container.findChild(QDoubleSpinBox, "stft_color_scale_max_db").setValue(-8.0)
+
+    data = module._collect_data()
+
+    channel = data["channels"][0]
+    assert channel["stft_color_scale_enabled"] is True
+    assert channel["stft_color_scale_min_db"] == pytest.approx(-88.0)
+    assert channel["stft_color_scale_max_db"] == pytest.approx(-8.0)
+
+
+def test_populate_detail_restores_stft_score_controls(qapp):
+    module = _make_module()
+    module._populate_detail(
+        _detail_payload(
+            [
+                _channel_payload(
+                    0,
+                    stft_score_enabled=False,
+                    stft_score_summary_mode="mean",
+                    stft_score_percentile=20.0,
+                    stft_score_loudness_reference_sone=12.5,
+                    stft_score_modulation_reference=0.3,
+                    stft_score_harmonic_ratio_reference=0.4,
+                    stft_score_frequency_instability_reference=0.08,
+                    stft_score_harmonic_start_order=3,
+                    stft_score_harmonic_end_order=80,
+                )
+            ]
+        )
+    )
+
+    container = module._channel_containers[0]
+
+    assert container.findChild(QCheckBox, "stft_score_enabled").isChecked() is False
+    assert (
+        container.findChild(QComboBox, "stft_score_summary_mode").currentData()
+        == "mean"
+    )
+    assert container.findChild(
+        QDoubleSpinBox, "stft_score_percentile"
+    ).value() == pytest.approx(20.0)
+    assert container.findChild(
+        QDoubleSpinBox, "stft_score_loudness_reference_sone"
+    ).value() == pytest.approx(12.5)
+    assert container.findChild(
+        QDoubleSpinBox, "stft_score_modulation_reference"
+    ).value() == pytest.approx(0.3)
+    assert container.findChild(
+        QDoubleSpinBox, "stft_score_harmonic_ratio_reference"
+    ).value() == pytest.approx(0.4)
+    assert container.findChild(
+        QDoubleSpinBox, "stft_score_frequency_instability_reference"
+    ).value() == pytest.approx(0.08)
+    assert (
+        container.findChild(QSpinBox, "stft_score_harmonic_start_order").value()
+        == 3
+    )
+    assert (
+        container.findChild(QSpinBox, "stft_score_harmonic_end_order").value()
+        == 80
+    )
+    assert (
+        _ancestor_group_title(
+            container.findChild(QComboBox, "stft_score_summary_mode")
+        )
+        == "STFT 评分"
+    )
+
+
+def test_stft_score_inputs_disable_when_unchecked(qapp):
+    module = _make_module()
+    module._populate_detail(_detail_payload([_channel_payload(0)]))
+
+    container = module._channel_containers[0]
+    enabled = container.findChild(QCheckBox, "stft_score_enabled")
+    score_controls = [
+        container.findChild(QComboBox, "stft_score_summary_mode"),
+        container.findChild(QDoubleSpinBox, "stft_score_percentile"),
+        container.findChild(QDoubleSpinBox, "stft_score_loudness_reference_sone"),
+        container.findChild(QDoubleSpinBox, "stft_score_modulation_reference"),
+        container.findChild(QDoubleSpinBox, "stft_score_harmonic_ratio_reference"),
+        container.findChild(
+            QDoubleSpinBox, "stft_score_frequency_instability_reference"
+        ),
+        container.findChild(QSpinBox, "stft_score_harmonic_start_order"),
+        container.findChild(QSpinBox, "stft_score_harmonic_end_order"),
+    ]
+
+    assert enabled.isChecked() is True
+    assert all(control.isEnabled() for control in score_controls)
+
+    enabled.setChecked(False)
+
+    assert all(not control.isEnabled() for control in score_controls)
+
+    enabled.setChecked(True)
+
+    assert all(control.isEnabled() for control in score_controls)
+
+
+def test_collect_data_includes_stft_score_fields(qapp):
+    module = _make_module()
+    module._populate_detail(_detail_payload([_channel_payload(0)]))
+    container = module._channel_containers[0]
+
+    container.findChild(QCheckBox, "stft_score_enabled").setChecked(False)
+    combo = container.findChild(QComboBox, "stft_score_summary_mode")
+    combo.setCurrentIndex(combo.findData("min"))
+    container.findChild(QDoubleSpinBox, "stft_score_percentile").setValue(25.0)
+    container.findChild(
+        QDoubleSpinBox, "stft_score_loudness_reference_sone"
+    ).setValue(11.5)
+    container.findChild(
+        QDoubleSpinBox, "stft_score_modulation_reference"
+    ).setValue(0.35)
+    container.findChild(
+        QDoubleSpinBox, "stft_score_harmonic_ratio_reference"
+    ).setValue(0.45)
+    container.findChild(
+        QDoubleSpinBox, "stft_score_frequency_instability_reference"
+    ).setValue(0.09)
+    container.findChild(QSpinBox, "stft_score_harmonic_start_order").setValue(4)
+    container.findChild(QSpinBox, "stft_score_harmonic_end_order").setValue(90)
+
+    data = module._collect_data()
+
+    channel = data["channels"][0]
+    assert channel["stft_score_enabled"] is False
+    assert channel["stft_score_summary_mode"] == "min"
+    assert channel["stft_score_percentile"] == pytest.approx(25.0)
+    assert channel["stft_score_loudness_reference_sone"] == pytest.approx(11.5)
+    assert channel["stft_score_modulation_reference"] == pytest.approx(0.35)
+    assert channel["stft_score_harmonic_ratio_reference"] == pytest.approx(0.45)
+    assert channel["stft_score_frequency_instability_reference"] == pytest.approx(
+        0.09
+    )
+    assert channel["stft_score_harmonic_start_order"] == 4
+    assert channel["stft_score_harmonic_end_order"] == 90
+
+
+def test_populate_detail_restores_fft_x_axis_scale(qapp):
+    module = _make_module()
+    payload = _detail_payload(
+        [_channel_payload(0, fft_x_axis_scale="log")]
+    )
+
+    module._populate_detail(payload)
+    container = module._channel_containers[0]
+    combo = container.findChild(QComboBox, "fft_x_axis_scale")
+
+    assert combo is not None
+    assert combo.currentData() == "log"
+
+
+def test_collect_data_includes_fft_x_axis_scale(qapp):
+    module = _make_module()
+    module._current_config_id = 7
+    module._populate_detail(_detail_payload([_channel_payload(0)]))
+    container = module._channel_containers[0]
+    combo = container.findChild(QComboBox, "fft_x_axis_scale")
+    assert combo is not None
+    combo.setCurrentIndex(combo.findData("log"))
+
+    data = module._collect_data()
+
+    assert data["channels"][0]["fft_x_axis_scale"] == "log"
+
+
+def test_fft_band_table_insert_adds_column_after_selected(qapp):
+    module = _make_module()
+    module._populate_detail(
+        _detail_payload(
+            [
+                _channel_payload(
+                    0,
+                    fft_band_limits=[
+                        {"freq": 100.0, "lower": 30.0, "upper": 70.0},
+                        {"freq": 300.0, "lower": 50.0, "upper": 80.0},
+                    ],
+                )
+            ]
+        )
+    )
+    table = module._channel_containers[0].findChild(QTableWidget, "fft_band_table")
+    assert table is not None
+    table.selectColumn(0)
+
+    module._insert_band_after_selection(table)
+
+    assert table.columnCount() == 3
+    assert table.item(0, 1).text() == "200.0"
+    assert table.item(1, 1).text() == "30.0"
+    assert table.item(2, 1).text() == "70.0"
+    assert {index.column() for index in table.selectedIndexes()} == {1}
+
+
+def test_fft_band_table_insert_after_invalid_selected_frequency_uses_append_defaults(
+    qapp,
+):
+    module = _make_module()
+    module._populate_detail(
+        _detail_payload(
+            [
+                _channel_payload(
+                    0,
+                    fft_band_limits=[
+                        {"freq": -100.0, "lower": 30.0, "upper": 70.0},
+                        {"freq": 300.0, "lower": 50.0, "upper": 80.0},
+                    ],
+                )
+            ]
+        )
+    )
+    table = module._channel_containers[0].findChild(QTableWidget, "fft_band_table")
+    assert table is not None
+    table.selectColumn(0)
+
+    module._insert_band_after_selection(table)
+
+    assert table.columnCount() == 3
+    assert table.item(0, 1).text() == "1000"
+    assert table.item(1, 1).text() == "0"
+    assert table.item(2, 1).text() == "100"
+    assert {index.column() for index in table.selectedIndexes()} == {1}
+
+
+def test_octave_band_table_does_not_get_fft_insert_controls(qapp):
+    module = _make_module()
+    module._populate_detail(_detail_payload([_channel_payload(0)]))
+    container = module._channel_containers[0]
+    oct_table = container.findChild(QTableWidget, "oct_band_table")
+    assert oct_table is not None
+
+    buttons = oct_table.parent().findChildren(QPushButton)
+    assert [button.text() for button in buttons] == ["添加频带", "删除选中"]
 
 
 def test_loudness_unit_change_keeps_numeric_limits_visible_as_is(qapp):

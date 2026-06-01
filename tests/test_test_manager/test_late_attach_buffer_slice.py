@@ -771,9 +771,22 @@ class TestLateAttachBufferSlice:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
+        state_at_abort = {}
+
+        def capture_state_at_abort(payload):
+            state_at_abort["payload"] = payload
+            state_at_abort["running"] = mgr.is_running(config_id=1)
+            state_at_abort["sessions"] = dict(mgr._sessions)
+            state_at_abort["recorders"] = dict(mgr._recorders)
+
+        bus.factory_runtime_aborted.emit.side_effect = capture_state_at_abort
+
         mgr._on_error(1, "monitor disconnected")
 
-        abort_payload = bus.factory_runtime_aborted.emit.call_args.args[0]
+        abort_payload = state_at_abort["payload"]
+        assert state_at_abort["running"] is False
+        assert state_at_abort["sessions"] == {}
+        assert state_at_abort["recorders"] == {}
         assert abort_payload.config_id == 1
         assert abort_payload.run_id == "run-1"
         assert abort_payload.trigger_source == "plc"

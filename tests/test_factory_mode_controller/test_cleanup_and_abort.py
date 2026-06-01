@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 from dataclasses import replace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+from PyQt6.QtCore import QCoreApplication, QEventLoop
 import app.services_container as services_mod
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.test_manager import TestManager
@@ -23,6 +25,22 @@ from ._support import (
     _make_services,
     _run_id_for,
 )
+
+
+_QT_APP = None
+
+
+def _process_qt_events():
+    global _QT_APP
+    app = QCoreApplication.instance()
+    if app is None:
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PyQt6.QtWidgets import QApplication
+
+        app = QApplication([])
+        _QT_APP = app
+    for _ in range(3):
+        app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 20)
 
 
 def _make_stopped_payload(
@@ -322,6 +340,45 @@ def test_factory_mode_controller_real_manager_auto_completion_gates_start_readin
     assert services.test.is_running() is False
     assert services.test._sessions == {}
     assert 101 in services.test._completed_sessions
+
+
+def test_factory_mode_controller_restores_start_ready_after_real_manager_monitor_startup_abort(
+    monkeypatch,
+):
+    controller, services, reset_reasons, reviews, states, _ = (
+        _make_real_manager_factory_context(monkeypatch, with_monitor=True)
+    )
+
+    started = controller.start_manual({"sn": "SN-1"})
+
+    assert started is True
+    assert controller.state.run_phase == "running"
+    assert services.test.is_running(config_id=101) is True
+    monitor = services.test._monitors[101]
+    assert monitor.start_calls == 1
+
+    monitor.error_occurred.emit("Device not found: Speaker (MME)")
+    _process_qt_events()
+
+    assert services.test.is_running(config_id=101) is False
+    assert services.test.is_running() is False
+    assert controller.state.run_phase == "armed"
+    assert controller.state.start_ready is True
+    assert controller.state.start_ready_reason is None
+    assert reset_reasons[-1] == "runtime_aborted"
+    assert reviews[-1] == services_mod.FactoryReviewPayload()
+    assert states[-1].run_phase == "armed"
+    assert states[-1].start_ready is True
+    assert states[-1].start_ready_reason is None
+    assert monitor.stop_calls == 1
+    assert monitor.wait_calls == [1000]
+
+    restarted = controller.start_manual({"sn": "SN-2"})
+
+    assert restarted is True
+    assert controller.state.run_phase == "running"
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == "当前测试运行中"
 
 
 @pytest.mark.parametrize(

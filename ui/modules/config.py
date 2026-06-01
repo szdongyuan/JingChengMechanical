@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from contextlib import contextmanager
 
 from PyQt6.QtCore import Qt
@@ -366,6 +367,10 @@ class ConfigModule(QWidget):
         self._channel_checkboxes = []
         hw_lay.addRow("通道选择", self._channel_check_container)
 
+        self.combo_vibration_view_channel = _NoWheelComboBox()
+        self.combo_vibration_view_channel.setObjectName("combo_vibration_view_channel")
+        hw_lay.addRow("振动视图通道", self.combo_vibration_view_channel)
+
         self.combo_monitor_channel = _NoWheelComboBox()
         self.combo_monitor_channel.setObjectName("combo_monitor_channel")
         hw_lay.addRow("监听通道", self.combo_monitor_channel)
@@ -575,6 +580,7 @@ class ConfigModule(QWidget):
         """Rebuild channel checkboxes and tabs when input device changes."""
         existing_channel_data = self._current_channel_editor_data()
         preferred_monitor_channel = self.combo_monitor_channel.currentData()
+        preferred_vibration_channel = self.combo_vibration_view_channel.currentData()
         was_monitor_channel_explicit = self._monitor_channel_explicit
         for cb in self._channel_checkboxes:
             cb.deleteLater()
@@ -587,6 +593,7 @@ class ConfigModule(QWidget):
         if not dev_info or not isinstance(dev_info, dict):
             self._prune_staged_bindings([])
             self._rebuild_monitor_channel_options(preferred=None)
+            self._rebuild_vibration_view_channel_options(preferred=None)
             self._monitor_channel_explicit = False
             self._build_channel_tabs([], None)
             return
@@ -600,6 +607,9 @@ class ConfigModule(QWidget):
             self._channel_checkboxes.append(cb)
 
         self._rebuild_monitor_channel_options(preferred=preferred_monitor_channel)
+        self._rebuild_vibration_view_channel_options(
+            preferred=preferred_vibration_channel
+        )
         self._monitor_channel_explicit = (
             was_monitor_channel_explicit
             and self._is_valid_monitor_channel(
@@ -616,6 +626,11 @@ class ConfigModule(QWidget):
 
     def _on_channel_selection_changed(self):
         """Channel checkbox toggled — tabs are built by _on_input_device_changed."""
+        current_vibration_channel = self.combo_vibration_view_channel.currentData()
+        self._rebuild_vibration_view_channel_options(
+            preferred=current_vibration_channel
+        )
+
         current = self.combo_monitor_channel.currentData()
         max_ch = self._current_input_channel_count()
         if not self._is_valid_monitor_channel(current, max_ch):
@@ -687,6 +702,50 @@ class ConfigModule(QWidget):
             self.combo_monitor_channel.setCurrentIndex(index if index >= 0 else -1)
         self.combo_monitor_channel.blockSignals(False)
         self._suspend_monitor_channel_tracking = False
+        return target
+
+    @staticmethod
+    def _is_valid_vibration_view_channel(value, selected_channels: list[int]) -> bool:
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value in selected_channels
+        )
+
+    def _set_vibration_view_channel_current_data(self, value: int | None) -> None:
+        self.combo_vibration_view_channel.blockSignals(True)
+        try:
+            index = self.combo_vibration_view_channel.findData(value)
+            self.combo_vibration_view_channel.setCurrentIndex(index if index >= 0 else 0)
+        finally:
+            self.combo_vibration_view_channel.blockSignals(False)
+
+    def _rebuild_vibration_view_channel_options(
+        self,
+        preferred: int | None = None,
+    ) -> int | None:
+        selected = [
+            index
+            for index, checkbox in enumerate(self._channel_checkboxes)
+            if checkbox.isChecked()
+        ]
+        target = (
+            int(preferred)
+            if self._is_valid_vibration_view_channel(preferred, selected)
+            else None
+        )
+        self.combo_vibration_view_channel.blockSignals(True)
+        try:
+            self.combo_vibration_view_channel.clear()
+            self.combo_vibration_view_channel.addItem("无", None)
+            for index in selected:
+                self.combo_vibration_view_channel.addItem(f"输入{index + 1}", index)
+            combo_index = self.combo_vibration_view_channel.findData(target)
+            self.combo_vibration_view_channel.setCurrentIndex(
+                combo_index if combo_index >= 0 else 0
+            )
+        finally:
+            self.combo_vibration_view_channel.blockSignals(False)
         return target
 
     @staticmethod
@@ -1171,8 +1230,161 @@ class ConfigModule(QWidget):
         combo_overlap.setCurrentIndex(idx if idx >= 0 else 1)
         sf_lay.addRow("重叠率", combo_overlap)
 
+        color_scale_enabled = QCheckBox("固定色阶")
+        color_scale_enabled.setObjectName("stft_color_scale_enabled")
+        color_scale_enabled.setChecked(
+            bool(data.get("stft_color_scale_enabled", False)) if data else False
+        )
+        sf_lay.addRow(color_scale_enabled)
+
+        color_scale_min = _NoWheelSpinBox()
+        color_scale_min.setObjectName("stft_color_scale_min_db")
+        color_scale_min.setRange(-300.0, 300.0)
+        color_scale_min.setDecimals(1)
+        color_scale_min.setSuffix(" dB")
+        color_scale_min.setValue(
+            data.get("stft_color_scale_min_db", -120.0) if data else -120.0
+        )
+        sf_lay.addRow("色阶下限", color_scale_min)
+
+        color_scale_max = _NoWheelSpinBox()
+        color_scale_max.setObjectName("stft_color_scale_max_db")
+        color_scale_max.setRange(-300.0, 300.0)
+        color_scale_max.setDecimals(1)
+        color_scale_max.setSuffix(" dB")
+        color_scale_max.setValue(
+            data.get("stft_color_scale_max_db", 0.0) if data else 0.0
+        )
+        sf_lay.addRow("色阶上限", color_scale_max)
+
+        color_scale_min.setEnabled(color_scale_enabled.isChecked())
+        color_scale_max.setEnabled(color_scale_enabled.isChecked())
+        color_scale_enabled.toggled.connect(color_scale_min.setEnabled)
+        color_scale_enabled.toggled.connect(color_scale_max.setEnabled)
+
         stft.add_widget(stft_form)
         lay.addWidget(stft)
+
+        # STFT score section
+        stft_score = CollapsibleGroupBox("STFT 评分", section_id="stft_score")
+        stft_score_form = QWidget()
+        ss_lay = QFormLayout(stft_score_form)
+        ss_lay.setContentsMargins(0, 0, 0, 0)
+        ss_lay.setHorizontalSpacing(10)
+        ss_lay.setVerticalSpacing(6)
+
+        score_enabled = QCheckBox("启用评分")
+        score_enabled.setObjectName("stft_score_enabled")
+        score_enabled.setChecked(
+            bool(data.get("stft_score_enabled", True)) if data else True
+        )
+        ss_lay.addRow(score_enabled)
+
+        score_summary = _NoWheelComboBox()
+        score_summary.setObjectName("stft_score_summary_mode")
+        score_summary.addItem("10%分位数", "percentile")
+        score_summary.addItem("平均分", "mean")
+        score_summary.addItem("最低分", "min")
+        val = (
+            data.get("stft_score_summary_mode", "percentile")
+            if data
+            else "percentile"
+        )
+        idx = score_summary.findData(val)
+        score_summary.setCurrentIndex(idx if idx >= 0 else 0)
+        ss_lay.addRow("汇总方式", score_summary)
+
+        score_percentile = _NoWheelSpinBox()
+        score_percentile.setObjectName("stft_score_percentile")
+        score_percentile.setRange(0.1, 100.0)
+        score_percentile.setDecimals(1)
+        score_percentile.setValue(
+            data.get("stft_score_percentile", 10.0) if data else 10.0
+        )
+        ss_lay.addRow("分位数", score_percentile)
+
+        score_loudness_reference = _NoWheelSpinBox()
+        score_loudness_reference.setObjectName("stft_score_loudness_reference_sone")
+        score_loudness_reference.setRange(0.001, 999999.0)
+        score_loudness_reference.setDecimals(3)
+        score_loudness_reference.setValue(
+            data.get("stft_score_loudness_reference_sone", 10.0)
+            if data
+            else 10.0
+        )
+        ss_lay.addRow("响度参考值", score_loudness_reference)
+
+        score_modulation_reference = _NoWheelSpinBox()
+        score_modulation_reference.setObjectName("stft_score_modulation_reference")
+        score_modulation_reference.setRange(0.001, 10.0)
+        score_modulation_reference.setDecimals(3)
+        score_modulation_reference.setValue(
+            data.get("stft_score_modulation_reference", 0.20) if data else 0.20
+        )
+        ss_lay.addRow("调制参考值", score_modulation_reference)
+
+        score_harmonic_reference = _NoWheelSpinBox()
+        score_harmonic_reference.setObjectName(
+            "stft_score_harmonic_ratio_reference"
+        )
+        score_harmonic_reference.setRange(0.001, 1.0)
+        score_harmonic_reference.setDecimals(3)
+        score_harmonic_reference.setValue(
+            data.get("stft_score_harmonic_ratio_reference", 0.25)
+            if data
+            else 0.25
+        )
+        ss_lay.addRow("谐波占比参考值", score_harmonic_reference)
+
+        score_frequency_reference = _NoWheelSpinBox()
+        score_frequency_reference.setObjectName(
+            "stft_score_frequency_instability_reference"
+        )
+        score_frequency_reference.setRange(0.001, 10.0)
+        score_frequency_reference.setDecimals(3)
+        score_frequency_reference.setValue(
+            data.get("stft_score_frequency_instability_reference", 0.05)
+            if data
+            else 0.05
+        )
+        ss_lay.addRow("频率不稳定参考值", score_frequency_reference)
+
+        score_harmonic_start = _NoWheelSpinBoxInt()
+        score_harmonic_start.setObjectName("stft_score_harmonic_start_order")
+        score_harmonic_start.setRange(2, 10000)
+        score_harmonic_start.setValue(
+            data.get("stft_score_harmonic_start_order", 2) if data else 2
+        )
+        ss_lay.addRow("谐波起始阶次", score_harmonic_start)
+
+        score_harmonic_end = _NoWheelSpinBoxInt()
+        score_harmonic_end.setObjectName("stft_score_harmonic_end_order")
+        score_harmonic_end.setRange(2, 10000)
+        score_harmonic_end.setValue(
+            data.get("stft_score_harmonic_end_order", 100) if data else 100
+        )
+        ss_lay.addRow("谐波结束阶次", score_harmonic_end)
+
+        score_controls = (
+            score_summary,
+            score_percentile,
+            score_loudness_reference,
+            score_modulation_reference,
+            score_harmonic_reference,
+            score_frequency_reference,
+            score_harmonic_start,
+            score_harmonic_end,
+        )
+
+        def set_score_controls_enabled(checked: bool) -> None:
+            for control in score_controls:
+                control.setEnabled(checked)
+
+        set_score_controls_enabled(score_enabled.isChecked())
+        score_enabled.toggled.connect(set_score_controls_enabled)
+
+        stft_score.add_widget(stft_score_form)
+        lay.addWidget(stft_score)
 
         # Sound pressure section
         spl = CollapsibleGroupBox("声压级参数", section_id="spl")
@@ -1354,6 +1566,15 @@ class ConfigModule(QWidget):
         )
         fft_controls_form.addRow("FFT 分辨率", fft_resolution)
 
+        fft_axis = _NoWheelComboBox()
+        fft_axis.setObjectName("fft_x_axis_scale")
+        fft_axis.addItem("线性", "linear")
+        fft_axis.addItem("对数", "log")
+        fft_axis_value = data.get("fft_x_axis_scale", "linear") if data else "linear"
+        fft_axis_index = fft_axis.findData(fft_axis_value)
+        fft_axis.setCurrentIndex(fft_axis_index if fft_axis_index >= 0 else 0)
+        fft_controls_form.addRow("FFT 横轴", fft_axis)
+
         fft_mode = _NoWheelComboBox()
         fft_mode.setObjectName("fft_golden_mode")
         fft_mode.addItem("关闭", "off")
@@ -1376,6 +1597,8 @@ class ConfigModule(QWidget):
         fft_table = self._build_band_table(
             "fft_band_table",
             data.get("fft_band_limits", []) if data else [],
+            add_label="添加频点",
+            allow_insert=True,
         )
         fft_layout.addWidget(fft_table)
         fft_section.add_widget(fft_widget)
@@ -1431,7 +1654,14 @@ class ConfigModule(QWidget):
 
         return container
 
-    def _build_band_table(self, object_name: str, bands: list[dict]) -> QWidget:
+    def _build_band_table(
+        self,
+        object_name: str,
+        bands: list[dict],
+        *,
+        add_label: str = "添加频带",
+        allow_insert: bool = False,
+    ) -> QWidget:
         wrapper = QWidget()
         w_lay = QVBoxLayout(wrapper)
         w_lay.setContentsMargins(0, 0, 0, 0)
@@ -1466,10 +1696,16 @@ class ConfigModule(QWidget):
         br_lay = QHBoxLayout(btn_row)
         br_lay.setContentsMargins(0, 0, 0, 0)
         br_lay.setSpacing(6)
-        btn_add = QPushButton("添加频带")
+        btn_add = QPushButton(add_label)
         btn_del = QPushButton("删除选中")
         btn_del.setObjectName("Danger")
         br_lay.addWidget(btn_add)
+        if allow_insert:
+            btn_insert = QPushButton("插入频点")
+            br_lay.addWidget(btn_insert)
+            btn_insert.clicked.connect(
+                lambda _checked=False, t=table: self._insert_band_after_selection(t)
+            )
         br_lay.addWidget(btn_del)
         br_lay.addStretch(1)
 
@@ -1483,12 +1719,92 @@ class ConfigModule(QWidget):
     def _add_band_col(table: QTableWidget, freq: float, lower: float, upper: float):
         col = table.columnCount()
         table.insertColumn(col)
+        ConfigModule._set_band_col(table, col, freq, lower, upper)
+
+    @staticmethod
+    def _set_band_col(
+        table: QTableWidget,
+        column: int,
+        freq: float,
+        lower: float,
+        upper: float,
+    ) -> None:
         for row, val in enumerate([freq, lower, upper]):
             item = QTableWidgetItem(str(val))
             item.setTextAlignment(
                 Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter
             )
-            table.setItem(row, col, item)
+            table.setItem(row, column, item)
+
+    def _insert_band_after_selection(self, table: QTableWidget) -> None:
+        selected_columns = sorted({index.column() for index in table.selectedIndexes()})
+        if not selected_columns:
+            insert_col = table.columnCount()
+            table.insertColumn(insert_col)
+            self._set_band_col(table, insert_col, 1000, 0, 100)
+            table.clearSelection()
+            table.selectColumn(insert_col)
+            return
+
+        source_col = selected_columns[-1]
+        insert_col = source_col + 1
+        freq, lower, upper = self._band_column_values(table, source_col)
+        next_freq, _next_lower, _next_upper = (
+            self._band_column_values(table, insert_col)
+            if insert_col < table.columnCount()
+            else (None, None, None)
+        )
+
+        valid_freq = self._is_finite_positive_number(freq)
+        valid_next_freq = self._is_finite_positive_number(next_freq)
+        if valid_freq and valid_next_freq and float(next_freq) > float(freq):
+            insert_freq = (float(freq) + float(next_freq)) / 2.0
+        elif valid_freq:
+            insert_freq = float(freq)
+        else:
+            insert_freq = 1000
+            lower = 0
+            upper = 100
+
+        insert_lower = lower if self._is_finite_number(lower) else 0
+        insert_upper = upper if self._is_finite_number(upper) else 100
+        table.insertColumn(insert_col)
+        self._set_band_col(table, insert_col, insert_freq, insert_lower, insert_upper)
+        table.clearSelection()
+        table.selectColumn(insert_col)
+
+    @staticmethod
+    def _band_column_values(
+        table: QTableWidget,
+        column: int,
+    ) -> tuple[float | None, float | None, float | None]:
+        return tuple(
+            ConfigModule._coerce_float(
+                table.item(row, column).text() if table.item(row, column) else None
+            )
+            for row in range(3)
+        )
+
+    @staticmethod
+    def _coerce_float(value) -> float | None:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _is_finite_number(value) -> bool:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return False
+        return math.isfinite(number)
+
+    @classmethod
+    def _is_finite_positive_number(cls, value) -> bool:
+        if not cls._is_finite_number(value):
+            return False
+        return float(value) > 0.0
 
     @staticmethod
     def _delete_selected_cols(table: QTableWidget):
@@ -1643,6 +1959,9 @@ class ConfigModule(QWidget):
             saved_monitor_channel,
             self._current_input_channel_count(),
         )
+        self._rebuild_vibration_view_channel_options(
+            preferred=data.get("vibration_view_channel_index")
+        )
 
     def _match_device_combo(self, combo, name, hostapi, samplerate):
         """Match saved device against combo items. Inject unavailable device if not found."""
@@ -1680,6 +1999,7 @@ class ConfigModule(QWidget):
         dev_info = self.combo_input_dev.currentData()
         if not dev_info or not isinstance(dev_info, dict):
             self._rebuild_monitor_channel_options(preferred=None)
+            self._rebuild_vibration_view_channel_options(preferred=None)
             return
 
         max_ch = dev_info.get("max_input_channels", 0)
@@ -1691,6 +2011,9 @@ class ConfigModule(QWidget):
             self._channel_checkboxes.append(cb)
         self._rebuild_monitor_channel_options(
             preferred=self.combo_monitor_channel.currentData()
+        )
+        self._rebuild_vibration_view_channel_options(
+            preferred=self.combo_vibration_view_channel.currentData()
         )
 
     # ── Data collection ─────────────────────────────────────
@@ -1705,8 +2028,115 @@ class ConfigModule(QWidget):
         combo_fft_nfft = container.findChild(QComboBox, "fft_nfft")
         ch["fft_nfft"] = combo_fft_nfft.currentData() if combo_fft_nfft else 4096
 
+        fft_axis = container.findChild(QComboBox, "fft_x_axis_scale")
+        ch["fft_x_axis_scale"] = fft_axis.currentData() if fft_axis else "linear"
+
         combo_overlap = container.findChild(QComboBox, "stft_overlap")
         ch["stft_overlap"] = combo_overlap.currentData() if combo_overlap else 0.5
+
+        stft_color_scale_enabled = container.findChild(
+            QCheckBox, "stft_color_scale_enabled"
+        )
+        ch["stft_color_scale_enabled"] = (
+            stft_color_scale_enabled.isChecked()
+            if stft_color_scale_enabled
+            else False
+        )
+
+        stft_color_scale_min = container.findChild(
+            QDoubleSpinBox, "stft_color_scale_min_db"
+        )
+        ch["stft_color_scale_min_db"] = (
+            stft_color_scale_min.value()
+            if stft_color_scale_min
+            else -120.0
+        )
+
+        stft_color_scale_max = container.findChild(
+            QDoubleSpinBox, "stft_color_scale_max_db"
+        )
+        ch["stft_color_scale_max_db"] = (
+            stft_color_scale_max.value()
+            if stft_color_scale_max
+            else 0.0
+        )
+
+        stft_score_enabled = container.findChild(QCheckBox, "stft_score_enabled")
+        ch["stft_score_enabled"] = (
+            stft_score_enabled.isChecked()
+            if stft_score_enabled
+            else True
+        )
+
+        stft_score_summary = container.findChild(QComboBox, "stft_score_summary_mode")
+        ch["stft_score_summary_mode"] = (
+            stft_score_summary.currentData()
+            if stft_score_summary
+            else "percentile"
+        )
+
+        stft_score_percentile = container.findChild(
+            QDoubleSpinBox, "stft_score_percentile"
+        )
+        ch["stft_score_percentile"] = (
+            stft_score_percentile.value()
+            if stft_score_percentile
+            else 10.0
+        )
+
+        stft_score_loudness_reference = container.findChild(
+            QDoubleSpinBox, "stft_score_loudness_reference_sone"
+        )
+        ch["stft_score_loudness_reference_sone"] = (
+            stft_score_loudness_reference.value()
+            if stft_score_loudness_reference
+            else 10.0
+        )
+
+        stft_score_modulation_reference = container.findChild(
+            QDoubleSpinBox, "stft_score_modulation_reference"
+        )
+        ch["stft_score_modulation_reference"] = (
+            stft_score_modulation_reference.value()
+            if stft_score_modulation_reference
+            else 0.20
+        )
+
+        stft_score_harmonic_reference = container.findChild(
+            QDoubleSpinBox, "stft_score_harmonic_ratio_reference"
+        )
+        ch["stft_score_harmonic_ratio_reference"] = (
+            stft_score_harmonic_reference.value()
+            if stft_score_harmonic_reference
+            else 0.25
+        )
+
+        stft_score_frequency_reference = container.findChild(
+            QDoubleSpinBox, "stft_score_frequency_instability_reference"
+        )
+        ch["stft_score_frequency_instability_reference"] = (
+            stft_score_frequency_reference.value()
+            if stft_score_frequency_reference
+            else 0.05
+        )
+
+        stft_score_harmonic_start = container.findChild(
+            QSpinBox, "stft_score_harmonic_start_order"
+        )
+        ch["stft_score_harmonic_start_order"] = (
+            stft_score_harmonic_start.value()
+            if stft_score_harmonic_start
+            else 2
+        )
+
+        stft_score_harmonic_end = container.findChild(
+            QSpinBox, "stft_score_harmonic_end_order"
+        )
+        ch["stft_score_harmonic_end_order"] = (
+            stft_score_harmonic_end.value()
+            if stft_score_harmonic_end
+            else 100
+        )
 
         combo_spl_w = container.findChild(QComboBox, "spl_weighting")
         ch["spl_weighting"] = combo_spl_w.currentText() if combo_spl_w else "A"
@@ -1818,6 +2248,7 @@ class ConfigModule(QWidget):
             "monitor_channel_index": self.combo_monitor_channel.currentData()
             if self.combo_monitor_channel.count() > 0
             else None,
+            "vibration_view_channel_index": self.combo_vibration_view_channel.currentData(),
             "monitor_gain_db": float(self.spin_monitor_gain_db.value()),
             "channels": [],
             "golden_editor_state": {},
