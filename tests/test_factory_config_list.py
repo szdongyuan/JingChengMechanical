@@ -147,7 +147,22 @@ def test_factory_config_list_visually_marks_top_checked_row_as_primary(qapp):
     )
 
     assert widget.primary_config_id() == 202
-    assert "Primary" in widget.primary_row_badge_text()
+    assert "首选" in widget.primary_row_badge_text()
+
+
+def test_factory_config_list_primary_badge_has_non_clipping_height(qapp):
+    widget = FactoryConfigListWidget()
+
+    widget.set_rows(
+        rows=[_row(101, "Config A"), _row(202, "Config B")],
+        enabled_config_ids=(101, 202),
+    )
+    _show_widget(widget, qapp)
+    row_widget = widget.itemWidget(widget.item(0))
+
+    assert row_widget.lbl_primary.minimumHeight() >= 20
+    assert row_widget.lbl_primary.height() >= row_widget.lbl_primary.minimumHeight()
+    assert widget.item(0).sizeHint().height() >= row_widget.sizeHint().height()
 
 
 def test_factory_config_list_drag_preview_matches_current_row_widget_size(qapp):
@@ -313,7 +328,7 @@ def test_factory_config_list_drop_event_preserves_all_checked_configs_when_movin
     assert widget.enabled_config_ids() == (303, 101, 202)
     assert widget.visual_config_order() == (303, 101, 202)
     assert widget.primary_config_id() == 303
-    assert widget.primary_row_badge_text() == "Primary"
+    assert widget.primary_row_badge_text() == "首选"
     assert emissions[-1] == (303, 101, 202)
     assert drop_event.accepted is True
     assert drop_event.ignored is False

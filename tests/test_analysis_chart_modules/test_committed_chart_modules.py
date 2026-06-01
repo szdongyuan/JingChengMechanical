@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
 import pytest
 
 from app.services_container import FactoryControllerState, FactoryReviewPayload
@@ -69,7 +73,7 @@ def test_spl_module_renders_committed_chart_for_selected_channel(qapp):
     assert module.current_plot_payload()["x_values"] == [0.0, 1.0]
     assert module.current_plot_payload()["y_values"] == [71.0, 72.0]
     assert module.current_render_channel() == 1
-    assert module.plot.plot_item.getAxis("bottom").labelText == "Time (s)"
+    assert module.plot.plot_item.getAxis("bottom").labelText == "时间 (s)"
     _assert_left_axis_title_hidden_ticks_visible(module.plot)
 
 
@@ -90,7 +94,7 @@ def test_spl_module_keeps_axes_visibility_when_committed_payload_has_no_series_p
     qapp.processEvents()
 
     _assert_empty_chart_visible(module, qapp)
-    assert module.plot.plot_item.getAxis("bottom").labelText == "Time (s)"
+    assert module.plot.plot_item.getAxis("bottom").labelText == "时间 (s)"
     _assert_left_axis_title_hidden_ticks_visible(module.plot)
 
 
@@ -115,11 +119,11 @@ def test_loudness_module_renders_committed_chart_for_selected_channel(qapp):
     assert module.current_plot_payload()["lower_limit"] == 40.0
     assert module.current_plot_payload()["upper_limit"] == 60.0
     assert module.current_render_channel() == 1
-    assert module.plot.plot_item.getAxis("bottom").labelText == "Time (s)"
+    assert module.plot.plot_item.getAxis("bottom").labelText == "时间 (s)"
     _assert_left_axis_title_hidden_ticks_visible(module.plot)
 
 
-@pytest.mark.parametrize("module_cls", (SplModule, SpectrumModule, OctaveModule, LoudnessModule))
+@pytest.mark.parametrize("module_cls", (SplModule, OctaveModule, LoudnessModule))
 def test_committed_chart_modules_hide_left_axis_title_but_keep_ticks(qapp, module_cls):
     services = _make_services(initial_state=_state(101, "reviewing"))
     module = module_cls(services)
@@ -135,7 +139,75 @@ def test_committed_chart_modules_hide_left_axis_title_but_keep_ticks(qapp, modul
     _assert_left_axis_title_hidden_ticks_visible(module.plot)
 
 
-def test_stft_module_hides_left_axis_title_but_keeps_ticks(qapp):
+def test_spectrum_module_keeps_chinese_axis_labels_visible(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = SpectrumModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    bottom_axis = module.plot.plot_item.getAxis("bottom")
+    left_axis = module.plot.plot_item.getAxis("left")
+    assert bottom_axis.labelText == "频率"
+    assert bottom_axis.labelUnits == "Hz"
+    assert left_axis.labelText == "幅值"
+    assert left_axis.labelUnits == "dB"
+
+
+@pytest.mark.parametrize("module_cls", (SplModule, SpectrumModule, OctaveModule, LoudnessModule))
+def test_display_reset_keeps_committed_chart_controller_without_selected_api(
+    qapp,
+    module_cls,
+):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = module_cls(services)
+    try:
+        review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+        if module_cls is LoudnessModule:
+            review_payload = _with_loudness_payload(review_payload)
+        services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+        services.bus.factory_review_changed.emit(review_payload)
+        qapp.processEvents()
+
+        services.bus.factory_display_reset.emit("manual")
+        qapp.processEvents()
+
+        assert module.plot.chart_interactions is not None
+        assert not hasattr(module.plot.chart_interactions, "selected_x_range")
+    finally:
+        module.close()
+
+
+@pytest.mark.parametrize("module_cls", (SplModule, SpectrumModule, OctaveModule, LoudnessModule))
+def test_channel_refresh_keeps_committed_chart_controller_without_selected_api(
+    qapp,
+    module_cls,
+):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = module_cls(services)
+    selected_channel = {"value": 0}
+    module.selected_display_channel_provider = lambda: selected_channel["value"]
+    try:
+        review_payload = _review_payload_with_chart_payload(101, channels=(0, 1))
+        if module_cls is LoudnessModule:
+            review_payload = _with_loudness_payload(review_payload)
+        services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+        services.bus.factory_review_changed.emit(review_payload)
+        qapp.processEvents()
+
+        selected_channel["value"] = 1
+        module.refresh_selected_display_channel()
+
+        assert module.plot.chart_interactions is not None
+        assert not hasattr(module.plot.chart_interactions, "selected_x_range")
+    finally:
+        module.close()
+
+
+def test_stft_module_keeps_chinese_axis_labels_visible(qapp):
     services = _make_services(initial_state=_state(101, "running"))
     module = StftModule(services)
 
@@ -143,7 +215,12 @@ def test_stft_module_hides_left_axis_title_but_keeps_ticks(qapp):
         module.show()
         qapp.processEvents()
 
-        _assert_left_axis_title_hidden_ticks_visible(module.canvas.heatmap)
+        bottom_axis = module.canvas.heatmap.plot_item.getAxis("bottom")
+        left_axis = module.canvas.heatmap.plot_item.getAxis("left")
+        assert bottom_axis.labelText == "时间"
+        assert bottom_axis.labelUnits == "s"
+        assert left_axis.labelText == "频率"
+        assert left_axis.labelUnits == "Hz"
     finally:
         module.close()
 
@@ -168,6 +245,88 @@ def test_loudness_module_uses_spl_style_y_range_so_limit_lines_are_visible(qapp)
     assert y_max >= 10.0
 
 
+@pytest.mark.parametrize(
+    ("module_cls", "payload_key", "expected_field", "expected_values"),
+    [
+        (SplModule, "spl", "y_values", [76.0, 77.0]),
+        (SpectrumModule, "fft", "levels_db", [46.0, 48.0]),
+        (OctaveModule, "octave", "levels_db", [38.0, 40.0]),
+    ],
+)
+def test_imported_review_chart_modules_render_chart_only_channel(
+    qapp,
+    module_cls,
+    payload_key,
+    expected_field,
+    expected_values,
+):
+    services = _make_services(
+        initial_state=FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="reviewing",
+            trigger_source="import_audio",
+        )
+    )
+    module = module_cls(services)
+    module.selected_display_channel_provider = lambda: 6
+    review_payload = _review_payload_with_chart_payload(
+        101,
+        run_id="import_101_test",
+        channels=(0, 6),
+    )
+    review_payload = replace(review_payload, trigger_source="import_audio")
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="reviewing",
+            trigger_source="import_audio",
+        )
+    )
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is True
+    assert module.current_render_channel() == 6
+    assert module.current_plot_payload()[expected_field] == expected_values
+
+
+def test_imported_review_loudness_module_renders_chart_only_channel(qapp):
+    services = _make_services(
+        initial_state=FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="reviewing",
+            trigger_source="import_audio",
+        )
+    )
+    module = LoudnessModule(services)
+    module.selected_display_channel_provider = lambda: 6
+    review_payload = _with_loudness_payload(
+        _review_payload_with_chart_payload(
+            101,
+            run_id="import_101_test",
+            channels=(0, 6),
+        ),
+        units_by_channel={6: "phon"},
+    )
+    review_payload = replace(review_payload, trigger_source="import_audio")
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="reviewing",
+            trigger_source="import_audio",
+        )
+    )
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is True
+    assert module.current_render_channel() == 6
+    assert module.current_plot_payload()["values"] == [48.0, 49.0]
+    assert module.current_plot_payload()["unit"] == "phon"
+
+
 def test_spectrum_module_renders_committed_chart_for_selected_channel(qapp):
     services = _make_services(initial_state=_state(101, "reviewing"))
     module = SpectrumModule(services)
@@ -183,6 +342,102 @@ def test_spectrum_module_renders_committed_chart_for_selected_channel(qapp):
     assert module.current_plot_payload()["frequencies_hz"] == [125.0, 250.0]
     assert module.current_plot_payload()["levels_db"] == [41.0, 43.0]
     assert module.current_render_channel() == 1
+
+
+def test_spectrum_module_passes_selected_channel_fft_x_axis_scale(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    services.config_service = SimpleNamespace(
+        load_config=MagicMock(
+            return_value={
+                "channels": [
+                    {"channel_index": 0, "fft_x_axis_scale": "log"},
+                    {"channel_index": 1, "fft_x_axis_scale": "linear"},
+                ],
+                "selected_channels": [0, 1],
+            }
+        )
+    )
+    module = SpectrumModule(services)
+    module.selected_display_channel_provider = lambda: 0
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0, 1))
+    )
+    qapp.processEvents()
+
+    assert module.current_plot_payload()["x_axis_scale"] == "log"
+    services.config_service.load_config.assert_called_with(101)
+
+
+def test_spectrum_module_defaults_fft_axis_to_linear_when_config_load_fails(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    services.config_service = SimpleNamespace(
+        load_config=MagicMock(side_effect=RuntimeError("db offline"))
+    )
+    module = SpectrumModule(services)
+    module.selected_display_channel_provider = lambda: 0
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0,))
+    )
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is True
+    assert module.current_plot_payload()["frequencies_hz"] == [125.0, 250.0]
+    assert module.current_plot_payload()["levels_db"] == [40.0, 42.0]
+    assert module.current_plot_payload()["x_axis_scale"] == "linear"
+    services.config_service.load_config.assert_called_with(101)
+
+
+def test_spectrum_module_uses_committed_fft_axis_scale_when_config_load_fails(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    services.config_service = SimpleNamespace(
+        load_config=MagicMock(side_effect=RuntimeError("db offline"))
+    )
+    module = SpectrumModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["fft"]["x_axis_scale"] = "log"
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is True
+    assert module.current_plot_payload()["x_axis_scale"] == "log"
+    assert module.plot.plot_item.getViewBox().state["logMode"][0] is True
+    services.config_service.load_config.assert_not_called()
+
+
+def test_spectrum_module_passes_committed_fft_limit_envelope_to_chart(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = SpectrumModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    envelope = {
+        "control_points": [
+            {"freq_hz": 125.0, "lower_db": 35.0, "upper_db": 45.0},
+            {"freq_hz": 250.0, "lower_db": 37.0, "upper_db": 43.0},
+        ],
+        "failed_points": [
+            {
+                "freq_hz": 250.0,
+                "actual_db": 47.0,
+                "lower_db": 37.0,
+                "upper_db": 43.0,
+            },
+        ],
+    }
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["fft"]["limit_envelope"] = envelope
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is True
+    assert module.current_plot_payload()["limit_envelope"] == envelope
 
 
 def test_spectrum_module_consumes_golden_overlay_fields_from_committed_payload(qapp):

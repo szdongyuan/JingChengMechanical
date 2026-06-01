@@ -20,12 +20,12 @@ class TodayStatisticsModule(QWidget):
         self.lb_ok = self._create_value_label("#16a34a")
         self.lb_ng = self._create_value_label("#dc2626")
 
-        # 两行显示：第一行总数，第二行 OK / NG 数。
+        # 两行显示：第一行总数，第二行良品 / 不良品数。
         layout.addWidget(QLabel("今日总测试数："), 0, 0)
         layout.addWidget(self.lb_total, 0, 1)
-        layout.addWidget(QLabel("OK数："), 1, 0)
+        layout.addWidget(QLabel("良品数："), 1, 0)
         layout.addWidget(self.lb_ok, 1, 1)
-        layout.addWidget(QLabel("NG数："), 1, 2)
+        layout.addWidget(QLabel("不良品数："), 1, 2)
         layout.addWidget(self.lb_ng, 1, 3)
         layout.setColumnStretch(1, 1)
         layout.setColumnStretch(3, 1)

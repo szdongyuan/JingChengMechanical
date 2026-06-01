@@ -55,15 +55,16 @@ class _FactoryConfigRowWidget(QWidget):
         self.lbl_primary.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_primary.setStyleSheet(
             "QLabel { background: #dbeafe; color: #1d4ed8; border-radius: 9px; "
-            "padding: 2px 8px; font-size: 11px; font-weight: 600; }"
+            "padding: 0 8px; font-size: 11px; font-weight: 600; }"
         )
-        layout.addWidget(self.lbl_primary, 0, Qt.AlignmentFlag.AlignTop)
+        self.lbl_primary.setMinimumHeight(20)
+        layout.addWidget(self.lbl_primary, 0, Qt.AlignmentFlag.AlignVCenter)
 
         self.set_primary(primary)
         self.set_locked(locked)
 
     def set_primary(self, primary: bool) -> None:
-        self.lbl_primary.setText("Primary" if primary else "")
+        self.lbl_primary.setText("首选" if primary else "")
         self.lbl_primary.setVisible(primary)
         self.lbl_name.setStyleSheet(
             "font-weight: 700; color: #0f172a;" if primary else "color: #0f172a;"

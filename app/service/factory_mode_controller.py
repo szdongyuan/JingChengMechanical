@@ -11,6 +11,7 @@ from app.services_container import (
     FactoryControllerState,
     FactoryPlcIngressPayload,
     FactoryReviewPayload,
+    FactoryReviewWindow,
     FactoryRuntimeConfigPayload,
     FactoryRuntimeStartPayload,
     FactoryRuntimeStoppedPayload,
@@ -49,6 +50,7 @@ class FactoryModeController(QObject):
         self._owned_reanalysis_run_id: str | None = None
         self._last_plc_ingress: FactoryPlcIngressPayload | None = None
         self._last_scan_ingress: FactoryScanIngressPayload | None = None
+        self._last_import_audio_request = None
         self._selected_configs: dict[int, dict] = {}
         self._selection_refresh_deferred = False
         self._invalid_selection_warning_active = False
@@ -214,6 +216,40 @@ class FactoryModeController(QObject):
             return self._emit_blocked_start("manual")
         config_id = selected[0]
         return self._accept_start(config_id, "manual", workorder)
+
+    def analyze_imported_audio(self, request) -> bool:
+        if self._start_feedback_is_busy():
+            return False
+
+        test_manager = getattr(self.services, "test", None)
+        analyze = getattr(test_manager, "analyze_imported_wav", None)
+        if not callable(analyze):
+            return False
+
+        try:
+            payload = analyze(request)
+        except Exception as exc:
+            self._last_import_audio_request = None
+            error_message = str(exc) or exc.__class__.__name__
+            config_id = getattr(request, "config_id", None)
+            payload = FactoryReviewPayload(
+                displayed_config_id=config_id,
+                run_id=f"import_error_{uuid.uuid4().hex}",
+                trigger_source="import_audio",
+                no_result=True,
+                error_message=error_message,
+                summary_payload=build_summary_payload(
+                    config=self._selected_configs.get(config_id, {}),
+                    judgment_payload=None,
+                    error_message=error_message,
+                ),
+            )
+            self._apply_review_payload(payload)
+            return False
+
+        self._last_import_audio_request = request
+        self._apply_review_payload(replace(payload, trigger_source="import_audio"))
+        return True
 
     def clear_display_state(self, reason: str) -> None:
         self.clear_for_next_run(reason)
@@ -425,6 +461,9 @@ class FactoryModeController(QObject):
             return False
 
         config_id = self._state.displayed_config_id
+        if self._review_payload.trigger_source == "import_audio":
+            return self._begin_import_audio_reanalysis(config_id, start_sec, end_sec)
+
         self._owned_reanalysis_config_id = config_id
         self._owned_reanalysis_run_id = self._review_payload.run_id
         self._review_payload = replace(
@@ -454,6 +493,68 @@ class FactoryModeController(QObject):
             except Exception as exc:
                 self.finish_reanalysis_failure(str(exc))
                 return False
+        return True
+
+    def _begin_import_audio_reanalysis(
+        self,
+        config_id: int,
+        start_sec: float,
+        end_sec: float,
+    ) -> bool:
+        request = self._last_import_audio_request
+        if request is None or getattr(request, "config_id", None) != config_id:
+            return False
+
+        test_manager = getattr(self.services, "test", None)
+        analyze = getattr(test_manager, "analyze_imported_wav", None)
+        if not callable(analyze):
+            return False
+
+        try:
+            start = float(start_sec)
+            end = float(end_sec)
+        except (TypeError, ValueError):
+            return False
+        duration = end - start
+        if duration <= 0:
+            return False
+
+        reanalysis_request = replace(
+            request,
+            start_sec=start,
+            duration_sec=duration,
+        )
+        self._review_payload = replace(
+            self._review_payload,
+            displayed_config_id=config_id,
+            trigger_source="import_audio",
+            default_window=FactoryReviewWindow(start, end),
+            no_result=False,
+            error_message=None,
+            judgment_payload=None,
+            summary_payload=None,
+            chart_payload=None,
+        )
+        self._state = self._state_with_readiness(
+            replace(
+                self._state,
+                active_config_id=None,
+                displayed_config_id=config_id,
+                run_phase="reanalyzing",
+                trigger_source="import_audio",
+            )
+        )
+        self.bus.factory_review_changed.emit(self._review_payload)
+        self._emit_state()
+
+        try:
+            payload = analyze(reanalysis_request)
+        except Exception as exc:
+            self.finish_reanalysis_failure(str(exc))
+            return False
+
+        self._last_import_audio_request = reanalysis_request
+        self._apply_review_payload(replace(payload, trigger_source="import_audio"))
         return True
 
     def finish_reanalysis_success(self, payload: FactoryReviewPayload) -> None:
@@ -861,6 +962,7 @@ class FactoryModeController(QObject):
         self._owned_runtime_run_id = None
         self._owned_reanalysis_config_id = None
         self._owned_reanalysis_run_id = None
+        self._last_import_audio_request = None
         self._stopped_review_payload = None
         self._apply_deferred_selection_refresh()
         self._review_payload = FactoryReviewPayload()

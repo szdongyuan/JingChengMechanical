@@ -28,18 +28,38 @@ class FakeApplication:
 class FakeWindow:
     def __init__(self):
         self.show_maximized_called = False
+        self.set_role_called = False
 
     def showMaximized(self):
         self.show_maximized_called = True
 
+    def set_role(self):
+        self.set_role_called = True
+
+
+class FakeLoginWindow:
+    instances: list["FakeLoginWindow"] = []
+
+    def __init__(self, *, on_login_success, on_login_cancel, window_title):
+        self.on_login_success = on_login_success
+        self.on_login_cancel = on_login_cancel
+        self.window_title = window_title
+        self.show_called = False
+        self.__class__.instances.append(self)
+
+    def show(self):
+        self.show_called = True
+        self.on_login_success("tester", "管理员")
+
 
 @pytest.fixture(autouse=True)
-def fake_qt_startup(monkeypatch):
+def fake_qt_startup(monkeypatch, tmp_path):
     FakeApplication.instances.clear()
+    FakeLoginWindow.instances.clear()
     monkeypatch.setattr(startup_mod, "QApplication", FakeApplication)
     monkeypatch.setattr(startup_mod, "QIcon", MagicMock(side_effect=lambda path: path))
-    monkeypatch.setattr(startup_mod, "asset_path", lambda name: f"asset:{name}")
-    monkeypatch.setattr(startup_mod.os.path, "exists", lambda path: False)
+    monkeypatch.setattr(startup_mod, "LoginWindow", FakeLoginWindow)
+    monkeypatch.setattr(startup_mod, "asset_path", lambda name: str(tmp_path / name))
 
 
 @pytest.mark.parametrize(
@@ -135,8 +155,14 @@ def test_run_app_success_constructs_main_window_and_returns_event_loop_code(
 
     assert result == 37
     assert FakeApplication.instances[0].argv == ["jingcheng", "--factory"]
+    assert len(FakeLoginWindow.instances) == 1
+    assert FakeLoginWindow.instances[0].window_title == "登录"
+    assert FakeLoginWindow.instances[0].show_called is True
     service_container.assert_called_once_with()
     main_window.assert_called_once_with(services)
+    assert window.current_user_name == "tester"
+    assert window.current_user_role == "管理员"
+    assert window.set_role_called is True
     assert window.show_maximized_called is True
     assert FakeApplication.instances[0].exec_called is True
     critical.assert_not_called()

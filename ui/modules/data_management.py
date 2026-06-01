@@ -262,7 +262,6 @@ class ExportCanceled(Exception):
 
 
 class AudioDataExportThread(QThread):
-    # 后台导出线程：避免大量音频写入 zip 时卡住主界面。
     progress_changed = pyqtSignal(int)
     succeeded = pyqtSignal(str, int)
     failed = pyqtSignal(str)
@@ -276,7 +275,6 @@ class AudioDataExportThread(QThread):
 
     def run(self) -> None:
         try:
-            # progress_callback 会在服务层每写入一项后触发，用来更新进度条。
             self.audio_data_service.export_zip(
                 self.target_path,
                 self.records,
@@ -587,12 +585,20 @@ class DataManagementModule(QWidget):
         if not target_path.lower().endswith(".zip"):
             target_path += ".zip"
 
-        # 导出放到后台线程里执行，主界面只负责显示进度。
         self.btn_export.setEnabled(False)
-        self._export_progress_dialog = QProgressDialog("正在打包...", "取消", 0, len(records) + 1, self)
+        self._export_progress_dialog = QProgressDialog(
+            "正在打包...",
+            "取消",
+            0,
+            len(records) + 1,
+            self,
+        )
         self._export_progress_dialog.setWindowTitle("打包导出")
         self._export_progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
-        self._export_progress_dialog.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
+        self._export_progress_dialog.setWindowFlag(
+            Qt.WindowType.WindowCloseButtonHint,
+            False,
+        )
         self._export_progress_dialog.setValue(0)
         self._export_progress_dialog.canceled.connect(self._cancel_export)
 
@@ -601,7 +607,6 @@ class DataManagementModule(QWidget):
             target_path,
             records,
         )
-        # 线程发出当前进度值后，直接更新进度条。
         self._export_thread.progress_changed.connect(self._export_progress_dialog.setValue)
         self._export_thread.succeeded.connect(self._on_export_succeeded)
         self._export_thread.failed.connect(self._on_export_failed)

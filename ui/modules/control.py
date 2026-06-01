@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from PyQt6.QtWidgets import (
+    QDialog,
     QHBoxLayout,
     QMessageBox,
     QPushButton,
@@ -9,6 +10,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.services_container import FactoryControllerState
+from ui.popups.import_audio_analysis_dialog import ImportAudioAnalysisDialog
 
 
 class ControlModule(QWidget):
@@ -17,6 +19,9 @@ class ControlModule(QWidget):
     _STOP_ENABLED_PHASES = frozenset({"running", "analyzing"})
     _REVIEW_CLEANUP_BUSY_REASON = "当前测试运行中"
     _PENDING_START_REASON = "启动请求处理中"
+    _BUSY_START_READY_REASONS = frozenset(
+        {_REVIEW_CLEANUP_BUSY_REASON, _PENDING_START_REASON}
+    )
 
     def __init__(self, services):
         super().__init__()
@@ -52,6 +57,12 @@ class ControlModule(QWidget):
         row2.addWidget(self.btn_fail)
         lay.addLayout(row2)
 
+        row3 = QHBoxLayout()
+        self.btn_import_audio = QPushButton("导入音频分析")
+        self.btn_import_audio.setMinimumHeight(36)
+        row3.addWidget(self.btn_import_audio)
+        lay.addLayout(row3)
+
         self.services.bus.workorder_changed.connect(self._on_workorder)
         if hasattr(self.services.bus, "factory_state_changed"):
             self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
@@ -63,6 +74,7 @@ class ControlModule(QWidget):
         self.btn_stop.clicked.connect(self._stop)
         self.btn_pass.clicked.connect(lambda: self._apply_manual_judgment("OK"))
         self.btn_fail.clicked.connect(lambda: self._apply_manual_judgment("NG"))
+        self.btn_import_audio.clicked.connect(self._import_audio)
         self._sync_start_state()
 
     def _on_workorder(self, wo: dict):
@@ -110,6 +122,50 @@ class ControlModule(QWidget):
         if callable(stop_active_run):
             stop_active_run()
 
+    def _import_audio(self) -> None:
+        if self._import_audio_disabled():
+            return
+
+        factory_mode = getattr(self.services, "factory_mode", None)
+        state = getattr(factory_mode, "state", self._factory_state)
+        selected_config_ids = tuple(getattr(state, "selected_config_ids", ()) or ())
+        if not selected_config_ids:
+            QMessageBox.warning(self, "导入音频分析", "请先启用一个配置")
+            return
+
+        try:
+            configs = [
+                self.services.config_service.load_config(config_id)
+                for config_id in selected_config_ids
+            ]
+        except Exception:
+            QMessageBox.warning(self, "导入音频分析", "配置加载失败，无法导入音频分析")
+            return
+
+        default_config_id = (
+            selected_config_ids[0] if len(selected_config_ids) == 1 else None
+        )
+        dialog = ImportAudioAnalysisDialog(
+            configs=configs,
+            default_config_id=default_config_id,
+            parent=self,
+        )
+        result = dialog.exec()
+        if result not in (QDialog.DialogCode.Accepted, int(QDialog.DialogCode.Accepted)):
+            return
+
+        request = dialog.current_request()
+        if request is None:
+            return
+
+        analyze_imported_audio = getattr(factory_mode, "analyze_imported_audio", None)
+        if not callable(analyze_imported_audio) or not analyze_imported_audio(request):
+            QMessageBox.warning(
+                self,
+                "导入音频分析",
+                "导入音频分析失败，请查看结果区域或日志",
+            )
+
     def _apply_manual_judgment(self, label: str) -> None:
         normalized = str(label or "").strip().upper()
         if normalized == "OK":
@@ -135,11 +191,12 @@ class ControlModule(QWidget):
         self.services.bus.log.emit(log_message)
 
     def _show_manual_judgment_warning(self, message: str) -> None:
-        QMessageBox.warning(self, "提示", f"人工判定失败：{message}")
+        QMessageBox.warning(self, "人工判定失败", message)
 
     def _sync_start_state(self) -> None:
         self.btn_start.setEnabled(not self._start_click_disabled())
         self.btn_stop.setEnabled(self._factory_state.run_phase in self._STOP_ENABLED_PHASES)
+        self.btn_import_audio.setEnabled(not self._import_audio_disabled())
 
     def _start_disabled_reason(self) -> str | None:
         if not self._start_click_disabled():
@@ -149,8 +206,13 @@ class ControlModule(QWidget):
     def _start_click_disabled(self) -> bool:
         return (
             self._factory_state.run_phase in self._BUSY_RUN_PHASES
-            or self._factory_state.start_ready_reason == self._REVIEW_CLEANUP_BUSY_REASON
-            or self._factory_state.start_ready_reason == self._PENDING_START_REASON
+            or self._factory_state.start_ready_reason in self._BUSY_START_READY_REASONS
+        )
+
+    def _import_audio_disabled(self) -> bool:
+        return (
+            self._factory_state.run_phase in self._BUSY_RUN_PHASES
+            or self._factory_state.start_ready_reason in self._BUSY_START_READY_REASONS
         )
 
     def _current_idle_blocking_reason(self) -> str | None:

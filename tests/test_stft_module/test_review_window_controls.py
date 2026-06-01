@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import pytest
+from PyQt6.QtCore import Qt
 
 from app.services_container import FactoryReviewWindow
+from ui.widgets.cards import Card
 
 from ._support import (
     _assert_selection_box_matches_selected_window,
@@ -15,7 +17,7 @@ from ._support import (
 )
 
 
-def test_review_success_shows_analysis_box_from_automatic_window_with_fixed_duration(qapp):
+def test_review_success_hides_analysis_box_until_selection_mode(qapp):
     module, services = _make_module()
     module.selected_display_channel_provider = lambda: 0
     _show(module, qapp)
@@ -32,15 +34,77 @@ def test_review_success_shows_analysis_box_from_automatic_window_with_fixed_dura
         ),
     )
 
-    assert module.selection_box.isVisible() is True
-    assert module.analyze_button.isVisible() is True
+    assert module.selection_box.isVisible() is False
+    assert module.analyze_button.isVisible() is False
+    assert module.replay_button.isVisible() is False
+    assert module.analysis_select_button.isVisible() is True
+    assert module.analysis_select_button.isEnabled() is True
+    assert module.analysis_select_button.text() == "框选分析"
     assert module.selected_window == pytest.approx((1.0, 3.0))
+    assert module.canvas.heatmap.chart_interactions.reset_button is None
+    assert module.analysis_select_button.parentWidget() is module
+    assert module.analysis_select_button.width() >= 144
+    assert module.analysis_select_button.height() >= (
+        module.analysis_select_button.sizeHint().height()
+    )
+    assert module.analysis_select_button.x() == 4
+    assert (
+        module.height()
+        - module.analysis_select_button.geometry().bottom()
+        - 1
+    ) == 4
 
     module.move_selection_to_start(2.25)
 
     assert module.selected_window == pytest.approx((2.25, 4.25))
     assert module.selected_window[1] - module.selected_window[0] == pytest.approx(2.0)
+    assert module.selection_box.isVisible() is False
+
+    module.analysis_select_button.click()
+
+    assert module.selection_box.isVisible() is True
+    assert module.analyze_button.isVisible() is True
+    assert module.analysis_select_button.text() == "取消框选"
+    assert module.selection_box.testAttribute(
+        Qt.WidgetAttribute.WA_TransparentForMouseEvents
+    ) is False
     _assert_selection_box_matches_selected_window(module)
+
+    module.analysis_select_button.click()
+
+    assert module.selection_box.isVisible() is False
+    assert module.analyze_button.isVisible() is False
+    assert module.replay_button.isVisible() is False
+
+
+def test_review_selection_button_uses_card_bottom_padding_when_embedded(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    card = Card("STFT时频图", module)
+    card.resize(700, 320)
+    card.show()
+    qapp.processEvents()
+    _seed_stft_history(module, services, qapp, channel_index=0)
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            judgment_payload={
+                "overall": "合格",
+                "analysis_window": (1.0, 3.0),
+            }
+        ),
+    )
+
+    button = module.analysis_select_button
+
+    assert button.isVisible() is True
+    assert button.parentWidget() is card
+    assert button.height() >= button.sizeHint().height()
+    assert button.geometry().bottom() == card.height() - 5
+    assert button.geometry().bottom() > module.geometry().bottom()
+    assert module.analysis_select_button.text() == "框选分析"
 
 
 def test_auto_analysis_failure_uses_first_valid_manual_window_when_reanalysis_is_allowed(qapp):
@@ -68,9 +132,15 @@ def test_auto_analysis_failure_uses_first_valid_manual_window_when_reanalysis_is
         ),
     )
 
+    assert module.selection_box.isVisible() is False
+    assert module.analyze_button.isVisible() is False
+    assert module.analysis_select_button.isVisible() is True
+    assert module.selected_window == pytest.approx((0.0, 2.0))
+
+    module.analysis_select_button.click()
+
     assert module.selection_box.isVisible() is True
     assert module.analyze_button.isVisible() is True
-    assert module.selected_window == pytest.approx((0.0, 2.0))
 
 
 def test_auto_analysis_failure_without_full_valid_window_hides_reanalysis_controls_and_blocks_requests(
@@ -97,6 +167,7 @@ def test_auto_analysis_failure_without_full_valid_window_hides_reanalysis_contro
     assert module.selection_box.isVisible() is False
     assert module.analyze_button.isVisible() is False
     assert module.analyze_button.isEnabled() is False
+    assert module.analysis_select_button.isVisible() is False
 
     module.analyze_button.click()
 
@@ -116,6 +187,7 @@ def test_stft_keeps_rendering_in_stopped_phase_but_hides_manual_controls(qapp):
     assert module.current_image_payload() is not None
     assert module.selection_box.isVisible() is False
     assert module.analyze_button.isVisible() is False
+    assert module.analysis_select_button.isVisible() is False
 
 
 def test_stft_preserved_review_content_in_plain_stopped_still_hides_manual_controls(qapp):
@@ -155,9 +227,10 @@ def test_stft_shows_review_controls_for_stop_triggered_no_result_reviewing(qapp)
     services.bus.factory_review_changed.emit(payload)
     qapp.processEvents()
 
-    assert module.selection_box.isVisible() is True
-    assert module.analyze_button.isVisible() is True
-    assert module.analyze_button.isEnabled() is True
+    assert module.selection_box.isVisible() is False
+    assert module.analyze_button.isVisible() is False
+    assert module.analysis_select_button.isVisible() is True
+    assert module.analysis_select_button.isEnabled() is True
 
 
 @pytest.mark.parametrize(
@@ -167,8 +240,8 @@ def test_stft_shows_review_controls_for_stop_triggered_no_result_reviewing(qapp)
         ("armed", False, False, False),
         ("running", False, False, False),
         ("analyzing", False, False, False),
-        ("reviewing", True, True, True),
-        ("reanalyzing", True, True, False),
+        ("reviewing", False, True, True),
+        ("reanalyzing", False, True, False),
         ("stopped", False, False, False),
     ],
 )
@@ -195,5 +268,7 @@ def test_analysis_controls_follow_review_only_visibility_rule(
 
     assert module.selected_window == pytest.approx((1.0, 3.0))
     assert module.selection_box.isVisible() is box_visible
-    assert module.analyze_button.isVisible() is button_visible
-    assert module.analyze_button.isEnabled() is button_enabled
+    assert module.analyze_button.isVisible() is False
+    assert module.analyze_button.isEnabled() is False
+    assert module.analysis_select_button.isVisible() is button_visible
+    assert module.analysis_select_button.isEnabled() is button_enabled

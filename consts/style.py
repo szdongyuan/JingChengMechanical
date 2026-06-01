@@ -14,20 +14,6 @@ QWidget {
   color: #111827;
 }
 QMessageBox { background: white; }
-QProgressDialog {
-  background: white;
-  color: #111827;
-}
-QProgressDialog QLabel {
-  color: #111827;
-}
-QProgressDialog QPushButton {
-  background: white;
-  color: #111827;
-  border: 1px solid #d1d5db;
-  border-radius: 8px;
-  padding: 6px 12px;
-}
 
 /* Popups / Dialog-like windows */
 QWidget#LoginWindow,
@@ -88,6 +74,23 @@ QLabel#CardTitle {
   font-weight: 700;
   color: #0f172a;
   font-size: 13px;
+}
+QLabel#CardTitleSuffix {
+  color: #0f172a;
+  font-size: 13px;
+}
+QLabel#CardTitleMetricLabel {
+  color: #0f172a;
+  font-size: 15px;
+}
+QLabel#CardTitleMetricValue {
+  background: #f8fafc;
+  border: 1px solid #cbd5e1;
+  border-radius: 5px;
+  color: #0f172a;
+  font-size: 15px;
+  font-weight: 700;
+  padding: 2px 10px;
 }
 QGroupBox {
   border: 1px solid #e5e7eb;
@@ -252,22 +255,6 @@ QPushButton#TablePlayButton:hover {
 }
 QPushButton#TablePlayButton:pressed {
   background: #e2e8f0;
-  padding-top: 1px;
-  padding-left: 1px;
-}
-QPushButton#TableDeleteButton {
-  border-radius: 4px;
-  padding: 0px;
-  color: #ef4444;
-  font-size: 18px;
-  font-weight: 900;
-  line-height: 18px;
-}
-QPushButton#TableDeleteButton:hover {
-  background: #fef2f2;
-}
-QPushButton#TableDeleteButton:pressed {
-  background: #fee2e2;
   padding-top: 1px;
   padding-left: 1px;
 }

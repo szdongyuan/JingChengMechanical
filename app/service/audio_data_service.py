@@ -80,19 +80,22 @@ class AudioDataService:
         max_value = latest.record_date[:19] if latest and latest.record_date else None
         return min_value, max_value
 
-    def export_zip(self, target_path: str, records: list[dict[str, object]], progress_callback=None) -> None:
+    def export_zip(
+        self,
+        target_path: str,
+        records: list[dict[str, object]],
+        progress_callback=None,
+    ) -> None:
         # 导出/保存：生成 zip 包，里面包含 1 个 db 和分类后的音频文件。
         base_name = os.path.splitext(os.path.basename(target_path))[0]
         db_name = f"{base_name}.db"
         temp_db_path = f"{target_path}.tmp.db"
         export_records = [self._build_export_record(record) for record in records]
 
-        self._export_db(temp_db_path, export_records)
-        if progress_callback:
-            # 第一步是写出随 zip 一起导出的临时数据库。
-            progress_callback(1)
         try:
-            # 只打包不压缩，避免数据量大时压缩音频导致界面长时间卡住。
+            self._export_db(temp_db_path, export_records)
+            if progress_callback:
+                progress_callback(1)
             with zipfile.ZipFile(target_path, "w", zipfile.ZIP_STORED) as archive:
                 archive.write(temp_db_path, db_name)
                 for index, record in enumerate(export_records, start=2):
@@ -101,7 +104,6 @@ class AudioDataService:
                     if source_path and archive_path and os.path.exists(source_path):
                         archive.write(source_path, str(archive_path))
                     if progress_callback:
-                        # 每处理完一个音频文件，通知界面更新一次进度。
                         progress_callback(index)
         finally:
             if os.path.exists(temp_db_path):

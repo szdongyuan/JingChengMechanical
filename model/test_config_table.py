@@ -38,6 +38,7 @@ class TestConfigTable(BaseModel):
     output_device_hostapi = TextField(null=True)
     output_device_samplerate = FloatField(null=True)
     selected_channels = TextField(default='[]')
+    vibration_view_channel_index = IntegerField(null=True, default=None)
     analysis_window_offset_ms = IntegerField(default=0)
     monitor_channel_index = IntegerField(null=True, default=None)
     monitor_gain_db = FloatField(null=True, default=None)

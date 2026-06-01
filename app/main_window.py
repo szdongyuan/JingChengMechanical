@@ -31,6 +31,7 @@ from ui.modules.stft import StftModule
 from ui.modules.loudness import LoudnessModule
 from ui.modules.spl import SplModule
 from ui.modules.octave import OctaveModule
+from ui.modules.vibration import VibrationAxisModule, VibrationTrendModule
 from ui.modules.result import ResultModule
 from ui.modules.video import VideoModule
 from ui.modules.today_statistics import TodayStatisticsModule
@@ -87,6 +88,7 @@ class MainWindow(QMainWindow):
         self._review_payload = getattr(factory_mode, "review_payload", FactoryReviewPayload())
         self.display_channel_by_config_id: dict[int, int] = {}
         self._last_selected_display_channel: int | None = None
+        self._review_identity_by_config_id: dict[int, tuple] = {}
         self._current_main_tab_index = self._TEST_PAGE_INDEX
         self._pending_guarded_tab_index: int | None = None
         self._reverting_main_tab_change = False
@@ -121,6 +123,7 @@ class MainWindow(QMainWindow):
         self.tab.currentChanged.connect(self._on_main_tab_changed)
 
         self.services.bus.log.emit("[App] 启动程序")
+        self._record_review_identity(self._review_payload)
         self._sync_analysis_toolbar()
         self._refresh_analysis_display_modules()
         self.set_role()
@@ -349,23 +352,37 @@ class MainWindow(QMainWindow):
         self.analysis_toolbar.hide()
         grid.addWidget(self.analysis_toolbar, 0, 1, 1, 2)
 
-        self.spectrum = SpectrumModule(self.services)
-        grid.addWidget(Card("FFT频谱（dB）", self.spectrum), 1, 2)
-
         self.stft = StftModule(self.services)
-        grid.addWidget(Card("STFT时频图（频率Hz，幅值dB）", self.stft), 1, 1)
+        self.stft_card = Card("时频图", self.stft)
+        self._set_stft_score_title(self.stft.current_score_title())
+        self.stft.score_title_changed.connect(self._set_stft_score_title)
+        grid.addWidget(self.stft_card, 1, 1)
+
+        self.spectrum = SpectrumModule(self.services)
+        self.spectrum_card = Card("频谱", self.spectrum)
+        grid.addWidget(self.spectrum_card, 1, 2)
 
         self.loudness = LoudnessModule(self.services)
-        self.loudness_card = Card("响度", self.loudness)
-        self.loudness.title_changed.connect(self.loudness_card.set_title)
+        self.vibration_axis = VibrationAxisModule(self.services)
+        self.loudness_stack = QStackedWidget()
+        self.loudness_stack.addWidget(self.loudness)
+        self.loudness_stack.addWidget(self.vibration_axis)
+        self.loudness_card = Card("响度", self.loudness_stack)
+        self.loudness.title_changed.connect(self._on_loudness_title_changed)
         self.loudness_card.set_title(self.loudness.current_title())
         grid.addWidget(self.loudness_card, 2, 0)
 
         self.spl = SplModule(self.services)
-        grid.addWidget(Card("声压级（dB）", self.spl), 2, 1)
+        self.vibration_trend = VibrationTrendModule(self.services)
+        self.spl_stack = QStackedWidget()
+        self.spl_stack.addWidget(self.spl)
+        self.spl_stack.addWidget(self.vibration_trend)
+        self.spl_card = Card("声压级（dB）", self.spl_stack)
+        grid.addWidget(self.spl_card, 2, 1)
 
         self.octave = OctaveModule(self.services)
-        grid.addWidget(Card("倍频程（dB）", self.octave), 2, 2)
+        self.octave_card = Card("倍频程（dB）", self.octave)
+        grid.addWidget(self.octave_card, 2, 2)
 
         self._attach_analysis_channel_providers()
 
@@ -486,9 +503,25 @@ class MainWindow(QMainWindow):
         return self.display_channel_by_config_id.get(config_id)
 
     def _attach_analysis_channel_providers(self) -> None:
-        for module in (self.result, self.stft, self.loudness, self.spl, self.spectrum, self.octave):
+        for module in (
+            self.result,
+            self.stft,
+            self.loudness,
+            self.spl,
+            self.spectrum,
+            self.octave,
+            self.vibration_axis,
+            self.vibration_trend,
+        ):
             module.selected_display_channel_provider = self.current_display_channel_index
-        for module in (self.loudness, self.spl, self.spectrum, self.octave):
+        for module in (
+            self.loudness,
+            self.spl,
+            self.spectrum,
+            self.octave,
+            self.vibration_axis,
+            self.vibration_trend,
+        ):
             module.selected_display_channel_sync = self._sync_selected_display_channel
 
     def _on_factory_state_changed(self, state) -> None:
@@ -503,11 +536,41 @@ class MainWindow(QMainWindow):
             self._review_payload = review
         else:
             self._review_payload = FactoryReviewPayload()
+        self._clear_display_channel_for_new_review_identity(self._review_payload)
         self._sync_analysis_toolbar()
 
+    def _review_identity(self, review: FactoryReviewPayload) -> tuple:
+        return (
+            getattr(review, "displayed_config_id", None),
+            getattr(review, "run_id", None),
+            getattr(review, "trigger_source", None),
+        )
+
+    def _record_review_identity(self, review: FactoryReviewPayload) -> None:
+        config_id = getattr(review, "displayed_config_id", None)
+        if isinstance(config_id, int):
+            self._review_identity_by_config_id[config_id] = self._review_identity(review)
+
+    def _clear_display_channel_for_new_review_identity(
+        self,
+        review: FactoryReviewPayload,
+    ) -> None:
+        config_id = getattr(review, "displayed_config_id", None)
+        if not isinstance(config_id, int):
+            return
+
+        identity = self._review_identity(review)
+        if self._review_identity_by_config_id.get(config_id) != identity:
+            self.display_channel_by_config_id.pop(config_id, None)
+        self._review_identity_by_config_id[config_id] = identity
+
     def _on_factory_display_reset(self, _reason: str) -> None:
+        config_id = self._factory_state.displayed_config_id
+        if isinstance(config_id, int):
+            self.display_channel_by_config_id.pop(config_id, None)
         self._review_payload = FactoryReviewPayload()
         self._sync_analysis_toolbar()
+        self._apply_analysis_display_mode()
 
     def _on_topbar_tab_clicked(self, index: int) -> None:
         current_index = self.tab.currentIndex()
@@ -549,6 +612,7 @@ class MainWindow(QMainWindow):
         self._sync_topbar_selection(index)
         if index == self._TEST_PAGE_INDEX:
             self._refresh_analysis_display_modules()
+            self._apply_analysis_display_mode()
 
     def _revert_main_tab_change(self, previous_index: int) -> None:
         self._reverting_main_tab_change = True
@@ -639,8 +703,8 @@ class MainWindow(QMainWindow):
         if config_id is None:
             return
 
-        selected_channels = self._selected_channels_for_config(config_id)
-        if channel_index not in selected_channels:
+        channels = self._resolve_display_channels(config_id)
+        if channel_index not in channels:
             return
 
         self._last_selected_display_channel = channel_index
@@ -650,12 +714,22 @@ class MainWindow(QMainWindow):
             self._build_analysis_toolbar_context(config_id, channel_index)
         )
         self._emit_factory_display_channel_changed(config_id, channel_index)
+        self._apply_analysis_display_mode()
 
         if refresh_modules:
             self._refresh_analysis_display_modules()
 
     def _refresh_analysis_display_modules(self) -> None:
-        for module in (self.stft, self.loudness, self.spl, self.spectrum, self.octave, self.result):
+        for module in (
+            self.stft,
+            self.loudness,
+            self.spl,
+            self.spectrum,
+            self.octave,
+            self.vibration_axis,
+            self.vibration_trend,
+            self.result,
+        ):
             refresh = getattr(module, "refresh_selected_display_channel", None)
             if callable(refresh):
                 refresh()
@@ -674,6 +748,7 @@ class MainWindow(QMainWindow):
             self.analysis_toolbar.set_available_channels([])
             self.analysis_toolbar.set_context_label_text("")
             self.analysis_toolbar.hide()
+            self._apply_analysis_display_mode()
             return
 
         channels = self._resolve_display_channels(config_id)
@@ -682,6 +757,7 @@ class MainWindow(QMainWindow):
             self.analysis_toolbar.set_available_channels([])
             self.analysis_toolbar.set_context_label_text("")
             self.analysis_toolbar.hide()
+            self._apply_analysis_display_mode()
             return
 
         current_channel = self._resolve_current_display_channel(config_id, channels)
@@ -690,16 +766,21 @@ class MainWindow(QMainWindow):
             self.analysis_toolbar.set_available_channels([])
             self.analysis_toolbar.set_context_label_text("")
             self.analysis_toolbar.hide()
+            self._apply_analysis_display_mode()
             return
 
         self.display_channel_by_config_id[config_id] = current_channel
-        self.analysis_toolbar.set_available_channels(channels)
+        self.analysis_toolbar.set_available_channels(
+            channels,
+            self._display_channel_labels_for_config(config_id),
+        )
         self.analysis_toolbar.set_current_channel(current_channel)
         self.analysis_toolbar.set_context_label_text(
             self._build_analysis_toolbar_context(config_id, current_channel)
         )
         self.analysis_toolbar.show()
         self._emit_factory_display_channel_changed(config_id, current_channel)
+        self._apply_analysis_display_mode()
 
     def _emit_factory_display_channel_changed(
         self,
@@ -712,7 +793,27 @@ class MainWindow(QMainWindow):
             emit(config_id, channel_index)
 
     def _resolve_display_channels(self, config_id: int) -> list[int]:
+        if self._is_current_imported_review(config_id):
+            return self._chart_payload_channels_for_config(config_id)
+        if self._is_transient_imported_review_without_chart_payload(config_id):
+            channels = self._analysis_toolbar_channel_options()
+            stored_channel = self.display_channel_by_config_id.get(config_id)
+            if isinstance(stored_channel, int) and stored_channel in channels:
+                return channels
         return self._selected_channels_for_config(config_id)
+
+    def _analysis_toolbar_channel_options(self) -> list[int]:
+        if not hasattr(self, "analysis_toolbar"):
+            return []
+        combo = getattr(self.analysis_toolbar, "channel_combo", None)
+        if combo is None:
+            return []
+        channels: list[int] = []
+        for index in range(combo.count()):
+            channel = combo.itemData(index)
+            if isinstance(channel, int) and channel not in channels:
+                channels.append(channel)
+        return channels
 
     def _resolve_current_display_channel(
         self,
@@ -722,16 +823,48 @@ class MainWindow(QMainWindow):
         if not channels:
             return None
 
+        review_channels: list[int] | None = None
+        is_transient_reanalysis_without_chart_payload = False
+        if (
+            self._factory_state.run_phase in self._COMMITTED_CHART_CHANNEL_PHASES
+            and self._review_payload.displayed_config_id == config_id
+        ):
+            is_transient_reanalysis_without_chart_payload = (
+                self._is_transient_reanalysis_review_without_chart_payload(config_id)
+            )
+            if is_transient_reanalysis_without_chart_payload:
+                review_channels = None
+            else:
+                review_channels = self._chart_payload_channels_for_config(config_id)
+
+        def channel_is_available(channel_index: int | None) -> bool:
+            return (
+                channel_index in channels
+                and (review_channels is None or channel_index in review_channels)
+            )
+
+        if is_transient_reanalysis_without_chart_payload:
+            stored_channel = self.display_channel_by_config_id.get(config_id)
+            if isinstance(stored_channel, int) and stored_channel in channels:
+                return stored_channel
+
+        vibration_channel = self._vibration_view_channel_for_config(config_id)
+        if channel_is_available(vibration_channel):
+            stored_channel = self.display_channel_by_config_id.get(config_id)
+            if channel_is_available(stored_channel):
+                return stored_channel
+            return vibration_channel
+
+        if review_channels is not None:
+            stored_channel = self.display_channel_by_config_id.get(config_id)
+            if channel_is_available(stored_channel):
+                return stored_channel
+
         remembered_channel = self._last_selected_display_channel
-        review_channels = []
-        if self._factory_state.run_phase in self._COMMITTED_CHART_CHANNEL_PHASES:
-            review_channels = self._chart_payload_channels_for_config(config_id)
+        if channel_is_available(remembered_channel):
+            return remembered_channel
 
-        if remembered_channel in channels:
-            candidate_channel = remembered_channel
-        else:
-            candidate_channel = channels[0]
-
+        candidate_channel = channels[0]
         if review_channels and candidate_channel not in review_channels:
             for channel in channels:
                 if channel in review_channels:
@@ -741,20 +874,38 @@ class MainWindow(QMainWindow):
         return candidate_channel
 
     def _selected_channels_for_config(self, config_id: int) -> list[int]:
+        config = self._load_config_for_display(config_id)
+        return self._normalize_channels(config.get("selected_channels", []))
+
+    def _config_payload_for_displayed_review(self, config_id: int) -> dict:
+        if self._review_payload.displayed_config_id != config_id:
+            return {}
+        config_payload = getattr(self._review_payload, "config_payload", None)
+        return config_payload if isinstance(config_payload, dict) else {}
+
+    def _load_config_for_display(self, config_id: int) -> dict:
+        payload_config = self._config_payload_for_displayed_review(config_id)
+        if payload_config:
+            return payload_config
+
         config_service = getattr(self.services, "config_service", None)
         load_config = getattr(config_service, "load_config", None)
         if not callable(load_config):
-            return []
+            return {}
 
         try:
             config = load_config(config_id)
         except Exception:
-            return []
+            return {}
+        return config if isinstance(config, dict) else {}
 
-        if not isinstance(config, dict):
-            return []
-
-        return self._normalize_channels(config.get("selected_channels", []))
+    def _vibration_view_channel_for_config(self, config_id: int) -> int | None:
+        config = self._load_config_for_display(config_id)
+        value = config.get("vibration_view_channel_index")
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            return None
+        selected = self._normalize_channels(config.get("selected_channels", []))
+        return value if value in selected else None
 
     def _chart_payload_channels_for_config(self, config_id: int) -> list[int]:
         if self._review_payload.displayed_config_id != config_id:
@@ -763,6 +914,61 @@ class MainWindow(QMainWindow):
         if not isinstance(chart_payload, dict):
             return []
         return self._normalize_channels(chart_payload.keys())
+
+    def _is_transient_reanalysis_review_without_chart_payload(
+        self,
+        config_id: int,
+    ) -> bool:
+        stored_channel = self.display_channel_by_config_id.get(config_id)
+        return (
+            self._factory_state.run_phase in {"reviewing", "reanalyzing"}
+            and isinstance(stored_channel, int)
+            and self._review_payload.displayed_config_id == config_id
+            and getattr(self._review_payload, "chart_payload", None) is None
+            and getattr(self._review_payload, "summary_payload", None) is None
+            and getattr(self._review_payload, "judgment_payload", None) is None
+            and not bool(getattr(self._review_payload, "no_result", False))
+            and getattr(self._review_payload, "error_message", None) is None
+        )
+
+    def _is_transient_imported_review_without_chart_payload(
+        self,
+        config_id: int,
+    ) -> bool:
+        return (
+            getattr(self._review_payload, "trigger_source", None) == "import_audio"
+            and self._is_transient_reanalysis_review_without_chart_payload(config_id)
+        )
+
+    def _display_channel_labels_for_config(self, config_id: int) -> dict[int, str] | None:
+        if not self._is_current_imported_review(config_id):
+            return None
+
+        labels = getattr(self._review_payload, "display_channel_labels", None)
+        if not isinstance(labels, dict):
+            return None
+
+        normalized: dict[int, str] = {}
+        vibration_channel = self._vibration_view_channel_for_config(config_id)
+        for channel, label in labels.items():
+            try:
+                channel_index = int(channel)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(label, str) and label.strip():
+                normalized_label = label.strip()
+                if channel_index == vibration_channel:
+                    normalized_label = self._append_vibration_label(normalized_label)
+                normalized[channel_index] = normalized_label
+        return normalized
+
+    def _is_current_imported_review(self, config_id: int) -> bool:
+        return (
+            getattr(self._review_payload, "trigger_source", None) == "import_audio"
+            and self._factory_state.run_phase in self._COMMITTED_CHART_CHANNEL_PHASES
+            and self._review_payload.displayed_config_id == config_id
+            and isinstance(getattr(self._review_payload, "chart_payload", None), dict)
+        )
 
     @staticmethod
     def _normalize_channels(channels) -> list[int]:
@@ -776,9 +982,80 @@ class MainWindow(QMainWindow):
                 normalized_channels.append(channel_index)
         return normalized_channels
 
+    def _build_analysis_toolbar_context(self, config_id: int, channel_index: int) -> str:
+        if self._is_current_imported_review(config_id):
+            label = (self._display_channel_labels_for_config(config_id) or {}).get(
+                channel_index
+            )
+            suffix = label or f"配置 {config_id} / 通道{channel_index + 1}"
+            context = f"导入音频 / {suffix}"
+        else:
+            context = f"配置 {config_id} / 通道{channel_index + 1}"
+        if channel_index == self._vibration_view_channel_for_config(config_id):
+            context = self._append_vibration_context(context)
+        return context
+
     @staticmethod
-    def _build_analysis_toolbar_context(config_id: int, channel_index: int) -> str:
-        return f"配置 {config_id} / 通道{channel_index + 1}"
+    def _append_vibration_label(label: str) -> str:
+        return label if "振动" in label else f"{label}（振动）"
+
+    @staticmethod
+    def _append_vibration_context(context: str) -> str:
+        return context if "振动" in context else f"{context} / 振动"
+
+    def _on_loudness_title_changed(self, title: str) -> None:
+        if not self._is_current_display_vibration():
+            self.loudness_card.set_title(title)
+
+    def _set_stft_score_title(self, text: str) -> None:
+        self.stft_card.set_title_metric("频谱平均得分：", self._stft_score_value(text))
+
+    @staticmethod
+    def _stft_score_value(text: str) -> str:
+        normalized = str(text or "").strip()
+        for separator in ("：", ":"):
+            if separator in normalized:
+                return normalized.split(separator, 1)[1].strip() or "--"
+        return normalized or "--"
+
+    def _is_current_display_vibration(self) -> bool:
+        config_id = self._factory_state.displayed_config_id
+        channel = self.current_display_channel_index()
+        if config_id is None or channel is None:
+            return False
+        return channel == self._vibration_view_channel_for_config(config_id)
+
+    def _apply_analysis_display_mode(self) -> None:
+        if not hasattr(self, "loudness_card"):
+            return
+
+        vibration_mode = self._is_current_display_vibration()
+        if vibration_mode:
+            self.stft_card.set_title("振动纹理")
+            self.spectrum_card.set_title("振动频谱")
+            self.loudness_card.set_title("振动频率稳定性")
+            self.spl_card.set_title("振动脉冲")
+            self.octave_card.set_title("机械频带")
+            self.loudness_stack.setCurrentWidget(self.vibration_axis)
+            self.spl_stack.setCurrentWidget(self.vibration_trend)
+        else:
+            self.stft_card.set_title("时频图")
+            self.spectrum_card.set_title("频谱")
+            self.loudness_card.set_title(self.loudness.current_title())
+            self.spl_card.set_title("声压级（dB）")
+            self.octave_card.set_title("倍频程（dB）")
+            self.loudness_stack.setCurrentWidget(self.loudness)
+            self.spl_stack.setCurrentWidget(self.spl)
+
+        self._set_module_vibration_mode(self.stft, vibration_mode)
+        self._set_module_vibration_mode(self.spectrum, vibration_mode)
+        self._set_module_vibration_mode(self.octave, vibration_mode)
+
+    @staticmethod
+    def _set_module_vibration_mode(module, enabled: bool) -> None:
+        set_vibration_mode = getattr(module, "set_vibration_mode", None)
+        if callable(set_vibration_mode):
+            set_vibration_mode(enabled)
 
     def closeEvent(self, event: QCloseEvent):
         if not self._can_leave_main_tab(self._ai_tool_management_tab_index()):

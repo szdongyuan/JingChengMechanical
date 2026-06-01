@@ -168,6 +168,7 @@ def _make_config(
         "input_device_name": "Mic",
         "input_device_hostapi": "MME",
         "input_device_samplerate": 100,
+        "selected_channels": [0],
         "plc_id": plc_id,
         "scan_triggers_test": scan_triggers_test,
     }
@@ -322,6 +323,7 @@ def _make_real_manager_factory_context(
     monkeypatch,
     *,
     save_wav_error: Exception | None = None,
+    with_monitor: bool = False,
 ):
     controller_mod = _load_factory_mode_controller_module()
 
@@ -371,6 +373,42 @@ def _make_real_manager_factory_context(
 
         def get_buffer_from(self, snapshot):
             return self._buffer
+
+    class FakeMonitor:
+        instances = []
+
+        def __init__(
+            self,
+            *,
+            device_name,
+            hostapi,
+            sample_rate,
+            monitor_channel,
+            gain_db=0.0,
+        ):
+            self.device_name = device_name
+            self.hostapi = hostapi
+            self.sample_rate = sample_rate
+            self.monitor_channel = monitor_channel
+            self.gain_db = gain_db
+            self.error_occurred = _DummySignal()
+            self.start_calls = 0
+            self.stop_calls = 0
+            self.wait_calls: list[int] = []
+            FakeMonitor.instances.append(self)
+
+        def feed(self, chunk):
+            return None
+
+        def start(self):
+            self.start_calls += 1
+
+        def stop(self):
+            self.stop_calls += 1
+
+        def wait(self, timeout):
+            self.wait_calls.append(timeout)
+            return True
 
     class FakeSession:
         def __init__(self, config, bus, ai_service, mic_cal, workorder, audio_dir):
@@ -422,12 +460,24 @@ def _make_real_manager_factory_context(
             )
 
     monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
+    monkeypatch.setattr("app.service.analysis.test_manager.AudioMonitor", FakeMonitor)
     monkeypatch.setattr("app.service.analysis.test_manager.TestSession", FakeSession)
 
     config_map = {
         101: _make_config(101),
         202: _make_config(202),
     }
+    if with_monitor:
+        for config in config_map.values():
+            config.update(
+                {
+                    "output_device_name": "Speaker",
+                    "output_device_hostapi": "MME",
+                    "output_device_samplerate": 100,
+                    "monitor_channel_index": 0,
+                    "monitor_gain_db": 0.0,
+                }
+            )
     bus = EventBus()
     reset_reasons: list[str] = []
     reviews: list[object] = []

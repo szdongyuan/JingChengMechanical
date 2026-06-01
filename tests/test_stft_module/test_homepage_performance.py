@@ -120,11 +120,21 @@ def test_refresh_selected_display_channel_reuses_cached_matrix_without_column_st
     cached_matrix = cache_entry.image_payload()["magnitude_db"]
     captured: dict[str, object] = {}
 
-    def _capture_set_image(*, times_sec, frequencies_hz, magnitude_db, reset_levels):
+    def _capture_set_image(
+        *,
+        times_sec,
+        frequencies_hz,
+        magnitude_db,
+        reset_levels,
+        levels_db,
+        snap_initial_to_zero,
+    ):
         captured["times_sec"] = times_sec
         captured["frequencies_hz"] = frequencies_hz
         captured["magnitude_db"] = magnitude_db
         captured["reset_levels"] = reset_levels
+        captured["levels_db"] = levels_db
+        captured["snap_initial_to_zero"] = snap_initial_to_zero
 
     def _fail_column_stack(*args, **kwargs):
         raise AssertionError("refresh should reuse the stored matrix directly")
@@ -138,6 +148,8 @@ def test_refresh_selected_display_channel_reuses_cached_matrix_without_column_st
     assert captured["frequencies_hz"] == [100.0, 200.0]
     assert captured["magnitude_db"] is cached_matrix
     assert captured["reset_levels"] is False
+    assert captured["levels_db"] is None
+    assert captured["snap_initial_to_zero"] is True
 
 
 def test_refresh_selected_display_channel_skips_redraw_when_same_signature_is_visible(
@@ -210,7 +222,7 @@ def test_review_metadata_churn_skips_redraw_for_same_run_without_new_frames(
     qapp.processEvents()
 
     assert redraw_calls == []
-    assert module.selection_box.isVisible() is True
+    assert module.selection_box.isVisible() is False
 
 
 def test_review_and_reanalysis_state_churn_skip_redraw_for_unchanged_signature(
@@ -298,13 +310,23 @@ def test_refresh_selected_display_channel_restores_cached_image_after_heatmap_cl
     render_calls: list[dict[str, object]] = []
     real_set_image = module.canvas.heatmap.set_image
 
-    def _spy_set_image(*, times_sec, frequencies_hz, magnitude_db, reset_levels):
+    def _spy_set_image(
+        *,
+        times_sec,
+        frequencies_hz,
+        magnitude_db,
+        reset_levels,
+        levels_db,
+        snap_initial_to_zero,
+    ):
         render_calls.append(
             {
                 "times_sec": list(times_sec),
                 "frequencies_hz": list(frequencies_hz),
                 "magnitude_db": magnitude_db,
                 "reset_levels": reset_levels,
+                "levels_db": levels_db,
+                "snap_initial_to_zero": snap_initial_to_zero,
             }
         )
         real_set_image(
@@ -312,6 +334,8 @@ def test_refresh_selected_display_channel_restores_cached_image_after_heatmap_cl
             frequencies_hz=frequencies_hz,
             magnitude_db=magnitude_db,
             reset_levels=reset_levels,
+            levels_db=levels_db,
+            snap_initial_to_zero=snap_initial_to_zero,
         )
 
     monkeypatch.setattr(module.canvas.heatmap, "set_image", _spy_set_image)
@@ -329,6 +353,8 @@ def test_refresh_selected_display_channel_restores_cached_image_after_heatmap_cl
     assert render_calls[0]["frequencies_hz"] == [100.0, 200.0]
     assert render_calls[0]["magnitude_db"] is cached_matrix
     assert render_calls[0]["reset_levels"] is True
+    assert render_calls[0]["levels_db"] is None
+    assert render_calls[0]["snap_initial_to_zero"] is True
     assert module.current_render_cache_key() == cache_key
     assert restored_payload is not None
     assert np.array_equal(restored_payload["magnitude_db"], cached_matrix)
@@ -442,13 +468,23 @@ def test_live_updates_schedule_one_flush_for_many_frames_until_module_flush_runs
         lambda callback: scheduled_flushes.append(callback),
     )
 
-    def _capture_set_image(*, times_sec, frequencies_hz, magnitude_db, reset_levels):
+    def _capture_set_image(
+        *,
+        times_sec,
+        frequencies_hz,
+        magnitude_db,
+        reset_levels,
+        levels_db,
+        snap_initial_to_zero,
+    ):
         render_calls.append(
             {
                 "times_sec": list(times_sec),
                 "frequencies_hz": list(frequencies_hz),
                 "magnitude_db": magnitude_db,
                 "reset_levels": reset_levels,
+                "levels_db": levels_db,
+                "snap_initial_to_zero": snap_initial_to_zero,
             }
         )
 
@@ -473,6 +509,8 @@ def test_live_updates_schedule_one_flush_for_many_frames_until_module_flush_runs
     assert len(render_calls) == 1
     assert render_calls[0]["times_sec"] == [0.0]
     assert render_calls[0]["reset_levels"] is True
+    assert render_calls[0]["levels_db"] is None
+    assert render_calls[0]["snap_initial_to_zero"] is True
     assert module.pending_live_flush_key() is None
 
     services.bus.stft_updated.emit(
@@ -499,6 +537,8 @@ def test_live_updates_schedule_one_flush_for_many_frames_until_module_flush_runs
     assert render_calls[1]["times_sec"] == [0.0, 0.5, 1.0]
     assert render_calls[1]["frequencies_hz"] == [100.0, 200.0]
     assert render_calls[1]["reset_levels"] is False
+    assert render_calls[1]["levels_db"] is None
+    assert render_calls[1]["snap_initial_to_zero"] is True
     assert np.array_equal(
         render_calls[1]["magnitude_db"],
         np.array([[1.0, 3.0, 5.0], [2.0, 4.0, 6.0]]),
@@ -522,13 +562,23 @@ def test_refresh_boundary_consumes_pending_live_flush_without_double_render(
         lambda callback: scheduled_flushes.append(callback),
     )
 
-    def _capture_set_image(*, times_sec, frequencies_hz, magnitude_db, reset_levels):
+    def _capture_set_image(
+        *,
+        times_sec,
+        frequencies_hz,
+        magnitude_db,
+        reset_levels,
+        levels_db,
+        snap_initial_to_zero,
+    ):
         render_calls.append(
             {
                 "times_sec": list(times_sec),
                 "frequencies_hz": list(frequencies_hz),
                 "magnitude_db": magnitude_db,
                 "reset_levels": reset_levels,
+                "levels_db": levels_db,
+                "snap_initial_to_zero": snap_initial_to_zero,
             }
         )
 
@@ -557,6 +607,8 @@ def test_refresh_boundary_consumes_pending_live_flush_without_double_render(
     )
 
     assert len(render_calls) == 1
+    assert render_calls[0]["levels_db"] is None
+    assert render_calls[0]["snap_initial_to_zero"] is True
     assert len(scheduled_flushes) == 1
     assert module.pending_live_flush_key() == (101, "run-101", 0)
 
@@ -565,6 +617,8 @@ def test_refresh_boundary_consumes_pending_live_flush_without_double_render(
     assert len(render_calls) == 2
     assert render_calls[1]["times_sec"] == [0.0, 0.5]
     assert render_calls[1]["reset_levels"] is False
+    assert render_calls[1]["levels_db"] is None
+    assert render_calls[1]["snap_initial_to_zero"] is True
     assert module.pending_live_flush_key() is None
 
     scheduled_flushes[0]()

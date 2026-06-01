@@ -5,6 +5,7 @@ import os
 from dataclasses import dataclass, field
 
 import numpy as np
+from scipy import signal as scipy_signal
 from scipy.io import wavfile
 
 from app.service.analysis import dsp
@@ -43,6 +44,7 @@ class GoldenReferenceCache:
         configured_input_sample_rate,
         runtime_sample_rate,
         mic_sensitivity: float,
+        allow_runtime_resample: bool = False,
     ) -> GoldenReferenceBundle:
         cached = self._bundles.get(channel_index)
         if cached is not None:
@@ -68,9 +70,8 @@ class GoldenReferenceCache:
             or runtime_sample_rate is None
         ):
             raise GoldenReferenceError("黄金样本采样率无效")
-        if (
-            stored_sample_rate != configured_sample_rate
-            or stored_sample_rate != runtime_sample_rate
+        if stored_sample_rate != configured_sample_rate or (
+            not allow_runtime_resample and stored_sample_rate != runtime_sample_rate
         ):
             raise GoldenReferenceError("黄金样本采样率与当前配置或运行采样率不一致")
 
@@ -92,10 +93,19 @@ class GoldenReferenceCache:
         if signal.size != expected_num_samples:
             raise GoldenReferenceError("黄金样本文件长度与记录元数据不一致")
 
+        bundle_sample_rate = stored_sample_rate
+        if allow_runtime_resample:
+            signal = _resample_signal(
+                signal,
+                source_rate=stored_sample_rate,
+                target_rate=runtime_sample_rate,
+            )
+            bundle_sample_rate = runtime_sample_rate
+
         calibrated = dsp.apply_mic_calibration(signal, mic_sensitivity)
         bundle = GoldenReferenceBundle(
             signal=np.asarray(calibrated, dtype=np.float64).reshape(-1),
-            sample_rate=stored_sample_rate,
+            sample_rate=bundle_sample_rate,
         )
         self._bundles[channel_index] = bundle
         return bundle
@@ -168,6 +178,22 @@ def _read_wav(path: str) -> tuple[int, object]:
 def _absolute_levels_db(levels_db: np.ndarray | list[float]) -> np.ndarray:
     levels = np.asarray(levels_db, dtype=np.float64)
     return levels - _REF_PRESSURE_DB
+
+
+def _resample_signal(
+    signal: np.ndarray,
+    source_rate: float,
+    target_rate: float,
+) -> np.ndarray:
+    source = int(round(source_rate))
+    target = int(round(target_rate))
+    if source <= 0 or target <= 0:
+        raise GoldenReferenceError("黄金样本采样率无效")
+    samples = np.asarray(signal, dtype=np.float64).reshape(-1)
+    if source == target:
+        return samples
+    divisor = math.gcd(source, target)
+    return scipy_signal.resample_poly(samples, target // divisor, source // divisor)
 
 
 def _coerce_positive_float(value) -> float | None:

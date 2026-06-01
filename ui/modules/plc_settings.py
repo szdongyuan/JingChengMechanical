@@ -122,18 +122,6 @@ class PlcSettingsModule(QWidget):
         self.btn_save.clicked.connect(self.save_current)
         self.btn_toggle.clicked.connect(self.toggle_state)
         self.btn_connect.clicked.connect(self.connect_plc)
-        for edit in (
-            self.ed_name,
-            self.ed_ip,
-            self.ed_rack,
-            self.ed_slot,
-            self.ed_db_number,
-            self.ed_byte_index,
-            self.ed_bit_index,
-            self.ed_poll_interval,
-            self.ed_reconnect_interval,
-        ):
-            edit.textChanged.connect(lambda _text: self.btn_save.setText("保存*"))
         plc_changed = getattr(self.services.bus, "plc_changed", None)
         if plc_changed is not None:
             plc_changed.connect(self.reload_rows)
@@ -200,19 +188,6 @@ class PlcSettingsModule(QWidget):
             self._render_empty()
             return
         # 把当前 PLC 记录填充到界面控件中。
-        edits = (
-            self.ed_name,
-            self.ed_ip,
-            self.ed_rack,
-            self.ed_slot,
-            self.ed_db_number,
-            self.ed_byte_index,
-            self.ed_bit_index,
-            self.ed_poll_interval,
-            self.ed_reconnect_interval,
-        )
-        for edit in edits:
-            edit.blockSignals(True)
         self.ed_name.setText(text_or_empty(row.plc_name))
         self.ed_ip.setText(text_or_empty(row.plc_ip))
         self.ed_rack.setText(text_or_empty(row.plc_rack))
@@ -222,9 +197,6 @@ class PlcSettingsModule(QWidget):
         self.ed_bit_index.setText(text_or_empty(row.plc_bit_index))
         self.ed_poll_interval.setText(text_or_empty(row.plc_poll_interval_ms))
         self.ed_reconnect_interval.setText(text_or_empty(row.plc_reconnect_interval_ms))
-        for edit in edits:
-            edit.blockSignals(False)
-        self.btn_save.setText("保存")
 
         is_open = self._is_open_state_enabled(row.plc_open_state)  # 是否已开启开机自启
         if is_open:
@@ -251,7 +223,6 @@ class PlcSettingsModule(QWidget):
             self.ed_reconnect_interval,
         ):
             edit.setText("")
-        self.btn_save.setText("保存")
         self.lb_state.setText("-")
         self.set_connect_label("-")
         self.btn_toggle.setText("开启")
@@ -289,9 +260,8 @@ class PlcSettingsModule(QWidget):
             PlcTable.update(**values).where(PlcTable.id == row.id).execute()
             self._emit_plc_changed()
             self.on_combo_changed()
-            self.btn_save.setText("保存")
             self.services.bus.log.emit(f"PLC {row.id} 保存成功")
-            QMessageBox.information(self, "成功", f"PLC {row.id}      配置保存成功!")
+            QMessageBox.information(self, "成功", f"PLC {row.id} 保存成功")
         except Exception as exc:
             self.services.bus.log.emit(f"保存 PLC 配置失败: {exc}")
             QMessageBox.warning(self, "提示", f"保存 PLC 配置失败: {exc}")
