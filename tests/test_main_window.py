@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+import gc
 import os
 import sys
 from types import ModuleType, SimpleNamespace
@@ -32,7 +34,7 @@ if "snap7" not in sys.modules:
     sys.modules["snap7.util"] = snap7_util_module
 
 from PyQt6 import sip
-from PyQt6.QtCore import QCoreApplication, Qt
+from PyQt6.QtCore import QCoreApplication, QEvent, Qt
 from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import QApplication, QLabel, QWidget
 
@@ -41,7 +43,8 @@ try:
 except Exception:  # pragma: no cover - pyqtgraph import is environment-dependent
     GraphicsView = None
 else:
-    GraphicsView.paintEvent = lambda self, event: None
+    _ORIGINAL_GRAPHICS_VIEW_PAINT_EVENT = GraphicsView.paintEvent
+    _NOOP_GRAPHICS_VIEW_PAINT_EVENT = lambda self, event: None
 
 from app.service.analysis.frames import StftFrame
 from app.services_container import (
@@ -50,6 +53,8 @@ from app.services_container import (
     FactoryReviewWindow,
 )
 import app.main_window as main_window_mod
+from consts.style import APP_QSS
+from ui.widgets.cards import Card
 
 
 class _SignalStub:
@@ -72,6 +77,7 @@ class _BusStub:
         self.log = _SignalStub()
         self.workorder_changed = _SignalStub()
         self.result_changed = _SignalStub()
+        self.test_finished = _SignalStub()
         self.stft_updated = _SignalStub()
         self.fft_updated = _SignalStub()
         self.spl_updated = _SignalStub()
@@ -109,6 +115,7 @@ class _ChannelProbeModule(_StubModule):
     def __init__(self, services=None):
         super().__init__(services)
         self.title_changed = _SignalStub()
+        self.score_title_changed = _SignalStub()
         self.selected_display_channel_provider = None
         self.state_seen_channels = []
         self.review_seen_channels = []
@@ -130,6 +137,9 @@ class _ChannelProbeModule(_StubModule):
 
     def current_title(self) -> str:
         return "响度"
+
+    def current_score_title(self) -> str:
+        return "得分：--"
 
 class _RefreshProbeResultModule(_StubModule):
     def __init__(self, services=None):
@@ -205,12 +215,16 @@ def _close_plot_widget(chart_widget: QWidget) -> None:
 
 @pytest.fixture(autouse=True)
 def _close_top_level_widgets(qapp):
+    if GraphicsView is not None:
+        GraphicsView.paintEvent = _NOOP_GRAPHICS_VIEW_PAINT_EVENT
     yield
+    chart_widgets = []
     for widget in list(qapp.topLevelWidgets()):
         if sip.isdeleted(widget):
             continue
         for child in widget.findChildren(QWidget):
             if _is_analysis_chart_widget(child):
+                chart_widgets.append(child)
                 _disable_updates_and_remove_events(child)
                 _close_plot_widget(child)
         widget.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
@@ -221,14 +235,24 @@ def _close_top_level_widgets(qapp):
         if sip.isdeleted(widget):
             continue
         widget.deleteLater()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    for widget in chart_widgets:
+        if not sip.isdeleted(widget):
+            QCoreApplication.removePostedEvents(widget)
     for _ in range(5):
         qapp.processEvents()
+    gc.collect()
+    for _ in range(5):
+        qapp.processEvents()
+    if GraphicsView is not None:
+        GraphicsView.paintEvent = _ORIGINAL_GRAPHICS_VIEW_PAINT_EVENT
 
 
 def _patch_non_target_modules(monkeypatch, *, use_real_control: bool = False):
     module_names = [
         "WorkOrderModule",
         "VideoModule",
+        "TodayStatisticsModule",
         "HardwareModule",
         "InputCalibrationModule",
         "ConfigModule",
@@ -850,6 +874,35 @@ def _review_payload_with_chart_payload(
     )
 
 
+def _review_payload_with_vibration(
+    config_id: int = 101,
+    *,
+    vibration_channel: int = 1,
+) -> FactoryReviewPayload:
+    payload = _review_payload_with_chart_payload(config_id, channels=(0, 1))
+    payload.chart_payload[vibration_channel]["vibration"] = {
+        "channel_index": vibration_channel,
+        "sample_rate": 1000.0,
+        "overall_rms": 1.0,
+        "overall_peak": 2.0,
+        "overall_crest_factor": 2.0,
+        "dominant_frequency_hz": 50.0,
+        "times_sec": [0.05, 0.10],
+        "rms_values": [0.8, 1.0],
+        "peak_values": [1.5, 2.0],
+        "crest_factors": [1.8, 2.0],
+        "calibration_value": 1.0,
+    }
+    return dataclasses.replace(
+        payload,
+        config_payload={
+            "config_id": config_id,
+            "selected_channels": [0, 1],
+            "vibration_view_channel_index": vibration_channel,
+        },
+    )
+
+
 def _summary_payload(
     *,
     overall_status: str,
@@ -1177,7 +1230,7 @@ def test_next_run_reset_clears_result_stft_and_chart_cards_before_next_review_pa
     qapp.processEvents()
 
     assert window.result.empty_state.isHidden() is True
-    assert window.stft.selection_box.isVisible() is True
+    assert window.stft.selection_box.isVisible() is False
     _assert_chart_cards_visible(window)
 
     services.bus.factory_display_reset.emit("next_run_accepted")
@@ -1255,7 +1308,7 @@ def test_selection_changed_reset_clears_result_stft_and_chart_cards(qapp, monkey
     qapp.processEvents()
 
     assert window.result.empty_state.isHidden() is True
-    assert window.stft.selection_box.isVisible() is True
+    assert window.stft.selection_box.isVisible() is False
     _assert_chart_cards_visible(window)
 
     services.bus.factory_display_reset.emit("selection_changed")
@@ -1275,21 +1328,87 @@ def test_main_window_reflows_test_page_for_loudness_and_video(qapp, monkeypatch)
     _show(window, qapp)
 
     assert "系统日志" not in _test_page_card_titles(window)
-    assert _card_title(_test_page_left_slot_card(window, 2)) == "视频预览"
-    assert window.video.parentWidget() is _test_page_left_slot_card(window, 2)
     assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度"
-    assert window.loudness.parentWidget() is _test_page_grid_card(window, 2, 0)
+    assert window.loudness.parentWidget() is window.loudness_stack
+    assert window.loudness_stack.parentWidget() is _test_page_grid_card(window, 2, 0)
 
 
 def test_test_page_uses_chinese_chart_titles_with_units(qapp, monkeypatch):
     window, _ = _make_window(monkeypatch)
     _show(window, qapp)
 
-    assert _card_title(_test_page_grid_card(window, 1, 2)) == "FFT频谱（dB）"
-    assert _card_title(_test_page_grid_card(window, 1, 1)) == "STFT时频图（频率Hz，幅值dB）"
+    assert _card_title(_test_page_grid_card(window, 1, 2)) == "频谱"
+    assert _card_title(_test_page_grid_card(window, 1, 1)) == "时频图"
     assert _card_title(_test_page_grid_card(window, 2, 0)) == "响度"
     assert _card_title(_test_page_grid_card(window, 2, 1)) == "声压级（dB）"
     assert _card_title(_test_page_grid_card(window, 2, 2)) == "倍频程（dB）"
+
+
+def test_stft_card_shows_score_label_without_changing_title(qapp, monkeypatch):
+    window, _services = _make_window(monkeypatch)
+    _show(window, qapp)
+    stft_card = _test_page_grid_card(window, 1, 1)
+
+    assert stft_card.title() == "时频图"
+    assert stft_card.title_suffix() == "频谱平均得分：--"
+    assert stft_card.title_metric_label.text() == "频谱平均得分："
+    assert stft_card.title_metric_value_label.text() == "--"
+
+    window.stft.score_title_changed.emit("得分：87.42")
+
+    assert stft_card.title() == "时频图"
+    assert stft_card.title_suffix() == "频谱平均得分：87.42"
+    assert stft_card.title_metric_label.text() == "频谱平均得分："
+    assert stft_card.title_metric_value_label.text() == "87.42"
+
+
+def test_only_stft_card_has_score_suffix(qapp, monkeypatch):
+    window, _services = _make_window(monkeypatch)
+    _show(window, qapp)
+
+    assert _test_page_grid_card(window, 1, 1).title_suffix() == "频谱平均得分：--"
+    assert _test_page_grid_card(window, 1, 0).title_suffix() == ""
+    assert _test_page_grid_card(window, 1, 2).title_suffix() == ""
+    assert _test_page_grid_card(window, 2, 0).title_suffix() == ""
+    assert _test_page_grid_card(window, 2, 1).title_suffix() == ""
+    assert _test_page_grid_card(window, 2, 2).title_suffix() == ""
+
+
+def test_card_title_suffix_does_not_overlap_title_at_narrow_width(qapp):
+    body = QWidget()
+    card = Card("时频图", body)
+    card.set_title_metric("频谱平均得分：", "87.42")
+    card.resize(220, 120)
+    card.show()
+    qapp.processEvents()
+
+    assert card.title_label.geometry().right() < card.title_metric_widget.geometry().left()
+    assert card.title_metric_widget.geometry().top() >= card.contentsRect().top()
+    assert card.title_metric_widget.geometry().right() <= card.contentsRect().right()
+    assert card.title_metric_widget.geometry().bottom() < body.geometry().top()
+    assert card.title_metric_value_label.minimumWidth() == 68
+    assert card.title_metric_value_label.minimumHeight() == 26
+
+
+def test_card_title_metric_uses_score_value_box_style():
+    label_style = APP_QSS.split("QLabel#CardTitleMetricLabel", 1)[1].split("}", 1)[0]
+    value_style = APP_QSS.split("QLabel#CardTitleMetricValue", 1)[1].split("}", 1)[0]
+
+    assert "font-size: 15px;" in label_style
+    assert "font-size: 15px;" in value_style
+    assert "border: 1px solid #cbd5e1;" in value_style
+
+
+def test_card_empty_title_suffix_is_hidden_and_title_uses_row_width(qapp):
+    body = QWidget()
+    card = Card("时频图", body)
+    card.resize(360, 120)
+    card.show()
+    qapp.processEvents()
+
+    assert card.title_suffix() == ""
+    assert card.title_suffix_label.isHidden()
+    assert card.title_label.geometry().width() > body.geometry().width() * 0.70
 
 
 def test_loudness_card_title_updates_to_rendered_unit(qapp, monkeypatch):
@@ -1502,6 +1621,418 @@ def test_main_window_analysis_toolbar_uses_chinese_channel_text(qapp, monkeypatc
     assert combo.itemText(1) == "通道2"
     assert combo.itemData(1) == 1
     assert window.analysis_toolbar.context_label.text() == "配置 101 / 通道1"
+
+
+def test_imported_review_toolbar_uses_chart_payload_channels_and_labels(qapp, monkeypatch):
+    _patch_non_target_modules(monkeypatch)
+    review = FactoryReviewPayload(
+        displayed_config_id=101,
+        run_id="import-101",
+        trigger_source="import_audio",
+        chart_payload={0: {"spl": {}}, 6: {"spl": {}}},
+        display_channel_labels={0: "配置通道1 / WAV 1", 6: "仅图表 / WAV 2"},
+    )
+    state = FactoryControllerState(
+        selected_config_ids=(101,),
+        displayed_config_id=101,
+        run_phase="reviewing",
+    )
+    services = _make_services(initial_state=state, initial_review_payload=review)
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0],
+        "channels": [{"channel_index": 0}],
+    }
+
+    window = main_window_mod.MainWindow(services)
+
+    assert window.analysis_toolbar.channel_combo.itemText(0) == "配置通道1 / WAV 1"
+    assert window.analysis_toolbar.channel_combo.itemText(1) == "仅图表 / WAV 2"
+    assert "导入音频" in window.analysis_toolbar.context_label.text()
+
+    window._sync_selected_display_channel(6, refresh_modules=False)
+
+    assert window.current_display_channel_index() == 6
+    assert "导入音频" in window.analysis_toolbar.context_label.text()
+
+
+def test_main_window_imported_reanalysis_interim_review_preserves_chart_only_channel(
+    qapp,
+    monkeypatch,
+):
+    initial_payload = dataclasses.replace(
+        _review_payload_with_chart_payload(101, channels=(0, 6)),
+        trigger_source="import_audio",
+        display_channel_labels={0: "配置通道1 / WAV 1", 6: "仅图表 / WAV 2"},
+    )
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=initial_payload,
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(initial_payload)
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 6)
+
+    interim_payload = dataclasses.replace(
+        initial_payload,
+        judgment_payload=None,
+        summary_payload=None,
+        chart_payload=None,
+    )
+    services.bus.factory_review_changed.emit(interim_payload)
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 6
+    assert window.analysis_toolbar.current_channel_index() == 6
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            selected_config_ids=(101, 202),
+            displayed_config_id=101,
+            run_phase="reanalyzing",
+            trigger_source="import_audio",
+        )
+    )
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 6
+    assert window.analysis_toolbar.current_channel_index() == 6
+    assert window.stft.selected_display_channel_provider() == 6
+
+    services.bus.factory_review_changed.emit(initial_payload)
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 6
+    assert window.analysis_toolbar.current_channel_index() == 6
+
+
+def test_hardware_review_toolbar_still_uses_selected_config_channels(qapp, monkeypatch):
+    _patch_non_target_modules(monkeypatch)
+    review = FactoryReviewPayload(
+        displayed_config_id=101,
+        run_id="run-101",
+        trigger_source="manual",
+        chart_payload={0: {"spl": {}}, 2: {"spl": {}}},
+    )
+    state = FactoryControllerState(
+        selected_config_ids=(101,),
+        displayed_config_id=101,
+        run_phase="reviewing",
+    )
+    services = _make_services(initial_state=state, initial_review_payload=review)
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0],
+        "channels": [{"channel_index": 0}],
+    }
+
+    window = main_window_mod.MainWindow(services)
+
+    assert window.analysis_toolbar.channel_combo.count() == 1
+    assert window.analysis_toolbar.channel_combo.itemData(0) == 0
+
+
+def test_running_hardware_toolbar_ignores_stale_imported_review_channels(qapp, monkeypatch):
+    _patch_non_target_modules(monkeypatch)
+    review = FactoryReviewPayload(
+        displayed_config_id=101,
+        run_id="import-101",
+        trigger_source="import_audio",
+        chart_payload={0: {"spl": {}}, 6: {"spl": {}}},
+        display_channel_labels={6: "仅图表 / WAV 2"},
+    )
+    state = FactoryControllerState(
+        selected_config_ids=(101,),
+        displayed_config_id=101,
+        run_phase="running",
+    )
+    services = _make_services(initial_state=state, initial_review_payload=review)
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+        "channels": [{"channel_index": 0}, {"channel_index": 1}],
+    }
+
+    window = main_window_mod.MainWindow(services)
+
+    assert window.analysis_toolbar.channel_combo.count() == 2
+    assert window.analysis_toolbar.channel_combo.itemData(0) == 0
+    assert window.analysis_toolbar.channel_combo.itemData(1) == 1
+    assert "导入音频" not in window.analysis_toolbar.context_label.text()
+
+
+def test_analysis_defaults_to_vibration_channel_from_review_config(qapp, monkeypatch):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_vibration(
+            101,
+            vibration_channel=1,
+        ),
+    )
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_vibration(101, vibration_channel=1)
+    )
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 1
+    assert window.analysis_toolbar.current_channel_index() == 1
+
+
+def test_vibration_channel_resolution_uses_review_payload_config_before_loaded_config(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_vibration(
+            101,
+            vibration_channel=1,
+        ),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+        "vibration_view_channel_index": 0,
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_vibration(101, vibration_channel=1)
+    )
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 1
+
+
+def test_imported_review_defaults_to_vibration_channel_from_payload_config(
+    qapp,
+    monkeypatch,
+):
+    payload = dataclasses.replace(
+        _review_payload_with_vibration(101, vibration_channel=1),
+        trigger_source="import_audio",
+        display_channel_labels={0: "配置通道1 / WAV 1", 1: "配置通道2 / WAV 2"},
+    )
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=payload,
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+        "vibration_view_channel_index": 0,
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(payload)
+    qapp.processEvents()
+
+    context = window.analysis_toolbar.context_label.text()
+    assert window.current_display_channel_index() == 1
+    assert window.analysis_toolbar.current_channel_index() == 1
+    assert "配置通道2 / WAV 2" in context
+    assert context.count("振动") == 1
+    assert window.analysis_toolbar.channel_combo.currentText() == "配置通道2 / WAV 2（振动）"
+
+
+def test_vibration_channel_switches_card_titles_and_body_modules(qapp, monkeypatch):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_vibration(
+            101,
+            vibration_channel=1,
+        ),
+    )
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_vibration(101, vibration_channel=1)
+    )
+    qapp.processEvents()
+
+    assert _card_title(_test_page_grid_card(window, 1, 1)) == "振动纹理"
+    assert _card_title(_test_page_grid_card(window, 1, 2)) == "振动频谱"
+    assert _card_title(_test_page_grid_card(window, 2, 0)) == "振动频率稳定性"
+    assert _card_title(_test_page_grid_card(window, 2, 1)) == "振动脉冲"
+    assert _card_title(_test_page_grid_card(window, 2, 2)) == "机械频带"
+    assert window.loudness_stack.currentWidget() is window.vibration_axis
+    assert window.spl_stack.currentWidget() is window.vibration_trend
+    assert "振动" in window.analysis_toolbar.context_label.text()
+
+    window.analysis_toolbar.channel_changed.emit(0)
+    qapp.processEvents()
+
+    assert _card_title(_test_page_grid_card(window, 1, 1)) == "时频图"
+    assert _card_title(_test_page_grid_card(window, 1, 2)) == "频谱"
+    assert _card_title(_test_page_grid_card(window, 2, 0)).startswith("响度")
+    assert _card_title(_test_page_grid_card(window, 2, 1)) == "声压级（dB）"
+    assert _card_title(_test_page_grid_card(window, 2, 2)) == "倍频程（dB）"
+    assert window.loudness_stack.currentWidget() is window.loudness
+    assert window.spl_stack.currentWidget() is window.spl
+
+
+def test_vibration_same_config_reset_discards_manual_acoustic_selection_before_next_review(
+    qapp,
+    monkeypatch,
+):
+    first_payload = _review_payload_with_vibration(101, vibration_channel=1)
+    next_payload = dataclasses.replace(first_payload, run_id="run-101-next")
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=first_payload,
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+        "vibration_view_channel_index": 1,
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(first_payload)
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 1
+
+    window.analysis_toolbar.channel_changed.emit(0)
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 0
+
+    services.bus.factory_display_channel_changed.emissions.clear()
+    services.bus.factory_display_reset.emit("next_run_accepted")
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 1
+    assert services.bus.factory_display_channel_changed.emissions[-1][0] == (101, 1)
+    assert all(
+        emission[0] != (101, 0)
+        for emission in services.bus.factory_display_channel_changed.emissions
+    )
+
+    services.bus.factory_review_changed.emit(next_payload)
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 1
+    assert window.analysis_toolbar.current_channel_index() == 1
+
+
+def test_invalid_vibration_channel_keeps_existing_default_display(qapp, monkeypatch):
+    payload = _review_payload_with_chart_payload(101, channels=(0, 1))
+    payload = dataclasses.replace(
+        payload,
+        config_payload={
+            "config_id": 101,
+            "selected_channels": [0, 1],
+            "vibration_view_channel_index": 9,
+        },
+    )
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=payload,
+    )
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(payload)
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 0
+    assert _card_title(_test_page_grid_card(window, 2, 1)) == "声压级（dB）"
+
+
+@pytest.mark.parametrize("chart_payload", [{}, None])
+def test_empty_review_chart_payload_does_not_default_to_vibration_channel(
+    qapp,
+    monkeypatch,
+    chart_payload,
+):
+    payload = dataclasses.replace(
+        _review_payload_with_chart_payload(101, channels=(0, 1)),
+        chart_payload=chart_payload,
+        config_payload={
+            "config_id": 101,
+            "selected_channels": [0, 1],
+            "vibration_view_channel_index": 1,
+        },
+    )
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=payload,
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+        "vibration_view_channel_index": 1,
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(payload)
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 0
+    assert window.analysis_toolbar.current_channel_index() == 0
+    assert _card_title(_test_page_grid_card(window, 2, 1)) == "声压级（dB）"
+
+
+def test_vibration_channel_applies_non_acoustic_chart_semantics(qapp, monkeypatch):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_vibration(
+            101,
+            vibration_channel=1,
+        ),
+    )
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_vibration(101, vibration_channel=1)
+    )
+    qapp.processEvents()
+
+    assert window.spectrum.plot.value_semantics() == "vibration"
+    assert window.octave.plot.value_semantics() == "vibration"
+    spectrum_headers = window.spectrum.plot.export_csv_table().headers
+    octave_headers = window.octave.plot.export_csv_table().headers
+    assert "level_db" not in spectrum_headers
+    assert "golden_level_db" not in spectrum_headers
+    assert "calibrated_amplitude" in spectrum_headers
+    assert "level_db" not in octave_headers
+    assert "golden_level_db" not in octave_headers
+    assert "calibrated_amplitude" in octave_headers
+    assert "dB" not in _card_title(_test_page_grid_card(window, 1, 2))
+    assert "dB" not in _card_title(_test_page_grid_card(window, 2, 2))
+
+    window.analysis_toolbar.channel_changed.emit(0)
+    qapp.processEvents()
+
+    assert window.spectrum.plot.value_semantics() == "acoustic"
+    assert window.octave.plot.value_semantics() == "acoustic"
 
 
 def test_main_window_toolbar_selection_immediately_refreshes_stft_cached_channel(
@@ -1915,6 +2446,153 @@ def test_main_window_toolbar_selection_immediately_refreshes_committed_chart_mod
     _assert_committed_chart_channel(window, channel_index=1)
 
 
+def test_main_window_reanalysis_interim_review_preserves_selected_display_channel(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0, 1)),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0, 1))
+    )
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 1)
+
+    interim_payload = dataclasses.replace(
+        _review_payload_with_chart_payload(101, channels=(0, 1)),
+        judgment_payload=None,
+        summary_payload=None,
+        chart_payload=None,
+    )
+    services.bus.factory_review_changed.emit(interim_payload)
+    qapp.processEvents()
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            selected_config_ids=(101, 202),
+            displayed_config_id=101,
+            run_phase="reanalyzing",
+            trigger_source="manual",
+        )
+    )
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 1
+    assert window.analysis_toolbar.current_channel_index() == 1
+    assert window.stft.selected_display_channel_provider() == 1
+
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0, 1))
+    )
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 1
+    assert window.analysis_toolbar.current_channel_index() == 1
+    _assert_committed_chart_channel(window, channel_index=1)
+
+
+def test_main_window_reanalysis_interim_review_preserves_auto_resolved_display_channel(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(1,)),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(1,))
+    )
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 1
+    assert window.analysis_toolbar.current_channel_index() == 1
+    assert window.display_channel_by_config_id[101] == 1
+    assert window._last_selected_display_channel is None
+
+    interim_payload = dataclasses.replace(
+        _review_payload_with_chart_payload(101, channels=(1,)),
+        judgment_payload=None,
+        summary_payload=None,
+        chart_payload=None,
+    )
+    services.bus.factory_review_changed.emit(interim_payload)
+    qapp.processEvents()
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            selected_config_ids=(101, 202),
+            displayed_config_id=101,
+            run_phase="reanalyzing",
+            trigger_source="manual",
+        )
+    )
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 1
+    assert window.analysis_toolbar.current_channel_index() == 1
+    assert window.stft.selected_display_channel_provider() == 1
+
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0, 1))
+    )
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 1
+    assert window.analysis_toolbar.current_channel_index() == 1
+    assert window.stft.selected_display_channel_provider() == 1
+    _assert_committed_chart_channel(window, channel_index=1)
+
+
+def test_main_window_reanalysis_final_payload_missing_selected_channel_falls_back(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        initial_state=_reviewing_state(101),
+        initial_review_payload=_review_payload_with_chart_payload(101, channels=(0, 1)),
+    )
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0, 1],
+    }
+    _show(window, qapp)
+
+    services.bus.factory_state_changed.emit(_reviewing_state(101))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0, 1))
+    )
+    qapp.processEvents()
+    _select_toolbar_channel(window, qapp, 1)
+
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0,))
+    )
+    qapp.processEvents()
+
+    assert window.current_display_channel_index() == 0
+    assert window.analysis_toolbar.current_channel_index() == 0
+    _assert_committed_chart_channel(window, channel_index=0)
+
+
 def test_main_window_analysis_toolbar_remains_visible_in_stopped_phase(
     qapp,
     monkeypatch,
@@ -1992,7 +2670,12 @@ def test_main_window_review_loudness_card_uses_data_focused_y_range(
     )
     qapp.processEvents()
 
-    assert window.loudness.plot.plot_item.vb.viewRange()[1] == pytest.approx((9.8, 12.2))
+    y_min, y_max = window.loudness.plot.plot_item.vb.viewRange()[1]
+    payload = window.loudness.current_plot_payload()
+    assert payload["lower_limit"] == 0.0
+    assert payload["upper_limit"] == 60.0
+    assert y_min <= 0.0
+    assert y_max >= 60.0
 
 
 def test_main_window_ai_partial_no_result_keeps_rule_rows_and_committed_charts_visible(
@@ -2030,7 +2713,7 @@ def test_main_window_ai_partial_no_result_keeps_rule_rows_and_committed_charts_v
     assert _result_table_value(window, 1, 1) == "-0.5 sone"
     assert _result_table_value(window, 1, 2) == "通道2"
     assert _result_table_value(window, 1, 3) == "OK"
-    assert _result_table_value(window, 2, 0) == "FFT频谱"
+    assert _result_table_value(window, 2, 0) == "频谱"
     assert _result_table_value(window, 2, 1) == "2 dB"
     assert _result_table_value(window, 2, 2) == "通道1"
     assert _result_table_value(window, 2, 3) == "NG"

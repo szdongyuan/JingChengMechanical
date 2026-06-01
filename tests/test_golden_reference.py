@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from scipy import signal as scipy_signal
 from scipy.io import wavfile
 
 from app.service.analysis import golden_reference as golden_reference_module
@@ -20,9 +21,10 @@ def _write_temp_wav(
     sample_rate: int = 48_000,
     samples: int = 144_000,
     channels: int = 1,
+    amplitude: float = 0.5,
 ) -> tuple[Path, np.ndarray]:
     path.parent.mkdir(parents=True, exist_ok=True)
-    base = np.linspace(-0.5, 0.5, samples, dtype=np.float32)
+    base = np.linspace(-amplitude, amplitude, samples, dtype=np.float32)
     if channels <= 1:
         data = base
     else:
@@ -142,6 +144,161 @@ def test_bundle_for_channel_rejects_sample_count_mismatch_against_binding_metada
             runtime_sample_rate=48_000.0,
             mic_sensitivity=1.0,
         )
+
+
+def test_golden_reference_can_resample_to_import_runtime_rate(tmp_path):
+    service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    golden_path, golden_data = _write_temp_wav(
+        tmp_path / "managed" / "config_1" / "gold.wav",
+        sample_rate=48_000,
+        samples=480,
+    )
+    cache = GoldenReferenceCache(golden_sample_service=service)
+
+    bundle = cache.bundle_for_channel(
+        channel_index=0,
+        channel_config=_binding(
+            golden_path,
+            sample_rate=48_000.0,
+            num_samples=480,
+        ),
+        configured_input_sample_rate=48_000.0,
+        runtime_sample_rate=25_600.0,
+        mic_sensitivity=0.0,
+        allow_runtime_resample=True,
+    )
+
+    expected = scipy_signal.resample_poly(golden_data.astype(np.float64), 16, 30)
+    assert bundle.sample_rate == 25_600.0
+    assert bundle.signal.size == pytest.approx(256, abs=1)
+    np.testing.assert_allclose(bundle.signal, expected, rtol=1e-12, atol=1e-12)
+
+
+def test_golden_reference_strict_mode_still_rejects_rate_mismatch(tmp_path):
+    service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    golden_path, _ = _write_temp_wav(
+        tmp_path / "managed" / "config_1" / "gold.wav",
+        sample_rate=48_000,
+        samples=480,
+    )
+    cache = GoldenReferenceCache(golden_sample_service=service)
+
+    with pytest.raises(GoldenReferenceError, match="采样率"):
+        cache.bundle_for_channel(
+            channel_index=0,
+            channel_config=_binding(
+                golden_path,
+                sample_rate=48_000.0,
+                num_samples=480,
+            ),
+            configured_input_sample_rate=48_000.0,
+            runtime_sample_rate=25_600.0,
+            mic_sensitivity=0.0,
+        )
+
+
+def test_golden_reference_resample_mode_uses_noop_calibration_when_zero(tmp_path):
+    service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    golden_path, _ = _write_temp_wav(
+        tmp_path / "managed" / "config_1" / "gold.wav",
+        sample_rate=48_000,
+        samples=480,
+        amplitude=0.5,
+    )
+    cache = GoldenReferenceCache(golden_sample_service=service)
+
+    bundle = cache.bundle_for_channel(
+        channel_index=0,
+        channel_config=_binding(
+            golden_path,
+            sample_rate=48_000.0,
+            num_samples=480,
+        ),
+        configured_input_sample_rate=48_000.0,
+        runtime_sample_rate=25_600.0,
+        mic_sensitivity=0.0,
+        allow_runtime_resample=True,
+    )
+
+    assert np.max(np.abs(bundle.signal)) <= 1.0
+
+
+def test_golden_reference_resample_mode_still_validates_actual_wav_sample_rate(
+    tmp_path,
+):
+    service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    golden_path, _ = _write_temp_wav(
+        tmp_path / "managed" / "config_1" / "gold.wav",
+        sample_rate=44_100,
+        samples=441,
+    )
+    cache = GoldenReferenceCache(golden_sample_service=service)
+
+    with pytest.raises(GoldenReferenceError, match="采样率"):
+        cache.bundle_for_channel(
+            channel_index=0,
+            channel_config=_binding(
+                golden_path,
+                sample_rate=48_000.0,
+                num_samples=441,
+            ),
+            configured_input_sample_rate=48_000.0,
+            runtime_sample_rate=25_600.0,
+            mic_sensitivity=0.0,
+            allow_runtime_resample=True,
+        )
+
+
+def test_golden_reference_resample_mode_still_validates_sample_count(tmp_path):
+    service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    golden_path, _ = _write_temp_wav(
+        tmp_path / "managed" / "config_1" / "gold.wav",
+        sample_rate=48_000,
+        samples=480,
+    )
+    cache = GoldenReferenceCache(golden_sample_service=service)
+
+    with pytest.raises(GoldenReferenceError, match="长度"):
+        cache.bundle_for_channel(
+            channel_index=0,
+            channel_config=_binding(
+                golden_path,
+                sample_rate=48_000.0,
+                num_samples=960,
+            ),
+            configured_input_sample_rate=48_000.0,
+            runtime_sample_rate=25_600.0,
+            mic_sensitivity=0.0,
+            allow_runtime_resample=True,
+        )
+
+
+def test_golden_reference_resample_mode_does_not_rewrite_managed_file_or_binding(
+    tmp_path,
+):
+    service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    golden_path, _ = _write_temp_wav(
+        tmp_path / "managed" / "config_1" / "gold.wav",
+        sample_rate=48_000,
+        samples=480,
+    )
+    original_bytes = golden_path.read_bytes()
+    binding = _binding(golden_path, sample_rate=48_000.0, num_samples=480)
+    original_binding = dict(binding)
+    cache = GoldenReferenceCache(golden_sample_service=service)
+
+    bundle = cache.bundle_for_channel(
+        channel_index=0,
+        channel_config=binding,
+        configured_input_sample_rate=48_000.0,
+        runtime_sample_rate=25_600.0,
+        mic_sensitivity=0.0,
+        allow_runtime_resample=True,
+    )
+
+    assert bundle.sample_rate == 25_600.0
+    assert golden_path.read_bytes() == original_bytes
+    assert binding == original_binding
 
 
 def test_ensure_fft_wraps_derivation_failures_in_golden_reference_error(

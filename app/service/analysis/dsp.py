@@ -4,6 +4,7 @@ Most functions operate on numpy arrays and have no side effects.
 """
 from __future__ import annotations
 
+from collections.abc import Sequence
 from functools import lru_cache
 from math import log2
 from numbers import Integral
@@ -83,6 +84,11 @@ def _c_weight_linear(f: float) -> float:
 
 _REF_PRESSURE = 20e-6
 LOUDNESS_BACKEND_SAMPLE_RATE = 48000.0
+LOUDNESS_TRACE_ALGORITHM = "reduced_zwtv"
+LOUDNESS_TRACE_INTERNAL_RATE_HZ = 150.0
+LOUDNESS_TRACE_DISPLAY_RATE_HZ = 25.0
+_LOUDNESS_REDUCED_ZWTV_NL_ITER = 12
+_LOUDNESS_REDUCED_ZWTV_LP_ITER = 12
 LOUDNESS_WINDOW_SAMPLES = 8192
 _LOUDNESS_MIN_SAMPLE_RATE = LOUDNESS_BACKEND_SAMPLE_RATE
 _LOUDNESS_WINDOW_SAMPLES = LOUDNESS_WINDOW_SAMPLES
@@ -240,6 +246,247 @@ def _load_loudness_backend():
 def _compute_loudness_zwtv(signal: np.ndarray, sample_rate: float):
     backend = _load_loudness_backend()
     return backend(signal, int(round(sample_rate)), field_type="free")
+
+
+@lru_cache(maxsize=1)
+def _load_reduced_zwtv_components():
+    try:
+        from mosqito.sq_metrics.loudness.loudness_zwtv._third_octave_levels import _third_octave_levels
+        from mosqito.sq_metrics.loudness.loudness_zwst._calc_slopes import _calc_slopes
+        from mosqito.sq_metrics.loudness.loudness_zwst._main_loudness import _main_loudness
+    except ImportError as exc:
+        raise RuntimeError("MoSQITo loudness backend is unavailable") from exc
+    return _third_octave_levels, _main_loudness, _calc_slopes
+
+
+def _loudness_trace_internal_times(signal_size: int) -> np.ndarray:
+    period_samples = int(LOUDNESS_BACKEND_SAMPLE_RATE // LOUDNESS_TRACE_INTERNAL_RATE_HZ)
+    count = max(1, int(signal_size) // period_samples + 1)
+    return np.arange(count, dtype=np.float64) / LOUDNESS_TRACE_INTERNAL_RATE_HZ
+
+
+def _interpolate_third_octave_levels(
+    third_octave_levels: np.ndarray,
+    source_times: np.ndarray,
+    target_times: np.ndarray,
+) -> np.ndarray:
+    levels = np.asarray(third_octave_levels, dtype=np.float64)
+    source = np.asarray(source_times, dtype=np.float64).reshape(-1)
+    target = np.asarray(target_times, dtype=np.float64).reshape(-1)
+    if levels.ndim != 2 or source.size == 0 or levels.shape[1] != source.size:
+        raise RuntimeError("MoSQITo loudness backend returned unusable output")
+    if not np.all(np.isfinite(levels)) or not np.all(np.isfinite(source)):
+        raise RuntimeError("MoSQITo loudness backend returned non-finite output")
+    if source.size > 1 and not np.all(np.diff(source) > 0.0):
+        raise RuntimeError("MoSQITo loudness backend returned unusable output")
+
+    interpolated = np.empty((levels.shape[0], target.size), dtype=np.float64)
+    for band_index in range(levels.shape[0]):
+        band = levels[band_index]
+        interpolated[band_index, :] = np.interp(
+            target,
+            source,
+            band,
+            left=float(band[0]),
+            right=float(band[-1]),
+        )
+    return interpolated
+
+
+def _reduced_zwtv_nonlinear_loudness(
+    core_loudness: np.ndarray,
+    *,
+    sample_rate: float,
+    nl_iter: int,
+) -> np.ndarray:
+    """Mirror MoSQITo's private nonlinear decay with configurable reduced rate."""
+    core = np.asarray(core_loudness, dtype=np.float64)
+    if core.ndim != 2 or core.shape[0] <= 0 or core.shape[1] <= 0:
+        raise RuntimeError("MoSQITo loudness backend returned unusable output")
+
+    nl_loudness = core.copy()
+    t_short = 0.005
+    t_long = 0.015
+    t_var = 0.075
+    delta_t = 1.0 / (float(sample_rate) * int(nl_iter))
+    p_value = (t_var + t_long) / (t_var * t_short)
+    q_value = 1.0 / (t_short * t_var)
+    lambda_1 = -p_value / 2.0 + np.sqrt(p_value * p_value / 4.0 - q_value)
+    lambda_2 = -p_value / 2.0 - np.sqrt(p_value * p_value / 4.0 - q_value)
+    den = t_var * (lambda_1 - lambda_2)
+    e1 = np.exp(lambda_1 * delta_t)
+    e2 = np.exp(lambda_2 * delta_t)
+    factors = [
+        (e1 - e2) / den,
+        ((t_var * lambda_2 + 1.0) * e1 - (t_var * lambda_1 + 1.0) * e2) / den,
+        ((t_var * lambda_1 + 1.0) * e1 - (t_var * lambda_2 + 1.0) * e2) / den,
+        (t_var * lambda_1 + 1.0) * (t_var * lambda_2 + 1.0) * (e1 - e2) / den,
+        np.exp(-delta_t / t_long),
+        np.exp(-delta_t / t_var),
+    ]
+
+    delta = core.copy()
+    delta = np.roll(delta, -1, axis=1)
+    delta[:, -1] = 0.0
+    delta = (delta - nl_loudness) / int(nl_iter)
+
+    ui_delta = np.zeros((core.shape[0], core.shape[1], int(nl_iter)), dtype=np.float64)
+    ui_delta[:, :, 0] = core
+    for i_in in np.arange(1, int(nl_iter)):
+        ui_delta[:, :, i_in] = ui_delta[:, :, i_in - 1] + delta
+    ui_delta = ui_delta.reshape(core.shape[0], core.shape[1] * int(nl_iter))
+
+    uo_mat = ui_delta.copy()
+    u2_mat = np.zeros(uo_mat.shape, dtype=np.float64)
+    mask = core[:, 0] >= 1e-5
+    u2_mat[mask, 0] = core[mask, 0] * (1.0 - factors[5])
+
+    for col in np.arange(core.shape[1] * int(nl_iter)):
+        uo2 = uo_mat[:, col - 1] * factors[2] - u2_mat[:, col - 1] * factors[3]
+        mask = np.logical_and(
+            uo_mat[:, col - 1] > u2_mat[:, col - 1],
+            uo2 >= ui_delta[:, col],
+        )
+        uo_mat[mask, col] = uo2[mask]
+
+        uo2 = uo_mat[:, col - 1] * factors[4]
+        mask = np.logical_and(
+            uo_mat[:, col - 1] <= u2_mat[:, col - 1],
+            uo2 >= ui_delta[:, col],
+        )
+        uo_mat[mask, col] = uo2[mask]
+
+        u2_mat[:, col] = uo_mat[:, col]
+        u22 = uo_mat[:, col - 1] * factors[0] - u2_mat[:, col - 1] * factors[1]
+        mask = np.logical_and(
+            np.logical_and(
+                ui_delta[:, col] < uo_mat[:, col - 1],
+                uo_mat[:, col - 1] > u2_mat[:, col - 1],
+            ),
+            u22 <= uo_mat[:, col],
+        )
+        u2_mat[mask, col] = u22[mask]
+
+        u2_2 = (u2_mat[:, col - 1] - ui_delta[:, col]) * factors[5] + ui_delta[:, col]
+        mask = np.logical_and(
+            ui_delta[:, col] >= uo_mat[:, col - 1],
+            np.logical_not(
+                np.logical_and(
+                    np.abs(ui_delta[:, col] - uo_mat[:, col - 1]) < 1e-5,
+                    uo_mat[:, col] <= u2_mat[:, col - 1],
+                )
+            ),
+        )
+        u2_mat[mask, col] = u2_2[mask]
+
+    return uo_mat.reshape(core.shape[0], core.shape[1], int(nl_iter))[:, :, 0]
+
+
+def _reduced_zwtv_lowpass_intp(
+    loudness: np.ndarray,
+    tau: float,
+    sample_rate: float,
+    lp_iter: int,
+) -> np.ndarray:
+    values = np.asarray(loudness, dtype=np.float64).reshape(-1)
+    num_samples = int(values.size)
+    if num_samples == 0:
+        return values
+
+    a1 = np.exp(-1.0 / (float(sample_rate) * int(lp_iter) * float(tau)))
+    b0 = 1.0 - a1
+    delta = np.roll(values.copy(), -1)
+    delta[-1] = 0.0
+    delta = (delta - values) / int(lp_iter)
+
+    ui_delta = np.zeros((num_samples, int(lp_iter)), dtype=np.float64)
+    ui_delta[:, 0] = values
+    for i_in in np.arange(1, int(lp_iter)):
+        ui_delta[:, i_in] = delta + ui_delta[:, i_in - 1]
+
+    filtered = scipy_signal.lfilter([b0], [1.0, -a1], ui_delta.reshape(int(lp_iter) * num_samples))
+    return filtered.reshape(num_samples, int(lp_iter))[:, 0]
+
+
+def _reduced_zwtv_temporal_weighting(
+    loudness: np.ndarray,
+    *,
+    sample_rate: float = LOUDNESS_TRACE_INTERNAL_RATE_HZ,
+    lp_iter: int = _LOUDNESS_REDUCED_ZWTV_LP_ITER,
+) -> np.ndarray:
+    fast = _reduced_zwtv_lowpass_intp(loudness, 3.5e-3, sample_rate, lp_iter)
+    slow = _reduced_zwtv_lowpass_intp(loudness, 70e-3, sample_rate, lp_iter)
+    return 0.47 * fast + 0.53 * slow
+
+
+def _compute_zwtv_startup_loudness_value(
+    source_spec_third: np.ndarray,
+    main_loudness,
+    calc_slopes,
+) -> float:
+    source = np.asarray(source_spec_third, dtype=np.float64)
+    if source.ndim != 2 or source.shape[1] <= 0:
+        raise RuntimeError("MoSQITo loudness backend returned unusable output")
+    if source.shape[1] > 1:
+        startup_spec = np.column_stack((source[:, 0], source[:, -1]))
+    else:
+        startup_spec = source
+
+    core_loudness = np.asarray(main_loudness(startup_spec, "free"), dtype=np.float64)
+    if core_loudness.ndim == 1:
+        core_loudness = core_loudness.reshape(-1, 1)
+    # MoSQITo's nonlinear helper wraps the first step against the final column.
+    # Keep that startup state aligned with the original helper to avoid a
+    # reduced-rate artifact at the t=0 display sample.
+    core_loudness = _reduced_zwtv_nonlinear_loudness(
+        core_loudness,
+        sample_rate=2000.0,
+        nl_iter=24,
+    )
+    loudness, _specific_loudness = calc_slopes(core_loudness)
+    weighted = _reduced_zwtv_temporal_weighting(
+        np.asarray(loudness, dtype=np.float64).reshape(-1),
+        sample_rate=2000.0,
+        lp_iter=24,
+    )
+    return float(np.asarray(weighted, dtype=np.float64).reshape(-1)[0])
+
+
+def _compute_reduced_zwtv_loudness_values(
+    signal: np.ndarray,
+    sample_rate: float,
+    target_times: np.ndarray,
+) -> np.ndarray:
+    # The public MoSQITo ZWTv API fixes its internal/output rates, so the
+    # reduced path mirrors the private helper sequence with local rate controls.
+    third_octave_levels, main_loudness, calc_slopes = _load_reduced_zwtv_components()
+    spec_third, source_times, _freq = third_octave_levels(signal, int(round(sample_rate)))
+    reduced_spec_third = _interpolate_third_octave_levels(
+        spec_third,
+        source_times,
+        target_times,
+    )
+    core_loudness = np.asarray(main_loudness(reduced_spec_third, "free"), dtype=np.float64)
+    if core_loudness.ndim == 1:
+        core_loudness = core_loudness.reshape(-1, 1)
+    core_loudness = _reduced_zwtv_nonlinear_loudness(
+        core_loudness,
+        sample_rate=LOUDNESS_TRACE_INTERNAL_RATE_HZ,
+        nl_iter=_LOUDNESS_REDUCED_ZWTV_NL_ITER,
+    )
+    loudness, _specific_loudness = calc_slopes(core_loudness)
+    values = _reduced_zwtv_temporal_weighting(
+        np.asarray(loudness, dtype=np.float64).reshape(-1),
+        sample_rate=LOUDNESS_TRACE_INTERNAL_RATE_HZ,
+        lp_iter=_LOUDNESS_REDUCED_ZWTV_LP_ITER,
+    )
+    if values.size:
+        values[0] = _compute_zwtv_startup_loudness_value(
+            spec_third,
+            main_loudness,
+            calc_slopes,
+        )
+    return values
 
 
 class _UnsupportedOptimizedLoudnessInput(Exception):
@@ -438,6 +685,29 @@ def _validate_loudness_values(
     return values
 
 
+def _validate_loudness_trace_inputs(
+    times_sec: Sequence[float],
+    values_sone: Sequence[float],
+) -> tuple[np.ndarray, np.ndarray]:
+    try:
+        times = np.asarray(times_sec, dtype=np.float64).reshape(-1)
+        values = np.asarray(values_sone, dtype=np.float64).reshape(-1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Loudness trace times and values must be finite") from exc
+
+    if times.size == 0 or values.size == 0:
+        raise ValueError("Loudness trace is empty")
+    if times.size != values.size:
+        raise ValueError("Loudness trace times and values must have the same length")
+    if not np.all(np.isfinite(times)) or not np.all(np.isfinite(values)):
+        raise ValueError("Loudness trace times and values must be finite")
+    if np.any(values < 0.0):
+        raise ValueError("Loudness trace values must be non-negative")
+    if times.size > 1 and not np.all(np.diff(times) > 0.0):
+        raise ValueError("Loudness trace times must be strictly increasing")
+    return times, values
+
+
 def _compute_loudness_values_from_windows(
     windows: np.ndarray,
     sample_rate: float,
@@ -449,26 +719,98 @@ def _compute_loudness_values_from_windows(
 
 
 def compute_loudness_trace(signal: np.ndarray, sample_rate: float) -> tuple[list[float], list[float], float]:
-    """Compute a rolling frequency-domain loudness trace in canonical sones."""
+    """Compute a reduced-ZWTv internal loudness trace in canonical sones."""
     sig, backend_sample_rate = _prepare_loudness_signal(signal, sample_rate)
-    window_samples = _loudness_window_samples(backend_sample_rate)
-    hop_samples = _loudness_hop_samples(backend_sample_rate)
-    starts = _loudness_window_starts(int(sig.size), window_samples, hop_samples)
-    windows = _loudness_windows(sig, starts, window_samples)
+    if not np.all(np.isfinite(sig)):
+        raise ValueError("Loudness signal must contain finite values")
 
-    values = _compute_loudness_values_from_windows(windows, backend_sample_rate)
-    if sig.size < window_samples:
-        time_axis = np.array([sig.size / (2.0 * backend_sample_rate)], dtype=np.float64)
-    else:
-        time_axis = (starts.astype(np.float64) + window_samples / 2.0) / backend_sample_rate
-
-    if not np.all(np.isfinite(time_axis)):
-        raise RuntimeError("MoSQITo loudness backend returned non-finite output")
-    if time_axis.size > 1 and not np.all(np.diff(time_axis) > 0.0):
-        raise RuntimeError("MoSQITo loudness backend returned unusable output")
+    time_axis = _loudness_trace_internal_times(int(sig.size))
+    values = _compute_reduced_zwtv_loudness_values(sig, backend_sample_rate, time_axis)
+    values = _validate_loudness_values(values, int(time_axis.size))
+    time_axis, values = _validate_loudness_trace_inputs(time_axis, values)
 
     max_sone = float(np.max(values))
     return time_axis.tolist(), values.tolist(), max_sone
+
+
+def _loudness_trace_times_for_duration(duration_sec: float) -> np.ndarray:
+    try:
+        duration = float(duration_sec)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Loudness analysis window must be finite") from exc
+    if not np.isfinite(duration) or duration <= 0.0:
+        raise ValueError("Loudness analysis window must be positive")
+
+    count = max(
+        1,
+        int(np.floor(duration * LOUDNESS_TRACE_INTERNAL_RATE_HZ + 1e-12)) + 1,
+    )
+    times = np.arange(count, dtype=np.float64) / LOUDNESS_TRACE_INTERNAL_RATE_HZ
+    times = times[times <= duration + 1e-12]
+    if times.size == 0:
+        return np.array([0.0], dtype=np.float64)
+    return times
+
+
+def compute_loudness_trace_for_window(
+    signal: np.ndarray,
+    sample_rate: float,
+    start_sec: float,
+    end_sec: float,
+) -> tuple[list[float], list[float], float]:
+    """Compute selected-window loudness while preserving prior temporal context."""
+    try:
+        start = float(start_sec)
+        end = float(end_sec)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Loudness analysis window must be finite") from exc
+    if not np.isfinite(start) or not np.isfinite(end):
+        raise ValueError("Loudness analysis window must be finite")
+    if end <= start:
+        raise ValueError("Loudness analysis window must be positive")
+
+    full_times, full_values, _full_max = compute_loudness_trace(signal, sample_rate)
+    trace_times, trace_values = _validate_loudness_trace_inputs(full_times, full_values)
+    relative_times = _loudness_trace_times_for_duration(end - start)
+    absolute_times = start + relative_times
+    window_values = np.interp(
+        absolute_times,
+        trace_times,
+        trace_values,
+        left=float(trace_values[0]),
+        right=float(trace_values[-1]),
+    )
+    window_values = _validate_loudness_values(window_values, int(relative_times.size))
+    relative_times, window_values = _validate_loudness_trace_inputs(
+        relative_times,
+        window_values,
+    )
+    return (
+        relative_times.tolist(),
+        window_values.tolist(),
+        float(np.max(window_values)),
+    )
+
+
+def downsample_loudness_trace_for_display(
+    times_sec: Sequence[float],
+    values_sone: Sequence[float],
+) -> tuple[list[float], list[float]]:
+    """Return 25 Hz display loudness data from a validated trace."""
+    times, values = _validate_loudness_trace_inputs(times_sec, values_sone)
+    if times.size == 1:
+        return times.tolist(), values.tolist()
+
+    internal_period = 1.0 / LOUDNESS_TRACE_INTERNAL_RATE_HZ
+    if np.allclose(np.diff(times), internal_period, rtol=0.0, atol=1e-9):
+        return times[::6].tolist(), values[::6].tolist()
+
+    display_period = 1.0 / LOUDNESS_TRACE_DISPLAY_RATE_HZ
+    display_count = max(1, int(np.floor((times[-1] - times[0]) / display_period + 1e-12)) + 1)
+    display_times = times[0] + np.arange(display_count, dtype=np.float64) * display_period
+    display_times = display_times[display_times <= times[-1] + 1e-12]
+    display_values = np.interp(display_times, times, values)
+    return display_times.tolist(), display_values.tolist()
 
 
 def compute_loudness_window_sone(signal: np.ndarray, sample_rate: float) -> float:

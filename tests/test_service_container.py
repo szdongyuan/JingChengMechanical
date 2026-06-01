@@ -5,6 +5,9 @@ from dataclasses import fields, is_dataclass
 import importlib
 import importlib.util
 import inspect
+from pathlib import Path
+import subprocess
+import sys
 from unittest.mock import MagicMock
 
 import pytest
@@ -30,6 +33,20 @@ def _normalized_signal_argument_types(signal) -> tuple[str, ...]:
         signature = signature.split("(", 1)[1]
     signature = signature.removesuffix(")")
     return tuple(part.strip() for part in signature.split(","))
+
+
+def test_services_container_cold_imports_in_subprocess():
+    repo_root = Path(__file__).resolve().parents[1]
+    result = subprocess.run(
+        [sys.executable, "-c", "import app.services_container; print('ok')"],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "ok"
 
 
 def test_service_container_has_ai_service():
@@ -280,6 +297,32 @@ def test_factory_start_blocked_payload_contract_is_explicit():
     assert payload.trigger_source == "manual"
 
 
+def test_import_audio_warning_contract_is_explicit():
+    warning_cls = getattr(mod, "ImportAudioWarning", None)
+    assert warning_cls is not None
+    assert is_dataclass(warning_cls)
+    assert [field.name for field in fields(warning_cls)] == [
+        "code",
+        "message",
+        "severity",
+        "channel_index",
+        "wav_channel_index",
+        "metric",
+    ]
+
+    warning = warning_cls(
+        code="nyquist_skipped",
+        message="超出奈奎斯特频率的限制已跳过",
+        severity="warning",
+        channel_index=0,
+        wav_channel_index=1,
+        metric="fft",
+    )
+
+    assert warning.code == "nyquist_skipped"
+    assert warning.severity == "warning"
+
+
 def test_factory_review_payload_contract_is_explicit():
     review_payload_cls = getattr(mod, "FactoryReviewPayload", None)
     review_window_cls = getattr(mod, "FactoryReviewWindow", None)
@@ -295,6 +338,7 @@ def test_factory_review_payload_contract_is_explicit():
     assert is_dataclass(abort_payload_cls)
     assert [field.name for field in fields(review_payload_cls)] == [
         "displayed_config_id",
+        "config_payload",
         "run_id",
         "trigger_source",
         "captured_duration_sec",
@@ -306,6 +350,8 @@ def test_factory_review_payload_contract_is_explicit():
         "judgment_payload",
         "summary_payload",
         "chart_payload",
+        "import_warnings",
+        "display_channel_labels",
     ]
     assert [field.name for field in fields(abort_payload_cls)] == [
         "config_id",
@@ -327,6 +373,8 @@ def test_factory_review_payload_contract_is_explicit():
 
     assert payload.default_window == review_window
     assert payload.run_id == "run-101-1"
+    assert review_payload_cls().import_warnings == ()
+    assert review_payload_cls().display_channel_labels == {}
     assert plc_payload.plc_id == 12
     assert abort_payload.config_id == 101
     assert abort_payload.run_id == "run-101-1"

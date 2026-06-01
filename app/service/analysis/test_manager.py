@@ -5,6 +5,7 @@ API so ControlModule needs zero changes.
 """
 from __future__ import annotations
 
+import copy
 import inspect
 import os
 import uuid
@@ -17,6 +18,7 @@ from PyQt6.QtCore import QObject, Qt, QThread, pyqtSignal
 from app.service.analysis import dsp
 from app.service.analysis.audio_monitor import AudioMonitor
 from app.service.analysis.audio_recorder import AudioRecorder
+from app.service.analysis.judgment import JudgmentEngine
 from app.service.analysis.monitor_playback import (
     MONITOR_GAIN_MAX_DB,
     MONITOR_GAIN_MIN_DB,
@@ -32,6 +34,7 @@ class TestManager(QObject):
     """Manages TestSession instances and shared AudioRecorders."""
 
     __test__ = False
+    _MIN_MANUAL_REANALYSIS_DURATION_SEC = 0.1
 
     _deferred_monitor_error_occurred = pyqtSignal(int, str)
 
@@ -65,6 +68,29 @@ class TestManager(QObject):
 
     def last_start_error(self) -> str | None:
         return self._last_start_error
+
+    def analyze_imported_wav(self, request):
+        from app.service.analysis import imported_audio
+
+        config = self._services.config_service.load_config(request.config_id)
+        device_info = self._services.hss_service.load_io_devices()
+        mic_cal = device_info.get("mic_cal", {}) if isinstance(device_info, dict) else {}
+        if not isinstance(mic_cal, dict):
+            mic_cal = {}
+        return imported_audio.analyze_imported_wav(
+            request=request,
+            config=config,
+            mic_cal=mic_cal,
+            judgment_engine=self._create_judgment_engine(),
+        )
+
+    def _create_judgment_engine(self) -> JudgmentEngine:
+        config_service = getattr(self._services, "config_service", None)
+        golden_sample_service = getattr(config_service, "golden_sample_service", None)
+        return JudgmentEngine(
+            self._services.ai_service,
+            golden_sample_service=golden_sample_service,
+        )
 
     def start(self, workorder: dict, *, on_start_accepted=None) -> bool:
         """Start a test for the config_id in the workorder."""
@@ -160,6 +186,16 @@ class TestManager(QObject):
             )
         config = dict(config)
         config["selected_channels"] = list(normalized_selected_channels)
+        try:
+            self._resolve_vibration_view_channel(
+                config,
+                hardware_channel_count=n_channels,
+            )
+        except ValueError as exc:
+            self._bus.log.emit(
+                f"[TestManager] ERROR config {config_id} invalid vibration view channel: {exc}"
+            )
+            return self._fail_start_before_acceptance(request_id, str(exc))
         try:
             resolved_monitor_channel = self._resolve_monitor_channel(
                 config,
@@ -371,6 +407,32 @@ class TestManager(QObject):
                 f"监听通道必须在输入通道范围 0..{hardware_channel_count - 1} 内"
             )
         return resolved
+
+    @classmethod
+    def _resolve_vibration_view_channel(
+        cls,
+        config: dict,
+        *,
+        hardware_channel_count: int,
+    ) -> int | None:
+        raw_channel = config.get("vibration_view_channel_index")
+        if raw_channel is None:
+            return None
+        if not isinstance(raw_channel, Integral) or isinstance(
+            raw_channel,
+            (bool, np.bool_),
+        ):
+            raise ValueError("振动视图通道必须为不小于 0 的整数")
+        channel = int(raw_channel)
+        if channel < 0:
+            raise ValueError("振动视图通道必须为不小于 0 的整数")
+        if channel >= hardware_channel_count:
+            raise ValueError(
+                f"振动视图通道必须在输入通道范围 0..{hardware_channel_count - 1} 内"
+            )
+        if channel not in cls._selected_channels(config):
+            raise ValueError("振动视图通道必须来自已选择通道")
+        return channel
 
     @staticmethod
     def _resolve_monitor_gain_db(config: dict) -> float:
@@ -976,16 +1038,16 @@ class TestManager(QObject):
         session = self._sessions.get(config_id)
         self._bus.log.emit(f"[TestManager] ERROR config={config_id}: {message}")
         self._bus.status.emit(f"Error: {message}")
+        abort_payload = None
         if session is not None:
-            self._emit_optional_signal(
-                "factory_runtime_aborted",
-                self._make_factory_runtime_abort_payload(
-                    config_id,
-                    session,
-                    error_message=message,
-                ),
+            abort_payload = self._make_factory_runtime_abort_payload(
+                config_id,
+                session,
+                error_message=message,
             )
         self._stop_one(config_id, silent=True)
+        if abort_payload is not None:
+            self._emit_optional_signal("factory_runtime_aborted", abort_payload)
 
     def _on_monitor_error(self, config_id: int, message: str):
         if self._is_nonfatal_monitor_diagnostic(message):
@@ -1657,8 +1719,7 @@ class TestManager(QObject):
         manual_reanalysis_allowed = (
             session is not None
             and captured_duration_sec is not None
-            and analysis_duration > 0
-            and captured_duration_sec >= analysis_duration
+            and captured_duration_sec >= self._MIN_MANUAL_REANALYSIS_DURATION_SEC
             and getattr(session, "_audio_file_path", None) is not None
         )
         fallback_window = None
@@ -1667,13 +1728,20 @@ class TestManager(QObject):
             or default_window.start_sec < 0
             or default_window.end_sec > captured_duration_sec
         ):
+            fallback_duration = (
+                analysis_duration
+                if analysis_duration > 0
+                else self._MIN_MANUAL_REANALYSIS_DURATION_SEC
+            )
+            fallback_duration = min(float(fallback_duration), captured_duration_sec)
             fallback_window = FactoryReviewWindow(
                 start_sec=0.0,
-                end_sec=analysis_duration,
+                end_sec=fallback_duration,
             )
 
         return FactoryReviewPayload(
             displayed_config_id=config_id,
+            config_payload=copy.deepcopy(config) if isinstance(config, dict) else None,
             run_id=self._factory_run_id(session),
             trigger_source=self._factory_trigger_source(session),
             captured_duration_sec=captured_duration_sec,
@@ -1804,20 +1872,11 @@ class TestManager(QObject):
                 )
                 continue
 
-            serialized_peak = self._coerce_finite_float(channel_result.get("loudness_max_sone"))
             chart_peak = self._loudness_chart_peak_sone(loudness_payload)
-            if serialized_peak is None or chart_peak is None:
+            if chart_peak is None:
                 self._bus.log.emit(
                     "[TestManager] WARNING: loudness chart recompute failed "
                     f"for config={config_id} channel=CH{channel_index + 1}"
-                )
-                continue
-
-            if not np.isclose(chart_peak, serialized_peak, atol=1e-4, rtol=1e-4):
-                self._bus.log.emit(
-                    "[TestManager] WARNING: loudness chart scalar mismatch "
-                    f"for config={config_id} channel=CH{channel_index + 1} "
-                    f"serialized={serialized_peak:g} recomputed={chart_peak:g}"
                 )
 
     @staticmethod

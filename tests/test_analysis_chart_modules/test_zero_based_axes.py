@@ -3,6 +3,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from app.service.analysis.dsp import compute_stft
 from ui.widgets.analysis_charts import (
     FftLineChartWidget,
     LineChartWidget,
@@ -33,6 +34,21 @@ def _assert_default_left_axis_label_refresh_visible(widget) -> None:
     assert left_axis.isVisible() is True
     assert left_axis.labelText == "Refreshed"
     assert left_axis.style.get("showValues") is True
+
+
+def _computed_stft_payload(*, overlap: float, time_shift_sec: float = 0.0) -> tuple:
+    sample_rate = 48_000.0
+    nfft = 1024
+    duration_samples = nfft * 4
+    sample_index = np.arange(duration_samples, dtype=float)
+    signal = np.sin(2.0 * np.pi * 1_000.0 * sample_index / sample_rate)
+    times_sec, frequencies_hz, magnitude_db = compute_stft(
+        signal,
+        sample_rate,
+        nfft,
+        overlap,
+    )
+    return times_sec + time_shift_sec, frequencies_hz, magnitude_db
 
 
 @pytest.mark.parametrize(
@@ -163,7 +179,7 @@ def test_left_axis_title_hiding_preserves_zero_based_ranges(qapp):
         _assert_x_range(line, (0.0, 2.0))
         _assert_x_range(fft, (0.0, 250.0))
         _assert_x_range(octave, (-0.5, 1.5))
-        _assert_xy_range(stft, (0.0, 1.0), (0.0, 200.0))
+        _assert_xy_range(stft, (0.0, 1.5), (0.0, 200.0))
         for widget in (line, fft, octave, stft):
             _assert_left_axis_title_hidden_ticks_visible(widget)
     finally:
@@ -402,7 +418,275 @@ def test_stft_image_chart_widget_uses_zero_based_x_and_y_axes_without_padding(qa
         )
         qapp.processEvents()
 
-        _assert_xy_range(widget, (0.0, 3.0), (0.0, 200.0))
+        _assert_xy_range(widget, (0.0, 3.5), (0.0, 200.0))
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_extends_first_time_column_to_zero(qapp):
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=[0.25, 0.75, 1.25],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0, 2.0, 3.0], [3.0, 4.0, 5.0]]),
+        )
+        qapp.processEvents()
+
+        rendered = widget.rendered_time_extent_sec()
+        assert rendered == pytest.approx((0.0, 1.5))
+        _assert_x_range(widget, (0.0, 1.5))
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_real_default_overlap_timestamps_start_at_zero(qapp):
+    times_sec, frequencies_hz, magnitude_db = _computed_stft_payload(overlap=0.5)
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=times_sec,
+            frequencies_hz=frequencies_hz,
+            magnitude_db=magnitude_db,
+            snap_initial_to_zero=True,
+        )
+        qapp.processEvents()
+
+        step = float(np.median(np.diff(times_sec)))
+        assert float(times_sec[0]) == pytest.approx(step)
+        rendered = widget.rendered_time_extent_sec()
+        assert rendered == pytest.approx((0.0, float(times_sec[-1]) + 0.5 * step))
+        _assert_x_range(widget, (0.0, float(times_sec[-1]) + 0.5 * step))
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_real_high_overlap_timestamps_start_at_zero(qapp):
+    times_sec, frequencies_hz, magnitude_db = _computed_stft_payload(overlap=0.75)
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=times_sec,
+            frequencies_hz=frequencies_hz,
+            magnitude_db=magnitude_db,
+            snap_initial_to_zero=True,
+        )
+        qapp.processEvents()
+
+        step = float(np.median(np.diff(times_sec)))
+        assert float(times_sec[0]) == pytest.approx(2.0 * step)
+        rendered = widget.rendered_time_extent_sec()
+        assert rendered == pytest.approx((0.0, float(times_sec[-1]) + 0.5 * step))
+        _assert_x_range(widget, (0.0, float(times_sec[-1]) + 0.5 * step))
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_shifted_imported_real_timestamps_keep_absolute_left_extent(
+    qapp,
+):
+    times_sec, frequencies_hz, magnitude_db = _computed_stft_payload(
+        overlap=0.5,
+        time_shift_sec=5.0,
+    )
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=times_sec,
+            frequencies_hz=frequencies_hz,
+            magnitude_db=magnitude_db,
+        )
+        qapp.processEvents()
+
+        step = float(np.median(np.diff(times_sec)))
+        expected_left = float(times_sec[0]) - 0.5 * step
+        expected_right = float(times_sec[-1]) + 0.5 * step
+        rendered = widget.rendered_time_extent_sec()
+        assert rendered == pytest.approx((expected_left, expected_right))
+        _assert_x_range(widget, (0.0, expected_right))
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_small_shifted_imported_timestamps_keep_absolute_left_extent(
+    qapp,
+):
+    times_sec = np.asarray([0.1853, 0.3133, 0.4413], dtype=float)
+    frequencies_hz = np.asarray([100.0, 200.0], dtype=float)
+    magnitude_db = np.asarray([[1.0, 2.0, 3.0], [3.0, 4.0, 5.0]], dtype=float)
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=times_sec,
+            frequencies_hz=frequencies_hz,
+            magnitude_db=magnitude_db,
+            snap_initial_to_zero=False,
+        )
+        qapp.processEvents()
+
+        step = float(np.median(np.diff(times_sec)))
+        expected_left = float(times_sec[0]) - 0.5 * step
+        expected_right = float(times_sec[-1]) + 0.5 * step
+        rendered = widget.rendered_time_extent_sec()
+        assert rendered == pytest.approx((expected_left, expected_right))
+        assert rendered[0] != pytest.approx(0.0)
+        _assert_x_range(widget, (0.0, expected_right))
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_single_time_uses_exact_one_second_extent(qapp):
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=[0.25],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0], [2.0]]),
+            snap_initial_to_zero=True,
+        )
+        qapp.processEvents()
+
+        rendered = widget.rendered_time_extent_sec()
+        assert rendered == pytest.approx((0.0, 1.0))
+        _assert_x_range(widget, (0.0, 1.0))
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_single_imported_time_preserves_absolute_center(qapp):
+    time_sec = 0.1853
+    expected_extent = (time_sec - 0.5, time_sec + 0.5)
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=[time_sec],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0], [2.0]]),
+            snap_initial_to_zero=False,
+        )
+        qapp.processEvents()
+
+        rendered = widget.rendered_time_extent_sec()
+        assert rendered == pytest.approx(expected_extent)
+        assert rendered != pytest.approx((0.0, 1.0))
+        _assert_x_range(widget, (0.0, expected_extent[1]))
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_applies_fixed_levels(qapp):
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=[0.0, 1.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0, 2.0], [3.0, 4.0]]),
+            levels_db=(-90.0, -10.0),
+        )
+        qapp.processEvents()
+
+        assert widget.image_levels() == pytest.approx((-90.0, -10.0))
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_fixed_levels_do_not_seed_auto_cache(qapp):
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=[0.0, 1.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0, 2.0], [3.0, 4.0]]),
+            levels_db=(-90.0, -10.0),
+        )
+
+        widget.set_image(
+            times_sec=[0.0, 1.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[20.0, 25.0], [30.0, 50.0]]),
+            reset_levels=False,
+        )
+        qapp.processEvents()
+
+        assert widget.image_levels() == pytest.approx((20.0, 50.0))
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_fixed_levels_clear_prior_auto_cache(qapp):
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=[0.0, 1.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0, 2.0], [3.0, 4.0]]),
+        )
+        assert widget.image_levels() == pytest.approx((1.0, 4.0))
+
+        widget.set_image(
+            times_sec=[0.0, 1.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[10.0, 12.0], [14.0, 16.0]]),
+            levels_db=(-90.0, -10.0),
+        )
+
+        widget.set_image(
+            times_sec=[0.0, 1.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[20.0, 25.0], [30.0, 50.0]]),
+            reset_levels=False,
+        )
+        qapp.processEvents()
+
+        assert widget.image_levels() == pytest.approx((20.0, 50.0))
+    finally:
+        widget.close()
+
+
+def test_stft_image_chart_widget_rejects_invalid_fixed_levels_without_mutation(qapp):
+    widget = StftImageChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_image(
+            times_sec=[0.0, 1.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0, 2.0], [3.0, 4.0]]),
+            levels_db=(-90.0, -10.0),
+        )
+        previous_payload = widget.image_payload()
+        previous_levels = widget.image_levels()
+
+        with pytest.raises(ValueError):
+            widget.set_image(
+                times_sec=[0.0, 1.0],
+                frequencies_hz=[100.0, 200.0],
+                magnitude_db=np.array([[5.0, 6.0], [7.0, 8.0]]),
+                levels_db=(-10.0, -90.0),
+            )
+
+        assert widget.image_payload()["times_sec"] == previous_payload["times_sec"]
+        assert widget.image_levels() == previous_levels
     finally:
         widget.close()
 
@@ -551,7 +835,7 @@ def test_stft_image_chart_widget_zero_span_time_uses_rendered_extent_without_pad
         qapp.processEvents()
 
         x_range, _y_range = widget.plot_item.vb.viewRange()
-        assert x_range == pytest.approx((0.0, 6.0))
+        assert x_range == pytest.approx((0.0, 5.5))
     finally:
         widget.close()
 
@@ -570,7 +854,7 @@ def test_stft_image_chart_widget_zero_span_subunit_uses_rendered_single_frame_ex
         )
         qapp.processEvents()
 
-        _assert_xy_range(widget, (0.0, 1.5), (0.0, 1.25))
+        _assert_xy_range(widget, (0.0, 1.0), (0.0, 1.25))
     finally:
         widget.close()
 
@@ -648,7 +932,7 @@ def test_chart_widgets_programmatic_refresh_reset_preserve_zero_based_axes(qapp)
         _assert_x_range(line, (0.0, 4.0))
         _assert_x_range(fft, (0.0, 500.0))
         _assert_x_range(octave, (-0.5, 2.5))
-        _assert_xy_range(stft, (0.0, 2.0), (0.0, 300.0))
+        _assert_xy_range(stft, (0.0, 2.5), (0.0, 300.0))
     finally:
         line.close()
         fft.close()

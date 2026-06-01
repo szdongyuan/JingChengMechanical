@@ -3,7 +3,9 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
+from app.service.analysis import dsp, stft_score
 from app.service.analysis.frames import ChannelJudgment, JudgmentResult
 from app.service.analysis.test_manager import TestManager
 
@@ -44,6 +46,111 @@ class TestReviewPayloadEmission:
         assert payload.displayed_config_id == 1
         assert payload.run_id == session._workorder["factory_run_id"]
         assert payload.trigger_source == "plc"
+
+    def test_auto_analysis_review_payload_includes_deep_copied_session_config(
+        self,
+        monkeypatch,
+    ):
+        partial_buf = np.arange(400, dtype=np.float32).reshape(400, 1)
+        bus, _, mgr, session, _, _, _ = _make_running_factory_manager(
+            monkeypatch,
+            analysis_duration=2.0,
+            analysis_window_offset_ms=1000,
+            allow_incomplete_recording_analysis=True,
+            partial_buf=partial_buf,
+            sample_rate=100.0,
+        )
+        session._config["selected_channels"] = [0]
+        session._config["vibration_view_channel_index"] = 0
+        session._run_judgment = MagicMock(
+            return_value=JudgmentResult(
+                overall="合格",
+                limit_pass=True,
+                ai_pass=True,
+                ai_score=0.93,
+                analysis_window=(1.0, 3.0),
+            )
+        )
+        expected_summary = _expected_summary_payload(overall_status="pass")
+        expected_chart = _expected_chart_payload()
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_summary_payload",
+            lambda **kwargs: expected_summary,
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_chart_payload",
+            lambda **kwargs: expected_chart,
+            raising=False,
+        )
+
+        mgr.stop_active_run(config_id=1)
+
+        payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
+        assert payload.config_payload["selected_channels"] == [0]
+        assert payload.config_payload["vibration_view_channel_index"] == 0
+
+        payload.config_payload["selected_channels"].append(99)
+        assert session._config["selected_channels"] == [0]
+
+    def test_short_capture_above_manual_minimum_allows_manual_reanalysis(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        mock_session = MagicMock()
+        mock_session.config_id = 1
+        mock_session._workorder = {
+            "trigger_source": "manual",
+            "factory_run_id": "run-1",
+        }
+        mock_session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+        }
+        mock_session._buffer = np.zeros((50, 1), dtype=np.float32)
+        mock_session._sample_rate = 100.0
+        mock_session._audio_file_path = "captured.wav"
+
+        payload = mgr._make_factory_review_payload(
+            1,
+            mock_session,
+            no_result=True,
+            error_message="analysis window not fully captured",
+        )
+
+        assert payload.captured_duration_sec == pytest.approx(0.5)
+        assert payload.manual_reanalysis_allowed is True
+        assert payload.fallback_window.start_sec == pytest.approx(0.0)
+        assert payload.fallback_window.end_sec == pytest.approx(0.5)
+
+    def test_capture_below_manual_minimum_disallows_manual_reanalysis(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        mock_session = MagicMock()
+        mock_session.config_id = 1
+        mock_session._workorder = {
+            "trigger_source": "manual",
+            "factory_run_id": "run-1",
+        }
+        mock_session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+        }
+        mock_session._buffer = np.zeros((5, 1), dtype=np.float32)
+        mock_session._sample_rate = 100.0
+        mock_session._audio_file_path = "captured.wav"
+
+        payload = mgr._make_factory_review_payload(
+            1,
+            mock_session,
+            no_result=True,
+            error_message="analysis window not fully captured",
+        )
+
+        assert payload.captured_duration_sec == pytest.approx(0.05)
+        assert payload.manual_reanalysis_allowed is False
+        assert payload.fallback_window is None
 
     def test_stop_after_judgment_returns_suppresses_late_auto_analysis_review_emission(
         self,
@@ -183,7 +290,13 @@ class TestReviewPayloadEmission:
         }
         session._audio_file_path = "captured.wav"
         session._last_loudness_trace_cache = {
-            0: {"times_sec": [0.25], "values_sone": [4.0], "max_sone": 4.0}
+            0: {
+                "times_sec": [0.25],
+                "values_sone": [4.0],
+                "max_sone": 4.0,
+                "algorithm": dsp.LOUDNESS_TRACE_ALGORITHM,
+                "internal_rate_hz": dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ,
+            }
         }
         session.last_ai_review = {
             "status": "success",
@@ -683,6 +796,158 @@ class TestReviewPayloadEmission:
         assert sorted(payload.chart_payload) == [3]
         assert payload.no_result is False
 
+    def test_rejudge_success_emits_stft_score_payload_with_reanalysis_window_times(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        mock_session = MagicMock()
+        mock_session.config_id = 1
+        mock_session._workorder = {
+            "trigger_source": "manual",
+            "factory_run_id": "run-1",
+        }
+        mock_session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+            "selected_channels": [0],
+            "channels": [
+                {
+                    "channel_index": 0,
+                    "stft_nfft": 128,
+                    "stft_overlap": 0.5,
+                    "stft_score_enabled": True,
+                }
+            ],
+        }
+        mock_session._buffer = np.zeros((500, 1), dtype=np.float32)
+        mock_session._sample_rate = 100.0
+        mock_session._audio_file_path = "captured.wav"
+        mock_session.last_ai_review = None
+        mock_session.rejudge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+            analysis_window=(1.25, 3.25),
+            channel_results=[
+                ChannelJudgment(
+                    channel_index=0,
+                    spl_db=70.0,
+                    spl_pass=True,
+                    loudness_available=False,
+                )
+            ],
+        )
+        captured = {}
+
+        def fake_score(**kwargs):
+            captured.update(kwargs)
+            return {
+                "enabled": True,
+                "summary_score": 86.5,
+                "times_sec": [1.25, 2.25],
+                "scores": [88.0, 85.0],
+                "summary_mode": "percentile",
+                "percentile": 10.0,
+            }
+
+        monkeypatch.setattr(stft_score, "compute_stft_score_payload", fake_score)
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_summary_payload",
+            lambda **kwargs: {"overall_status": "pass", "rows": []},
+            raising=False,
+        )
+        mgr._completed_sessions[1] = mock_session
+
+        mgr.rejudge(config_id=1, start_sec=1.25, end_sec=3.25)
+
+        payload = bus.factory_runtime_reanalysis_completed.emit.call_args.args[0]
+        assert payload.chart_payload[0]["stft_score"]["summary_score"] == 86.5
+        assert payload.chart_payload[0]["stft_score"]["times_sec"][0] == pytest.approx(1.25)
+        assert captured["absolute_start_sec"] == pytest.approx(1.25)
+
+    @pytest.mark.parametrize("score_mode", ["enabled", "disabled", "raises"])
+    def test_stft_score_never_changes_reanalysis_judgment_or_summary(
+        self,
+        monkeypatch,
+        score_mode,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        mock_session = MagicMock()
+        mock_session.config_id = 1
+        mock_session._workorder = {"trigger_source": "manual", "factory_run_id": "run-1"}
+        mock_session._config = {
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+            "selected_channels": [0],
+            "channels": [
+                {
+                    "channel_index": 0,
+                    "stft_nfft": 128,
+                    "stft_overlap": 0.5,
+                    "stft_score_enabled": score_mode != "disabled",
+                }
+            ],
+        }
+        mock_session._buffer = np.zeros((500, 1), dtype=np.float32)
+        mock_session._sample_rate = 100.0
+        mock_session._audio_file_path = "captured.wav"
+        mock_session.last_ai_review = None
+        mock_session.rejudge.return_value = JudgmentResult(
+            overall="不合格",
+            limit_pass=False,
+            ai_pass=None,
+            ai_score=None,
+            analysis_window=(1.25, 3.25),
+            channel_results=[
+                ChannelJudgment(
+                    channel_index=0,
+                    spl_db=92.0,
+                    spl_pass=False,
+                    loudness_available=False,
+                )
+            ],
+        )
+        expected_summary = {"overall_status": "fail", "rows": []}
+
+        if score_mode == "raises":
+            def fail_score(**_kwargs):
+                raise RuntimeError("score unavailable")
+
+            monkeypatch.setattr(stft_score, "compute_stft_score_payload", fail_score)
+        elif score_mode == "enabled":
+            monkeypatch.setattr(
+                stft_score,
+                "compute_stft_score_payload",
+                lambda **kwargs: {
+                    "enabled": True,
+                    "summary_score": 64.0,
+                    "times_sec": [float(kwargs["absolute_start_sec"])],
+                    "scores": [64.0],
+                    "summary_mode": "percentile",
+                    "percentile": 10.0,
+                },
+            )
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_summary_payload",
+            lambda **kwargs: expected_summary,
+            raising=False,
+        )
+        mgr._completed_sessions[1] = mock_session
+
+        mgr.rejudge(config_id=1, start_sec=1.25, end_sec=3.25)
+
+        payload = bus.factory_runtime_reanalysis_completed.emit.call_args.args[0]
+        assert payload.judgment_payload["overall"] == "不合格"
+        assert payload.judgment_payload["limit_pass"] is False
+        assert payload.summary_payload["overall_status"] == "fail"
+
     def test_rejudge_failure_emits_full_no_result_summary_without_chart_payload(self, monkeypatch):
         bus = _mock_bus()
         services = _mock_services(bus)
@@ -801,7 +1066,7 @@ class TestReviewPayloadEmission:
             for call in bus.log.emit.call_args_list
         )
 
-    def test_on_session_done_logs_warning_when_loudness_chart_scalar_disagrees_with_serialized_judgment(
+    def test_on_session_done_does_not_warn_when_display_loudness_peak_differs_from_serialized_internal_peak(
         self,
         monkeypatch,
     ):
@@ -849,7 +1114,7 @@ class TestReviewPayloadEmission:
         )
         expected_summary = _expected_summary_payload(overall_status="pass")
         expected_chart = _expected_chart_payload()
-        expected_chart[0]["loudness"]["values"] = [2.0, 5.0]
+        expected_chart[0]["loudness"]["values"] = [2.0]
 
         monkeypatch.setattr(
             "app.service.analysis.test_manager.build_summary_payload",
@@ -870,7 +1135,7 @@ class TestReviewPayloadEmission:
         assert payload.summary_payload == expected_summary
         assert payload.chart_payload == expected_chart
         assert payload.no_result is False
-        assert any(
+        assert not any(
             "WARNING" in call.args[0] and "scalar" in call.args[0] and "loudness" in call.args[0]
             for call in bus.log.emit.call_args_list
         )

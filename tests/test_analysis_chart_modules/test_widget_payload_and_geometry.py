@@ -100,7 +100,7 @@ def test_stft_image_chart_widget_reports_rendered_time_extent_from_payload(qapp)
             magnitude_db=np.array([[1.0, 2.0, 3.0], [3.5, 4.5, 5.5]]),
         )
 
-        assert widget.rendered_time_extent_sec() == pytest.approx((0.0, 1.0))
+        assert widget.rendered_time_extent_sec() == pytest.approx((0.0, 1.25))
     finally:
         widget.close()
 
@@ -224,7 +224,12 @@ def test_stft_image_chart_widget_maps_time_values_to_widget_x_positions(qapp):
             plot_rect.left(),
             abs=1.0,
         )
-        assert widget.widget_x_for_time_sec(3.0) == pytest.approx(
+        rendered_left, rendered_right = widget.rendered_time_extent_sec()
+        assert (rendered_left, rendered_right) == pytest.approx((0.0, 3.5))
+
+        timestamp_x = widget.widget_x_for_time_sec(3.0)
+        assert plot_rect.left() < timestamp_x < plot_rect.right()
+        assert widget.widget_x_for_time_sec(rendered_right) == pytest.approx(
             plot_rect.right(),
             abs=1.0,
         )
@@ -510,10 +515,305 @@ def test_fft_line_chart_widget_accepts_golden_overlay_payload(qapp):
     assert widget.spectrum_payload() == {
         "frequencies_hz": [125.0, 250.0, 500.0],
         "levels_db": [42.0, 45.0, 51.0],
+        "display_frequencies_hz": [125.0, 250.0, 500.0],
+        "display_levels_db": [42.0, 45.0, 51.0],
         "limit_bands": [],
+        "limit_envelope": None,
+        "display_limit_envelope": {"control_points": [], "failed_points": []},
         "golden_overlay_levels_db": [40.0, 44.0, 49.0],
+        "display_golden_overlay_levels_db": [40.0, 44.0, 49.0],
         "show_zero_reference": False,
+        "x_axis_scale": "linear",
     }
+
+
+def test_fft_chart_filters_zero_hz_in_linear_mode(qapp):
+    widget = FftLineChartWidget()
+    widget.set_spectrum(
+        frequencies_hz=[0.0, 100.0, 200.0],
+        levels_db=[10.0, 20.0, 30.0],
+        limit_bands=[],
+        x_axis_scale="linear",
+    )
+
+    payload = widget.spectrum_payload()
+    assert payload["frequencies_hz"] == [0.0, 100.0, 200.0]
+    assert payload["levels_db"] == [10.0, 20.0, 30.0]
+    assert payload["display_frequencies_hz"] == [100.0, 200.0]
+    assert payload["display_levels_db"] == [20.0, 30.0]
+
+
+def test_fft_chart_filters_non_positive_golden_overlay_values(qapp):
+    widget = FftLineChartWidget()
+    widget.set_spectrum(
+        frequencies_hz=[0.0, 100.0, 200.0],
+        levels_db=[10.0, 20.0, 30.0],
+        golden_overlay_levels_db=[11.0, 21.0, 31.0],
+        limit_bands=[],
+    )
+
+    payload = widget.spectrum_payload()
+    assert payload["display_frequencies_hz"] == [100.0, 200.0]
+    assert payload["display_golden_overlay_levels_db"] == [21.0, 31.0]
+
+
+def test_fft_chart_filters_non_positive_limit_envelope_points(qapp):
+    widget = FftLineChartWidget()
+    envelope = {
+        "control_points": [
+            {"freq_hz": 0.0, "lower_db": 10.0, "upper_db": 30.0},
+            {"freq_hz": 100.0, "lower_db": 20.0, "upper_db": 40.0},
+            {"freq_hz": 200.0, "lower_db": 30.0, "upper_db": 50.0},
+        ],
+        "line_points": [
+            {"freq_hz": 0.0, "lower_db": 10.0, "upper_db": 30.0},
+            {"freq_hz": 150.0, "lower_db": 25.0, "upper_db": 45.0},
+            {"freq_hz": -200.0, "lower_db": 30.0, "upper_db": 50.0},
+        ],
+        "failed_points": [
+            {
+                "freq_hz": -1.0,
+                "actual_db": 90.0,
+                "lower_db": 10.0,
+                "upper_db": 30.0,
+            },
+            {
+                "freq_hz": 150.0,
+                "actual_db": 90.0,
+                "lower_db": 25.0,
+                "upper_db": 45.0,
+            },
+        ],
+    }
+    widget.set_spectrum(
+        frequencies_hz=[0.0, 100.0, 200.0],
+        levels_db=[10.0, 20.0, 30.0],
+        limit_envelope=envelope,
+    )
+
+    rendered = widget.spectrum_payload()["display_limit_envelope"]
+    assert rendered["control_points"] == envelope["control_points"][1:]
+    assert rendered["line_points"] == envelope["line_points"][1:2]
+    assert rendered["failed_points"] == envelope["failed_points"][1:]
+
+
+def test_fft_chart_uses_log_x_axis_mode(qapp):
+    widget = FftLineChartWidget()
+    widget.set_spectrum(
+        frequencies_hz=[0.0, 100.0, 1000.0],
+        levels_db=[10.0, 20.0, 30.0],
+        limit_bands=[],
+        x_axis_scale="log",
+    )
+
+    assert widget.spectrum_payload()["x_axis_scale"] == "log"
+    assert widget.spectrum_payload()["display_frequencies_hz"] == [100.0, 1000.0]
+    assert widget.plot_item.getViewBox().state["logMode"][0] is True
+
+
+def test_fft_chart_renders_limit_envelope_lines_and_failed_spectrum_segments(qapp):
+    widget = FftLineChartWidget()
+    envelope = {
+        "control_points": [
+            {"freq_hz": 100.0, "lower_db": 30.0, "upper_db": 80.0},
+            {"freq_hz": 200.0, "lower_db": 40.0, "upper_db": 90.0},
+        ],
+        "line_points": [
+            {"freq_hz": 100.0, "lower_db": 30.0, "upper_db": 80.0},
+            {"freq_hz": 150.0, "lower_db": 35.0, "upper_db": 85.0},
+            {"freq_hz": 175.0, "lower_db": 37.5, "upper_db": 87.5},
+            {"freq_hz": 200.0, "lower_db": 40.0, "upper_db": 90.0},
+        ],
+        "failed_points": [
+            {
+                "freq_hz": 150.0,
+                "actual_db": 95.0,
+                "lower_db": 35.0,
+                "upper_db": 85.0,
+            },
+        ],
+    }
+    widget.set_spectrum(
+        frequencies_hz=[100.0, 150.0, 175.0, 200.0],
+        levels_db=[50.0, 95.0, 96.0, 60.0],
+        limit_envelope=envelope,
+    )
+
+    payload = widget.spectrum_payload()
+    assert payload["limit_envelope"] == envelope
+    lower_x, lower_y = widget._lower_envelope_curve_item.getData()
+    upper_x, upper_y = widget._upper_envelope_curve_item.getData()
+    failed_x, failed_y = widget._failed_marker_item.getData()
+    failed_line_x, failed_line_y = widget._failed_spectrum_curve_item.getData()
+    assert list(lower_x) == [100.0, 150.0, 175.0, 200.0]
+    assert list(lower_y) == [30.0, 35.0, 37.5, 40.0]
+    assert list(upper_x) == [100.0, 150.0, 175.0, 200.0]
+    assert list(upper_y) == [80.0, 85.0, 87.5, 90.0]
+    assert failed_x is None or list(failed_x) == []
+    assert failed_y is None or list(failed_y) == []
+    assert list(failed_line_x) == [100.0, 150.0, 175.0, 200.0]
+    assert np.isnan(failed_line_y[0])
+    assert list(failed_line_y[1:3]) == [95.0, 96.0]
+    assert np.isnan(failed_line_y[3])
+
+
+def test_fft_chart_renders_limit_envelope_line_points_when_present(qapp):
+    widget = FftLineChartWidget()
+    envelope = {
+        "control_points": [
+            {"freq_hz": 150.0, "lower_db": 14.0, "upper_db": 16.0},
+            {"freq_hz": 200.0, "lower_db": 18.0, "upper_db": 22.0},
+            {"freq_hz": 200.0, "lower_db": 1.0, "upper_db": 60.0},
+            {"freq_hz": 350.0, "lower_db": 32.0, "upper_db": 38.0},
+        ],
+        "line_points": [
+            {"freq_hz": 150.0, "lower_db": 14.0, "upper_db": 16.0},
+            {"freq_hz": 200.0, "lower_db": 18.0, "upper_db": 22.0},
+            {"freq_hz": 300.0, "lower_db": 24.0, "upper_db": 36.0},
+            {"freq_hz": 350.0, "lower_db": 32.0, "upper_db": 38.0},
+        ],
+        "failed_points": [],
+    }
+
+    widget.set_spectrum(
+        frequencies_hz=[100.0, 200.0, 300.0, 400.0],
+        levels_db=[11.0, 21.0, 31.0, 41.0],
+        limit_envelope=envelope,
+    )
+
+    lower_x, lower_y = widget._lower_envelope_curve_item.getData()
+    upper_x, upper_y = widget._upper_envelope_curve_item.getData()
+    assert widget.spectrum_payload()["display_limit_envelope"]["line_points"] == (
+        envelope["line_points"]
+    )
+    assert list(lower_x) == [150.0, 200.0, 300.0, 350.0]
+    assert list(lower_y) == [14.0, 18.0, 24.0, 32.0]
+    assert list(upper_x) == [150.0, 200.0, 300.0, 350.0]
+    assert list(upper_y) == [16.0, 22.0, 36.0, 38.0]
+
+
+def test_fft_chart_keeps_legacy_limit_band_markers_without_limit_envelope(qapp):
+    widget = FftLineChartWidget()
+    limit_bands = [
+        {
+            "freq_hz": 1000.0,
+            "lower_db": 40.0,
+            "upper_db": 60.0,
+            "actual_db": 67.0,
+            "passed": False,
+        }
+    ]
+
+    widget.set_spectrum(
+        frequencies_hz=[125.0, 250.0, 500.0, 1000.0],
+        levels_db=[42.0, 45.0, 51.0, 67.0],
+        limit_bands=limit_bands,
+    )
+
+    marker_x, marker_y = widget._band_marker_item.getData()
+    lower_x, lower_y = widget._lower_envelope_curve_item.getData()
+    upper_x, upper_y = widget._upper_envelope_curve_item.getData()
+    failed_x, failed_y = widget._failed_marker_item.getData()
+    assert widget.spectrum_payload()["limit_bands"] == limit_bands
+    assert list(marker_x) == [1000.0]
+    assert list(marker_y) == [67.0]
+    assert lower_x is None or list(lower_x) == []
+    assert lower_y is None or list(lower_y) == []
+    assert upper_x is None or list(upper_x) == []
+    assert upper_y is None or list(upper_y) == []
+    assert failed_x is None or list(failed_x) == []
+    assert failed_y is None or list(failed_y) == []
+
+
+def test_fft_chart_linear_mode_filters_zero_hz_legacy_limit_band_markers(qapp):
+    widget = FftLineChartWidget()
+    limit_bands = [
+        {
+            "freq_hz": 0.0,
+            "lower_db": 10.0,
+            "upper_db": 20.0,
+            "actual_db": 15.0,
+            "passed": True,
+        },
+        {
+            "freq_hz": 100.0,
+            "lower_db": 20.0,
+            "upper_db": 40.0,
+            "actual_db": 35.0,
+            "passed": True,
+        },
+    ]
+
+    widget.set_spectrum(
+        frequencies_hz=[100.0],
+        levels_db=[35.0],
+        limit_bands=limit_bands,
+        limit_envelope=None,
+        x_axis_scale="linear",
+    )
+
+    marker_x, marker_y = widget._band_marker_item.getData()
+    assert widget.spectrum_payload()["limit_bands"] == limit_bands
+    assert list(marker_x) == [100.0]
+    assert list(marker_y) == [35.0]
+    assert list(np.asarray(widget._band_range_item.opts["x"], dtype=float)) == [
+        100.0
+    ]
+
+
+def test_fft_chart_log_mode_transforms_legacy_limit_band_markers(qapp):
+    widget = FftLineChartWidget()
+    limit_bands = [
+        {
+            "freq_hz": 0.0,
+            "lower_db": 10.0,
+            "upper_db": 20.0,
+            "actual_db": 15.0,
+            "passed": True,
+        },
+        {
+            "freq_hz": 100.0,
+            "lower_db": 20.0,
+            "upper_db": 40.0,
+            "actual_db": 35.0,
+            "passed": True,
+        },
+        {
+            "freq_hz": 1000.0,
+            "lower_db": 25.0,
+            "upper_db": 45.0,
+            "actual_db": 55.0,
+            "passed": False,
+        },
+        {
+            "freq_hz": -50.0,
+            "lower_db": 30.0,
+            "upper_db": 60.0,
+            "actual_db": 75.0,
+            "passed": False,
+        },
+    ]
+
+    widget.set_spectrum(
+        frequencies_hz=[100.0, 1000.0],
+        levels_db=[35.0, 55.0],
+        limit_bands=limit_bands,
+        limit_envelope=None,
+        x_axis_scale="log",
+    )
+
+    marker_x, marker_y = widget._band_marker_item.getData()
+    expected_x = [math.log10(100.0), math.log10(1000.0)]
+    assert widget.spectrum_payload()["limit_bands"] == limit_bands
+    assert list(marker_x) == pytest.approx(expected_x)
+    assert list(marker_y) == [35.0, 55.0]
+    assert list(np.asarray(widget._band_range_item.opts["x"], dtype=float)) == (
+        pytest.approx(expected_x)
+    )
+    assert list(np.asarray(widget._band_range_item.opts["y"], dtype=float)) == [
+        30.0,
+        35.0,
+    ]
 
 
 def test_fft_line_chart_widget_renders_golden_overlay_as_second_line_item(qapp):
@@ -531,6 +831,16 @@ def test_fft_line_chart_widget_renders_golden_overlay_as_second_line_item(qapp):
     assert list(overlay_x) == [125.0, 250.0, 500.0]
     assert list(overlay_y) == [40.0, 44.0, 49.0]
     assert widget._zero_reference_line.isVisible() is False
+
+
+def test_fft_line_chart_widget_uses_thin_spectrum_pens(qapp):
+    widget = FftLineChartWidget()
+
+    assert widget._curve.opts["pen"].widthF() == pytest.approx(0.7)
+    assert widget._golden_overlay_curve_item.opts["pen"].widthF() == pytest.approx(0.7)
+    assert widget._failed_spectrum_curve_item.opts["pen"].widthF() == pytest.approx(0.7)
+    assert widget._lower_envelope_curve_item.opts["pen"].widthF() == pytest.approx(2.0)
+    assert widget._upper_envelope_curve_item.opts["pen"].widthF() == pytest.approx(2.0)
 
 
 def test_fft_line_chart_widget_shows_zero_reference_line_in_delta_mode(qapp):

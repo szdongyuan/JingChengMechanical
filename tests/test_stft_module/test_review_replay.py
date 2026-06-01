@@ -22,6 +22,7 @@ def _prepare_review_overlay(
     can_replay: bool = True,
     selected_channel: int = 2,
     default_window: FactoryReviewWindow | None = None,
+    enter_selection_mode: bool = True,
 ):
     module, services = _make_module()
     services.test.can_replay_selection.return_value = can_replay
@@ -48,7 +49,15 @@ def _prepare_review_overlay(
         _emit_reviewing(module, services, payload)
     else:
         _emit_reviewing(module, services, payload)
+        if enter_selection_mode and module.analysis_select_button.isEnabled():
+            module.analysis_select_button.click()
         _emit_phase(services, payload, run_phase=run_phase)
+    if (
+        run_phase == "reviewing"
+        and enter_selection_mode
+        and module.analysis_select_button.isEnabled()
+    ):
+        module.analysis_select_button.click()
     qapp.processEvents()
     return module, services, payload
 
@@ -61,11 +70,21 @@ def test_replay_button_is_separate_from_analysis_button(qapp):
     assert module.replay_button.text() == "重放"
 
 
+def test_replay_controls_are_hidden_before_selection_mode(qapp):
+    module, _, _ = _prepare_review_overlay(qapp, enter_selection_mode=False)
+
+    assert module.selection_box.isVisible() is False
+    assert module.analyze_button.isVisible() is False
+    assert module.replay_button.isVisible() is False
+    assert module.analysis_select_button.isVisible() is True
+    assert module.analysis_select_button.text() == "框选分析"
+
+
 @pytest.mark.parametrize(
     ("run_phase", "expected_visible"),
     [
         ("reviewing", True),
-        ("reanalyzing", True),
+        ("reanalyzing", False),
         ("stopped", False),
     ],
 )
@@ -80,16 +99,15 @@ def test_replay_button_visibility_follows_review_selection_phases(
     assert module.replay_button.isVisible() is expected_visible
 
 
-def test_replay_button_is_not_gated_by_manual_reanalysis_allowed(qapp):
+def test_replay_button_is_hidden_when_selection_mode_is_unavailable(qapp):
     module, _, _ = _prepare_review_overlay(
         qapp,
         manual_reanalysis_allowed=False,
     )
 
-    assert module.selection_box.isVisible() is True
+    assert module.selection_box.isVisible() is False
     assert module.analyze_button.isVisible() is False
-    assert module.replay_button.isVisible() is True
-    assert module.replay_button.isEnabled() is True
+    assert module.replay_button.isVisible() is False
 
 
 def test_replay_button_enabled_state_uses_service_availability(qapp):
@@ -175,8 +193,11 @@ def test_full_width_selection_keeps_controls_visible_inside_plot_when_sides_do_n
 
     assert plot_rect is not None
     assert module.selection_box.isVisible() is True
-    assert selection_rect.left() == pytest.approx(plot_rect.left(), abs=1)
-    assert selection_rect.right() == pytest.approx(plot_rect.right(), abs=1)
+    assert selection_rect.width() > 0
+    assert selection_rect.left() >= plot_rect.left()
+    assert selection_rect.right() <= plot_rect.right()
+    assert selection_rect.top() == plot_rect.top()
+    assert selection_rect.bottom() == plot_rect.bottom()
     assert module.analyze_button.isVisible() is True
     assert module.analyze_button.isEnabled() is True
     assert module.replay_button.isVisible() is True

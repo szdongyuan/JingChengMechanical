@@ -137,12 +137,26 @@ def _channel_payload(channel_index: int) -> dict:
     }
 
 
+_STFT_SCORE_CUSTOM = {
+    "stft_score_enabled": False,
+    "stft_score_summary_mode": "min",
+    "stft_score_percentile": 35.0,
+    "stft_score_loudness_reference_sone": 12.5,
+    "stft_score_modulation_reference": 0.35,
+    "stft_score_harmonic_ratio_reference": 0.45,
+    "stft_score_frequency_instability_reference": 0.08,
+    "stft_score_harmonic_start_order": 3,
+    "stft_score_harmonic_end_order": 80,
+}
+
+
 def _config_payload(
     config_id: int,
     *,
     config_name: str = "Cfg1",
     monitor_channel_index: int | None = 0,
     monitor_gain_db: float | None = 0.0,
+    vibration_view_channel_index: int | None = None,
 ) -> dict:
     return {
         "config_id": config_id,
@@ -162,6 +176,7 @@ def _config_payload(
         "selected_channels": [0],
         "monitor_channel_index": monitor_channel_index,
         "monitor_gain_db": monitor_gain_db,
+        "vibration_view_channel_index": vibration_view_channel_index,
         "channels": [_channel_payload(0)],
     }
 
@@ -417,6 +432,86 @@ def test_export_writes_monitor_fields_in_config_payload(
 
     assert package_payload["config"]["monitor_channel_index"] == 2
     assert package_payload["config"]["monitor_gain_db"] == -9.5
+
+
+def test_export_writes_vibration_view_channel_in_config_payload(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    config_id = services.config_service.create_config("CfgVibration")
+    payload = _config_payload(
+        config_id,
+        config_name="CfgVibration",
+        vibration_view_channel_index=0,
+    )
+    services.config_service.save_config(payload)
+    target = tmp_path / "vibration.dy"
+
+    services.config_package_service.export_package(
+        config_id=config_id,
+        target_path=str(target),
+        options=ConfigPackageExportOptions(),
+    )
+
+    with zipfile.ZipFile(target) as zf:
+        package_payload = json.loads(zf.read("config/config.json"))
+
+    assert package_payload["config"]["vibration_view_channel_index"] == 0
+
+
+def test_export_package_preserves_stft_color_scale_fields(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    config_id = services.config_service.create_config("Color Scale")
+    payload = _config_payload(config_id, config_name="Color Scale")
+    payload["channels"][0].update(
+        {
+            "stft_color_scale_enabled": True,
+            "stft_color_scale_min_db": -88.0,
+            "stft_color_scale_max_db": -8.0,
+        }
+    )
+    services.config_service.save_config(payload)
+    target = tmp_path / "stft-color-scale-export.dy"
+
+    services.config_package_service.export_package(
+        config_id=config_id,
+        target_path=str(target),
+        options=ConfigPackageExportOptions(),
+    )
+
+    with zipfile.ZipFile(target) as zf:
+        package_payload = json.loads(zf.read("config/config.json"))
+
+    channel = package_payload["config"]["channels"][0]
+    assert channel["stft_color_scale_enabled"] is True
+    assert channel["stft_color_scale_min_db"] == pytest.approx(-88.0)
+    assert channel["stft_color_scale_max_db"] == pytest.approx(-8.0)
+
+
+def test_export_package_preserves_stft_score_fields(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    config_id = services.config_service.create_config("STFT Score")
+    payload = _config_payload(config_id, config_name="STFT Score")
+    payload["channels"][0].update(_STFT_SCORE_CUSTOM)
+    services.config_service.save_config(payload)
+    target = tmp_path / "stft-score-export.dy"
+
+    services.config_package_service.export_package(
+        config_id=config_id,
+        target_path=str(target),
+        options=ConfigPackageExportOptions(),
+    )
+
+    with zipfile.ZipFile(target) as zf:
+        package_payload = json.loads(zf.read("config/config.json"))
+
+    channel = package_payload["config"]["channels"][0]
+    for field, expected in _STFT_SCORE_CUSTOM.items():
+        assert channel[field] == expected
 
 
 def test_export_includes_selected_golden_samples(tmp_path: Path, services: SimpleNamespace):
@@ -1279,6 +1374,55 @@ def test_import_package_round_trips_limit_switch_fields(
     assert channel["loudness_average_upper_limit"] == 9.5
 
 
+def test_import_package_round_trips_stft_color_scale_fields(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    imported_config = _config_payload(999, config_name="Imported")
+    imported_config["channels"][0].update(
+        {
+            "stft_color_scale_enabled": True,
+            "stft_color_scale_min_db": -88.0,
+            "stft_color_scale_max_db": -8.0,
+        }
+    )
+    path = _write_package(
+        tmp_path / "stft-color-scale-import.dy",
+        _package_entries(config_payload=imported_config),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    channel = services.config_service.load_config(result.config_id)["channels"][0]
+    assert channel["stft_color_scale_enabled"] is True
+    assert channel["stft_color_scale_min_db"] == pytest.approx(-88.0)
+    assert channel["stft_color_scale_max_db"] == pytest.approx(-8.0)
+
+
+def test_import_package_round_trips_stft_score_fields(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    imported_config = _config_payload(999, config_name="Imported")
+    imported_config["channels"][0].update(_STFT_SCORE_CUSTOM)
+    path = _write_package(
+        tmp_path / "stft-score-import.dy",
+        _package_entries(config_payload=imported_config),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    channel = services.config_service.load_config(result.config_id)["channels"][0]
+    for field, expected in _STFT_SCORE_CUSTOM.items():
+        assert channel[field] == expected
+
+
 def test_import_package_round_trips_monitor_fields(
     tmp_path: Path,
     services: SimpleNamespace,
@@ -1302,6 +1446,29 @@ def test_import_package_round_trips_monitor_fields(
     loaded = services.config_service.load_config(result.config_id)
     assert loaded["monitor_channel_index"] == 2
     assert loaded["monitor_gain_db"] == 6.5
+
+
+def test_import_package_round_trips_vibration_view_channel(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    imported_config = _config_payload(
+        999,
+        config_name="Imported",
+        vibration_view_channel_index=0,
+    )
+    path = _write_package(
+        tmp_path / "vibration.dy",
+        _package_entries(config_payload=imported_config),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    loaded = services.config_service.load_config(result.config_id)
+    assert loaded["vibration_view_channel_index"] == 0
 
 
 def test_import_package_overwrite_rollback_preserves_old_golden_binding(

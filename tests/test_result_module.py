@@ -15,6 +15,7 @@ from app.services_container import (
     FactoryControllerState,
     FactoryReviewPayload,
     FactoryReviewWindow,
+    ImportAudioWarning,
 )
 from app.service.analysis import dsp
 from app.service.analysis.judgment import JudgmentEngine
@@ -216,7 +217,7 @@ def _assert_placeholder(module: ResultModule, *, badge_text: str) -> None:
     assert _table_value(module, 1, 0) == "平均声压级"
     assert _table_value(module, 2, 0) == "响度"
     assert _table_value(module, 3, 0) == "平均响度"
-    assert _table_value(module, 4, 0) == "FFT频谱"
+    assert _table_value(module, 4, 0) == "频谱"
     assert _table_value(module, 5, 0) == "倍频程"
     assert _table_value(module, 6, 0) == "AI分析"
     assert _table_value(module, 0, 1) == "-"
@@ -1034,7 +1035,7 @@ def test_result_module_renders_average_metrics_from_production_serialized_judgme
     }
     monkeypatch.setattr(
         dsp,
-        "compute_loudness_trace",
+        "compute_loudness_trace_for_window",
         lambda *args, **kwargs: ([0.0, 0.5], [1.0, 3.0], 3.0),
     )
     engine = JudgmentEngine(SimpleNamespace(resolve_binding=lambda _config_id: None))
@@ -1482,7 +1483,7 @@ def test_result_module_renders_completed_summary_rows_from_summary_payload(qapp)
         )
     )
 
-    assert module.lb_overall.text() == "FAIL"
+    assert module.lb_overall.text() == "不通过"
     assert module.lb_overall.property("resultLevel") == "fail"
     assert module.table.rowCount() == 7
     assert _table_value(module, 0, 0) == "声压级"
@@ -1501,7 +1502,7 @@ def test_result_module_renders_completed_summary_rows_from_summary_payload(qapp)
     assert _table_value(module, 3, 1) == "-1 sone"
     assert _table_value(module, 3, 2) == "通道2"
     assert _table_value(module, 3, 3) == "OK"
-    assert _table_value(module, 4, 0) == "FFT频谱"
+    assert _table_value(module, 4, 0) == "频谱"
     assert _table_value(module, 4, 1) == "-3 dB"
     assert _table_value(module, 4, 2) == "通道1"
     assert _table_value(module, 4, 3) == "OK"
@@ -1521,7 +1522,7 @@ def test_result_module_preserves_approved_status_labels(qapp):
         _make_review_payload(summary_payload=_summary_payload(overall_status="fail"))
     )
 
-    assert module.lb_overall.text() == "FAIL"
+    assert module.lb_overall.text() == "不通过"
     assert _table_value(module, 0, 3) == "OK"
 
 
@@ -1595,14 +1596,144 @@ def test_result_module_preserves_existing_summary_card_when_plain_stop_enters_st
         _make_review_payload(summary_payload=_summary_payload(overall_status="pass"))
     )
 
-    assert module.lb_overall.text() == "PASS"
+    assert module.lb_overall.text() == "通过"
 
     module.services.bus.factory_state_changed.emit(_state("stopped", displayed_config_id=101))
 
-    assert module.lb_overall.text() == "PASS"
+    assert module.lb_overall.text() == "通过"
     assert module.lb_overall.property("resultLevel") == "pass"
     assert _table_value(module, 0, 0) == "声压级"
     assert _table_value(module, 6, 0) == "AI分析"
+
+
+def test_result_module_shows_import_warnings(qapp):
+    warning = ImportAudioWarning(
+        code="nyquist_skipped",
+        message="FFT 超过 12800 Hz 的限制已跳过",
+        severity="warning",
+        metric="fft",
+    )
+    payload = FactoryReviewPayload(
+        displayed_config_id=101,
+        trigger_source="import_audio",
+        summary_payload={
+            "overall_status": "pass",
+            "overall_label": "通过",
+            "rows": [],
+        },
+        import_warnings=(warning,),
+    )
+    module = _make_module()
+    module.services.bus.factory_review_changed.emit(payload)
+
+    assert "12800" in module.lb_empty_text.text()
+    assert module.lb_overall.text() == "通过"
+    assert module.lb_overall.property("resultLevel") == "pass"
+
+
+def test_result_module_appends_import_warnings_below_no_result_error(qapp):
+    warning = ImportAudioWarning(
+        code="golden_unavailable",
+        message="黄金样本不可用，已跳过对比",
+        severity="warning",
+        metric="golden",
+    )
+    payload = _make_review_payload(
+        no_result=True,
+        error_message="MoSQITo unavailable",
+        summary_payload=_summary_payload(
+            overall_status="no_result",
+            error_message="MoSQITo unavailable",
+        ),
+    )
+    payload = FactoryReviewPayload(
+        displayed_config_id=payload.displayed_config_id,
+        run_id=payload.run_id,
+        trigger_source="import_audio",
+        captured_duration_sec=payload.captured_duration_sec,
+        default_window=payload.default_window,
+        fallback_window=payload.fallback_window,
+        manual_reanalysis_allowed=payload.manual_reanalysis_allowed,
+        no_result=payload.no_result,
+        error_message=payload.error_message,
+        judgment_payload=payload.judgment_payload,
+        summary_payload=payload.summary_payload,
+        import_warnings=(warning,),
+    )
+    module = _make_module()
+    module.services.bus.factory_review_changed.emit(payload)
+
+    message = module.lb_empty_text.text()
+    assert "MoSQITo unavailable" in message
+    assert "黄金样本不可用" in message
+
+
+def test_result_module_shows_imported_ai_as_not_run(qapp):
+    payload = FactoryReviewPayload(
+        displayed_config_id=101,
+        trigger_source="import_audio",
+        summary_payload={
+            "overall_status": "pass",
+            "overall_label": "通过",
+            "rows": [
+                {
+                    "item_key": "spl",
+                    "label": "SPL",
+                    "deviation_display": "-",
+                    "channel_label": "CH1",
+                    "status": "通过",
+                },
+                {
+                    "item_key": "spl_average",
+                    "label": "平均SPL",
+                    "deviation_display": "-",
+                    "channel_label": "CH1",
+                    "status": "通过",
+                },
+                {
+                    "item_key": "loudness",
+                    "label": "Loudness",
+                    "deviation_display": "-",
+                    "channel_label": "CH1",
+                    "status": "通过",
+                },
+                {
+                    "item_key": "loudness_average",
+                    "label": "平均Loudness",
+                    "deviation_display": "-",
+                    "channel_label": "CH1",
+                    "status": "通过",
+                },
+                {
+                    "item_key": "fft",
+                    "label": "FFT",
+                    "deviation_display": "-",
+                    "channel_label": "CH1",
+                    "status": "通过",
+                },
+                {
+                    "item_key": "octave",
+                    "label": "倍频程",
+                    "deviation_display": "-",
+                    "channel_label": "CH1",
+                    "status": "通过",
+                },
+                {
+                    "item_key": "ai",
+                    "label": "AI分析",
+                    "deviation_display": "--",
+                    "channel_label": "--",
+                    "status": "未运行",
+                    "constrained": False,
+                },
+            ],
+        },
+    )
+    module = _make_module()
+    module.services.bus.factory_review_changed.emit(payload)
+
+    assert _table_value(module, 6, 0) == "AI分析"
+    assert _table_value(module, 6, 3) == "未运行"
 
 
 def test_result_module_shows_no_result_plus_error_text_from_summary_payload(qapp):
@@ -1707,7 +1838,7 @@ def test_result_module_shows_no_result_plus_error_text_from_summary_payload(qapp
     assert _table_value(module, 3, 0) == "平均响度"
     assert _table_value(module, 3, 2) == "通道2"
     assert _table_value(module, 3, 3) == "无结果"
-    assert _table_value(module, 4, 0) == "FFT频谱"
+    assert _table_value(module, 4, 0) == "频谱"
     assert _table_value(module, 4, 2) == "通道1"
     assert _table_value(module, 4, 3) == "OK"
     assert _table_value(module, 5, 0) == "倍频程"
@@ -1724,7 +1855,7 @@ def test_factory_reset_still_clears_to_the_empty_badge_state(qapp):
         _make_review_payload(summary_payload=_summary_payload(overall_status="pass"))
     )
 
-    assert module.lb_overall.text() == "PASS"
+    assert module.lb_overall.text() == "通过"
 
     module.services.bus.factory_display_reset.emit("next_run_accepted")
     module.services.bus.factory_review_changed.emit(FactoryReviewPayload())

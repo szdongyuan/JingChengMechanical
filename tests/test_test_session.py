@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 from scipy.io import wavfile
 
+from app.service.analysis import dsp
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.test_manager import TestManager
 from app.service.analysis.test_session import TestSession
@@ -714,6 +715,8 @@ class TestTestSessionJudgment:
                 "times_sec": [0.25],
                 "values_sone": [4.0],
                 "max_sone": 4.0,
+                "algorithm": dsp.LOUDNESS_TRACE_ALGORITHM,
+                "internal_rate_hz": dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ,
             }
             return JudgmentResult(
                 overall="合格",
@@ -731,6 +734,10 @@ class TestTestSessionJudgment:
         assert result is session.last_result
         assert session._last_loudness_trace_cache is created_caches[0]
         assert session._last_loudness_trace_cache[0]["values_sone"] == [4.0]
+        assert (
+            session._last_loudness_trace_cache[0]["algorithm"]
+            == dsp.LOUDNESS_TRACE_ALGORITHM
+        )
 
     def test_run_judgment_required_window_failure_preserves_no_result_session_state(self, tmp_path):
         bus = _make_mock_bus()
@@ -1463,6 +1470,8 @@ class TestTestSessionJudgment:
                 "times_sec": [0.25],
                 "values_sone": [2.0],
                 "max_sone": 2.0,
+                "algorithm": dsp.LOUDNESS_TRACE_ALGORITHM,
+                "internal_rate_hz": dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ,
             }
             return JudgmentResult(
                 overall="合格",
@@ -1481,6 +1490,10 @@ class TestTestSessionJudgment:
         assert session._last_loudness_trace_cache is created_caches[0]
         assert session._last_loudness_trace_cache is not old_cache
         assert session._last_loudness_trace_cache[0]["values_sone"] == [2.0]
+        assert (
+            session._last_loudness_trace_cache[0]["internal_rate_hz"]
+            == dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ
+        )
 
     def test_rejudge_passes_selected_channel_mapping_to_judgment(self, tmp_path):
         bus = _make_mock_bus()

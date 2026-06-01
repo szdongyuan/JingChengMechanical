@@ -23,6 +23,18 @@ _CHANNEL_DEFAULTS = {
     "stft_nfft": 1024,
     "fft_nfft": 4096,
     "stft_overlap": 0.5,
+    "stft_color_scale_enabled": False,
+    "stft_color_scale_min_db": -120.0,
+    "stft_color_scale_max_db": 0.0,
+    "stft_score_enabled": True,
+    "stft_score_summary_mode": "percentile",
+    "stft_score_percentile": 10.0,
+    "stft_score_loudness_reference_sone": 10.0,
+    "stft_score_modulation_reference": 0.20,
+    "stft_score_harmonic_ratio_reference": 0.25,
+    "stft_score_frequency_instability_reference": 0.05,
+    "stft_score_harmonic_start_order": 2,
+    "stft_score_harmonic_end_order": 100,
     "spl_weighting": "A",
     "spl_time_constant": 0.125,
     "spl_lower_enabled": False,
@@ -42,6 +54,7 @@ _CHANNEL_DEFAULTS = {
     "loudness_average_lower_limit": 0.0,
     "loudness_average_upper_enabled": False,
     "loudness_average_upper_limit": 60.0,
+    "fft_x_axis_scale": "linear",
     "fft_band_limits": "[]",
     "oct_weighting": "A",
     "oct_band_limits": "[]",
@@ -123,6 +136,8 @@ _VALID_OVERLAP = [0.25, 0.5, 0.75]
 _VALID_WEIGHTING = ["A", "C", "Z"]
 _VALID_LOUDNESS_UNITS = ["sone", "phon"]
 _VALID_GOLDEN_MODES = {"off", "absolute", "delta"}
+_VALID_FFT_X_AXIS_SCALES = {"linear", "log"}
+_VALID_STFT_SCORE_SUMMARY_MODES = {"percentile", "mean", "min"}
 MONITOR_GAIN_DEFAULT_DB = 0.0
 MONITOR_GAIN_MIN_DB = -60.0
 MONITOR_GAIN_MAX_DB = 24.0
@@ -143,6 +158,7 @@ _CONFIG_LOAD_FIELD_NAMES = (
     "output_device_hostapi",
     "output_device_samplerate",
     "selected_channels",
+    "vibration_view_channel_index",
     *_MONITOR_CONFIG_FIELDS,
 )
 
@@ -234,6 +250,7 @@ class ConfigService:
             "output_device_hostapi": cfg.get("output_device_hostapi"),
             "output_device_samplerate": cfg.get("output_device_samplerate"),
             "selected_channels": selected_channels,
+            "vibration_view_channel_index": cfg.get("vibration_view_channel_index"),
             "monitor_channel_index": None,
             "monitor_gain_db": self._normalize_monitor_gain(
                 cfg.get("monitor_gain_db")
@@ -256,6 +273,69 @@ class ConfigService:
                         else _CHANNEL_DEFAULTS["fft_nfft"]
                     ),
                     "stft_overlap": ch.stft_overlap,
+                    "stft_color_scale_enabled": bool(
+                        getattr(
+                            ch,
+                            "stft_color_scale_enabled",
+                            _CHANNEL_DEFAULTS["stft_color_scale_enabled"],
+                        )
+                    ),
+                    "stft_color_scale_min_db": self._finite_float_or_default(
+                        getattr(ch, "stft_color_scale_min_db", None),
+                        _CHANNEL_DEFAULTS["stft_color_scale_min_db"],
+                    ),
+                    "stft_color_scale_max_db": self._finite_float_or_default(
+                        getattr(ch, "stft_color_scale_max_db", None),
+                        _CHANNEL_DEFAULTS["stft_color_scale_max_db"],
+                    ),
+                    "stft_score_enabled": bool(
+                        getattr(
+                            ch,
+                            "stft_score_enabled",
+                            _CHANNEL_DEFAULTS["stft_score_enabled"],
+                        )
+                    ),
+                    "stft_score_summary_mode": self._normalize_stft_score_summary_mode(
+                        getattr(
+                            ch,
+                            "stft_score_summary_mode",
+                            _CHANNEL_DEFAULTS["stft_score_summary_mode"],
+                        )
+                    ),
+                    "stft_score_percentile": self._finite_float_or_default(
+                        getattr(ch, "stft_score_percentile", None),
+                        _CHANNEL_DEFAULTS["stft_score_percentile"],
+                    ),
+                    "stft_score_loudness_reference_sone": self._finite_float_or_default(
+                        getattr(ch, "stft_score_loudness_reference_sone", None),
+                        _CHANNEL_DEFAULTS["stft_score_loudness_reference_sone"],
+                    ),
+                    "stft_score_modulation_reference": self._finite_float_or_default(
+                        getattr(ch, "stft_score_modulation_reference", None),
+                        _CHANNEL_DEFAULTS["stft_score_modulation_reference"],
+                    ),
+                    "stft_score_harmonic_ratio_reference": self._finite_float_or_default(
+                        getattr(ch, "stft_score_harmonic_ratio_reference", None),
+                        _CHANNEL_DEFAULTS["stft_score_harmonic_ratio_reference"],
+                    ),
+                    "stft_score_frequency_instability_reference": self._finite_float_or_default(
+                        getattr(
+                            ch,
+                            "stft_score_frequency_instability_reference",
+                            None,
+                        ),
+                        _CHANNEL_DEFAULTS[
+                            "stft_score_frequency_instability_reference"
+                        ],
+                    ),
+                    "stft_score_harmonic_start_order": self._int_or_default(
+                        getattr(ch, "stft_score_harmonic_start_order", None),
+                        _CHANNEL_DEFAULTS["stft_score_harmonic_start_order"],
+                    ),
+                    "stft_score_harmonic_end_order": self._int_or_default(
+                        getattr(ch, "stft_score_harmonic_end_order", None),
+                        _CHANNEL_DEFAULTS["stft_score_harmonic_end_order"],
+                    ),
                     "spl_weighting": ch.spl_weighting,
                     "spl_time_constant": ch.spl_time_constant,
                     "spl_lower_enabled": bool(
@@ -331,6 +411,13 @@ class ConfigService:
                         ch,
                         "loudness_average_upper_limit",
                         _CHANNEL_DEFAULTS["loudness_average_upper_limit"],
+                    ),
+                    "fft_x_axis_scale": self._normalize_fft_x_axis_scale(
+                        getattr(
+                            ch,
+                            "fft_x_axis_scale",
+                            _CHANNEL_DEFAULTS["fft_x_axis_scale"],
+                        )
                     ),
                     "fft_band_limits": self._parse_json(ch.fft_band_limits, []),
                     "oct_weighting": ch.oct_weighting,
@@ -532,6 +619,9 @@ class ConfigService:
             "output_device_hostapi": source.get("output_device_hostapi"),
             "output_device_samplerate": source.get("output_device_samplerate"),
             "selected_channels": selected_channels,
+            "vibration_view_channel_index": source.get(
+                "vibration_view_channel_index"
+            ),
             "monitor_channel_index": source.get("monitor_channel_index"),
             "monitor_gain_db": monitor_gain_db,
             "channels": prepared_channels,
@@ -738,7 +828,6 @@ class ConfigService:
             errors.append(
                 f"监听增益必须在 {MONITOR_GAIN_MIN_DB:g} 到 {MONITOR_GAIN_MAX_DB:g} dB 之间"
             )
-
         channels = data.get("channels", [])
         if not isinstance(channels, list):
             errors.append("通道数据格式无效")
@@ -769,8 +858,37 @@ class ConfigService:
                 errors.append(f"{prefix}: STFT FFT 点数无效")
             if ch.get("fft_nfft", _CHANNEL_DEFAULTS["fft_nfft"]) not in _VALID_FFT_NFFT:
                 errors.append(f"{prefix}: FFT 分辨率无效")
+            if (
+                ch.get(
+                    "fft_x_axis_scale",
+                    _CHANNEL_DEFAULTS["fft_x_axis_scale"],
+                )
+                not in _VALID_FFT_X_AXIS_SCALES
+            ):
+                errors.append(f"{prefix}: FFT 横轴模式无效")
             if ch.get("stft_overlap") not in _VALID_OVERLAP:
                 errors.append(f"{prefix}: STFT 重叠率无效")
+            fixed_color_scale_enabled = ch.get(
+                "stft_color_scale_enabled",
+                _CHANNEL_DEFAULTS["stft_color_scale_enabled"],
+            )
+            if "stft_color_scale_enabled" in ch and not isinstance(
+                fixed_color_scale_enabled,
+                bool,
+            ):
+                errors.append(f"{prefix}: STFT 固定色阶开关必须为布尔值")
+            elif fixed_color_scale_enabled:
+                min_db = self._finite_float_or_none(
+                    ch.get("stft_color_scale_min_db")
+                )
+                max_db = self._finite_float_or_none(
+                    ch.get("stft_color_scale_max_db")
+                )
+                if min_db is None or max_db is None:
+                    errors.append(f"{prefix}: STFT 色阶上下限必须为有限数值")
+                elif min_db >= max_db:
+                    errors.append(f"{prefix}: STFT 色阶下限必须小于上限")
+            errors.extend(self._validate_stft_score_fields(prefix, ch))
             if ch.get("spl_weighting") not in _VALID_WEIGHTING:
                 errors.append(f"{prefix}: SPL 计权模式无效")
             tc = ch.get("spl_time_constant", 0)
@@ -797,6 +915,16 @@ class ConfigService:
                     freq = band.get("freq", 0)
                     lo = band.get("lower", 0)
                     hi = band.get("upper", 0)
+                    if label == "FFT":
+                        if not self._is_finite_number(freq) or float(freq) <= 0:
+                            errors.append(f"{prefix}: FFT 第 {j+1} 行频率必须为正有限数")
+                        if not self._is_finite_number(lo):
+                            errors.append(f"{prefix}: FFT 第 {j+1} 行下限必须为有限数值")
+                        elif not self._is_finite_number(hi):
+                            errors.append(f"{prefix}: FFT 第 {j+1} 行上限必须为有限数值")
+                        elif lo >= hi:
+                            errors.append(f"{prefix}: FFT 第 {j+1} 行下限必须小于上限")
+                        continue
                     if not isinstance(freq, (int, float)) or isinstance(freq, bool) or freq <= 0:
                         errors.append(f"{prefix}: {label} 第 {j+1} 行频率必须为正数")
                     if not isinstance(lo, (int, float)) or isinstance(lo, bool):
@@ -805,6 +933,8 @@ class ConfigService:
                         errors.append(f"{prefix}: {label} 第 {j+1} 行上限必须为数值")
                     elif lo >= hi:
                         errors.append(f"{prefix}: {label} 第 {j+1} 行下限必须小于上限")
+                if key == "fft_band_limits":
+                    errors.extend(self._validate_fft_limit_envelope(prefix, bands))
 
             errors.extend(
                 self._validate_golden_channel(
@@ -822,6 +952,26 @@ class ConfigService:
             )
         )
         return errors
+
+    def _validate_vibration_view_channel(self, data: dict) -> list[str]:
+        vibration_channel = data.get("vibration_view_channel_index")
+        if vibration_channel is None:
+            return []
+        if (
+            not isinstance(vibration_channel, int)
+            or isinstance(vibration_channel, bool)
+            or vibration_channel < 0
+        ):
+            return ["振动视图通道必须为不小于 0 的整数"]
+
+        input_channel_count = self.get_channel_count()
+        if input_channel_count > 0 and vibration_channel >= input_channel_count:
+            return ["振动视图通道必须小于输入通道数"]
+
+        selected_channels = data.get("selected_channels", [])
+        if isinstance(selected_channels, list) and vibration_channel not in selected_channels:
+            return ["振动视图通道必须来自已选择通道"]
+        return []
 
     def validate_factory_runtime(self, data: dict) -> list[str]:
         errors = []
@@ -843,6 +993,72 @@ class ConfigService:
                 if window_end_ms > record_duration_ms:
                     errors.append("分析窗起始偏移加分析时长不能超过录音时长")
 
+        errors.extend(self._validate_vibration_view_channel(data))
+        return errors
+
+    def _validate_stft_score_fields(self, prefix: str, channel: dict) -> list[str]:
+        errors: list[str] = []
+        if "stft_score_enabled" in channel and not isinstance(
+            channel["stft_score_enabled"],
+            bool,
+        ):
+            errors.append(f"{prefix}: STFT 评分启用必须为布尔值")
+        summary_mode = channel.get(
+            "stft_score_summary_mode",
+            _CHANNEL_DEFAULTS["stft_score_summary_mode"],
+        )
+        if not (
+            isinstance(summary_mode, str)
+            and summary_mode in _VALID_STFT_SCORE_SUMMARY_MODES
+        ):
+            errors.append(f"{prefix}: STFT 评分汇总方式无效")
+
+        percentile = channel.get(
+            "stft_score_percentile",
+            _CHANNEL_DEFAULTS["stft_score_percentile"],
+        )
+        if not self._is_finite_number(percentile) or not (
+            0.0 < float(percentile) <= 100.0
+        ):
+            errors.append(f"{prefix}: STFT 评分分位数必须大于0且小于等于100")
+
+        for field, label in (
+            ("stft_score_loudness_reference_sone", "响度参考值"),
+            ("stft_score_modulation_reference", "调制参考值"),
+            ("stft_score_harmonic_ratio_reference", "谐波占比参考值"),
+            ("stft_score_frequency_instability_reference", "频率不稳定参考值"),
+        ):
+            if not self._is_positive_finite(
+                channel.get(field, _CHANNEL_DEFAULTS[field])
+            ):
+                errors.append(f"{prefix}: STFT 评分{label}必须为正数")
+
+        start_order = channel.get(
+            "stft_score_harmonic_start_order",
+            _CHANNEL_DEFAULTS["stft_score_harmonic_start_order"],
+        )
+        end_order = channel.get(
+            "stft_score_harmonic_end_order",
+            _CHANNEL_DEFAULTS["stft_score_harmonic_end_order"],
+        )
+        if not isinstance(start_order, int) or isinstance(start_order, bool):
+            errors.append(f"{prefix}: STFT 评分谐波起始阶次必须为整数")
+        if not isinstance(end_order, int) or isinstance(end_order, bool):
+            errors.append(f"{prefix}: STFT 评分谐波结束阶次必须为整数")
+        if (
+            isinstance(start_order, int)
+            and not isinstance(start_order, bool)
+            and start_order < 2
+        ):
+            errors.append(f"{prefix}: STFT 评分谐波起始阶次必须大于等于2")
+        if (
+            isinstance(start_order, int)
+            and not isinstance(start_order, bool)
+            and isinstance(end_order, int)
+            and not isinstance(end_order, bool)
+            and end_order < start_order
+        ):
+            errors.append(f"{prefix}: STFT 评分谐波结束阶次必须大于等于起始阶次")
         return errors
 
     def _validate_channel_limit_groups(self, prefix: str, channel: dict) -> list[str]:
@@ -1109,6 +1325,8 @@ class ConfigService:
                 "stft_overlap",
                 _CHANNEL_DEFAULTS["stft_overlap"],
             ),
+            **self._normalized_stft_color_scale_fields(channel),
+            **self._normalized_stft_score_fields(channel),
             "spl_weighting": channel.get(
                 "spl_weighting",
                 _CHANNEL_DEFAULTS["spl_weighting"],
@@ -1185,6 +1403,12 @@ class ConfigService:
                 "loudness_average_upper_limit",
                 _CHANNEL_DEFAULTS["loudness_average_upper_limit"],
             ),
+            "fft_x_axis_scale": self._normalize_fft_x_axis_scale(
+                channel.get(
+                    "fft_x_axis_scale",
+                    _CHANNEL_DEFAULTS["fft_x_axis_scale"],
+                )
+            ),
             "fft_band_limits": deepcopy(channel.get("fft_band_limits", [])),
             "oct_weighting": channel.get(
                 "oct_weighting",
@@ -1221,11 +1445,45 @@ class ConfigService:
     def _channel_db_values(self, channel: dict) -> dict:
         normalized_channel = dict(channel)
         self._normalize_channel_limit_storage(normalized_channel)
+        self._normalize_stft_color_scale_storage(normalized_channel)
+        self._normalize_stft_score_storage(normalized_channel)
         return {
             "channel_index": normalized_channel["channel_index"],
             "stft_nfft": normalized_channel["stft_nfft"],
             "fft_nfft": normalized_channel.get("fft_nfft", _CHANNEL_DEFAULTS["fft_nfft"]),
             "stft_overlap": normalized_channel["stft_overlap"],
+            "stft_color_scale_enabled": normalized_channel[
+                "stft_color_scale_enabled"
+            ],
+            "stft_color_scale_min_db": normalized_channel[
+                "stft_color_scale_min_db"
+            ],
+            "stft_color_scale_max_db": normalized_channel[
+                "stft_color_scale_max_db"
+            ],
+            "stft_score_enabled": normalized_channel["stft_score_enabled"],
+            "stft_score_summary_mode": normalized_channel[
+                "stft_score_summary_mode"
+            ],
+            "stft_score_percentile": normalized_channel["stft_score_percentile"],
+            "stft_score_loudness_reference_sone": normalized_channel[
+                "stft_score_loudness_reference_sone"
+            ],
+            "stft_score_modulation_reference": normalized_channel[
+                "stft_score_modulation_reference"
+            ],
+            "stft_score_harmonic_ratio_reference": normalized_channel[
+                "stft_score_harmonic_ratio_reference"
+            ],
+            "stft_score_frequency_instability_reference": normalized_channel[
+                "stft_score_frequency_instability_reference"
+            ],
+            "stft_score_harmonic_start_order": normalized_channel[
+                "stft_score_harmonic_start_order"
+            ],
+            "stft_score_harmonic_end_order": normalized_channel[
+                "stft_score_harmonic_end_order"
+            ],
             "spl_weighting": normalized_channel["spl_weighting"],
             "spl_time_constant": normalized_channel["spl_time_constant"],
             "spl_lower_enabled": normalized_channel["spl_lower_enabled"],
@@ -1247,6 +1505,12 @@ class ConfigService:
             "loudness_average_lower_limit": normalized_channel["loudness_average_lower_limit"],
             "loudness_average_upper_enabled": normalized_channel["loudness_average_upper_enabled"],
             "loudness_average_upper_limit": normalized_channel["loudness_average_upper_limit"],
+            "fft_x_axis_scale": self._normalize_fft_x_axis_scale(
+                normalized_channel.get(
+                    "fft_x_axis_scale",
+                    _CHANNEL_DEFAULTS["fft_x_axis_scale"],
+                )
+            ),
             "fft_band_limits": json.dumps(normalized_channel["fft_band_limits"]),
             "oct_weighting": normalized_channel["oct_weighting"],
             "oct_band_limits": json.dumps(normalized_channel["oct_band_limits"]),
@@ -1308,6 +1572,13 @@ class ConfigService:
             values["monitor_gain_db"] = self._normalize_monitor_gain(
                 data.get("monitor_gain_db", MONITOR_GAIN_DEFAULT_DB)
             )
+        if self._config_field_exists(
+            "vibration_view_channel_index",
+            available_columns,
+        ):
+            values["vibration_view_channel_index"] = data.get(
+                "vibration_view_channel_index"
+            )
         return values
 
     @staticmethod
@@ -1347,6 +1618,130 @@ class ConfigService:
         if self._is_numeric(value) and math.isfinite(float(value)):
             return float(value)
         return MONITOR_GAIN_DEFAULT_DB
+
+    @staticmethod
+    def _normalize_fft_x_axis_scale(value) -> str:
+        text = str(value or "").strip().lower()
+        return text if text in _VALID_FFT_X_AXIS_SCALES else "linear"
+
+    def _normalized_stft_color_scale_fields(self, channel: dict) -> dict:
+        enabled = channel.get(
+            "stft_color_scale_enabled",
+            _CHANNEL_DEFAULTS["stft_color_scale_enabled"],
+        )
+        if enabled is True:
+            return {
+                "stft_color_scale_enabled": True,
+                "stft_color_scale_min_db": channel.get(
+                    "stft_color_scale_min_db"
+                ),
+                "stft_color_scale_max_db": channel.get(
+                    "stft_color_scale_max_db"
+                ),
+            }
+        if enabled is not False:
+            return {
+                "stft_color_scale_enabled": enabled,
+                "stft_color_scale_min_db": channel.get(
+                    "stft_color_scale_min_db"
+                ),
+                "stft_color_scale_max_db": channel.get(
+                    "stft_color_scale_max_db"
+                ),
+            }
+        return {
+            "stft_color_scale_enabled": False,
+            "stft_color_scale_min_db": self._finite_float_or_default(
+                channel.get("stft_color_scale_min_db"),
+                _CHANNEL_DEFAULTS["stft_color_scale_min_db"],
+            ),
+            "stft_color_scale_max_db": self._finite_float_or_default(
+                channel.get("stft_color_scale_max_db"),
+                _CHANNEL_DEFAULTS["stft_color_scale_max_db"],
+            ),
+        }
+
+    def _normalize_stft_color_scale_storage(self, channel: dict) -> None:
+        normalized = self._normalized_stft_color_scale_fields(channel)
+        if normalized["stft_color_scale_enabled"]:
+            for field in (
+                "stft_color_scale_min_db",
+                "stft_color_scale_max_db",
+            ):
+                value = normalized[field]
+                if self._is_finite_number(value):
+                    normalized[field] = float(value)
+        channel.update(normalized)
+
+    @staticmethod
+    def _normalize_stft_score_summary_mode(value) -> str:
+        if isinstance(value, str) and value in _VALID_STFT_SCORE_SUMMARY_MODES:
+            return value
+        return _CHANNEL_DEFAULTS["stft_score_summary_mode"]
+
+    def _normalized_stft_score_fields(self, channel: dict) -> dict:
+        return {
+            field: channel[field] if field in channel else _CHANNEL_DEFAULTS[field]
+            for field in (
+                "stft_score_enabled",
+                "stft_score_summary_mode",
+                "stft_score_percentile",
+                "stft_score_loudness_reference_sone",
+                "stft_score_modulation_reference",
+                "stft_score_harmonic_ratio_reference",
+                "stft_score_frequency_instability_reference",
+                "stft_score_harmonic_start_order",
+                "stft_score_harmonic_end_order",
+            )
+        }
+
+    def _normalize_stft_score_storage(self, channel: dict) -> None:
+        normalized = self._normalized_stft_score_fields(channel)
+        normalized["stft_score_enabled"] = (
+            normalized["stft_score_enabled"] is True
+        )
+        normalized["stft_score_summary_mode"] = (
+            self._normalize_stft_score_summary_mode(
+                normalized["stft_score_summary_mode"]
+            )
+        )
+        for field in (
+            "stft_score_percentile",
+            "stft_score_loudness_reference_sone",
+            "stft_score_modulation_reference",
+            "stft_score_harmonic_ratio_reference",
+            "stft_score_frequency_instability_reference",
+        ):
+            normalized[field] = self._finite_float_or_default(
+                normalized[field],
+                _CHANNEL_DEFAULTS[field],
+            )
+        for field in (
+            "stft_score_harmonic_start_order",
+            "stft_score_harmonic_end_order",
+        ):
+            normalized[field] = self._int_or_default(
+                normalized[field],
+                _CHANNEL_DEFAULTS[field],
+            )
+        channel.update(normalized)
+
+    def _finite_float_or_default(self, value, default: float) -> float:
+        value = self._finite_float_or_none(value)
+        if value is None:
+            return float(default)
+        return value
+
+    def _finite_float_or_none(self, value) -> float | None:
+        if self._is_finite_number(value):
+            return float(value)
+        return None
+
+    @staticmethod
+    def _int_or_default(value, default: int) -> int:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return int(value)
+        return int(default)
 
     def _replace_channel_rows(self, *, config_id: int, channels: list[dict]) -> None:
         ChannelConfigTable.delete().where(ChannelConfigTable.config == config_id).execute()
@@ -1436,3 +1831,52 @@ class ConfigService:
     @staticmethod
     def _is_numeric(value) -> bool:
         return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    @staticmethod
+    def _is_finite_number(value) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
+
+    def _is_positive_finite(self, value) -> bool:
+        return self._is_finite_number(value) and float(value) > 0.0
+
+    def _validate_fft_limit_envelope(self, prefix: str, bands: list[dict]) -> list[str]:
+        if not bands:
+            return []
+
+        valid_points: list[tuple[float, float, float]] = []
+        for band in bands:
+            if not isinstance(band, dict):
+                continue
+            freq = band.get("freq")
+            lower = band.get("lower")
+            upper = band.get("upper")
+            if (
+                self._is_finite_number(freq)
+                and float(freq) > 0.0
+                and self._is_finite_number(lower)
+                and self._is_finite_number(upper)
+                and lower < upper
+            ):
+                valid_points.append((float(freq), float(lower), float(upper)))
+
+        distinct = sorted({freq for freq, _lower, _upper in valid_points})
+        if len(distinct) < 2:
+            return [f"{prefix}: FFT 至少需要两个不同频率的控制点"]
+
+        errors: list[str] = []
+        for freq in distinct:
+            lowers = [
+                lower for current, lower, _upper in valid_points if current == freq
+            ]
+            uppers = [
+                upper for current, _lower, upper in valid_points if current == freq
+            ]
+            if max(lowers) >= min(uppers):
+                errors.append(
+                    f"{prefix}: FFT 频率 {freq:g} Hz 的下限包络必须小于上限包络"
+                )
+        return errors
