@@ -200,10 +200,13 @@ class EventBus(QObject):
     result_changed = pyqtSignal(dict)
     # 刷新通道
     refresh_channels = pyqtSignal()
+    # 写入plc信号
+    write_test_result_to_plc = pyqtSignal(dict)
 
     # 配置变化（供外部模块监听，如工单模块刷新可选配置列表）
     config_changed = pyqtSignal()
     plc_changed = pyqtSignal()
+    plc_workorder_changed = pyqtSignal(dict)
     ai_toolchains_changed = pyqtSignal()
 
     # ── Analysis kernel real-time signals ──
@@ -247,6 +250,7 @@ class ServiceContainer:
     bus: EventBus = field(default_factory=EventBus)
 
     def __post_init__(self):
+        self.bus.plc_limit_values_dict = {}
         self.test = TestManager(self.bus, self)
         # 数据库连接服务（长连接）
         self.db = DbConnectionService()

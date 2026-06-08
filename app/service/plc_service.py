@@ -28,11 +28,10 @@ class PlcService(QObject):
         rack: int = 0,
         slot: int = 1,
         db_number: int = 1,
-        byte_index: int = 0,
-        bit_index: int = 0,
         poll_interval_ms = 200,
         reconnect_interval_ms = 3000,
         auto_reset_bit = True,
+        field_offsets_dict = None,
         plc_id = None,
     ):
         # 初始化 PLC 服务，保存连接参数、轮询参数和运行时状态。
@@ -41,6 +40,7 @@ class PlcService(QObject):
         self.logger = LogManager.set_log_handler("core")
         self._on_start_requested = on_start_requested
         self._plc_id = plc_id
+        self._field_offsets_dict = field_offsets_dict
 
         # PLC 连接参数(IP，机架号，槽号）
         self._ip = ip
@@ -49,10 +49,6 @@ class PlcService(QObject):
 
         # 数据块号DB
         self._db_number = int(db_number)
-        # 数据块里的第几个字节
-        self._byte_index = int(byte_index)
-        # 字节里的第几位
-        self._bit_index = int(bit_index)
         # 轮询周期
         self._poll_interval_ms = int(poll_interval_ms)
         # 重连周期
@@ -90,11 +86,12 @@ class PlcService(QObject):
         self.connect_result.emit(True, "")
 
         self.logger.info(f"PLC开始监听: ip={self._ip}, rack={self._rack}, slot={self._slot}, "
-            f"DB{self._db_number}.DBX{self._byte_index}.{self._bit_index}")
+            f"DB{self._db_number}")
         self.bus.log.emit(
             f"PLC开始监听: ip={self._ip}, rack={self._rack}, slot={self._slot}, "
-            f"DB{self._db_number}.DBX{self._byte_index}.{self._bit_index}"
+            f"DB{self._db_number}"
         )
+        self.read_plc_limit()
 
     @pyqtSlot()
     def stop_plc_service(self):
@@ -120,18 +117,10 @@ class PlcService(QObject):
         try:
             client = snap7.client.Client()
             client.connect(self._ip, self._rack, self._slot)
-            self.logger.info(
-                f"PLC连接参数: ip={self._ip}, rack={self._rack}, slot={self._slot}"
-            )
-            self.logger.info(
-                f"PLC地址参数: db_number数据块号={self._db_number}, 字节偏移={self._byte_index}, 位偏移={self._bit_index}"
-            )
-            self.bus.log.emit(
-                f"PLC连接参数: ip={self._ip}, rack={self._rack}, slot={self._slot}"
-            )
-            self.bus.log.emit(
-                 f"PLC地址参数: db_number数据块号={self._db_number}, 字节偏移={self._byte_index}, 位偏移={self._bit_index}"
-            )
+            self.logger.info(f"PLC连接参数: ip={self._ip}, rack={self._rack}, slot={self._slot}")
+            self.logger.info(f"PLC地址参数: db_number数据块号={self._db_number}")
+            self.bus.log.emit(f"PLC连接参数: ip={self._ip}, rack={self._rack}, slot={self._slot}")
+            self.bus.log.emit(f"PLC地址参数: db_number数据块号={self._db_number}")
             self.plc_client = client
             self._reconnect_timer_ms = 0
             self._last_connect_error = ""
@@ -177,9 +166,10 @@ class PlcService(QObject):
             return None
 
         try:
-            bytes = self.plc_client.db_read(self._db_number, self._byte_index, 1)
+            byte_index, bit_index = self.parse_bit_offset(self._field_offsets_dict["start_signal_offset"])
+            bytes = self.plc_client.db_read(self._db_number, byte_index, 1)
             # 取第几位
-            data = snap7.util.get_bool(bytes, 0, self._bit_index)
+            data = snap7.util.get_bool(bytes, 0, bit_index)
             return bool(data)
         except Exception as exc:
             self._disconnect()
@@ -187,21 +177,166 @@ class PlcService(QObject):
             self.logger.error(f"PLC 读取失败: {exc}")
             return None
 
-    def _write_start_bit(self, value: bool) -> bool:
-        # 向 PLC 写入开始位，通常用于触发后自动复位为 0。
-        if self.plc_client is None:
-            return False
-
-        try:
-            data = bytearray(1)
-            snap7.util.set_bool(data, 0, self._bit_index, bool(value))
-            self.plc_client.db_write(self._db_number, self._byte_index, data)
+    def write_plc_value(self, offset, type, value):
+        if type == "string":
+            byte_index = int(str(offset).split(".", 1)[0])
+            data = bytearray(256)
+            snap7.util.set_string(data, 0, str(value), 254)
+            self.plc_client.db_write(self._db_number, byte_index, data)
             return True
+        if type == "bool":
+            byte_index, bit_index = self.parse_bit_offset(offset)
+            data = bytearray(self.plc_client.db_read(self._db_number, byte_index, 1))
+            snap7.util.set_bool(data, 0, bit_index, bool(value))
+            self.plc_client.db_write(self._db_number, byte_index, data)
+            return True
+        if type == "real":
+            byte_index = int(str(offset).split(".", 1)[0])
+            data = bytearray(4)
+            snap7.util.set_real(data, 0, float(value))
+            self.plc_client.db_write(self._db_number, byte_index, data)
+            return True
+        return False
+
+    def write_test_result_to_plc(self, test_result):
+        """
+        test_result = {
+                "finished": True,
+                "error_code": "0",
+                "sn_code": "01010101",
+                "result": True,
+                "score": 86.5,
+                "spl": 65.2,
+                "loudness": 12.3,
+                "vibrate": 0.8,
+                "ai_score": 91.0,
+                }
+        """
+        if self.plc_client is None:
+            return
+        plc_values = [
+            ("res_error_code_offset", "string", test_result.get("error_code")),
+            ("res_sn_code_offset", "string", test_result.get("sn_code")),
+            ("res_result_offset", "bool", test_result.get("result")),
+            ("res_score_offset", "real", test_result.get("score")),
+            ("res_spl_offset", "real", test_result.get("spl")),
+            ("res_loudness_offset", "real", test_result.get("loudness")),
+            ("res_vibrate_data_offset", "real", test_result.get("vibrate")),
+            ("res_ai_score_offset", "real", test_result.get("ai_score")),
+        ]
+        try:
+            for field_name, type, value in plc_values:
+                offset = self._field_offsets_dict.get(field_name)
+                if not offset:
+                    self.logger.warning(f"PLC {self._plc_id} 未找到偏移配置: {field_name}")
+                    continue
+                self.write_plc_value(offset, type, value)
+            # 最后写结束信号
+            if test_result.get("finished", False):
+                finish_offset = self._field_offsets_dict.get("res_finish_signal_offset")
+                if finish_offset:
+                    self.write_plc_value(finish_offset, "bool", True)
+            self.bus.log.emit(f"PLC {self._plc_id} 写入测试结果完成")
         except Exception as exc:
-            self._disconnect()
-            self.bus.log.emit(f"PLC 写入失败: {exc}")
-            self.logger.error(f"PLC 写入失败: {exc}")
-            return False
+            self.bus.log.emit(f"PLC {self._plc_id} 写入测试结果失败: {exc}")
+            self.logger.error(f"PLC 写入测试结果失败: {exc}")
+
+    def read_offset_value(self, offset, type):
+        if type == "string":
+            byte_index = int(str(offset).split(".", 1)[0])
+            data = self.plc_client.db_read(self._db_number, byte_index, 256)
+            current_len = data[1]
+            if current_len <= 0:
+                return ""
+            raw = bytes(data[2:2 + current_len])
+            return raw.decode("ascii", errors="ignore").strip()
+
+        if type == "bool":
+            byte_index, bit_index = self.parse_bit_offset(offset)
+            data = self.plc_client.db_read(self._db_number, byte_index, 1)
+            return snap7.util.get_bool(data, 0, bit_index)
+
+        if type == "real":
+            byte_index = int(str(offset).split(".", 1)[0])
+            data = self.plc_client.db_read(self._db_number, byte_index, 4)
+            return snap7.util.get_real(data, 0)
+
+        return None
+
+    def read_plc_values(self, *field_names) -> dict:
+        values = {}
+        string_fields = {
+            "sn_code_offset",
+            "product_model_offset",
+            "res_error_code_offset",
+            "res_sn_code_offset",
+            "res_product_model_offset",
+        }
+        bool_fields = {
+            "start_signal_offset",
+            "res_finish_signal_offset",
+            "res_result_offset",
+        }
+        real_fields = {
+            "res_score_offset",
+            "res_spl_offset",
+            "res_loudness_offset",
+            "res_vibrate_data_offset",
+            "res_ai_score_offset",
+            "res_spl_limit_up_offset",
+            "res_spl_limit_down_offset",
+            "res_loudness_limit_up_offset",
+            "res_loudness_limit_down_offset",
+            "res_vibrate_limit_up_offset",
+            "res_vibrate_limit_down_offset",
+            "res_ai_score_limit_down_offset",
+        }
+
+        for field_name in field_names:
+            offset = self._field_offsets_dict.get(field_name)
+            if not offset:
+                self.logger.warning(f"PLC {self._plc_id} 未找到偏移配置: {field_name}")
+                continue
+
+            if field_name in string_fields:
+                value = self.read_offset_value(offset, "string")
+            elif field_name in bool_fields:
+                value = self.read_offset_value(offset, "bool")
+            elif field_name in real_fields:
+                value = self.read_offset_value(offset, "real")
+            else:
+                continue
+
+            # 字符串为空或读取失败时不放进结果；False 和 0.0 是有效值，需要保留。
+            if value == "" or value is None:
+                continue
+            values[field_name] = value
+        return values
+
+    def read_plc_limit(self):
+        # PLC 连接成功后读取一次机种和各项上下限，后续测试可直接按 plc_id 取用。
+        values = self.read_plc_values(
+            "res_product_model_offset",
+            "res_spl_limit_up_offset",
+            "res_spl_limit_down_offset",
+            "res_loudness_limit_up_offset",
+            "res_loudness_limit_down_offset",
+            "res_vibrate_limit_up_offset",
+            "res_vibrate_limit_down_offset",
+            "res_ai_score_limit_down_offset",
+        )
+        self.bus.plc_limit_values_dict[self._plc_id] = values
+        self.bus.log.emit(f"PLC {self._plc_id} 读取限值完成: {values}")
+
+    def _emit_plc_workorder(self):
+        payload = {}
+        values = self.read_plc_values("sn_code_offset", "product_model_offset")
+        if values.get("sn_code_offset"):
+            payload["sn"] = values["sn_code_offset"]
+        if values.get("product_model_offset"):
+            payload["model"] = values["product_model_offset"]
+        if payload:
+            self.bus.plc_workorder_changed.emit(payload)
 
     def poll_once(self):
         """
@@ -230,6 +365,7 @@ class PlcService(QObject):
             return
         self.bus.log.emit(f"PLC {self._plc_id} 检测到开始信号")
         self.logger.info(f"PLC {self._plc_id} 检测到开始信号")
+        self._emit_plc_workorder()
         try:
             self._on_start_requested()
         except Exception as exc:
@@ -238,5 +374,9 @@ class PlcService(QObject):
 
         # 如果需要，触发后自动清零，方便 PLC 下次再次置 1 触发。
         if self._auto_reset_bit:
-            self._write_start_bit(False)
+            self.write_plc_value(self._field_offsets_dict["start_signal_offset"],"bool",False)
+
+    def parse_bit_offset(self, offset):
+        byte_text, bit_text = str(offset).split(".", 1)
+        return int(byte_text), int(bit_text)
 

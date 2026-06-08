@@ -78,6 +78,8 @@ class WorkOrderModule(QWidget):
             self.services.bus.factory_selection_notice.connect(self._on_factory_selection_notice)
         if hasattr(self.services.bus, "factory_display_reset"):
             self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
+        if hasattr(self.services.bus, "plc_workorder_changed"):
+            self.services.bus.plc_workorder_changed.connect(self._on_plc_workorder_changed)
 
         self._reload_config_options()
         self._restore_startup_selection()
@@ -122,6 +124,14 @@ class WorkOrderModule(QWidget):
             return
         self.ed_sn.clear()
         self._publish_workorder(force=True)
+
+    def _on_plc_workorder_changed(self, payload: dict) -> None:
+        sn = str(payload.get("sn") or "").strip()
+        model = str(payload.get("model") or "").strip()
+        if sn:
+            self.ed_sn.setText(sn)
+        if model:
+            self.ed_model.setText(model)
 
     def _sync_factory_state(
         self,

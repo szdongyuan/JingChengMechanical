@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import re
+
 from PyQt6.QtCore import QMetaObject, QThread, Qt
 from PyQt6.QtWidgets import (
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -14,9 +18,148 @@ from PyQt6.QtWidgets import (
 
 from app.service.log_manager import LogManager
 from base.utils import int_or_none, text_or_empty, text_or_none
+from consts.style import APP_QSS
 from app.service.plc_service import PlcService
+from model.plc_field_offset_table import PlcFieldOffsetTable
+from model.plc_process_param_offset_table import PlcProcessParamOffsetTable
 from model.plc_table import PlcTable
 
+
+PLC_FIELD_OFFSETS = [
+    ("start_signal_offset", "启动型号 StartSignal"),
+    ("sn_code_offset", "SN码 SnCode"),
+    ("product_model_offset", "产品型号 ProductModel"),
+    ("res_finish_signal_offset", "返回结束信号 ResFinishSignal"),
+    ("res_error_code_offset", "返回异常代码 ResErrorCode"),
+    ("res_sn_code_offset", "返回SN码 ResSnCode"),
+    ("res_result_offset", "返回测试结果 ResResult"),
+    ("res_score_offset", "返回评分 ResScore"),
+    ("res_spl_offset", "返回平均声压级 ResSPL"),
+    ("res_loudness_offset", "返回响度 ResLoudness"),
+    ("res_vibrate_data_offset", "返回中场振动 ResVibrateData"),
+    ("res_ai_score_offset", "返回AI评分 ResAiScore"),
+    ("res_product_model_offset", "返回机种 ResProductModel"),
+    ("res_spl_limit_up_offset", "返回声压值上限 ResSplLimitUp"),
+    ("res_spl_limit_down_offset", "返回声压值下限 ResSplLimitDown"),
+    ("res_loudness_limit_up_offset", "返回响度值上限 ResLoudnessLimitUp"),
+    ("res_loudness_limit_down_offset", "返回响度值下限 ResLoudnessLimitDown"),
+    ("res_vibrate_limit_up_offset", "返回振动值上限 ResVibrateLimitUp"),
+    ("res_vibrate_limit_down_offset", "返回振动值下限 ResVibrateLimitDown"),
+    ("res_ai_score_limit_down_offset", "返回AI评分下限 ResAiScoreLimitDown"),
+]
+
+PLC_PROCESS_PARAM_OFFSETS = [
+    ("load_cw_scan_offset", "加载Cw扫描 LoadCwScan"),
+    ("load_cw_load_offset", "加载CwLoad LoadCwLoad"),
+    ("load_pause_offset", "加载停顿 LoadPause"),
+    ("load_ccw_scan_offset", "加载Ccw扫描 LoadCcwScan"),
+    ("load_ccw_load_offset", "加载CcwLoad LoadCcwLoad"),
+    ("load_to_noload_waiting_time_offset", "负载到空载等待时间"),
+    ("switch_sound_cw_1_offset", "切换音Cw1 SwitchSoundCw_1"),
+    ("switch_sound_ccw_1_offset", "切换音Ccw1 SwitchSoundCcw_1"),
+    ("switch_sound_cw_2_offset", "切换音Cw2 SwitchSoundCw_2"),
+    ("switch_sound_ccw_2_offset", "切换音Ccw2 SwitchSoundCcw_2"),
+    ("noload_cw_offset", "空载Cw NoloadCw"),
+    ("noload_pause_offset", "空载停顿 NoloadPause"),
+    ("noload_ccw_offset", "空载Ccw NoloadCcw"),
+]
+
+
+class PlcFieldOffsetDialog(QDialog):
+    def __init__(self, plc_id, values=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"字段偏移量配置 - PLC {plc_id}")
+        self.resize(520, 620)
+        self.setStyleSheet(APP_QSS + "\nQDialog { background: white; }")
+        self.edits = {}
+
+        form = QFormLayout()
+        values = values or {}
+        for key, label in PLC_FIELD_OFFSETS:
+            edit = QLineEdit(text_or_empty(values.get(key)))
+            edit.setMinimumHeight(34)
+            self.edits[key] = edit
+            form.addRow(f"{label}：", edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    def get_values(self):
+        return {
+            key: text_or_none(edit.text())
+            for key, edit in self.edits.items()
+        }
+
+    def validate_values(self):
+        for key, label in PLC_FIELD_OFFSETS:
+            value = self.edits[key].text().strip()
+            if not re.fullmatch(r"\d+\.\d+", value):
+                QMessageBox.warning(self, "提示", f"{label} 偏移格式错误，请输入类似 0.0 的格式")
+                self.edits[key].setFocus()
+                return False
+        return True
+
+    def accept(self):
+        if not self.validate_values():
+            return
+        super().accept()
+
+
+class PlcProcessParamOffsetDialog(QDialog):
+    def __init__(self, values=None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("工艺参数偏移配置")
+        self.resize(520, 520)
+        self.setStyleSheet(APP_QSS + "\nQDialog { background: white; }")
+        self.edits = {}
+
+        form = QFormLayout()
+        values = values or {}
+        for key, label in PLC_PROCESS_PARAM_OFFSETS:
+            edit = QLineEdit(text_or_empty(values.get(key)))
+            edit.setMinimumHeight(34)
+            self.edits[key] = edit
+            form.addRow(f"{label}：", edit)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        layout = QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(buttons)
+
+    def get_values(self):
+        return {
+            key: text_or_none(edit.text())
+            for key, edit in self.edits.items()
+        }
+
+    def validate_values(self):
+        for key, label in PLC_PROCESS_PARAM_OFFSETS:
+            value = self.edits[key].text().strip()
+            if not re.fullmatch(r"\d+\.\d+", value):
+                QMessageBox.warning(self, "提示", f"{label} 偏移格式错误，请输入类似 0.0 的格式")
+                self.edits[key].setFocus()
+                return False
+        return True
+
+    def accept(self):
+        if not self.validate_values():
+            return
+        super().accept()
+    
 
 class PlcSettingsModule(QWidget):
     def __init__(self, services):
@@ -53,8 +196,6 @@ class PlcSettingsModule(QWidget):
         self.ed_rack = QLineEdit()
         self.ed_slot = QLineEdit()
         self.ed_db_number = QLineEdit()
-        self.ed_byte_index = QLineEdit()
-        self.ed_bit_index = QLineEdit()
         self.ed_poll_interval = QLineEdit()
         self.ed_reconnect_interval = QLineEdit()
         # 状态只展示当前值，开关和连接通过按钮触发。
@@ -67,8 +208,6 @@ class PlcSettingsModule(QWidget):
             self.ed_rack,
             self.ed_slot,
             self.ed_db_number,
-            self.ed_byte_index,
-            self.ed_bit_index,
             self.ed_poll_interval,
             self.ed_reconnect_interval,
         ):
@@ -80,8 +219,6 @@ class PlcSettingsModule(QWidget):
         form.addRow("机架号：", self.ed_rack)
         form.addRow("槽号：", self.ed_slot)
         form.addRow("数据块号：", self.ed_db_number)
-        form.addRow("字节偏移：", self.ed_byte_index)
-        form.addRow("位偏移：", self.ed_bit_index)
         form.addRow("轮询时间(ms)：", self.ed_poll_interval)
         form.addRow("断线重连时间(ms)：", self.ed_reconnect_interval)
         form.addRow("开机启动：", self.lb_state)
@@ -90,7 +227,15 @@ class PlcSettingsModule(QWidget):
 
         btn_row = QHBoxLayout()
         btn_row.setContentsMargins(0, 0, 0, 0)
-        btn_row.setSpacing(60)
+        btn_row.setSpacing(20)
+
+        self.btn_field_offset = QPushButton("偏移设置")
+        self.btn_field_offset.setObjectName("Primary")
+        self.btn_field_offset.setFixedWidth(96)
+
+        self.btn_process_param_offset = QPushButton("工艺")
+        self.btn_process_param_offset.setObjectName("Primary")
+        self.btn_process_param_offset.setFixedWidth(96)
 
         self.btn_save = QPushButton("保存")
         self.btn_save.setObjectName("Primary")
@@ -105,6 +250,8 @@ class PlcSettingsModule(QWidget):
         self.btn_connect.setFixedWidth(96)
 
         btn_row.addStretch(1)
+        btn_row.addWidget(self.btn_field_offset)
+        btn_row.addWidget(self.btn_process_param_offset)
         btn_row.addWidget(self.btn_save)
         btn_row.addWidget(self.btn_toggle)
         btn_row.addWidget(self.btn_connect)
@@ -117,14 +264,14 @@ class PlcSettingsModule(QWidget):
         self.btn_save.clicked.connect(self.save_current)
         self.btn_toggle.clicked.connect(self.toggle_state)
         self.btn_connect.clicked.connect(self.connect_plc)
+        self.btn_field_offset.clicked.connect(self.open_field_offset_dialog)
+        self.btn_process_param_offset.clicked.connect(self.open_process_param_offset_dialog)
         for edit in (
             self.ed_name,
             self.ed_ip,
             self.ed_rack,
             self.ed_slot,
             self.ed_db_number,
-            self.ed_byte_index,
-            self.ed_bit_index,
             self.ed_poll_interval,
             self.ed_reconnect_interval,
         ):
@@ -153,6 +300,8 @@ class PlcSettingsModule(QWidget):
         self.btn_save.setEnabled(has_rows)
         self.btn_toggle.setEnabled(has_rows)
         self.btn_connect.setEnabled(has_rows)
+        self.btn_field_offset.setEnabled(has_rows)
+        self.btn_process_param_offset.setEnabled(has_rows)
         self._set_fields_enabled(has_rows)
 
         if has_rows:
@@ -187,8 +336,6 @@ class PlcSettingsModule(QWidget):
             self.ed_rack,
             self.ed_slot,
             self.ed_db_number,
-            self.ed_byte_index,
-            self.ed_bit_index,
             self.ed_poll_interval,
             self.ed_reconnect_interval,
         )
@@ -199,8 +346,6 @@ class PlcSettingsModule(QWidget):
         self.ed_rack.setText(text_or_empty(row.plc_rack))
         self.ed_slot.setText(text_or_empty(row.plc_slot))
         self.ed_db_number.setText(text_or_empty(row.plc_db_number))
-        self.ed_byte_index.setText(text_or_empty(row.plc_byte_index))
-        self.ed_bit_index.setText(text_or_empty(row.plc_bit_index))
         self.ed_poll_interval.setText(text_or_empty(row.plc_poll_interval_ms))
         self.ed_reconnect_interval.setText(text_or_empty(row.plc_reconnect_interval_ms))
         for edit in edits:
@@ -226,8 +371,6 @@ class PlcSettingsModule(QWidget):
             self.ed_rack,
             self.ed_slot,
             self.ed_db_number,
-            self.ed_byte_index,
-            self.ed_bit_index,
             self.ed_poll_interval,
             self.ed_reconnect_interval,
         ):
@@ -238,6 +381,82 @@ class PlcSettingsModule(QWidget):
         self.btn_toggle.setText("开启")
         self.btn_connect.setText("连接")
         self.btn_connect.setEnabled(False)
+        self.btn_field_offset.setEnabled(False)
+        self.btn_process_param_offset.setEnabled(False)
+
+    def open_field_offset_dialog(self):
+        row = self.get_current_row()
+        if row is None:
+            QMessageBox.warning(self, "提示", "请先选择 PLC")
+            return
+
+        offset_row = (
+            PlcFieldOffsetTable
+            .select()
+            .where(PlcFieldOffsetTable.plc_id == row.id)
+            .first()
+        )
+        if offset_row is None:
+            QMessageBox.warning(self, "提示", f"PLC {row.id} 未配置偏移数据")
+            return
+
+        values = {
+            field_name: getattr(offset_row, field_name)
+            for field_name, _label in PLC_FIELD_OFFSETS
+        }
+
+        dialog = PlcFieldOffsetDialog(row.id, values, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        try:
+            PlcFieldOffsetTable.update(**dialog.get_values()).where(
+                PlcFieldOffsetTable.plc_id == row.id
+            ).execute()
+            self.services.bus.log.emit(f"PLC {row.id} 偏移设置保存成功")
+            QMessageBox.information(self, "成功", f"PLC {row.id} 偏移设置保存成功!")
+        except Exception as exc:
+            self.services.bus.log.emit(f"PLC {row.id} 偏移设置保存失败: {exc}")
+            QMessageBox.warning(self, "提示", f"偏移设置保存失败: {exc}")
+
+    def open_process_param_offset_dialog(self):
+        offset_row = PlcProcessParamOffsetTable.select().first()
+        if offset_row is None:
+            QMessageBox.warning(self, "提示", "未配置工艺参数偏移数据")
+            return
+
+        values = {
+            field_name: getattr(offset_row, field_name)
+            for field_name, _label in PLC_PROCESS_PARAM_OFFSETS
+        }
+
+        dialog = PlcProcessParamOffsetDialog(values, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        try:
+            PlcProcessParamOffsetTable.update(**dialog.get_values()).execute()
+            self.services.bus.log.emit("工艺参数偏移保存成功")
+            QMessageBox.information(self, "成功", "工艺参数偏移保存成功!")
+        except Exception as exc:
+            self.services.bus.log.emit(f"工艺参数偏移保存失败: {exc}")
+            QMessageBox.warning(self, "提示", f"工艺参数偏移保存失败: {exc}")
+
+    def get_field_offsets(self, plc_id):
+        offset_row = (
+            PlcFieldOffsetTable
+            .select()
+            .where(PlcFieldOffsetTable.plc_id == plc_id)
+            .first()
+        )
+        if offset_row is None:
+            QMessageBox.warning(self, "提示", f"PLC {plc_id} 未配置偏移数据")
+            return None
+
+        return {
+            field_name: getattr(offset_row, field_name)
+            for field_name, _label in PLC_FIELD_OFFSETS
+        }
 
     def save_current(self):
         row = self.get_current_row()
@@ -252,8 +471,6 @@ class PlcSettingsModule(QWidget):
                 "plc_rack": int_or_none(self.ed_rack.text(), "机架号"),
                 "plc_slot": int_or_none(self.ed_slot.text(), "槽号"),
                 "plc_db_number": int_or_none(self.ed_db_number.text(), "数据块号"),
-                "plc_byte_index": int_or_none(self.ed_byte_index.text(), "字节偏移"),
-                "plc_bit_index": int_or_none(self.ed_bit_index.text(), "位偏移"),
                 "plc_poll_interval_ms": int_or_none(self.ed_poll_interval.text(), "轮询时间"),
                 "plc_reconnect_interval_ms": int_or_none(
                     self.ed_reconnect_interval.text(), "断线重连时间"
@@ -328,6 +545,10 @@ class PlcSettingsModule(QWidget):
             self.logger.info(f"PLC {row.id} 连接线程仍在运行，不重复创建")
             return
 
+        field_offsets_dict = self.get_field_offsets(row.id)
+        if field_offsets_dict is None:
+            return
+        print(f"row.id: {row.id}")
         plc_service = PlcService(
             bus=self.services.bus,
             on_start_requested=lambda plc_id=row.id: self.services._start_from_plc(plc_id),
@@ -335,11 +556,10 @@ class PlcSettingsModule(QWidget):
             rack=row.plc_rack,
             slot=row.plc_slot,
             db_number=row.plc_db_number,
-            byte_index=row.plc_byte_index,
-            bit_index=row.plc_bit_index,
             poll_interval_ms=row.plc_poll_interval_ms,
             reconnect_interval_ms=row.plc_reconnect_interval_ms,
             auto_reset_bit=True,
+            field_offsets_dict=field_offsets_dict,
             plc_id=row.id,
         )
 
@@ -480,8 +700,6 @@ class PlcSettingsModule(QWidget):
             self.ed_rack,
             self.ed_slot,
             self.ed_db_number,
-            self.ed_byte_index,
-            self.ed_bit_index,
             self.ed_poll_interval,
             self.ed_reconnect_interval,
         ):
@@ -498,13 +716,13 @@ class PlcSettingsModule(QWidget):
                 self.ed_rack,
                 self.ed_slot,
                 self.ed_db_number,
-                self.ed_byte_index,
-                self.ed_bit_index,
                 self.ed_poll_interval,
                 self.ed_reconnect_interval,
                 self.btn_save,
                 self.btn_toggle,
                 self.btn_connect,
+                self.btn_field_offset,
+                self.btn_process_param_offset,
         ):
             widget.setEnabled(allowed)
         self.combo_plc.setEnabled(True)
