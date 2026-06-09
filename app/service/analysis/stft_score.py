@@ -16,6 +16,9 @@ F0_MIN_WINDOW_SEC = 0.2
 F0_AUTOCORRELATION_THRESHOLD = 0.30
 F0_BOUNDARY_LAG_TOLERANCE = 0.05
 LOCAL_MODULATION_WINDOW_SEC = 1.0
+LOUDNESS_CHANGE_SIDE_WINDOW_SEC = 0.15
+LOUDNESS_CHANGE_LOW_PERCENTILE = 10.0
+LOUDNESS_CHANGE_HIGH_PERCENTILE = 90.0
 LOCAL_F0_WINDOW_SEC = 1.0
 SPEED_LOCAL_RIPPLE_SPAN_SEC = 0.25
 SPEED_LOCAL_RIPPLE_MIN_PERCENTILE_SAMPLES = 5
@@ -172,60 +175,29 @@ def compute_stft_score_payload(
     if loudness is None:
         return None
 
-    with np.errstate(over="ignore", invalid="ignore"):
-        power = 10.0 ** (magnitudes_db / 10.0)
-    if not np.all(np.isfinite(power)):
+    trace_times_absolute = _float_array_or_none(loudness_times, reshape=True)
+    if trace_times_absolute is None:
         return None
-    f0_values = _estimate_frame_f0_values(
-        sig,
-        resolved_sample_rate,
-        score_times_sec=absolute_times,
-        absolute_start_sec=absolute_start,
+    trace_times_absolute = trace_times_absolute + absolute_start
+    local_changes = _local_loudness_change_values(
+        trace_times=trace_times_absolute,
+        trace_values=loudness_values,
+        score_times=absolute_times,
     )
-    speed_track = _estimate_speed_frequency_track(
-        sig,
-        resolved_sample_rate,
-        score_times_sec=relative_times,
-    )
-    speed_stability = _speed_stability_factors(
-        relative_times,
-        speed_track,
-        reference=config["stft_score_frequency_instability_reference"],
-        absolute_start_sec=0.0,
-        window_duration_sec=window_duration_sec,
-    )
+    if local_changes is None or local_changes.size != absolute_times.size:
+        return None
 
     scores = []
-    modulation_factors = _modulation_factors(
-        absolute_times,
-        loudness,
-        config["stft_score_modulation_reference"],
-    )
+    change_reference = config["stft_score_modulation_reference"]
     loudness_reference = config["stft_score_loudness_reference_sone"]
-    harmonic_reference = config["stft_score_harmonic_ratio_reference"]
-    start_order = config["stft_score_harmonic_start_order"]
-    end_order = config["stft_score_harmonic_end_order"]
 
-    for index, frame_loudness in enumerate(loudness):
+    for frame_loudness, change_value in zip(loudness, local_changes, strict=False):
+        if not np.isfinite(frame_loudness) or not np.isfinite(change_value):
+            return None
         loudness_factor = _clamp01(float(frame_loudness) / loudness_reference)
-        harmonic_factor = 0.0
-        f0_hz = f0_values[index]
-        if f0_hz is not None:
-            harmonic_ratio = harmonic_energy_ratio(
-                frequencies_hz=frequencies_hz,
-                frame_power=power[:, index],
-                f0_hz=f0_hz,
-                start_order=start_order,
-                end_order=end_order,
-            )
-            harmonic_factor = _clamp01(harmonic_ratio / harmonic_reference)
-
-        anomaly = (
-            loudness_factor * (modulation_factors[index] + harmonic_factor)
-            + speed_stability[index]
-        )
-        anomaly_score = float(np.clip(anomaly * 100.0, 0.0, 100.0))
-        scores.append(100.0 - anomaly_score)
+        change_factor = _clamp01(float(change_value) / change_reference)
+        anomaly = loudness_factor * change_factor
+        scores.append(float(100.0 * (1.0 - anomaly)))
 
     score_array = np.asarray(scores, dtype=np.float64)
     if score_array.size == 0 or not np.all(np.isfinite(score_array)):
@@ -757,6 +729,58 @@ def _interpolate_loudness_to_score_times(
     if unique_times.size == 0:
         return None
     return np.interp(score_times, unique_times, unique_values)
+
+
+def _percentile_span(values) -> float:
+    arr = _float_array_or_none(values, reshape=True)
+    if arr is None:
+        return 0.0
+    arr = arr[np.isfinite(arr)]
+    if arr.size < 2:
+        return 0.0
+    high = float(np.percentile(arr, LOUDNESS_CHANGE_HIGH_PERCENTILE))
+    low = float(np.percentile(arr, LOUDNESS_CHANGE_LOW_PERCENTILE))
+    if not np.isfinite(high) or not np.isfinite(low):
+        return 0.0
+    return max(0.0, high - low)
+
+
+def _local_loudness_change_values(
+    *,
+    trace_times,
+    trace_values,
+    score_times,
+    side_window_sec: float = LOUDNESS_CHANGE_SIDE_WINDOW_SEC,
+) -> np.ndarray | None:
+    times = _float_array_or_none(trace_times, reshape=True)
+    values = _float_array_or_none(trace_values, reshape=True)
+    centers = _float_array_or_none(score_times, reshape=True)
+    if times is None or values is None or centers is None:
+        return None
+    if times.size == 0 or times.size != values.size:
+        return None
+    if not np.all(np.isfinite(times)) or not np.all(np.isfinite(values)):
+        return None
+    if np.any(values < 0.0):
+        return None
+
+    window = _finite_float(side_window_sec)
+    if window is None or window <= 0.0:
+        return None
+
+    order = np.argsort(times)
+    times = times[order]
+    values = values[order]
+    changes = []
+    for center in centers:
+        if not np.isfinite(center):
+            return None
+        left = values[(times >= center - window) & (times <= center)]
+        right = values[(times >= center) & (times <= center + window)]
+        left_change = _percentile_span(left)
+        right_change = _percentile_span(right)
+        changes.append((left_change + right_change) / 2.0)
+    return np.asarray(changes, dtype=np.float64)
 
 
 def _modulation_factors(

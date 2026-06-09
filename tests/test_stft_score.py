@@ -40,6 +40,19 @@ def _loudness_trace_entry(times_sec, values_sone):
     }
 
 
+def _patch_single_frame_stft(monkeypatch, *, times):
+    times_array = np.asarray(times, dtype=np.float64)
+    monkeypatch.setattr(
+        stft_score.dsp,
+        "compute_stft",
+        lambda *_args, **_kwargs: (
+            times_array,
+            np.array([60.0], dtype=np.float64),
+            np.full((1, times_array.size), -120.0, dtype=np.float64),
+        ),
+    )
+
+
 def test_dominant_speed_frequency_hz_detects_known_line():
     sample_rate = 25600.0
     duration = 4.0
@@ -273,6 +286,148 @@ def test_stft_score_uses_provided_loudness_trace_without_recompute(monkeypatch):
     assert captured == {"times": internal_times, "values": internal_values}
 
 
+def test_loudness_only_score_penalizes_centered_local_rise_and_fall(monkeypatch):
+    score_times = np.array([0.10, 0.30, 0.45, 0.60, 0.80], dtype=np.float64)
+    trace_times = np.arange(
+        0.0,
+        0.900 + 1e-12,
+        1.0 / stft_score.dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ,
+    )
+    trace_values = np.interp(
+        trace_times,
+        [0.0, 0.15, 0.30, 0.42, 0.55, 0.70, 0.90],
+        [61.0, 60.6, 61.6, 65.1, 63.8, 62.2, 61.7],
+    )
+    _patch_single_frame_stft(monkeypatch, times=score_times)
+    monkeypatch.setattr(
+        stft_score.dsp,
+        "compute_loudness_trace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cached loudness trace must be reused")
+        ),
+    )
+    monkeypatch.setattr(
+        stft_score.dsp,
+        "compute_loudness_trace_for_window",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cached contextual loudness trace must be reused")
+        ),
+    )
+
+    payload = stft_score.compute_stft_score_payload(
+        signal=np.ones(int(0.9 * 2000), dtype=np.float64),
+        sample_rate=2000.0,
+        stft_nfft=16,
+        stft_overlap=0.5,
+        score_config=_default_config(
+            stft_score_summary_mode="min",
+            stft_score_loudness_reference_sone=70.0,
+            stft_score_modulation_reference=2.0,
+        ),
+        absolute_start_sec=0.0,
+        loudness_trace=_loudness_trace_entry(trace_times, trace_values),
+    )
+
+    assert payload is not None
+    scores = np.asarray(payload["scores"], dtype=np.float64)
+    center_index = int(np.argmin(np.abs(score_times - 0.45)))
+    assert scores[center_index] == pytest.approx(np.min(scores))
+    assert scores[center_index] < scores[0] - 20.0
+    assert scores[center_index] < scores[-1] - 20.0
+
+
+def test_loudness_only_score_loudness_reference_controls_level_penalty(monkeypatch):
+    score_times = np.array([0.15], dtype=np.float64)
+    trace_times = np.arange(
+        0.0,
+        0.300 + 1e-12,
+        1.0 / stft_score.dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ,
+    )
+    trace_values = np.interp(trace_times, [0.0, 0.15, 0.30], [20.0, 60.0, 20.0])
+    _patch_single_frame_stft(monkeypatch, times=score_times)
+    monkeypatch.setattr(
+        stft_score.dsp,
+        "compute_loudness_trace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cached loudness trace must be reused")
+        ),
+    )
+    monkeypatch.setattr(
+        stft_score.dsp,
+        "compute_loudness_trace_for_window",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cached contextual loudness trace must be reused")
+        ),
+    )
+
+    def score_for_loudness_reference(reference_sone):
+        payload = stft_score.compute_stft_score_payload(
+            signal=np.ones(int(0.3 * 2000), dtype=np.float64),
+            sample_rate=2000.0,
+            stft_nfft=16,
+            stft_overlap=0.5,
+            score_config=_default_config(
+                stft_score_loudness_reference_sone=reference_sone,
+                stft_score_modulation_reference=1.0,
+            ),
+            absolute_start_sec=0.0,
+            loudness_trace=_loudness_trace_entry(trace_times, trace_values),
+        )
+        assert payload is not None
+        return float(payload["scores"][0])
+
+    low_reference_score = score_for_loudness_reference(40.0)
+    high_reference_score = score_for_loudness_reference(80.0)
+
+    assert low_reference_score < high_reference_score - 20.0
+
+
+def test_loudness_only_score_modulation_reference_controls_change_penalty(monkeypatch):
+    score_times = np.array([0.15], dtype=np.float64)
+    trace_times = np.arange(
+        0.0,
+        0.300 + 1e-12,
+        1.0 / stft_score.dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ,
+    )
+    trace_values = np.interp(trace_times, [0.0, 0.15, 0.30], [20.0, 60.0, 20.0])
+    _patch_single_frame_stft(monkeypatch, times=score_times)
+    monkeypatch.setattr(
+        stft_score.dsp,
+        "compute_loudness_trace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cached loudness trace must be reused")
+        ),
+    )
+    monkeypatch.setattr(
+        stft_score.dsp,
+        "compute_loudness_trace_for_window",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cached contextual loudness trace must be reused")
+        ),
+    )
+
+    def score_for_change_reference(reference_sone):
+        payload = stft_score.compute_stft_score_payload(
+            signal=np.ones(int(0.3 * 2000), dtype=np.float64),
+            sample_rate=2000.0,
+            stft_nfft=16,
+            stft_overlap=0.5,
+            score_config=_default_config(
+                stft_score_loudness_reference_sone=80.0,
+                stft_score_modulation_reference=reference_sone,
+            ),
+            absolute_start_sec=0.0,
+            loudness_trace=_loudness_trace_entry(trace_times, trace_values),
+        )
+        assert payload is not None
+        return float(payload["scores"][0])
+
+    low_reference_score = score_for_change_reference(5.0)
+    high_reference_score = score_for_change_reference(80.0)
+
+    assert low_reference_score < high_reference_score - 20.0
+
+
 def test_stft_score_accepts_non_grid_aligned_internal_loudness_trace(monkeypatch):
     duration_sec = 1.011
     sample_rate = 1000.0
@@ -469,12 +624,11 @@ def test_stft_score_uses_contextual_loudness_for_mid_file_window(monkeypatch):
     assert payload["times_sec"] == pytest.approx([0.6])
 
 
-def test_speed_stability_affects_score_independent_of_loudness(monkeypatch):
+def test_loudness_only_score_ignores_speed_track_when_loudness_trace_matches(monkeypatch):
     relative_times = np.arange(0.0, 0.30 + 1e-12, 0.025)
     absolute_start = 2.0
     constant_signal = np.ones(4096, dtype=np.float64)
     drifting_signal = np.full(4096, 2.0, dtype=np.float64)
-    speed_calls = []
     constant_track = np.full(relative_times.size, 60.0, dtype=np.float64)
     drifting_track = np.array(
         [60.0, 60.4, 60.8, 60.4, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0],
@@ -501,7 +655,6 @@ def test_speed_stability_affects_score_independent_of_loudness(monkeypatch):
     )
 
     def fake_speed_track(signal, sample_rate, *, score_times_sec):
-        speed_calls.append(np.asarray(score_times_sec, dtype=np.float64).copy())
         assert sample_rate == pytest.approx(2000.0)
         np.testing.assert_allclose(score_times_sec, relative_times)
         if float(np.max(signal)) > 1.5:
@@ -541,34 +694,43 @@ def test_speed_stability_affects_score_independent_of_loudness(monkeypatch):
     assert stable_payload is not None
     assert drifting_payload is not None
     assert stable_payload["times_sec"] == pytest.approx((relative_times + absolute_start).tolist())
-    assert len(speed_calls) == 2
-    assert drifting_payload["summary_score"] <= stable_payload["summary_score"] - 50.0
+    assert drifting_payload["times_sec"] == pytest.approx(stable_payload["times_sec"])
+    assert drifting_payload["scores"] == pytest.approx(stable_payload["scores"])
+    assert drifting_payload["summary_score"] == pytest.approx(stable_payload["summary_score"])
 
 
-def test_strong_modulation_and_harmonics_score_lower_than_stable_tone(monkeypatch):
+def test_loudness_only_score_ignores_harmonics_when_loudness_trace_matches(monkeypatch):
     sample_rate = 4000.0
     t = np.arange(int(sample_rate * 4.0), dtype=float) / sample_rate
     stable = 0.03 * np.sin(2.0 * np.pi * 60.0 * t)
-    modulation = 1.0 + 0.75 * np.sin(2.0 * np.pi * 4.0 * t)
-    harmonic_rich = modulation * (
+    harmonic_rich = (
         0.02 * np.sin(2.0 * np.pi * 60.0 * t)
         + 0.015 * np.sin(2.0 * np.pi * 600.0 * t)
         + 0.015 * np.sin(2.0 * np.pi * 1200.0 * t)
     )
+    trace_times = np.arange(
+        0.0,
+        4.0 + 1e-12,
+        1.0 / stft_score.dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ,
+    )
+    trace_values = np.full(trace_times.shape, 5.0, dtype=np.float64)
 
     def fake_loudness_trace(signal, sample_rate):
-        times = np.arange(0.25, 4.0, 0.25)
-        if np.max(np.abs(signal)) > np.max(np.abs(stable)):
-            values = 0.02 + 0.015 * (1.0 + np.sin(2.0 * np.pi * times))
-        else:
-            values = np.full(times.shape, 0.02)
-        return times.tolist(), values.tolist(), float(np.max(values))
+        return trace_times.tolist(), trace_values.tolist(), float(np.max(trace_values))
+
+    def fake_f0_values(signal, sample_rate, *, score_times_sec, absolute_start_sec):
+        return [60.0] * len(score_times_sec)
+
+    def fake_speed_track(signal, sample_rate, *, score_times_sec):
+        return np.full(len(score_times_sec), np.nan, dtype=np.float64)
 
     monkeypatch.setattr(stft_score.dsp, "compute_loudness_trace", fake_loudness_trace)
+    monkeypatch.setattr(stft_score, "_estimate_frame_f0_values", fake_f0_values)
+    monkeypatch.setattr(stft_score, "_estimate_speed_frequency_track", fake_speed_track)
 
     cfg = _default_config(
-        stft_score_loudness_reference_sone=0.01,
-        stft_score_modulation_reference=0.05,
+        stft_score_loudness_reference_sone=5.0,
+        stft_score_modulation_reference=0.001,
         stft_score_harmonic_ratio_reference=0.05,
         stft_score_frequency_instability_reference=0.02,
     )
@@ -589,7 +751,11 @@ def test_strong_modulation_and_harmonics_score_lower_than_stable_tone(monkeypatc
         absolute_start_sec=0.0,
     )
 
-    assert bad_payload["summary_score"] < stable_payload["summary_score"]
+    assert stable_payload is not None
+    assert bad_payload is not None
+    assert bad_payload["times_sec"] == pytest.approx(stable_payload["times_sec"])
+    assert bad_payload["scores"] == pytest.approx(stable_payload["scores"])
+    assert bad_payload["summary_score"] == pytest.approx(stable_payload["summary_score"])
 
 
 def test_periodic_f0_estimation_accepts_periodicity_inside_fixed_range():
@@ -1128,7 +1294,7 @@ def test_loudness_failure_returns_unavailable_without_exception(monkeypatch):
     assert payload is None
 
 
-def test_stft_nonfinite_magnitude_to_power_returns_unavailable(monkeypatch):
+def test_loudness_only_score_ignores_extreme_stft_magnitudes(monkeypatch):
     def fake_stft(*_args, **_kwargs):
         return (
             np.array([0.25, 0.5]),
@@ -1151,4 +1317,6 @@ def test_stft_nonfinite_magnitude_to_power_returns_unavailable(monkeypatch):
         absolute_start_sec=0.0,
     )
 
-    assert payload is None
+    assert payload is not None
+    assert payload["scores"] == pytest.approx([100.0, 100.0])
+    assert payload["summary_score"] == pytest.approx(100.0)
