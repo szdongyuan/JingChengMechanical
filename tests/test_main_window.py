@@ -2705,7 +2705,7 @@ def test_main_window_ai_partial_no_result_keeps_rule_rows_and_committed_charts_v
     assert window.result.lb_overall.text() == "无结果"
     assert window.result.error_label.isHidden() is False
     assert window.result.error_label.text() == "AI timeout"
-    assert _result_table_value(window, 0, 0) == "声压级"
+    assert _result_table_value(window, 0, 0) == "声压级（峰值）"
     assert _result_table_value(window, 0, 1) == "-1 dB"
     assert _result_table_value(window, 0, 2) == "通道2"
     assert _result_table_value(window, 0, 3) == "OK"
@@ -2714,7 +2714,7 @@ def test_main_window_ai_partial_no_result_keeps_rule_rows_and_committed_charts_v
     assert _result_table_value(window, 1, 1) == "-"
     assert _result_table_value(window, 1, 2) == "-"
     assert _result_table_value(window, 1, 3) == "-"
-    assert _result_table_value(window, 2, 0) == "响度"
+    assert _result_table_value(window, 2, 0) == "响度（峰值）"
     assert _result_table_value(window, 2, 1) == "-0.5 sone"
     assert _result_table_value(window, 2, 2) == "通道2"
     assert _result_table_value(window, 2, 3) == "OK"

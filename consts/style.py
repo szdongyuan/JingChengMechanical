@@ -156,10 +156,11 @@ QWidget#ResultMetricBadge {
 QLabel#ResultMetricLabel {
   color: #64748b;
   font-weight: 700;
+  font-size: 12px;
 }
 QLabel#ResultMetricValue {
   color: #0f172a;
-  font-size: 20px;
+  font-size: 18px;
   font-weight: 700;
 }
 QWidget#EmptyState { background: transparent; }
@@ -295,6 +296,16 @@ QTableWidget {
   border: 1px solid #e5e7eb;
   border-radius: 10px;
   gridline-color: #e5e7eb;
+}
+QTableWidget#ResultSummaryTable {
+  font-size: 12px;
+}
+QTableWidget#ResultSummaryTable QHeaderView::section {
+  padding: 4px 6px;
+  font-size: 12px;
+}
+QTableWidget#ResultSummaryTable::item {
+  padding: 4px 6px;
 }
 QTableWidget:disabled,
 QTableView:disabled {
