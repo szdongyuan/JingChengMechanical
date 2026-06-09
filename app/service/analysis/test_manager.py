@@ -1792,10 +1792,8 @@ class TestManager(QObject):
     def _emit_plc_test_result_if_needed(self, session, review_payload) -> None:
         if getattr(review_payload, "trigger_source", None) != "plc":
             return
-        self._emit_optional_signal(
-            "write_test_result_to_plc",
-            self._make_plc_test_result_payload(session, review_payload),
-        )
+        test_result = self._make_plc_test_result_payload(session, review_payload)
+        self._bus.write_test_result_to_plc.emit(test_result)
 
     @classmethod
     def _make_plc_test_result_payload(cls, session, review_payload) -> dict:
