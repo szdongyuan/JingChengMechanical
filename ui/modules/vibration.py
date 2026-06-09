@@ -448,6 +448,7 @@ class VibrationAxisModule(_BaseVibrationModule):
                 times_sec,
                 fundamental_values,
                 y_axis_mode="data_focus",
+                x_axis_range=vibration_payload.get("x_axis_range_sec"),
             )
         except (TypeError, ValueError):
             return False
@@ -597,6 +598,7 @@ class VibrationTrendModule(_BaseVibrationModule):
                 times_sec,
                 rms_values,
                 y_axis_mode="data_focus",
+                x_axis_range=vibration_payload.get("x_axis_range_sec"),
             )
         except (TypeError, ValueError):
             return False

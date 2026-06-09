@@ -9,6 +9,14 @@ from decimal import Decimal
 
 from peewee import IntegrityError
 
+from app.service.analysis.limit_tables import (
+    normalize_limit_tables_for_storage,
+    validate_limit_tables,
+)
+from app.service.current_meter_service import (
+    normalize_current_meter_config,
+    validate_current_meter_config,
+)
 from app.service.golden_sample_service import GoldenSampleService, StagedGoldenSample
 from consts.time_consts import now_str
 from model.channel_config_table import ChannelConfigTable
@@ -142,6 +150,22 @@ MONITOR_GAIN_DEFAULT_DB = 0.0
 MONITOR_GAIN_MIN_DB = -60.0
 MONITOR_GAIN_MAX_DB = 24.0
 _MONITOR_CONFIG_FIELDS = ("monitor_channel_index", "monitor_gain_db")
+_CURRENT_METER_CONFIG_FIELDS = (
+    "current_meter_enabled",
+    "current_meter_host",
+    "current_meter_port",
+    "current_meter_unit_id",
+    "current_meter_register_type",
+    "current_meter_register_address",
+    "current_meter_register_count",
+    "current_meter_data_type",
+    "current_meter_byte_order",
+    "current_meter_word_order",
+    "current_meter_scale",
+    "current_meter_offset",
+    "current_meter_poll_interval_ms",
+    "current_meter_timeout_ms",
+)
 _CONFIG_LOAD_FIELD_NAMES = (
     "config_id",
     "config_name",
@@ -160,6 +184,7 @@ _CONFIG_LOAD_FIELD_NAMES = (
     "selected_channels",
     "vibration_view_channel_index",
     *_MONITOR_CONFIG_FIELDS,
+    *_CURRENT_METER_CONFIG_FIELDS,
 )
 
 
@@ -255,6 +280,7 @@ class ConfigService:
             "monitor_gain_db": self._normalize_monitor_gain(
                 cfg.get("monitor_gain_db")
             ),
+            "current_meter": self._normalize_current_meter_from_row(cfg),
             "channels": [],
         }
         ch_rows = (
@@ -462,15 +488,27 @@ class ConfigService:
             raise ValueError(f"配置名称「{name}」已存在")
         try:
             with TestConfigTable._meta.database.atomic():
-                cfg = TestConfigTable.create(
-                    config_name=name,
-                    created_time=now_str(),
-                    updated_time=now_str(),
+                row_values = {
+                    "config_name": name,
+                    "record_duration": 5.0,
+                    "analysis_duration": 3.0,
+                    "allow_incomplete_recording_analysis": False,
+                    "scan_triggers_test": False,
+                    "selected_channels": "[]",
+                    "analysis_window_offset_ms": 0,
+                    "created_time": now_str(),
+                    "updated_time": now_str(),
+                }
+                self._add_current_meter_row_values(
+                    row_values,
+                    current_meter=normalize_current_meter_config(None),
+                    available_columns=self._config_table_columns(),
                 )
+                config_id = self._insert_config_row_values(row_values)
         except IntegrityError:
             raise ValueError(f"配置名称「{name}」已存在")
         self.bus.config_changed.emit()
-        return cfg.config_id
+        return int(config_id)
 
     def save_config(self, data: dict) -> int:
         pending = self.begin_save_config(data)
@@ -519,12 +557,15 @@ class ConfigService:
                 raise ValueError("导入配置 ID 已被占用")
 
             with TestConfigTable._meta.database.atomic():
-                TestConfigTable.create(
-                    config_id=reserved_config_id,
-                    created_time=now_str(),
-                    updated_time=now_str(),
-                    **self._config_row_values(prepared),
+                row_values = self._config_row_values(prepared)
+                row_values.update(
+                    {
+                        "config_id": reserved_config_id,
+                        "created_time": now_str(),
+                        "updated_time": now_str(),
+                    }
                 )
+                self._insert_config_row_values(row_values)
                 self._replace_channel_rows(
                     config_id=reserved_config_id,
                     channels=prepared["channels"],
@@ -624,6 +665,9 @@ class ConfigService:
             ),
             "monitor_channel_index": source.get("monitor_channel_index"),
             "monitor_gain_db": monitor_gain_db,
+            "current_meter": normalize_current_meter_config(
+                source.get("current_meter")
+            ),
             "channels": prepared_channels,
         }
 
@@ -800,6 +844,7 @@ class ConfigService:
                 errors.append("PLC 不存在或已被删除")
 
         errors.extend(self.validate_factory_runtime(data))
+        errors.extend(validate_current_meter_config(data.get("current_meter")))
 
         input_dev = data.get("input_device_name")
         sel_ch = data.get("selected_channels", [])
@@ -904,37 +949,13 @@ class ConfigService:
                 errors.append(f"{prefix}: 倍频程计权模式无效")
 
             for label, key in [("FFT", "fft_band_limits"), ("倍频程", "oct_band_limits")]:
-                bands = ch.get(key, [])
-                if not isinstance(bands, list):
-                    errors.append(f"{prefix}: {label} 频带数据格式无效")
-                    continue
-                for j, band in enumerate(bands):
-                    if not isinstance(band, dict):
-                        errors.append(f"{prefix}: {label} 第 {j+1} 行格式无效")
-                        continue
-                    freq = band.get("freq", 0)
-                    lo = band.get("lower", 0)
-                    hi = band.get("upper", 0)
-                    if label == "FFT":
-                        if not self._is_finite_number(freq) or float(freq) <= 0:
-                            errors.append(f"{prefix}: FFT 第 {j+1} 行频率必须为正有限数")
-                        if not self._is_finite_number(lo):
-                            errors.append(f"{prefix}: FFT 第 {j+1} 行下限必须为有限数值")
-                        elif not self._is_finite_number(hi):
-                            errors.append(f"{prefix}: FFT 第 {j+1} 行上限必须为有限数值")
-                        elif lo >= hi:
-                            errors.append(f"{prefix}: FFT 第 {j+1} 行下限必须小于上限")
-                        continue
-                    if not isinstance(freq, (int, float)) or isinstance(freq, bool) or freq <= 0:
-                        errors.append(f"{prefix}: {label} 第 {j+1} 行频率必须为正数")
-                    if not isinstance(lo, (int, float)) or isinstance(lo, bool):
-                        errors.append(f"{prefix}: {label} 第 {j+1} 行下限必须为数值")
-                    elif not isinstance(hi, (int, float)) or isinstance(hi, bool):
-                        errors.append(f"{prefix}: {label} 第 {j+1} 行上限必须为数值")
-                    elif lo >= hi:
-                        errors.append(f"{prefix}: {label} 第 {j+1} 行下限必须小于上限")
-                if key == "fft_band_limits":
-                    errors.extend(self._validate_fft_limit_envelope(prefix, bands))
+                errors.extend(
+                    f"{prefix}: {message}"
+                    for message in self._validate_channel_limit_tables(
+                        ch.get(key, []),
+                        label=label,
+                    )
+                )
 
             errors.extend(
                 self._validate_golden_channel(
@@ -1106,6 +1127,19 @@ class ConfigService:
             ):
                 errors.append(f"{prefix}: {lower_label}必须小于上限")
         return errors
+
+    def _validate_channel_limit_tables(self, raw_limits, *, label: str) -> list[str]:
+        return [
+            self._channel_limit_table_validation_message(message)
+            for message in validate_limit_tables(raw_limits, label=label)
+        ]
+
+    @staticmethod
+    def _channel_limit_table_validation_message(message: str) -> str:
+        return (
+            message.replace("类型必须是 upper 或 lower", "类型必须是上限或下限")
+            .replace(" points 必须是列表", "频点列表必须是列表")
+        )
 
     @staticmethod
     def _limit_bound_label(label: str, bound: str) -> str:
@@ -1579,7 +1613,89 @@ class ConfigService:
             values["vibration_view_channel_index"] = data.get(
                 "vibration_view_channel_index"
             )
+        current_meter = normalize_current_meter_config(data.get("current_meter"))
+        self._add_current_meter_row_values(
+            values,
+            current_meter=current_meter,
+            available_columns=available_columns,
+        )
         return values
+
+    def _add_current_meter_row_values(
+        self,
+        values: dict,
+        *,
+        current_meter: dict,
+        available_columns: set[str],
+    ) -> None:
+        field_map = {
+            "current_meter_enabled": "enabled",
+            "current_meter_host": "host",
+            "current_meter_port": "port",
+            "current_meter_unit_id": "unit_id",
+            "current_meter_register_type": "register_type",
+            "current_meter_register_address": "register_address",
+            "current_meter_register_count": "register_count",
+            "current_meter_data_type": "data_type",
+            "current_meter_byte_order": "byte_order",
+            "current_meter_word_order": "word_order",
+            "current_meter_scale": "scale",
+            "current_meter_offset": "offset",
+            "current_meter_poll_interval_ms": "poll_interval_ms",
+            "current_meter_timeout_ms": "timeout_ms",
+        }
+        for field_name, config_key in field_map.items():
+            if self._config_field_exists(field_name, available_columns):
+                values[field_name] = current_meter[config_key]
+
+    def _normalize_current_meter_from_row(self, row: dict) -> dict:
+        return normalize_current_meter_config(
+            {
+                "enabled": row.get("current_meter_enabled", False),
+                "host": row.get("current_meter_host"),
+                "port": row.get("current_meter_port"),
+                "unit_id": row.get("current_meter_unit_id"),
+                "register_type": row.get("current_meter_register_type"),
+                "register_address": row.get("current_meter_register_address"),
+                "register_count": row.get("current_meter_register_count"),
+                "data_type": row.get("current_meter_data_type"),
+                "byte_order": row.get("current_meter_byte_order"),
+                "word_order": row.get("current_meter_word_order"),
+                "scale": row.get("current_meter_scale"),
+                "offset": row.get("current_meter_offset"),
+                "poll_interval_ms": row.get("current_meter_poll_interval_ms"),
+                "timeout_ms": row.get("current_meter_timeout_ms"),
+            }
+        )
+
+    def _insert_config_row_values(self, values: dict) -> int:
+        available_columns = self._config_table_columns()
+        filtered_values = {
+            field_name: value
+            for field_name, value in values.items()
+            if self._config_field_exists(field_name, available_columns)
+        }
+        if not filtered_values:
+            raise ValueError("配置数据为空")
+
+        columns = []
+        params = []
+        for field_name, value in filtered_values.items():
+            field = TestConfigTable._meta.fields[field_name]
+            columns.append(field.column_name)
+            params.append(value)
+
+        table_name = TestConfigTable._meta.table_name
+        column_sql = ", ".join(f'"{column}"' for column in columns)
+        placeholder_sql = ", ".join("?" for _ in columns)
+        cursor = TestConfigTable._meta.database.execute_sql(
+            f'INSERT INTO "{table_name}" ({column_sql}) VALUES ({placeholder_sql})',
+            params,
+        )
+        config_id = filtered_values.get("config_id")
+        if config_id is not None:
+            return int(config_id)
+        return int(cursor.lastrowid)
 
     @staticmethod
     def _config_table_columns() -> set[str]:
@@ -1808,6 +1924,15 @@ class ConfigService:
                 channel[field] = float(value)
             else:
                 channel[field] = float(_CHANNEL_DEFAULTS[field])
+        for label, key in [("FFT", "fft_band_limits"), ("倍频程", "oct_band_limits")]:
+            raw_limits = channel.get(key, [])
+            if validate_limit_tables(raw_limits, label=label):
+                channel[key] = deepcopy(raw_limits)
+            else:
+                channel[key] = normalize_limit_tables_for_storage(
+                    raw_limits,
+                    label=label,
+                )
 
     @staticmethod
     def _parse_json(text: str, default):
@@ -1842,41 +1967,3 @@ class ConfigService:
 
     def _is_positive_finite(self, value) -> bool:
         return self._is_finite_number(value) and float(value) > 0.0
-
-    def _validate_fft_limit_envelope(self, prefix: str, bands: list[dict]) -> list[str]:
-        if not bands:
-            return []
-
-        valid_points: list[tuple[float, float, float]] = []
-        for band in bands:
-            if not isinstance(band, dict):
-                continue
-            freq = band.get("freq")
-            lower = band.get("lower")
-            upper = band.get("upper")
-            if (
-                self._is_finite_number(freq)
-                and float(freq) > 0.0
-                and self._is_finite_number(lower)
-                and self._is_finite_number(upper)
-                and lower < upper
-            ):
-                valid_points.append((float(freq), float(lower), float(upper)))
-
-        distinct = sorted({freq for freq, _lower, _upper in valid_points})
-        if len(distinct) < 2:
-            return [f"{prefix}: FFT 至少需要两个不同频率的控制点"]
-
-        errors: list[str] = []
-        for freq in distinct:
-            lowers = [
-                lower for current, lower, _upper in valid_points if current == freq
-            ]
-            uppers = [
-                upper for current, _lower, upper in valid_points if current == freq
-            ]
-            if max(lowers) >= min(uppers):
-                errors.append(
-                    f"{prefix}: FFT 频率 {freq:g} Hz 的下限包络必须小于上限包络"
-                )
-        return errors

@@ -1,6 +1,7 @@
 """Tests for ConfigService hardware field persistence and validation."""
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -309,6 +310,7 @@ def test_load_config_returns_hardware_fields_with_cleaned_trigger_model():
         "monitor_channel_index",
         "monitor_gain_db",
         "vibration_view_channel_index",
+        "current_meter",
         "channels",
     }
     assert result["input_device_name"] == "Mic 1"
@@ -356,6 +358,7 @@ def test_load_config_returns_plc_id_and_not_legacy_plc_text_fields():
         "monitor_channel_index",
         "monitor_gain_db",
         "vibration_view_channel_index",
+        "current_meter",
         "channels",
     }
     assert result["plc_id"] == plc.id
@@ -409,6 +412,7 @@ def test_save_config_persists_hardware_fields():
         "monitor_channel_index",
         "monitor_gain_db",
         "vibration_view_channel_index",
+        "current_meter",
         "channels",
     }
     assert loaded["input_device_name"] == "Mic 1"
@@ -507,6 +511,42 @@ def test_save_config_persists_vibration_view_channel():
 
     assert loaded["vibration_view_channel_index"] == 2
     assert row.vibration_view_channel_index == 2
+
+
+def test_save_config_persists_current_meter_config():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    payload = _config_payload(
+        config_id,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    payload["current_meter"] = {
+        "enabled": True,
+        "host": "192.168.1.20",
+        "port": 1502,
+        "unit_id": 3,
+        "register_type": "input",
+        "register_address": 120,
+        "register_count": 2,
+        "data_type": "float32",
+        "byte_order": "little",
+        "word_order": "big",
+        "scale": 0.1,
+        "offset": 1.5,
+        "poll_interval_ms": 250,
+        "timeout_ms": 1200,
+    }
+
+    svc.save_config(payload)
+
+    loaded = svc.load_config(config_id)
+    row = ConfigTable.get_by_id(config_id)
+    assert loaded["current_meter"] == payload["current_meter"]
+    assert row.current_meter_enabled is True
+    assert row.current_meter_host == "192.168.1.20"
+    assert row.current_meter_register_type == "input"
+    assert row.current_meter_scale == pytest.approx(0.1)
 
 
 def test_save_config_persists_plc_id_and_rejects_missing_plc_rows():
@@ -737,6 +777,80 @@ def test_create_imported_config_uses_reserved_id_and_clears_plc_id():
     assert loaded["output_device_samplerate"] == 48_000.0
 
 
+def test_create_imported_config_normalizes_legacy_and_grouped_limit_tables():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {"freq": 1000.0, "lower": 40.0, "upper": 100.0},
+        {"freq": 2000.0, "lower": 50.0, "upper": 90.0},
+    ]
+    channel["oct_band_limits"] = [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 125.0, "limit": 20.0},
+                {"freq": 250.0, "limit": 25.0},
+            ],
+        }
+    ]
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[channel],
+        selected_channels=[0],
+    )
+    reserved_id = svc.reserve_import_config_id()
+
+    new_id = svc.create_imported_config(source, reserved_config_id=reserved_id)
+    loaded_channel = svc.load_config(new_id)["channels"][0]
+
+    assert loaded_channel["fft_band_limits"] == [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 40.0},
+                {"freq": 2000.0, "limit": 50.0},
+            ],
+        },
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 90.0},
+            ],
+        },
+    ]
+    assert loaded_channel["oct_band_limits"] == channel["oct_band_limits"]
+
+
+def test_create_imported_config_rejects_malformed_grouped_limits_with_ui_message():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {
+            "kind": "ceiling",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 90.0},
+            ],
+        }
+    ]
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[channel],
+        selected_channels=[0],
+    )
+    reserved_id = svc.reserve_import_config_id()
+
+    with pytest.raises(ValueError) as excinfo:
+        svc.create_imported_config(source, reserved_config_id=reserved_id)
+
+    message = str(excinfo.value)
+    assert "通道 1: FFT限制表第 1 项类型必须是上限或下限" in message
+    assert "upper 或 lower" not in message
+
+
 def test_overwrite_imported_config_keeps_local_id_and_clears_plc_id():
     svc = _service()
     local_plc = PlcTable.create(plc_name="Local PLC")
@@ -823,6 +937,103 @@ def test_prepare_import_payload_defaults_missing_fft_x_axis_scale_to_linear():
     prepared = svc.prepare_import_payload(source)
 
     assert prepared["channels"][0]["fft_x_axis_scale"] == "linear"
+
+
+def test_prepare_import_payload_normalizes_legacy_limits_and_preserves_grouped_limits():
+    svc = _service()
+    legacy_channel = _channel_payload(0)
+    legacy_channel["fft_band_limits"] = [
+        {"freq": 1000.0, "lower": 40.0, "upper": 100.0},
+        {"freq": 2000.0, "lower": 50.0, "upper": 90.0},
+    ]
+    legacy_channel["oct_band_limits"] = [
+        {"freq": 125.0, "lower": 15.0, "upper": 60.0},
+        {"freq": 250.0, "lower": 20.0, "upper": 55.0},
+    ]
+    grouped_channel = _channel_payload(1)
+    grouped_channel["fft_band_limits"] = [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 3000.0, "limit": 80.0},
+                {"freq": 4000.0, "limit": 75.0},
+            ],
+        }
+    ]
+    grouped_channel["oct_band_limits"] = [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 500.0, "limit": 30.0},
+                {"freq": 1000.0, "limit": 35.0},
+            ],
+        }
+    ]
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[legacy_channel, grouped_channel],
+        selected_channels=[0, 1],
+    )
+
+    prepared = svc.prepare_import_payload(source)
+
+    assert prepared["channels"][0]["fft_band_limits"] == [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 40.0},
+                {"freq": 2000.0, "limit": 50.0},
+            ],
+        },
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 90.0},
+            ],
+        },
+    ]
+    assert prepared["channels"][0]["oct_band_limits"] == [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 125.0, "limit": 15.0},
+                {"freq": 250.0, "limit": 20.0},
+            ],
+        },
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 125.0, "limit": 60.0},
+                {"freq": 250.0, "limit": 55.0},
+            ],
+        },
+    ]
+    assert prepared["channels"][1]["fft_band_limits"] == grouped_channel[
+        "fft_band_limits"
+    ]
+    assert prepared["channels"][1]["oct_band_limits"] == grouped_channel[
+        "oct_band_limits"
+    ]
+
+
+def test_prepare_import_payload_malformed_grouped_limits_validate_with_ui_message():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["oct_band_limits"] = [{"kind": "upper", "points": "bad"}]
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[channel],
+        selected_channels=[0],
+    )
+
+    prepared = svc.prepare_import_payload(source)
+    errors = svc.validate(prepared)
+
+    assert "通道 1: 倍频程限制表第 1 项频点列表必须是列表" in errors
+    assert not any("points" in error for error in errors)
 
 
 def test_prepare_import_payload_defaults_missing_stft_color_scale_fields():
@@ -1284,6 +1495,141 @@ def test_save_config_persists_fft_x_axis_scale():
 
     assert loaded["channels"][0]["fft_x_axis_scale"] == "log"
     assert getattr(row, "fft_x_axis_scale", None) == "log"
+
+
+def test_save_config_preserves_grouped_fft_and_octave_limits():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 80.0},
+            ],
+        }
+    ]
+    channel["oct_band_limits"] = [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 125.0, "limit": 20.0},
+                {"freq": 250.0, "limit": 25.0},
+            ],
+        }
+    ]
+
+    svc.save_config(
+        _config_payload(config_id, channels=[channel], selected_channels=[0])
+    )
+
+    loaded = svc.load_config(config_id)
+    row = ChannelConfigTable.get(
+        (ChannelConfigTable.config == config_id)
+        & (ChannelConfigTable.channel_index == 0)
+    )
+    assert loaded["channels"][0]["fft_band_limits"] == channel["fft_band_limits"]
+    assert loaded["channels"][0]["oct_band_limits"] == channel["oct_band_limits"]
+    assert json.loads(row.fft_band_limits) == channel["fft_band_limits"]
+    assert json.loads(row.oct_band_limits) == channel["oct_band_limits"]
+
+
+def test_save_config_converts_legacy_paired_fft_and_octave_limits_to_grouped_storage():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {"freq": 1000.0, "lower": 40.0, "upper": 100.0},
+        {"freq": 2000.0, "lower": 50.0, "upper": 90.0},
+        {"freq": 2000.0, "lower": 55.0, "upper": 85.0},
+    ]
+    channel["oct_band_limits"] = [
+        {"freq": 125.0, "lower": 15.0, "upper": 60.0},
+        {"freq": 250.0, "lower": 20.0, "upper": 55.0},
+    ]
+
+    svc.save_config(
+        _config_payload(config_id, channels=[channel], selected_channels=[0])
+    )
+
+    expected_fft = [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 40.0},
+                {"freq": 2000.0, "limit": 50.0},
+                {"freq": 2000.0, "limit": 55.0},
+            ],
+        },
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 90.0},
+                {"freq": 2000.0, "limit": 85.0},
+            ],
+        },
+    ]
+    expected_octave = [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 125.0, "limit": 15.0},
+                {"freq": 250.0, "limit": 20.0},
+            ],
+        },
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 125.0, "limit": 60.0},
+                {"freq": 250.0, "limit": 55.0},
+            ],
+        },
+    ]
+
+    loaded = svc.load_config(config_id)
+    row = ChannelConfigTable.get(
+        (ChannelConfigTable.config == config_id)
+        & (ChannelConfigTable.channel_index == 0)
+    )
+    assert loaded["channels"][0]["fft_band_limits"] == expected_fft
+    assert loaded["channels"][0]["oct_band_limits"] == expected_octave
+    assert json.loads(row.fft_band_limits) == expected_fft
+    assert json.loads(row.oct_band_limits) == expected_octave
+
+
+def test_save_config_drops_empty_grouped_limit_tables_without_validation_error():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {"kind": "upper", "points": []},
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 40.0},
+                {"freq": 2000.0, "limit": 45.0},
+            ],
+        },
+    ]
+    channel["oct_band_limits"] = [{"kind": "upper", "points": []}]
+    payload = _config_payload(config_id, channels=[channel], selected_channels=[0])
+
+    assert svc.validate(payload) == []
+    svc.save_config(payload)
+
+    loaded = svc.load_config(config_id)
+    assert loaded["channels"][0]["fft_band_limits"] == [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 40.0},
+                {"freq": 2000.0, "limit": 45.0},
+            ],
+        }
+    ]
+    assert loaded["channels"][0]["oct_band_limits"] == []
 
 
 def test_save_config_persists_stft_color_scale_fields():
@@ -1773,6 +2119,46 @@ def test_validate_rejects_invalid_stft_score_values_when_disabled():
     assert any("STFT 评分谐波起始阶次必须大于等于2" in error for error in errors)
 
 
+def test_validate_accepts_grouped_upper_only_fft_limits():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 50.0},
+            ],
+        }
+    ]
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert errors == []
+
+
+def test_validate_accepts_grouped_lower_only_octave_limits():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["oct_band_limits"] = [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 125.0, "limit": 20.0},
+                {"freq": 250.0, "limit": 25.0},
+            ],
+        }
+    ]
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert errors == []
+
+
 def test_validate_accepts_unsorted_and_duplicate_fft_limit_control_points():
     svc = _service()
     channel = _channel_payload(0)
@@ -1801,7 +2187,7 @@ def test_validate_rejects_fft_limits_with_less_than_two_distinct_frequencies():
         _config_payload(1, channels=[channel], selected_channels=[0])
     )
 
-    assert "通道 1: FFT 至少需要两个不同频率的控制点" in errors
+    assert any("FFT限制表" in error and "至少需要两个不同频率" in error for error in errors)
 
 
 def test_validate_rejects_fft_duplicate_collapsed_invalid_envelope():
@@ -1817,16 +2203,16 @@ def test_validate_rejects_fft_duplicate_collapsed_invalid_envelope():
         _config_payload(1, channels=[channel], selected_channels=[0])
     )
 
-    assert "通道 1: FFT 频率 100 Hz 的下限包络必须小于上限包络" in errors
+    assert "通道 1: FFT限制表下限必须小于上限" in errors
 
 
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
-        ("freq", float("inf"), "通道 1: FFT 第 1 行频率必须为正有限数"),
-        ("freq", float("nan"), "通道 1: FFT 第 1 行频率必须为正有限数"),
-        ("lower", float("nan"), "通道 1: FFT 第 1 行下限必须为有限数值"),
-        ("upper", float("inf"), "通道 1: FFT 第 1 行上限必须为有限数值"),
+        ("freq", float("inf"), "通道 1: FFT限制表第 1 行频率必须是有限数字"),
+        ("freq", float("nan"), "通道 1: FFT限制表第 1 行频率必须是有限数字"),
+        ("lower", float("nan"), "通道 1: FFT限制表第 1 行下限必须是有限数字"),
+        ("upper", float("inf"), "通道 1: FFT限制表第 1 行上限必须是有限数字"),
     ],
 )
 def test_validate_rejects_non_finite_fft_limit_values(field, value, message):
@@ -1844,6 +2230,121 @@ def test_validate_rejects_non_finite_fft_limit_values(field, value, message):
     )
 
     assert message in errors
+
+
+def test_validate_rejects_mixed_legacy_and_grouped_limit_shapes():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {"freq": 1000.0, "lower": 40.0, "upper": 100.0},
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 80.0},
+            ],
+        },
+    ]
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert "通道 1: FFT限制表不能混合旧版频点格式和分组格式" in errors
+
+
+def test_validate_rejects_malformed_grouped_point_data():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["oct_band_limits"] = [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 125.0, "limit": 20.0},
+                {"freq": 250.0, "limit": "bad"},
+            ],
+        }
+    ]
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert "通道 1: 倍频程限制表第 1 项第 2 个频点限值必须是有限数字" in errors
+
+
+@pytest.mark.parametrize(
+    ("limits", "expected", "raw_fragment"),
+    [
+        (
+            [
+                {
+                    "kind": "ceiling",
+                    "points": [
+                        {"freq": 1000.0, "limit": 100.0},
+                        {"freq": 2000.0, "limit": 90.0},
+                    ],
+                }
+            ],
+            "通道 1: FFT限制表第 1 项类型必须是上限或下限",
+            "upper 或 lower",
+        ),
+        (
+            [{"kind": "upper", "points": "bad"}],
+            "通道 1: FFT限制表第 1 项频点列表必须是列表",
+            "points 必须是列表",
+        ),
+    ],
+)
+def test_validate_maps_grouped_limit_shape_messages_for_ui(
+    limits, expected, raw_fragment
+):
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = limits
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert expected in errors
+    assert not any(raw_fragment in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("fft_band_limits", None, "通道 1: FFT限制表必须是列表"),
+        ("oct_band_limits", {"kind": "upper"}, "通道 1: 倍频程限制表必须是列表"),
+    ],
+)
+def test_validate_rejects_none_or_non_list_limit_fields(field, value, expected):
+    svc = _service()
+    channel = _channel_payload(0)
+    channel[field] = value
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert expected in errors
+
+
+def test_validate_rejects_octave_one_point_table():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["oct_band_limits"] = [
+        {
+            "kind": "upper",
+            "points": [{"freq": 1000.0, "limit": 80.0}],
+        }
+    ]
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert "通道 1: 倍频程限制表第 1 项至少需要两个不同频率" in errors
 
 
 def test_validate_rejects_negative_loudness_limits():

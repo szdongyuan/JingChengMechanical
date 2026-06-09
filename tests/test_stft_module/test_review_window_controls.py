@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from PyQt6.QtCore import Qt
 
@@ -105,6 +107,126 @@ def test_review_selection_button_uses_card_bottom_padding_when_embedded(qapp):
     assert button.geometry().bottom() == card.height() - 5
     assert button.geometry().bottom() > module.geometry().bottom()
     assert module.analysis_select_button.text() == "框选分析"
+
+
+def test_stale_displayed_config_review_cannot_activate_selection_or_reanalysis(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        times=(0.0, 0.5, 1.0, 1.5),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            displayed_config_id=101,
+            run_id="run-101",
+            default_window=FactoryReviewWindow(start_sec=0.0, end_sec=0.5),
+            manual_reanalysis_allowed=False,
+            judgment_payload={"overall": "合格", "analysis_window": (0.0, 0.5)},
+        ),
+    )
+
+    assert module.current_render_cache_key() == (101, "run-101", 0)
+    rendered_payload = module.current_image_payload()
+    assert rendered_payload is not None
+    rendered_matrix = rendered_payload["magnitude_db"]
+    assert module.selected_window == pytest.approx((0.0, 0.5))
+    assert module.is_selection_movable() is False
+
+    services.bus.factory_review_changed.emit(
+        _make_review_payload(
+            displayed_config_id=202,
+            run_id="run-101",
+            default_window=FactoryReviewWindow(start_sec=1.0, end_sec=1.5),
+            manual_reanalysis_allowed=True,
+            judgment_payload={"overall": "合格", "analysis_window": (1.0, 1.5)},
+        )
+    )
+    qapp.processEvents()
+
+    assert module.current_render_cache_key() == (101, "run-101", 0)
+    stale_image_payload = module.current_image_payload()
+    assert stale_image_payload is not None
+    assert stale_image_payload["magnitude_db"] is rendered_matrix
+    assert stale_image_payload["times_sec"] == rendered_payload["times_sec"]
+    assert stale_image_payload["frequencies_hz"] == rendered_payload["frequencies_hz"]
+    if module.selected_window is not None:
+        assert not (module.selected_window == pytest.approx((1.0, 1.5)))
+    assert module.is_selection_movable() is False
+    assert module.analysis_select_button.isVisible() is False
+
+    module._begin_reanalysis()
+
+    services.factory_mode.begin_reanalysis.assert_not_called()
+
+
+def test_stale_run_review_cannot_activate_selection_or_reanalysis(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(
+        module,
+        services,
+        qapp,
+        channel_index=0,
+        run_id="run-current",
+        times=(0.0, 0.5, 1.0, 1.5),
+    )
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            displayed_config_id=101,
+            run_id="run-current",
+            default_window=FactoryReviewWindow(start_sec=0.0, end_sec=0.5),
+            manual_reanalysis_allowed=False,
+            judgment_payload={"overall": "合格", "analysis_window": (0.0, 0.5)},
+        ),
+    )
+
+    assert module.current_render_cache_key() == (101, "run-current", 0)
+    rendered_payload = module.current_image_payload()
+    assert rendered_payload is not None
+    rendered_matrix = rendered_payload["magnitude_db"]
+    assert module.selected_window == pytest.approx((0.0, 0.5))
+    assert module.is_selection_movable() is False
+    module._on_factory_runtime_context(
+        SimpleNamespace(config_id=101, run_id="run-current")
+    )
+
+    services.bus.factory_review_changed.emit(
+        _make_review_payload(
+            displayed_config_id=101,
+            run_id="run-stale",
+            default_window=FactoryReviewWindow(start_sec=1.0, end_sec=1.5),
+            manual_reanalysis_allowed=True,
+            judgment_payload={"overall": "合格", "analysis_window": (1.0, 1.5)},
+        )
+    )
+    qapp.processEvents()
+
+    assert module.current_render_cache_key() == (101, "run-current", 0)
+    stale_image_payload = module.current_image_payload()
+    assert stale_image_payload is not None
+    assert stale_image_payload["magnitude_db"] is rendered_matrix
+    assert stale_image_payload["times_sec"] == rendered_payload["times_sec"]
+    assert stale_image_payload["frequencies_hz"] == rendered_payload["frequencies_hz"]
+    if module.selected_window is not None:
+        assert not (module.selected_window == pytest.approx((1.0, 1.5)))
+    assert module.is_selection_movable() is False
+    assert module.analysis_select_button.isVisible() is False
+
+    module._begin_reanalysis()
+
+    services.factory_mode.begin_reanalysis.assert_not_called()
 
 
 def test_auto_analysis_failure_uses_first_valid_manual_window_when_reanalysis_is_allowed(qapp):

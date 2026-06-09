@@ -132,6 +132,7 @@ class LoudnessModule(QWidget):
                 lower_limit=loudness_payload.get("lower_limit"),
                 upper_limit=loudness_payload.get("upper_limit"),
                 export_metadata={"unit": unit},
+                x_axis_range=loudness_payload.get("x_axis_range_sec"),
             )
         except (TypeError, ValueError):
             self._clear_plot()

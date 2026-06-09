@@ -4,9 +4,15 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 
-from app.services_container import FactoryControllerState, FactoryReviewPayload
+from app.service.analysis.frames import StftFrame
+from app.services_container import (
+    FactoryControllerState,
+    FactoryReviewPayload,
+    FactoryReviewWindow,
+)
 from ui.modules.loudness import LoudnessModule
 from ui.modules.octave import OctaveModule
 from ui.modules.spectrum import SpectrumModule
@@ -15,6 +21,7 @@ from ui.modules.stft import StftModule
 
 from ._support import (
     _assert_empty_chart_visible,
+    _assert_x_range,
     _make_services,
     _review_payload_with_chart_payload,
     _state,
@@ -58,6 +65,75 @@ def _assert_left_axis_title_hidden_ticks_visible(widget) -> None:
     assert widget.plot_item.getAxis("bottom").isVisible() is True
 
 
+def _make_stft_frame(
+    *,
+    time: float,
+    magnitudes: tuple[float, ...],
+    frequencies: tuple[float, ...] = (100.0, 200.0),
+) -> StftFrame:
+    return StftFrame(
+        time=time,
+        frequencies=np.asarray(frequencies, dtype=float),
+        magnitudes=np.asarray(magnitudes, dtype=float),
+    )
+
+
+def _seed_stft_cache(
+    module: StftModule,
+    *,
+    config_id: int = 101,
+    run_id: str = "run-101",
+    channel_index: int = 0,
+    magnitudes: tuple[tuple[float, ...], ...] = ((1.0, 2.0), (3.0, 4.0)),
+) -> None:
+    for frame_index, magnitude_values in enumerate(magnitudes):
+        module._on_stft_updated(
+            config_id,
+            run_id,
+            channel_index,
+            _make_stft_frame(time=float(frame_index) * 0.5, magnitudes=magnitude_values),
+        )
+
+
+def _current_trace(
+    values: tuple[float, ...],
+    *,
+    times: tuple[float, ...] = (0.0, 0.5),
+    unit: str = "mA",
+) -> dict:
+    return {
+        "times_sec": list(times),
+        "values_a": list(values),
+        "average_a": sum(values) / len(values),
+        "max_a": max(values),
+        "latest_a": values[-1],
+        "unit": unit,
+    }
+
+
+def _assert_heatmap_current_trace(module: StftModule, values: list[float]) -> None:
+    payload = module.canvas.heatmap.current_trace_payload()
+    current_x, current_y = module.canvas.heatmap._current_curve_item.getData()
+    right_axis = module.canvas.heatmap.plot_item.getAxis("right")
+
+    assert payload is not None
+    assert payload["times_sec"] == [0.0, 0.5]
+    assert payload["values_a"] == values
+    assert list(current_x) == [0.0, 0.5]
+    assert list(current_y) == values
+    assert right_axis.isVisible() is True
+    assert right_axis.labelUnits == "mA"
+
+
+def _assert_heatmap_current_trace_cleared(module: StftModule) -> None:
+    current_x, current_y = module.canvas.heatmap._current_curve_item.getData()
+
+    assert module.canvas.heatmap.current_trace_payload() is None
+    assert current_x is None or list(current_x) == []
+    assert current_y is None or list(current_y) == []
+    assert module.canvas.heatmap.plot_item.getAxis("right").isVisible() is False
+
+
 def test_spl_module_renders_committed_chart_for_selected_channel(qapp):
     services = _make_services(initial_state=_state(101, "reviewing"))
     module = SplModule(services)
@@ -75,6 +151,24 @@ def test_spl_module_renders_committed_chart_for_selected_channel(qapp):
     assert module.current_render_channel() == 1
     assert module.plot.plot_item.getAxis("bottom").labelText == "时间 (s)"
     _assert_left_axis_title_hidden_ticks_visible(module.plot)
+
+
+def test_spl_module_uses_selected_window_axis_range(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = SplModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["spl"]["times_sec"] = [4.05, 4.10, 4.15]
+    review_payload.chart_payload[0]["spl"]["values_db"] = [71.0, 72.0, 73.0]
+    review_payload.chart_payload[0]["spl"]["x_axis_range_sec"] = [4.0, 12.0]
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is True
+    _assert_x_range(module.plot, (4.0, 12.0))
+    assert module.current_plot_payload()["x_values"] == [4.05, 4.10, 4.15]
 
 
 def test_spl_module_keeps_axes_visibility_when_committed_payload_has_no_series_points(qapp):
@@ -121,6 +215,26 @@ def test_loudness_module_renders_committed_chart_for_selected_channel(qapp):
     assert module.current_render_channel() == 1
     assert module.plot.plot_item.getAxis("bottom").labelText == "时间 (s)"
     _assert_left_axis_title_hidden_ticks_visible(module.plot)
+
+
+def test_loudness_module_uses_selected_window_axis_range(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = LoudnessModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    review_payload = _with_loudness_payload(
+        _review_payload_with_chart_payload(101, channels=(0,))
+    )
+    review_payload.chart_payload[0]["loudness"]["times_sec"] = [4.0, 4.04, 4.08]
+    review_payload.chart_payload[0]["loudness"]["values"] = [2.8, 2.9, 3.0]
+    review_payload.chart_payload[0]["loudness"]["x_axis_range_sec"] = [4.0, 12.0]
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is True
+    _assert_x_range(module.plot, (4.0, 12.0))
+    assert module.current_plot_payload()["times_sec"] == [4.0, 4.04, 4.08]
 
 
 @pytest.mark.parametrize("module_cls", (SplModule, OctaveModule, LoudnessModule))
@@ -223,6 +337,230 @@ def test_stft_module_keeps_chinese_axis_labels_visible(qapp):
         assert left_axis.labelUnits == "Hz"
     finally:
         module.close()
+
+
+def test_stft_module_passes_committed_current_trace_to_heatmap(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = StftModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    _seed_stft_cache(module, channel_index=0)
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["current_trace"] = _current_trace((1.2, 1.6))
+
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.current_render_cache_key() == (101, "run-101", 0)
+    _assert_heatmap_current_trace(module, [1.2, 1.6])
+
+
+def test_stft_module_ignores_current_trace_for_mismatched_displayed_config_id(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = StftModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    _seed_stft_cache(module, channel_index=0)
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["current_trace"] = _current_trace((1.2, 1.6))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.current_render_cache_key() == (101, "run-101", 0)
+    rendered_payload = module.current_image_payload()
+    assert rendered_payload is not None
+    rendered_matrix = rendered_payload["magnitude_db"]
+    _assert_heatmap_current_trace(module, [1.2, 1.6])
+
+    stale_review_payload = _review_payload_with_chart_payload(
+        202,
+        run_id="run-101",
+        channels=(0,),
+    )
+    stale_review_payload.chart_payload[0]["current_trace"] = _current_trace((2.2, 2.6))
+
+    services.bus.factory_review_changed.emit(stale_review_payload)
+    qapp.processEvents()
+
+    assert module.current_render_cache_key() == (101, "run-101", 0)
+    stale_image_payload = module.current_image_payload()
+    assert stale_image_payload is not None
+    assert stale_image_payload["magnitude_db"] is rendered_matrix
+    assert stale_image_payload["times_sec"] == rendered_payload["times_sec"]
+    assert stale_image_payload["frequencies_hz"] == rendered_payload["frequencies_hz"]
+    _assert_heatmap_current_trace_cleared(module)
+
+
+def test_stft_module_ignores_current_trace_for_mismatched_run_id(qapp):
+    services = _make_services(initial_state=_state(101, "running"))
+    module = StftModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    _seed_stft_cache(module, run_id="run-current", channel_index=0)
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    review_payload = _review_payload_with_chart_payload(
+        101,
+        run_id="run-stale",
+        channels=(0,),
+    )
+    review_payload.chart_payload[0]["current_trace"] = _current_trace((2.2, 2.6))
+
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.current_render_cache_key() == (101, "run-current", 0)
+    assert module.current_image_payload() is not None
+    _assert_heatmap_current_trace_cleared(module)
+
+
+def test_stft_module_clears_current_trace_when_leaving_review_context(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = StftModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    _seed_stft_cache(module, channel_index=0)
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["current_trace"] = _current_trace((1.2, 1.6))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+    _assert_heatmap_current_trace(module, [1.2, 1.6])
+
+    services.bus.factory_state_changed.emit(_state(101, "running"))
+    qapp.processEvents()
+
+    assert module.current_render_cache_key() == (101, "run-101", 0)
+    assert module.current_image_payload() is not None
+    _assert_heatmap_current_trace_cleared(module)
+
+
+def test_stft_module_clears_current_trace_on_review_reset(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = StftModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    _seed_stft_cache(module, channel_index=0)
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["current_trace"] = _current_trace((1.2, 1.6))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+    _assert_heatmap_current_trace(module, [1.2, 1.6])
+
+    services.bus.factory_review_changed.emit(FactoryReviewPayload())
+    qapp.processEvents()
+
+    _assert_heatmap_current_trace_cleared(module)
+
+
+def test_stft_module_updates_current_trace_when_selected_channel_changes(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = StftModule(services)
+    selected_channel = {"value": 0}
+    module.selected_display_channel_provider = lambda: selected_channel["value"]
+    _seed_stft_cache(module, channel_index=0)
+    _seed_stft_cache(
+        module,
+        channel_index=1,
+        magnitudes=((5.0, 6.0), (7.0, 8.0)),
+    )
+    review_payload = _review_payload_with_chart_payload(101, channels=(0, 1))
+    review_payload.chart_payload[0]["current_trace"] = _current_trace((1.2, 1.6))
+    review_payload.chart_payload[1]["current_trace"] = _current_trace((3.2, 3.6))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.current_render_cache_key() == (101, "run-101", 0)
+    _assert_heatmap_current_trace(module, [1.2, 1.6])
+
+    selected_channel["value"] = 1
+    module.refresh_selected_display_channel()
+    qapp.processEvents()
+
+    assert module.current_render_cache_key() == (101, "run-101", 1)
+    _assert_heatmap_current_trace(module, [3.2, 3.6])
+
+
+def test_stft_module_updates_current_trace_without_redrawing_heatmap(qapp, monkeypatch):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = StftModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    _seed_stft_cache(module, channel_index=0)
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["current_trace"] = _current_trace((1.2, 1.6))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    cache_key = (101, "run-101", 0)
+    cache_entry = module._stft_cache[cache_key]
+    initial_revision = cache_entry.render_revision
+    assert module.current_render_cache_key() == cache_key
+    _assert_heatmap_current_trace(module, [1.2, 1.6])
+
+    set_image_calls: list[dict[str, object]] = []
+    real_set_image = module.canvas.heatmap.set_image
+
+    def _spy_set_image(**kwargs):
+        set_image_calls.append(kwargs)
+        real_set_image(**kwargs)
+
+    monkeypatch.setattr(module.canvas.heatmap, "set_image", _spy_set_image)
+
+    updated_review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    updated_review_payload.chart_payload[0]["current_trace"] = _current_trace(
+        (4.2, 4.6)
+    )
+    services.bus.factory_review_changed.emit(updated_review_payload)
+    qapp.processEvents()
+
+    assert module.current_render_cache_key() == cache_key
+    assert cache_entry.render_revision == initial_revision
+    assert set_image_calls == []
+    _assert_heatmap_current_trace(module, [4.2, 4.6])
+
+
+@pytest.mark.parametrize(
+    ("trigger_source", "run_id", "judgment_payload"),
+    [
+        (
+            "manual",
+            "run-101-reanalysis",
+            {"overall": "合格", "source": "reanalysis", "analysis_window": (1.0, 2.0)},
+        ),
+        (
+            "import_audio",
+            "import-101",
+            {"overall": "合格", "analysis_window": (1.0, 2.0)},
+        ),
+    ],
+)
+def test_stft_committed_current_trace_keeps_full_duration_with_selected_analysis_window(
+    qapp,
+    trigger_source,
+    run_id,
+    judgment_payload,
+):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = StftModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    _seed_stft_cache(module, run_id=run_id, channel_index=0)
+    review_payload = _review_payload_with_chart_payload(
+        101,
+        run_id=run_id,
+        channels=(0,),
+    )
+    review_payload = replace(
+        review_payload,
+        trigger_source=trigger_source,
+        default_window=FactoryReviewWindow(start_sec=1.0, end_sec=2.0),
+        judgment_payload=judgment_payload,
+    )
+    review_payload.chart_payload[0]["current_trace"] = _current_trace(
+        (1.0, 2.0, 3.0),
+        times=(0.0, 1.5, 4.0),
+    )
+
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    payload = module.canvas.heatmap.current_trace_payload()
+    assert module.selected_window == pytest.approx((1.0, 2.0))
+    assert payload is not None
+    assert payload["times_sec"] == [0.0, 1.5, 4.0]
+    assert payload["values_a"] == [1.0, 2.0, 3.0]
 
 
 def test_loudness_module_uses_spl_style_y_range_so_limit_lines_are_visible(qapp):
@@ -342,6 +680,40 @@ def test_spectrum_module_renders_committed_chart_for_selected_channel(qapp):
     assert module.current_plot_payload()["frequencies_hz"] == [125.0, 250.0]
     assert module.current_plot_payload()["levels_db"] == [41.0, 43.0]
     assert module.current_render_channel() == 1
+
+
+def test_spectrum_module_ignores_committed_current_trace(qapp, monkeypatch):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = SpectrumModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    current_trace = {
+        "times_sec": [0.0, 0.2],
+        "values_a": [1.2, 1.6],
+        "average_a": 1.4,
+        "max_a": 1.6,
+        "latest_a": 1.6,
+        "unit": "mA",
+    }
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["current_trace"] = current_trace
+    review_payload.chart_payload[0]["fft"]["current_trace"] = current_trace
+    captured_kwargs: dict[str, object] = {}
+    real_set_spectrum = module.plot.set_spectrum
+
+    def _spy_set_spectrum(**kwargs):
+        captured_kwargs.update(kwargs)
+        return real_set_spectrum(**kwargs)
+
+    monkeypatch.setattr(module.plot, "set_spectrum", _spy_set_spectrum)
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is True
+    assert "current_trace" not in captured_kwargs
+    assert "current_trace" not in module.current_plot_payload()
+    assert module.plot.plot_item.getAxis("right").isVisible() is False
 
 
 def test_spectrum_module_passes_selected_channel_fft_x_axis_scale(qapp):
@@ -513,6 +885,40 @@ def test_spectrum_module_keeps_two_committed_limit_band_markers_renderable(qapp)
     module.plot._band_range_item.boundingRect()
 
 
+def test_spectrum_module_keeps_committed_one_sided_limit_band_markers(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = SpectrumModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    limit_bands = [
+        {
+            "freq_hz": 125.0,
+            "lower_db": None,
+            "upper_db": 45.0,
+            "actual_db": 48.0,
+            "passed": False,
+        },
+        {
+            "freq_hz": 250.0,
+            "lower_db": 37.0,
+            "upper_db": None,
+            "actual_db": 35.0,
+            "passed": False,
+        },
+    ]
+    review_payload.chart_payload[0]["fft"]["limit_bands"] = limit_bands
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    marker_x, marker_y = module.plot._band_marker_item.getData()
+    assert module.has_committed_plot_data() is True
+    assert module.current_plot_payload()["limit_bands"] == limit_bands
+    assert list(marker_x) == [125.0, 250.0]
+    assert list(marker_y) == [48.0, 35.0]
+
+
 def test_spectrum_module_keeps_selected_channel_when_fft_payload_is_missing(qapp):
     services = _make_services(initial_state=_state(101, "reviewing"))
     module = SpectrumModule(services)
@@ -575,6 +981,30 @@ def test_octave_module_consumes_golden_overlay_fields_from_committed_payload(qap
     assert list(overlay_y) == [30.0, 33.0]
 
 
+def test_octave_module_passes_committed_limit_lines_to_chart(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = OctaveModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    limit_lines = [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq_hz": 125.0, "limit_db": 40.0},
+                {"freq_hz": 250.0, "limit_db": 40.0},
+            ],
+        }
+    ]
+    review_payload.chart_payload[0]["octave"]["limit_lines"] = limit_lines
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is True
+    assert module.current_plot_payload()["limit_lines"] == limit_lines
+
+
 def test_octave_module_renders_committed_chart_without_limit_band_markers(qapp):
     services = _make_services(initial_state=_state(101, "reviewing"))
     module = OctaveModule(services)
@@ -621,6 +1051,40 @@ def test_octave_module_keeps_two_committed_limit_band_markers_renderable(qapp):
     assert module.has_committed_plot_data() is True
     assert len(module.current_plot_payload()["limit_bands"]) == 2
     module.plot._band_range_item.boundingRect()
+
+
+def test_octave_module_keeps_committed_one_sided_limit_band_markers(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = OctaveModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    limit_bands = [
+        {
+            "freq_hz": 125.0,
+            "lower_db": None,
+            "upper_db": 36.0,
+            "actual_db": 38.0,
+            "passed": False,
+        },
+        {
+            "freq_hz": 250.0,
+            "lower_db": 30.0,
+            "upper_db": None,
+            "actual_db": 28.0,
+            "passed": False,
+        },
+    ]
+    review_payload.chart_payload[0]["octave"]["limit_bands"] = limit_bands
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    marker_x, marker_y = module.plot._band_marker_item.getData()
+    assert module.has_committed_plot_data() is True
+    assert module.current_plot_payload()["limit_bands"] == limit_bands
+    assert list(marker_x) == [0.0, 1.0]
+    assert list(marker_y) == [38.0, 28.0]
 
 
 def test_octave_module_keeps_selected_channel_when_octave_payload_is_missing(qapp):

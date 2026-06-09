@@ -109,6 +109,7 @@ class OctaveModule(QWidget):
                 center_freqs_hz=center_freqs_hz,
                 levels_db=levels_db,
                 limit_bands=octave_payload.get("limit_bands"),
+                limit_lines=octave_payload.get("limit_lines"),
                 golden_overlay_levels_db=octave_payload.get("golden_overlay_levels_db"),
                 show_zero_reference=bool(octave_payload.get("show_zero_reference")),
             )

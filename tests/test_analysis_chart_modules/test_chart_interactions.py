@@ -1183,6 +1183,26 @@ def test_line_export_visible_scope_filters_current_x_view(qapp):
         widget.close()
 
 
+def test_line_visible_export_with_explicit_x_axis_range_preserves_real_timestamps(qapp):
+    widget = LineChartWidget()
+    try:
+        widget.set_series(
+            [4.0, 4.5, 12.0],
+            [10.0, 20.0, 30.0],
+            x_axis_range=(4.0, 12.0),
+        )
+
+        table = widget.export_csv_table(scope="visible")
+
+        assert table.rows == [
+            ["4", "10", "", ""],
+            ["4.5", "20", "", ""],
+            ["12", "30", "", ""],
+        ]
+    finally:
+        widget.close()
+
+
 def test_line_visible_export_uses_left_box_zoom_range(qapp):
     widget = LineChartWidget()
     try:

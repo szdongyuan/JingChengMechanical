@@ -685,12 +685,15 @@ class ConfigPackageService:
     def _persist_imported_config(self, prepared_config: dict, *, config_action: str) -> None:
         config_id = prepared_config["config_id"]
         if config_action == "create":
-            TestConfigTable.create(
-                config_id=config_id,
-                created_time=now_str(),
-                updated_time=now_str(),
-                **self._config_service._config_row_values(prepared_config),
+            row_values = self._config_service._config_row_values(prepared_config)
+            row_values.update(
+                {
+                    "config_id": config_id,
+                    "created_time": now_str(),
+                    "updated_time": now_str(),
+                }
             )
+            self._config_service._insert_config_row_values(row_values)
             self._config_service._replace_channel_rows(
                 config_id=config_id,
                 channels=prepared_config["channels"],

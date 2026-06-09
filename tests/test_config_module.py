@@ -18,11 +18,13 @@ from PyQt6.QtWidgets import QApplication
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFormLayout,
-    QDialogButtonBox,
     QLabel,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTableWidget,
     QWidget,
@@ -41,6 +43,7 @@ from model.plc_table import PlcTable
 from model.test_config_table import TestConfigTable as ConfigTable
 from ui.modules.config import ConfigModule
 from ui.widgets.collapsible_group_box import CollapsibleGroupBox
+from ui.widgets.limit_table_editor import LimitTableEditor
 
 
 class _SignalStub:
@@ -499,6 +502,15 @@ def _field_label_text(container: QWidget, object_name: str) -> str | None:
     return None
 
 
+def _is_descendant_of(widget: QWidget, ancestor: QWidget) -> bool:
+    current = widget
+    while current is not None:
+        if current is ancestor:
+            return True
+        current = current.parentWidget()
+    return False
+
+
 def _ancestor_group_title(widget: QWidget | None) -> str | None:
     parent = widget.parentWidget() if widget is not None else None
     while parent is not None:
@@ -528,7 +540,7 @@ def _write_temp_wav(
 
 
 def test_collapsible_group_box_exposes_public_section_state_api(qapp):
-    box = CollapsibleGroupBox("FFT 频带上下限", section_id="fft")
+    box = CollapsibleGroupBox("FFT 参数", section_id="fft")
 
     assert box.section_id() == "fft"
     assert box.is_expanded() is True
@@ -629,6 +641,19 @@ def test_checkbox_defaults_to_unchecked_for_newly_loaded_config(qapp):
     assert module.chk_allow_incomplete_recording_analysis.isChecked() is False
 
 
+def test_scan_trigger_checkbox_is_removed_from_config_page(qapp):
+    module = _make_module()
+    payload = _detail_payload([])
+    payload["scan_triggers_test"] = True
+
+    module._populate_detail(payload)
+    data = module._collect_data()
+
+    assert not hasattr(module, "chk_scan")
+    assert module.findChild(QWidget, "chk_scan") is None
+    assert data["scan_triggers_test"] is False
+
+
 def test_collect_data_returns_main_config_analysis_offset_and_plc_id(qapp):
     plc = PlcTable.create(plc_name="PLC A")
     module = _make_module()
@@ -672,8 +697,544 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_id(qapp):
         "monitor_channel_index",
         "vibration_view_channel_index",
         "monitor_gain_db",
+        "current_meter",
         "channels",
         "golden_editor_state",
+    }
+
+
+def test_top_level_config_launchers_open_cards_and_keep_plc_visible(qapp):
+    plc = PlcTable.create(plc_name="PLC A")
+    loaded = {
+        7: _detail_payload([], config_id=7, config_name="Cfg1", plc_id=plc.id),
+    }
+    module = _make_module(config_service=_ConfigServiceStub(loaded_configs=loaded))
+    module.resize(1600, 1200)
+    module.show()
+    qapp.processEvents()
+
+    assert module.combo_plc.currentData() == plc.id
+    assert _field_label_text(module, "combo_plc") == "PLC"
+    assert module.detail.isVisible() is True
+    assert module.combo_plc.isVisible() is True
+    current = module.combo_plc.parentWidget()
+    while current is not None:
+        assert not isinstance(current, QDialog)
+        current = current.parentWidget()
+
+    launcher_panel = module.findChild(QWidget, "top_level_config_launcher_panel")
+    assert launcher_panel is not None
+
+    expected = {
+        "open_audio_vibration_hardware_card": (
+            "音频/振动硬件设置",
+            "top_level_audio_vibration_hardware_card_dialog",
+        ),
+        "open_current_meter_card": (
+            "电流表设置",
+            "top_level_current_meter_card_dialog",
+        ),
+        "open_ai_binding_card": (
+            "AI 工具链绑定",
+            "top_level_ai_binding_card_dialog",
+        ),
+    }
+    for button_name, (title, dialog_name) in expected.items():
+        button = module.findChild(QPushButton, button_name)
+        dialog = module.findChild(QDialog, dialog_name)
+        assert button is not None
+        assert button.text() == title
+        assert dialog is not None
+        assert dialog.isVisible() is False
+
+        button.click()
+        qapp.processEvents()
+
+        assert dialog.isVisible() is True
+        dialog.hide()
+
+    audio_dialog = module.findChild(
+        QDialog, "top_level_audio_vibration_hardware_card_dialog"
+    )
+    current_meter_dialog = module.findChild(
+        QDialog, "top_level_current_meter_card_dialog"
+    )
+    ai_dialog = module.findChild(QDialog, "top_level_ai_binding_card_dialog")
+
+    assert _is_descendant_of(module.combo_monitor_channel, audio_dialog)
+    assert _is_descendant_of(module.combo_vibration_view_channel, audio_dialog)
+    assert _is_descendant_of(module.spin_current_meter_offset, current_meter_dialog)
+    assert _is_descendant_of(module.ed_current_meter_host, current_meter_dialog)
+    assert _is_descendant_of(module.chk_ai_enabled, ai_dialog)
+    assert _is_descendant_of(module.combo_ai_toolchain, ai_dialog)
+
+
+def _expected_centered_dialog_pos(dialog: QDialog, owner: QWidget) -> QPoint:
+    owner_top_left = owner.mapToGlobal(QPoint(0, 0))
+    return QPoint(
+        owner_top_left.x() + (owner.width() - dialog.width()) // 2,
+        owner_top_left.y() + (owner.height() - dialog.height()) // 2,
+    )
+
+
+def test_top_level_config_dialog_default_position_uses_window_center(qapp):
+    loaded = {
+        7: _detail_payload([], config_id=7, config_name="Cfg1"),
+    }
+    module = _make_module(config_service=_ConfigServiceStub(loaded_configs=loaded))
+    module.resize(1600, 1200)
+    module.show()
+    qapp.processEvents()
+
+    button = module.findChild(QPushButton, "open_audio_vibration_hardware_card")
+    dialog = module.findChild(
+        QDialog, "top_level_audio_vibration_hardware_card_dialog"
+    )
+    assert button is not None
+    assert dialog is not None
+    assert dialog.parentWidget() is module
+
+    button.click()
+    qapp.processEvents()
+
+    assert dialog.isVisible() is True
+    assert dialog.pos() == _expected_centered_dialog_pos(dialog, module)
+
+
+def test_top_level_config_dialogs_are_module_owned_and_hide_on_reload(qapp):
+    loaded = {
+        7: _detail_payload([], config_id=7, config_name="Cfg1"),
+        8: _detail_payload([], config_id=8, config_name="Cfg2"),
+    }
+    module = _make_module(config_service=_ConfigServiceStub(loaded_configs=loaded))
+    module.resize(1600, 1200)
+    module.show()
+    qapp.processEvents()
+
+    dialogs = [
+        module.findChild(QDialog, "top_level_audio_vibration_hardware_card_dialog"),
+        module.findChild(QDialog, "top_level_current_meter_card_dialog"),
+        module.findChild(QDialog, "top_level_ai_binding_card_dialog"),
+    ]
+    for dialog in dialogs:
+        dialog.show_card()
+    qapp.processEvents()
+
+    assert all(dialog is not None for dialog in dialogs)
+    assert all(dialog.isVisible() for dialog in dialogs)
+
+    module._populate_detail(loaded[8])
+    qapp.processEvents()
+
+    assert all(not dialog.isVisible() for dialog in dialogs)
+    assert module.findChild(QComboBox, "combo_monitor_channel") is module.combo_monitor_channel
+    assert module.findChild(QDoubleSpinBox, "spin_current_meter_offset") is module.spin_current_meter_offset
+
+
+def test_top_level_config_buttons_show_only_one_dialog(qapp):
+    loaded = {
+        7: _detail_payload([], config_id=7, config_name="Cfg1"),
+    }
+    module = _make_module(config_service=_ConfigServiceStub(loaded_configs=loaded))
+    module.resize(1600, 1200)
+    module.show()
+    qapp.processEvents()
+
+    audio_button = module.findChild(QPushButton, "open_audio_vibration_hardware_card")
+    current_button = module.findChild(QPushButton, "open_current_meter_card")
+    ai_button = module.findChild(QPushButton, "open_ai_binding_card")
+    audio_dialog = module.findChild(
+        QDialog, "top_level_audio_vibration_hardware_card_dialog"
+    )
+    current_dialog = module.findChild(
+        QDialog, "top_level_current_meter_card_dialog"
+    )
+    ai_dialog = module.findChild(QDialog, "top_level_ai_binding_card_dialog")
+
+    audio_button.click()
+    qapp.processEvents()
+    assert audio_dialog.isVisible() is True
+    assert current_dialog.isVisible() is False
+    assert ai_dialog.isVisible() is False
+
+    current_button.click()
+    qapp.processEvents()
+    assert audio_dialog.isVisible() is False
+    assert current_dialog.isVisible() is True
+    assert ai_dialog.isVisible() is False
+
+    ai_button.click()
+    qapp.processEvents()
+    assert audio_dialog.isVisible() is False
+    assert current_dialog.isVisible() is False
+    assert ai_dialog.isVisible() is True
+
+
+def test_current_meter_dialog_opens_without_default_vertical_scroll(qapp):
+    loaded = {
+        7: _detail_payload([], config_id=7, config_name="Cfg1"),
+    }
+    module = _make_module(config_service=_ConfigServiceStub(loaded_configs=loaded))
+    module.resize(1600, 1200)
+    module.show()
+    qapp.processEvents()
+
+    current_button = module.findChild(QPushButton, "open_current_meter_card")
+    current_dialog = module.findChild(
+        QDialog, "top_level_current_meter_card_dialog"
+    )
+
+    current_button.click()
+    qapp.processEvents()
+
+    body_scroll = current_dialog.findChild(
+        QScrollArea,
+        "ConfigSectionCardBodyScroll",
+    )
+    assert current_dialog.height() >= 620
+    assert body_scroll.verticalScrollBar().maximum() == 0
+
+
+def test_config_dialog_x_and_confirm_close_without_saving(qapp):
+    loaded = {
+        7: _detail_payload([], config_id=7, config_name="Cfg1"),
+    }
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        config_changed=_SignalStub(),
+    )
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service, bus=bus)
+    module.resize(1600, 1200)
+    module.show()
+    qapp.processEvents()
+
+    audio_button = module.findChild(QPushButton, "open_audio_vibration_hardware_card")
+    dialog = module.findChild(
+        QDialog, "top_level_audio_vibration_hardware_card_dialog"
+    )
+    close_button = dialog.findChild(QPushButton, "TopLevelConfigCardCloseButton")
+    confirm_button = dialog.findChild(QPushButton, "TopLevelConfigCardConfirmButton")
+
+    assert close_button is not None
+    assert close_button.text() == "X"
+    assert confirm_button is not None
+    assert confirm_button.text() == "确定"
+
+    audio_button.click()
+    qapp.processEvents()
+    close_button.click()
+    qapp.processEvents()
+
+    assert dialog.isVisible() is False
+    assert config_service.begin_calls == 0
+    assert bus.status.emissions == []
+
+    audio_button.click()
+    qapp.processEvents()
+    confirm_button.click()
+    qapp.processEvents()
+
+    assert config_service.begin_calls == 0
+    assert dialog.isVisible() is False
+    assert bus.status.emissions == []
+
+
+def test_config_confirm_leave_cancel_keeps_dirty_editor_without_saving(qapp, monkeypatch):
+    loaded = {
+        7: _detail_payload([], config_id=7, config_name="Cfg1"),
+    }
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service)
+    qapp.processEvents()
+    prompts = []
+
+    monkeypatch.setattr(
+        module,
+        "_prompt_unsaved_config_changes",
+        lambda action: prompts.append(action) or False,
+    )
+
+    original_record_duration = module.spin_record.value()
+    module.spin_record.setValue(original_record_duration + 1.0)
+
+    assert module.confirm_leave() is False
+    assert prompts == ["leave"]
+    assert config_service.begin_calls == 0
+    assert module.spin_record.value() == pytest.approx(original_record_duration + 1.0)
+
+
+def test_config_confirm_leave_save_persists_without_success_popup(qapp, monkeypatch):
+    loaded = {
+        7: _detail_payload([], config_id=7, config_name="Cfg1"),
+    }
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        config_changed=_SignalStub(),
+    )
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service, bus=bus)
+    qapp.processEvents()
+    prompts = []
+    infos = []
+
+    monkeypatch.setattr(
+        module,
+        "_prompt_unsaved_config_changes",
+        lambda action: prompts.append(action) or True,
+    )
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.information",
+        lambda *args: infos.append(args),
+    )
+
+    module.spin_record.setValue(module.spin_record.value() + 1.0)
+
+    assert module.confirm_leave() is True
+    assert prompts == ["leave"]
+    assert config_service.begin_calls == 1
+    assert infos == []
+    assert bus.status.emissions == [(("配置已保存",), {})]
+
+    assert module.confirm_leave() is True
+    assert prompts == ["leave"]
+
+
+def test_config_list_switch_cancel_restores_previous_dirty_config(qapp, monkeypatch):
+    loaded = {
+        7: _detail_payload([], config_id=7, config_name="Cfg1"),
+        8: _detail_payload([], config_id=8, config_name="Cfg2"),
+    }
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service)
+    qapp.processEvents()
+    prompts = []
+
+    monkeypatch.setattr(
+        module,
+        "_prompt_unsaved_config_changes",
+        lambda action: prompts.append(action) or False,
+    )
+
+    assert module._current_config_id == 7
+    edited_record_duration = module.spin_record.value() + 1.0
+    module.spin_record.setValue(edited_record_duration)
+
+    module.config_list.setCurrentRow(1)
+    qapp.processEvents()
+
+    assert prompts == ["switch"]
+    assert module._current_config_id == 7
+    assert module.config_list.currentItem().data(Qt.ItemDataRole.UserRole) == 7
+    assert module.spin_record.value() == pytest.approx(edited_record_duration)
+    assert config_service.begin_calls == 0
+
+
+def test_config_list_switch_save_then_loads_target_config(qapp, monkeypatch):
+    loaded = {
+        7: _detail_payload([], config_id=7, config_name="Cfg1"),
+        8: _detail_payload([], config_id=8, config_name="Cfg2"),
+    }
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service)
+    qapp.processEvents()
+    prompts = []
+
+    monkeypatch.setattr(
+        module,
+        "_prompt_unsaved_config_changes",
+        lambda action: prompts.append(action) or True,
+    )
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    monkeypatch.setattr("ui.modules.config.QMessageBox.information", lambda *args: None)
+
+    module.spin_record.setValue(module.spin_record.value() + 1.0)
+
+    module.config_list.setCurrentRow(1)
+    qapp.processEvents()
+
+    assert prompts == ["switch"]
+    assert config_service.begin_calls == 1
+    assert module._current_config_id == 8
+    assert module.config_list.currentItem().data(Qt.ItemDataRole.UserRole) == 8
+    assert module.ed_name.text() == "Cfg2"
+
+
+def test_top_level_config_dialogs_hide_when_refresh_enters_empty_state(qapp):
+    loaded = {
+        7: _detail_payload([], config_id=7, config_name="Cfg1"),
+    }
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service)
+    module.resize(1600, 1200)
+    module.show()
+    qapp.processEvents()
+
+    dialogs = [
+        module.findChild(QDialog, "top_level_audio_vibration_hardware_card_dialog"),
+        module.findChild(QDialog, "top_level_current_meter_card_dialog"),
+        module.findChild(QDialog, "top_level_ai_binding_card_dialog"),
+    ]
+    for dialog in dialogs:
+        dialog.show_card()
+    qapp.processEvents()
+
+    assert all(dialog.isVisible() for dialog in dialogs)
+
+    config_service._loaded_configs.clear()
+    config_service.saved_configs = []
+    module._refresh_list()
+    qapp.processEvents()
+
+    assert module.detail.isVisible() is False
+    assert all(not dialog.isVisible() for dialog in dialogs)
+
+
+def test_populate_detail_loads_default_current_meter_controls(qapp):
+    module = _make_module()
+
+    module._populate_detail(_detail_payload([]))
+
+    assert module.spin_current_meter_port.value() == 502
+    assert module.spin_current_meter_unit_id.value() == 1
+    assert module.combo_current_meter_register_type.currentData() == "input"
+    assert module.spin_current_meter_register_address.value() == 0
+    assert module.combo_current_meter_data_type.currentData() == "uint16"
+    assert module.combo_current_meter_byte_order.currentData() == "big"
+    assert module.combo_current_meter_word_order.currentData() == "big"
+    assert module.spin_current_meter_scale.value() == pytest.approx(0.001)
+    assert module.spin_current_meter_offset.value() == pytest.approx(0.0)
+    assert module.spin_current_meter_poll_interval_ms.value() == 200
+    assert module.spin_current_meter_timeout_ms.value() == 1000
+    assert _field_label_text(module, "spin_current_meter_offset") == "电流表偏移(mA)"
+
+
+def test_populate_detail_preserves_current_meter_unit_id_zero():
+    module = _make_module()
+    payload = _detail_payload([])
+    payload["current_meter"] = {
+        "enabled": True,
+        "host": "192.168.1.20",
+        "unit_id": 0,
+    }
+
+    module._populate_detail(payload)
+
+    assert module.spin_current_meter_unit_id.value() == 0
+    assert module._collect_data()["current_meter"]["unit_id"] == 0
+
+
+def test_populate_detail_uses_neutral_offset_label_for_generic_float32_config(qapp):
+    module = _make_module()
+    payload = _detail_payload([])
+    payload["current_meter"] = {
+        "enabled": True,
+        "host": "192.168.1.20",
+        "unit_id": 3,
+        "register_type": "holding",
+        "register_address": 8,
+        "register_count": 2,
+        "data_type": "float32",
+        "byte_order": "little",
+        "word_order": "big",
+        "scale": 1.0,
+        "offset": 1.5,
+        "poll_interval_ms": 250,
+        "timeout_ms": 1200,
+    }
+
+    module._populate_detail(payload)
+
+    assert _field_label_text(module, "spin_current_meter_offset") == "电流表偏移"
+
+
+def test_current_meter_offset_label_refreshes_when_controls_change(qapp):
+    module = _make_module()
+
+    module._populate_detail(_detail_payload([]))
+
+    assert _field_label_text(module, "spin_current_meter_offset") == "电流表偏移(mA)"
+
+    module.combo_current_meter_register_type.setCurrentIndex(
+        module.combo_current_meter_register_type.findData("holding")
+    )
+    module.combo_current_meter_data_type.setCurrentIndex(
+        module.combo_current_meter_data_type.findData("float32")
+    )
+    module.combo_current_meter_byte_order.setCurrentIndex(
+        module.combo_current_meter_byte_order.findData("little")
+    )
+    module.combo_current_meter_word_order.setCurrentIndex(
+        module.combo_current_meter_word_order.findData("little")
+    )
+    module.spin_current_meter_scale.setValue(1.0)
+
+    assert _field_label_text(module, "spin_current_meter_offset") == "电流表偏移"
+
+    module.combo_current_meter_register_type.setCurrentIndex(
+        module.combo_current_meter_register_type.findData("input")
+    )
+    module.combo_current_meter_data_type.setCurrentIndex(
+        module.combo_current_meter_data_type.findData("uint16")
+    )
+    module.combo_current_meter_byte_order.setCurrentIndex(
+        module.combo_current_meter_byte_order.findData("big")
+    )
+    module.combo_current_meter_word_order.setCurrentIndex(
+        module.combo_current_meter_word_order.findData("big")
+    )
+    module.spin_current_meter_scale.setValue(0.001)
+
+    assert _field_label_text(module, "spin_current_meter_offset") == "电流表偏移(mA)"
+
+
+def test_populate_detail_preserves_explicit_current_meter_values(qapp):
+    module = _make_module()
+    payload = _detail_payload([])
+    payload["current_meter"] = {
+        "enabled": True,
+        "host": "192.168.1.20",
+        "port": 1502,
+        "unit_id": 3,
+        "register_type": "holding",
+        "register_address": 120,
+        "register_count": 2,
+        "data_type": "float32",
+        "byte_order": "little",
+        "word_order": "big",
+        "scale": 1.0,
+        "offset": 1.5,
+        "poll_interval_ms": 250,
+        "timeout_ms": 1200,
+    }
+    module._populate_detail(payload)
+
+    data = module._collect_data()
+
+    assert data["current_meter"] == {
+        "enabled": True,
+        "host": "192.168.1.20",
+        "port": 1502,
+        "unit_id": 3,
+        "register_type": "holding",
+        "register_address": 120,
+        "register_count": 2,
+        "data_type": "float32",
+        "byte_order": "little",
+        "word_order": "big",
+        "scale": pytest.approx(1.0),
+        "offset": pytest.approx(1.5),
+        "poll_interval_ms": 250,
+        "timeout_ms": 1200,
     }
 
 
@@ -1038,6 +1599,51 @@ def test_collect_data_includes_allow_incomplete_recording_analysis(qapp):
     data = module._collect_data()
 
     assert data["allow_incomplete_recording_analysis"] is True
+
+
+def test_collect_data_includes_current_meter_settings(qapp):
+    module = _make_module()
+    module._current_config_id = 7
+    module.chk_current_meter_enabled.setChecked(True)
+    module.ed_current_meter_host.setText("192.168.1.20")
+    module.spin_current_meter_port.setValue(1502)
+    module.spin_current_meter_unit_id.setValue(3)
+    module.combo_current_meter_register_type.setCurrentIndex(
+        module.combo_current_meter_register_type.findData("input")
+    )
+    module.spin_current_meter_register_address.setValue(120)
+    module.combo_current_meter_data_type.setCurrentIndex(
+        module.combo_current_meter_data_type.findData("uint16")
+    )
+    module.combo_current_meter_byte_order.setCurrentIndex(
+        module.combo_current_meter_byte_order.findData("little")
+    )
+    module.combo_current_meter_word_order.setCurrentIndex(
+        module.combo_current_meter_word_order.findData("big")
+    )
+    module.spin_current_meter_scale.setValue(0.1)
+    module.spin_current_meter_offset.setValue(1.5)
+    module.spin_current_meter_poll_interval_ms.setValue(250)
+    module.spin_current_meter_timeout_ms.setValue(1200)
+
+    data = module._collect_data()
+
+    assert data["current_meter"] == {
+        "enabled": True,
+        "host": "192.168.1.20",
+        "port": 1502,
+        "unit_id": 3,
+        "register_type": "input",
+        "register_address": 120,
+        "register_count": 1,
+        "data_type": "uint16",
+        "byte_order": "little",
+        "word_order": "big",
+        "scale": pytest.approx(0.1),
+        "offset": pytest.approx(1.5),
+        "poll_interval_ms": 250,
+        "timeout_ms": 1200,
+    }
 
 
 def test_collect_ai_binding_does_not_include_analysis_window_offset(qapp):
@@ -1446,7 +2052,193 @@ def test_on_save_preserves_selected_channel_and_collapsed_sections_and_shows_suc
     assert infos[-1][-2:] == ("保存成功", "配置保存成功！")
 
 
-def test_channel_section_layout_does_not_stretch_after_repeated_collapses(qapp):
+def test_channel_section_launchers_open_movable_card_dialogs(qapp):
+    loaded = {
+        7: _detail_payload([_channel_payload(0)], config_id=7, config_name="Cfg1"),
+    }
+    module = _make_module(config_service=_ConfigServiceStub(loaded_configs=loaded))
+    module.resize(1600, 1200)
+    module.show()
+    qapp.processEvents()
+
+    container = module._channel_containers[0]
+    launcher_panel = container.findChild(QWidget, "channel_section_launcher_panel")
+    assert launcher_panel is not None
+    expected_buttons = {
+        "stft": "STFT 参数",
+        "stft_score": "STFT 评分",
+        "spl": "声压级参数",
+        "loudness": "响度参数",
+        "golden_sample": "黄金样本",
+        "fft": "FFT 参数",
+        "octave": "1/3 倍频程参数",
+    }
+    for section_id, title in expected_buttons.items():
+        button = container.findChild(QPushButton, f"open_{section_id}_section")
+        assert button is not None
+        assert button.text() == title
+
+    fft_dialog = module._channel_section_dialogs[(0, "fft")]
+    assert fft_dialog.isVisible() is False
+
+    fft_button = container.findChild(QPushButton, "open_fft_section")
+    fft_button.click()
+    qapp.processEvents()
+
+    assert fft_dialog.isVisible() is True
+    assert fft_dialog.parentWidget() is container
+    initial_pos = fft_dialog.pos()
+    assert initial_pos == _expected_centered_dialog_pos(fft_dialog, module)
+    assert fft_dialog.windowFlags() & Qt.WindowType.Tool
+    assert fft_dialog.findChild(CollapsibleGroupBox).section_id() == "fft"
+    assert fft_dialog.width() >= 760
+    fft_editor = fft_dialog.findChild(LimitTableEditor, "fft_limit_table_editor")
+    assert fft_editor is not None
+    fft_editor.findChild(QPushButton, "fft_add_limit_table").click()
+    fft_table = fft_dialog.findChild(QTableWidget, "fft_limit_points_0")
+    assert fft_table.horizontalHeader().defaultSectionSize() == 72
+    assert fft_table.verticalHeader().defaultSectionSize() == 30
+
+    fft_dialog.hide()
+    fft_button.click()
+    qapp.processEvents()
+
+    assert fft_dialog.pos() == initial_pos
+
+    moved_pos = fft_dialog.pos() + QPoint(31, 17)
+    fft_dialog.move(moved_pos)
+    fft_dialog._user_moved = True
+    fft_dialog.hide()
+    fft_button.click()
+    qapp.processEvents()
+
+    assert fft_dialog.pos() == moved_pos
+
+    close_button = fft_dialog.findChild(QPushButton, "ChannelSectionCardCloseButton")
+    assert close_button.text() == "X"
+    confirm_button = fft_dialog.findChild(QPushButton, "ChannelSectionCardConfirmButton")
+    assert confirm_button is not None
+    assert confirm_button.text() == "确定"
+    close_button.click()
+    qapp.processEvents()
+
+    assert fft_dialog.isVisible() is False
+    assert module._channel_section_dialogs[(0, "fft")] is fft_dialog
+
+
+def test_fft_and_octave_dialogs_use_wide_compact_limit_tables(qapp):
+    loaded = {
+        7: _detail_payload([_channel_payload(0)], config_id=7, config_name="Cfg1"),
+    }
+    module = _make_module(config_service=_ConfigServiceStub(loaded_configs=loaded))
+    module.resize(1600, 1200)
+    module.show()
+    qapp.processEvents()
+
+    container = module._channel_containers[0]
+    fft_button = container.findChild(QPushButton, "open_fft_section")
+    octave_button = container.findChild(QPushButton, "open_octave_section")
+    fft_dialog = module._channel_section_dialogs[(0, "fft")]
+    octave_dialog = module._channel_section_dialogs[(0, "octave")]
+
+    fft_button.click()
+    qapp.processEvents()
+
+    fft_editor = fft_dialog.findChild(LimitTableEditor, "fft_limit_table_editor")
+    fft_editor.findChild(QPushButton, "fft_add_limit_table").click()
+    fft_table = fft_dialog.findChild(QTableWidget, "fft_limit_points_0")
+    assert fft_dialog.width() >= 760
+    assert fft_table.horizontalHeader().defaultSectionSize() == 72
+    assert fft_table.verticalHeader().defaultSectionSize() == 30
+
+    octave_button.click()
+    qapp.processEvents()
+
+    oct_editor = octave_dialog.findChild(LimitTableEditor, "oct_limit_table_editor")
+    oct_editor.findChild(QPushButton, "oct_add_limit_table").click()
+    octave_table = octave_dialog.findChild(QTableWidget, "oct_limit_points_0")
+    assert octave_dialog.width() >= 720
+    assert octave_table.horizontalHeader().defaultSectionSize() == 72
+    assert octave_table.verticalHeader().defaultSectionSize() == 30
+
+
+def test_channel_config_dialog_confirm_closes_without_saving(qapp):
+    loaded = {
+        7: _detail_payload([_channel_payload(0)], config_id=7, config_name="Cfg1"),
+    }
+    bus = SimpleNamespace(
+        refresh_channels=_SignalStub(),
+        status=_SignalStub(),
+        config_changed=_SignalStub(),
+    )
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service, bus=bus)
+    module.resize(1600, 1200)
+    module.show()
+    qapp.processEvents()
+
+    fft_button = module._channel_containers[0].findChild(
+        QPushButton,
+        "open_fft_section",
+    )
+    fft_button.click()
+    qapp.processEvents()
+
+    fft_dialog = module._channel_section_dialogs[(0, "fft")]
+    confirm_button = fft_dialog.findChild(
+        QPushButton,
+        "ChannelSectionCardConfirmButton",
+    )
+    assert confirm_button is not None
+    assert confirm_button.text() == "确定"
+
+    confirm_button.click()
+    qapp.processEvents()
+
+    assert config_service.begin_calls == 0
+    assert fft_dialog.isVisible() is False
+    assert bus.status.emissions == []
+
+
+def test_config_card_buttons_show_only_one_dialog_across_top_level_and_channel(qapp):
+    loaded = {
+        7: _detail_payload([_channel_payload(0)], config_id=7, config_name="Cfg1"),
+    }
+    module = _make_module(config_service=_ConfigServiceStub(loaded_configs=loaded))
+    module.resize(1600, 1200)
+    module.show()
+    qapp.processEvents()
+
+    audio_button = module.findChild(QPushButton, "open_audio_vibration_hardware_card")
+    audio_dialog = module.findChild(
+        QDialog, "top_level_audio_vibration_hardware_card_dialog"
+    )
+    container = module._channel_containers[0]
+    fft_button = container.findChild(QPushButton, "open_fft_section")
+    spl_button = container.findChild(QPushButton, "open_spl_section")
+    fft_dialog = module._channel_section_dialogs[(0, "fft")]
+    spl_dialog = module._channel_section_dialogs[(0, "spl")]
+
+    audio_button.click()
+    qapp.processEvents()
+    assert audio_dialog.isVisible() is True
+    assert fft_dialog.isVisible() is False
+    assert spl_dialog.isVisible() is False
+
+    fft_button.click()
+    qapp.processEvents()
+    assert audio_dialog.isVisible() is False
+    assert fft_dialog.isVisible() is True
+    assert spl_dialog.isVisible() is False
+
+    spl_button.click()
+    qapp.processEvents()
+    assert audio_dialog.isVisible() is False
+    assert fft_dialog.isVisible() is False
+    assert spl_dialog.isVisible() is True
+
+
+def test_channel_section_cards_do_not_stretch_after_repeated_collapses(qapp):
     loaded = {
         7: _detail_payload([_channel_payload(0)], config_id=7, config_name="Cfg1"),
     }
@@ -1460,10 +2252,10 @@ def test_channel_section_layout_does_not_stretch_after_repeated_collapses(qapp):
         box.section_id(): box
         for box in container.findChildren(CollapsibleGroupBox)
     }
-    baseline = {
-        key: boxes[key].sizeHint().height()
-        for key in ("loudness", "golden_sample", "fft", "octave")
-    }
+
+    module._channel_section_dialogs[(0, "stft")].show_card()
+    module._channel_section_dialogs[(0, "spl")].show_card()
+    qapp.processEvents()
 
     for _ in range(5):
         boxes["stft"].set_expanded(False)
@@ -1482,46 +2274,9 @@ def test_channel_section_layout_does_not_stretch_after_repeated_collapses(qapp):
 
     assert boxes["stft"].height() == boxes["stft"].sizeHint().height()
     assert boxes["spl"].height() == boxes["spl"].sizeHint().height()
-    for key, expected_height in baseline.items():
-        assert boxes[key].height() == expected_height
-        assert boxes[key].height() == boxes[key].sizeHint().height()
 
 
-def test_channel_section_layout_preserves_scroll_reachability_in_short_viewport(qapp):
-    loaded = {
-        7: _detail_payload([_channel_payload(0)], config_id=7, config_name="Cfg1"),
-    }
-    module = _make_module(config_service=_ConfigServiceStub(loaded_configs=loaded))
-    module.resize(900, 700)
-    module.show()
-    qapp.processEvents()
-
-    container = module._channel_containers[0]
-    boxes = {
-        box.section_id(): box
-        for box in container.findChildren(CollapsibleGroupBox)
-    }
-    scroll_bar = module.detail_scroll.verticalScrollBar()
-
-    assert scroll_bar.maximum() > 0
-
-    module.detail_scroll.ensureWidgetVisible(boxes["octave"], 0, 0)
-    qapp.processEvents()
-
-    top_in_viewport = boxes["octave"].mapTo(
-        module.detail_scroll.viewport(),
-        QPoint(0, 0),
-    ).y()
-    bottom_in_viewport = boxes["octave"].mapTo(
-        module.detail_scroll.viewport(),
-        QPoint(0, boxes["octave"].height()),
-    ).y()
-
-    assert top_in_viewport >= 0
-    assert bottom_in_viewport <= module.detail_scroll.viewport().height()
-
-
-def test_on_save_preserves_collapsed_section_geometry_in_tall_viewport(
+def test_on_save_preserves_collapsed_section_state_in_card_dialogs(
     qapp, monkeypatch
 ):
     loaded = {
@@ -1564,10 +2319,14 @@ def test_on_save_preserves_collapsed_section_geometry_in_tall_viewport(
 
     assert restored_boxes["stft"].is_expanded() is False
     assert restored_boxes["spl"].is_expanded() is False
-    assert restored_boxes["stft"].height() == restored_boxes["stft"].sizeHint().height()
-    assert restored_boxes["spl"].height() == restored_boxes["spl"].sizeHint().height()
-    for key in ("loudness", "golden_sample", "fft", "octave"):
-        assert restored_boxes[key].height() == restored_boxes[key].sizeHint().height()
+    assert restored.findChild(QPushButton, "open_stft_section") is not None
+    assert restored.findChild(QPushButton, "open_spl_section") is not None
+
+    restored.findChild(QPushButton, "open_stft_section").click()
+    qapp.processEvents()
+
+    assert module._channel_section_dialogs[(0, "stft")].isVisible() is True
+    assert restored_boxes["stft"].is_expanded() is False
 
 
 def test_on_save_falls_back_to_first_available_channel_when_selected_channel_disappears(
@@ -1831,7 +2590,7 @@ def test_populate_detail_loads_fft_resolution_in_fft_section(qapp):
     assert fft_resolution is not None
     assert fft_resolution.currentData() == 4096
     assert _field_label_text(container, "fft_nfft") == "FFT 分辨率"
-    assert _ancestor_group_title(fft_resolution) == "FFT 频带上下限"
+    assert _ancestor_group_title(fft_resolution) == "FFT 参数"
     assert _ancestor_group_title(stft_nfft) == "STFT 参数"
 
 
@@ -2071,35 +2830,7 @@ def test_collect_data_includes_fft_x_axis_scale(qapp):
     assert data["channels"][0]["fft_x_axis_scale"] == "log"
 
 
-def test_fft_band_table_insert_adds_column_after_selected(qapp):
-    module = _make_module()
-    module._populate_detail(
-        _detail_payload(
-            [
-                _channel_payload(
-                    0,
-                    fft_band_limits=[
-                        {"freq": 100.0, "lower": 30.0, "upper": 70.0},
-                        {"freq": 300.0, "lower": 50.0, "upper": 80.0},
-                    ],
-                )
-            ]
-        )
-    )
-    table = module._channel_containers[0].findChild(QTableWidget, "fft_band_table")
-    assert table is not None
-    table.selectColumn(0)
-
-    module._insert_band_after_selection(table)
-
-    assert table.columnCount() == 3
-    assert table.item(0, 1).text() == "200.0"
-    assert table.item(1, 1).text() == "30.0"
-    assert table.item(2, 1).text() == "70.0"
-    assert {index.column() for index in table.selectedIndexes()} == {1}
-
-
-def test_fft_band_table_insert_after_invalid_selected_frequency_uses_append_defaults(
+def test_config_module_loads_legacy_fft_and_octave_limits_as_separate_limit_tables(
     qapp,
 ):
     module = _make_module()
@@ -2109,35 +2840,712 @@ def test_fft_band_table_insert_after_invalid_selected_frequency_uses_append_defa
                 _channel_payload(
                     0,
                     fft_band_limits=[
-                        {"freq": -100.0, "lower": 30.0, "upper": 70.0},
-                        {"freq": 300.0, "lower": 50.0, "upper": 80.0},
+                        {"freq": 1000.0, "lower": 0.0, "upper": 100.0},
+                        {"freq": 2000.0, "lower": 10.0, "upper": 90.0},
+                    ],
+                    oct_band_limits=[
+                        {"freq": 125.0, "lower": 20.0, "upper": 70.0},
+                        {"freq": 250.0, "lower": 30.0, "upper": 80.0},
                     ],
                 )
             ]
         )
     )
-    table = module._channel_containers[0].findChild(QTableWidget, "fft_band_table")
-    assert table is not None
-    table.selectColumn(0)
+    container = module._channel_containers[0]
 
-    module._insert_band_after_selection(table)
+    fft_editor = container.findChild(LimitTableEditor, "fft_limit_table_editor")
+    oct_editor = container.findChild(LimitTableEditor, "oct_limit_table_editor")
 
-    assert table.columnCount() == 3
-    assert table.item(0, 1).text() == "1000"
-    assert table.item(1, 1).text() == "0"
-    assert table.item(2, 1).text() == "100"
-    assert {index.column() for index in table.selectedIndexes()} == {1}
+    assert fft_editor is not None
+    assert oct_editor is not None
+    assert fft_editor.limits() == [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 0.0},
+                {"freq": 2000.0, "limit": 10.0},
+            ],
+        },
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 90.0},
+            ],
+        },
+    ]
+    assert oct_editor.limits() == [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 125.0, "limit": 20.0},
+                {"freq": 250.0, "limit": 30.0},
+            ],
+        },
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 125.0, "limit": 70.0},
+                {"freq": 250.0, "limit": 80.0},
+            ],
+        },
+    ]
 
 
-def test_octave_band_table_does_not_get_fft_insert_controls(qapp):
+def test_config_module_loads_and_collects_grouped_limit_tables(qapp):
     module = _make_module()
+    fft_limits = [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 2000.0, "limit": 90.0},
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 70.0},
+            ],
+        },
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 5.0},
+                {"freq": 3000.0, "limit": 10.0},
+            ],
+        },
+    ]
+    oct_limits = [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 20.0},
+                {"freq": 2000.0, "limit": 30.0},
+            ],
+        }
+    ]
+    module._current_config_id = 7
+    module._populate_detail(
+        _detail_payload(
+            [
+                _channel_payload(
+                    0,
+                    fft_band_limits=fft_limits,
+                    oct_band_limits=oct_limits,
+                )
+            ]
+        )
+    )
+
+    data = module._collect_data()
+
+    assert data["channels"][0]["fft_band_limits"] == [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 90.0},
+                {"freq": 2000.0, "limit": 70.0},
+            ],
+        },
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 5.0},
+                {"freq": 3000.0, "limit": 10.0},
+            ],
+        },
+    ]
+    assert data["channels"][0]["oct_band_limits"] == oct_limits
+
+
+def test_config_module_loads_invalid_legacy_fft_limits_for_validation(qapp):
+    module = _make_module()
+    module._current_config_id = 7
+    module._populate_detail(
+        _detail_payload(
+            [
+                _channel_payload(
+                    0,
+                    fft_band_limits=[
+                        {"freq": 1000.0, "lower": 0.0, "upper": "bad"},
+                    ],
+                )
+            ]
+        )
+    )
+    container = module._channel_containers[0]
+
+    editor = container.findChild(LimitTableEditor, "fft_limit_table_editor")
+    collected = module._collect_data()
+    errors = ConfigService(SimpleNamespace(config_changed=_SignalStub())).validate(
+        collected
+    )
+
+    assert editor is not None
+    assert collected["channels"][0]["fft_band_limits"] == [
+        {
+            "kind": "lower",
+            "points": [{"freq": 1000.0, "limit": 0.0}],
+        },
+        {
+            "kind": "upper",
+            "points": [{"freq": 1000.0, "limit": "bad"}],
+        },
+    ]
+    assert any(
+        "FFT限制表" in error and "限值必须是有限数字" in error
+        for error in errors
+    )
+
+
+def test_config_module_loads_invalid_grouped_octave_limits_for_validation(qapp):
+    module = _make_module()
+    module._current_config_id = 7
+    module._populate_detail(
+        _detail_payload(
+            [
+                _channel_payload(
+                    0,
+                    oct_band_limits=[
+                        {
+                            "kind": "ceiling",
+                            "points": [
+                                {"freq": 1000.0, "limit": "bad"},
+                                {"freq": "oops", "limit": 80.0},
+                            ],
+                        },
+                        {"kind": "upper", "points": "bad-points"},
+                    ],
+                )
+            ]
+        )
+    )
+    container = module._channel_containers[0]
+
+    editor = container.findChild(LimitTableEditor, "oct_limit_table_editor")
+    kind_combo = editor.findChild(QComboBox, "oct_limit_kind_0")
+    collected = module._collect_data()
+    limits = collected["channels"][0]["oct_band_limits"]
+    errors = ConfigService(SimpleNamespace(config_changed=_SignalStub())).validate(
+        collected
+    )
+
+    assert editor is not None
+    assert kind_combo.currentText() == "无效: ceiling"
+    assert kind_combo.currentData() == "ceiling"
+    assert limits == [
+        {
+            "kind": "ceiling",
+            "points": [
+                {"freq": 1000.0, "limit": "bad"},
+                {"freq": "oops", "limit": 80.0},
+            ],
+        },
+        {
+            "kind": "upper",
+            "points": [{"freq": "", "limit": "bad-points"}],
+        },
+    ]
+    assert "通道 1: 倍频程限制表第 1 项类型必须是上限或下限" in errors
+    assert any(
+        "倍频程限制表" in error and "频率必须是有限数字" in error
+        for error in errors
+    )
+    assert any(
+        "倍频程限制表" in error and "限值必须是有限数字" in error
+        for error in errors
+    )
+
+
+def test_limit_table_editor_invalid_grouped_kind_is_visible_and_collected_until_changed(
+    qapp,
+):
+    editor = LimitTableEditor(object_name="fft_limit_table_editor", label="FFT")
+    editor.set_limits(
+        [
+            {
+                "kind": "ceiling",
+                "points": [
+                    {"freq": 1000.0, "limit": 100.0},
+                    {"freq": 2000.0, "limit": 90.0},
+                ],
+            }
+        ]
+    )
+
+    kind_combo = editor.findChild(QComboBox, "fft_limit_kind_0")
+    assert kind_combo is not None
+    assert kind_combo.currentText() == "无效: ceiling"
+    assert kind_combo.currentData() == "ceiling"
+    assert kind_combo.findData("ceiling") != -1
+    assert editor.limits()[0]["kind"] == kind_combo.currentData()
+
+    kind_combo.setCurrentIndex(kind_combo.findData("lower"))
+
+    assert kind_combo.currentData() == "lower"
+    assert editor.limits()[0]["kind"] == "lower"
+    assert kind_combo.findData("ceiling") == -1
+
+    kind_combo.setCurrentIndex(kind_combo.findData("ceiling"))
+
+    assert editor.limits()[0]["kind"] in {"upper", "lower"}
+    assert editor.limits()[0]["kind"] != "ceiling"
+
+
+def test_limit_table_editor_add_and_delete_table_updates_collected_payload(qapp):
+    module = _make_module()
+    module._current_config_id = 7
     module._populate_detail(_detail_payload([_channel_payload(0)]))
     container = module._channel_containers[0]
-    oct_table = container.findChild(QTableWidget, "oct_band_table")
-    assert oct_table is not None
+    fft_editor = container.findChild(LimitTableEditor, "fft_limit_table_editor")
+    oct_editor = container.findChild(LimitTableEditor, "oct_limit_table_editor")
+    assert fft_editor is not None
+    assert oct_editor is not None
 
-    buttons = oct_table.parent().findChildren(QPushButton)
-    assert [button.text() for button in buttons] == ["添加频带", "删除选中"]
+    fft_editor.findChild(QPushButton, "fft_add_limit_table").click()
+    oct_editor.findChild(QPushButton, "oct_add_limit_table").click()
+
+    assert fft_editor.limits() == [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 100.0},
+            ],
+        }
+    ]
+    assert oct_editor.limits() == [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 100.0},
+            ],
+        }
+    ]
+
+    kind_combo = fft_editor.findChild(QComboBox, "fft_limit_kind_0")
+    kind_combo.setCurrentIndex(kind_combo.findData("lower"))
+
+    assert fft_editor.limits() == [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 100.0},
+            ],
+        }
+    ]
+
+    fft_editor.findChild(QPushButton, "fft_delete_limit_table_0").click()
+
+    assert fft_editor.limits() == []
+    assert module._collect_data()["channels"][0]["fft_band_limits"] == []
+
+
+def test_limit_table_editor_point_actions_preserve_duplicate_frequencies(qapp):
+    module = _make_module()
+    module._current_config_id = 7
+    module._populate_detail(
+        _detail_payload(
+            [
+                _channel_payload(
+                    0,
+                    fft_band_limits=[
+                        {
+                            "kind": "upper",
+                            "points": [
+                                {"freq": 1000.0, "limit": 100.0},
+                                {"freq": 2000.0, "limit": 100.0},
+                            ],
+                        }
+                    ],
+                )
+            ]
+        )
+    )
+    editor = module._channel_containers[0].findChild(
+        LimitTableEditor,
+        "fft_limit_table_editor",
+    )
+    table = editor.findChild(QTableWidget, "fft_limit_points_0")
+    assert table is not None
+
+    editor.findChild(QPushButton, "fft_add_limit_point_0").click()
+    assert editor.limits()[0]["points"] == [
+        {"freq": 1000.0, "limit": 100.0},
+        {"freq": 2000.0, "limit": 100.0},
+        {"freq": 3000.0, "limit": 100.0},
+    ]
+
+    table.selectColumn(0)
+    editor.findChild(QPushButton, "fft_insert_limit_point_0").click()
+    table.item(0, 1).setText("2000")
+    table.item(1, 1).setText("50")
+
+    table.clearSelection()
+    table.selectColumn(3)
+    editor.findChild(QPushButton, "fft_delete_limit_point_0").click()
+
+    assert module._collect_data()["channels"][0]["fft_band_limits"] == [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 50.0},
+                {"freq": 2000.0, "limit": 100.0},
+            ],
+        }
+    ]
+
+
+def test_limit_table_editor_insert_after_final_point_copies_selected_point(qapp):
+    module = _make_module()
+    module._current_config_id = 7
+    module._populate_detail(
+        _detail_payload(
+            [
+                _channel_payload(
+                    0,
+                    fft_band_limits=[
+                        {
+                            "kind": "upper",
+                            "points": [
+                                {"freq": 1000.0, "limit": 95.0},
+                                {"freq": 2000.0, "limit": 82.5},
+                            ],
+                        }
+                    ],
+                )
+            ]
+        )
+    )
+    editor = module._channel_containers[0].findChild(
+        LimitTableEditor,
+        "fft_limit_table_editor",
+    )
+    table = editor.findChild(QTableWidget, "fft_limit_points_0")
+    assert table is not None
+
+    table.selectColumn(1)
+    editor.findChild(QPushButton, "fft_insert_limit_point_0").click()
+
+    assert module._collect_data()["channels"][0]["fft_band_limits"] == [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 95.0},
+                {"freq": 2000.0, "limit": 82.5},
+                {"freq": 2000.0, "limit": 82.5},
+            ],
+        }
+    ]
+
+
+def test_limit_table_editor_insert_copies_invalid_selected_point_raw_values(qapp):
+    module = _make_module()
+    module._current_config_id = 7
+    module._populate_detail(
+        _detail_payload(
+            [
+                _channel_payload(
+                    0,
+                    fft_band_limits=[
+                        {
+                            "kind": "upper",
+                            "points": [
+                                {"freq": 1000.0, "limit": 95.0},
+                                {"freq": 2000.0, "limit": 82.5},
+                            ],
+                        }
+                    ],
+                )
+            ]
+        )
+    )
+    editor = module._channel_containers[0].findChild(
+        LimitTableEditor,
+        "fft_limit_table_editor",
+    )
+    table = editor.findChild(QTableWidget, "fft_limit_points_0")
+    assert table is not None
+    table.item(0, 0).setText("bad-freq")
+    table.item(1, 0).setText("bad-limit")
+
+    table.selectColumn(0)
+    editor.findChild(QPushButton, "fft_insert_limit_point_0").click()
+
+    assert module._collect_data()["channels"][0]["fft_band_limits"] == [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": "bad-freq", "limit": "bad-limit"},
+                {"freq": "bad-freq", "limit": "bad-limit"},
+                {"freq": 2000.0, "limit": 82.5},
+            ],
+        }
+    ]
+
+
+@pytest.mark.parametrize("selected_freq", [-100.0, 0.0])
+def test_limit_table_editor_insert_copies_non_positive_selected_frequency(
+    qapp,
+    selected_freq,
+):
+    editor = LimitTableEditor(object_name="fft_limit_table_editor", label="FFT")
+    editor.set_limits(
+        [
+            {
+                "kind": "upper",
+                "points": [
+                    {"freq": selected_freq, "limit": 95.0},
+                    {"freq": 2000.0, "limit": 82.5},
+                ],
+            }
+        ]
+    )
+    table = editor.findChild(QTableWidget, "fft_limit_points_0")
+    assert table is not None
+
+    table.selectColumn(0)
+    editor.findChild(QPushButton, "fft_insert_limit_point_0").click()
+
+    assert editor.limits() == [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": selected_freq, "limit": 95.0},
+                {"freq": selected_freq, "limit": 95.0},
+                {"freq": 2000.0, "limit": 82.5},
+            ],
+        }
+    ]
+
+
+def test_limit_table_editor_invalid_cells_remain_for_config_validation(qapp):
+    module = _make_module()
+    module._current_config_id = 7
+    module._populate_detail(
+        _detail_payload(
+            [
+                _channel_payload(
+                    0,
+                    fft_band_limits=[
+                        {
+                            "kind": "upper",
+                            "points": [
+                                {"freq": 1000.0, "limit": 100.0},
+                                {"freq": 2000.0, "limit": 90.0},
+                            ],
+                        }
+                    ],
+                )
+            ]
+        )
+    )
+    editor = module._channel_containers[0].findChild(
+        LimitTableEditor,
+        "fft_limit_table_editor",
+    )
+    table = editor.findChild(QTableWidget, "fft_limit_points_0")
+    table.item(1, 0).setText("")
+
+    collected = module._collect_data()
+    errors = ConfigService(SimpleNamespace(config_changed=_SignalStub())).validate(collected)
+
+    assert collected["channels"][0]["fft_band_limits"][0]["points"][0] == {
+        "freq": 1000.0,
+        "limit": "",
+    }
+    assert any("限值" in error for error in errors)
+
+
+@pytest.mark.parametrize("raw_limits", [None, "", 0, False])
+def test_limit_table_editor_falsey_non_list_limits_remain_invalid_for_validation(
+    qapp,
+    raw_limits,
+):
+    editor = LimitTableEditor(object_name="fft_limit_table_editor", label="FFT")
+
+    editor.set_limits(raw_limits)
+    collected_limits = editor.limits()
+    payload = _detail_payload(
+        [_channel_payload(0, fft_band_limits=collected_limits)]
+    )
+    errors = ConfigService(SimpleNamespace(config_changed=_SignalStub())).validate(
+        payload
+    )
+
+    assert collected_limits != []
+    assert collected_limits[0]["points"] != []
+    assert any("FFT限制表" in error for error in errors)
+
+
+def test_limit_table_editor_user_actions_emit_limits_changed_once(qapp):
+    editor = LimitTableEditor(object_name="fft_limit_table_editor", label="FFT")
+    emissions = []
+    editor.limitsChanged.connect(lambda: emissions.append(editor.limits()))
+
+    editor.set_limits([])
+    assert emissions == []
+
+    def assert_one_emission(action):
+        before = len(emissions)
+        action()
+        assert len(emissions) == before + 1
+
+    assert_one_emission(
+        lambda: editor.findChild(QPushButton, "fft_add_limit_table").click()
+    )
+    table = editor.findChild(QTableWidget, "fft_limit_points_0")
+    assert table is not None
+    assert table.columnCount() == 2
+
+    assert_one_emission(
+        lambda: editor.findChild(QPushButton, "fft_add_limit_point_0").click()
+    )
+
+    table.selectColumn(0)
+    assert_one_emission(
+        lambda: editor.findChild(QPushButton, "fft_insert_limit_point_0").click()
+    )
+
+    table.clearSelection()
+    table.selectColumn(1)
+    assert_one_emission(
+        lambda: editor.findChild(QPushButton, "fft_delete_limit_point_0").click()
+    )
+
+    kind_combo = editor.findChild(QComboBox, "fft_limit_kind_0")
+    assert kind_combo is not None
+    assert_one_emission(
+        lambda: kind_combo.setCurrentIndex(kind_combo.findData("lower"))
+    )
+
+    assert_one_emission(
+        lambda: editor.findChild(QPushButton, "fft_delete_limit_table_0").click()
+    )
+    assert editor.limits() == []
+
+
+def test_limit_table_editor_set_limits_does_not_emit_limits_changed(qapp):
+    editor = LimitTableEditor(object_name="fft_limit_table_editor", label="FFT")
+    emissions = []
+    editor.limitsChanged.connect(lambda: emissions.append(editor.limits()))
+
+    editor.set_limits(
+        [
+            {
+                "kind": "upper",
+                "points": [
+                    {"freq": 1000.0, "limit": 100.0},
+                    {"freq": 2000.0, "limit": 90.0},
+                ],
+            }
+        ]
+    )
+
+    assert emissions == []
+    assert editor.limits() == [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 90.0},
+            ],
+        }
+    ]
+
+
+def test_limit_table_editor_delete_buttons_keep_danger_marker_after_renumbering(qapp):
+    editor = LimitTableEditor(object_name="fft_limit_table_editor", label="FFT")
+    editor.set_limits(
+        [
+            {
+                "kind": "upper",
+                "points": [
+                    {"freq": 1000.0, "limit": 100.0},
+                    {"freq": 2000.0, "limit": 90.0},
+                ],
+            },
+            {
+                "kind": "lower",
+                "points": [
+                    {"freq": 1000.0, "limit": 0.0},
+                    {"freq": 2000.0, "limit": 10.0},
+                ],
+            },
+        ]
+    )
+
+    editor.findChild(QPushButton, "fft_delete_limit_table_0").click()
+    delete_table_button = editor.findChild(
+        QPushButton,
+        "fft_delete_limit_table_0",
+    )
+    delete_point_button = editor.findChild(
+        QPushButton,
+        "fft_delete_limit_point_0",
+    )
+
+    assert delete_table_button is not None
+    assert delete_point_button is not None
+    assert delete_table_button.objectName() == "fft_delete_limit_table_0"
+    assert delete_point_button.objectName() == "fft_delete_limit_point_0"
+    assert delete_table_button.property("danger") is True
+    assert delete_point_button.property("danger") is True
+    assert "#ef4444" in delete_table_button.styleSheet()
+    assert "#ef4444" in delete_point_button.styleSheet()
+
+
+def test_limit_table_editor_empty_table_is_omitted_from_collected_payload(qapp):
+    module = _make_module()
+    module._current_config_id = 7
+    module._populate_detail(_detail_payload([_channel_payload(0)]))
+    editor = module._channel_containers[0].findChild(
+        LimitTableEditor,
+        "fft_limit_table_editor",
+    )
+    editor.findChild(QPushButton, "fft_add_limit_table").click()
+    table = editor.findChild(QTableWidget, "fft_limit_points_0")
+    table.selectAll()
+    editor.findChild(QPushButton, "fft_delete_limit_point_0").click()
+
+    assert editor.limits() == []
+    assert module._collect_data()["channels"][0]["fft_band_limits"] == []
+
+
+def test_limit_table_editor_cell_changes_are_tracked_as_unsaved_changes(qapp):
+    loaded = {
+        7: _detail_payload(
+            [
+                _channel_payload(
+                    0,
+                    fft_band_limits=[
+                        {
+                            "kind": "upper",
+                            "points": [
+                                {"freq": 1000.0, "limit": 100.0},
+                                {"freq": 2000.0, "limit": 90.0},
+                            ],
+                        }
+                    ],
+                )
+            ],
+            config_id=7,
+            config_name="Cfg1",
+        ),
+    }
+    module = _make_module(config_service=_ConfigServiceStub(loaded_configs=loaded))
+    qapp.processEvents()
+    editor = module._channel_containers[0].findChild(
+        LimitTableEditor,
+        "fft_limit_table_editor",
+    )
+    table = editor.findChild(QTableWidget, "fft_limit_points_0")
+
+    assert module._has_unsaved_changes() is False
+
+    table.item(1, 0).setText("99")
+
+    assert module._has_unsaved_changes() is True
 
 
 def test_loudness_unit_change_keeps_numeric_limits_visible_as_is(qapp):
@@ -2415,7 +3823,7 @@ def test_clear_discards_staged_file_and_preserves_existing_golden_settings(qapp,
     assert config_service.golden_sample_service.discarded_paths == [str(staged_path)]
 
 
-def test_selection_change_discards_unsaved_staged_files(qapp, tmp_path):
+def test_selection_change_discards_unsaved_staged_files(qapp, tmp_path, monkeypatch):
     config_service = _ConfigServiceStub(
         loaded_configs={
             7: _detail_payload([_channel_payload(0)], config_id=7, config_name="Cfg1"),
@@ -2423,6 +3831,13 @@ def test_selection_change_discards_unsaved_staged_files(qapp, tmp_path):
         }
     )
     module = _make_module(config_service=config_service)
+    monkeypatch.setattr(module, "_prompt_unsaved_config_changes", lambda _action: True)
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    monkeypatch.setattr("ui.modules.config.QMessageBox.information", lambda *args: None)
+
     staged_path = tmp_path / "staged.wav"
     staged_path.write_bytes(b"wav")
     module._golden_editor_state[0] = _staged_golden_binding(staged_path)
@@ -2434,6 +3849,7 @@ def test_selection_change_discards_unsaved_staged_files(qapp, tmp_path):
     assert module.ed_name.text() == "Cfg2"
     assert module._golden_editor_state == {}
     assert config_service.golden_sample_service.discarded_paths == [str(staged_path)]
+    assert config_service.begin_calls == 1
 
 
 def test_reloading_detail_discards_unsaved_staged_files(qapp, tmp_path):

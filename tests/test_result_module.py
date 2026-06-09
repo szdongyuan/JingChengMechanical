@@ -74,6 +74,12 @@ def _table_value(module: ResultModule, row: int, column: int) -> str:
     return item.text()
 
 
+def _table_foreground(module: ResultModule, row: int, column: int) -> str:
+    item = module.table.item(row, column)
+    assert item is not None
+    return item.foreground().color().name()
+
+
 def _metric_text(module: ResultModule, attr: str) -> str:
     return getattr(module, attr).text()
 
@@ -212,14 +218,16 @@ def _make_review_payload(
 
 def _assert_placeholder(module: ResultModule, *, badge_text: str) -> None:
     assert module.lb_overall.text() == badge_text
-    assert module.table.rowCount() == 7
+    assert module.table.rowCount() == 8
+    assert module.table.horizontalHeaderItem(1).text() == "实测值"
     assert _table_value(module, 0, 0) == "声压级"
     assert _table_value(module, 1, 0) == "平均声压级"
     assert _table_value(module, 2, 0) == "响度"
     assert _table_value(module, 3, 0) == "平均响度"
     assert _table_value(module, 4, 0) == "频谱"
     assert _table_value(module, 5, 0) == "倍频程"
-    assert _table_value(module, 6, 0) == "AI分析"
+    assert _table_value(module, 6, 0) == "频谱平均评分"
+    assert _table_value(module, 7, 0) == "AI分析"
     assert _table_value(module, 0, 1) == "-"
     assert _table_value(module, 0, 2) == "-"
     assert _table_value(module, 0, 3) == "-"
@@ -1413,6 +1421,7 @@ def test_result_module_renders_completed_summary_rows_from_summary_payload(qapp)
                         "label": "SPL",
                         "deviation_value": 6.0,
                         "deviation_display": "6 dB",
+                        "actual_display": "86 dB",
                         "channel_index": 1,
                         "channel_label": "CH2",
                         "status": "NG",
@@ -1453,6 +1462,7 @@ def test_result_module_renders_completed_summary_rows_from_summary_payload(qapp)
                         "label": "FFT",
                         "deviation_value": -3.0,
                         "deviation_display": "-3 dB",
+                        "actual_display": "57 dB @ 1000 Hz",
                         "channel_index": 0,
                         "channel_label": "CH1",
                         "status": "OK",
@@ -1485,9 +1495,9 @@ def test_result_module_renders_completed_summary_rows_from_summary_payload(qapp)
 
     assert module.lb_overall.text() == "不通过"
     assert module.lb_overall.property("resultLevel") == "fail"
-    assert module.table.rowCount() == 7
+    assert module.table.rowCount() == 8
     assert _table_value(module, 0, 0) == "声压级"
-    assert _table_value(module, 0, 1) == "6 dB"
+    assert _table_value(module, 0, 1) == "86 dB"
     assert _table_value(module, 0, 2) == "通道2"
     assert _table_value(module, 0, 3) == "NG"
     assert _table_value(module, 1, 0) == "平均声压级"
@@ -1503,16 +1513,76 @@ def test_result_module_renders_completed_summary_rows_from_summary_payload(qapp)
     assert _table_value(module, 3, 2) == "通道2"
     assert _table_value(module, 3, 3) == "OK"
     assert _table_value(module, 4, 0) == "频谱"
-    assert _table_value(module, 4, 1) == "-3 dB"
+    assert _table_value(module, 4, 1) == "57 dB @ 1000 Hz"
     assert _table_value(module, 4, 2) == "通道1"
     assert _table_value(module, 4, 3) == "OK"
     assert _table_value(module, 5, 0) == "倍频程"
     assert _table_value(module, 5, 1) == "0 dB"
     assert _table_value(module, 5, 2) == "通道1"
-    assert _table_value(module, 6, 0) == "AI分析"
-    assert _table_value(module, 6, 1) == "--"
-    assert _table_value(module, 6, 2) == "--"
-    assert _table_value(module, 6, 3) == "OK"
+    assert _table_value(module, 6, 0) == "频谱平均评分"
+    assert _table_value(module, 6, 1) == "-"
+    assert _table_value(module, 6, 2) == "-"
+    assert _table_value(module, 6, 3) == "-"
+    assert _table_value(module, 7, 0) == "AI分析"
+    assert _table_value(module, 7, 1) == "--"
+    assert _table_value(module, 7, 2) == "--"
+    assert _table_value(module, 7, 3) == "OK"
+
+
+def test_result_module_colors_only_judged_result_cells(qapp):
+    module = _make_module()
+    module.services.bus.factory_state_changed.emit(_state("reviewing", displayed_config_id=101))
+
+    module.services.bus.factory_review_changed.emit(
+        _make_review_payload(
+            judgment_payload={"overall": "不合格"},
+            summary_payload=_summary_payload(
+                overall_status="fail",
+                rows=[
+                    {
+                        "item_key": "spl",
+                        "label": "SPL",
+                        "actual_display": "86 dB",
+                        "channel_label": "CH1",
+                        "status": "NG",
+                        "constrained": True,
+                    },
+                    {
+                        "item_key": "spl_average",
+                        "label": "平均SPL",
+                        "actual_display": "70 dB",
+                        "channel_label": "CH1",
+                        "status": "OK",
+                        "constrained": True,
+                    },
+                    {
+                        "item_key": "stft_score",
+                        "label": "频谱平均评分",
+                        "actual_display": "86.50",
+                        "channel_label": "CH1",
+                        "status": "OK",
+                        "constrained": False,
+                    },
+                    {
+                        "item_key": "ai",
+                        "label": "AI分析",
+                        "deviation_display": "--",
+                        "channel_label": "--",
+                        "status": "OK",
+                        "constrained": False,
+                    },
+                ],
+            ),
+        )
+    )
+
+    assert _table_foreground(module, 0, 3) == "#d93025"
+    assert _table_foreground(module, 1, 3) == "#188038"
+    assert _table_foreground(module, 6, 3) == "#000000"
+    assert _table_foreground(module, 7, 3) == "#000000"
+    assert _table_foreground(module, 0, 0) == "#000000"
+    assert _table_foreground(module, 0, 1) == "#000000"
+    assert _table_foreground(module, 0, 2) == "#000000"
 
 
 def test_result_module_preserves_approved_status_labels(qapp):
@@ -1603,7 +1673,8 @@ def test_result_module_preserves_existing_summary_card_when_plain_stop_enters_st
     assert module.lb_overall.text() == "通过"
     assert module.lb_overall.property("resultLevel") == "pass"
     assert _table_value(module, 0, 0) == "声压级"
-    assert _table_value(module, 6, 0) == "AI分析"
+    assert _table_value(module, 6, 0) == "频谱平均评分"
+    assert _table_value(module, 7, 0) == "AI分析"
 
 
 def test_result_module_shows_import_warnings(qapp):
@@ -1732,8 +1803,9 @@ def test_result_module_shows_imported_ai_as_not_run(qapp):
     module = _make_module()
     module.services.bus.factory_review_changed.emit(payload)
 
-    assert _table_value(module, 6, 0) == "AI分析"
-    assert _table_value(module, 6, 3) == "未运行"
+    assert _table_value(module, 6, 0) == "频谱平均评分"
+    assert _table_value(module, 7, 0) == "AI分析"
+    assert _table_value(module, 7, 3) == "未运行"
 
 
 def test_result_module_shows_no_result_plus_error_text_from_summary_payload(qapp):
@@ -1842,8 +1914,9 @@ def test_result_module_shows_no_result_plus_error_text_from_summary_payload(qapp
     assert _table_value(module, 4, 2) == "通道1"
     assert _table_value(module, 4, 3) == "OK"
     assert _table_value(module, 5, 0) == "倍频程"
-    assert _table_value(module, 6, 0) == "AI分析"
-    assert _table_value(module, 6, 3) == "OK"
+    assert _table_value(module, 6, 0) == "频谱平均评分"
+    assert _table_value(module, 7, 0) == "AI分析"
+    assert _table_value(module, 7, 3) == "OK"
     assert getattr(module, "error_label").isHidden() is False
     assert getattr(module, "error_label").text() == "MoSQITo unavailable"
 

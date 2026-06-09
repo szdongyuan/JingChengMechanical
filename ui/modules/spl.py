@@ -113,6 +113,7 @@ class SplModule(QWidget):
                 values_db,
                 lower_limit=spl_payload.get("lower_limit_db"),
                 upper_limit=spl_payload.get("upper_limit_db"),
+                x_axis_range=spl_payload.get("x_axis_range_sec"),
             )
         except (TypeError, ValueError):
             self._clear_plot()

@@ -799,6 +799,7 @@ def test_imported_analysis_adds_stft_score_with_mapped_config_and_window(monkeyp
     )
 
     assert payload.chart_payload[0]["stft_score"]["summary_score"] == 84.25
+    assert _summary_row(payload.summary_payload, "stft_score")["actual_display"] == "84.25"
     assert payload.chart_payload[0]["stft_score"]["times_sec"][0] == pytest.approx(0.25)
     assert captured["sample_rate"] == 25600.0
     assert captured["stft_nfft"] == 512
@@ -961,10 +962,12 @@ def test_above_nyquist_frequency_limits_are_removed_with_warning(monkeypatch):
         selected_channels=[0],
         fft_band_limits=[
             {"freq": 1000.0, "lower": 20.0, "upper": 80.0},
+            {"freq": 2000.0, "lower": 30.0, "upper": 90.0},
             {"freq": 20000.0, "lower": 20.0, "upper": 80.0},
         ],
         oct_band_limits=[
             {"freq": 1000.0, "lower": 20.0, "upper": 80.0},
+            {"freq": 2000.0, "lower": 30.0, "upper": 90.0},
             {"freq": 16000.0, "lower": 20.0, "upper": 80.0},
         ],
     )
@@ -981,9 +984,275 @@ def test_above_nyquist_frequency_limits_are_removed_with_warning(monkeypatch):
         request,
     )
 
-    assert all(limit["freq"] <= 12800.0 for limit in shaped_channel["fft_band_limits"])
-    assert all(limit["freq"] <= 12800.0 for limit in shaped_channel["oct_band_limits"])
+    assert shaped_channel["fft_band_limits"] == [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 20.0},
+                {"freq": 2000.0, "limit": 30.0},
+            ],
+        },
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 80.0},
+                {"freq": 2000.0, "limit": 90.0},
+            ],
+        },
+    ]
+    assert shaped_channel["oct_band_limits"] == [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 20.0},
+                {"freq": 2000.0, "limit": 30.0},
+            ],
+        },
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 80.0},
+                {"freq": 2000.0, "limit": 90.0},
+            ],
+        },
+    ]
     assert any(w.code == "nyquist_skipped" for w in result.import_warnings)
+
+
+def test_import_audio_filters_grouped_limits_above_nyquist(monkeypatch):
+    wav = ImportedWav("import.wav", 25600.0, np.zeros((25600, 1), dtype=np.float64))
+    config = _single_channel_config(
+        config_id=101,
+        selected_channels=[0],
+        fft_band_limits=[
+            {
+                "kind": "upper",
+                "points": [
+                    {"freq": 1000.0, "limit": 100.0},
+                    {"freq": 2000.0, "limit": 90.0},
+                    {"freq": 2000.0, "limit": 70.0},
+                    {"freq": 20000.0, "limit": 80.0},
+                ],
+            }
+        ],
+        oct_band_limits=[
+            {
+                "kind": "lower",
+                "points": [
+                    {"freq": 1000.0, "limit": 10.0},
+                    {"freq": 2000.0, "limit": 20.0},
+                    {"freq": 16000.0, "limit": 30.0},
+                ],
+            }
+        ],
+    )
+    request = ImportedAudioAnalysisRequest(
+        config_id=101,
+        wav_path="import.wav",
+        assignments=(ImportedChannelAssignment(0, "config", 0),),
+    )
+
+    result, shaped_channel = _run_import_and_return_shaped_channel(
+        monkeypatch,
+        wav,
+        config,
+        request,
+    )
+
+    assert shaped_channel["fft_band_limits"] == [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 90.0},
+                {"freq": 2000.0, "limit": 70.0},
+            ],
+        }
+    ]
+    assert shaped_channel["oct_band_limits"] == [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 10.0},
+                {"freq": 2000.0, "limit": 20.0},
+            ],
+        }
+    ]
+    warning_metrics = {
+        warning.metric
+        for warning in result.import_warnings
+        if warning.code == "nyquist_skipped"
+    }
+    assert {"fft", "octave"} <= warning_metrics
+
+
+@pytest.mark.parametrize(
+    (
+        "field_name",
+        "metric",
+        "summary_item_key",
+        "no_evaluable_code",
+    ),
+    [
+        (
+            "fft_band_limits",
+            "fft",
+            "fft",
+            "nyquist_no_evaluable_fft",
+        ),
+        (
+            "oct_band_limits",
+            "octave",
+            "octave",
+            "nyquist_no_evaluable_octave",
+        ),
+    ],
+)
+def test_import_audio_treats_grouped_empty_limits_as_disabled(
+    monkeypatch,
+    field_name,
+    metric,
+    summary_item_key,
+    no_evaluable_code,
+):
+    wav = ImportedWav("import.wav", 25600.0, np.zeros((25600, 1), dtype=np.float64))
+    config = _single_channel_config(
+        config_id=101,
+        selected_channels=[0],
+        **{field_name: [{"kind": "upper", "points": []}]},
+    )
+    request = ImportedAudioAnalysisRequest(
+        config_id=101,
+        wav_path="import.wav",
+        assignments=(ImportedChannelAssignment(0, "config", 0),),
+    )
+
+    result, shaped_channel = _run_import_and_return_shaped_channel(
+        monkeypatch,
+        wav,
+        config,
+        request,
+    )
+
+    assert shaped_channel[field_name] == []
+    metric_warning_codes = {
+        warning.code for warning in result.import_warnings if warning.metric == metric
+    }
+    assert "nyquist_skipped" not in metric_warning_codes
+    assert no_evaluable_code not in metric_warning_codes
+    assert _summary_row(result.summary_payload, summary_item_key)["status"] != "无结果"
+
+
+@pytest.mark.parametrize(
+    (
+        "field_name",
+        "metric",
+        "no_evaluable_code",
+        "malformed_limits",
+    ),
+    [
+        (
+            "fft_band_limits",
+            "fft",
+            "nyquist_no_evaluable_fft",
+            [
+                {
+                    "kind": "ceiling",
+                    "points": [
+                        {"freq": 1000.0, "limit": 100.0},
+                        {"freq": 20000.0, "limit": 80.0},
+                    ],
+                }
+            ],
+        ),
+        (
+            "oct_band_limits",
+            "octave",
+            "nyquist_no_evaluable_octave",
+            [
+                {
+                    "kind": "ceiling",
+                    "points": [
+                        {"freq": 1000.0, "limit": 100.0},
+                        {"freq": 16000.0, "limit": 80.0},
+                    ],
+                }
+            ],
+        ),
+        (
+            "fft_band_limits",
+            "fft",
+            "nyquist_no_evaluable_fft",
+            [{"freq": 20000.0, "lower": 20.0}],
+        ),
+    ],
+)
+def test_import_audio_preserves_malformed_limits_without_nyquist_warnings(
+    monkeypatch,
+    field_name,
+    metric,
+    no_evaluable_code,
+    malformed_limits,
+):
+    wav = ImportedWav("import.wav", 25600.0, np.zeros((25600, 1), dtype=np.float64))
+    config = _single_channel_config(
+        config_id=101,
+        selected_channels=[0],
+        **{field_name: malformed_limits},
+    )
+    request = ImportedAudioAnalysisRequest(
+        config_id=101,
+        wav_path="import.wav",
+        assignments=(ImportedChannelAssignment(0, "config", 0),),
+    )
+
+    result, shaped_channel = _run_import_and_return_shaped_channel(
+        monkeypatch,
+        wav,
+        config,
+        request,
+    )
+
+    assert shaped_channel[field_name] != []
+    assert shaped_channel[field_name] == malformed_limits
+    metric_warning_codes = {
+        warning.code for warning in result.import_warnings if warning.metric == metric
+    }
+    assert "nyquist_skipped" not in metric_warning_codes
+    assert no_evaluable_code not in metric_warning_codes
+
+
+def test_grouped_limits_with_too_few_remaining_frequencies_force_no_result(monkeypatch):
+    wav = ImportedWav("import.wav", 25600.0, np.zeros((1024, 1), dtype=np.float64))
+    config = _single_channel_config(
+        config_id=101,
+        selected_channels=[0],
+        fft_band_limits=[
+            {
+                "kind": "upper",
+                "points": [
+                    {"freq": 1000.0, "limit": 100.0},
+                    {"freq": 20000.0, "limit": 80.0},
+                ],
+            }
+        ],
+        oct_band_limits=[
+            {
+                "kind": "lower",
+                "points": [
+                    {"freq": 1000.0, "limit": 10.0},
+                    {"freq": 16000.0, "limit": 30.0},
+                ],
+            }
+        ],
+    )
+
+    payload = _run_import(monkeypatch, wav, config)
+
+    assert _summary_row(payload.summary_payload, "fft")["status"] == "无结果"
+    assert _summary_row(payload.summary_payload, "octave")["status"] == "无结果"
+    warning_codes = {warning.code for warning in payload.import_warnings}
+    assert {"nyquist_no_evaluable_fft", "nyquist_no_evaluable_octave"} <= warning_codes
 
 
 def test_all_fft_limits_above_nyquist_marks_fft_no_result_not_unconstrained(monkeypatch):
@@ -1091,7 +1360,10 @@ def test_all_octave_limits_above_nyquist_marks_octave_no_result_not_unconstraine
     config = _single_channel_config(
         config_id=101,
         selected_channels=[0],
-        oct_band_limits=[{"freq": 16000.0, "lower": 20.0, "upper": 80.0}],
+        oct_band_limits=[
+            {"freq": 16000.0, "lower": 20.0, "upper": 80.0},
+            {"freq": 20000.0, "lower": 20.0, "upper": 80.0},
+        ],
     )
 
     payload = _run_import(monkeypatch, wav, config)

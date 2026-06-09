@@ -216,6 +216,7 @@ class EventBus(QObject):
     loudness_updated = pyqtSignal(int, str, int, object)  # config_id, run_id, channel_idx, LoudnessFrame
     octave_updated = pyqtSignal(int, str, int, object)   # config_id, run_id, channel_idx, OctaveFrame
     fft_updated = pyqtSignal(int, str, int, object)      # config_id, run_id, channel_idx, FftFrame
+    current_trace_updated = pyqtSignal(int, str, object)  # config_id, run_id, current_trace payload
 
     # Session lifecycle
     recording_progress = pyqtSignal(int, float)     # config_id, elapsed_sec

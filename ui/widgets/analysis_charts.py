@@ -52,16 +52,65 @@ def _normalize_limit_bands(limit_bands: Iterable[dict] | None) -> list[dict]:
         if missing_keys:
             missing = ", ".join(missing_keys)
             raise ValueError(f"limit band is missing required keys: {missing}")
+        lower_db = _normalize_optional_limit_bound(band["lower_db"])
+        upper_db = _normalize_optional_limit_bound(band["upper_db"])
+        if lower_db is None and upper_db is None:
+            raise ValueError("limit band must include at least one bound")
+        try:
+            freq_hz = float(band["freq_hz"])
+            actual_db = float(band["actual_db"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("limit band frequency and actual value must be numeric") from exc
         normalized.append(
             {
-                "freq_hz": float(band["freq_hz"]),
-                "lower_db": float(band["lower_db"]),
-                "upper_db": float(band["upper_db"]),
-                "actual_db": float(band["actual_db"]),
+                "freq_hz": freq_hz,
+                "lower_db": lower_db,
+                "upper_db": upper_db,
+                "actual_db": actual_db,
                 "passed": bool(band["passed"]),
             }
         )
     return normalized
+
+
+def _normalize_limit_lines(limit_lines: Iterable[dict] | None) -> list[dict]:
+    normalized: list[dict] = []
+    if limit_lines is None:
+        return normalized
+
+    for line in limit_lines:
+        if not isinstance(line, dict):
+            continue
+        kind = str(line.get("kind") or "").strip().lower()
+        if kind not in {"lower", "upper"}:
+            continue
+        points = []
+        for point in line.get("points") or []:
+            if not isinstance(point, dict):
+                continue
+            try:
+                freq_hz = float(point.get("freq_hz"))
+                limit_db = float(point.get("limit_db"))
+            except (TypeError, ValueError):
+                continue
+            if (
+                np.isfinite(freq_hz)
+                and freq_hz > 0.0
+                and np.isfinite(limit_db)
+            ):
+                points.append({"freq_hz": freq_hz, "limit_db": limit_db})
+        if points:
+            normalized.append({"kind": kind, "points": points})
+    return normalized
+
+
+def _normalize_optional_limit_bound(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("limit band bounds must be numeric or None") from exc
 
 
 def _normalize_optional_overlay_levels(
@@ -81,6 +130,66 @@ def _normalize_optional_overlay_levels(
 
 def _normalize_fft_x_axis_scale(value) -> str:
     return "log" if str(value or "").strip().lower() == "log" else "linear"
+
+
+def _normalize_current_trace_payload(payload: dict | None) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    try:
+        average = float(payload.get("average_a"))
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(average):
+        return None
+    times = []
+    values = []
+    raw_times = _payload_sequence_or_empty(payload, "times_sec")
+    raw_values = _payload_sequence_or_empty(payload, "values_a")
+    for time_value, current_value in zip(
+        raw_times,
+        raw_values,
+        strict=False,
+    ):
+        try:
+            time_sec = float(time_value)
+        except (TypeError, ValueError):
+            continue
+        try:
+            current = float(current_value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(time_sec) and np.isfinite(current):
+            times.append(time_sec)
+            values.append(current)
+    unit = payload.get("unit")
+    normalized_unit = None
+    if isinstance(unit, str):
+        normalized_unit = unit.strip() or None
+    normalized = {
+        "times_sec": times,
+        "values_a": values,
+        "average_a": average,
+        "max_a": _finite_or_none(payload.get("max_a")),
+        "latest_a": _finite_or_none(payload.get("latest_a")),
+    }
+    if normalized_unit:
+        normalized["unit"] = normalized_unit
+    return normalized
+
+
+def _payload_sequence_or_empty(payload: dict, key: str):
+    values = payload.get(key)
+    if values is None:
+        return []
+    return values
+
+
+def _finite_or_none(value) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
 
 
 def _nearest_positions(base_values: list[float], band_freqs: Iterable[float]) -> list[float]:
@@ -114,6 +223,23 @@ def _visible_axis_max(values: Iterable[float] | None) -> float:
     return payload_max
 
 
+def _normalize_x_axis_range(value) -> tuple[float, float] | None:
+    if value is None:
+        return None
+    try:
+        lower, upper = value
+    except (TypeError, ValueError) as exc:
+        raise ValueError("x_axis_range must contain exactly two numeric values") from exc
+    try:
+        lower = float(lower)
+        upper = float(upper)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("x_axis_range must contain exactly two numeric values") from exc
+    if not np.isfinite(lower) or not np.isfinite(upper) or upper <= lower:
+        raise ValueError("x_axis_range must be finite and increasing")
+    return (lower, upper)
+
+
 def _normalize_line_chart_y_axis_mode(mode: str) -> str:
     normalized = str(mode).strip().lower()
     if normalized not in _LINE_CHART_Y_AXIS_MODES:
@@ -128,6 +254,91 @@ def _format_csv_number(value: float | None) -> str:
     if not np.isfinite(number):
         return ""
     return f"{number:.17g}"
+
+
+def _passes_limit_bounds(
+    value: float,
+    lower_limit: float | None,
+    upper_limit: float | None,
+) -> bool:
+    if lower_limit is not None and value < lower_limit:
+        return False
+    if upper_limit is not None and value > upper_limit:
+        return False
+    return True
+
+
+def _tightened_lower_limit(
+    existing: float | None,
+    candidate: float | None,
+) -> float | None:
+    if existing is None:
+        return candidate
+    if candidate is None:
+        return existing
+    return max(existing, candidate)
+
+
+def _tightened_upper_limit(
+    existing: float | None,
+    candidate: float | None,
+) -> float | None:
+    if existing is None:
+        return candidate
+    if candidate is None:
+        return existing
+    return min(existing, candidate)
+
+
+def _limit_line_pen(kind: str) -> pg.QtGui.QPen:
+    if kind == "lower":
+        return pg.mkPen(color="#0891b2", width=2)
+    return pg.mkPen(color="#dc2626", width=2)
+
+
+def _limit_line_value_at(line: dict, frequency: float) -> float | None:
+    points = line.get("points") or []
+    exact_values = [
+        point["limit_db"]
+        for point in points
+        if point.get("freq_hz") == frequency
+    ]
+    if exact_values:
+        return max(exact_values) if line.get("kind") == "lower" else min(exact_values)
+
+    for left, right in zip(points, points[1:], strict=False):
+        left_freq = left["freq_hz"]
+        right_freq = right["freq_hz"]
+        if left_freq == right_freq:
+            continue
+        lower_freq, upper_freq = sorted((left_freq, right_freq))
+        if lower_freq < frequency < upper_freq:
+            ratio = (frequency - left_freq) / (right_freq - left_freq)
+            return left["limit_db"] + ratio * (right["limit_db"] - left["limit_db"])
+    return None
+
+
+def _combined_limit_line_bounds_at(
+    limit_lines: list[dict],
+    frequency: float,
+) -> tuple[float | None, float | None] | None:
+    lower_values: list[float] = []
+    upper_values: list[float] = []
+    for line in limit_lines:
+        value = _limit_line_value_at(line, frequency)
+        if value is None:
+            continue
+        if line.get("kind") == "lower":
+            lower_values.append(value)
+        elif line.get("kind") == "upper":
+            upper_values.append(value)
+
+    if not lower_values and not upper_values:
+        return None
+    return (
+        max(lower_values) if lower_values else None,
+        min(upper_values) if upper_values else None,
+    )
 
 
 @dataclass(frozen=True)
@@ -167,6 +378,24 @@ class LineChartExportSchema:
         )
 
 
+class _ViewBoxClippedPlotCurveItem(pg.PlotCurveItem):
+    clips_to_view_box = True
+
+    def paint(self, painter, option, widget) -> None:
+        view_box = self.getViewBox()
+        if view_box is None:
+            super().paint(painter, option, widget)
+            return
+
+        painter.save()
+        try:
+            clip_rect = view_box.mapRectToItem(self, view_box.boundingRect())
+            painter.setClipRect(clip_rect)
+            super().paint(painter, option, widget)
+        finally:
+            painter.restore()
+
+
 def _validate_data_focus_series(*, x_values: list[float], y_values: list[float]) -> tuple[float, float]:
     if not x_values or not y_values:
         raise ValueError("data_focus requires a non-empty series")
@@ -178,6 +407,28 @@ def _validate_data_focus_series(*, x_values: list[float], y_values: list[float])
 
     y_min = float(y_array.min())
     y_max = float(y_array.max())
+    if np.isclose(y_min, y_max):
+        padding = max(0.1 * abs(y_min), 0.5)
+        return (y_min - padding, y_max + padding)
+
+    padding = max(0.1 * (y_max - y_min), 0.1)
+    return (y_min - padding, y_max + padding)
+
+
+def _data_focus_range(values: Iterable[float]) -> tuple[float, float]:
+    normalized = []
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(number):
+            normalized.append(number)
+    if not normalized:
+        return (0.0, 1.0)
+
+    y_min = min(normalized)
+    y_max = max(normalized)
     if np.isclose(y_min, y_max):
         padding = max(0.1 * abs(y_min), 0.5)
         return (y_min - padding, y_max + padding)
@@ -236,10 +487,18 @@ class _BasePlotChart(QWidget):
 
         self.plot_item.setLabel = set_label_with_left_axis_guard
 
-    def _apply_x_axis_policy(self, *, payload_values: Iterable[float] | None) -> None:
-        visible_max = _visible_axis_max(payload_values)
+    def _apply_x_axis_policy(
+        self,
+        *,
+        payload_values: Iterable[float] | None,
+        x_axis_range: tuple[float, float] | None = None,
+    ) -> None:
         view_box = self.plot_item.vb
         view_box.enableAutoRange(axis=pg.ViewBox.XAxis, enable=False)
+        if x_axis_range is not None:
+            view_box.setXRange(x_axis_range[0], x_axis_range[1], padding=0.0)
+            return
+        visible_max = _visible_axis_max(payload_values)
         view_box.setXRange(0.0, visible_max, padding=0.0)
 
     def domain_x_range_from_display_range(
@@ -275,6 +534,7 @@ class StftImageChartWidget(_BasePlotChart):
         self._left_press_pos: QPoint | None = None
         self._left_press_inside_plot = False
         self._score_inspection_enabled = True
+        self._current_trace_payload: dict | None = None
         self._image_item = pg.ImageItem(axisOrder="row-major")
         self._image_item.setLookupTable(
             pg.ColorMap(
@@ -291,12 +551,26 @@ class StftImageChartWidget(_BasePlotChart):
             ).getLookupTable(0.0, 1.0, 256)
         )
         self.plot_item.addItem(self._image_item)
+        self._current_view_box = pg.ViewBox()
+        self._current_view_box.setDefaultPadding(0.0)
+        self._current_view_box.setMouseEnabled(x=False, y=False)
+        self._current_view_box.setZValue(10)
+        self._current_curve_item = _ViewBoxClippedPlotCurveItem(
+            pen=pg.mkPen(color="#f59e0b", width=2),
+        )
+        self._current_curve_item.setZValue(10)
+        self.plot_item.scene().addItem(self._current_view_box)
+        self.plot_item.getAxis("right").linkToView(self._current_view_box)
+        self._current_view_box.setXLink(self.plot_item.vb)
+        self._current_view_box.addItem(self._current_curve_item)
+        self.plot_item.vb.sigResized.connect(self._sync_current_view_geometry)
         self._snap_initial_to_zero = False
         self.plot_item.setLabel("bottom", "时间", units="s")
         self.plot_item.setLabel("left", "频率", units="Hz")
         if self._hide_left_axis_label:
             self.apply_left_axis_label_hidden_style()
         self._apply_stft_y_axis_policy(payload_values=None)
+        self._hide_current_axis()
         self._install_mouse_event_hooks()
         self.chart_interactions = ChartInteractionController(
             self,
@@ -437,13 +711,29 @@ class StftImageChartWidget(_BasePlotChart):
 
         self._apply_x_axis_policy(payload_values=x_axis_values)
         self._apply_stft_y_axis_policy(payload_values=y_axis_values)
+        self._render_current_trace()
         self.chart_interactions.refresh_full_view()
+
+    def set_current_trace(self, current_trace: dict | None) -> None:
+        normalized = _normalize_current_trace_payload(current_trace)
+        if normalized is not None:
+            times = _payload_sequence_or_empty(normalized, "times_sec")
+            values = _payload_sequence_or_empty(normalized, "values_a")
+            if len(times) != len(values) or len(times) == 0:
+                normalized = None
+        self._current_trace_payload = deepcopy(normalized)
+        self._render_current_trace()
+
+    def current_trace_payload(self) -> dict | None:
+        return deepcopy(self._current_trace_payload)
 
     def clear_data(self) -> None:
         self._image_payload = None
         self._cached_levels = None
         self._snap_initial_to_zero = False
+        self._current_trace_payload = None
         self._image_item.clear()
+        self._hide_current_axis()
         self._apply_x_axis_policy(payload_values=None)
         self._apply_stft_y_axis_policy(payload_values=None)
         self.chart_interactions.refresh_full_view()
@@ -615,6 +905,46 @@ class StftImageChartWidget(_BasePlotChart):
             return None
         return rendered_rect
 
+    def _render_current_trace(self) -> None:
+        current_trace = self._current_trace_payload
+        if not isinstance(current_trace, dict):
+            self._hide_current_axis()
+            return
+
+        times = _payload_sequence_or_empty(current_trace, "times_sec")
+        values = _payload_sequence_or_empty(current_trace, "values_a")
+        if len(times) != len(values) or len(times) == 0:
+            self._hide_current_axis()
+            return
+
+        self._current_curve_item.setData(times, values)
+        right_axis = self.plot_item.getAxis("right")
+        unit = current_trace.get("unit")
+        if isinstance(unit, str) and unit.strip():
+            right_axis.setLabel("电流", units=unit.strip())
+        else:
+            right_axis.setLabel("电流", units="")
+        right_axis.show()
+        y_min, y_max = _data_focus_range(values)
+        self._current_view_box.setYRange(y_min, y_max, padding=0.0)
+        self._sync_current_view_geometry()
+        self._refresh_current_curve_item()
+
+    def _hide_current_axis(self) -> None:
+        self._current_curve_item.setData([], [])
+        self.plot_item.getAxis("right").hide()
+
+    def _refresh_current_curve_item(self) -> None:
+        self._current_view_box.removeItem(self._current_curve_item)
+        self._current_view_box.addItem(self._current_curve_item)
+
+    def _sync_current_view_geometry(self) -> None:
+        self._current_view_box.setGeometry(self.plot_item.vb.sceneBoundingRect())
+        self._current_view_box.linkedViewChanged(
+            self.plot_item.vb,
+            self._current_view_box.XAxis,
+        )
+
     def _stft_mapping_context(self) -> tuple[float, float] | None:
         if self.plot_area_rect_in_widget() is None:
             return None
@@ -673,12 +1003,14 @@ class LineChartWidget(_BasePlotChart):
         upper_limit: float | None = None,
         y_axis_mode: str = "auto",
         export_metadata: dict | None = None,
+        x_axis_range=None,
     ) -> None:
         normalized_x = _normalize_vector(x_values, name="x_values")
         normalized_y = _normalize_vector(y_values, name="y_values")
         if len(normalized_x) != len(normalized_y):
             raise ValueError("x_values and y_values must be the same length")
         normalized_mode = _normalize_line_chart_y_axis_mode(y_axis_mode)
+        normalized_x_axis_range = _normalize_x_axis_range(x_axis_range)
         data_focus_y_range = None
         if normalized_mode == "data_focus":
             data_focus_y_range = _validate_data_focus_series(
@@ -686,12 +1018,15 @@ class LineChartWidget(_BasePlotChart):
                 y_values=normalized_y,
             )
 
-        self._series_payload = {
+        series_payload = {
             "x_values": normalized_x,
             "y_values": normalized_y,
             "lower_limit": None if lower_limit is None else float(lower_limit),
             "upper_limit": None if upper_limit is None else float(upper_limit),
         }
+        if normalized_x_axis_range is not None:
+            series_payload["x_axis_range"] = normalized_x_axis_range
+        self._series_payload = series_payload
         self._y_axis_mode = normalized_mode
         self._export_metadata = {
             str(key): "" if value is None else str(value)
@@ -707,7 +1042,10 @@ class LineChartWidget(_BasePlotChart):
             self._upper_limit_line,
             self._series_payload["upper_limit"],
         )
-        self._apply_x_axis_policy(payload_values=normalized_x)
+        self._apply_x_axis_policy(
+            payload_values=normalized_x,
+            x_axis_range=normalized_x_axis_range,
+        )
         if data_focus_y_range is None:
             self._apply_auto_y_axis_policy()
         else:
@@ -815,6 +1153,7 @@ class FftLineChartWidget(LineChartWidget):
         self._upper_envelope_curve_item = self.plot_item.plot(
             pen=pg.mkPen(color="#dc2626", width=2),
         )
+        self._limit_line_items: list[pg.PlotDataItem] = []
         self._failed_marker_item = pg.PlotDataItem(
             pen=None,
             symbol="x",
@@ -824,6 +1163,19 @@ class FftLineChartWidget(LineChartWidget):
         )
         self._band_range_item = pg.ErrorBarItem()
         self._band_marker_item = pg.ScatterPlotItem(size=10, pen=pg.mkPen(None))
+        self._current_view_box = pg.ViewBox()
+        self._current_curve_item = pg.PlotDataItem(
+            pen=pg.mkPen(
+                color="#f59e0b",
+                width=2,
+                style=pg.QtCore.Qt.PenStyle.DashLine,
+            )
+        )
+        self._current_view_box.addItem(self._current_curve_item)
+        self.plot_item.scene().addItem(self._current_view_box)
+        self.plot_item.getAxis("right").linkToView(self._current_view_box)
+        self._current_view_box.setXLink(self.plot_item.vb)
+        self.plot_item.vb.sigResized.connect(self._sync_current_view_geometry)
         self._zero_reference_line = pg.InfiniteLine(
             angle=0,
             pen=pg.mkPen(
@@ -838,6 +1190,7 @@ class FftLineChartWidget(LineChartWidget):
         self.plot_item.addItem(self._band_range_item)
         self.plot_item.addItem(self._band_marker_item)
         self._zero_reference_line.hide()
+        self._hide_current_axis()
         self.plot_item.setLabel("bottom", "频率", units="Hz")
         self.plot_item.setLabel("left", "幅值", units="dB")
         if self._hide_left_axis_label:
@@ -865,6 +1218,7 @@ class FftLineChartWidget(LineChartWidget):
         golden_overlay_levels_db: Iterable[float] | None = None,
         show_zero_reference: bool = False,
         x_axis_scale: str = "linear",
+        current_trace: dict | None = None,
     ) -> None:
         normalized_frequencies = _normalize_vector(
             frequencies_hz, name="frequencies_hz"
@@ -901,7 +1255,7 @@ class FftLineChartWidget(LineChartWidget):
         display_envelope = self._display_limit_envelope(limit_envelope)
 
         self.set_series(display_frequencies, display_levels)
-        self._spectrum_payload = {
+        spectrum_payload = {
             "frequencies_hz": normalized_frequencies,
             "levels_db": normalized_levels,
             "display_frequencies_hz": display_frequencies,
@@ -916,6 +1270,7 @@ class FftLineChartWidget(LineChartWidget):
             "show_zero_reference": bool(show_zero_reference),
             "x_axis_scale": scale,
         }
+        self._spectrum_payload = spectrum_payload
 
         self._render_golden_overlay(
             x_values=display_frequencies,
@@ -927,7 +1282,13 @@ class FftLineChartWidget(LineChartWidget):
             x_values=display_frequencies,
             levels_db=display_levels,
         )
-        if limit_envelope is None:
+        has_limit_lines = bool(display_envelope.get("limit_lines"))
+        if has_limit_lines:
+            _clear_error_bar_item(self._band_range_item)
+            self._band_marker_item.setData([])
+        elif limit_envelope is None or not self._has_legacy_renderable_limit_envelope(
+            display_envelope
+        ):
             self._failed_spectrum_curve_item.setData([], [])
             self._render_band_markers(
                 x_values=[band["freq_hz"] for band in normalized_limit_bands],
@@ -941,6 +1302,7 @@ class FftLineChartWidget(LineChartWidget):
             display_frequencies=display_frequencies,
             x_axis_scale=scale,
         )
+        self._hide_current_axis()
         self.plot_item.vb.updateAutoRange()
         self.chart_interactions.refresh_full_view()
 
@@ -953,9 +1315,11 @@ class FftLineChartWidget(LineChartWidget):
         self._failed_spectrum_curve_item.setData([], [])
         self._lower_envelope_curve_item.setData([], [])
         self._upper_envelope_curve_item.setData([], [])
+        self._clear_limit_line_items()
         self._failed_marker_item.setData([], [])
         self._band_marker_item.setData([])
         self._zero_reference_line.hide()
+        self._hide_current_axis()
         self.chart_interactions.refresh_full_view()
 
     def spectrum_payload(self) -> dict | None:
@@ -1026,33 +1390,51 @@ class FftLineChartWidget(LineChartWidget):
             row_entries.append((index, frequency, level))
 
         x_values = [frequency for _index, frequency, _level in row_entries]
-        envelope_points = self._export_envelope_points(payload)
-        discrete_limits = (
-            {}
-            if payload.get("limit_envelope") is not None
-            else self._export_discrete_limits_by_row(x_values, payload)
+        levels_by_row = [level for _source_index, _frequency, level in row_entries]
+        line_limits = self._export_limit_line_limits_by_row(
+            x_values,
+            levels_by_row,
+            payload,
         )
+        if line_limits is None:
+            envelope_points = self._export_envelope_points(payload)
+            discrete_limits = self._export_discrete_limits_by_row(
+                x_values,
+                levels_by_row,
+                payload,
+            )
+        else:
+            envelope_points = []
+            discrete_limits = {}
 
         rows: list[list[str]] = []
         for row_index, (source_index, frequency, level) in enumerate(row_entries):
             lower_limit = ""
             upper_limit = ""
             failed = ""
-            envelope_limits = self._interpolated_envelope_limits(
-                frequency,
-                envelope_points,
-                log_x=self.is_log_x_display(),
-            )
-            if envelope_limits is not None:
-                lower, upper = envelope_limits
-                lower_limit = _format_csv_number(lower)
-                upper_limit = _format_csv_number(upper)
-                failed = "1" if level < lower or level > upper else "0"
-            elif row_index in discrete_limits:
-                lower, upper = discrete_limits[row_index]
-                lower_limit = _format_csv_number(lower)
-                upper_limit = _format_csv_number(upper)
-                failed = "1" if level < lower or level > upper else "0"
+            if line_limits is not None:
+                line_limit = line_limits.get(row_index)
+                if line_limit is not None:
+                    lower, upper, passed = line_limit
+                    lower_limit = _format_csv_number(lower)
+                    upper_limit = _format_csv_number(upper)
+                    failed = "0" if passed else "1"
+            else:
+                envelope_limits = self._interpolated_envelope_limits(
+                    frequency,
+                    envelope_points,
+                    log_x=self.is_log_x_display(),
+                )
+                if envelope_limits is not None:
+                    lower, upper = envelope_limits
+                    lower_limit = _format_csv_number(lower)
+                    upper_limit = _format_csv_number(upper)
+                    failed = "0" if _passes_limit_bounds(level, lower, upper) else "1"
+                elif row_index in discrete_limits:
+                    lower, upper, passed = discrete_limits[row_index]
+                    lower_limit = _format_csv_number(lower)
+                    upper_limit = _format_csv_number(upper)
+                    failed = "0" if passed else "1"
 
             rows.append(
                 [
@@ -1116,6 +1498,32 @@ class FftLineChartWidget(LineChartWidget):
         ]
 
     @staticmethod
+    def _export_limit_line_limits_by_row(
+        x_values: list[float],
+        levels: list[float],
+        payload: dict,
+    ) -> dict[int, tuple[float | None, float | None, bool]] | None:
+        display_envelope = payload.get("display_limit_envelope") or {}
+        limit_lines = display_envelope.get("limit_lines") or []
+        if not limit_lines:
+            return None
+
+        limits_by_row: dict[int, tuple[float | None, float | None, bool]] = {}
+        for row_index, (frequency, level) in enumerate(
+            zip(x_values, levels, strict=False)
+        ):
+            bounds = _combined_limit_line_bounds_at(limit_lines, frequency)
+            if bounds is None:
+                continue
+            lower, upper = bounds
+            limits_by_row[row_index] = (
+                lower,
+                upper,
+                _passes_limit_bounds(level, lower, upper),
+            )
+        return limits_by_row
+
+    @staticmethod
     def _interpolated_envelope_limits(
         frequency: float,
         envelope_points: list[tuple[float, float, float]],
@@ -1154,30 +1562,41 @@ class FftLineChartWidget(LineChartWidget):
     def _export_discrete_limits_by_row(
         cls,
         x_values: list[float],
+        levels: list[float],
         payload: dict,
-    ) -> dict[int, tuple[float, float]]:
+    ) -> dict[int, tuple[float | None, float | None, bool]]:
         if not x_values:
             return {}
 
         frequencies = np.asarray(x_values, dtype=np.float64)
-        assigned: dict[int, tuple[float, float]] = {}
+        assigned: dict[int, tuple[float | None, float | None, bool]] = {}
         for band in payload.get("limit_bands") or []:
             if not isinstance(band, dict):
                 continue
             band_freq = cls._finite_float(band.get("freq_hz"))
             lower_db = cls._finite_float(band.get("lower_db"))
             upper_db = cls._finite_float(band.get("upper_db"))
-            if band_freq is None or lower_db is None or upper_db is None:
+            if band_freq is None or (lower_db is None and upper_db is None):
                 continue
             row_index = int(np.abs(frequencies - band_freq).argmin())
             if row_index in assigned:
-                existing_lower, existing_upper = assigned[row_index]
+                existing_lower, existing_upper, _existing_passed = assigned[row_index]
+                lower_db = _tightened_lower_limit(existing_lower, lower_db)
+                upper_db = _tightened_upper_limit(existing_upper, upper_db)
                 assigned[row_index] = (
-                    max(existing_lower, lower_db),
-                    min(existing_upper, upper_db),
+                    lower_db,
+                    upper_db,
+                    _passes_limit_bounds(levels[row_index], lower_db, upper_db),
                 )
             else:
-                assigned[row_index] = (lower_db, upper_db)
+                passed = band.get("passed")
+                assigned[row_index] = (
+                    lower_db,
+                    upper_db,
+                    passed
+                    if isinstance(passed, bool)
+                    else _passes_limit_bounds(levels[row_index], lower_db, upper_db),
+                )
         return assigned
 
     def _render_golden_overlay(
@@ -1198,6 +1617,21 @@ class FftLineChartWidget(LineChartWidget):
         x_values: list[float],
         levels_db: list[float],
     ) -> None:
+        limit_lines = display_envelope.get("limit_lines") or []
+        if limit_lines:
+            self._lower_envelope_curve_item.setData([], [])
+            self._upper_envelope_curve_item.setData([], [])
+            self._render_limit_line_items(limit_lines)
+            failed_x, failed_y = self._failed_spectrum_curve_data_for_limit_lines(
+                x_values=x_values,
+                levels_db=levels_db,
+                limit_lines=limit_lines,
+            )
+            self._failed_spectrum_curve_item.setData(failed_x, failed_y)
+            self._failed_marker_item.setData([], [])
+            return
+
+        self._clear_limit_line_items()
         control_points = display_envelope["control_points"]
         line_points = display_envelope.get("line_points") or control_points
         self._lower_envelope_curve_item.setData(
@@ -1215,6 +1649,37 @@ class FftLineChartWidget(LineChartWidget):
             envelope_points=line_points,
         )
         self._failed_spectrum_curve_item.setData(failed_x, failed_y)
+        failed_marker_points = self._one_sided_failed_marker_points(
+            display_envelope.get("failed_points") or []
+        )
+        self._failed_marker_item.setData(
+            [point["freq_hz"] for point in failed_marker_points],
+            [point["actual_db"] for point in failed_marker_points],
+        )
+
+    def _render_limit_line_items(self, limit_lines: list[dict]) -> None:
+        self._clear_limit_line_items()
+        for line in limit_lines:
+            points = line.get("points") or []
+            item = self.plot_item.plot(
+                [point["freq_hz"] for point in points],
+                [point["limit_db"] for point in points],
+                pen=_limit_line_pen(line["kind"]),
+            )
+            self._limit_line_items.append(item)
+
+    def _clear_limit_line_items(self) -> None:
+        for item in self._limit_line_items:
+            self.plot_item.removeItem(item)
+        self._limit_line_items.clear()
+
+    @staticmethod
+    def _one_sided_failed_marker_points(failed_points: list[dict]) -> list[dict]:
+        return [
+            point
+            for point in failed_points
+            if (point.get("lower_db") is None) != (point.get("upper_db") is None)
+        ]
 
     @staticmethod
     def _failed_spectrum_curve_data(
@@ -1298,6 +1763,47 @@ class FftLineChartWidget(LineChartWidget):
         failed_y[failed] = y_array[failed]
         return x_array.tolist(), failed_y.tolist()
 
+    @staticmethod
+    def _failed_spectrum_curve_data_for_limit_lines(
+        *,
+        x_values: list[float],
+        levels_db: list[float],
+        limit_lines: list[dict],
+    ) -> tuple[list[float], list[float]]:
+        if len(x_values) != len(levels_db) or not limit_lines:
+            return [], []
+
+        try:
+            x_array = np.asarray(x_values, dtype=np.float64)
+            y_array = np.asarray(levels_db, dtype=np.float64)
+        except (TypeError, ValueError):
+            return [], []
+        if x_array.ndim != 1 or y_array.ndim != 1 or x_array.size != y_array.size:
+            return [], []
+
+        failed = np.zeros(y_array.shape, dtype=np.bool_)
+        for index, (frequency, level) in enumerate(
+            zip(x_array, y_array, strict=False)
+        ):
+            if (
+                not np.isfinite(float(frequency))
+                or not np.isfinite(float(level))
+                or float(frequency) <= 0.0
+            ):
+                continue
+            bounds = _combined_limit_line_bounds_at(limit_lines, float(frequency))
+            if bounds is None:
+                continue
+            lower, upper = bounds
+            failed[index] = not _passes_limit_bounds(float(level), lower, upper)
+
+        if not np.any(failed):
+            return [], []
+
+        failed_y = np.full(y_array.shape, np.nan, dtype=np.float64)
+        failed_y[failed] = y_array[failed]
+        return x_array.tolist(), failed_y.tolist()
+
     def _update_zero_reference_line(self, show_zero_reference: bool) -> None:
         if not show_zero_reference:
             self._zero_reference_line.hide()
@@ -1336,28 +1842,40 @@ class FftLineChartWidget(LineChartWidget):
         rendered_x_values = [x_value for x_value, _ in display_entries]
         rendered_limit_bands = [band for _, band in display_entries]
 
-        centers = np.array(
-            [
-                (band["lower_db"] + band["upper_db"]) / 2.0
-                for band in rendered_limit_bands
-            ],
-            dtype=float,
-        )
-        spans = np.array(
-            [
-                (band["upper_db"] - band["lower_db"]) / 2.0
-                for band in rendered_limit_bands
-            ],
-            dtype=float,
-        )
-        x_array = np.asarray(rendered_x_values, dtype=float)
-        self._band_range_item.setData(
-            x=x_array,
-            y=centers,
-            top=spans,
-            bottom=spans,
-            beam=0.0,
-        )
+        range_entries = [
+            (x_value, band["lower_db"], band["upper_db"])
+            for x_value, band in zip(
+                rendered_x_values, rendered_limit_bands, strict=False
+            )
+            if band["lower_db"] is not None
+            and band["upper_db"] is not None
+            and np.isfinite(float(band["lower_db"]))
+            and np.isfinite(float(band["upper_db"]))
+        ]
+        if range_entries:
+            lower_values = np.asarray(
+                [lower_db for _x_value, lower_db, _upper_db in range_entries],
+                dtype=float,
+            )
+            upper_values = np.asarray(
+                [upper_db for _x_value, _lower_db, upper_db in range_entries],
+                dtype=float,
+            )
+            centers = (lower_values + upper_values) / 2.0
+            spans = (upper_values - lower_values) / 2.0
+            x_array = np.asarray(
+                [x_value for x_value, _lower_db, _upper_db in range_entries],
+                dtype=float,
+            )
+            self._band_range_item.setData(
+                x=x_array,
+                y=centers,
+                top=spans,
+                bottom=spans,
+                beam=0.0,
+            )
+        else:
+            _clear_error_bar_item(self._band_range_item)
         self._band_marker_item.setData(
             [
                 {
@@ -1368,6 +1886,15 @@ class FftLineChartWidget(LineChartWidget):
                     rendered_x_values, rendered_limit_bands, strict=False
                 )
             ]
+        )
+
+    @staticmethod
+    def _has_legacy_renderable_limit_envelope(display_envelope: dict) -> bool:
+        if display_envelope.get("limit_lines"):
+            return False
+        return bool(
+            display_envelope.get("line_points")
+            or display_envelope.get("control_points")
         )
 
     def _apply_fft_x_axis_policy(
@@ -1399,6 +1926,70 @@ class FftLineChartWidget(LineChartWidget):
             upper += padding
         view_box.setXRange(lower, upper, padding=0.0)
 
+    def _render_current_trace(
+        self,
+        current_trace: dict | None,
+        *,
+        display_frequencies: list[float],
+        x_axis_scale: str,
+    ) -> None:
+        if not isinstance(current_trace, dict) or not display_frequencies:
+            self._hide_current_axis()
+            return
+        x_values = self._current_line_x_values(
+            display_frequencies,
+            x_axis_scale=x_axis_scale,
+        )
+        if len(x_values) != 2:
+            self._hide_current_axis()
+            return
+        average = float(current_trace["average_a"])
+        self._current_curve_item.setData(x_values, [average, average])
+        right_axis = self.plot_item.getAxis("right")
+        right_axis.show()
+        unit = current_trace.get("unit")
+        if isinstance(unit, str):
+            unit = unit.strip()
+            if unit:
+                right_axis.setLabel("电流", units=unit)
+            else:
+                right_axis.setLabel("电流")
+        else:
+            right_axis.setLabel("电流")
+        values = list(_payload_sequence_or_empty(current_trace, "values_a"))
+        if average not in values:
+            values.append(average)
+        y_min, y_max = _data_focus_range(values)
+        self._current_view_box.setYRange(y_min, y_max, padding=0.0)
+        self._sync_current_view_geometry()
+
+    @staticmethod
+    def _current_line_x_values(
+        display_frequencies: list[float],
+        *,
+        x_axis_scale: str,
+    ) -> list[float]:
+        positive = np.asarray(display_frequencies, dtype=np.float64)
+        positive = positive[np.isfinite(positive) & (positive > 0.0)]
+        if positive.size == 0:
+            return []
+        lower = float(positive.min())
+        upper = float(positive.max())
+        if x_axis_scale == "log":
+            return [float(np.log10(lower)), float(np.log10(upper))]
+        return [lower, upper]
+
+    def _hide_current_axis(self) -> None:
+        self._current_curve_item.setData([], [])
+        self.plot_item.getAxis("right").hide()
+
+    def _sync_current_view_geometry(self) -> None:
+        self._current_view_box.setGeometry(self.plot_item.vb.sceneBoundingRect())
+        self._current_view_box.linkedViewChanged(
+            self.plot_item.vb,
+            self._current_view_box.XAxis,
+        )
+
     @classmethod
     def _display_limit_envelope(cls, limit_envelope: dict | None) -> dict:
         if not isinstance(limit_envelope, dict):
@@ -1413,6 +2004,7 @@ class FftLineChartWidget(LineChartWidget):
             normalized = cls._normalize_envelope_control_point(point)
             if normalized is not None:
                 line_points.append(normalized)
+        limit_lines = _normalize_limit_lines(limit_envelope.get("limit_lines"))
         failed_points = []
         for point in limit_envelope.get("failed_points", []):
             normalized = cls._normalize_envelope_failed_point(point)
@@ -1424,6 +2016,8 @@ class FftLineChartWidget(LineChartWidget):
         }
         if isinstance(limit_envelope.get("line_points"), list):
             display_envelope["line_points"] = line_points
+        if isinstance(limit_envelope.get("limit_lines"), list):
+            display_envelope["limit_lines"] = limit_lines
         return display_envelope
 
     @staticmethod
@@ -1463,12 +2057,9 @@ class FftLineChartWidget(LineChartWidget):
         actual_db = cls._finite_float(point.get("actual_db"))
         lower_db = cls._finite_float(point.get("lower_db"))
         upper_db = cls._finite_float(point.get("upper_db"))
-        if (
-            freq_hz is None
-            or actual_db is None
-            or lower_db is None
-            or upper_db is None
-        ):
+        if freq_hz is None or actual_db is None:
+            return None
+        if lower_db is None and upper_db is None:
             return None
         return {
             "freq_hz": freq_hz,
@@ -1506,6 +2097,7 @@ class OctaveBarChartWidget(_BasePlotChart):
         )
         self._band_range_item = pg.ErrorBarItem()
         self._band_marker_item = pg.ScatterPlotItem(size=10, pen=pg.mkPen(None))
+        self._limit_line_items: list[pg.PlotDataItem] = []
         self._zero_reference_line = pg.InfiniteLine(
             angle=0,
             pen=pg.mkPen(
@@ -1544,6 +2136,7 @@ class OctaveBarChartWidget(_BasePlotChart):
         center_freqs_hz: Iterable[float],
         levels_db: Iterable[float],
         limit_bands: Iterable[dict] | None = None,
+        limit_lines: Iterable[dict] | None = None,
         golden_overlay_levels_db: Iterable[float] | None = None,
         show_zero_reference: bool = False,
     ) -> None:
@@ -1555,6 +2148,7 @@ class OctaveBarChartWidget(_BasePlotChart):
             raise ValueError("center_freqs_hz and levels_db must be the same length")
 
         normalized_limit_bands = _normalize_limit_bands(limit_bands)
+        normalized_limit_lines = _normalize_limit_lines(limit_lines)
         normalized_golden_overlay = _normalize_optional_overlay_levels(
             golden_overlay_levels_db,
             expected_length=len(normalized_frequencies),
@@ -1564,6 +2158,7 @@ class OctaveBarChartWidget(_BasePlotChart):
             "center_freqs_hz": normalized_frequencies,
             "levels_db": normalized_levels,
             "limit_bands": normalized_limit_bands,
+            "limit_lines": normalized_limit_lines,
             "golden_overlay_levels_db": normalized_golden_overlay,
             "show_zero_reference": bool(show_zero_reference),
         }
@@ -1576,6 +2171,10 @@ class OctaveBarChartWidget(_BasePlotChart):
         self._render_golden_overlay(
             x_values=x_values,
             levels_db=normalized_golden_overlay,
+        )
+        self._render_limit_line_items(
+            normalized_limit_lines,
+            center_freqs_hz=normalized_frequencies,
         )
         self._update_zero_reference_line(bool(show_zero_reference))
         visible_labels_hz = {
@@ -1617,6 +2216,7 @@ class OctaveBarChartWidget(_BasePlotChart):
         _clear_error_bar_item(self._band_range_item)
         self._golden_overlay_item.setData([], [])
         self._band_marker_item.setData([])
+        self._clear_limit_line_items()
         self._replace_bar_item(x=np.array([], dtype=float), heights=np.array([], dtype=float))
         self.plot_item.getAxis("bottom").setTicks(None)
         self._apply_x_axis_policy(payload_values=None)
@@ -1699,8 +2299,26 @@ class OctaveBarChartWidget(_BasePlotChart):
     @staticmethod
     def _export_octave_limits_by_row(
         payload: dict,
-    ) -> dict[int, tuple[float, float, bool]]:
+    ) -> dict[int, tuple[float | None, float | None, bool]]:
         center_freqs = payload["center_freqs_hz"]
+        levels = payload["levels_db"]
+        limit_lines = payload.get("limit_lines") or []
+        if center_freqs and limit_lines:
+            line_limits_by_row: dict[int, tuple[float | None, float | None, bool]] = {}
+            for index, (center_freq, level) in enumerate(
+                zip(center_freqs, levels, strict=False)
+            ):
+                bounds = _combined_limit_line_bounds_at(limit_lines, float(center_freq))
+                if bounds is None:
+                    continue
+                lower, upper = bounds
+                line_limits_by_row[index] = (
+                    lower,
+                    upper,
+                    _passes_limit_bounds(float(level), lower, upper),
+                )
+            return line_limits_by_row
+
         limit_bands = payload.get("limit_bands") or []
         if not center_freqs or not limit_bands:
             return {}
@@ -1714,11 +2332,175 @@ class OctaveBarChartWidget(_BasePlotChart):
             if not np.isfinite(position):
                 continue
             limits_by_row[int(position)] = (
-                float(band["lower_db"]),
-                float(band["upper_db"]),
+                _normalize_optional_limit_bound(band["lower_db"]),
+                _normalize_optional_limit_bound(band["upper_db"]),
                 bool(band["passed"]),
             )
         return limits_by_row
+
+    def _render_limit_line_items(
+        self,
+        limit_lines: list[dict],
+        *,
+        center_freqs_hz: list[float],
+    ) -> None:
+        self._clear_limit_line_items()
+        if not limit_lines or not center_freqs_hz:
+            return
+
+        center_axis = np.asarray(center_freqs_hz, dtype=np.float64)
+        position_axis = np.arange(len(center_freqs_hz), dtype=np.float64)
+        finite = np.isfinite(center_axis)
+        if not np.any(finite):
+            return
+        center_axis = center_axis[finite]
+        position_axis = position_axis[finite]
+        order = np.argsort(center_axis, kind="stable")
+        center_axis = center_axis[order]
+        position_axis = position_axis[order]
+
+        for line in limit_lines:
+            x_values, y_values = self._clipped_limit_line_item_data(
+                line.get("points") or [],
+                center_axis=center_axis,
+                position_axis=position_axis,
+            )
+            if not x_values:
+                continue
+            item = self.plot_item.plot(
+                x_values,
+                y_values,
+                pen=_limit_line_pen(line["kind"]),
+            )
+            self._limit_line_items.append(item)
+
+    @staticmethod
+    def _clipped_limit_line_item_data(
+        points: list[dict],
+        *,
+        center_axis: np.ndarray,
+        position_axis: np.ndarray,
+    ) -> tuple[list[float], list[float]]:
+        if len(points) == 0:
+            return ([], [])
+
+        domain_lower = float(center_axis[0])
+        domain_upper = float(center_axis[-1])
+
+        def _in_domain(freq_hz: float) -> bool:
+            return domain_lower <= freq_hz <= domain_upper
+
+        def _position_for(freq_hz: float) -> float:
+            return float(np.interp(freq_hz, center_axis, position_axis))
+
+        def _interpolated_limit(
+            *,
+            freq_hz: float,
+            start_freq: float,
+            start_limit: float,
+            end_freq: float,
+            end_limit: float,
+        ) -> float:
+            if start_freq == end_freq:
+                return start_limit
+            ratio = (freq_hz - start_freq) / (end_freq - start_freq)
+            return start_limit + (ratio * (end_limit - start_limit))
+
+        def _clipped_segment(
+            start_point: dict,
+            end_point: dict,
+        ) -> list[tuple[float, float]]:
+            start_freq = float(start_point["freq_hz"])
+            end_freq = float(end_point["freq_hz"])
+            start_limit = float(start_point["limit_db"])
+            end_limit = float(end_point["limit_db"])
+
+            if start_freq == end_freq:
+                if not _in_domain(start_freq):
+                    return []
+                position = _position_for(start_freq)
+                return [(position, start_limit), (position, end_limit)]
+
+            segment_lower = min(start_freq, end_freq)
+            segment_upper = max(start_freq, end_freq)
+            if segment_upper < domain_lower or segment_lower > domain_upper:
+                return []
+
+            clipped_start_freq = min(max(start_freq, domain_lower), domain_upper)
+            clipped_end_freq = min(max(end_freq, domain_lower), domain_upper)
+            clipped_start_limit = _interpolated_limit(
+                freq_hz=clipped_start_freq,
+                start_freq=start_freq,
+                start_limit=start_limit,
+                end_freq=end_freq,
+                end_limit=end_limit,
+            )
+            clipped_end_limit = _interpolated_limit(
+                freq_hz=clipped_end_freq,
+                start_freq=start_freq,
+                start_limit=start_limit,
+                end_freq=end_freq,
+                end_limit=end_limit,
+            )
+            return [
+                (_position_for(clipped_start_freq), clipped_start_limit),
+                (_position_for(clipped_end_freq), clipped_end_limit),
+            ]
+
+        def _append_segment(
+            piece: list[tuple[float, float]],
+            segment: list[tuple[float, float]],
+        ) -> None:
+            if not piece:
+                piece.extend(segment)
+                return
+            if piece[-1] == segment[0]:
+                piece.extend(segment[1:])
+            else:
+                piece.extend(segment)
+
+        if len(points) == 1:
+            point = points[0]
+            freq_hz = float(point["freq_hz"])
+            if not _in_domain(freq_hz):
+                return ([], [])
+            return ([_position_for(freq_hz)], [float(point["limit_db"])])
+
+        pieces: list[list[tuple[float, float]]] = []
+        current_piece: list[tuple[float, float]] = []
+
+        for start_point, end_point in zip(points, points[1:], strict=False):
+            segment = _clipped_segment(start_point, end_point)
+            if not segment:
+                if current_piece:
+                    pieces.append(current_piece)
+                    current_piece = []
+                continue
+            if current_piece and not _in_domain(float(start_point["freq_hz"])):
+                pieces.append(current_piece)
+                current_piece = []
+            _append_segment(current_piece, segment)
+
+        if current_piece:
+            pieces.append(current_piece)
+
+        x_values: list[float] = []
+        y_values: list[float] = []
+        for piece in pieces:
+            if not piece:
+                continue
+            if x_values:
+                x_values.append(float("nan"))
+                y_values.append(float("nan"))
+            for x_value, y_value in piece:
+                x_values.append(x_value)
+                y_values.append(y_value)
+        return (x_values, y_values)
+
+    def _clear_limit_line_items(self) -> None:
+        for item in self._limit_line_items:
+            self.plot_item.removeItem(item)
+        self._limit_line_items.clear()
 
     def _apply_bar_x_axis_policy(self, *, x_values: np.ndarray) -> None:
         if x_values.size == 0:
@@ -1776,35 +2558,55 @@ class OctaveBarChartWidget(_BasePlotChart):
             self._band_marker_item.setData([])
             return
 
-        centers = np.array(
-            [
-                (band["lower_db"] + band["upper_db"]) / 2.0
-                for band in limit_bands
-            ],
-            dtype=float,
-        )
-        spans = np.array(
-            [
-                (band["upper_db"] - band["lower_db"]) / 2.0
-                for band in limit_bands
-            ],
-            dtype=float,
-        )
-        x_array = np.asarray(x_values, dtype=float)
-        self._band_range_item.setData(
-            x=x_array,
-            y=centers,
-            top=spans,
-            bottom=spans,
-            beam=0.3,
-        )
+        display_entries = [
+            (float(x_value), band)
+            for x_value, band in zip(x_values, limit_bands, strict=False)
+            if np.isfinite(float(x_value))
+        ]
+        if not display_entries:
+            _clear_error_bar_item(self._band_range_item)
+            self._band_marker_item.setData([])
+            return
+
+        range_entries = [
+            (x_value, band["lower_db"], band["upper_db"])
+            for x_value, band in display_entries
+            if band["lower_db"] is not None
+            and band["upper_db"] is not None
+            and np.isfinite(float(band["lower_db"]))
+            and np.isfinite(float(band["upper_db"]))
+        ]
+        if range_entries:
+            lower_values = np.asarray(
+                [lower_db for _x_value, lower_db, _upper_db in range_entries],
+                dtype=float,
+            )
+            upper_values = np.asarray(
+                [upper_db for _x_value, _lower_db, upper_db in range_entries],
+                dtype=float,
+            )
+            centers = (lower_values + upper_values) / 2.0
+            spans = (upper_values - lower_values) / 2.0
+            x_array = np.asarray(
+                [x_value for x_value, _lower_db, _upper_db in range_entries],
+                dtype=float,
+            )
+            self._band_range_item.setData(
+                x=x_array,
+                y=centers,
+                top=spans,
+                bottom=spans,
+                beam=0.3,
+            )
+        else:
+            _clear_error_bar_item(self._band_range_item)
         self._band_marker_item.setData(
             [
                 {
                     "pos": (x_value, band["actual_db"]),
                     "brush": "#16a34a" if band["passed"] else "#dc2626",
                 }
-                for x_value, band in zip(x_values, limit_bands, strict=False)
+                for x_value, band in display_entries
             ]
         )
 

@@ -20,6 +20,12 @@ from app.service.analysis.golden_reference import (
     GoldenReferenceCache,
     GoldenReferenceError,
 )
+from app.service.analysis.limit_tables import (
+    LimitTable,
+    evaluate_limit_tables,
+    normalize_limit_tables,
+    validate_limit_tables,
+)
 from app.service.golden_sample_service import GoldenSampleService
 from app.service.config_service import _CHANNEL_DEFAULTS
 
@@ -46,6 +52,18 @@ def _runtime_channel_defaults(channel_index: int) -> dict:
         else:
             cfg[k] = v
     return cfg
+
+
+def _configured_vibration_view_channel(config: dict, selected_channels) -> int | None:
+    value = config.get("vibration_view_channel_index")
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    selected = {
+        channel
+        for channel in selected_channels
+        if isinstance(channel, int) and not isinstance(channel, bool) and channel >= 0
+    }
+    return value if value in selected else None
 
 
 class JudgmentEngine:
@@ -162,6 +180,12 @@ class JudgmentEngine:
         window = buffer[start_idx:end_idx]
 
         selected = config.get("selected_channels", [])
+        vibration_channel_index = _configured_vibration_view_channel(config, selected)
+        judged_channels = [
+            ch_idx
+            for ch_idx in selected
+            if ch_idx != vibration_channel_index
+        ]
         channels_cfg = {ch["channel_index"]: ch for ch in config.get("channels", [])}
         golden_cache = GoldenReferenceCache(
             golden_sample_service=self._golden_sample_service
@@ -171,7 +195,7 @@ class JudgmentEngine:
         channel_results: list[ChannelJudgment] = []
         all_pass = True
 
-        for ch_idx in selected:
+        for ch_idx in judged_channels:
             ch_cfg = channels_cfg.get(ch_idx)
             if ch_cfg is None:
                 # Spec: use defaults when channel config is missing
@@ -402,7 +426,7 @@ class JudgmentEngine:
                 oct_band_results=oct_bands,
             ))
 
-        if selected and not channel_results:
+        if judged_channels and not channel_results:
             all_pass = False
 
         # AI analysis
@@ -456,7 +480,13 @@ class JudgmentEngine:
         overlay_requested = bool(channel_config.get("fft_show_golden_overlay"))
         nfft = channel_config.get("fft_nfft", _CHANNEL_DEFAULTS["fft_nfft"])
 
-        if not isinstance(band_limits, list) or not band_limits:
+        limit_tables, config_error = self._runtime_limit_tables(
+            band_limits,
+            label="FFT",
+        )
+        if config_error is not None:
+            return [], False, config_error
+        if not limit_tables:
             return [], True, None
 
         if mode != "off":
@@ -496,100 +526,33 @@ class JudgmentEngine:
             )
         except Exception as exc:
             return [], False, str(exc) or exc.__class__.__name__
-        envelope_error = self._fft_limit_envelope_runtime_error(band_limits)
-        if envelope_error is not None:
-            return [], False, envelope_error
         if mode == "off":
-            if (
-                self._fft_evaluable_bin_count(
-                    measured_freqs=measured_freqs,
-                    measured_levels=measured_levels,
-                    band_limits=band_limits,
-                    golden_levels=None,
-                )
-                == 0
-            ):
-                return [], False, "FFT 频率范围内无可评估频点"
-            return (
-                self._build_fft_band_results(
-                    measured_freqs=measured_freqs,
-                    measured_levels=measured_levels,
-                    band_limits=band_limits,
-                    golden_levels=None,
-                    mode=mode,
-                ),
-                True,
-                None,
+            bands, active_count = self._build_fft_band_results(
+                measured_freqs=measured_freqs,
+                measured_levels=measured_levels,
+                limit_tables=limit_tables,
+                golden_levels=None,
+                mode=mode,
             )
+            if active_count == 0:
+                return [], False, "FFT 频率范围内无可评估频点"
+            return bands, True, None
 
         try:
             self._validate_matching_axis(measured_freqs, golden_freqs, "FFT")
         except GoldenReferenceError as exc:
             return [], False, str(exc)
-        if (
-            self._fft_evaluable_bin_count(
-                measured_freqs=measured_freqs,
-                measured_levels=measured_levels,
-                band_limits=band_limits,
-                golden_levels=golden_levels,
-            )
-            == 0
-        ):
+        bands, active_count = self._build_fft_band_results(
+            measured_freqs=measured_freqs,
+            measured_levels=measured_levels,
+            limit_tables=limit_tables,
+            golden_levels=golden_levels,
+            mode=mode,
+        )
+        if active_count == 0:
             return [], False, "FFT 频率范围内无可评估频点"
 
-        return (
-            self._build_fft_band_results(
-                measured_freqs=measured_freqs,
-                measured_levels=measured_levels,
-                band_limits=band_limits,
-                golden_levels=golden_levels,
-                mode=mode,
-            ),
-            True,
-            None,
-        )
-
-    @classmethod
-    def _fft_limit_envelope_runtime_error(cls, band_limits: list[dict]) -> str | None:
-        row_error = cls._fft_limit_rows_runtime_error(band_limits)
-        if row_error is not None:
-            return row_error
-
-        points = cls._normalize_fft_limit_points(band_limits)
-        env_freqs, env_lower, env_upper = cls._collapse_fft_envelope(points)
-        if env_freqs.size < 2:
-            return "FFT 至少需要两个不同频率的控制点"
-
-        invalid = np.flatnonzero(env_lower >= env_upper)
-        if invalid.size:
-            freq = float(env_freqs[int(invalid[0])])
-            return f"FFT 频率 {freq:g} Hz 的下限包络必须小于上限包络"
-        return None
-
-    @classmethod
-    def _fft_limit_rows_runtime_error(cls, band_limits: list[dict]) -> str | None:
-        for index, band in enumerate(band_limits or [], start=1):
-            if not isinstance(band, dict):
-                return f"FFT 第 {index} 行格式无效"
-
-            freq = band.get("freq")
-            lower = band.get("lower")
-            upper = band.get("upper")
-            if any(isinstance(value, bool) for value in (freq, lower, upper)):
-                return f"FFT 第 {index} 行数值不能为布尔值"
-            if not cls._is_fft_limit_number(freq) or float(freq) <= 0.0:
-                return f"FFT 第 {index} 行频率必须为正有限数"
-            if not cls._is_fft_limit_number(lower):
-                return f"FFT 第 {index} 行下限必须为有限数值"
-            if not cls._is_fft_limit_number(upper):
-                return f"FFT 第 {index} 行上限必须为有限数值"
-            if float(lower) >= float(upper):
-                return f"FFT 第 {index} 行下限必须小于上限"
-        return None
-
-    @staticmethod
-    def _is_fft_limit_number(value) -> bool:
-        return isinstance(value, (int, float)) and np.isfinite(float(value))
+        return bands, True, None
 
     def _check_octave_bands(
         self,
@@ -608,7 +571,13 @@ class JudgmentEngine:
         mode = self._golden_mode(channel_config.get("oct_golden_mode"))
         overlay_requested = bool(channel_config.get("oct_show_golden_overlay"))
 
-        if not isinstance(band_limits, list) or not band_limits:
+        limit_tables, config_error = self._runtime_limit_tables(
+            band_limits,
+            label="倍频程",
+        )
+        if config_error is not None:
+            return [], False, config_error
+        if not limit_tables:
             return [], True, None
 
         if mode != "off":
@@ -640,40 +609,42 @@ class JudgmentEngine:
             except GoldenReferenceError as exc:
                 logger.warning("黄金样本加载失败，倍频程对比曲线已忽略: %s", exc)
 
-        measured_centers, measured_levels = self._measure_octave(
-            sig,
-            sample_rate,
-            weighting,
-        )
-        if mode == "off":
-            return (
-                self._build_octave_band_results(
-                    measured_centers=measured_centers,
-                    measured_levels=measured_levels,
-                    band_limits=band_limits,
-                    golden_levels=None,
-                    mode=mode,
-                ),
-                True,
-                None,
+        try:
+            measured_centers, measured_levels = self._measure_octave(
+                sig,
+                sample_rate,
+                weighting,
             )
+        except Exception as exc:
+            return [], False, str(exc) or exc.__class__.__name__
+        if mode == "off":
+            bands, active_count = self._build_octave_band_results(
+                measured_centers=measured_centers,
+                measured_levels=measured_levels,
+                limit_tables=limit_tables,
+                golden_levels=None,
+                mode=mode,
+            )
+            if active_count == 0:
+                return [], False, "倍频程频率范围内无可评估频点"
+            return bands, True, None
 
         try:
             self._validate_matching_axis(measured_centers, golden_centers, "倍频程")
         except GoldenReferenceError as exc:
             return [], False, str(exc)
 
-        return (
-            self._build_octave_band_results(
-                measured_centers=measured_centers,
-                measured_levels=measured_levels,
-                band_limits=band_limits,
-                golden_levels=golden_levels,
-                mode=mode,
-            ),
-            True,
-            None,
+        bands, active_count = self._build_octave_band_results(
+            measured_centers=measured_centers,
+            measured_levels=measured_levels,
+            limit_tables=limit_tables,
+            golden_levels=golden_levels,
+            mode=mode,
         )
+        if active_count == 0:
+            return [], False, "倍频程频率范围内无可评估频点"
+
+        return bands, True, None
 
     def _measure_fft(
         self,
@@ -699,116 +670,34 @@ class JudgmentEngine:
         *,
         measured_freqs: np.ndarray,
         measured_levels: np.ndarray,
-        band_limits: list[dict],
+        limit_tables: list[LimitTable],
         golden_levels: np.ndarray | None,
         mode: str,
-    ) -> list[BandResult]:
-        points = self._normalize_fft_limit_points(band_limits)
-        env_freqs, env_lower, env_upper = self._collapse_fft_envelope(points)
-        if env_freqs.size < 2:
-            return []
-
-        freq_axis = np.asarray(measured_freqs, dtype=np.float64)
-        level_axis = np.asarray(measured_levels, dtype=np.float64)
-        finite_mask = np.isfinite(freq_axis) & np.isfinite(level_axis)
-        if golden_levels is not None:
-            golden_axis = np.asarray(golden_levels, dtype=np.float64)
-            finite_mask &= np.isfinite(golden_axis)
-        else:
-            golden_axis = None
-        mask = (
-            finite_mask
-            & (freq_axis >= env_freqs[0])
-            & (freq_axis <= env_freqs[-1])
+    ) -> tuple[list[BandResult], int]:
+        eval_freqs, eval_measured, eval_golden = self._finite_limit_inputs(
+            frequencies=measured_freqs,
+            levels=measured_levels,
+            golden_levels=golden_levels,
         )
-        eval_freqs = freq_axis[mask]
-        eval_measured = level_axis[mask]
         if eval_freqs.size == 0:
-            return []
+            return [], 0
 
-        eval_golden = golden_axis[mask] if golden_axis is not None else None
-        offset_lower = np.interp(eval_freqs, env_freqs, env_lower)
-        offset_upper = np.interp(eval_freqs, env_freqs, env_upper)
-        if mode == "absolute" and eval_golden is not None:
-            levels = eval_measured
-            lower = eval_golden + offset_lower
-            upper = eval_golden + offset_upper
-        elif mode == "delta" and eval_golden is not None:
-            levels = eval_measured - eval_golden
-            lower = offset_lower
-            upper = offset_upper
-        else:
-            levels = eval_measured
-            lower = offset_lower
-            upper = offset_upper
-
-        failed = (levels < lower) | (levels > upper)
-        return [
-            BandResult(
-                freq=float(freq),
-                level=float(level),
-                lower=float(lower_value),
-                upper=float(upper_value),
-                passed=False,
-            )
-            for freq, level, lower_value, upper_value in zip(
-                eval_freqs[failed],
-                levels[failed],
-                lower[failed],
-                upper[failed],
-                strict=False,
-            )
-        ]
-
-    @staticmethod
-    def _normalize_fft_limit_points(band_limits: list[dict]) -> list[dict]:
-        indexed: list[tuple[int, float, float, float]] = []
-        for index, band in enumerate(band_limits or []):
-            if not isinstance(band, dict):
-                continue
-            try:
-                freq = float(band.get("freq"))
-                lower = float(band.get("lower"))
-                upper = float(band.get("upper"))
-            except (TypeError, ValueError):
-                continue
-            if not (
-                np.isfinite(freq)
-                and freq > 0.0
-                and np.isfinite(lower)
-                and np.isfinite(upper)
-            ):
-                continue
-            indexed.append((index, freq, lower, upper))
-        indexed.sort(key=lambda item: (item[1], item[0]))
-        return [
-            {"freq": freq, "lower": lower, "upper": upper, "source_index": index}
-            for index, freq, lower, upper in indexed
-        ]
-
-    @staticmethod
-    def _collapse_fft_envelope(
-        points: list[dict],
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        distinct_freqs: list[float] = []
-        lower_values: list[float] = []
-        upper_values: list[float] = []
-        index = 0
-        while index < len(points):
-            freq = float(points[index]["freq"])
-            lowers: list[float] = []
-            uppers: list[float] = []
-            while index < len(points) and float(points[index]["freq"]) == freq:
-                lowers.append(float(points[index]["lower"]))
-                uppers.append(float(points[index]["upper"]))
-                index += 1
-            distinct_freqs.append(freq)
-            lower_values.append(max(lowers))
-            upper_values.append(min(uppers))
-        return (
-            np.asarray(distinct_freqs, dtype=np.float64),
-            np.asarray(lower_values, dtype=np.float64),
-            np.asarray(upper_values, dtype=np.float64),
+        evaluated = evaluate_limit_tables(
+            limit_tables,
+            eval_freqs,
+            golden_levels=eval_golden,
+            mode=mode,
+        )
+        judged_levels = self._judged_levels(
+            measured_levels=eval_measured,
+            golden_levels=eval_golden,
+            mode=mode,
+        )
+        return self._band_results_from_evaluated_limits(
+            frequencies=eval_freqs,
+            levels=judged_levels,
+            evaluated=evaluated,
+            include_passes=False,
         )
 
     def _build_octave_band_results(
@@ -816,76 +705,145 @@ class JudgmentEngine:
         *,
         measured_centers: np.ndarray,
         measured_levels: np.ndarray,
-        band_limits: list[dict],
+        limit_tables: list[LimitTable],
         golden_levels: np.ndarray | None,
         mode: str,
-    ) -> list[BandResult]:
-        results: list[BandResult] = []
-        for band_limit in band_limits:
-            target_freq = band_limit["freq"]
-            idx = int(np.argmin(np.abs(measured_centers - target_freq)))
-            measured_level = float(measured_levels[idx])
-            level, lower, upper = self._judged_band_space(
-                measured_level=measured_level,
-                golden_level=(
-                    float(golden_levels[idx]) if golden_levels is not None else None
-                ),
-                lower=band_limit.get("lower", -np.inf),
-                upper=band_limit.get("upper", np.inf),
-                mode=mode,
-            )
-            results.append(
-                BandResult(
-                    freq=float(measured_centers[idx]),
-                    level=level,
-                    lower=lower,
-                    upper=upper,
-                    passed=lower <= level <= upper,
-                )
-            )
-        return results
-
-    def _fft_evaluable_bin_count(
-        self,
-        *,
-        measured_freqs: np.ndarray,
-        measured_levels: np.ndarray,
-        band_limits: list[dict],
-        golden_levels: np.ndarray | None,
-    ) -> int:
-        points = self._normalize_fft_limit_points(band_limits)
-        env_freqs, _env_lower, _env_upper = self._collapse_fft_envelope(points)
-        if env_freqs.size < 2:
-            return 0
-
-        freq_axis = np.asarray(measured_freqs, dtype=np.float64)
-        level_axis = np.asarray(measured_levels, dtype=np.float64)
-        finite_mask = np.isfinite(freq_axis) & np.isfinite(level_axis)
-        if golden_levels is not None:
-            finite_mask &= np.isfinite(np.asarray(golden_levels, dtype=np.float64))
-        mask = (
-            finite_mask
-            & (freq_axis >= env_freqs[0])
-            & (freq_axis <= env_freqs[-1])
+    ) -> tuple[list[BandResult], int]:
+        eval_freqs, eval_measured, eval_golden = self._finite_limit_inputs(
+            frequencies=measured_centers,
+            levels=measured_levels,
+            golden_levels=golden_levels,
         )
-        return int(np.count_nonzero(mask))
+        if eval_freqs.size == 0:
+            return [], 0
+
+        evaluated = evaluate_limit_tables(
+            limit_tables,
+            eval_freqs,
+            golden_levels=eval_golden,
+            mode=mode,
+        )
+        judged_levels = self._judged_levels(
+            measured_levels=eval_measured,
+            golden_levels=eval_golden,
+            mode=mode,
+        )
+        return self._band_results_from_evaluated_limits(
+            frequencies=eval_freqs,
+            levels=judged_levels,
+            evaluated=evaluated,
+            include_passes=True,
+        )
 
     @staticmethod
-    def _judged_band_space(
+    def _runtime_limit_tables(
+        raw_limits,
         *,
-        measured_level: float,
-        golden_level: float | None,
-        lower,
-        upper,
+        label: str,
+    ) -> tuple[list[LimitTable], str | None]:
+        errors = validate_limit_tables(raw_limits, label=label)
+        if errors:
+            return [], f"{label}配置错误: {'；'.join(errors)}"
+        try:
+            return normalize_limit_tables(raw_limits, label=label), None
+        except ValueError as exc:
+            return [], f"{label}配置错误: {exc}"
+
+    @staticmethod
+    def _finite_limit_inputs(
+        *,
+        frequencies: np.ndarray,
+        levels: np.ndarray,
+        golden_levels: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+        frequency_axis = np.asarray(frequencies, dtype=np.float64)
+        level_axis = np.asarray(levels, dtype=np.float64)
+        finite_mask = np.isfinite(frequency_axis) & np.isfinite(level_axis)
+        if golden_levels is None:
+            return frequency_axis[finite_mask], level_axis[finite_mask], None
+
+        golden_axis = np.asarray(golden_levels, dtype=np.float64)
+        finite_mask &= np.isfinite(golden_axis)
+        return (
+            frequency_axis[finite_mask],
+            level_axis[finite_mask],
+            golden_axis[finite_mask],
+        )
+
+    @staticmethod
+    def _judged_levels(
+        *,
+        measured_levels: np.ndarray,
+        golden_levels: np.ndarray | None,
         mode: str,
-    ) -> tuple[float, float, float]:
-        if mode == "absolute" and golden_level is not None:
-            lower = float(golden_level + lower)
-            upper = float(golden_level + upper)
-            return measured_level, lower, upper
-        if mode == "delta" and golden_level is not None:
-            return float(measured_level - golden_level), float(lower), float(upper)
-        return measured_level, float(lower), float(upper)
+    ) -> np.ndarray:
+        if mode == "delta" and golden_levels is not None:
+            return np.asarray(measured_levels, dtype=np.float64) - np.asarray(
+                golden_levels,
+                dtype=np.float64,
+            )
+        return np.asarray(measured_levels, dtype=np.float64)
+
+    @classmethod
+    def _band_results_from_evaluated_limits(
+        cls,
+        *,
+        frequencies: np.ndarray,
+        levels: np.ndarray,
+        evaluated,
+        include_passes: bool,
+    ) -> tuple[list[BandResult], int]:
+        results: list[BandResult] = []
+        active_count = 0
+        for freq, level, lower_value, upper_value, active in zip(
+            frequencies,
+            levels,
+            evaluated.lower,
+            evaluated.upper,
+            evaluated.active,
+            strict=False,
+        ):
+            if not bool(active):
+                continue
+            active_count += 1
+            lower = cls._finite_bound_or_none(lower_value)
+            upper = cls._finite_bound_or_none(upper_value)
+            passed = cls._passes_one_sided_limit(
+                level=float(level),
+                lower=lower,
+                upper=upper,
+            )
+            if include_passes or not passed:
+                results.append(
+                    BandResult(
+                        freq=float(freq),
+                        level=float(level),
+                        lower=lower,
+                        upper=upper,
+                        passed=passed,
+                    )
+                )
+        return results, active_count
+
+    @staticmethod
+    def _finite_bound_or_none(value) -> float | None:
+        numeric = float(value)
+        if np.isfinite(numeric):
+            return numeric
+        return None
+
+    @staticmethod
+    def _passes_one_sided_limit(
+        *,
+        level: float,
+        lower: float | None,
+        upper: float | None,
+    ) -> bool:
+        if lower is not None and level < lower:
+            return False
+        if upper is not None and level > upper:
+            return False
+        return True
 
     @staticmethod
     def _validate_matching_axis(

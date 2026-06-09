@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -8,6 +9,7 @@ import pytest
 from app.service.analysis import dsp, stft_score
 from app.service.analysis.frames import ChannelJudgment, JudgmentResult
 from app.service.analysis.test_manager import TestManager
+from app.service.current_meter_service import CurrentSample, build_current_trace_payload
 
 from ._support import (
     _expected_chart_payload,
@@ -16,6 +18,178 @@ from ._support import (
     _mock_bus,
     _mock_services,
 )
+
+
+def test_start_current_collection_emits_live_current_trace_update_with_run_id(monkeypatch):
+    bus = _mock_bus()
+    bus.current_trace_updated = MagicMock()
+    bus.current_trace_updated.emit = MagicMock()
+    services = _mock_services(bus)
+
+    class FakeCollector:
+        instances = []
+
+        def __init__(self, config, *, sample_callback=None, log_callback=None):
+            self.config = config
+            self.sample_callback = sample_callback
+            self.log_callback = log_callback
+            FakeCollector.instances.append(self)
+
+        def start(self):
+            return True
+
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.CurrentMeterCollector",
+        FakeCollector,
+    )
+
+    manager = TestManager(bus, services)
+    session = SimpleNamespace(
+        _config={
+            "config_id": 7,
+            "current_meter": {
+                "enabled": True,
+                "host": "127.0.0.1",
+                "port": 1503,
+            },
+        },
+        _workorder={"factory_run_id": "run-live"},
+    )
+
+    manager._start_current_collection(7, session)
+    FakeCollector.instances[0].sample_callback(
+        CurrentSample(time_sec=0.0, current_a=1.642),
+        (
+            CurrentSample(time_sec=0.0, current_a=1.642),
+            CurrentSample(time_sec=0.2, current_a=1.7),
+        ),
+    )
+
+    bus.current_trace_updated.emit.assert_called_once_with(
+        7,
+        "run-live",
+        {
+            "times_sec": [0.0, 0.2],
+            "values_a": [1.642, 1.7],
+            "average_a": 1.671,
+            "max_a": 1.7,
+            "latest_a": 1.7,
+            "unit": "mA",
+        },
+    )
+
+
+def test_start_current_collection_emits_live_current_trace_with_raw_meter_unit(monkeypatch):
+    bus = _mock_bus()
+    bus.current_trace_updated = MagicMock()
+    bus.current_trace_updated.emit = MagicMock()
+    services = _mock_services(bus)
+
+    class FakeCollector:
+        instances = []
+
+        def __init__(self, config, *, sample_callback=None, log_callback=None):
+            self.config = config
+            self.sample_callback = sample_callback
+            self.log_callback = log_callback
+            FakeCollector.instances.append(self)
+
+        def start(self):
+            return True
+
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.CurrentMeterCollector",
+        FakeCollector,
+    )
+
+    raw_current_meter = {
+        "enabled": True,
+        "host": "127.0.0.1",
+        "port": 1503,
+        "unit": "A",
+        "register_count": 2,
+        "data_type": "float32",
+        "scale": 1.0,
+    }
+    samples = (
+        CurrentSample(time_sec=0.0, current_a=1.642),
+        CurrentSample(time_sec=0.2, current_a=1.7),
+    )
+
+    manager = TestManager(bus, services)
+    session = SimpleNamespace(
+        _config={
+            "config_id": 7,
+            "analysis_window_offset_ms": 1000,
+            "current_meter": raw_current_meter,
+        },
+        _workorder={"factory_run_id": "run-live"},
+    )
+
+    manager._start_current_collection(7, session)
+    FakeCollector.instances[0].sample_callback(samples[-1], samples)
+
+    expected_payload = build_current_trace_payload(samples, config=raw_current_meter)
+    assert expected_payload["unit"] == "A"
+    bus.current_trace_updated.emit.assert_called_once_with(
+        7,
+        "run-live",
+        expected_payload,
+    )
+
+
+def test_current_trace_update_is_not_emitted_without_run_id_or_payload():
+    bus = _mock_bus()
+    bus.current_trace_updated = MagicMock()
+    bus.current_trace_updated.emit = MagicMock()
+    manager = TestManager(bus, _mock_services(bus))
+
+    manager._emit_current_trace_update(
+        7,
+        None,
+        (CurrentSample(time_sec=0.0, current_a=1.0),),
+        {"enabled": True, "host": "127.0.0.1"},
+    )
+    manager._emit_current_trace_update(
+        7,
+        "run-live",
+        (),
+        {"enabled": True, "host": "127.0.0.1"},
+    )
+
+    bus.current_trace_updated.emit.assert_not_called()
+
+
+def test_start_current_collection_does_not_emit_live_current_when_meter_disabled(monkeypatch):
+    bus = _mock_bus()
+    bus.current_trace_updated = MagicMock()
+    bus.current_trace_updated.emit = MagicMock()
+    services = _mock_services(bus)
+
+    class FakeCollector:
+        instances = []
+
+        def __init__(self, *args, **kwargs):
+            FakeCollector.instances.append((args, kwargs))
+
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.CurrentMeterCollector",
+        FakeCollector,
+    )
+
+    manager = TestManager(bus, services)
+    session = SimpleNamespace(
+        _config={
+            "config_id": 7,
+            "current_meter": {"enabled": False, "host": "127.0.0.1"},
+        },
+        _workorder={"factory_run_id": "run-live"},
+    )
+
+    manager._start_current_collection(7, session)
+
+    assert FakeCollector.instances == []
+    bus.current_trace_updated.emit.assert_not_called()
 
 
 class TestReviewPayloadEmission:
@@ -279,10 +453,23 @@ class TestReviewPayloadEmission:
         session._buffer = None
         session._attach_snapshot = attach_snapshot
         session._config = {
+            "config_id": 1,
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 0,
             "selected_channels": [0],
             "channels": [{"channel_index": 0}],
+            "current_meter": {
+                "port": 502,
+                "unit_id": 1,
+                "register_type": "input",
+                "register_address": 0,
+                "register_count": 1,
+                "data_type": "uint16",
+                "byte_order": "big",
+                "word_order": "big",
+                "scale": 0.001,
+                "offset": 0.0,
+            },
         }
         session._workorder = {
             "trigger_source": "scan",
@@ -334,6 +521,11 @@ class TestReviewPayloadEmission:
         )
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
+        mgr._current_samples_by_config_id[1] = [
+            CurrentSample(time_sec=0.5, current_a=1.0),
+            CurrentSample(time_sec=1.5, current_a=2.0),
+            CurrentSample(time_sec=2.5, current_a=3.0),
+        ]
 
         mgr._on_session_done(1)
 
@@ -351,6 +543,14 @@ class TestReviewPayloadEmission:
         assert calls["chart"]["config"] == session._config
         assert calls["chart"]["sample_rate"] == 100.0
         assert calls["chart"]["analysis_window"] == (1.0, 3.0)
+        assert calls["chart"]["current_trace_payload"] == {
+            "times_sec": [0.5, 1.5, 2.5],
+            "values_a": [1.0, 2.0, 3.0],
+            "average_a": 2.0,
+            "max_a": 3.0,
+            "latest_a": 3.0,
+            "unit": "mA",
+        }
         assert calls["chart"]["loudness_trace_cache"] is session._last_loudness_trace_cache
         assert calls["chart"]["judgment_payload"] == {
             "overall": "合格",
@@ -796,6 +996,89 @@ class TestReviewPayloadEmission:
         assert sorted(payload.chart_payload) == [3]
         assert payload.no_result is False
 
+    def test_rejudge_success_passes_full_current_trace_payload(self, monkeypatch):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        mock_session = MagicMock()
+        mock_session.config_id = 1
+        mock_session._workorder = {
+            "trigger_source": "manual",
+            "factory_run_id": "run-1",
+        }
+        mock_session._config = {
+            "config_id": 1,
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+            "selected_channels": [0],
+            "channels": [{"channel_index": 0}],
+            "current_meter": {
+                "port": 502,
+                "unit_id": 1,
+                "register_type": "input",
+                "register_address": 0,
+                "register_count": 1,
+                "data_type": "uint16",
+                "byte_order": "big",
+                "word_order": "big",
+                "scale": 0.001,
+                "offset": 0.0,
+            },
+        }
+        mock_session._buffer = np.full((500, 1), 0.37, dtype=np.float32)
+        mock_session._sample_rate = 100.0
+        mock_session._audio_file_path = "captured.wav"
+        mock_session.last_ai_review = None
+        mock_session.rejudge.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+            analysis_window=(1.0, 3.0),
+            channel_results=[
+                ChannelJudgment(
+                    channel_index=0,
+                    spl_db=70.0,
+                    spl_pass=True,
+                    loudness_available=False,
+                )
+            ],
+        )
+        captured = {}
+
+        def fake_build_chart_payload(**kwargs):
+            captured.update(kwargs)
+            return {0: {"spl": {"values_db": [37.0]}}}
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_summary_payload",
+            lambda **kwargs: {"overall_status": "pass", "rows": []},
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.build_chart_payload",
+            fake_build_chart_payload,
+            raising=False,
+        )
+        mgr._completed_sessions[1] = mock_session
+        mgr._current_samples_by_config_id[1] = [
+            CurrentSample(time_sec=0.5, current_a=1.0),
+            CurrentSample(time_sec=1.5, current_a=2.0),
+            CurrentSample(time_sec=2.5, current_a=3.0),
+        ]
+
+        mgr.rejudge(config_id=1, start_sec=1.0, end_sec=3.0)
+
+        assert captured["analysis_window"] == (1.0, 3.0)
+        assert captured["current_trace_payload"] == {
+            "times_sec": [0.5, 1.5, 2.5],
+            "values_a": [1.0, 2.0, 3.0],
+            "average_a": 2.0,
+            "max_a": 3.0,
+            "latest_a": 3.0,
+            "unit": "mA",
+        }
+
     def test_rejudge_success_emits_stft_score_payload_with_reanalysis_window_times(
         self,
         monkeypatch,
@@ -867,6 +1150,8 @@ class TestReviewPayloadEmission:
         payload = bus.factory_runtime_reanalysis_completed.emit.call_args.args[0]
         assert payload.chart_payload[0]["stft_score"]["summary_score"] == 86.5
         assert payload.chart_payload[0]["stft_score"]["times_sec"][0] == pytest.approx(1.25)
+        assert payload.summary_payload["rows"][0]["item_key"] == "stft_score"
+        assert payload.summary_payload["rows"][0]["actual_display"] == "86.50"
         assert captured["absolute_start_sec"] == pytest.approx(1.25)
 
     @pytest.mark.parametrize("score_mode", ["enabled", "disabled", "raises"])
