@@ -1817,7 +1817,6 @@ class TestManager(QObject):
             "finished": True,
             "error_code": "0",
             "sn_code": cls._session_sn_code(session),
-            "result": passed,
             "test_result": passed,
             "score": cls._plc_float_value(score),
             "spl": cls._plc_float_value(
