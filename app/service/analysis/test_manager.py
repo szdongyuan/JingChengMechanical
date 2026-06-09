@@ -1265,16 +1265,18 @@ class TestManager(QObject):
                 allow_accepted_stop=allow_accepted_stop,
             ):
                 return False
+            review_payload = self._make_factory_review_payload(
+                config_id,
+                session,
+                no_result=True,
+                error_message=payload["error_summary"],
+                summary_payload=summary_payload,
+            )
             self._emit_optional_signal(
                 signal_name,
-                self._make_factory_review_payload(
-                    config_id,
-                    session,
-                    no_result=True,
-                    error_message=payload["error_summary"],
-                    summary_payload=summary_payload,
-                ),
+                review_payload,
             )
+            self._emit_plc_test_result_if_needed(session, review_payload)
         else:
             summary_payload = self._build_summary_payload(
                 session,
@@ -1314,16 +1316,18 @@ class TestManager(QObject):
                 allow_accepted_stop=allow_accepted_stop,
             ):
                 return False
+            review_payload = self._make_factory_review_payload(
+                config_id,
+                session,
+                judgment_payload=result_dict,
+                summary_payload=summary_payload,
+                chart_payload=chart_payload,
+            )
             self._emit_optional_signal(
                 "factory_runtime_auto_analysis_succeeded",
-                self._make_factory_review_payload(
-                    config_id,
-                    session,
-                    judgment_payload=result_dict,
-                    summary_payload=summary_payload,
-                    chart_payload=chart_payload,
-                ),
+                review_payload,
             )
+            self._emit_plc_test_result_if_needed(session, review_payload)
 
         if not self._auto_analysis_review_still_owned(
             config_id,
@@ -1379,16 +1383,18 @@ class TestManager(QObject):
         ):
             return False
 
+        review_payload = self._make_factory_review_payload(
+            config_id,
+            session,
+            no_result=True,
+            error_message=payload["error_summary"],
+            summary_payload=summary_payload,
+        )
         self._emit_optional_signal(
             signal_name,
-            self._make_factory_review_payload(
-                config_id,
-                session,
-                no_result=True,
-                error_message=payload["error_summary"],
-                summary_payload=summary_payload,
-            ),
+            review_payload,
         )
+        self._emit_plc_test_result_if_needed(session, review_payload)
         if not self._auto_analysis_review_still_owned(
             config_id,
             session,
@@ -1754,6 +1760,132 @@ class TestManager(QObject):
             summary_payload=summary_payload,
             chart_payload=chart_payload,
         )
+
+    def _emit_plc_test_result_if_needed(self, session, review_payload) -> None:
+        if getattr(review_payload, "trigger_source", None) != "plc":
+            return
+        self._emit_optional_signal(
+            "write_test_result_to_plc",
+            self._make_plc_test_result_payload(session, review_payload),
+        )
+
+    @classmethod
+    def _make_plc_test_result_payload(cls, session, review_payload) -> dict:
+        summary_payload = getattr(review_payload, "summary_payload", None)
+        judgment_payload = getattr(review_payload, "judgment_payload", None)
+        chart_payload = getattr(review_payload, "chart_payload", None)
+        passed = (
+            isinstance(summary_payload, dict)
+            and summary_payload.get("overall_status") == "pass"
+        )
+        score = cls._summary_actual_value(summary_payload, "stft_score")
+        if score is None:
+            score = cls._stft_score_from_chart_payload(chart_payload)
+        ai_score = cls._value_from_mapping(judgment_payload, "ai_score")
+        if ai_score is None:
+            ai_score = cls._summary_actual_value(summary_payload, "ai")
+
+        return {
+            "finished": True,
+            "error_code": "0",
+            "sn_code": cls._session_sn_code(session),
+            "result": passed,
+            "test_result": passed,
+            "score": cls._plc_float_value(score),
+            "spl": cls._plc_float_value(
+                cls._max_channel_result_value(judgment_payload, "spl_max_db")
+            ),
+            "loudness": cls._plc_float_value(
+                cls._max_channel_result_value(judgment_payload, "loudness_max_sone")
+            ),
+            "vibrate": cls._plc_float_value(
+                cls._vibration_rms_from_chart_payload(chart_payload)
+            ),
+            "ai_score": cls._plc_float_value(ai_score),
+        }
+
+    @staticmethod
+    def _session_sn_code(session) -> str:
+        workorder = getattr(session, "_workorder", None)
+        if not isinstance(workorder, dict):
+            return ""
+        sn_code = workorder.get("sn")
+        if sn_code is None:
+            sn_code = workorder.get("sn_code")
+        if sn_code is None:
+            return ""
+        return str(sn_code).strip()
+
+    @classmethod
+    def _summary_actual_value(cls, summary_payload, item_key: str) -> float | None:
+        if not isinstance(summary_payload, dict):
+            return None
+        rows = summary_payload.get("rows")
+        if not isinstance(rows, list):
+            return None
+        for row in rows:
+            if isinstance(row, dict) and row.get("item_key") == item_key:
+                return cls._value_from_mapping(row, "actual_value")
+        return None
+
+    @classmethod
+    def _max_channel_result_value(cls, judgment_payload, field_name: str) -> float | None:
+        if not isinstance(judgment_payload, dict):
+            return None
+        values = []
+        channel_results = judgment_payload.get("channel_results")
+        if not isinstance(channel_results, list):
+            return None
+        for channel_result in channel_results:
+            value = cls._value_from_mapping(channel_result, field_name)
+            if value is not None:
+                values.append(value)
+        return max(values) if values else None
+
+    @classmethod
+    def _stft_score_from_chart_payload(cls, chart_payload) -> float | None:
+        for channel_payload in cls._iter_chart_channel_payloads(chart_payload):
+            score_payload = channel_payload.get("stft_score")
+            if isinstance(score_payload, dict):
+                score = cls._value_from_mapping(score_payload, "summary_score")
+                if score is not None:
+                    return score
+        return None
+
+    @classmethod
+    def _vibration_rms_from_chart_payload(cls, chart_payload) -> float | None:
+        values = []
+        for channel_payload in cls._iter_chart_channel_payloads(chart_payload):
+            vibration_payload = channel_payload.get("vibration")
+            if isinstance(vibration_payload, dict):
+                value = cls._value_from_mapping(vibration_payload, "overall_rms")
+                if value is not None:
+                    values.append(value)
+        return max(values) if values else None
+
+    @staticmethod
+    def _iter_chart_channel_payloads(chart_payload):
+        if not isinstance(chart_payload, dict):
+            return
+        for channel_payload in chart_payload.values():
+            if isinstance(channel_payload, dict):
+                yield channel_payload
+
+    @classmethod
+    def _value_from_mapping(cls, mapping, key: str) -> float | None:
+        if not isinstance(mapping, dict):
+            return None
+        value = mapping.get(key)
+        if isinstance(value, bool):
+            return None
+        return cls._coerce_finite_float(value)
+
+    @classmethod
+    def _plc_float_value(cls, value) -> float:
+        if isinstance(value, bool):
+            return -1.0
+        coerced = cls._coerce_finite_float(value)
+        return coerced if coerced is not None else -1.0
 
     @staticmethod
     def _session_config(session) -> dict:
