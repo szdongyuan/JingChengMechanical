@@ -220,9 +220,9 @@ def _assert_placeholder(module: ResultModule, *, badge_text: str) -> None:
     assert module.lb_overall.text() == badge_text
     assert module.table.rowCount() == 8
     assert module.table.horizontalHeaderItem(1).text() == "实测值"
-    assert _table_value(module, 0, 0) == "声压级"
+    assert _table_value(module, 0, 0) == "声压级（峰值）"
     assert _table_value(module, 1, 0) == "平均声压级"
-    assert _table_value(module, 2, 0) == "响度"
+    assert _table_value(module, 2, 0) == "响度（峰值）"
     assert _table_value(module, 3, 0) == "平均响度"
     assert _table_value(module, 4, 0) == "频谱"
     assert _table_value(module, 5, 0) == "倍频程"
@@ -237,9 +237,9 @@ def _assert_placeholder(module: ResultModule, *, badge_text: str) -> None:
 def test_result_module_shows_metric_placeholders_before_config(qapp):
     module = _make_module()
 
-    assert _metric_text(module, "lb_spl_metric_label") == "声压级"
+    assert _metric_text(module, "lb_spl_metric_label") == "声压级（峰值）"
     assert module.lb_spl_metric_value.text() == "--"
-    assert _metric_text(module, "lb_loudness_metric_label") == "响度"
+    assert _metric_text(module, "lb_loudness_metric_label") == "响度（峰值）"
     assert module.lb_loudness_metric_value.text() == "--"
 
 
@@ -274,9 +274,9 @@ def test_result_module_updates_live_metrics_only_for_current_run_and_channel(qap
     module.services.bus.spl_updated.emit(101, "old-run", 1, SimpleNamespace(spl_db=80.0))
     module.services.bus.loudness_updated.emit(101, "run-101", 0, SimpleNamespace(loudness_sone=9.0))
 
-    assert module.lb_spl_metric_label.text() == "声压级"
+    assert module.lb_spl_metric_label.text() == "声压级（峰值）"
     assert module.lb_spl_metric_value.text() == "72.3 dB"
-    assert module.lb_loudness_metric_label.text() == "响度"
+    assert module.lb_loudness_metric_label.text() == "响度（峰值）"
     assert module.lb_loudness_metric_value.text() == "2.35 sone"
 
 
@@ -1496,7 +1496,7 @@ def test_result_module_renders_completed_summary_rows_from_summary_payload(qapp)
     assert module.lb_overall.text() == "不通过"
     assert module.lb_overall.property("resultLevel") == "fail"
     assert module.table.rowCount() == 8
-    assert _table_value(module, 0, 0) == "声压级"
+    assert _table_value(module, 0, 0) == "声压级（峰值）"
     assert _table_value(module, 0, 1) == "86 dB"
     assert _table_value(module, 0, 2) == "通道2"
     assert _table_value(module, 0, 3) == "NG"
@@ -1504,7 +1504,7 @@ def test_result_module_renders_completed_summary_rows_from_summary_payload(qapp)
     assert _table_value(module, 1, 1) == "4 dB"
     assert _table_value(module, 1, 2) == "通道2"
     assert _table_value(module, 1, 3) == "NG"
-    assert _table_value(module, 2, 0) == "响度"
+    assert _table_value(module, 2, 0) == "响度（峰值）"
     assert _table_value(module, 2, 1) == "4 sone"
     assert _table_value(module, 2, 2) == "通道2"
     assert _table_value(module, 2, 3) == "NG"
@@ -1672,7 +1672,7 @@ def test_result_module_preserves_existing_summary_card_when_plain_stop_enters_st
 
     assert module.lb_overall.text() == "通过"
     assert module.lb_overall.property("resultLevel") == "pass"
-    assert _table_value(module, 0, 0) == "声压级"
+    assert _table_value(module, 0, 0) == "声压级（峰值）"
     assert _table_value(module, 6, 0) == "频谱平均评分"
     assert _table_value(module, 7, 0) == "AI分析"
 
@@ -1897,14 +1897,14 @@ def test_result_module_shows_no_result_plus_error_text_from_summary_payload(qapp
     )
 
     assert module.lb_overall.text() == "无结果"
-    assert _table_value(module, 0, 0) == "声压级"
+    assert _table_value(module, 0, 0) == "声压级（峰值）"
     assert _table_value(module, 0, 1) == "-1 dB"
     assert _table_value(module, 0, 2) == "通道1"
     assert _table_value(module, 0, 3) == "OK"
     assert _table_value(module, 1, 0) == "平均声压级"
     assert _table_value(module, 1, 2) == "通道1"
     assert _table_value(module, 1, 3) == "OK"
-    assert _table_value(module, 2, 0) == "响度"
+    assert _table_value(module, 2, 0) == "响度（峰值）"
     assert _table_value(module, 2, 2) == "通道2"
     assert _table_value(module, 2, 3) == "无结果"
     assert _table_value(module, 3, 0) == "平均响度"
