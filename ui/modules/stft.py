@@ -314,6 +314,8 @@ class StftModule(QWidget):
         self._display_run_id = getattr(self._review_payload, "run_id", None)
         self._display_run_id_locked_by_runtime = False
         self._score_payload_by_channel: dict[int, dict] = {}
+        self._current_trace_payload_by_channel: dict[int, dict] = {}
+        self._live_current_trace_payload_by_run: dict[tuple[int, str], dict] = {}
         self._current_score_text = self._SCORE_TITLE_PLACEHOLDER
         self._score_times_sec: list[float] = []
         self._score_values: list[float] = []
@@ -392,6 +394,10 @@ class StftModule(QWidget):
         if hasattr(self.services.bus, "factory_runtime_analyzing_entered"):
             self.services.bus.factory_runtime_analyzing_entered.connect(
                 self._on_factory_runtime_context
+            )
+        if hasattr(self.services.bus, "current_trace_updated"):
+            self.services.bus.current_trace_updated.connect(
+                self._on_current_trace_updated
             )
         if hasattr(self.services.bus, "stft_updated"):
             self.services.bus.stft_updated.connect(self._on_stft_updated)
@@ -553,6 +559,7 @@ class StftModule(QWidget):
     def is_selection_movable(self) -> bool:
         return (
             self._selected_window is not None
+            and self._review_payload_matches_active_context(self._review_payload)
             and bool(getattr(self._review_payload, "manual_reanalysis_allowed", False))
             and self._factory_state.run_phase == "reviewing"
         )
@@ -606,7 +613,8 @@ class StftModule(QWidget):
 
     def _can_use_analysis_selection_mode(self) -> bool:
         return (
-            bool(getattr(self._review_payload, "manual_reanalysis_allowed", False))
+            self._review_payload_matches_active_context(self._review_payload)
+            and bool(getattr(self._review_payload, "manual_reanalysis_allowed", False))
             and self._factory_state.run_phase == "reviewing"
             and self._current_overlay_geometry() is not None
         )
@@ -828,6 +836,7 @@ class StftModule(QWidget):
                 self._review_payload = review
                 self._sync_display_run_id_from_review(review)
                 self._refresh_score_payloads_from_review(review)
+                self._refresh_current_trace_payloads_from_review(review)
                 self._seed_imported_stft_cache_from_review(review)
                 self._refresh_cached_rendering()
                 self._update_overlay_geometry()
@@ -839,9 +848,10 @@ class StftModule(QWidget):
             self._clear_score_inspection_state()
             self._review_payload = FactoryReviewPayload()
 
-        self._selected_window = self._selection_from_review(self._review_payload)
         self._sync_display_run_id_from_review(self._review_payload)
+        self._selected_window = self._selection_from_review(self._review_payload)
         self._refresh_score_payloads_from_review(self._review_payload)
+        self._refresh_current_trace_payloads_from_review(self._review_payload)
         self._seed_imported_stft_cache_from_review(self._review_payload)
         self._refresh_cached_rendering()
         self._update_overlay_geometry()
@@ -856,6 +866,8 @@ class StftModule(QWidget):
         self._display_run_id = None
         self._display_run_id_locked_by_runtime = False
         self._score_payload_by_channel.clear()
+        self._current_trace_payload_by_channel.clear()
+        self._live_current_trace_payload_by_run.clear()
         self._score_times_sec = []
         self._score_values = []
         self._score_series_channel = None
@@ -881,9 +893,60 @@ class StftModule(QWidget):
                 self._clear_score_inspection_state()
             self._display_run_id = run_id
             self._display_run_id_locked_by_runtime = True
+            if (
+                run_switched
+                and self._current_trace_for_channel(self._selected_display_channel())
+                is None
+            ):
+                self.canvas.heatmap.set_current_trace(None)
             self._refresh_cached_rendering()
             self._refresh_score_series_for_current_channel()
             self._refresh_score_title()
+
+    def _on_current_trace_updated(self, config_id: int, run_id: str, current_trace) -> None:
+        if not isinstance(run_id, str) or not run_id:
+            return
+        if isinstance(config_id, bool):
+            return
+        try:
+            normalized_config_id = int(config_id)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(current_trace, dict):
+            return
+
+        if (
+            not self._has_display_context()
+            or normalized_config_id != self._factory_state.displayed_config_id
+        ):
+            return
+
+        key = (normalized_config_id, run_id)
+        if self._display_run_id is None:
+            self._live_current_trace_payload_by_run[key] = dict(current_trace)
+            return
+
+        if run_id != self._display_run_id:
+            return
+
+        self._live_current_trace_payload_by_run[key] = dict(current_trace)
+
+        if (
+            self._render_cache_key is not None
+            and self._render_cache_key[:2] == key
+            and self.canvas.heatmap.has_image()
+        ):
+            self.canvas.heatmap.set_current_trace(
+                self._current_trace_for_channel(self._render_cache_key[2])
+            )
+            self._update_overlay_geometry()
+            return
+
+        if self._resolve_render_target() is None:
+            return
+
+        self._refresh_cached_rendering()
+        self._update_overlay_geometry()
 
     def _on_stft_updated(
         self,
@@ -977,6 +1040,7 @@ class StftModule(QWidget):
             return
 
         seeded_channels: set[int] = set()
+        has_imported_stft_payload = False
         seen_channels: set[int] = set()
         for channel, channel_payload in chart_payload.items():
             try:
@@ -990,6 +1054,7 @@ class StftModule(QWidget):
             stft_payload = channel_payload.get("stft")
             if not isinstance(stft_payload, dict):
                 continue
+            has_imported_stft_payload = True
             parsed_payload = self._validated_imported_stft_payload(stft_payload)
             if parsed_payload is None:
                 continue
@@ -1007,6 +1072,9 @@ class StftModule(QWidget):
             if cache_entry.has_data():
                 self._stft_cache[(config_id, run_id, channel_index)] = cache_entry
                 seeded_channels.add(channel_index)
+
+        if not has_imported_stft_payload:
+            return
 
         for cache_key in list(self._stft_cache):
             cache_config_id, cache_run_id, cache_channel_index = cache_key
@@ -1099,6 +1167,28 @@ class StftModule(QWidget):
             if isinstance(score_payload, dict):
                 self._score_payload_by_channel[channel_index] = score_payload
 
+    def _refresh_current_trace_payloads_from_review(
+        self,
+        review: FactoryReviewPayload,
+    ) -> None:
+        self._current_trace_payload_by_channel.clear()
+        chart_payload = getattr(review, "chart_payload", None)
+        if not isinstance(chart_payload, dict):
+            return
+
+        for channel_key, channel_payload in chart_payload.items():
+            try:
+                channel_index = int(channel_key)
+            except (TypeError, ValueError):
+                continue
+            if channel_index in self._current_trace_payload_by_channel:
+                continue
+            if not isinstance(channel_payload, dict):
+                continue
+            current_trace = channel_payload.get("current_trace")
+            if isinstance(current_trace, dict):
+                self._current_trace_payload_by_channel[channel_index] = current_trace
+
     def _refresh_score_title(self) -> None:
         self._set_score_title(self._score_title_for_current_context())
 
@@ -1125,13 +1215,38 @@ class StftModule(QWidget):
         self,
         review: FactoryReviewPayload,
     ) -> bool:
+        return self._review_payload_matches_active_context(review)
+
+    def _review_payload_matches_active_context(
+        self,
+        review: FactoryReviewPayload,
+    ) -> bool:
         if self._factory_state.run_phase not in self._REVIEW_PHASES:
             return False
+        return self._review_payload_matches_display_context(review)
+
+    def _review_payload_matches_display_context(
+        self,
+        review: FactoryReviewPayload,
+    ) -> bool:
         if review.displayed_config_id != self._factory_state.displayed_config_id:
             return False
         if not isinstance(review.run_id, str) or not review.run_id:
             return False
         return self._display_run_id is None or review.run_id == self._display_run_id
+
+    def _current_trace_for_channel(self, channel_index: int | None) -> dict | None:
+        if channel_index is None:
+            return None
+        if self._review_payload_matches_score_context(self._review_payload):
+            return self._current_trace_payload_by_channel.get(channel_index)
+        if self._factory_state.run_phase not in {"running", "analyzing"}:
+            return None
+        config_id = self._factory_state.displayed_config_id
+        run_id = self._display_run_id
+        if config_id is None or not isinstance(run_id, str) or not run_id:
+            return None
+        return self._live_current_trace_payload_by_run.get((config_id, run_id))
 
     def _score_title_from_payload(self, score_payload: dict | None) -> str:
         if not isinstance(score_payload, dict):
@@ -1412,6 +1527,7 @@ class StftModule(QWidget):
         if (
             self._factory_state.run_phase not in self._REVIEW_PHASES
             or self._selected_window is None
+            or not self._review_payload_matches_active_context(self._review_payload)
         ):
             return None
 
@@ -1464,7 +1580,10 @@ class StftModule(QWidget):
         self,
         review: FactoryReviewPayload,
     ) -> tuple[float, float] | None:
-        if review.displayed_config_id is None:
+        if (
+            review.displayed_config_id is None
+            or not self._review_payload_matches_display_context(review)
+        ):
             return None
 
         if review.no_result or review.error_message:
@@ -1566,10 +1685,18 @@ class StftModule(QWidget):
 
     def _update_overlay_geometry(self) -> None:
         in_review_phase = self._factory_state.run_phase in self._REVIEW_PHASES
-        manual_allowed = bool(
-            getattr(self._review_payload, "manual_reanalysis_allowed", False)
+        review_matches_active_context = self._review_payload_matches_active_context(
+            self._review_payload
         )
-        has_review_window = self._selected_window is not None and in_review_phase
+        manual_allowed = bool(
+            review_matches_active_context
+            and getattr(self._review_payload, "manual_reanalysis_allowed", False)
+        )
+        has_review_window = (
+            self._selected_window is not None
+            and in_review_phase
+            and review_matches_active_context
+        )
         geometry = (
             self._current_overlay_geometry()
             if (has_review_window or manual_allowed)
@@ -1964,6 +2091,11 @@ class StftModule(QWidget):
             self._display_run_id = review.run_id
             self._display_run_id_locked_by_runtime = False
         elif self._factory_state.run_phase in self._REVIEW_PHASES:
+            if (
+                review.displayed_config_id is not None
+                and review.displayed_config_id != self._factory_state.displayed_config_id
+            ):
+                return
             self._display_run_id = None
             self._display_run_id_locked_by_runtime = False
 
@@ -2009,6 +2141,7 @@ class StftModule(QWidget):
         payload: dict,
     ) -> None:
         levels_db = self._fixed_color_levels_for_channel(cache_key[2])
+        current_trace = self._current_trace_for_channel(cache_key[2])
         render_signature = (
             cache_key,
             cache_entry.render_revision,
@@ -2018,6 +2151,7 @@ class StftModule(QWidget):
         has_image = self.canvas.heatmap.has_image()
         if render_signature == self._last_render_signature and has_image:
             self._render_cache_key = cache_key
+            self.canvas.heatmap.set_current_trace(current_trace)
             return
 
         reset_levels = cache_key != self._render_cache_key or not has_image
@@ -2030,6 +2164,7 @@ class StftModule(QWidget):
             levels_db=levels_db,
             snap_initial_to_zero=cache_entry.snap_initial_to_zero,
         )
+        self.canvas.heatmap.set_current_trace(current_trace)
         self._last_render_signature = render_signature
 
     def _clear_rendering(self) -> None:

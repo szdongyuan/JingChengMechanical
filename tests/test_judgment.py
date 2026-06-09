@@ -722,6 +722,187 @@ class TestLimitChecks:
         assert bands[0].lower == pytest.approx(50.0)
         assert bands[0].upper == pytest.approx(60.0)
 
+    def test_fft_grouped_upper_only_limit_fails_with_nullable_lower(
+        self,
+        monkeypatch,
+    ):
+        engine = self._make_engine()
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    spl_upper_limit=200.0,
+                    fft_band_limits=[
+                        {
+                            "kind": "upper",
+                            "points": [
+                                {"freq": 1000.0, "limit": 50.0},
+                                {"freq": 2000.0, "limit": 50.0},
+                            ],
+                        }
+                    ],
+                )
+            ],
+        )
+
+        monkeypatch.setattr(
+            dsp,
+            "compute_fft_spectrum",
+            lambda signal, sample_rate, nfft: (
+                np.array([1000.0, 1500.0, 2000.0], dtype=np.float64),
+                np.array([40.0, 60.0, 40.0], dtype=np.float64) + _REF_DB,
+            ),
+        )
+
+        result = engine.judge(
+            config,
+            np.ones((int(48_000.0 * 3.0), 1)),
+            48_000.0,
+            mic_cal={},
+            audio_file_path="/tmp/a.wav",
+        )
+
+        bands = result.channel_results[0].fft_band_results
+        assert [band.freq for band in bands] == [1500.0]
+        assert bands[0].lower is None
+        assert bands[0].upper == pytest.approx(50.0)
+        assert bands[0].passed is False
+
+    def test_fft_grouped_lower_only_limit_fails_with_nullable_upper(
+        self,
+        monkeypatch,
+    ):
+        engine = self._make_engine()
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    spl_upper_limit=200.0,
+                    fft_band_limits=[
+                        {
+                            "kind": "lower",
+                            "points": [
+                                {"freq": 1000.0, "limit": 40.0},
+                                {"freq": 2000.0, "limit": 40.0},
+                            ],
+                        }
+                    ],
+                )
+            ],
+        )
+
+        monkeypatch.setattr(
+            dsp,
+            "compute_fft_spectrum",
+            lambda signal, sample_rate, nfft: (
+                np.array([1000.0, 1500.0, 2000.0], dtype=np.float64),
+                np.array([50.0, 30.0, 50.0], dtype=np.float64) + _REF_DB,
+            ),
+        )
+
+        result = engine.judge(
+            config,
+            np.ones((int(48_000.0 * 3.0), 1)),
+            48_000.0,
+            mic_cal={},
+            audio_file_path="/tmp/a.wav",
+        )
+
+        bands = result.channel_results[0].fft_band_results
+        assert [band.freq for band in bands] == [1500.0]
+        assert bands[0].lower == pytest.approx(40.0)
+        assert bands[0].upper is None
+        assert bands[0].passed is False
+
+    def test_fft_duplicate_frequency_upper_limit_forms_vertical_step(
+        self,
+        monkeypatch,
+    ):
+        engine = self._make_engine()
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    spl_upper_limit=200.0,
+                    fft_band_limits=[
+                        {
+                            "kind": "upper",
+                            "points": [
+                                {"freq": 1000.0, "limit": 100.0},
+                                {"freq": 2000.0, "limit": 100.0},
+                                {"freq": 2000.0, "limit": 50.0},
+                                {"freq": 3000.0, "limit": 50.0},
+                            ],
+                        }
+                    ],
+                )
+            ],
+        )
+
+        monkeypatch.setattr(
+            dsp,
+            "compute_fft_spectrum",
+            lambda signal, sample_rate, nfft: (
+                np.asarray([1500.0, 2000.0, 2500.0], dtype=np.float64),
+                np.asarray([90.0, 75.0, 75.0], dtype=np.float64) + _REF_DB,
+            ),
+        )
+
+        result = engine.judge(
+            config,
+            np.ones((int(48_000.0 * 3.0), 1)),
+            48_000.0,
+            mic_cal={},
+            audio_file_path="/tmp/a.wav",
+        )
+
+        bands = result.channel_results[0].fft_band_results
+        assert [band.freq for band in bands] == [2000.0, 2500.0]
+        assert [band.lower for band in bands] == [None, None]
+        assert bands[0].upper == pytest.approx(50.0)
+        assert bands[1].upper == pytest.approx(50.0)
+        assert all(band.passed is False for band in bands)
+
+    def test_fft_malformed_grouped_limit_shape_makes_runtime_unavailable(
+        self,
+        monkeypatch,
+    ):
+        engine = self._make_engine()
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    spl_upper_limit=200.0,
+                    fft_band_limits=[
+                        {"kind": "upper", "points": "not a list"},
+                    ],
+                )
+            ],
+        )
+
+        monkeypatch.setattr(
+            dsp,
+            "compute_fft_spectrum",
+            lambda signal, sample_rate, nfft: (
+                np.array([1000.0, 2000.0], dtype=np.float64),
+                np.array([40.0, 40.0], dtype=np.float64) + _REF_DB,
+            ),
+        )
+
+        result = engine.judge(
+            config,
+            np.ones((int(48_000.0 * 3.0), 1)),
+            48_000.0,
+            mic_cal={},
+            audio_file_path="/tmp/a.wav",
+        )
+
+        channel_result = result.channel_results[0]
+        assert channel_result.fft_available is False
+        assert channel_result.fft_band_results == []
+        assert (channel_result.fft_error_message or "").startswith("FFT")
+        assert "points" in (channel_result.fft_error_message or "")
+
     def test_fft_absolute_mode_envelope_judges_between_points_in_absolute_space(
         self,
         tmp_path,
@@ -865,7 +1046,7 @@ class TestLimitChecks:
         channel_result = result.channel_results[0]
         assert channel_result.fft_available is False
         assert channel_result.fft_band_results == []
-        assert "下限包络必须小于上限包络" in (
+        assert "下限必须小于上限" in (
             channel_result.fft_error_message or ""
         )
         assert result.limit_pass is False
@@ -877,7 +1058,7 @@ class TestLimitChecks:
             ({"freq": float("nan"), "lower": 9.0, "upper": 13.0}, "频率"),
             ({"freq": 1500.0, "lower": float("nan"), "upper": 13.0}, "下限"),
             ({"freq": 1500.0, "lower": 9.0, "upper": float("inf")}, "上限"),
-            ({"freq": True, "lower": 9.0, "upper": 13.0}, "布尔"),
+            ({"freq": True, "lower": 9.0, "upper": 13.0}, "有限数字"),
             ("not a row", "格式"),
             ({"freq": 1500.0, "lower": 13.0, "upper": 13.0}, "小于"),
         ],
@@ -1172,6 +1353,7 @@ class TestLimitChecks:
                     fft_nfft=4096,
                     fft_band_limits=[
                         {"freq": 1000.0, "lower": 9.0, "upper": 13.0},
+                        {"freq": 2000.0, "lower": 9.0, "upper": 13.0},
                     ],
                     fft_golden_mode="off",
                 )
@@ -1221,6 +1403,7 @@ class TestLimitChecks:
                     fft_nfft=0,
                     fft_band_limits=[
                         {"freq": 1000.0, "lower": -1.0, "upper": 1.0},
+                        {"freq": 2000.0, "lower": -1.0, "upper": 1.0},
                     ],
                     fft_golden_mode="absolute",
                     **_golden_binding(golden_path),
@@ -1400,6 +1583,7 @@ class TestLimitChecks:
                     0,
                     fft_band_limits=[
                         {"freq": 1000.0, "lower": -1.0, "upper": 1.0},
+                        {"freq": 2000.0, "lower": -1.0, "upper": 1.0},
                     ],
                     fft_golden_mode="absolute",
                     **_golden_binding(golden_path, sample_rate=sr),
@@ -1443,6 +1627,7 @@ class TestLimitChecks:
                     0,
                     oct_band_limits=[
                         {"freq": 1000.0, "lower": -2.0, "upper": 2.0},
+                        {"freq": 2000.0, "lower": -2.0, "upper": 2.0},
                     ],
                     oct_golden_mode="absolute",
                     **_golden_binding(golden_path),
@@ -1457,8 +1642,8 @@ class TestLimitChecks:
                 level = 12.0
             else:  # pragma: no cover - makes failures easier to read
                 raise AssertionError(f"unexpected signal marker {float(signal[0])}")
-            return np.array([1000.0], dtype=np.float64), np.array(
-                [level + _REF_DB],
+            return np.array([1000.0, 2000.0], dtype=np.float64), np.array(
+                [level + _REF_DB, level + _REF_DB],
                 dtype=np.float64,
             )
 
@@ -1500,6 +1685,7 @@ class TestLimitChecks:
                     0,
                     oct_band_limits=[
                         {"freq": 1000.0, "lower": 1.0, "upper": 3.0},
+                        {"freq": 2000.0, "lower": 1.0, "upper": 3.0},
                     ],
                     oct_golden_mode="delta",
                     **_golden_binding(golden_path),
@@ -1514,8 +1700,8 @@ class TestLimitChecks:
                 level = 12.0
             else:  # pragma: no cover - makes failures easier to read
                 raise AssertionError(f"unexpected signal marker {float(signal[0])}")
-            return np.array([1000.0], dtype=np.float64), np.array(
-                [level + _REF_DB],
+            return np.array([1000.0, 2000.0], dtype=np.float64), np.array(
+                [level + _REF_DB, level + _REF_DB],
                 dtype=np.float64,
             )
 
@@ -1537,6 +1723,228 @@ class TestLimitChecks:
         assert band.passed is True
         assert result.channel_results[0].octave_available is True
 
+    def test_octave_grouped_upper_only_limit_fails_with_nullable_lower(
+        self,
+        monkeypatch,
+    ):
+        engine = self._make_engine()
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    oct_band_limits=[
+                        {
+                            "kind": "upper",
+                            "points": [
+                                {"freq": 1000.0, "limit": 50.0},
+                                {"freq": 2000.0, "limit": 50.0},
+                            ],
+                        }
+                    ],
+                )
+            ],
+        )
+
+        monkeypatch.setattr(
+            dsp,
+            "compute_octave_bands",
+            lambda signal, sample_rate, weighting: (
+                np.array([1000.0, 1500.0, 2000.0], dtype=np.float64),
+                np.array([40.0, 60.0, 40.0], dtype=np.float64) + _REF_DB,
+            ),
+        )
+
+        result = engine.judge(
+            config,
+            np.ones((int(48_000.0 * 3.0), 1)),
+            48_000.0,
+            mic_cal={},
+            audio_file_path="/tmp/a.wav",
+        )
+
+        bands = result.channel_results[0].oct_band_results
+        assert [band.freq for band in bands] == [1000.0, 1500.0, 2000.0]
+        assert [band.passed for band in bands] == [True, False, True]
+        assert bands[1].lower is None
+        assert bands[1].upper == pytest.approx(50.0)
+
+    def test_octave_grouped_lower_only_limit_fails_with_nullable_upper(
+        self,
+        monkeypatch,
+    ):
+        engine = self._make_engine()
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    oct_band_limits=[
+                        {
+                            "kind": "lower",
+                            "points": [
+                                {"freq": 1000.0, "limit": 40.0},
+                                {"freq": 2000.0, "limit": 40.0},
+                            ],
+                        }
+                    ],
+                )
+            ],
+        )
+
+        monkeypatch.setattr(
+            dsp,
+            "compute_octave_bands",
+            lambda signal, sample_rate, weighting: (
+                np.array([1000.0, 1500.0, 2000.0], dtype=np.float64),
+                np.array([50.0, 30.0, 50.0], dtype=np.float64) + _REF_DB,
+            ),
+        )
+
+        result = engine.judge(
+            config,
+            np.ones((int(48_000.0 * 3.0), 1)),
+            48_000.0,
+            mic_cal={},
+            audio_file_path="/tmp/a.wav",
+        )
+
+        bands = result.channel_results[0].oct_band_results
+        assert [band.freq for band in bands] == [1000.0, 1500.0, 2000.0]
+        assert [band.passed for band in bands] == [True, False, True]
+        assert bands[1].lower == pytest.approx(40.0)
+        assert bands[1].upper is None
+
+    def test_octave_limit_line_is_sampled_at_measured_centers(
+        self,
+        monkeypatch,
+    ):
+        engine = self._make_engine()
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    oct_band_limits=[
+                        {
+                            "kind": "upper",
+                            "points": [
+                                {"freq": 1000.0, "limit": 50.0},
+                                {"freq": 2000.0, "limit": 70.0},
+                            ],
+                        }
+                    ],
+                )
+            ],
+        )
+
+        monkeypatch.setattr(
+            dsp,
+            "compute_octave_bands",
+            lambda signal, sample_rate, weighting: (
+                np.array([1500.0], dtype=np.float64),
+                np.array([62.0], dtype=np.float64) + _REF_DB,
+            ),
+        )
+
+        result = engine.judge(
+            config,
+            np.ones((int(48_000.0 * 3.0), 1)),
+            48_000.0,
+            mic_cal={},
+            audio_file_path="/tmp/a.wav",
+        )
+
+        bands = result.channel_results[0].oct_band_results
+        assert len(bands) == 1
+        assert bands[0].freq == pytest.approx(1500.0)
+        assert bands[0].upper == pytest.approx(60.0)
+        assert bands[0].passed is False
+
+    def test_octave_duplicate_frequency_upper_limit_forms_vertical_step(
+        self,
+        monkeypatch,
+    ):
+        engine = self._make_engine()
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    oct_band_limits=[
+                        {
+                            "kind": "upper",
+                            "points": [
+                                {"freq": 1000.0, "limit": 100.0},
+                                {"freq": 2000.0, "limit": 100.0},
+                                {"freq": 2000.0, "limit": 50.0},
+                                {"freq": 3000.0, "limit": 50.0},
+                            ],
+                        }
+                    ],
+                )
+            ],
+        )
+
+        monkeypatch.setattr(
+            dsp,
+            "compute_octave_bands",
+            lambda signal, sample_rate, weighting: (
+                np.asarray([1500.0, 2000.0, 2500.0], dtype=np.float64),
+                np.asarray([90.0, 75.0, 75.0], dtype=np.float64) + _REF_DB,
+            ),
+        )
+
+        result = engine.judge(
+            config,
+            np.ones((int(48_000.0 * 3.0), 1)),
+            48_000.0,
+            mic_cal={},
+            audio_file_path="/tmp/a.wav",
+        )
+
+        bands = result.channel_results[0].oct_band_results
+        assert [band.freq for band in bands] == [1500.0, 2000.0, 2500.0]
+        assert [band.passed for band in bands] == [True, False, False]
+        assert bands[1].upper == pytest.approx(50.0)
+        assert bands[2].upper == pytest.approx(50.0)
+        assert [band.lower for band in bands] == [None, None, None]
+
+    def test_octave_malformed_grouped_limit_shape_makes_runtime_unavailable(
+        self,
+        monkeypatch,
+    ):
+        engine = self._make_engine()
+        config = _make_config(
+            channels=[
+                _make_channel_config(
+                    0,
+                    oct_band_limits=[
+                        {"kind": "upper", "points": "not a list"},
+                    ],
+                )
+            ],
+        )
+
+        monkeypatch.setattr(
+            dsp,
+            "compute_octave_bands",
+            lambda signal, sample_rate, weighting: (
+                np.array([1000.0, 2000.0], dtype=np.float64),
+                np.array([40.0, 40.0], dtype=np.float64) + _REF_DB,
+            ),
+        )
+
+        result = engine.judge(
+            config,
+            np.ones((int(48_000.0 * 3.0), 1)),
+            48_000.0,
+            mic_cal={},
+            audio_file_path="/tmp/a.wav",
+        )
+
+        channel_result = result.channel_results[0]
+        assert channel_result.octave_available is False
+        assert channel_result.oct_band_results == []
+        assert (channel_result.octave_error_message or "").startswith("倍频程")
+        assert "points" in (channel_result.octave_error_message or "")
+
     def test_octave_golden_derive_failure_becomes_unavailable_instead_of_raising(
         self,
         tmp_path,
@@ -1557,6 +1965,7 @@ class TestLimitChecks:
                     0,
                     oct_band_limits=[
                         {"freq": 1000.0, "lower": -1.0, "upper": 1.0},
+                        {"freq": 2000.0, "lower": -1.0, "upper": 1.0},
                     ],
                     oct_golden_mode="absolute",
                     **_golden_binding(golden_path, sample_rate=sr),
@@ -1605,6 +2014,7 @@ class TestLimitChecks:
                     0,
                     oct_band_limits=[
                         {"freq": 1000.0, "lower": -2.0, "upper": 2.0},
+                        {"freq": 2000.0, "lower": -2.0, "upper": 2.0},
                     ],
                     oct_golden_mode="absolute",
                     **_golden_binding(golden_path, sample_rate=sr),
@@ -1619,8 +2029,8 @@ class TestLimitChecks:
                 level = 12.0
             else:  # pragma: no cover - makes failures easier to read
                 raise AssertionError(f"unexpected signal marker {float(signal[0])}")
-            return np.array([1000.0], dtype=np.float64), np.array(
-                [level + _REF_DB],
+            return np.array([1000.0, 2000.0], dtype=np.float64), np.array(
+                [level + _REF_DB, level + _REF_DB],
                 dtype=np.float64,
             )
 
@@ -1657,9 +2067,11 @@ class TestLimitChecks:
                     0,
                     fft_band_limits=[
                         {"freq": 1000.0, "lower": -3.0, "upper": 3.0},
+                        {"freq": 2000.0, "lower": -3.0, "upper": 3.0},
                     ],
                     oct_band_limits=[
                         {"freq": 1000.0, "lower": -3.0, "upper": 3.0},
+                        {"freq": 2000.0, "lower": -3.0, "upper": 3.0},
                     ],
                     fft_golden_mode="absolute",
                     oct_golden_mode="delta",
@@ -1926,7 +2338,10 @@ class TestLimitChecks:
         # Set octave band limit: 1 kHz upper = 50 dB (will be exceeded)
         config = _make_config(
             channels=[_make_channel_config(0,
-                oct_band_limits=[{"freq": 1000, "lower": -100, "upper": 50}],
+                oct_band_limits=[
+                    {"freq": 900, "lower": -100, "upper": 50},
+                    {"freq": 1100, "lower": -100, "upper": 50},
+                ],
             )],
         )
         result = engine.judge(config, buf, sr, mic_cal={},
@@ -2004,6 +2419,48 @@ class TestLimitChecks:
         result = engine.judge(config, buf, sr, mic_cal={},
                               audio_file_path="/tmp/test.wav")
         assert len(result.channel_results) == 2
+
+    def test_vibration_channel_is_excluded_from_limit_judgment(self):
+        engine = self._make_engine()
+        sr = 44100.0
+        t = np.arange(int(sr * 3.0)) / sr
+        mic_amplitude = 20e-6 * 10 ** (60 / 20)
+        vibration_amplitude = 20e-6 * 10 ** (120 / 20)
+        mic = mic_amplitude * np.sin(2 * np.pi * 1000 * t)
+        vibration = vibration_amplitude * np.sin(2 * np.pi * 50 * t)
+        buf = np.column_stack([mic, vibration])
+        config = _make_config(
+            selected_channels=[0, 1],
+            vibration_view_channel_index=1,
+            channels=[
+                _make_channel_config(0),
+                _make_channel_config(1, spl_upper_limit=1.0),
+            ],
+        )
+
+        result = engine.judge(config, buf, sr, mic_cal={},
+                              audio_file_path="/tmp/test.wav")
+
+        assert result.limit_pass is True
+        assert [channel.channel_index for channel in result.channel_results] == [0]
+
+    def test_vibration_only_selection_does_not_fail_limits(self):
+        engine = self._make_engine()
+        sr = 44100.0
+        t = np.arange(int(sr * 3.0)) / sr
+        vibration = np.sin(2 * np.pi * 50 * t)
+        buf = np.column_stack([np.zeros_like(vibration), vibration])
+        config = _make_config(
+            selected_channels=[1],
+            vibration_view_channel_index=1,
+            channels=[_make_channel_config(1, spl_upper_limit=1.0)],
+        )
+
+        result = engine.judge(config, buf, sr, mic_cal={},
+                              audio_file_path="/tmp/test.wav")
+
+        assert result.limit_pass is True
+        assert result.channel_results == []
 
 
 class TestRejudge:

@@ -42,6 +42,20 @@ class TestConfigTable(BaseModel):
     analysis_window_offset_ms = IntegerField(default=0)
     monitor_channel_index = IntegerField(null=True, default=None)
     monitor_gain_db = FloatField(null=True, default=None)
+    current_meter_enabled = BooleanField(default=False)
+    current_meter_host = TextField(null=True, default=None)
+    current_meter_port = IntegerField(default=502)
+    current_meter_unit_id = IntegerField(default=1)
+    current_meter_register_type = TextField(default="input")
+    current_meter_register_address = IntegerField(default=0)
+    current_meter_register_count = IntegerField(default=1)
+    current_meter_data_type = TextField(default="uint16")
+    current_meter_byte_order = TextField(default="big")
+    current_meter_word_order = TextField(default="big")
+    current_meter_scale = FloatField(default=0.001)
+    current_meter_offset = FloatField(default=0.0)
+    current_meter_poll_interval_ms = IntegerField(default=200)
+    current_meter_timeout_ms = IntegerField(default=1000)
 
     class Meta:
         table_name = "test_config_table"

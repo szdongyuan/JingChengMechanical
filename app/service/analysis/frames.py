@@ -50,8 +50,8 @@ class BandResult:
     """Pass/fail result for a single frequency band limit check."""
     freq: float
     level: float
-    lower: float
-    upper: float
+    lower: float | None
+    upper: float | None
     passed: bool
 
 

@@ -202,6 +202,74 @@ def test_line_chart_widget_uses_zero_based_x_axis_without_horizontal_padding(qap
         widget.close()
 
 
+def test_line_chart_widget_uses_explicit_x_axis_range_without_padding(qapp):
+    widget = LineChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_series(
+            [4.05, 4.10, 4.15],
+            [70.0, 71.0, 72.0],
+            x_axis_range=(4.0, 12.0),
+        )
+        qapp.processEvents()
+
+        _assert_x_range(widget, (4.0, 12.0))
+        assert widget.series_payload()["x_axis_range"] == pytest.approx((4.0, 12.0))
+    finally:
+        widget.close()
+
+
+def test_line_chart_widget_reset_view_restores_explicit_x_axis_range(qapp):
+    widget = LineChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_series(
+            [4.05, 4.10, 4.15],
+            [70.0, 71.0, 72.0],
+            x_axis_range=(4.0, 12.0),
+        )
+        widget.plot_item.vb.setXRange(6.0, 7.0, padding=0.0)
+        widget.chart_interactions.reset_view()
+        qapp.processEvents()
+
+        _assert_x_range(widget, (4.0, 12.0))
+    finally:
+        widget.close()
+
+
+def test_line_chart_widget_rejects_invalid_explicit_x_axis_range(qapp):
+    widget = LineChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        with pytest.raises(ValueError, match="x_axis_range"):
+            widget.set_series([1.0], [70.0], x_axis_range=(5.0, 5.0))
+        assert widget.series_payload() is None
+    finally:
+        widget.close()
+
+
+def test_line_chart_widget_clear_data_removes_explicit_x_axis_range(qapp):
+    widget = LineChartWidget()
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_series(
+            [4.05, 4.10, 4.15],
+            [70.0, 71.0, 72.0],
+            x_axis_range=(4.0, 12.0),
+        )
+        widget.clear_data()
+        qapp.processEvents()
+
+        assert widget.series_payload() is None
+        _assert_x_range(widget, (0.0, 1.0))
+    finally:
+        widget.close()
+
+
 def test_line_chart_widget_limit_lines_do_not_expand_zero_based_x_range(qapp):
     widget = LineChartWidget()
 

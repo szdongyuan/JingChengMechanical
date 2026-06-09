@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from types import SimpleNamespace
 
@@ -87,6 +88,11 @@ def _visible_label_text(widget):
     )
 
 
+def _assert_x_range(widget, expected_range: tuple[float, float]) -> None:
+    x_range, _ = widget.plot_item.vb.viewRange()
+    assert x_range == pytest.approx(expected_range)
+
+
 def _review_payload(config_id=101):
     return FactoryReviewPayload(
         displayed_config_id=config_id,
@@ -159,6 +165,30 @@ def test_vibration_axis_module_renders_selected_channel_payload(qapp):
     _assert_no_forbidden_vibration_text(module)
 
 
+def test_vibration_axis_module_uses_selected_window_axis_range(qapp):
+    review = _review_payload(101)
+    vibration_payload = review.chart_payload[1]["vibration"]
+    vibration_payload["frequency_times_sec"] = [4.05, 4.10]
+    vibration_payload["fundamental_frequency_values_hz"] = [41.5, 42.5]
+    vibration_payload["spectral_centroid_values_hz"] = [43.0, 43.4]
+    vibration_payload["x_axis_range_sec"] = [4.0, 12.0]
+    services = _services(
+        state=FactoryControllerState(displayed_config_id=101, run_phase="reviewing"),
+        review=review,
+    )
+    module = VibrationAxisModule(services)
+    module.selected_display_channel_provider = lambda: 1
+
+    module.refresh_selected_display_channel()
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is True
+    _assert_x_range(module.plot, (4.0, 12.0))
+    centroid_x, centroid_y = module._centroid_curve.getData()
+    assert list(centroid_x) == [4.05, 4.10]
+    assert list(centroid_y) == [43.0, 43.4]
+
+
 def test_vibration_axis_module_exposes_frequency_stability_indicators(qapp):
     services = _services(
         state=FactoryControllerState(displayed_config_id=101, run_phase="reviewing"),
@@ -197,6 +227,42 @@ def test_vibration_trend_module_renders_rms_and_peak_series(qapp):
     assert module.plot.series_payload()["y_values"] == pytest.approx([1.0, 1.5])
     assert module.current_peak_values() == pytest.approx([2.0, 3.0])
     _assert_no_forbidden_vibration_text(module)
+
+
+def test_vibration_trend_module_uses_selected_window_axis_range(qapp):
+    review = _review_payload(101)
+    vibration_payload = review.chart_payload[1]["vibration"]
+    vibration_payload["times_sec"] = [4.05, 4.10]
+    vibration_payload["rms_values"] = [1.0, 1.5]
+    vibration_payload["peak_values"] = [5.0, 6.0]
+    vibration_payload["x_axis_range_sec"] = [4.0, 12.0]
+    services = _services(
+        state=FactoryControllerState(displayed_config_id=101, run_phase="reviewing"),
+        review=review,
+    )
+    module = VibrationTrendModule(services)
+    module.selected_display_channel_provider = lambda: 1
+
+    module.refresh_selected_display_channel()
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is True
+    _assert_x_range(module.plot, (4.0, 12.0))
+    emphasis_x, emphasis_y = module._rms_emphasis_curve.getData()
+    peak_x, peak_y = module._peak_curve.getData()
+    pulse_x, pulse_y = module._pulse_marker_curve.getData()
+    assert list(emphasis_x) == [4.05, 4.10]
+    assert list(emphasis_y) == [1.0, 1.5]
+    assert list(peak_x) == [4.05, 4.10]
+    assert list(peak_y) == [5.0, 6.0]
+    assert list(pulse_x) == pytest.approx(
+        [4.05, 4.05, math.nan, 4.10, 4.10, math.nan],
+        nan_ok=True,
+    )
+    assert list(pulse_y) == pytest.approx(
+        [1.0, 5.0, math.nan, 1.5, 6.0, math.nan],
+        nan_ok=True,
+    )
 
 
 def test_vibration_trend_module_exposes_pulse_indicators(qapp):

@@ -1,17 +1,19 @@
 from __future__ import annotations
 
-import math
+import copy
 from contextlib import contextmanager
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QPoint, Qt, QTimer
 from PyQt6.QtGui import QWheelEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
@@ -26,18 +28,17 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QStackedWidget,
-    QStyledItemDelegate,
-    QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from app.service.current_meter_service import current_meter_display_unit, normalize_current_meter_config
 from model.plc_table import PlcTable
 from ui.popups import config_package_dialogs
 from ui.popups.golden_sample_import_dialog import GoldenSampleImportDialog
 from ui.widgets.cards import Card
 from ui.widgets.collapsible_group_box import CollapsibleGroupBox
+from ui.widgets.limit_table_editor import LimitTableEditor
 
 _GOLDEN_BINDING_FIELDS = (
     "golden_sample_path",
@@ -78,6 +79,181 @@ class _NoWheelPlainTextEdit(QPlainTextEdit):
 
     def wheelEvent(self, event: QWheelEvent):
         event.ignore()
+
+
+class _ConfigSectionCardDialog(QDialog):
+    def __init__(
+        self,
+        title: str,
+        content: QWidget,
+        parent: QWidget,
+        *,
+        object_name: str,
+        close_button_object_name: str,
+        default_position_anchor: QWidget | None = None,
+        confirm_button_object_name: str = "ConfigSectionCardConfirmButton",
+        preferred_size: tuple[int, int] | None = None,
+    ):
+        super().__init__(
+            parent,
+            Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint,
+        )
+        self.setObjectName(object_name)
+        self.setWindowTitle(title)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+        self._drag_offset: QPoint | None = None
+        self._user_moved = False
+        self._default_position_anchor = default_position_anchor
+        self._preferred_size = preferred_size
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+
+        frame = QFrame()
+        frame.setObjectName("ChannelSectionCard")
+        frame.setStyleSheet(
+            "QFrame#ChannelSectionCard { background: white; border: 1px solid #cbd5e1; "
+            "border-radius: 8px; }"
+            "QWidget#ChannelSectionCardTitle { background: #f8fafc; "
+            "border-bottom: 1px solid #e2e8f0; border-top-left-radius: 8px; "
+            "border-top-right-radius: 8px; }"
+        )
+        frame_layout = QVBoxLayout(frame)
+        frame_layout.setContentsMargins(0, 0, 0, 0)
+        frame_layout.setSpacing(0)
+
+        title_bar = QWidget()
+        title_bar.setObjectName("ChannelSectionCardTitle")
+        title_bar.setCursor(Qt.CursorShape.SizeAllCursor)
+        title_layout = QHBoxLayout(title_bar)
+        title_layout.setContentsMargins(12, 8, 8, 8)
+        title_layout.setSpacing(8)
+
+        title_label = QLabel(title)
+        title_label.setObjectName("ChannelSectionCardTitleLabel")
+        title_label.setStyleSheet("font-weight: 700; color: #334155;")
+        title_layout.addWidget(title_label, 1)
+
+        close_button = QPushButton("X")
+        close_button.setObjectName(close_button_object_name)
+        close_button.clicked.connect(self.hide)
+        title_layout.addWidget(close_button, 0)
+        frame_layout.addWidget(title_bar)
+
+        body_widget = QWidget()
+        body_layout = QVBoxLayout(body_widget)
+        body_layout.setContentsMargins(12, 12, 12, 12)
+        body_layout.setSpacing(0)
+        body_layout.addWidget(content)
+        body_layout.addStretch(1)
+
+        body_scroll = QScrollArea()
+        body_scroll.setObjectName("ConfigSectionCardBodyScroll")
+        body_scroll.setWidgetResizable(True)
+        body_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        body_scroll.setWidget(body_widget)
+        frame_layout.addWidget(body_scroll, 1)
+
+        footer = QWidget()
+        footer_layout = QHBoxLayout(footer)
+        footer_layout.setContentsMargins(12, 8, 12, 12)
+        footer_layout.setSpacing(8)
+        footer_layout.addStretch(1)
+
+        confirm_button = QPushButton("确定")
+        confirm_button.setObjectName(confirm_button_object_name)
+        confirm_button.clicked.connect(self._confirm)
+        footer_layout.addWidget(confirm_button, 0)
+        frame_layout.addWidget(footer, 0)
+        root.addWidget(frame)
+
+        self._title_bar = title_bar
+        self._content = content
+        self._title_bar.mousePressEvent = self._on_title_mouse_press
+        self._title_bar.mouseMoveEvent = self._on_title_mouse_move
+        self._title_bar.mouseReleaseEvent = self._on_title_mouse_release
+
+    def show_card(self) -> None:
+        self.show()
+        if not self._user_moved:
+            self._move_to_default_position()
+            QTimer.singleShot(0, self._move_to_default_position_if_needed)
+        self.raise_()
+        self.activateWindow()
+
+    def closeEvent(self, event) -> None:
+        event.ignore()
+        self.hide()
+
+    def _confirm(self) -> None:
+        self.hide()
+
+    def _move_to_default_position(self) -> None:
+        anchor = self._default_position_anchor or self.parentWidget()
+        if anchor is None:
+            return
+        self.adjustSize()
+        self._apply_preferred_size(anchor)
+        owner = anchor.window()
+        owner_top_left = owner.mapToGlobal(QPoint(0, 0))
+        self.move(
+            QPoint(
+                owner_top_left.x() + (owner.width() - self.width()) // 2,
+                owner_top_left.y() + (owner.height() - self.height()) // 2,
+            )
+        )
+
+    def _apply_preferred_size(self, anchor: QWidget) -> None:
+        if self._preferred_size is None:
+            return
+        owner = anchor.window()
+        preferred_width, preferred_height = self._preferred_size
+        max_width = max(320, owner.width() - 48)
+        max_height = max(360, owner.height() - 48)
+        self.resize(
+            min(max(self.width(), preferred_width), max_width),
+            min(max(self.height(), preferred_height), max_height),
+        )
+
+    def _move_to_default_position_if_needed(self) -> None:
+        if self.isVisible() and not self._user_moved:
+            self._move_to_default_position()
+
+    def _on_title_mouse_press(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return
+        self._drag_offset = event.globalPosition().toPoint() - self.frameGeometry().topLeft()
+        event.accept()
+
+    def _on_title_mouse_move(self, event) -> None:
+        if self._drag_offset is None:
+            return
+        self.move(event.globalPosition().toPoint() - self._drag_offset)
+        self._user_moved = True
+        event.accept()
+
+    def _on_title_mouse_release(self, event) -> None:
+        self._drag_offset = None
+        event.accept()
+
+
+class _ChannelSectionCardDialog(_ConfigSectionCardDialog):
+    def __init__(
+        self,
+        title: str,
+        section: CollapsibleGroupBox,
+        parent: QWidget,
+        preferred_size: tuple[int, int] | None = None,
+    ):
+        super().__init__(
+            title,
+            section,
+            parent,
+            object_name="ChannelSectionCardDialog",
+            close_button_object_name="ChannelSectionCardCloseButton",
+            confirm_button_object_name="ChannelSectionCardConfirmButton",
+            preferred_size=preferred_size,
+        )
 
 
 def _numeric_value(data: dict | None, key: str) -> float:
@@ -183,28 +359,6 @@ _LIMIT_DEFAULTS = {
 }
 
 
-class _FloatDelegate(QStyledItemDelegate):
-    """单元格编辑器限制为浮点数输入。"""
-
-    def createEditor(self, parent, option, index):
-        editor = _NoWheelSpinBox(parent)
-        editor.setRange(-999999.0, 999999.0)
-        editor.setDecimals(2)
-        editor.setFrame(False)
-        editor.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
-        return editor
-
-    def setEditorData(self, editor, index):
-        try:
-            value = float(index.data())
-        except (TypeError, ValueError):
-            value = 0.0
-        editor.setValue(value)
-
-    def setModelData(self, editor, model, index):
-        model.setData(index, str(editor.value()))
-
-
 class ConfigModule(QWidget):
     module_id = "config"
 
@@ -219,6 +373,10 @@ class ConfigModule(QWidget):
         self._suspend_ai_binding_dirty_tracking = False
         self._monitor_channel_explicit = False
         self._suspend_monitor_channel_tracking = False
+        self._channel_section_dialogs: dict[tuple[int, str], _ChannelSectionCardDialog] = {}
+        self._top_level_config_dialogs: dict[str, _ConfigSectionCardDialog] = {}
+        self._loaded_config_editor_snapshot: dict | None = None
+        self._restoring_config_selection = False
 
         self._init_ui()
         self._connect_signals()
@@ -339,41 +497,58 @@ class ConfigModule(QWidget):
         )
         gf_lay.addRow(self.chk_allow_incomplete_recording_analysis)
 
-        self.chk_scan = QCheckBox("扫码枪直接触发测试")
-        gf_lay.addRow("扫码触发", self.chk_scan)
-
         scroll_lay.addWidget(Card("全局参数", global_form))
 
-        # Hardware settings card
-        hw_form = QWidget()
-        hw_lay = QFormLayout(hw_form)
-        hw_lay.setContentsMargins(0, 0, 0, 0)
-        hw_lay.setHorizontalSpacing(10)
-        hw_lay.setVerticalSpacing(8)
+        # PLC binding remains visible at the top level.
+        plc_form = QWidget()
+        plc_lay = QFormLayout(plc_form)
+        plc_lay.setContentsMargins(0, 0, 0, 0)
+        plc_lay.setHorizontalSpacing(10)
+        plc_lay.setVerticalSpacing(8)
 
         self.combo_plc = _NoWheelComboBox()
-        hw_lay.addRow("PLC", self.combo_plc)
+        self.combo_plc.setObjectName("combo_plc")
+        plc_lay.addRow("PLC", self.combo_plc)
+
+        scroll_lay.addWidget(Card("PLC", plc_form))
+
+        top_launcher_panel = QWidget()
+        top_launcher_panel.setObjectName("top_level_config_launcher_panel")
+        top_launcher_layout = QGridLayout(top_launcher_panel)
+        top_launcher_layout.setContentsMargins(0, 0, 0, 0)
+        top_launcher_layout.setHorizontalSpacing(8)
+        top_launcher_layout.setVerticalSpacing(8)
+        for column in range(3):
+            top_launcher_layout.setColumnStretch(column, 1)
+        scroll_lay.addWidget(top_launcher_panel)
+        top_launcher_index = 0
+
+        audio_form = QWidget()
+        audio_lay = QFormLayout(audio_form)
+        audio_lay.setContentsMargins(0, 0, 0, 0)
+        audio_lay.setHorizontalSpacing(10)
+        audio_lay.setVerticalSpacing(8)
 
         self.combo_input_dev = _NoWheelComboBox()
-        hw_lay.addRow("输入设备", self.combo_input_dev)
+        audio_lay.addRow("输入设备", self.combo_input_dev)
 
         self.combo_output_dev = _NoWheelComboBox()
-        hw_lay.addRow("监听设备", self.combo_output_dev)
+        audio_lay.addRow("监听设备", self.combo_output_dev)
 
         self._channel_check_container = QWidget()
         self._channel_check_layout = QGridLayout(self._channel_check_container)
         self._channel_check_layout.setContentsMargins(0, 0, 0, 0)
         self._channel_check_layout.setSpacing(4)
         self._channel_checkboxes = []
-        hw_lay.addRow("通道选择", self._channel_check_container)
+        audio_lay.addRow("通道选择", self._channel_check_container)
 
         self.combo_vibration_view_channel = _NoWheelComboBox()
         self.combo_vibration_view_channel.setObjectName("combo_vibration_view_channel")
-        hw_lay.addRow("振动视图通道", self.combo_vibration_view_channel)
+        audio_lay.addRow("振动视图通道", self.combo_vibration_view_channel)
 
         self.combo_monitor_channel = _NoWheelComboBox()
         self.combo_monitor_channel.setObjectName("combo_monitor_channel")
-        hw_lay.addRow("监听通道", self.combo_monitor_channel)
+        audio_lay.addRow("监听通道", self.combo_monitor_channel)
 
         self.spin_monitor_gain_db = _NoWheelSpinBox()
         self.spin_monitor_gain_db.setObjectName("spin_monitor_gain_db")
@@ -381,11 +556,116 @@ class ConfigModule(QWidget):
         self.spin_monitor_gain_db.setSingleStep(1.0)
         self.spin_monitor_gain_db.setDecimals(1)
         self.spin_monitor_gain_db.setSuffix(" dB")
-        hw_lay.addRow("监听增益", self.spin_monitor_gain_db)
+        audio_lay.addRow("监听增益", self.spin_monitor_gain_db)
 
-        scroll_lay.addWidget(Card("硬件设置", hw_form))
+        self._register_top_level_config_card(
+            launcher_layout=top_launcher_layout,
+            launcher_index=top_launcher_index,
+            section_id="audio_vibration_hardware",
+            title="音频/振动硬件设置",
+            content=audio_form,
+            default_position_anchor=top_launcher_panel,
+            button_object_name="open_audio_vibration_hardware_card",
+            dialog_object_name="top_level_audio_vibration_hardware_card_dialog",
+        )
+        top_launcher_index += 1
 
-        # AI binding card (test-level, not per-channel)
+        current_meter_form = QWidget()
+        cm_lay = QFormLayout(current_meter_form)
+        cm_lay.setContentsMargins(0, 0, 0, 0)
+        cm_lay.setHorizontalSpacing(10)
+        cm_lay.setVerticalSpacing(8)
+
+        self.chk_current_meter_enabled = QCheckBox("启用电流表")
+        cm_lay.addRow("电流表", self.chk_current_meter_enabled)
+
+        self.ed_current_meter_host = QLineEdit()
+        self.ed_current_meter_host.setPlaceholderText("例如 192.168.1.20")
+        cm_lay.addRow("电流表IP", self.ed_current_meter_host)
+
+        self.spin_current_meter_port = _NoWheelSpinBoxInt()
+        self.spin_current_meter_port.setRange(1, 65535)
+        self.spin_current_meter_port.setValue(502)
+        cm_lay.addRow("电流表端口", self.spin_current_meter_port)
+
+        self.spin_current_meter_unit_id = _NoWheelSpinBoxInt()
+        self.spin_current_meter_unit_id.setRange(0, 247)
+        self.spin_current_meter_unit_id.setValue(1)
+        cm_lay.addRow("电流表站号", self.spin_current_meter_unit_id)
+
+        self.combo_current_meter_register_type = _NoWheelComboBox()
+        self.combo_current_meter_register_type.addItem("Holding Register", "holding")
+        self.combo_current_meter_register_type.addItem("Input Register", "input")
+        self.combo_current_meter_register_type.setCurrentIndex(
+            self.combo_current_meter_register_type.findData("input")
+        )
+        cm_lay.addRow("电流表寄存器", self.combo_current_meter_register_type)
+
+        self.spin_current_meter_register_address = _NoWheelSpinBoxInt()
+        self.spin_current_meter_register_address.setRange(0, 65535)
+        self.spin_current_meter_register_address.setValue(0)
+        cm_lay.addRow("电流表地址", self.spin_current_meter_register_address)
+
+        self.combo_current_meter_data_type = _NoWheelComboBox()
+        self.combo_current_meter_data_type.addItem("Float32", "float32")
+        self.combo_current_meter_data_type.addItem("UInt16", "uint16")
+        self.combo_current_meter_data_type.addItem("Int16", "int16")
+        self.combo_current_meter_data_type.addItem("UInt32", "uint32")
+        self.combo_current_meter_data_type.addItem("Int32", "int32")
+        self.combo_current_meter_data_type.setCurrentIndex(
+            self.combo_current_meter_data_type.findData("uint16")
+        )
+        cm_lay.addRow("电流表数据类型", self.combo_current_meter_data_type)
+
+        self.combo_current_meter_byte_order = _NoWheelComboBox()
+        self.combo_current_meter_byte_order.addItem("Big endian", "big")
+        self.combo_current_meter_byte_order.addItem("Little endian", "little")
+        cm_lay.addRow("电流表字节序", self.combo_current_meter_byte_order)
+
+        self.combo_current_meter_word_order = _NoWheelComboBox()
+        self.combo_current_meter_word_order.addItem("Big word", "big")
+        self.combo_current_meter_word_order.addItem("Little word", "little")
+        cm_lay.addRow("电流表字序", self.combo_current_meter_word_order)
+
+        self.spin_current_meter_scale = _NoWheelSpinBox()
+        self.spin_current_meter_scale.setRange(-999999.0, 999999.0)
+        self.spin_current_meter_scale.setDecimals(6)
+        self.spin_current_meter_scale.setValue(0.001)
+        cm_lay.addRow("电流表倍率", self.spin_current_meter_scale)
+
+        self.spin_current_meter_offset = _NoWheelSpinBox()
+        self.spin_current_meter_offset.setObjectName("spin_current_meter_offset")
+        self.spin_current_meter_offset.setRange(-999999.0, 999999.0)
+        self.spin_current_meter_offset.setDecimals(6)
+        self.spin_current_meter_offset.setValue(0.0)
+        cm_lay.addRow("电流表偏移(mA)", self.spin_current_meter_offset)
+
+        self.spin_current_meter_poll_interval_ms = _NoWheelSpinBoxInt()
+        self.spin_current_meter_poll_interval_ms.setRange(20, 60000)
+        self.spin_current_meter_poll_interval_ms.setValue(200)
+        self.spin_current_meter_poll_interval_ms.setSuffix(" ms")
+        cm_lay.addRow("电流表轮询", self.spin_current_meter_poll_interval_ms)
+
+        self.spin_current_meter_timeout_ms = _NoWheelSpinBoxInt()
+        self.spin_current_meter_timeout_ms.setRange(50, 60000)
+        self.spin_current_meter_timeout_ms.setValue(1000)
+        self.spin_current_meter_timeout_ms.setSuffix(" ms")
+        cm_lay.addRow("电流表超时", self.spin_current_meter_timeout_ms)
+
+        self._register_top_level_config_card(
+            launcher_layout=top_launcher_layout,
+            launcher_index=top_launcher_index,
+            section_id="current_meter",
+            title="电流表设置",
+            content=current_meter_form,
+            default_position_anchor=top_launcher_panel,
+            button_object_name="open_current_meter_card",
+            dialog_object_name="top_level_current_meter_card_dialog",
+            preferred_size=(380, 640),
+        )
+        top_launcher_index += 1
+
+        # AI binding (test-level, not per-channel)
         ai_bind_form = QWidget()
         ab_lay = QFormLayout(ai_bind_form)
         ab_lay.setContentsMargins(0, 0, 0, 0)
@@ -406,8 +686,16 @@ class ConfigModule(QWidget):
         self.spin_ai_timeout.setValue(0)
         ab_lay.addRow("超时(ms)", self.spin_ai_timeout)
 
-
-        scroll_lay.addWidget(Card("AI 工具链绑定", ai_bind_form))
+        self._register_top_level_config_card(
+            launcher_layout=top_launcher_layout,
+            launcher_index=top_launcher_index,
+            section_id="ai_binding",
+            title="AI 工具链绑定",
+            content=ai_bind_form,
+            default_position_anchor=top_launcher_panel,
+            button_object_name="open_ai_binding_card",
+            dialog_object_name="top_level_ai_binding_card_dialog",
+        )
 
         # Channel warning
         self.channel_warning = QLabel("请先选择输入设备")
@@ -500,6 +788,21 @@ class ConfigModule(QWidget):
         self.chk_ai_enabled.toggled.connect(self._mark_ai_binding_dirty)
         self.combo_ai_toolchain.currentIndexChanged.connect(self._mark_ai_binding_dirty)
         self.spin_ai_timeout.valueChanged.connect(self._mark_ai_binding_dirty)
+        self.combo_current_meter_register_type.currentIndexChanged.connect(
+            self._refresh_current_meter_offset_label
+        )
+        self.combo_current_meter_data_type.currentIndexChanged.connect(
+            self._refresh_current_meter_offset_label
+        )
+        self.combo_current_meter_byte_order.currentIndexChanged.connect(
+            self._refresh_current_meter_offset_label
+        )
+        self.combo_current_meter_word_order.currentIndexChanged.connect(
+            self._refresh_current_meter_offset_label
+        )
+        self.spin_current_meter_scale.valueChanged.connect(
+            self._refresh_current_meter_offset_label
+        )
         self.services.bus.refresh_channels.connect(self._on_hardware_changed)
         ai_toolchains_changed = getattr(
             self.services.bus,
@@ -935,6 +1238,56 @@ class ConfigModule(QWidget):
         loaded = self.services.config_service.load_config(config_id)
         self._apply_loaded_config_state(config_id, loaded)
 
+    def _capture_editor_snapshot(self) -> dict | None:
+        if self._current_config_id is None:
+            return None
+        return copy.deepcopy(
+            {
+                "config": self._collect_data(),
+                "ai_binding": self._capture_ai_binding_editor_state(),
+            }
+        )
+
+    def _mark_editor_snapshot_clean(self) -> None:
+        self._loaded_config_editor_snapshot = self._capture_editor_snapshot()
+
+    def _has_unsaved_changes(self) -> bool:
+        if self._current_config_id is None:
+            return False
+        current = self._capture_editor_snapshot()
+        if current is None:
+            return False
+        return current != self._loaded_config_editor_snapshot
+
+    def _prompt_unsaved_config_changes(self, action: str) -> bool:
+        action_label = {
+            "switch": "切换配置",
+            "new": "新建配置",
+            "delete": "删除配置",
+            "import": "导入配置",
+            "leave": "离开配置页面",
+        }.get(action, "继续当前操作")
+        dialog = QMessageBox(self)
+        dialog.setIcon(QMessageBox.Icon.Warning)
+        dialog.setWindowTitle("未保存的更改")
+        dialog.setText(f"当前配置有未保存的更改。是否保存后再{action_label}？")
+        save_button = dialog.addButton("保存", QMessageBox.ButtonRole.AcceptRole)
+        cancel_button = dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        dialog.setDefaultButton(save_button)
+        dialog.setEscapeButton(cancel_button)
+        dialog.exec()
+        return dialog.clickedButton() is save_button
+
+    def _resolve_unsaved_changes_before(self, action: str) -> bool:
+        if not self._has_unsaved_changes():
+            return True
+        if not self._prompt_unsaved_config_changes(action):
+            return False
+        return self._save_current_config(show_success=False)
+
+    def confirm_leave(self) -> bool:
+        return self._resolve_unsaved_changes_before("leave")
+
     def _finalize_failed_save(
         self,
         *,
@@ -1144,6 +1497,11 @@ class ConfigModule(QWidget):
     # ── Channel tab building ────────────────────────────────
 
     def _build_channel_tabs(self, channel_indices: list[int], channel_data: list[dict] | None = None):
+        for dialog in self._channel_section_dialogs.values():
+            dialog.hide()
+            dialog.deleteLater()
+        self._channel_section_dialogs = {}
+
         # Remove previous tab buttons and stretch
         while self._channel_tab_bar_lay.count():
             item = self._channel_tab_bar_lay.takeAt(0)
@@ -1194,6 +1552,86 @@ class ConfigModule(QWidget):
             btn.setChecked(i == idx)
         self.channel_stack.setCurrentIndex(idx)
 
+    def _register_channel_section_card(
+        self,
+        *,
+        container: QWidget,
+        launcher_layout: QGridLayout,
+        launcher_index: int,
+        section: CollapsibleGroupBox,
+        title: str,
+        preferred_size: tuple[int, int] | None = None,
+    ) -> None:
+        section_id = section.section_id()
+        dialog = _ChannelSectionCardDialog(
+            title,
+            section,
+            container,
+            preferred_size=preferred_size,
+        )
+        dialog.hide()
+        channel_index = self._channel_container_index(container)
+        if channel_index is not None:
+            self._channel_section_dialogs[(channel_index, section_id)] = dialog
+
+        button = QPushButton(title)
+        button.setObjectName(f"open_{section_id}_section")
+        button.clicked.connect(
+            lambda _checked=False, current=dialog: self._show_config_dialog(current)
+        )
+        row, column = divmod(launcher_index, 3)
+        launcher_layout.addWidget(button, row, column)
+
+    def _hide_top_level_config_dialogs(self) -> None:
+        for dialog in self._top_level_config_dialogs.values():
+            dialog.hide()
+
+    def _hide_other_config_dialogs(self, active_dialog: QDialog) -> None:
+        for dialog in (
+            *self._top_level_config_dialogs.values(),
+            *self._channel_section_dialogs.values(),
+        ):
+            if dialog is not active_dialog:
+                dialog.hide()
+
+    def _show_config_dialog(self, dialog: _ConfigSectionCardDialog) -> None:
+        self._hide_other_config_dialogs(dialog)
+        dialog.show_card()
+
+    def _register_top_level_config_card(
+        self,
+        *,
+        launcher_layout: QGridLayout,
+        launcher_index: int,
+        section_id: str,
+        title: str,
+        content: QWidget,
+        default_position_anchor: QWidget,
+        button_object_name: str,
+        dialog_object_name: str,
+        preferred_size: tuple[int, int] | None = None,
+    ) -> None:
+        dialog = _ConfigSectionCardDialog(
+            title,
+            content,
+            self,
+            object_name=dialog_object_name,
+            close_button_object_name="TopLevelConfigCardCloseButton",
+            default_position_anchor=default_position_anchor,
+            confirm_button_object_name="TopLevelConfigCardConfirmButton",
+            preferred_size=preferred_size,
+        )
+        dialog.hide()
+        self._top_level_config_dialogs[section_id] = dialog
+
+        button = QPushButton(title)
+        button.setObjectName(button_object_name)
+        button.clicked.connect(
+            lambda _checked=False, current=dialog: self._show_config_dialog(current)
+        )
+        row, column = divmod(launcher_index, 3)
+        launcher_layout.addWidget(button, row, column)
+
     def _build_channel_tab(self, ch_index: int, data: dict | None) -> QWidget:
         container = QWidget()
         container.setProperty("channel_index", ch_index)
@@ -1203,6 +1641,15 @@ class ConfigModule(QWidget):
         lay = QVBoxLayout(container)
         lay.setContentsMargins(4, 4, 4, 4)
         lay.setSpacing(8)
+
+        launcher_panel = QWidget()
+        launcher_panel.setObjectName("channel_section_launcher_panel")
+        launcher_layout = QGridLayout(launcher_panel)
+        launcher_layout.setContentsMargins(0, 0, 0, 0)
+        launcher_layout.setHorizontalSpacing(8)
+        launcher_layout.setVerticalSpacing(8)
+        lay.addWidget(launcher_panel)
+        launcher_index = 0
 
         # STFT section
         stft = CollapsibleGroupBox("STFT 参数", section_id="stft")
@@ -1263,7 +1710,14 @@ class ConfigModule(QWidget):
         color_scale_enabled.toggled.connect(color_scale_max.setEnabled)
 
         stft.add_widget(stft_form)
-        lay.addWidget(stft)
+        self._register_channel_section_card(
+            container=container,
+            launcher_layout=launcher_layout,
+            launcher_index=launcher_index,
+            section=stft,
+            title="STFT 参数",
+        )
+        launcher_index += 1
 
         # STFT score section
         stft_score = CollapsibleGroupBox("STFT 评分", section_id="stft_score")
@@ -1384,7 +1838,14 @@ class ConfigModule(QWidget):
         score_enabled.toggled.connect(set_score_controls_enabled)
 
         stft_score.add_widget(stft_score_form)
-        lay.addWidget(stft_score)
+        self._register_channel_section_card(
+            container=container,
+            launcher_layout=launcher_layout,
+            launcher_index=launcher_index,
+            section=stft_score,
+            title="STFT 评分",
+        )
+        launcher_index += 1
 
         # Sound pressure section
         spl = CollapsibleGroupBox("声压级参数", section_id="spl")
@@ -1441,7 +1902,14 @@ class ConfigModule(QWidget):
         )
 
         spl.add_widget(spl_form)
-        lay.addWidget(spl)
+        self._register_channel_section_card(
+            container=container,
+            launcher_layout=launcher_layout,
+            launcher_index=launcher_index,
+            section=spl,
+            title="声压级参数",
+        )
+        launcher_index += 1
 
         loudness = CollapsibleGroupBox("响度参数", section_id="loudness")
         loudness_form = QWidget()
@@ -1486,7 +1954,14 @@ class ConfigModule(QWidget):
         )
 
         loudness.add_widget(loudness_form)
-        lay.addWidget(loudness)
+        self._register_channel_section_card(
+            container=container,
+            launcher_layout=launcher_layout,
+            launcher_index=launcher_index,
+            section=loudness,
+            title="响度参数",
+        )
+        launcher_index += 1
 
         golden_section = CollapsibleGroupBox(
             "黄金样本",
@@ -1540,10 +2015,17 @@ class ConfigModule(QWidget):
 
         golden_layout.addWidget(golden_buttons)
         golden_section.add_widget(golden_form)
-        lay.addWidget(golden_section)
+        self._register_channel_section_card(
+            container=container,
+            launcher_layout=launcher_layout,
+            launcher_index=launcher_index,
+            section=golden_section,
+            title="黄金样本",
+        )
+        launcher_index += 1
 
-        # FFT band limits section
-        fft_section = CollapsibleGroupBox("FFT 频带上下限", section_id="fft")
+        # FFT section
+        fft_section = CollapsibleGroupBox("FFT 参数", section_id="fft")
         fft_widget = QWidget()
         fft_layout = QVBoxLayout(fft_widget)
         fft_layout.setContentsMargins(0, 0, 0, 0)
@@ -1594,15 +2076,22 @@ class ConfigModule(QWidget):
             lambda _index, combo=fft_mode, checkbox=fft_overlay, current=container: self._on_golden_mode_changed(combo, checkbox, current)
         )
 
-        fft_table = self._build_band_table(
-            "fft_band_table",
-            data.get("fft_band_limits", []) if data else [],
-            add_label="添加频点",
-            allow_insert=True,
+        fft_editor = LimitTableEditor(
+            object_name="fft_limit_table_editor",
+            label="FFT",
         )
-        fft_layout.addWidget(fft_table)
+        fft_editor.set_limits(data.get("fft_band_limits", []) if data else [])
+        fft_layout.addWidget(fft_editor)
         fft_section.add_widget(fft_widget)
-        lay.addWidget(fft_section)
+        self._register_channel_section_card(
+            container=container,
+            launcher_layout=launcher_layout,
+            launcher_index=launcher_index,
+            section=fft_section,
+            title="FFT 参数",
+            preferred_size=(780, 520),
+        )
+        launcher_index += 1
 
         # Octave section
         oct_section = CollapsibleGroupBox("1/3 倍频程参数", section_id="octave")
@@ -1639,13 +2128,21 @@ class ConfigModule(QWidget):
             lambda _index, combo=oct_mode, checkbox=oct_overlay, current=container: self._on_golden_mode_changed(combo, checkbox, current)
         )
 
-        oct_table = self._build_band_table(
-            "oct_band_table",
-            data.get("oct_band_limits", []) if data else [],
+        oct_editor = LimitTableEditor(
+            object_name="oct_limit_table_editor",
+            label="倍频程",
         )
-        of_lay.addWidget(oct_table)
+        oct_editor.set_limits(data.get("oct_band_limits", []) if data else [])
+        of_lay.addWidget(oct_editor)
         oct_section.add_widget(oct_form)
-        lay.addWidget(oct_section)
+        self._register_channel_section_card(
+            container=container,
+            launcher_layout=launcher_layout,
+            launcher_index=launcher_index,
+            section=oct_section,
+            title="1/3 倍频程参数",
+            preferred_size=(740, 500),
+        )
         lay.addStretch(1)
 
         self._apply_golden_mode_state(fft_mode, fft_overlay)
@@ -1653,164 +2150,6 @@ class ConfigModule(QWidget):
         self._refresh_channel_golden_section(container)
 
         return container
-
-    def _build_band_table(
-        self,
-        object_name: str,
-        bands: list[dict],
-        *,
-        add_label: str = "添加频带",
-        allow_insert: bool = False,
-    ) -> QWidget:
-        wrapper = QWidget()
-        w_lay = QVBoxLayout(wrapper)
-        w_lay.setContentsMargins(0, 0, 0, 0)
-        w_lay.setSpacing(4)
-
-        table = QTableWidget()
-        table.setObjectName(object_name)
-        table.setRowCount(3)
-        table.setVerticalHeaderLabels(["频率 (Hz)", "下限 (dB)", "上限 (dB)"])
-        table.horizontalHeader().setVisible(False)
-        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectColumns)
-        table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-        table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
-        table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        table.setItemDelegate(_FloatDelegate(table))
-
-        row_h = 42
-        table.verticalHeader().setDefaultSectionSize(row_h)
-        table.setStyleSheet(
-            "QTableView::item { padding: 2px 4px; }"
-        )
-
-        for band in bands:
-            self._add_band_col(table, band.get("freq", 1000), band.get("lower", 0), band.get("upper", 100))
-
-        # 精确高度 = 3行 + 2px 边框
-        table.setFixedHeight(3 * row_h + 2)
-        w_lay.addWidget(table)
-
-        btn_row = QWidget()
-        br_lay = QHBoxLayout(btn_row)
-        br_lay.setContentsMargins(0, 0, 0, 0)
-        br_lay.setSpacing(6)
-        btn_add = QPushButton(add_label)
-        btn_del = QPushButton("删除选中")
-        btn_del.setObjectName("Danger")
-        br_lay.addWidget(btn_add)
-        if allow_insert:
-            btn_insert = QPushButton("插入频点")
-            br_lay.addWidget(btn_insert)
-            btn_insert.clicked.connect(
-                lambda _checked=False, t=table: self._insert_band_after_selection(t)
-            )
-        br_lay.addWidget(btn_del)
-        br_lay.addStretch(1)
-
-        btn_add.clicked.connect(lambda: self._add_band_col(table, 1000, 0, 100))
-        btn_del.clicked.connect(lambda: self._delete_selected_cols(table))
-
-        w_lay.addWidget(btn_row)
-        return wrapper
-
-    @staticmethod
-    def _add_band_col(table: QTableWidget, freq: float, lower: float, upper: float):
-        col = table.columnCount()
-        table.insertColumn(col)
-        ConfigModule._set_band_col(table, col, freq, lower, upper)
-
-    @staticmethod
-    def _set_band_col(
-        table: QTableWidget,
-        column: int,
-        freq: float,
-        lower: float,
-        upper: float,
-    ) -> None:
-        for row, val in enumerate([freq, lower, upper]):
-            item = QTableWidgetItem(str(val))
-            item.setTextAlignment(
-                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter
-            )
-            table.setItem(row, column, item)
-
-    def _insert_band_after_selection(self, table: QTableWidget) -> None:
-        selected_columns = sorted({index.column() for index in table.selectedIndexes()})
-        if not selected_columns:
-            insert_col = table.columnCount()
-            table.insertColumn(insert_col)
-            self._set_band_col(table, insert_col, 1000, 0, 100)
-            table.clearSelection()
-            table.selectColumn(insert_col)
-            return
-
-        source_col = selected_columns[-1]
-        insert_col = source_col + 1
-        freq, lower, upper = self._band_column_values(table, source_col)
-        next_freq, _next_lower, _next_upper = (
-            self._band_column_values(table, insert_col)
-            if insert_col < table.columnCount()
-            else (None, None, None)
-        )
-
-        valid_freq = self._is_finite_positive_number(freq)
-        valid_next_freq = self._is_finite_positive_number(next_freq)
-        if valid_freq and valid_next_freq and float(next_freq) > float(freq):
-            insert_freq = (float(freq) + float(next_freq)) / 2.0
-        elif valid_freq:
-            insert_freq = float(freq)
-        else:
-            insert_freq = 1000
-            lower = 0
-            upper = 100
-
-        insert_lower = lower if self._is_finite_number(lower) else 0
-        insert_upper = upper if self._is_finite_number(upper) else 100
-        table.insertColumn(insert_col)
-        self._set_band_col(table, insert_col, insert_freq, insert_lower, insert_upper)
-        table.clearSelection()
-        table.selectColumn(insert_col)
-
-    @staticmethod
-    def _band_column_values(
-        table: QTableWidget,
-        column: int,
-    ) -> tuple[float | None, float | None, float | None]:
-        return tuple(
-            ConfigModule._coerce_float(
-                table.item(row, column).text() if table.item(row, column) else None
-            )
-            for row in range(3)
-        )
-
-    @staticmethod
-    def _coerce_float(value) -> float | None:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return None
-
-    @staticmethod
-    def _is_finite_number(value) -> bool:
-        try:
-            number = float(value)
-        except (TypeError, ValueError):
-            return False
-        return math.isfinite(number)
-
-    @classmethod
-    def _is_finite_positive_number(cls, value) -> bool:
-        if not cls._is_finite_number(value):
-            return False
-        return float(value) > 0.0
-
-    @staticmethod
-    def _delete_selected_cols(table: QTableWidget):
-        cols = sorted(set(idx.column() for idx in table.selectedIndexes()), reverse=True)
-        for c in cols:
-            table.removeColumn(c)
 
     @contextmanager
     def _suspend_ai_binding_dirty_updates(self):
@@ -1962,6 +2301,83 @@ class ConfigModule(QWidget):
         self._rebuild_vibration_view_channel_options(
             preferred=data.get("vibration_view_channel_index")
         )
+        self._populate_current_meter(data.get("current_meter"))
+
+    def _populate_current_meter(self, current_meter: dict | None) -> None:
+        current_meter = normalize_current_meter_config(current_meter)
+        self.chk_current_meter_enabled.setChecked(bool(current_meter.get("enabled")))
+        self.ed_current_meter_host.setText(str(current_meter.get("host") or ""))
+        self.spin_current_meter_port.setValue(int(current_meter.get("port")))
+        self.spin_current_meter_unit_id.setValue(int(current_meter.get("unit_id")))
+        self._set_combo_current_data(
+            self.combo_current_meter_register_type, current_meter["register_type"]
+        )
+        self.spin_current_meter_register_address.setValue(
+            int(current_meter["register_address"])
+        )
+        self._set_combo_current_data(
+            self.combo_current_meter_data_type, current_meter["data_type"]
+        )
+        self._set_combo_current_data(
+            self.combo_current_meter_byte_order, current_meter["byte_order"]
+        )
+        self._set_combo_current_data(
+            self.combo_current_meter_word_order, current_meter["word_order"]
+        )
+        self.spin_current_meter_scale.setValue(
+            float(current_meter["scale"])
+        )
+        self.spin_current_meter_offset.setValue(float(current_meter["offset"]))
+        self.spin_current_meter_poll_interval_ms.setValue(
+            int(current_meter["poll_interval_ms"])
+        )
+        self.spin_current_meter_timeout_ms.setValue(
+            int(current_meter["timeout_ms"])
+        )
+        self._refresh_current_meter_offset_label()
+
+    def _set_current_meter_offset_label(self, current_meter: dict | None) -> None:
+        unit = current_meter_display_unit(current_meter)
+        label = "电流表偏移(mA)" if unit == "mA" else "电流表偏移"
+        self._set_form_row_label(self.spin_current_meter_offset, label)
+
+    def _refresh_current_meter_offset_label(self, *_args) -> None:
+        current_meter = self._build_current_meter_form_config()
+        self._set_current_meter_offset_label(current_meter)
+
+    def _build_current_meter_form_config(self) -> dict:
+        data_type = self.combo_current_meter_data_type.currentData() or "uint16"
+        return {
+            "register_type": self.combo_current_meter_register_type.currentData() or "input",
+            "data_type": data_type,
+            "byte_order": self.combo_current_meter_byte_order.currentData() or "big",
+            "word_order": self.combo_current_meter_word_order.currentData() or "big",
+            "scale": float(self.spin_current_meter_scale.value()),
+            "register_count": 1 if data_type in {"uint16", "int16"} else 2,
+        }
+
+    def _set_form_row_label(self, widget: QWidget, text: str) -> None:
+        current = widget
+        while current is not None:
+            layout = current.parentWidget().layout() if current.parentWidget() else None
+            if isinstance(layout, QFormLayout):
+                row, _ = layout.getWidgetPosition(current)
+                if row >= 0:
+                    item = layout.itemAt(row, QFormLayout.ItemRole.LabelRole)
+                    label = item.widget() if item else None
+                    if isinstance(label, QLabel):
+                        label.setText(text)
+                        return
+                if row < 0:
+                    current = current.parentWidget()
+                    continue
+                return
+            current = current.parentWidget()
+
+    @staticmethod
+    def _set_combo_current_data(combo: QComboBox, value) -> None:
+        index = combo.findData(value)
+        combo.setCurrentIndex(index if index >= 0 else 0)
 
     def _match_device_combo(self, combo, name, hostapi, samplerate):
         """Match saved device against combo items. Inject unavailable device if not found."""
@@ -2199,8 +2615,10 @@ class ConfigModule(QWidget):
         ch["oct_show_golden_overlay"] = oct_overlay.isChecked() if oct_overlay else False
 
         ch.update(self._channel_binding(container))
-        ch["fft_band_limits"] = self._read_band_table(container, "fft_band_table")
-        ch["oct_band_limits"] = self._read_band_table(container, "oct_band_table")
+        fft_editor = container.findChild(LimitTableEditor, "fft_limit_table_editor")
+        oct_editor = container.findChild(LimitTableEditor, "oct_limit_table_editor")
+        ch["fft_band_limits"] = fft_editor.limits() if fft_editor else []
+        ch["oct_band_limits"] = oct_editor.limits() if oct_editor else []
         ch["ai_config"] = {}
         return ch
 
@@ -2236,7 +2654,7 @@ class ConfigModule(QWidget):
             "allow_incomplete_recording_analysis": (
                 self.chk_allow_incomplete_recording_analysis.isChecked()
             ),
-            "scan_triggers_test": self.chk_scan.isChecked(),
+            "scan_triggers_test": False,
             "plc_id": self.combo_plc.currentData(),
             "input_device_name": input_dev.get("name") if isinstance(input_dev, dict) else None,
             "input_device_hostapi": input_dev.get("hostapi") if isinstance(input_dev, dict) else None,
@@ -2250,6 +2668,27 @@ class ConfigModule(QWidget):
             else None,
             "vibration_view_channel_index": self.combo_vibration_view_channel.currentData(),
             "monitor_gain_db": float(self.spin_monitor_gain_db.value()),
+            "current_meter": {
+                "enabled": self.chk_current_meter_enabled.isChecked(),
+                "host": self.ed_current_meter_host.text().strip(),
+                "port": self.spin_current_meter_port.value(),
+                "unit_id": self.spin_current_meter_unit_id.value(),
+                "register_type": self.combo_current_meter_register_type.currentData(),
+                "register_address": self.spin_current_meter_register_address.value(),
+                "register_count": (
+                    1
+                    if self.combo_current_meter_data_type.currentData()
+                    in {"uint16", "int16"}
+                    else 2
+                ),
+                "data_type": self.combo_current_meter_data_type.currentData(),
+                "byte_order": self.combo_current_meter_byte_order.currentData(),
+                "word_order": self.combo_current_meter_word_order.currentData(),
+                "scale": self.spin_current_meter_scale.value(),
+                "offset": self.spin_current_meter_offset.value(),
+                "poll_interval_ms": self.spin_current_meter_poll_interval_ms.value(),
+                "timeout_ms": self.spin_current_meter_timeout_ms.value(),
+            },
             "channels": [],
             "golden_editor_state": {},
         }
@@ -2281,26 +2720,10 @@ class ConfigModule(QWidget):
             "timeout_ms": timeout if timeout > 0 else None,
         }
 
-    @staticmethod
-    def _read_band_table(container: QWidget, table_name: str) -> list[dict]:
-        table = container.findChild(QTableWidget, table_name)
-        if not table:
-            return []
-        bands = []
-        for c in range(table.columnCount()):
-            try:
-                freq = float(table.item(0, c).text()) if table.item(0, c) else 0
-                lower = float(table.item(1, c).text()) if table.item(1, c) else 0
-                upper = float(table.item(2, c).text()) if table.item(2, c) else 0
-            except ValueError:
-                # Preserve column with sentinel values — validate() will flag freq <= 0
-                freq, lower, upper = -1, 0, 0
-            bands.append({"freq": freq, "lower": lower, "upper": upper})
-        return bands
-
     # ── Populate UI from data ───────────────────────────────
 
     def _populate_detail(self, data: dict):
+        self._hide_top_level_config_dialogs()
         self._discard_all_staged_bindings()
         self.ed_name.setText(data["config_name"])
         self.spin_record.setValue(data["record_duration"])
@@ -2311,8 +2734,6 @@ class ConfigModule(QWidget):
         self.chk_allow_incomplete_recording_analysis.setChecked(
             bool(data.get("allow_incomplete_recording_analysis", False))
         )
-        self.chk_scan.setChecked(data["scan_triggers_test"])
-
         self._populate_hardware_card(data)
 
         # Build tabs for ALL channels of the device, not just selected ones
@@ -2328,6 +2749,7 @@ class ConfigModule(QWidget):
         self._build_channel_tabs(all_indices, data.get("channels"))
         self._populate_ai_binding(data["config_id"])
         self._refresh_all_golden_sections()
+        self._mark_editor_snapshot_clean()
 
     # ── Interactions ────────────────────────────────────────
 
@@ -2348,32 +2770,65 @@ class ConfigModule(QWidget):
 
         if has_items:
             self.config_list.setCurrentRow(0)
+        else:
+            self._current_config_id = None
+            self._loaded_config_editor_snapshot = None
+            self._hide_top_level_config_dialogs()
 
-    def _select_config_by_id(self, config_id: int):
-        for i in range(self.config_list.count()):
-            item = self.config_list.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == config_id:
-                self.config_list.setCurrentRow(i)
-                return
-        if self.config_list.count() > 0:
-            self.config_list.setCurrentRow(0)
+    def _select_config_by_id(self, config_id: int, *, suppress_reload: bool = False):
+        previous_skip_reload = self._skip_reload
+        if suppress_reload:
+            self._skip_reload = True
+        try:
+            for i in range(self.config_list.count()):
+                item = self.config_list.item(i)
+                if item.data(Qt.ItemDataRole.UserRole) == config_id:
+                    self.config_list.setCurrentRow(i)
+                    return
+            if self.config_list.count() > 0:
+                self.config_list.setCurrentRow(0)
+        finally:
+            if suppress_reload:
+                self._skip_reload = previous_skip_reload
+
+    def _restore_current_config_selection(self) -> None:
+        if self._current_config_id is None:
+            return
+        self._restoring_config_selection = True
+        try:
+            self._select_config_by_id(self._current_config_id, suppress_reload=True)
+        finally:
+            self._restoring_config_selection = False
+
+    def _load_config_into_editor(self, config_id: int) -> None:
+        self._current_config_id = config_id
+        data = self.services.config_service.load_config(config_id)
+        self.empty_label.setVisible(False)
+        self.detail.setVisible(True)
+        self._populate_detail(data)
 
     def _on_item_changed(self, current: QListWidgetItem | None, _prev):
         if current is None:
             return
         if self._skip_reload:
             return
+        if self._restoring_config_selection:
+            return
         config_id = current.data(Qt.ItemDataRole.UserRole)
-        self._current_config_id = config_id
+        if config_id == self._current_config_id:
+            return
+        if not self._resolve_unsaved_changes_before("switch"):
+            self._restore_current_config_selection()
+            return
         try:
-            data = self.services.config_service.load_config(config_id)
-            self.empty_label.setVisible(False)
-            self.detail.setVisible(True)
-            self._populate_detail(data)
+            self._select_config_by_id(config_id, suppress_reload=True)
+            self._load_config_into_editor(config_id)
         except Exception as e:
             QMessageBox.warning(self, "加载失败", f"无法加载配置：{e}")
 
     def _on_new(self):
+        if not self._resolve_unsaved_changes_before("new"):
+            return
         name, ok = QInputDialog.getText(self, "新建配置", "请输入配置名称：")
         if not ok:
             return
@@ -2388,6 +2843,8 @@ class ConfigModule(QWidget):
         current = self.config_list.currentItem()
         if current is None:
             return
+        if not self._resolve_unsaved_changes_before("delete"):
+            return
         config_id = current.data(Qt.ItemDataRole.UserRole)
         config_name = current.text()
         reply = QMessageBox.question(
@@ -2400,6 +2857,7 @@ class ConfigModule(QWidget):
             return
         self.services.config_service.delete_config(config_id)
         self._current_config_id = None
+        self._hide_top_level_config_dialogs()
         self._refresh_list()
 
     def _on_export_package(self):
@@ -2433,6 +2891,8 @@ class ConfigModule(QWidget):
         QMessageBox.information(self, "导出成功", f"配置包已导出：{target_path}")
 
     def _on_import_package(self):
+        if not self._resolve_unsaved_changes_before("import"):
+            return
         source_path = config_package_dialogs.choose_dy_import_path(self)
         if not source_path:
             return
@@ -2466,8 +2926,11 @@ class ConfigModule(QWidget):
             QMessageBox.information(self, "导入提示", result.info_message)
 
     def _on_save(self):
+        self._save_current_config(show_success=True)
+
+    def _save_current_config(self, *, show_success: bool = True) -> bool:
         if self._current_config_id is None:
-            return
+            return True
         data = self._collect_data()
         errors = self.services.config_service.validate(data)
         if errors:
@@ -2475,7 +2938,7 @@ class ConfigModule(QWidget):
                 message_title="验证失败",
                 message_text="\n".join(errors),
             )
-            return
+            return False
         pending_save = None
         pending_save_committed = False
         try:
@@ -2488,7 +2951,7 @@ class ConfigModule(QWidget):
                     message_title="AI 配置错误",
                     message_text=str(e),
                 )
-                return
+                return False
 
             selected_channel_index = self._selected_channel_index()
             section_state = self._capture_collapsible_section_state()
@@ -2515,7 +2978,10 @@ class ConfigModule(QWidget):
             self._restore_collapsible_section_state(section_state)
             self._restore_selected_channel_tab(selected_channel_index)
             self.services.bus.status.emit("配置已保存")
-            QMessageBox.information(self, "保存成功", "配置保存成功！")
+            self._mark_editor_snapshot_clean()
+            if show_success:
+                QMessageBox.information(self, "保存成功", "配置保存成功！")
+            return True
         except ValueError as e:
             self._skip_reload = False
             self._finalize_failed_save(
@@ -2524,6 +2990,7 @@ class ConfigModule(QWidget):
                 pending_save=pending_save,
                 pending_save_committed=pending_save_committed,
             )
+            return False
         except Exception as e:
             self._skip_reload = False
             self._finalize_failed_save(
@@ -2532,6 +2999,7 @@ class ConfigModule(QWidget):
                 pending_save=pending_save,
                 pending_save_committed=pending_save_committed,
             )
+            return False
 
     def _on_hardware_changed(self):
         """Global hardware changed — refresh device combos, preserve current selection."""

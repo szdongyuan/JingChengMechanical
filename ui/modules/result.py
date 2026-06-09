@@ -5,6 +5,7 @@ import re
 import time
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -26,6 +27,7 @@ _DISPLAY_LABEL_MAP = {
     "平均Loudness": "平均响度",
     "FFT": "频谱",
     "Octave": "倍频程",
+    "频谱平均评分": "频谱平均评分",
 }
 _RESULT_LABEL_MAP = {
     "PASS": "通过",
@@ -33,19 +35,24 @@ _RESULT_LABEL_MAP = {
 }
 _CHANNEL_LABEL_RE = re.compile(r"CH(\d+)", flags=re.IGNORECASE)
 _SPL_METRIC_UI_THROTTLE_SEC = 0.25
+_RESULT_OK_FOREGROUND = QColor("#188038")
+_RESULT_NG_FOREGROUND = QColor("#d93025")
+_RESULT_NEUTRAL_FOREGROUND = QColor("#000000")
 
 
 class ResultModule(QWidget):
     module_id = "result"
-    _ROW_LABELS = (
-        "声压级",
-        "平均声压级",
-        "响度",
-        "平均响度",
-        "频谱",
-        "倍频程",
-        "AI分析",
+    _ROW_DEFS = (
+        ("spl", "声压级"),
+        ("spl_average", "平均声压级"),
+        ("loudness", "响度"),
+        ("loudness_average", "平均响度"),
+        ("fft", "频谱"),
+        ("octave", "倍频程"),
+        ("stft_score", "频谱平均评分"),
+        ("ai", "AI分析"),
     )
+    _ROW_LABELS = tuple(label for _item_key, label in _ROW_DEFS)
     _DISPLAY_PRESERVING_PHASES = frozenset(
         {"running", "analyzing", "reanalyzing", "stopped"}
     )
@@ -132,7 +139,7 @@ class ResultModule(QWidget):
         lay.addWidget(self.empty_state)
 
         self.table = QTableWidget(len(self._ROW_LABELS), 4)
-        self.table.setHorizontalHeaderLabels(["项目", "偏差值", "通道", "结果"])
+        self.table.setHorizontalHeaderLabels(["项目", "实测值", "通道", "结果"])
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
@@ -196,20 +203,38 @@ class ResultModule(QWidget):
 
         return {"widget": badge, "label": label, "value": value}
 
-    def _set_cell(self, row: int, column: int, text: str) -> None:
+    def _set_cell(
+        self,
+        row: int,
+        column: int,
+        text: str,
+        *,
+        foreground: QColor | None = None,
+    ) -> None:
         item = QTableWidgetItem(text)
         item.setFlags(Qt.ItemFlag.ItemIsEnabled)
         if column == 0:
             item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         else:
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        if foreground is not None:
+            item.setForeground(foreground)
         self.table.setItem(row, column, item)
 
-    def _set_row(self, row: int, label: str, deviation: str, channel: str, status: str) -> None:
+    def _set_row(
+        self,
+        row: int,
+        label: str,
+        deviation: str,
+        channel: str,
+        status: str,
+        *,
+        result_foreground: QColor | None = None,
+    ) -> None:
         self._set_cell(row, 0, label)
         self._set_cell(row, 1, deviation)
         self._set_cell(row, 2, channel)
-        self._set_cell(row, 3, status)
+        self._set_cell(row, 3, status, foreground=result_foreground)
 
     def _set_badge(self, text: str, level: str) -> None:
         self.lb_overall.setText(text)
@@ -266,16 +291,37 @@ class ResultModule(QWidget):
         rows = summary_payload.get("rows")
         if not isinstance(rows, list):
             rows = []
-        for row_index, default_label in enumerate(self._ROW_LABELS):
-            row_payload = rows[row_index] if row_index < len(rows) and isinstance(rows[row_index], dict) else {}
+        rows_by_key = {
+            row_payload.get("item_key"): row_payload
+            for row_payload in rows
+            if isinstance(row_payload, dict)
+            and isinstance(row_payload.get("item_key"), str)
+        }
+        matched_payload_ids = {id(row_payload) for row_payload in rows_by_key.values()}
+        for row_index, (item_key, default_label) in enumerate(self._ROW_DEFS):
+            row_payload = rows_by_key.get(item_key)
+            if row_payload is None:
+                candidate = (
+                    rows[row_index]
+                    if row_index < len(rows) and isinstance(rows[row_index], dict)
+                    else {}
+                )
+                row_payload = (
+                    candidate
+                    if isinstance(candidate, dict)
+                    and id(candidate) not in matched_payload_ids
+                    else {}
+                )
+            status = self._display_result_label(
+                self._text_or_default(row_payload.get("status"), "-")
+            )
             self._set_row(
                 row_index,
                 self._display_label(row_payload.get("label"), default_label),
-                self._text_or_default(row_payload.get("deviation_display"), "-"),
+                self._summary_value_display(row_payload),
                 self._display_channel(row_payload.get("channel_label"), "-"),
-                self._display_result_label(
-                    self._text_or_default(row_payload.get("status"), "-")
-                ),
+                status,
+                result_foreground=self._summary_result_foreground(row_payload, status),
             )
         self._refresh_metric_display()
 
@@ -787,6 +833,30 @@ class ResultModule(QWidget):
         if text is None:
             return None
         return _DISPLAY_LABEL_MAP.get(text, text)
+
+    @staticmethod
+    def _summary_value_display(row_payload: dict) -> str:
+        actual_display = ResultModule._text_or_default(
+            row_payload.get("actual_display"),
+            None,
+        )
+        if actual_display is not None:
+            return actual_display
+        return ResultModule._text_or_default(
+            row_payload.get("deviation_display"),
+            "-",
+        )
+
+    @staticmethod
+    def _summary_result_foreground(row_payload: dict, status: str | None) -> QColor:
+        if not isinstance(row_payload, dict) or row_payload.get("constrained") is not True:
+            return _RESULT_NEUTRAL_FOREGROUND
+        normalized_status = str(status or "").strip()
+        if normalized_status in {"OK", "PASS", "通过"}:
+            return _RESULT_OK_FOREGROUND
+        if normalized_status in {"", "-", "--"}:
+            return _RESULT_NEUTRAL_FOREGROUND
+        return _RESULT_NG_FOREGROUND
 
     @staticmethod
     def _display_result_label(value: str | None) -> str | None:

@@ -259,6 +259,7 @@ def _mock_bus():
         "spl_updated",
         "octave_updated",
         "fft_updated",
+        "current_trace_updated",
         "recording_progress",
         "test_started",
         "test_finished",

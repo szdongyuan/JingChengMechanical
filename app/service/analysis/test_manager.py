@@ -24,9 +24,18 @@ from app.service.analysis.monitor_playback import (
     MONITOR_GAIN_MIN_DB,
     OneShotReplayPlayer,
 )
-from app.service.analysis.review_payloads import build_chart_payload, build_summary_payload
+from app.service.analysis.review_payloads import (
+    attach_stft_score_summary,
+    build_chart_payload,
+    build_summary_payload,
+)
 from app.service.analysis.selected_channels import normalize_selected_channels
 from app.service.analysis.test_session import ManualLabelUpdateResult, TestSession
+from app.service.current_meter_service import (
+    CurrentMeterCollector,
+    build_current_trace_payload,
+    normalize_current_meter_config,
+)
 from consts.running_consts import base_dir
 
 
@@ -54,6 +63,8 @@ class TestManager(QObject):
         self._analyzing_sessions: set[int] = set()
         self._accepted_factory_stops: set[int] = set()
         self._live_loudness_channel_by_config_id: dict[int, int] = {}
+        self._current_collectors: dict[int, CurrentMeterCollector] = {}
+        self._current_samples_by_config_id: dict[int, list] = {}
         self._replay_player = OneShotReplayPlayer()
         self._replay_config_id: int | None = None
 
@@ -283,6 +294,7 @@ class TestManager(QObject):
             self._recorders[config_id] = recorder
             if monitor is not None:
                 self._monitors[config_id] = monitor
+            self._start_current_collection(config_id, session)
 
             if mon := self._monitors.get(config_id):
                 mon.start()
@@ -565,6 +577,7 @@ class TestManager(QObject):
         notify_factory_runtime_abort: bool = False,
     ):
         self._stop_replay_if_config(config_id)
+        self._stop_current_collection(config_id)
         session = self._sessions.pop(config_id, None)
         rec = self._recorders.pop(config_id, None)
         mon = self._monitors.pop(config_id, None)
@@ -652,6 +665,7 @@ class TestManager(QObject):
         monitor=None,
     ) -> None:
         registered_session = self._sessions.pop(config_id, None)
+        self._stop_current_collection(config_id)
         registered_recorder = self._recorders.pop(config_id, None)
         registered_monitor = self._monitors.pop(config_id, None)
 
@@ -940,6 +954,12 @@ class TestManager(QObject):
             analysis_window=result_dict.get("analysis_window"),
             judgment_payload=result_dict,
         )
+        attach_stft_score_summary(
+            summary_payload,
+            config=self._session_config(session),
+            judgment_payload=result_dict,
+            chart_payload=chart_payload,
+        )
         self._bus.test_finished.emit(config_id, result_dict)
         self._bus.result_changed.emit(result_dict)
         self._emit_optional_signal(
@@ -1002,6 +1022,7 @@ class TestManager(QObject):
                 session,
                 context="recording completion",
             )
+            self._stop_current_collection(config_id)
 
             if capture_error is not None:
                 if not self._emit_auto_analysis_failure_review(
@@ -1286,6 +1307,12 @@ class TestManager(QObject):
                 session,
                 analysis_window=result_dict.get("analysis_window"),
                 judgment_payload=result_dict,
+            )
+            attach_stft_score_summary(
+                summary_payload,
+                config=self._session_config(session),
+                judgment_payload=result_dict,
+                chart_payload=chart_payload,
             )
             if not self._auto_analysis_review_still_owned(
                 config_id,
@@ -1643,6 +1670,7 @@ class TestManager(QObject):
         finally:
             self._recorders.pop(config_id, None)
             self._monitors.pop(config_id, None)
+            self._stop_current_collection(config_id)
 
         if cleanup_error is not None:
             raise cleanup_error
@@ -1930,6 +1958,10 @@ class TestManager(QObject):
             judgment_payload=judgment_payload,
             channel_column_map=self._session_channel_column_map(session),
             loudness_trace_cache=loudness_trace_cache,
+            current_trace_payload=self._current_trace_payload(
+                self._session_config(session).get("config_id"),
+                current_meter=self._session_config(session).get("current_meter"),
+            ),
         )
         self._warn_loudness_chart_issues(
             session,
@@ -1937,6 +1969,79 @@ class TestManager(QObject):
             chart_payload=chart_payload,
         )
         return chart_payload
+
+    def _start_current_collection(self, config_id: int, session) -> None:
+        config = self._session_config(session)
+        current_meter_config = config.get("current_meter")
+        current_config = normalize_current_meter_config(current_meter_config)
+        self._current_samples_by_config_id.pop(config_id, None)
+        if not current_config["enabled"]:
+            return
+        run_id = self._factory_run_id(session)
+        sample_callback = None
+        if isinstance(run_id, str) and run_id:
+            sample_callback = (
+                lambda _sample, samples_snapshot, cid=config_id, rid=run_id, cfg=current_meter_config:
+                self._emit_current_trace_update(cid, rid, samples_snapshot, cfg)
+            )
+        collector = CurrentMeterCollector(
+            current_config,
+            log_callback=lambda message, cid=config_id: self._bus.log.emit(
+                f"[CurrentMeter] config={cid}: {message}"
+            ),
+            sample_callback=sample_callback,
+        )
+        if collector.start():
+            self._current_collectors[config_id] = collector
+            self._bus.log.emit(f"[CurrentMeter] started for config={config_id}")
+
+    def _stop_current_collection(self, config_id: int) -> None:
+        collector = self._current_collectors.pop(config_id, None)
+        if collector is None:
+            return
+        try:
+            collector.stop()
+        finally:
+            samples = collector.samples()
+            if samples:
+                self._current_samples_by_config_id[config_id] = samples
+            self._bus.log.emit(
+                f"[CurrentMeter] stopped for config={config_id}, samples={len(samples)}"
+            )
+
+    def _current_trace_payload(
+        self,
+        config_id,
+        *,
+        current_meter: dict | None = None,
+    ) -> dict | None:
+        normalized_config_id = self._as_non_bool_int(config_id)
+        if normalized_config_id is None:
+            return None
+        collector = self._current_collectors.get(normalized_config_id)
+        samples = (
+            collector.samples()
+            if collector is not None
+            else self._current_samples_by_config_id.get(normalized_config_id, [])
+        )
+        return build_current_trace_payload(samples, config=current_meter)
+
+    def _emit_current_trace_update(
+        self,
+        config_id: int,
+        run_id: str | None,
+        samples,
+        current_meter: dict | None,
+    ) -> None:
+        if not isinstance(run_id, str) or not run_id:
+            return
+        payload = build_current_trace_payload(samples, config=current_meter)
+        if payload is None:
+            return
+        signal = getattr(self._bus, "current_trace_updated", None)
+        emit = getattr(signal, "emit", None)
+        if callable(emit):
+            emit(config_id, run_id, payload)
 
     @staticmethod
     def _capture_session_recorder_buffer(

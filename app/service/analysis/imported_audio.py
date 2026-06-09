@@ -12,7 +12,12 @@ from scipy.io import wavfile
 
 from app.service.analysis import dsp, stft_score
 from app.service.analysis.judgment import JudgmentEngine, _runtime_channel_defaults
+from app.service.analysis.limit_tables import (
+    normalize_limit_tables,
+    normalize_limit_tables_for_storage,
+)
 from app.service.analysis.review_payloads import (
+    attach_stft_score_summary,
     build_chart_payload,
     build_summary_payload,
     canonical_channel_label,
@@ -66,6 +71,15 @@ class ImportedAudioAnalysisInputs:
     config: dict
     mic_cal: dict
     wav: ImportedWav
+
+
+@dataclass(frozen=True)
+class _NyquistLimitFilterResult:
+    valid: bool
+    configured: bool
+    limits: object
+    had_above_nyquist: bool
+    remaining_distinct: set[float]
 
 
 def normalize_wav_samples(data: np.ndarray) -> np.ndarray:
@@ -399,6 +413,12 @@ def analyze_imported_wav(
         mic_cal=effective_mic_cal,
         warnings=warnings,
     )
+    attach_stft_score_summary(
+        summary_payload,
+        config=shaped["judgment_config"],
+        judgment_payload=judgment_payload,
+        chart_payload=chart_payload,
+    )
 
     payload = FactoryReviewPayload(
         displayed_config_id=request.config_id,
@@ -602,11 +622,7 @@ def _shape_frequency_limits_for_import(
     measured_chart_metrics: set[str] = set()
     nyquist = float(sample_rate) / 2.0
     original_fft_limits = channel_config.get("fft_band_limits", [])
-    original_fft_had_above_nyquist = _limits_include_above_nyquist(
-        original_fft_limits,
-        nyquist=nyquist,
-    )
-    fft_limits = _filter_limits_above_nyquist(
+    fft_filter = _filter_limits_above_nyquist(
         original_fft_limits,
         nyquist=nyquist,
         channel_index=channel_index,
@@ -614,37 +630,32 @@ def _shape_frequency_limits_for_import(
         metric="fft",
         warnings=warnings,
     )
-    if _is_non_empty_list(channel_config.get("fft_band_limits")):
-        distinct = {
-            float(limit["freq"])
-            for limit in fft_limits
-            if _coerce_positive_number(limit.get("freq")) is not None
-        }
-        if len(distinct) < 2:
-            no_result_metrics.add("fft")
-            if original_fft_had_above_nyquist and distinct:
-                measured_chart_metrics.add("fft")
-            warnings.append(
-                ImportAudioWarning(
-                    code="nyquist_no_evaluable_fft",
-                    message="FFT 约束在当前 WAV 采样率下没有足够可评估频点",
-                    severity="warning",
-                    channel_index=channel_index,
-                    wav_channel_index=wav_channel_index,
-                    metric="fft",
-                )
+    if fft_filter.valid and fft_filter.configured and not fft_filter.limits:
+        no_result_metrics.add("fft")
+        if fft_filter.had_above_nyquist and fft_filter.remaining_distinct:
+            measured_chart_metrics.add("fft")
+        warnings.append(
+            ImportAudioWarning(
+                code="nyquist_no_evaluable_fft",
+                message="FFT 约束在当前 WAV 采样率下没有足够可评估频点",
+                severity="warning",
+                channel_index=channel_index,
+                wav_channel_index=wav_channel_index,
+                metric="fft",
             )
-    channel_config["fft_band_limits"] = fft_limits
+        )
+    channel_config["fft_band_limits"] = fft_filter.limits
 
-    oct_limits = _filter_limits_above_nyquist(
-        channel_config.get("oct_band_limits", []),
+    original_oct_limits = channel_config.get("oct_band_limits", [])
+    oct_filter = _filter_limits_above_nyquist(
+        original_oct_limits,
         nyquist=nyquist,
         channel_index=channel_index,
         wav_channel_index=wav_channel_index,
         metric="octave",
         warnings=warnings,
     )
-    if _is_non_empty_list(channel_config.get("oct_band_limits")) and not oct_limits:
+    if oct_filter.valid and oct_filter.configured and not oct_filter.limits:
         no_result_metrics.add("octave")
         warnings.append(
             ImportAudioWarning(
@@ -655,21 +666,9 @@ def _shape_frequency_limits_for_import(
                 wav_channel_index=wav_channel_index,
                 metric="octave",
             )
-            )
-    channel_config["oct_band_limits"] = oct_limits
+        )
+    channel_config["oct_band_limits"] = oct_filter.limits
     return no_result_metrics, measured_chart_metrics
-
-
-def _limits_include_above_nyquist(limits, *, nyquist: float) -> bool:
-    if not isinstance(limits, list):
-        return False
-    for limit in limits:
-        if not isinstance(limit, dict):
-            continue
-        freq = _coerce_positive_number(limit.get("freq"))
-        if freq is not None and freq > nyquist:
-            return True
-    return False
 
 
 def _filter_limits_above_nyquist(
@@ -680,20 +679,45 @@ def _filter_limits_above_nyquist(
     wav_channel_index: int,
     metric: str,
     warnings: list[ImportAudioWarning],
-) -> list[dict]:
-    if not isinstance(limits, list):
-        return []
+) -> _NyquistLimitFilterResult:
+    if limits == []:
+        return _NyquistLimitFilterResult(
+            valid=True,
+            configured=False,
+            limits=[],
+            had_above_nyquist=False,
+            remaining_distinct=set(),
+        )
+    try:
+        tables = normalize_limit_tables(
+            limits,
+            metric=metric,
+            label=_limit_table_label(metric),
+        )
+    except ValueError:
+        return _NyquistLimitFilterResult(
+            valid=False,
+            configured=False,
+            limits=copy.deepcopy(limits),
+            had_above_nyquist=False,
+            remaining_distinct=set(),
+        )
+
+    configured = bool(tables)
     filtered: list[dict] = []
     skipped = False
-    for limit in limits:
-        if not isinstance(limit, dict):
-            filtered.append(copy.deepcopy(limit))
+    remaining_distinct: set[float] = set()
+    for table in tables:
+        points = []
+        for point in table.points:
+            if point.freq > nyquist:
+                skipped = True
+                continue
+            points.append({"freq": point.freq, "limit": point.limit})
+            remaining_distinct.add(point.freq)
+        if len({point["freq"] for point in points}) < 2:
             continue
-        freq = _coerce_positive_number(limit.get("freq"))
-        if freq is not None and freq > nyquist:
-            skipped = True
-            continue
-        filtered.append(copy.deepcopy(limit))
+        filtered.append({"kind": table.kind, "points": points})
     if skipped:
         warnings.append(
             ImportAudioWarning(
@@ -705,7 +729,21 @@ def _filter_limits_above_nyquist(
                 metric=metric,
             )
         )
-    return filtered
+    return _NyquistLimitFilterResult(
+        valid=True,
+        configured=configured,
+        limits=normalize_limit_tables_for_storage(
+            filtered,
+            metric=metric,
+            label=_limit_table_label(metric),
+        ),
+        had_above_nyquist=skipped,
+        remaining_distinct=remaining_distinct,
+    )
+
+
+def _limit_table_label(metric: str) -> str:
+    return "倍频程" if metric == "octave" else "FFT"
 
 
 def _inspect_golden_configuration(

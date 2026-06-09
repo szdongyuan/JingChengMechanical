@@ -1,0 +1,404 @@
+from __future__ import annotations
+
+import math
+import struct
+import threading
+import time
+from dataclasses import dataclass
+from typing import Callable, Iterable
+
+try:  # pragma: no cover - exercised by integration with installed dependency.
+    from pymodbus.client import ModbusTcpClient
+except Exception:  # pragma: no cover - pymodbus may be absent in tests.
+    ModbusTcpClient = None
+
+
+_REGISTER_TYPES = {"holding", "input"}
+_DATA_TYPES = {"uint16", "int16", "uint32", "int32", "float32"}
+_BYTE_ORDERS = {"big", "little"}
+_WORD_ORDERS = {"big", "little"}
+
+
+@dataclass(frozen=True)
+class CurrentSample:
+    time_sec: float
+    current_a: float
+
+
+def normalize_current_meter_config(config: dict | None) -> dict:
+    source = config if isinstance(config, dict) else {}
+    enabled = bool(source.get("enabled", False))
+    return {
+        "enabled": enabled,
+        "host": str(source.get("host") or "").strip(),
+        "port": _int_or_default(source.get("port"), 502, minimum=1, maximum=65535),
+        "unit_id": _int_or_default(source.get("unit_id"), 1, minimum=0, maximum=247),
+        "register_type": _choice_or_default(
+            source.get("register_type"),
+            "input",
+            _REGISTER_TYPES,
+        ),
+        "register_address": _int_or_default(
+            source.get("register_address"),
+            0,
+            minimum=0,
+            maximum=65535,
+        ),
+        "register_count": _int_or_default(
+            source.get("register_count"),
+            1,
+            minimum=1,
+            maximum=4,
+        ),
+        "data_type": _choice_or_default(source.get("data_type"), "uint16", _DATA_TYPES),
+        "byte_order": _choice_or_default(source.get("byte_order"), "big", _BYTE_ORDERS),
+        "word_order": _choice_or_default(source.get("word_order"), "big", _WORD_ORDERS),
+        "scale": _float_or_default(source.get("scale"), 0.001),
+        "offset": _float_or_default(source.get("offset"), 0.0),
+        "poll_interval_ms": _int_or_default(
+            source.get("poll_interval_ms"),
+            200,
+            minimum=20,
+            maximum=60000,
+        ),
+        "timeout_ms": _int_or_default(
+            source.get("timeout_ms"),
+            1000,
+            minimum=50,
+            maximum=60000,
+        ),
+    }
+
+
+def current_meter_display_unit(config: dict | None) -> str | None:
+    source = config if isinstance(config, dict) else {}
+    explicit_unit = source.get("unit")
+    if isinstance(explicit_unit, str):
+        explicit_unit = explicit_unit.strip()
+        if explicit_unit:
+            return explicit_unit
+
+    normalized = normalize_current_meter_config(config)
+    if (
+        normalized["data_type"] in {"uint16", "int16"}
+        and normalized["register_type"] == "input"
+        and normalized["register_count"] == 1
+        and normalized["byte_order"] == "big"
+        and normalized["word_order"] == "big"
+        and math.isclose(normalized["scale"], 0.001, rel_tol=1e-9, abs_tol=1e-12)
+    ):
+        return "mA"
+    return None
+
+
+def validate_current_meter_config(config: dict | None) -> list[str]:
+    normalized = normalize_current_meter_config(config)
+    if not normalized["enabled"]:
+        return []
+
+    errors: list[str] = []
+    if not normalized["host"]:
+        errors.append("电流表 IP/主机不能为空")
+    if normalized["data_type"] in {"uint32", "int32", "float32"} and normalized["register_count"] < 2:
+        errors.append("电流表 32 位数据至少需要读取 2 个寄存器")
+    return errors
+
+
+def decode_current_registers(registers: Iterable[int], config: dict | None) -> float | None:
+    normalized = normalize_current_meter_config(config)
+    words = [int(value) & 0xFFFF for value in registers]
+    data_type = normalized["data_type"]
+    if data_type in {"uint16", "int16"}:
+        if not words:
+            return None
+        raw_value = words[0]
+        if data_type == "int16" and raw_value >= 0x8000:
+            raw_value -= 0x10000
+        value = float(raw_value)
+    else:
+        if len(words) < 2:
+            return None
+        pair = words[:2]
+        if normalized["word_order"] == "little":
+            pair = list(reversed(pair))
+        canonical_bytes = b"".join(
+            int(word).to_bytes(2, byteorder=normalized["byte_order"], signed=False)
+            for word in pair
+        )
+        if data_type == "float32":
+            try:
+                value = float(struct.unpack(">f", canonical_bytes)[0])
+            except struct.error:
+                return None
+        else:
+            signed = data_type == "int32"
+            value = float(int.from_bytes(canonical_bytes, byteorder="big", signed=signed))
+
+    current = value * normalized["scale"] + normalized["offset"]
+    return current if math.isfinite(current) else None
+
+
+def build_current_trace_payload(
+    samples: Iterable[CurrentSample | dict],
+    *,
+    analysis_window: tuple[float, float] | list[float] | None = None,
+    config: dict | None = None,
+) -> dict | None:
+    normalized_samples = _normalize_samples(samples)
+    if analysis_window is not None:
+        try:
+            start_sec = float(analysis_window[0])
+            end_sec = float(analysis_window[1])
+        except (TypeError, ValueError, IndexError):
+            start_sec = 0.0
+            end_sec = math.inf
+        lower, upper = sorted((start_sec, end_sec))
+        normalized_samples = [
+            sample for sample in normalized_samples if lower <= sample.time_sec <= upper
+        ]
+
+    if not normalized_samples:
+        return None
+
+    times = [round(sample.time_sec, 6) for sample in normalized_samples]
+    values = [round(sample.current_a, 6) for sample in normalized_samples]
+    average = sum(values) / len(values)
+    payload = {
+        "times_sec": times,
+        "values_a": values,
+        "average_a": round(average, 6),
+        "max_a": round(max(values), 6),
+        "latest_a": values[-1],
+    }
+    unit = current_meter_display_unit(config)
+    if unit:
+        payload["unit"] = unit
+    return payload
+
+
+class CurrentMeterCollector:
+    def __init__(
+        self,
+        config: dict,
+        *,
+        client_factory: Callable[..., object] | None = None,
+        time_func: Callable[[], float] | None = None,
+        log_callback: Callable[[str], None] | None = None,
+        sample_callback: Callable[[CurrentSample, tuple[CurrentSample, ...]], None] | None = None,
+    ):
+        self._config = normalize_current_meter_config(config)
+        self._client_factory = client_factory
+        self._time = time_func or time.monotonic
+        self._log = log_callback
+        self._sample_callback = sample_callback
+        self._samples: list[CurrentSample] = []
+        self._samples_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._start_time = 0.0
+        self._last_error = ""
+        self._last_callback_error = ""
+
+    def start(self) -> bool:
+        if not self._config["enabled"]:
+            return False
+        if not self._config["host"]:
+            self._log_message("电流表未配置 IP/主机，跳过采集")
+            return False
+        if self._thread is not None and self._thread.is_alive():
+            return True
+        self._stop_event.clear()
+        self._start_time = self._time()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="CurrentMeterCollector",
+            daemon=True,
+        )
+        self._thread.start()
+        return True
+
+    def stop(self, timeout: float | None = None) -> None:
+        self._stop_event.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout)
+
+    def samples(self) -> list[CurrentSample]:
+        with self._samples_lock:
+            return list(self._samples)
+
+    def trace_payload(self, analysis_window=None) -> dict | None:
+        return build_current_trace_payload(
+            self.samples(),
+            analysis_window=analysis_window,
+            config=self._config,
+        )
+
+    def _run(self) -> None:
+        client = None
+        try:
+            factory = self._client_factory or ModbusTcpClient
+            if factory is None:
+                self._log_message("未安装 pymodbus，跳过电流表采集")
+                return
+            client = factory(
+                self._config["host"],
+                port=self._config["port"],
+                timeout=self._config["timeout_ms"] / 1000.0,
+            )
+            connect = getattr(client, "connect", None)
+            if callable(connect) and connect() is False:
+                self._log_message("电流表 Modbus TCP 连接失败")
+                return
+
+            while not self._stop_event.is_set():
+                self._poll_once(client)
+                self._stop_event.wait(self._config["poll_interval_ms"] / 1000.0)
+        except Exception as exc:
+            self._log_message(f"电流表采集异常: {exc}")
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+    def _poll_once(self, client) -> None:
+        read = (
+            getattr(client, "read_input_registers", None)
+            if self._config["register_type"] == "input"
+            else getattr(client, "read_holding_registers", None)
+        )
+        if not callable(read):
+            self._log_once("电流表 Modbus 客户端不支持读取寄存器")
+            return
+        try:
+            result = self._read_modbus_registers(
+                read,
+                self._config["register_address"],
+                self._config["register_count"],
+                self._config["unit_id"],
+            )
+        except Exception as exc:
+            self._log_once(f"电流表读取失败: {exc}")
+            return
+
+        is_error = getattr(result, "isError", None)
+        if callable(is_error) and is_error():
+            self._log_once("电流表读取返回 Modbus 错误")
+            return
+        value = decode_current_registers(getattr(result, "registers", []), self._config)
+        if value is None:
+            self._log_once("电流表读取值无效")
+            return
+
+        sample = CurrentSample(
+            time_sec=max(0.0, self._time() - self._start_time),
+            current_a=float(value),
+        )
+        has_sample_callback = callable(self._sample_callback)
+        with self._samples_lock:
+            self._samples.append(sample)
+            if has_sample_callback:
+                samples_snapshot = tuple(self._samples)
+        self._last_error = ""
+        if has_sample_callback:
+            self._notify_sample_callback(sample, samples_snapshot)
+
+    def _notify_sample_callback(
+        self,
+        sample: CurrentSample,
+        samples_snapshot: tuple[CurrentSample, ...],
+    ) -> None:
+        if not callable(self._sample_callback):
+            return
+        try:
+            self._sample_callback(sample, samples_snapshot)
+            self._last_callback_error = ""
+        except Exception as exc:
+            message = f"电流表样本回调失败: {exc}"
+            if message == self._last_callback_error:
+                return
+            self._last_callback_error = message
+            self._log_message(message)
+
+    @staticmethod
+    def _read_modbus_registers(
+        read,
+        address: int,
+        count: int,
+        unit_id: int,
+    ):
+        attempts = (
+            lambda: read(address, count=count, slave=unit_id),
+            lambda: read(address, count=count, unit=unit_id),
+            lambda: read(address, count=count, device_id=unit_id),
+        )
+        last_error: TypeError | None = None
+        for attempt in attempts:
+            try:
+                return attempt()
+            except TypeError as exc:
+                last_error = exc
+                continue
+        if last_error is not None:
+            raise last_error
+
+    def _log_once(self, message: str) -> None:
+        if message == self._last_error:
+            return
+        self._last_error = message
+        self._log_message(message)
+
+    def _log_message(self, message: str) -> None:
+        if callable(self._log):
+            try:
+                self._log(message)
+            except Exception:
+                pass
+
+
+def _normalize_samples(samples: Iterable[CurrentSample | dict]) -> list[CurrentSample]:
+    normalized: list[CurrentSample] = []
+    for sample in samples or []:
+        if isinstance(sample, CurrentSample):
+            time_sec = sample.time_sec
+            current_a = sample.current_a
+        elif isinstance(sample, dict):
+            time_sec = sample.get("time_sec")
+            current_a = sample.get("current_a")
+        else:
+            continue
+        try:
+            time_value = float(time_sec)
+            current_value = float(current_a)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(time_value) and math.isfinite(current_value):
+            normalized.append(CurrentSample(time_value, current_value))
+    normalized.sort(key=lambda item: item.time_sec)
+    return normalized
+
+
+def _int_or_default(value, default: int, *, minimum: int, maximum: int) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = default
+    if isinstance(value, bool):
+        number = default
+    return min(max(number, minimum), maximum)
+
+
+def _float_or_default(value, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def _choice_or_default(value, default: str, choices: set[str]) -> str:
+    text = str(value or "").strip().lower()
+    return text if text in choices else default

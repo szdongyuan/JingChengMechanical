@@ -22,6 +22,7 @@ from app.service.config_package_service import (
     ConfigPackageService,
 )
 from app.service.config_service import ConfigService
+from app.service.current_meter_service import normalize_current_meter_config
 from app.service.golden_sample_service import GoldenSampleService
 from model.channel_config_table import ChannelConfigTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable as AiBindingTable
@@ -82,6 +83,49 @@ def _recreate_legacy_config_schema_without_monitor_columns() -> None:
     )
     ChannelConfigTable.create_table(safe=True)
     AiBindingTable.create_table(safe=True)
+
+
+def _recreate_accepted_legacy_config_schema_without_current_meter_columns() -> None:
+    database = ConfigTable._meta.database
+    database.execute_sql("DROP TABLE IF EXISTS channel_config_table")
+    database.execute_sql("DROP TABLE IF EXISTS test_config_ai_binding_table")
+    database.execute_sql("DROP TABLE IF EXISTS test_config_table")
+    database.execute_sql(
+        """
+        CREATE TABLE test_config_table (
+            config_id INTEGER NOT NULL PRIMARY KEY,
+            config_name TEXT NOT NULL UNIQUE,
+            record_duration REAL NOT NULL DEFAULT 5.0,
+            analysis_duration REAL NOT NULL DEFAULT 3.0,
+            allow_incomplete_recording_analysis INTEGER NOT NULL DEFAULT 0,
+            scan_triggers_test INTEGER NOT NULL DEFAULT 0,
+            plc_id INTEGER,
+            plc_device_key TEXT,
+            plc_device_label TEXT,
+            created_time TEXT NOT NULL DEFAULT 'legacy-created',
+            updated_time TEXT NOT NULL DEFAULT 'legacy-updated',
+            input_device_name TEXT,
+            input_device_hostapi TEXT,
+            input_device_samplerate REAL,
+            output_device_name TEXT,
+            output_device_hostapi TEXT,
+            output_device_samplerate REAL,
+            selected_channels TEXT NOT NULL DEFAULT '[]',
+            vibration_view_channel_index INTEGER,
+            analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0,
+            monitor_channel_index INTEGER,
+            monitor_gain_db REAL,
+            FOREIGN KEY (plc_id) REFERENCES plc_table (id) ON DELETE SET NULL
+        )
+        """
+    )
+    ChannelConfigTable.create_table(safe=True)
+    AiBindingTable.create_table(safe=True)
+
+
+def _config_table_columns() -> set[str]:
+    cursor = ConfigTable._meta.database.execute_sql("PRAGMA table_info(test_config_table)")
+    return {row[1] for row in cursor.fetchall()}
 
 
 @pytest.fixture
@@ -1246,6 +1290,50 @@ def test_import_package_creates_new_config_by_default_and_restores_golden_sample
     assert services.config_service.golden_sample_service.is_managed_path(
         channel["golden_sample_path"]
     )
+
+
+def test_import_package_create_supports_accepted_legacy_schema_without_current_meter_columns(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    _recreate_accepted_legacy_config_schema_without_current_meter_columns()
+    imported_config = _config_payload(
+        999,
+        config_name="Imported Legacy",
+        vibration_view_channel_index=0,
+    )
+    path = _write_package(
+        tmp_path / "legacy-without-current-meter.dy",
+        _package_entries(config_payload=imported_config),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    loaded = services.config_service.load_config(result.config_id)
+    row = ConfigTable._meta.database.execute_sql(
+        """
+        SELECT created_time, updated_time
+        FROM test_config_table
+        WHERE config_id = ?
+        """,
+        (result.config_id,),
+    ).fetchone()
+
+    assert "vibration_view_channel_index" in _config_table_columns()
+    assert "current_meter_enabled" not in _config_table_columns()
+    assert result.status == "created"
+    assert result.config_id == 1
+    assert loaded["config_id"] == result.config_id
+    assert loaded["config_name"] == "Imported Legacy"
+    assert loaded["vibration_view_channel_index"] == 0
+    assert loaded["current_meter"] == normalize_current_meter_config(None)
+    assert len(loaded["channels"]) == 1
+    assert loaded["channels"][0]["channel_index"] == 0
+    assert row[0] not in (None, "legacy-created")
+    assert row[1] not in (None, "legacy-updated")
 
 
 def test_import_package_config_conflict_use_existing_skips_entire_package_import(

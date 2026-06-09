@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from peewee import ForeignKeyField
+import pytest
 
 from model.plc_table import PlcTable
 from model.test_config_table import TestConfigTable as ConfigTable
@@ -18,6 +19,20 @@ def test_test_config_table_exposes_nullable_plc_id_field():
         "plc",
         "created_time",
         "updated_time",
+        "current_meter_host",
+        "current_meter_port",
+        "current_meter_unit_id",
+        "current_meter_register_type",
+        "current_meter_register_address",
+        "current_meter_register_count",
+        "current_meter_data_type",
+        "current_meter_byte_order",
+        "current_meter_word_order",
+        "current_meter_scale",
+        "current_meter_offset",
+        "current_meter_enabled",
+        "current_meter_poll_interval_ms",
+        "current_meter_timeout_ms",
         "input_device_name",
         "input_device_hostapi",
         "input_device_samplerate",
@@ -60,6 +75,19 @@ def test_model_defines_allow_incomplete_recording_analysis_with_false_default():
     config = ConfigTable(config_name="Incomplete Stop Defaults")
 
     assert config.allow_incomplete_recording_analysis is False
+
+
+def test_model_defines_default_lingli_current_meter_fields():
+    config = ConfigTable(config_name="LingLi Current Meter Defaults")
+
+    assert config.current_meter_register_type == "input"
+    assert config.current_meter_register_address == 0
+    assert config.current_meter_register_count == 1
+    assert config.current_meter_data_type == "uint16"
+    assert config.current_meter_byte_order == "big"
+    assert config.current_meter_word_order == "big"
+    assert config.current_meter_scale == pytest.approx(0.001)
+    assert config.current_meter_offset == pytest.approx(0.0)
 
 
 def test_db_backed_plc_fk_clears_config_binding_on_plc_delete():
