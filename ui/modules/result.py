@@ -25,9 +25,9 @@ _LOUDNESS_PEAK_LABEL = "响度（峰值）"
 
 _DISPLAY_LABEL_MAP = {
     "SPL": _SPL_PEAK_LABEL,
-    "平均SPL": "平均声压级",
+    "平均SPL": "声压级（平均）",
     "Loudness": _LOUDNESS_PEAK_LABEL,
-    "平均Loudness": "平均响度",
+    "平均Loudness": "响度（平均）",
     "FFT": "频谱",
     "Octave": "倍频程",
     "频谱平均评分": "频谱平均评分",
@@ -47,9 +47,9 @@ class ResultModule(QWidget):
     module_id = "result"
     _ROW_DEFS = (
         ("spl", _SPL_PEAK_LABEL),
-        ("spl_average", "平均声压级"),
+        ("spl_average", "声压级（平均）"),
         ("loudness", _LOUDNESS_PEAK_LABEL),
-        ("loudness_average", "平均响度"),
+        ("loudness_average", "响度（平均）"),
         ("fft", "频谱"),
         ("octave", "倍频程"),
         ("stft_score", "频谱平均评分"),

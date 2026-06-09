@@ -2710,7 +2710,7 @@ def test_main_window_ai_partial_no_result_keeps_rule_rows_and_committed_charts_v
     assert _result_table_value(window, 0, 2) == "通道2"
     assert _result_table_value(window, 0, 3) == "OK"
     assert window.result.table.rowCount() == 8
-    assert _result_table_value(window, 1, 0) == "平均声压级"
+    assert _result_table_value(window, 1, 0) == "声压级（平均）"
     assert _result_table_value(window, 1, 1) == "-"
     assert _result_table_value(window, 1, 2) == "-"
     assert _result_table_value(window, 1, 3) == "-"
@@ -2718,7 +2718,7 @@ def test_main_window_ai_partial_no_result_keeps_rule_rows_and_committed_charts_v
     assert _result_table_value(window, 2, 1) == "-0.5 sone"
     assert _result_table_value(window, 2, 2) == "通道2"
     assert _result_table_value(window, 2, 3) == "OK"
-    assert _result_table_value(window, 3, 0) == "平均响度"
+    assert _result_table_value(window, 3, 0) == "响度（平均）"
     assert _result_table_value(window, 3, 1) == "-"
     assert _result_table_value(window, 3, 2) == "-"
     assert _result_table_value(window, 3, 3) == "-"
