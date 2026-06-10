@@ -18,6 +18,7 @@ from ui.modules.octave import OctaveModule
 from ui.modules.spectrum import SpectrumModule
 from ui.modules.spl import SplModule
 from ui.modules.stft import StftModule
+from ui.modules.vibration import VibrationAxisModule, VibrationTrendModule
 
 from ._support import (
     _assert_empty_chart_visible,
@@ -53,6 +54,37 @@ def _with_loudness_payload(
                 "upper_limit": 10.0,
             }
     return review_payload
+
+
+def _review_payload_with_vibration_payload(
+    config_id: int,
+    *,
+    channels: tuple[int, ...] = (1,),
+) -> FactoryReviewPayload:
+    return FactoryReviewPayload(
+        displayed_config_id=config_id,
+        run_id="run-101",
+        trigger_source="manual",
+        summary_payload={"overall_status": "pass", "rows": []},
+        chart_payload={
+            channel_index: {
+                "vibration": {
+                    "overall_rms": 1.25 + channel_index,
+                    "overall_peak": 3.5 + channel_index,
+                    "overall_crest_factor": 2.8,
+                    "dominant_frequency_hz": 42.0,
+                    "times_sec": [0.05, 0.10],
+                    "rms_values": [1.0, 1.5],
+                    "peak_values": [2.0, 3.0],
+                    "frequency_times_sec": [0.05, 0.10],
+                    "fundamental_frequency_values_hz": [41.5, 42.5],
+                    "spectral_centroid_values_hz": [43.0, 43.4],
+                    "frequency_bandwidth_values_hz": [2.0, 2.5],
+                }
+            }
+            for channel_index in channels
+        },
+    )
 
 
 def _assert_left_axis_title_hidden_ticks_visible(widget) -> None:
@@ -132,6 +164,148 @@ def _assert_heatmap_current_trace_cleared(module: StftModule) -> None:
     assert current_x is None or list(current_x) == []
     assert current_y is None or list(current_y) == []
     assert module.canvas.heatmap.plot_item.getAxis("right").isVisible() is False
+
+
+def test_spectrum_strict_panel_binding_shows_empty_when_bound_channel_missing(qapp):
+    services = _make_services()
+    module = SpectrumModule(services)
+    module.strict_selected_display_channel = True
+    module.selected_display_channel_provider = lambda: 9
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0,))
+    )
+    qapp.processEvents()
+
+    assert module.current_plot_payload() is None
+    assert module.current_render_channel() == 9
+
+
+def test_spectrum_strict_panel_binding_shows_empty_when_provider_returns_none(qapp):
+    services = _make_services()
+    module = SpectrumModule(services)
+    module.strict_selected_display_channel = True
+    module.selected_display_channel_provider = lambda: None
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0,))
+    )
+    qapp.processEvents()
+
+    assert module.current_plot_payload() is None
+    assert module.current_render_channel() is None
+
+
+def test_octave_strict_panel_binding_shows_empty_when_bound_channel_missing(qapp):
+    services = _make_services()
+    module = OctaveModule(services)
+    module.strict_selected_display_channel = True
+    module.selected_display_channel_provider = lambda: 9
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0,))
+    )
+    qapp.processEvents()
+
+    assert module.current_plot_payload() is None
+    assert module.current_render_channel() == 9
+
+
+def test_spl_strict_panel_binding_shows_empty_when_bound_channel_missing(qapp):
+    services = _make_services()
+    module = SplModule(services)
+    module.strict_selected_display_channel = True
+    module.selected_display_channel_provider = lambda: 9
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_chart_payload(101, channels=(0,))
+    )
+    qapp.processEvents()
+
+    assert module.current_plot_payload() is None
+    assert module.current_render_channel() == 9
+
+
+def test_loudness_strict_panel_binding_shows_empty_when_bound_channel_missing(qapp):
+    services = _make_services()
+    module = LoudnessModule(services)
+    module.strict_selected_display_channel = True
+    module.selected_display_channel_provider = lambda: 9
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(
+        _with_loudness_payload(
+            _review_payload_with_chart_payload(101, channels=(0,))
+        )
+    )
+    qapp.processEvents()
+
+    assert module.current_plot_payload() is None
+    assert module.current_render_channel() == 9
+
+
+def test_vibration_trend_strict_panel_binding_shows_empty_when_bound_channel_missing(
+    qapp,
+):
+    services = _make_services()
+    module = VibrationTrendModule(services)
+    module.strict_selected_display_channel = True
+    module.selected_display_channel_provider = lambda: 9
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_vibration_payload(101, channels=(1,))
+    )
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is False
+    assert module.current_payload() is None
+    assert module.plot.series_payload() is None
+    assert module.current_render_channel() == 9
+
+
+def test_vibration_axis_strict_panel_binding_shows_empty_when_bound_channel_missing(
+    qapp,
+):
+    services = _make_services()
+    module = VibrationAxisModule(services)
+    module.strict_selected_display_channel = True
+    module.selected_display_channel_provider = lambda: 9
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_vibration_payload(101, channels=(1,))
+    )
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is False
+    assert module.current_payload() is None
+    assert module.plot.series_payload() is None
+    assert module.current_render_channel() == 9
+
+
+def test_vibration_trend_strict_panel_binding_shows_empty_when_provider_returns_none(
+    qapp,
+):
+    services = _make_services()
+    module = VibrationTrendModule(services)
+    module.strict_selected_display_channel = True
+    module.selected_display_channel_provider = lambda: None
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(
+        _review_payload_with_vibration_payload(101, channels=(1,))
+    )
+    qapp.processEvents()
+
+    assert module.has_committed_plot_data() is False
+    assert module.current_payload() is None
+    assert module.plot.series_payload() is None
+    assert module.current_render_channel() is None
 
 
 def test_spl_module_renders_committed_chart_for_selected_channel(qapp):

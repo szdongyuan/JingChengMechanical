@@ -197,6 +197,7 @@ class _BaseVibrationModule(QWidget):
         self.services = services
         self.selected_display_channel_provider = None
         self.selected_display_channel_sync = None
+        self.strict_selected_display_channel = False
         self._factory_state = getattr(
             services.factory_mode,
             "state",
@@ -266,7 +267,13 @@ class _BaseVibrationModule(QWidget):
             else None
         )
         if not isinstance(vibration_payload, dict):
-            self._clear_plot()
+            self._clear_plot(
+                rendered_channel_index=(
+                    channel_index
+                    if self.strict_selected_display_channel and channel_payload is None
+                    else None
+                )
+            )
             return
 
         if not self._render_vibration_payload(channel_index, vibration_payload):
@@ -279,7 +286,7 @@ class _BaseVibrationModule(QWidget):
     ) -> bool:
         raise NotImplementedError
 
-    def _clear_plot(self) -> None:
+    def _clear_plot(self, *, rendered_channel_index: int | None = None) -> None:
         raise NotImplementedError
 
     def _set_rendered_payload(
@@ -291,9 +298,13 @@ class _BaseVibrationModule(QWidget):
         self._rendered_channel_index = channel_index
         self._current_payload = deepcopy(payload)
 
-    def _clear_rendered_payload(self) -> None:
+    def _clear_rendered_payload(
+        self,
+        *,
+        rendered_channel_index: int | None = None,
+    ) -> None:
         self._has_plot_data = False
-        self._rendered_channel_index = None
+        self._rendered_channel_index = rendered_channel_index
         self._current_payload = None
 
     def _can_render_committed_chart(self) -> bool:
@@ -326,8 +337,13 @@ class _BaseVibrationModule(QWidget):
         chart_payload: dict[int, dict],
     ) -> tuple[int | None, dict | None]:
         selected_channel = self._selected_channel_index()
-        if selected_channel is not None and selected_channel in chart_payload:
-            return selected_channel, chart_payload[selected_channel]
+        if self.strict_selected_display_channel and selected_channel is None:
+            return None, None
+        if selected_channel is not None:
+            if selected_channel in chart_payload:
+                return selected_channel, chart_payload[selected_channel]
+            if self.strict_selected_display_channel:
+                return selected_channel, None
 
         for channel_index, channel_payload in chart_payload.items():
             self._sync_selected_channel(selected_channel, channel_index)
@@ -481,8 +497,8 @@ class VibrationAxisModule(_BaseVibrationModule):
         self._set_rendered_payload(channel_index, vibration_payload)
         return True
 
-    def _clear_plot(self) -> None:
-        self._clear_rendered_payload()
+    def _clear_plot(self, *, rendered_channel_index: int | None = None) -> None:
+        self._clear_rendered_payload(rendered_channel_index=rendered_channel_index)
         self._frequency_snapshot = {}
         self._fundamental_frequency_values = []
         self._centroid_values = []
@@ -632,8 +648,8 @@ class VibrationTrendModule(_BaseVibrationModule):
         self._set_rendered_payload(channel_index, vibration_payload)
         return True
 
-    def _clear_plot(self) -> None:
-        self._clear_rendered_payload()
+    def _clear_plot(self, *, rendered_channel_index: int | None = None) -> None:
+        self._clear_rendered_payload(rendered_channel_index=rendered_channel_index)
         self.plot.clear_data()
         self._rms_emphasis_curve.setData([], [])
         self._peak_curve.setData([], [])
