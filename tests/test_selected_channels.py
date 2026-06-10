@@ -41,6 +41,11 @@ def test_validate_rejects_empty_selected_channels():
         normalize_selected_channels([], hardware_channel_count=6)
 
 
+def test_validate_rejects_more_than_two_selected_channels():
+    with pytest.raises(ValueError, match="at most two|最多"):
+        normalize_selected_channels([0, 1, 2], hardware_channel_count=6)
+
+
 @pytest.mark.parametrize("hardware_channel_count", [0, -1])
 def test_validate_rejects_invalid_hardware_channel_count(hardware_channel_count):
     with pytest.raises(ValueError, match="positive"):

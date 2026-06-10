@@ -85,6 +85,7 @@ CHANNEL_CONFIG_COLUMN_SQL = {
 
 TEST_CONFIG_COLUMN_SQL = {
     "vibration_view_channel_index": "INTEGER DEFAULT NULL",
+    "result_dashboard_layout": "TEXT DEFAULT NULL",
 }
 
 
@@ -395,6 +396,41 @@ def test_connect_rejects_missing_vibration_view_column_without_mutating(
         assert check_db.execute_sql(
             "SELECT id FROM test_config_table"
         ).fetchall() == [(1,)]
+    finally:
+        check_db.close()
+
+
+def test_connect_rejects_missing_result_dashboard_layout_column_without_mutating(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "jingchen.db"
+    tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    tmp_db.connect()
+    for table_name in sorted(EXPECTED_RUNTIME_TABLES - {"test_config_table"}):
+        _create_table(tmp_db, table_name)
+    tmp_db.execute_sql(
+        "CREATE TABLE test_config_table "
+        "(id INTEGER PRIMARY KEY, vibration_view_channel_index INTEGER DEFAULT NULL)"
+    )
+    tmp_db.execute_sql("INSERT INTO test_config_table (id) VALUES (1)")
+    tmp_db.close()
+    monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    with pytest.raises(DatabaseStartupError, match="missing required test_config_table"):
+        svc_mod.DbConnectionService().connect()
+
+    check_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    check_db.connect()
+    try:
+        assert _table_column_names(check_db, "test_config_table") == [
+            "id",
+            "vibration_view_channel_index",
+        ]
+        assert check_db.execute_sql(
+            "SELECT id, vibration_view_channel_index FROM test_config_table"
+        ).fetchall() == [(1, None)]
     finally:
         check_db.close()
 
