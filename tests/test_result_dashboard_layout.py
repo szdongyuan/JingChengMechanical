@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+import app.service.result_dashboard_layout as layout_module
 from app.service.result_dashboard_layout import (
     DEFAULT_RESULT_DASHBOARD_LAYOUT,
     PANEL_FAMILIES,
@@ -106,6 +107,26 @@ def test_validation_rejects_overlapping_panels():
 
     with pytest.raises(ResultDashboardLayoutError, match="重叠|overlap"):
         validate_result_dashboard_layout(layout)
+
+
+def test_validation_of_large_valid_spans_does_not_iterate_occupied_cells(monkeypatch):
+    def fail_if_cell_ranges_are_materialized(*_args):
+        raise AssertionError("layout validation must not iterate every occupied cell")
+
+    monkeypatch.setattr(
+        layout_module,
+        "range",
+        fail_if_cell_ranges_are_materialized,
+        raising=False,
+    )
+    rows = 1_000_000_000
+    layout = _layout(
+        _panel("summary", "result_summary", row_span=rows),
+        columns=1,
+        rows=rows,
+    )
+
+    assert validate_result_dashboard_layout(layout) == layout
 
 
 def test_validation_rejects_missing_summary():

@@ -194,7 +194,7 @@ def validate_result_dashboard_layout(
         raise ResultDashboardLayoutError("结果展示布局 panels 必须是列表")
 
     seen_ids: set[str] = set()
-    occupied_cells: dict[tuple[int, int], str] = {}
+    placed_panels: list[dict[str, Any]] = []
     summary_count = 0
 
     for index, raw_panel in enumerate(raw_panels):
@@ -223,7 +223,8 @@ def validate_result_dashboard_layout(
 
         _validate_selected_channel_shape(panel_channel, selected_channels)
         _validate_panel_bounds(panel, normalized["rows"], normalized["columns"])
-        _reserve_panel_cells(panel, occupied_cells)
+        _validate_panel_does_not_overlap(panel, placed_panels)
+        placed_panels.append(panel)
         normalized["panels"].append(panel)
 
     if summary_count != 1:
@@ -352,19 +353,24 @@ def _validate_panel_bounds(panel: dict[str, Any], rows: int, columns: int) -> No
         raise ResultDashboardLayoutError("结果展示布局面板越界 bounds")
 
 
-def _reserve_panel_cells(
+def _validate_panel_does_not_overlap(
     panel: dict[str, Any],
-    occupied_cells: dict[tuple[int, int], str],
+    placed_panels: list[dict[str, Any]],
 ) -> None:
-    for row in range(panel["row"], panel["row"] + panel["row_span"]):
-        for column in range(panel["column"], panel["column"] + panel["column_span"]):
-            cell = (row, column)
-            existing_panel_id = occupied_cells.get(cell)
-            if existing_panel_id is not None:
-                raise ResultDashboardLayoutError(
-                    f"结果展示布局面板重叠 overlap: {existing_panel_id}, {panel['id']}"
-                )
-            occupied_cells[cell] = panel["id"]
+    for existing_panel in placed_panels:
+        if _panels_overlap(existing_panel, panel):
+            raise ResultDashboardLayoutError(
+                f"结果展示布局面板重叠 overlap: {existing_panel['id']}, {panel['id']}"
+            )
+
+
+def _panels_overlap(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    return (
+        first["row"] < second["row"] + second["row_span"]
+        and second["row"] < first["row"] + first["row_span"]
+        and first["column"] < second["column"] + second["column_span"]
+        and second["column"] < first["column"] + first["column_span"]
+    )
 
 
 def _first_non_vibration_channel(
