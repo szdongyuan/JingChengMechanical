@@ -1084,7 +1084,7 @@ def test_config_dialog_x_and_confirm_close_without_saving(qapp):
     confirm_button = dialog.findChild(QPushButton, "TopLevelConfigCardConfirmButton")
 
     assert close_button is not None
-    assert close_button.text() == "X"
+    assert close_button.text() == "x"
     assert confirm_button is not None
     assert confirm_button.text() == "确定"
 
@@ -2281,7 +2281,7 @@ def test_channel_section_launchers_open_movable_card_dialogs(qapp):
     assert fft_dialog.pos() == moved_pos
 
     close_button = fft_dialog.findChild(QPushButton, "ChannelSectionCardCloseButton")
-    assert close_button.text() == "X"
+    assert close_button.text() == "x"
     confirm_button = fft_dialog.findChild(QPushButton, "ChannelSectionCardConfirmButton")
     assert confirm_button is not None
     assert confirm_button.text() == "确定"

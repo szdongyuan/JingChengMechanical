@@ -141,7 +141,7 @@ class _ConfigSectionCardDialog(QDialog):
         title_label.setStyleSheet("font-weight: 700; color: #334155;")
         title_layout.addWidget(title_label, 1)
 
-        close_button = QPushButton("X")
+        close_button = QPushButton("x")
         close_button.setObjectName(close_button_object_name)
         close_button.clicked.connect(self.hide)
         title_layout.addWidget(close_button, 0)

@@ -65,16 +65,76 @@ class _GridPreview(QFrame):
     def __init__(self, editor: "ResultDashboardLayoutEditor"):
         super().__init__()
         self._editor = editor
+        self._drag_panel_id: str | None = None
+        self._drag_start_cell: tuple[int, int] | None = None
+        self._drag_start_pos = None
+        self._dragging = False
         self.setMinimumSize(360, 240)
         self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setMouseTracking(True)
         self.setObjectName("result_dashboard_grid_preview")
         self.setStyleSheet(
             "QFrame#result_dashboard_grid_preview { background: #f8fafc; "
             "border: 1px solid #cbd5e1; border-radius: 6px; }"
         )
 
-    def simulate_drop_for_test(self, panel_id: str, *, row: int, column: int) -> bool:
-        return self._editor.move_panel(panel_id, row=row, column=column)
+    def mousePressEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+
+        cell = self._cell_at_position(event.position().toPoint())
+        if cell is None:
+            super().mousePressEvent(event)
+            return
+
+        panel_id = self._panel_id_at_cell(*cell)
+        if panel_id is None:
+            self._editor.select_grid_cell(*cell)
+            self._drag_panel_id = None
+        else:
+            self._editor.select_panel(panel_id)
+            self._drag_panel_id = panel_id
+        self._drag_start_cell = cell
+        self._drag_start_pos = event.position().toPoint()
+        self._dragging = False
+        event.accept()
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_panel_id is None or self._drag_start_pos is None:
+            super().mouseMoveEvent(event)
+            return
+        if (event.position().toPoint() - self._drag_start_pos).manhattanLength() >= 4:
+            self._dragging = True
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mouseReleaseEvent(event)
+            return
+
+        cell = self._cell_at_position(event.position().toPoint())
+        panel_id = self._drag_panel_id
+        start_cell = self._drag_start_cell
+        dragging = self._dragging
+        self._drag_panel_id = None
+        self._drag_start_cell = None
+        self._drag_start_pos = None
+        self._dragging = False
+
+        if cell is None:
+            event.accept()
+            return
+
+        if panel_id is not None and (dragging or cell != start_cell):
+            self._editor.move_panel(panel_id, row=cell[0], column=cell[1])
+        else:
+            clicked_panel_id = self._panel_id_at_cell(*cell)
+            if clicked_panel_id is None:
+                self._editor.select_grid_cell(*cell)
+            else:
+                self._editor.select_panel(clicked_panel_id)
+        event.accept()
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
@@ -98,6 +158,21 @@ class _GridPreview(QFrame):
             y = round(row * cell_height)
             painter.drawLine(0, y, width, y)
 
+        selected_row, selected_column = self._editor._selected_grid_cell
+        if 0 <= selected_row < rows and 0 <= selected_column < columns:
+            x = round(selected_column * cell_width) + 2
+            y = round(selected_row * cell_height) + 2
+            painter.setBrush(QColor(219, 234, 254, 80))
+            painter.setPen(QPen(QColor("#2563eb"), 1, Qt.PenStyle.DashLine))
+            painter.drawRoundedRect(
+                x,
+                y,
+                max(4, round(cell_width) - 4),
+                max(4, round(cell_height) - 4),
+                5,
+                5,
+            )
+
         for panel in layout.get("panels", []):
             x = round(panel["column"] * cell_width) + 3
             y = round(panel["row"] * cell_height) + 3
@@ -116,6 +191,29 @@ class _GridPreview(QFrame):
                 Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
                 PANEL_TITLES.get(panel["type"], panel["type"]),
             )
+
+    def _cell_at_position(self, position) -> tuple[int, int] | None:
+        layout = self._editor.layout_data()
+        columns = max(MIN_COLUMNS, int(layout.get("columns", MIN_COLUMNS)))
+        rows = max(MIN_ROWS, int(layout.get("rows", MIN_ROWS)))
+        width = max(1, self.width() - 20)
+        height = max(1, self.height() - 20)
+        x = position.x() - 10
+        y = position.y() - 10
+        if x < 0 or y < 0 or x > width or y > height:
+            return None
+        column = min(columns - 1, int(x / (width / columns)))
+        row = min(rows - 1, int(y / (height / rows)))
+        return row, column
+
+    def _panel_id_at_cell(self, row: int, column: int) -> str | None:
+        for panel in reversed(self._editor.layout_data().get("panels", [])):
+            if (
+                panel["row"] <= row < panel["row"] + panel["row_span"]
+                and panel["column"] <= column < panel["column"] + panel["column_span"]
+            ):
+                return panel["id"]
+        return None
 
 
 class ResultDashboardLayoutEditor(QWidget):
@@ -209,10 +307,12 @@ class ResultDashboardLayoutEditor(QWidget):
         self._refresh_controls()
         return True
 
-    def select_grid_cell_for_test(self, row: int, column: int) -> None:
+    def select_grid_cell(self, row: int, column: int) -> bool:
         if 0 <= row < self._layout["rows"] and 0 <= column < self._layout["columns"]:
             self._selected_grid_cell = (int(row), int(column))
             self._preview.update()
+            return True
+        return False
 
     def set_panel_channel(self, panel_id: str, channel: str) -> bool:
         panel = self._find_panel(panel_id)
@@ -464,8 +564,7 @@ class ResultDashboardLayoutEditor(QWidget):
     def _on_add_panel_clicked(self) -> None:
         panel_type = self.panel_catalog_combo.currentData()
         if panel_type:
-            row, column = self._selected_grid_cell
-            self.add_panel(panel_type, row=row, column=column)
+            self.add_panel(panel_type)
 
     def _on_remove_panel_clicked(self) -> None:
         if self._selected_panel_id is not None:

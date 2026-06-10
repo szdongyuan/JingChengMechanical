@@ -6,6 +6,8 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import QApplication, QComboBox, QListWidget, QPushButton, QSpinBox
 
 from ui.widgets.result_dashboard_layout_editor import ResultDashboardLayoutEditor
@@ -17,6 +19,27 @@ def qapp():
     if app is None:
         app = QApplication([])
     return app
+
+
+def _show_editor(editor: ResultDashboardLayoutEditor, qapp) -> None:
+    editor.resize(720, 420)
+    editor.show()
+    qapp.processEvents()
+
+
+def _cell_center(editor: ResultDashboardLayoutEditor, row: int, column: int) -> QPoint:
+    preview = editor.grid_preview()
+    layout = editor.layout_data()
+    cell_width = (preview.width() - 20) / layout["columns"]
+    cell_height = (preview.height() - 20) / layout["rows"]
+    return QPoint(
+        round(10 + (column + 0.5) * cell_width),
+        round(10 + (row + 0.5) * cell_height),
+    )
+
+
+def _panel_by_id(editor: ResultDashboardLayoutEditor, panel_id: str) -> dict:
+    return next(panel for panel in editor.layout_data()["panels"] if panel["id"] == panel_id)
 
 
 def test_editor_blocks_removing_row_occupied_by_span(qapp):
@@ -249,17 +272,101 @@ def test_editor_panel_catalog_add_button_adds_panel_to_list(qapp):
             ],
         }
     )
+    _show_editor(editor, qapp)
     catalog = editor.findChild(QComboBox, "result_dashboard_panel_catalog_combo")
     add_button = editor.findChild(QPushButton, "result_dashboard_add_panel_button")
     panel_list = editor.findChild(QListWidget, "result_dashboard_panel_list")
 
     catalog.setCurrentIndex(catalog.findData("spectrum"))
-    editor.select_grid_cell_for_test(row=0, column=1)
-    add_button.click()
+    QTest.mouseClick(
+        editor.grid_preview(),
+        Qt.MouseButton.LeftButton,
+        pos=_cell_center(editor, 0, 1),
+    )
+    QTest.mouseClick(add_button, Qt.MouseButton.LeftButton)
     qapp.processEvents()
 
     assert panel_list.count() == 2
     assert any(panel["type"] == "spectrum" for panel in editor.layout_data()["panels"])
+
+
+def test_editor_grid_click_selects_empty_cell_for_visible_add_button(qapp):
+    editor = ResultDashboardLayoutEditor()
+    editor.set_layout(
+        {
+            "version": 1,
+            "columns": 2,
+            "rows": 2,
+            "panels": [
+                {
+                    "id": "summary",
+                    "type": "result_summary",
+                    "row": 0,
+                    "column": 0,
+                    "row_span": 1,
+                    "column_span": 1,
+                    "channel": "none",
+                },
+            ],
+        }
+    )
+    _show_editor(editor, qapp)
+    catalog = editor.findChild(QComboBox, "result_dashboard_panel_catalog_combo")
+    add_button = editor.findChild(QPushButton, "result_dashboard_add_panel_button")
+
+    catalog.setCurrentIndex(catalog.findData("spectrum"))
+    QTest.mouseClick(
+        editor.grid_preview(),
+        Qt.MouseButton.LeftButton,
+        pos=_cell_center(editor, 1, 1),
+    )
+    QTest.mouseClick(add_button, Qt.MouseButton.LeftButton)
+    qapp.processEvents()
+
+    spectrum = next(
+        panel for panel in editor.layout_data()["panels"] if panel["type"] == "spectrum"
+    )
+    assert (spectrum["row"], spectrum["column"]) == (1, 1)
+
+
+def test_editor_visible_add_button_uses_empty_cell_after_grid_expands(qapp):
+    editor = ResultDashboardLayoutEditor()
+    editor.set_layout(
+        {
+            "version": 1,
+            "columns": 1,
+            "rows": 1,
+            "panels": [
+                {
+                    "id": "summary",
+                    "type": "result_summary",
+                    "row": 0,
+                    "column": 0,
+                    "row_span": 1,
+                    "column_span": 1,
+                    "channel": "none",
+                },
+            ],
+        }
+    )
+    _show_editor(editor, qapp)
+    columns = editor.findChild(QComboBox, "result_dashboard_column_count_combo")
+    add_row = editor.findChild(QPushButton, "result_dashboard_add_row_button")
+    catalog = editor.findChild(QComboBox, "result_dashboard_panel_catalog_combo")
+    add_panel = editor.findChild(QPushButton, "result_dashboard_add_panel_button")
+
+    columns.setCurrentText("2")
+    QTest.mouseClick(add_row, Qt.MouseButton.LeftButton)
+    catalog.setCurrentIndex(catalog.findData("spectrum"))
+    QTest.mouseClick(add_panel, Qt.MouseButton.LeftButton)
+    qapp.processEvents()
+
+    spectrum = next(
+        panel for panel in editor.layout_data()["panels"] if panel["type"] == "spectrum"
+    )
+    assert (spectrum["row"], spectrum["column"]) != (0, 0)
+    assert spectrum["row"] < editor.layout_data()["rows"]
+    assert spectrum["column"] < editor.layout_data()["columns"]
 
 
 def test_editor_remove_panel_button_removes_selected_optional_panel(qapp):
@@ -617,7 +724,7 @@ def test_editor_cannot_remove_summary(qapp):
     assert editor.remove_panel("summary") is False
 
 
-def test_editor_grid_drag_drop_moves_panel(qapp):
+def test_editor_grid_mouse_drag_moves_panel(qapp):
     editor = ResultDashboardLayoutEditor()
     editor.set_layout(
         {
@@ -646,8 +753,70 @@ def test_editor_grid_drag_drop_moves_panel(qapp):
             ],
         }
     )
-    editor.grid_preview().simulate_drop_for_test("spectrum", row=1, column=0)
-    spectrum = next(
-        panel for panel in editor.layout_data()["panels"] if panel["id"] == "spectrum"
+    _show_editor(editor, qapp)
+
+    preview = editor.grid_preview()
+    QTest.mousePress(
+        preview,
+        Qt.MouseButton.LeftButton,
+        pos=_cell_center(editor, 0, 1),
     )
+    QTest.mouseMove(preview, pos=_cell_center(editor, 1, 0))
+    QTest.mouseRelease(
+        preview,
+        Qt.MouseButton.LeftButton,
+        pos=_cell_center(editor, 1, 0),
+    )
+    qapp.processEvents()
+
+    spectrum = _panel_by_id(editor, "spectrum")
     assert (spectrum["row"], spectrum["column"]) == (1, 0)
+
+
+def test_editor_grid_mouse_drag_rejects_overlap(qapp):
+    editor = ResultDashboardLayoutEditor()
+    editor.set_layout(
+        {
+            "version": 1,
+            "columns": 2,
+            "rows": 2,
+            "panels": [
+                {
+                    "id": "summary",
+                    "type": "result_summary",
+                    "row": 0,
+                    "column": 0,
+                    "row_span": 1,
+                    "column_span": 1,
+                    "channel": "none",
+                },
+                {
+                    "id": "spectrum",
+                    "type": "spectrum",
+                    "row": 0,
+                    "column": 1,
+                    "row_span": 1,
+                    "column_span": 1,
+                    "channel": "selected_1",
+                },
+            ],
+        }
+    )
+    _show_editor(editor, qapp)
+
+    preview = editor.grid_preview()
+    QTest.mousePress(
+        preview,
+        Qt.MouseButton.LeftButton,
+        pos=_cell_center(editor, 0, 1),
+    )
+    QTest.mouseMove(preview, pos=_cell_center(editor, 0, 0))
+    QTest.mouseRelease(
+        preview,
+        Qt.MouseButton.LeftButton,
+        pos=_cell_center(editor, 0, 0),
+    )
+    qapp.processEvents()
+
+    spectrum = _panel_by_id(editor, "spectrum")
+    assert (spectrum["row"], spectrum["column"]) == (0, 1)
