@@ -180,6 +180,60 @@ def _spectrum_panel(panel_id: str, *, column: int = 1) -> dict:
     }
 
 
+@pytest.mark.parametrize(
+    ("panel_id", "panel_type", "channel", "vibration_channel"),
+    [
+        ("stft", "stft", "selected_1", None),
+        ("vib_stft", "vibration_stft", "vibration", 1),
+    ],
+)
+def test_stft_dashboard_card_initializes_and_updates_score_metric(
+    qapp,
+    panel_id,
+    panel_type,
+    channel,
+    vibration_channel,
+):
+    services = _make_services_with_config(
+        {
+            "config_id": 101,
+            "selected_channels": [0, 1],
+            "vibration_view_channel_index": vibration_channel,
+            "result_dashboard_layout": _dashboard_layout(
+                [
+                    _summary_panel(),
+                    {
+                        "id": panel_id,
+                        "type": panel_type,
+                        "row": 0,
+                        "column": 1,
+                        "row_span": 1,
+                        "column_span": 1,
+                        "channel": channel,
+                    },
+                ],
+                columns=2,
+            ),
+        }
+    )
+    module = ResultDashboardModule(services)
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
+    )
+
+    panel = module.panel_widget(panel_id)
+    card = module.cards_by_panel_id()[panel_id]
+
+    assert panel.current_score_title() == "得分：--"
+    assert card.title_suffix() == "频谱平均得分：--"
+    assert card.title_metric_value_label.text() == "--"
+
+    panel.score_title_changed.emit("得分：88.50")
+
+    assert card.title_suffix() == "频谱平均得分：88.50"
+    assert card.title_metric_value_label.text() == "88.50"
+
+
 def test_dashboard_renders_cards_from_layout(qapp):
     services = _make_services_with_config(
         {

@@ -58,6 +58,9 @@ _PANEL_FACTORIES: dict[str, _PanelFactory] = {
 }
 
 
+_STFT_SCORE_METRIC_LABEL = "频谱平均得分："
+
+
 class ResultDashboardModule(QWidget):
     module_id = "result_dashboard"
 
@@ -287,6 +290,7 @@ class ResultDashboardModule(QWidget):
 
         panel_widget = self._create_panel_widget(panel, factory)
         card = Card(title, panel_widget)
+        self._bind_stft_score_metric(panel_type, panel_widget, card)
 
         row, column, row_span, column_span = position
         self._grid.addWidget(card, row, column, row_span, column_span)
@@ -308,6 +312,43 @@ class ResultDashboardModule(QWidget):
         if callable(refresh):
             refresh()
         return panel_widget
+
+    def _bind_stft_score_metric(
+        self,
+        panel_type: str,
+        panel_widget: QWidget,
+        card: Card,
+    ) -> None:
+        if panel_type not in {PANEL_STFT, PANEL_VIBRATION_STFT}:
+            return
+
+        current_score_title = getattr(panel_widget, "current_score_title", None)
+        if callable(current_score_title):
+            self._set_stft_card_score_metric(card, current_score_title())
+
+        score_title_changed = getattr(panel_widget, "score_title_changed", None)
+        if hasattr(score_title_changed, "connect"):
+            score_title_changed.connect(
+                lambda text, dashboard_card=card: self._set_stft_card_score_metric(
+                    dashboard_card,
+                    text,
+                )
+            )
+
+    @staticmethod
+    def _set_stft_card_score_metric(card: Card, text: str) -> None:
+        card.set_title_metric(
+            _STFT_SCORE_METRIC_LABEL,
+            ResultDashboardModule._stft_score_value(text),
+        )
+
+    @staticmethod
+    def _stft_score_value(text: str) -> str:
+        normalized = str(text or "").strip()
+        for separator in ("：", ":"):
+            if separator in normalized:
+                return normalized.split(separator, 1)[1].strip() or "--"
+        return normalized or "--"
 
     def _bind_panel_channel(self, panel_widget: QWidget, panel: dict[str, Any]) -> None:
         provider = self._provider_for_panel(panel)
