@@ -315,7 +315,7 @@ class FactoryModeController(QObject):
                 plc_id=payload.plc_id,
             )
             return False
-        return self._accept_start(config_id, "plc")
+        return self._accept_start(config_id, "plc", {"plc_id": payload.plc_id})
 
     def handle_scan_event(self, payload: FactoryScanIngressPayload) -> bool:
         self._last_scan_ingress = payload

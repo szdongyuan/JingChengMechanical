@@ -1792,8 +1792,22 @@ class TestManager(QObject):
     def _emit_plc_test_result_if_needed(self, session, review_payload) -> None:
         if getattr(review_payload, "trigger_source", None) != "plc":
             return
+        plc_id = self._plc_id_from_session_workorder(session)
+        if plc_id is None:
+            self._bus.log.emit("[TestManager] PLC 测试结果未写入：未找到 plc_id")
+            return
         test_result = self._make_plc_test_result_payload(session, review_payload)
-        self._bus.write_test_result_to_plc.emit(test_result)
+        self._bus.write_test_result_to_plc.emit(plc_id, test_result)
+
+    @staticmethod
+    def _plc_id_from_session_workorder(session) -> int | None:
+        workorder = getattr(session, "_workorder", None)
+        if not isinstance(workorder, dict):
+            return None
+        plc_id = workorder.get("plc_id")
+        if isinstance(plc_id, Integral) and not isinstance(plc_id, bool):
+            return int(plc_id)
+        return None
 
     @classmethod
     def _make_plc_test_result_payload(cls, session, review_payload) -> dict:

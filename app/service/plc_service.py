@@ -198,8 +198,9 @@ class PlcService(QObject):
             return True
         return False
 
-    def write_test_result_to_plc(self, test_result):
+    def write_test_result_to_plc(self, plc_id, test_result):
         """
+        plc_id 是本次测试由哪个 PLC 触发的 id。
         test_result = {
                 "finished": True,
                 "error_code": "0",
@@ -212,12 +213,16 @@ class PlcService(QObject):
                 "ai_score": 91.0,
                 }
         """
+        print(plc_id, self._plc_id)
+        if plc_id != self._plc_id:
+            return
         if self.plc_client is None:
             return
+        print(plc_id, test_result)
         plc_values = [
             ("res_error_code_offset", "string", test_result.get("error_code")),
             ("res_sn_code_offset", "string", test_result.get("sn_code")),
-            ("res_result_offset", "bool", test_result.get("result")),
+            ("res_result_offset", "bool", test_result.get("test_result")),
             ("res_score_offset", "real", test_result.get("score")),
             ("res_spl_offset", "real", test_result.get("spl")),
             ("res_loudness_offset", "real", test_result.get("loudness")),
@@ -367,7 +372,7 @@ class PlcService(QObject):
         self.logger.info(f"PLC {self._plc_id} 检测到开始信号")
         self._emit_plc_workorder()
         try:
-            self._on_start_requested()
+            self._on_start_requested(self._plc_id)
         except Exception as exc:
             self.bus.log.emit(f"PLC 开始回调失败: {exc}")
             self.logger.error(f"PLC 开始回调失败: {exc}")
