@@ -44,6 +44,7 @@ from model.test_config_table import TestConfigTable as ConfigTable
 from ui.modules.config import ConfigModule
 from ui.widgets.collapsible_group_box import CollapsibleGroupBox
 from ui.widgets.limit_table_editor import LimitTableEditor
+from ui.widgets.result_dashboard_layout_editor import ResultDashboardLayoutEditor
 
 
 class _SignalStub:
@@ -698,6 +699,7 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_id(qapp):
         "vibration_view_channel_index",
         "monitor_gain_db",
         "current_meter",
+        "result_dashboard_layout",
         "channels",
         "golden_editor_state",
     }
@@ -767,6 +769,170 @@ def test_top_level_config_launchers_open_cards_and_keep_plc_visible(qapp):
     assert _is_descendant_of(module.ed_current_meter_host, current_meter_dialog)
     assert _is_descendant_of(module.chk_ai_enabled, ai_dialog)
     assert _is_descendant_of(module.combo_ai_toolchain, ai_dialog)
+
+
+def test_top_level_config_launchers_include_result_dashboard_layout(qapp):
+    loaded = {7: _detail_payload([], config_id=7, config_name="Cfg1")}
+    module = _make_module(config_service=_ConfigServiceStub(loaded_configs=loaded))
+    button = module.findChild(QPushButton, "open_result_dashboard_layout_card")
+    dialog = module.findChild(QDialog, "top_level_result_dashboard_layout_card_dialog")
+
+    assert button is not None
+    assert button.text() == "结果展示布局"
+    assert dialog is not None
+
+
+def test_result_dashboard_layout_dialog_confirm_stages_without_saving(qapp):
+    layout = {
+        "version": 1,
+        "columns": 1,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "summary",
+                "type": "result_summary",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "none",
+            }
+        ],
+    }
+    loaded = {
+        7: {
+            **_detail_payload([], config_id=7, config_name="Cfg1"),
+            "result_dashboard_layout": layout,
+        }
+    }
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service)
+
+    module.findChild(QPushButton, "open_result_dashboard_layout_card").click()
+    editor = module.findChild(
+        ResultDashboardLayoutEditor, "result_dashboard_layout_editor"
+    )
+    editor.add_row()
+    module.findChild(QPushButton, "TopLevelConfigCardConfirmButton").click()
+
+    assert module._collect_data()["result_dashboard_layout"]["rows"] == 2
+    assert config_service.begin_calls == 0
+
+
+def test_result_dashboard_layout_confirm_marks_config_dirty_for_leave_prompt(
+    qapp, monkeypatch
+):
+    layout = {
+        "version": 1,
+        "columns": 1,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "summary",
+                "type": "result_summary",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "none",
+            }
+        ],
+    }
+    loaded = {
+        7: {
+            **_detail_payload([], config_id=7, config_name="Cfg1"),
+            "result_dashboard_layout": layout,
+        }
+    }
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service)
+    prompts = []
+    monkeypatch.setattr(
+        module,
+        "_prompt_unsaved_config_changes",
+        lambda action: prompts.append(action) or False,
+    )
+
+    module.findChild(QPushButton, "open_result_dashboard_layout_card").click()
+    editor = module.findChild(
+        ResultDashboardLayoutEditor, "result_dashboard_layout_editor"
+    )
+    editor.add_row()
+    module.findChild(QPushButton, "TopLevelConfigCardConfirmButton").click()
+
+    assert module.confirm_leave() is False
+    assert prompts == ["leave"]
+    assert config_service.begin_calls == 0
+
+
+def test_result_dashboard_layout_dialog_x_discards_unconfirmed_edits(qapp):
+    layout = {
+        "version": 1,
+        "columns": 1,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "summary",
+                "type": "result_summary",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "none",
+            }
+        ],
+    }
+    loaded = {
+        7: {
+            **_detail_payload([], config_id=7, config_name="Cfg1"),
+            "result_dashboard_layout": layout,
+        }
+    }
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service)
+
+    module.findChild(QPushButton, "open_result_dashboard_layout_card").click()
+    editor = module.findChild(
+        ResultDashboardLayoutEditor, "result_dashboard_layout_editor"
+    )
+    editor.add_row()
+    dialog = module.findChild(QDialog, "top_level_result_dashboard_layout_card_dialog")
+    dialog.findChild(QPushButton, "TopLevelConfigCardCloseButton").click()
+    qapp.processEvents()
+
+    data = module._collect_data()
+    assert data["result_dashboard_layout"]["rows"] == 1
+    assert [panel["id"] for panel in data["result_dashboard_layout"]["panels"]] == [
+        "summary"
+    ]
+    assert config_service.begin_calls == 0
+
+
+def test_malformed_loaded_result_dashboard_layout_stays_invalid_until_dialog_confirm(
+    qapp,
+):
+    loaded = {
+        7: {
+            **_detail_payload([], config_id=7, config_name="Cfg1"),
+            "result_dashboard_layout": "{bad json",
+            "_result_dashboard_layout_error": "结果展示布局：JSON invalid",
+        }
+    }
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service)
+
+    assert module._collect_data()["result_dashboard_layout"] == "{bad json"
+
+    module.findChild(QPushButton, "open_result_dashboard_layout_card").click()
+    editor = module.findChild(
+        ResultDashboardLayoutEditor, "result_dashboard_layout_editor"
+    )
+    assert editor.layout_data()["panels"][0]["id"] == "summary"
+    module.findChild(QPushButton, "TopLevelConfigCardConfirmButton").click()
+
+    data = module._collect_data()
+    assert isinstance(data["result_dashboard_layout"], dict)
+    assert data["result_dashboard_layout"]["panels"][0]["id"] == "summary"
 
 
 def _expected_centered_dialog_pos(dialog: QDialog, owner: QWidget) -> QPoint:

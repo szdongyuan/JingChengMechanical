@@ -33,12 +33,17 @@ from PyQt6.QtWidgets import (
 )
 
 from app.service.current_meter_service import current_meter_display_unit, normalize_current_meter_config
+from app.service.result_dashboard_layout import (
+    normalize_result_dashboard_layout,
+    normalize_result_dashboard_layout_for_display,
+)
 from model.plc_table import PlcTable
 from ui.popups import config_package_dialogs
 from ui.popups.golden_sample_import_dialog import GoldenSampleImportDialog
 from ui.widgets.cards import Card
 from ui.widgets.collapsible_group_box import CollapsibleGroupBox
 from ui.widgets.limit_table_editor import LimitTableEditor
+from ui.widgets.result_dashboard_layout_editor import ResultDashboardLayoutEditor
 
 _GOLDEN_BINDING_FIELDS = (
     "golden_sample_path",
@@ -93,6 +98,7 @@ class _ConfigSectionCardDialog(QDialog):
         default_position_anchor: QWidget | None = None,
         confirm_button_object_name: str = "ConfigSectionCardConfirmButton",
         preferred_size: tuple[int, int] | None = None,
+        on_confirm=None,
     ):
         super().__init__(
             parent,
@@ -105,6 +111,7 @@ class _ConfigSectionCardDialog(QDialog):
         self._user_moved = False
         self._default_position_anchor = default_position_anchor
         self._preferred_size = preferred_size
+        self._on_confirm = on_confirm
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -186,6 +193,9 @@ class _ConfigSectionCardDialog(QDialog):
         self.hide()
 
     def _confirm(self) -> None:
+        if callable(self._on_confirm):
+            self._on_confirm()
+            return
         self.hide()
 
     def _move_to_default_position(self) -> None:
@@ -377,6 +387,8 @@ class ConfigModule(QWidget):
         self._top_level_config_dialogs: dict[str, _ConfigSectionCardDialog] = {}
         self._loaded_config_editor_snapshot: dict | None = None
         self._restoring_config_selection = False
+        self._result_dashboard_layout = normalize_result_dashboard_layout(None)
+        self._result_dashboard_layout_error = None
 
         self._init_ui()
         self._connect_signals()
@@ -522,6 +534,25 @@ class ConfigModule(QWidget):
             top_launcher_layout.setColumnStretch(column, 1)
         scroll_lay.addWidget(top_launcher_panel)
         top_launcher_index = 0
+
+        self.result_dashboard_layout_editor = ResultDashboardLayoutEditor()
+        self.result_dashboard_layout_editor.setObjectName(
+            "result_dashboard_layout_editor"
+        )
+        self._register_top_level_config_card(
+            launcher_layout=top_launcher_layout,
+            launcher_index=top_launcher_index,
+            section_id="result_dashboard_layout",
+            title="结果展示布局",
+            content=self.result_dashboard_layout_editor,
+            default_position_anchor=top_launcher_panel,
+            button_object_name="open_result_dashboard_layout_card",
+            dialog_object_name="top_level_result_dashboard_layout_card_dialog",
+            preferred_size=(900, 640),
+            on_open=self._open_result_dashboard_layout_dialog,
+            on_confirm=self._confirm_result_dashboard_layout_dialog,
+        )
+        top_launcher_index += 1
 
         audio_form = QWidget()
         audio_lay = QFormLayout(audio_form)
@@ -1598,6 +1629,22 @@ class ConfigModule(QWidget):
         self._hide_other_config_dialogs(dialog)
         dialog.show_card()
 
+    def _open_result_dashboard_layout_dialog(self) -> None:
+        self.result_dashboard_layout_editor.set_layout(
+            normalize_result_dashboard_layout_for_display(
+                self._result_dashboard_layout,
+                selected_channels=self._selected_channels_from_editor(),
+            )
+        )
+        self._show_config_dialog(
+            self._top_level_config_dialogs["result_dashboard_layout"]
+        )
+
+    def _confirm_result_dashboard_layout_dialog(self) -> None:
+        self._result_dashboard_layout = self.result_dashboard_layout_editor.layout_data()
+        self._result_dashboard_layout_error = None
+        self._top_level_config_dialogs["result_dashboard_layout"].hide()
+
     def _register_top_level_config_card(
         self,
         *,
@@ -1610,6 +1657,8 @@ class ConfigModule(QWidget):
         button_object_name: str,
         dialog_object_name: str,
         preferred_size: tuple[int, int] | None = None,
+        on_open=None,
+        on_confirm=None,
     ) -> None:
         dialog = _ConfigSectionCardDialog(
             title,
@@ -1620,15 +1669,19 @@ class ConfigModule(QWidget):
             default_position_anchor=default_position_anchor,
             confirm_button_object_name="TopLevelConfigCardConfirmButton",
             preferred_size=preferred_size,
+            on_confirm=on_confirm,
         )
         dialog.hide()
         self._top_level_config_dialogs[section_id] = dialog
 
         button = QPushButton(title)
         button.setObjectName(button_object_name)
-        button.clicked.connect(
-            lambda _checked=False, current=dialog: self._show_config_dialog(current)
-        )
+        if callable(on_open):
+            button.clicked.connect(lambda _checked=False: on_open())
+        else:
+            button.clicked.connect(
+                lambda _checked=False, current=dialog: self._show_config_dialog(current)
+            )
         row, column = divmod(launcher_index, 3)
         launcher_layout.addWidget(button, row, column)
 
@@ -2637,13 +2690,16 @@ class ConfigModule(QWidget):
             spinbox = container.findChild(QDoubleSpinBox, field)
             channel[field] = spinbox.value() if spinbox else float(_LIMIT_DEFAULTS[field])
 
+    def _selected_channels_from_editor(self) -> list[int]:
+        return [
+            i for i, cb in enumerate(self._channel_checkboxes) if cb.isChecked()
+        ]
+
     def _collect_data(self) -> dict:
         input_dev = self.combo_input_dev.currentData()
         output_dev = self.combo_output_dev.currentData()
 
-        selected_channels = [
-            i for i, cb in enumerate(self._channel_checkboxes) if cb.isChecked()
-        ]
+        selected_channels = self._selected_channels_from_editor()
 
         data = {
             "config_id": self._current_config_id,
@@ -2689,6 +2745,7 @@ class ConfigModule(QWidget):
                 "poll_interval_ms": self.spin_current_meter_poll_interval_ms.value(),
                 "timeout_ms": self.spin_current_meter_timeout_ms.value(),
             },
+            "result_dashboard_layout": copy.deepcopy(self._result_dashboard_layout),
             "channels": [],
             "golden_editor_state": {},
         }
@@ -2734,6 +2791,10 @@ class ConfigModule(QWidget):
         self.chk_allow_incomplete_recording_analysis.setChecked(
             bool(data.get("allow_incomplete_recording_analysis", False))
         )
+        self._result_dashboard_layout = copy.deepcopy(
+            data.get("result_dashboard_layout")
+        )
+        self._result_dashboard_layout_error = data.get("_result_dashboard_layout_error")
         self._populate_hardware_card(data)
 
         # Build tabs for ALL channels of the device, not just selected ones
