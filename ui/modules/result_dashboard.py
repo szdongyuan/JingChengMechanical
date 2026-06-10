@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from PyQt6.QtCore import Qt
@@ -154,7 +154,9 @@ class ResultDashboardModule(QWidget):
             self.refresh_dashboard()
 
     def _on_config_changed(self) -> None:
-        if self._state_displayed_config_id() is not None:
+        config_id = self._state_displayed_config_id()
+        if config_id is not None:
+            self._discard_non_import_review_config_payload(config_id)
             self.refresh_dashboard()
 
     def _on_factory_review_changed(self, review) -> None:
@@ -187,6 +189,17 @@ class ResultDashboardModule(QWidget):
             setattr(factory_mode, name, value)
         except Exception:
             pass
+
+    def _discard_non_import_review_config_payload(self, config_id: int) -> None:
+        if getattr(self._review_payload, "trigger_source", None) == "import_audio":
+            return
+        if getattr(self._review_payload, "displayed_config_id", None) != config_id:
+            return
+        if not isinstance(getattr(self._review_payload, "config_payload", None), dict):
+            return
+
+        self._review_payload = replace(self._review_payload, config_payload=None)
+        self._store_factory_mode_value("review_payload", self._review_payload)
 
     def _state_displayed_config_id(self) -> int | None:
         config_id = getattr(self._factory_state, "displayed_config_id", None)

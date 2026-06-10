@@ -486,35 +486,42 @@ def test_dashboard_uses_display_config_loader_for_runtime_layout(qapp):
 
 
 def test_dashboard_rebuilds_current_config_layout_on_config_changed(qapp):
-    first_config = {
+    old_config = {
         "config_id": 101,
-        "selected_channels": [0],
+        "selected_channels": [9],
         "vibration_view_channel_index": None,
         "result_dashboard_layout": _dashboard_layout([_summary_panel()], columns=1),
     }
-    second_config = {
+    new_saved_config = {
         "config_id": 101,
-        "selected_channels": [0],
+        "selected_channels": [3],
         "vibration_view_channel_index": None,
         "result_dashboard_layout": _dashboard_layout(
             [_summary_panel(), _spectrum_panel("spectrum")]
         ),
     }
-    services = _make_services_with_config(first_config)
+    services = _make_services_with_config(old_config)
     services.config_service.load_config_for_result_dashboard.side_effect = [
-        first_config,
-        second_config,
+        old_config,
+        new_saved_config,
     ]
     module = ResultDashboardModule(services)
 
     services.bus.factory_state_changed.emit(
         FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
     )
+
+    services.bus.factory_review_changed.emit(
+        FactoryReviewPayload(displayed_config_id=101, config_payload=old_config)
+    )
     assert list(module.cards_by_panel_id()) == ["summary"]
 
     services.bus.config_changed.emit()
 
     assert list(module.cards_by_panel_id()) == ["summary", "spectrum"]
+    assert module.grid_position("spectrum") == (0, 1, 1, 1)
+    spectrum_panel = module.panel_widget("spectrum")
+    assert spectrum_panel.selected_display_channel_provider() == 3
 
 
 def test_dashboard_uses_matching_review_config_payload_for_panel_bindings(qapp):
@@ -550,6 +557,12 @@ def test_dashboard_uses_matching_review_config_payload_for_panel_bindings(qapp):
             trigger_source="import_audio",
         )
     )
+
+    assert list(module.cards_by_panel_id()) == ["summary", "import_spectrum"]
+    imported_panel = module.panel_widget("import_spectrum")
+    assert imported_panel.selected_display_channel_provider() == 6
+
+    services.bus.config_changed.emit()
 
     assert list(module.cards_by_panel_id()) == ["summary", "import_spectrum"]
     imported_panel = module.panel_widget("import_spectrum")
