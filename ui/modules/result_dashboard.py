@@ -9,8 +9,10 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QGridLayout, QScrollArea, QVBoxLayout, QWidget
 
 from app.service.result_dashboard_layout import (
+    CHANNEL_PRIMARY_ACOUSTIC,
     DEFAULT_RESULT_DASHBOARD_LAYOUT,
     PANEL_FAMILIES,
+    PANEL_FAMILY_ACOUSTIC,
     PANEL_LOUDNESS,
     PANEL_OCTAVE,
     PANEL_RESULT_SUMMARY,
@@ -309,7 +311,7 @@ class ResultDashboardModule(QWidget):
 
         self._bind_panel_channel(panel_widget, panel)
         refresh = getattr(panel_widget, "refresh_selected_display_channel", None)
-        if callable(refresh):
+        if callable(refresh) and panel.get("type") != PANEL_RESULT_SUMMARY:
             refresh()
         return panel_widget
 
@@ -359,9 +361,13 @@ class ResultDashboardModule(QWidget):
         panel_widget.strict_selected_display_channel = True
 
     def _provider_for_panel(self, panel: dict[str, Any]) -> Callable[[], int | None]:
-        channel_key = str(panel.get("channel") or "")
         panel_type = str(panel.get("type") or "")
-        panel_family = PANEL_FAMILIES.get(panel_type, "")
+        if panel_type == PANEL_RESULT_SUMMARY:
+            channel_key = CHANNEL_PRIMARY_ACOUSTIC
+            panel_family = PANEL_FAMILY_ACOUSTIC
+        else:
+            channel_key = str(panel.get("channel") or "")
+            panel_family = PANEL_FAMILIES.get(panel_type, "")
 
         def provider() -> int | None:
             return resolve_layout_channel(

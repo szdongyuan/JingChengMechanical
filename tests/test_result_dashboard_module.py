@@ -22,7 +22,11 @@ else:
     _NOOP_GRAPHICS_VIEW_PAINT_EVENT = lambda self, event: None
 
 from app.service.result_dashboard_layout import DEFAULT_RESULT_DASHBOARD_LAYOUT
-from app.services_container import FactoryControllerState, FactoryReviewPayload
+from app.services_container import (
+    FactoryControllerState,
+    FactoryReviewPayload,
+    FactoryRuntimeStartPayload,
+)
 from ui.modules.result_dashboard import ResultDashboardModule
 
 
@@ -276,6 +280,63 @@ def test_dashboard_renders_cards_from_layout(qapp):
         "结果摘要",
         "脉冲强度（振动）",
     ]
+
+
+def test_result_summary_metrics_follow_primary_acoustic_channel(qapp):
+    services = _make_services_with_config(
+        {
+            "config_id": 101,
+            "selected_channels": [0, 1],
+            "vibration_view_channel_index": 1,
+            "channels": [
+                {"channel_index": 0, "loudness_unit": "sone"},
+                {"channel_index": 1, "loudness_unit": "sone"},
+            ],
+            "result_dashboard_layout": _dashboard_layout(
+                [_summary_panel()],
+                columns=1,
+            ),
+        }
+    )
+    module = ResultDashboardModule(services)
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            selected_config_ids=(101,),
+            active_config_id=101,
+            displayed_config_id=101,
+            run_phase="running",
+        )
+    )
+    services.bus.factory_runtime_start_accepted.emit(
+        FactoryRuntimeStartPayload(
+            config_id=101,
+            run_id="run-101",
+            trigger_source="manual",
+        )
+    )
+
+    summary_panel = module.panel_widget("summary")
+    services.bus.spl_updated.emit(101, "run-101", 1, SimpleNamespace(spl_db=89.0))
+    services.bus.loudness_updated.emit(
+        101,
+        "run-101",
+        1,
+        SimpleNamespace(loudness_sone=8.0),
+    )
+
+    assert summary_panel.lb_spl_metric_value.text() == "--"
+    assert summary_panel.lb_loudness_metric_value.text() == "--"
+
+    services.bus.spl_updated.emit(101, "run-101", 0, SimpleNamespace(spl_db=72.34))
+    services.bus.loudness_updated.emit(
+        101,
+        "run-101",
+        0,
+        SimpleNamespace(loudness_sone=2.345),
+    )
+
+    assert summary_panel.lb_spl_metric_value.text() == "72.3 dB"
+    assert summary_panel.lb_loudness_metric_value.text() == "2.35 sone"
 
 
 def test_duplicate_spectrum_panels_get_different_channel_providers(qapp):
