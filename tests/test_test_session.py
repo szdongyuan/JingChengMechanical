@@ -354,6 +354,87 @@ class TestTestSessionProcessing:
 
         assert session._live_loudness_channel_index == 2
 
+    def test_setup_pipelines_submits_primary_acoustic_live_loudness_channel(
+        self,
+        monkeypatch,
+    ):
+        created_dispatchers = []
+
+        class FakeLiveDisplayDispatcher(_CapturingLiveDisplayDispatcher):
+            def __init__(self, *, pipelines, bus, config_id):
+                super().__init__()
+                self.pipelines = pipelines
+                self.bus = bus
+                self.config_id = config_id
+                created_dispatchers.append(self)
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_session.LiveDisplayDispatcher",
+            FakeLiveDisplayDispatcher,
+        )
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        config = _make_config(
+            selected_channels=[1, 0],
+            vibration_view_channel_index=1,
+        )
+        config["channels"] = [
+            {**config["channels"][0], "channel_index": 1},
+            config["channels"][0],
+        ]
+        session = TestSession(
+            config=config,
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={},
+            audio_dir="/tmp/audio",
+        )
+
+        session._setup_pipelines()
+        session._on_chunk(np.ones((2048, 2), dtype=np.float32), 0)
+
+        assert created_dispatchers[-1].calls[-1]["live_loudness_channel_index"] == 0
+
+    def test_setup_pipelines_submits_no_live_loudness_channel_without_acoustic(
+        self,
+        monkeypatch,
+    ):
+        created_dispatchers = []
+
+        class FakeLiveDisplayDispatcher(_CapturingLiveDisplayDispatcher):
+            def __init__(self, *, pipelines, bus, config_id):
+                super().__init__()
+                self.pipelines = pipelines
+                self.bus = bus
+                self.config_id = config_id
+                created_dispatchers.append(self)
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_session.LiveDisplayDispatcher",
+            FakeLiveDisplayDispatcher,
+        )
+        bus = _make_mock_bus()
+        ai = MagicMock()
+        config = _make_config(
+            selected_channels=[1],
+            vibration_view_channel_index=1,
+        )
+        config["channels"] = [{**config["channels"][0], "channel_index": 1}]
+        session = TestSession(
+            config=config,
+            bus=bus,
+            ai_service=ai,
+            mic_cal={},
+            workorder={},
+            audio_dir="/tmp/audio",
+        )
+
+        session._setup_pipelines()
+        session._on_chunk(np.ones((2048, 1), dtype=np.float32), 0)
+
+        assert created_dispatchers[-1].calls[-1]["live_loudness_channel_index"] is None
+
     def test_on_chunk_submits_live_loudness_channel_to_display_dispatcher(self):
         bus = _make_mock_bus()
         ai = MagicMock()
