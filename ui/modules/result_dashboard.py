@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,6 +23,7 @@ from app.service.result_dashboard_layout import (
     PANEL_VIBRATION_PULSE,
     PANEL_VIBRATION_SPECTRUM,
     PANEL_VIBRATION_STFT,
+    normalize_result_dashboard_layout_for_display,
     resolve_layout_channel,
 )
 from app.services_container import FactoryControllerState, FactoryReviewPayload
@@ -70,6 +72,7 @@ class ResultDashboardModule(QWidget):
             FactoryReviewPayload(),
         )
         self._display_config: dict[str, Any] = {}
+        self._display_config_uses_review_payload = False
         self._displayed_config_id: int | None = None
         self._cards_by_panel_id: dict[str, Card] = {}
         self._panel_widgets_by_id: dict[str, QWidget] = {}
@@ -132,6 +135,8 @@ class ResultDashboardModule(QWidget):
 
     def _connect_factory_signals(self) -> None:
         bus = getattr(self.services, "bus", None)
+        if hasattr(bus, "config_changed"):
+            bus.config_changed.connect(self._on_config_changed)
         if hasattr(bus, "factory_state_changed"):
             bus.factory_state_changed.connect(self._on_factory_state_changed)
         if hasattr(bus, "factory_review_changed"):
@@ -148,15 +153,31 @@ class ResultDashboardModule(QWidget):
         if self._state_displayed_config_id() != self._displayed_config_id:
             self.refresh_dashboard()
 
+    def _on_config_changed(self) -> None:
+        if self._state_displayed_config_id() is not None:
+            self.refresh_dashboard()
+
     def _on_factory_review_changed(self, review) -> None:
+        was_using_review_config = self._display_config_uses_review_payload
         self._review_payload = (
             review if isinstance(review, FactoryReviewPayload) else FactoryReviewPayload()
         )
         self._store_factory_mode_value("review_payload", self._review_payload)
+        config_id = self._state_displayed_config_id()
+        if config_id is None:
+            return
+        if (
+            self._review_config_payload_for_display(config_id) is not None
+            or was_using_review_config
+        ):
+            self.refresh_dashboard()
 
     def _on_factory_display_reset(self, _reason: str) -> None:
+        was_using_review_config = self._display_config_uses_review_payload
         self._review_payload = FactoryReviewPayload()
         self._store_factory_mode_value("review_payload", self._review_payload)
+        if was_using_review_config and self._state_displayed_config_id() is not None:
+            self.refresh_dashboard()
 
     def _store_factory_mode_value(self, name: str, value) -> None:
         factory_mode = getattr(self.services, "factory_mode", None)
@@ -173,8 +194,15 @@ class ResultDashboardModule(QWidget):
 
     def _load_display_config(self, config_id: int | None) -> dict[str, Any]:
         if config_id is None:
+            self._display_config_uses_review_payload = False
             return {}
 
+        review_config = self._review_config_payload_for_display(config_id)
+        if review_config is not None:
+            self._display_config_uses_review_payload = True
+            return review_config
+
+        self._display_config_uses_review_payload = False
         config_service = getattr(self.services, "config_service", None)
         load_config = getattr(config_service, "load_config_for_result_dashboard", None)
         if not callable(load_config):
@@ -185,6 +213,29 @@ class ResultDashboardModule(QWidget):
         except Exception:
             return {}
         return config if isinstance(config, dict) else {}
+
+    def _review_config_payload_for_display(
+        self,
+        config_id: int,
+    ) -> dict[str, Any] | None:
+        if getattr(self._review_payload, "displayed_config_id", None) != config_id:
+            return None
+        config_payload = getattr(self._review_payload, "config_payload", None)
+        if not isinstance(config_payload, dict):
+            return None
+
+        display_config = deepcopy(config_payload)
+        selected_channels = self._normalize_channels(
+            display_config.get("selected_channels", [])
+        )
+        display_config["selected_channels"] = selected_channels
+        display_config["result_dashboard_layout"] = (
+            normalize_result_dashboard_layout_for_display(
+                display_config.get("result_dashboard_layout"),
+                selected_channels=selected_channels,
+            )
+        )
+        return display_config
 
     def _clear_grid(self) -> None:
         while self._grid.count():

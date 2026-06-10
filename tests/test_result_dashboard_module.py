@@ -42,6 +42,7 @@ class _SignalStub:
 
 class _BusStub:
     def __init__(self):
+        self.config_changed = _SignalStub()
         self.factory_state_changed = _SignalStub()
         self.factory_review_changed = _SignalStub()
         self.factory_display_reset = _SignalStub()
@@ -139,6 +140,44 @@ def _make_services_with_config(config: dict) -> SimpleNamespace:
             review_payload=FactoryReviewPayload(),
         ),
     )
+
+
+def _dashboard_layout(
+    panels: list[dict],
+    *,
+    columns: int = 2,
+    rows: int = 1,
+) -> dict:
+    return {
+        "version": 1,
+        "columns": columns,
+        "rows": rows,
+        "panels": panels,
+    }
+
+
+def _summary_panel() -> dict:
+    return {
+        "id": "summary",
+        "type": "result_summary",
+        "row": 0,
+        "column": 0,
+        "row_span": 1,
+        "column_span": 1,
+        "channel": "none",
+    }
+
+
+def _spectrum_panel(panel_id: str, *, column: int = 1) -> dict:
+    return {
+        "id": panel_id,
+        "type": "spectrum",
+        "row": 0,
+        "column": column,
+        "row_span": 1,
+        "column_span": 1,
+        "channel": "selected_1",
+    }
 
 
 def test_dashboard_renders_cards_from_layout(qapp):
@@ -444,3 +483,74 @@ def test_dashboard_uses_display_config_loader_for_runtime_layout(qapp):
     assert "summary" in module.cards_by_panel_id()
     services.config_service.load_config_for_result_dashboard.assert_called_with(101)
     services.config_service.load_config.assert_not_called()
+
+
+def test_dashboard_rebuilds_current_config_layout_on_config_changed(qapp):
+    first_config = {
+        "config_id": 101,
+        "selected_channels": [0],
+        "vibration_view_channel_index": None,
+        "result_dashboard_layout": _dashboard_layout([_summary_panel()], columns=1),
+    }
+    second_config = {
+        "config_id": 101,
+        "selected_channels": [0],
+        "vibration_view_channel_index": None,
+        "result_dashboard_layout": _dashboard_layout(
+            [_summary_panel(), _spectrum_panel("spectrum")]
+        ),
+    }
+    services = _make_services_with_config(first_config)
+    services.config_service.load_config_for_result_dashboard.side_effect = [
+        first_config,
+        second_config,
+    ]
+    module = ResultDashboardModule(services)
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
+    )
+    assert list(module.cards_by_panel_id()) == ["summary"]
+
+    services.bus.config_changed.emit()
+
+    assert list(module.cards_by_panel_id()) == ["summary", "spectrum"]
+
+
+def test_dashboard_uses_matching_review_config_payload_for_panel_bindings(qapp):
+    db_config = {
+        "config_id": 101,
+        "selected_channels": [0],
+        "vibration_view_channel_index": None,
+        "result_dashboard_layout": _dashboard_layout(
+            [_summary_panel(), _spectrum_panel("db_spectrum")]
+        ),
+    }
+    review_config = {
+        "config_id": 101,
+        "selected_channels": [6],
+        "vibration_view_channel_index": None,
+        "result_dashboard_layout": _dashboard_layout(
+            [_summary_panel(), _spectrum_panel("import_spectrum")]
+        ),
+    }
+    services = _make_services_with_config(db_config)
+    module = ResultDashboardModule(services)
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
+    )
+    db_panel = module.panel_widget("db_spectrum")
+    assert db_panel.selected_display_channel_provider() == 0
+
+    services.bus.factory_review_changed.emit(
+        FactoryReviewPayload(
+            displayed_config_id=101,
+            config_payload=review_config,
+            trigger_source="import_audio",
+        )
+    )
+
+    assert list(module.cards_by_panel_id()) == ["summary", "import_spectrum"]
+    imported_panel = module.panel_widget("import_spectrum")
+    assert imported_panel.selected_display_channel_provider() == 6
