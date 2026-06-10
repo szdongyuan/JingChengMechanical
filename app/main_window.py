@@ -8,7 +8,6 @@ from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QButtonGroup,
     QHBoxLayout,
-    QGridLayout,
     QLabel,
     QMainWindow,
     QMenu,
@@ -23,16 +22,9 @@ from base.utils import asset_path
 from app.services_container import FactoryControllerState, FactoryReviewPayload
 from consts.style import APP_QSS
 from ui.widgets.cards import Card
-from ui.widgets.analysis_channel_toolbar import AnalysisChannelToolbar
 from ui.modules.workorder import WorkOrderModule
 from ui.modules.control import ControlModule
-from ui.modules.spectrum import SpectrumModule
-from ui.modules.stft import StftModule
-from ui.modules.loudness import LoudnessModule
-from ui.modules.spl import SplModule
-from ui.modules.octave import OctaveModule
-from ui.modules.vibration import VibrationAxisModule, VibrationTrendModule
-from ui.modules.result import ResultModule
+from ui.modules.result_dashboard import ResultDashboardModule
 from ui.modules.video import VideoModule
 from ui.modules.today_statistics import TodayStatisticsModule
 from ui.modules.hardware import HardwareModule
@@ -327,66 +319,14 @@ class MainWindow(QMainWindow):
 
         content_lay.addWidget(left)
 
-        # 右侧主区域：3x2 网格（6 个卡片同尺寸）
+        # 右侧主区域：运行时结果展示面板
         main = QWidget()
         main_lay = QVBoxLayout(main)
         main_lay.setContentsMargins(0, 0, 0, 0)
         main_lay.setSpacing(12)
 
-        grid = QGridLayout()
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(5)
-
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(2, 1)
-        grid.setRowStretch(0, 0)
-        grid.setRowStretch(1, 1)
-        grid.setRowStretch(2, 1)
-
-        self.result = ResultModule(self.services)
-        grid.addWidget(Card("结果摘要", self.result), 1, 0)
-
-        self.analysis_toolbar = AnalysisChannelToolbar()
-        self.analysis_toolbar.channel_changed.connect(self._on_analysis_channel_changed)
-        self.analysis_toolbar.hide()
-        grid.addWidget(self.analysis_toolbar, 0, 1, 1, 2)
-
-        self.stft = StftModule(self.services)
-        self.stft_card = Card("时频图", self.stft)
-        self._set_stft_score_title(self.stft.current_score_title())
-        self.stft.score_title_changed.connect(self._set_stft_score_title)
-        grid.addWidget(self.stft_card, 1, 1)
-
-        self.spectrum = SpectrumModule(self.services)
-        self.spectrum_card = Card("频谱", self.spectrum)
-        grid.addWidget(self.spectrum_card, 1, 2)
-
-        self.loudness = LoudnessModule(self.services)
-        self.vibration_axis = VibrationAxisModule(self.services)
-        self.loudness_stack = QStackedWidget()
-        self.loudness_stack.addWidget(self.loudness)
-        self.loudness_stack.addWidget(self.vibration_axis)
-        self.loudness_card = Card("响度", self.loudness_stack)
-        self.loudness.title_changed.connect(self._on_loudness_title_changed)
-        self.loudness_card.set_title(self.loudness.current_title())
-        grid.addWidget(self.loudness_card, 2, 0)
-
-        self.spl = SplModule(self.services)
-        self.vibration_trend = VibrationTrendModule(self.services)
-        self.spl_stack = QStackedWidget()
-        self.spl_stack.addWidget(self.spl)
-        self.spl_stack.addWidget(self.vibration_trend)
-        self.spl_card = Card("声压级（dB）", self.spl_stack)
-        grid.addWidget(self.spl_card, 2, 1)
-
-        self.octave = OctaveModule(self.services)
-        self.octave_card = Card("倍频程（dB）", self.octave)
-        grid.addWidget(self.octave_card, 2, 2)
-
-        self._attach_analysis_channel_providers()
-
-        main_lay.addLayout(grid, 1)
+        self.result_dashboard = ResultDashboardModule(self.services)
+        main_lay.addWidget(self.result_dashboard, 1)
         content_lay.addWidget(main, 1)
         return page
 
@@ -720,16 +660,17 @@ class MainWindow(QMainWindow):
             self._refresh_analysis_display_modules()
 
     def _refresh_analysis_display_modules(self) -> None:
-        for module in (
-            self.stft,
-            self.loudness,
-            self.spl,
-            self.spectrum,
-            self.octave,
-            self.vibration_axis,
-            self.vibration_trend,
-            self.result,
+        for name in (
+            "stft",
+            "loudness",
+            "spl",
+            "spectrum",
+            "octave",
+            "vibration_axis",
+            "vibration_trend",
+            "result",
         ):
+            module = getattr(self, name, None)
             refresh = getattr(module, "refresh_selected_display_channel", None)
             if callable(refresh):
                 refresh()
