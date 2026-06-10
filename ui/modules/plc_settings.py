@@ -584,7 +584,7 @@ class PlcSettingsModule(QWidget):
         # 连接结束后，把这次对应的 plc_id 和 plc_service 一起传回处理函数。
         plc_service.connect_result.connect(on_connect_finished)
         plc_service.state_changed.connect(on_state_changed)
-        self.services.bus.write_test_result_to_plc.connect(plc_service.write_test_result_to_plc)
+        self.services.bus.write_test_result_sign.connect(plc_service.last_write_test_result_to_plc)
         # 线程彻底结束后，把这条 PLC 对应的线程记录清掉。
         connect_thread.finished.connect(on_connect_thread_stopped)
         # 启动后台连接线程，避免界面卡住。

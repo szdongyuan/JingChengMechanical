@@ -198,9 +198,9 @@ class PlcService(QObject):
             return True
         return False
 
-    def write_test_result_to_plc(self, plc_id, test_result):
+    def last_write_test_result_to_plc(self, plc_id, test_result):
         """
-        plc_id 是本次测试由哪个 PLC 触发的 id。
+        最后按照plcid来写入对应的plc
         test_result = {
                 "finished": True,
                 "error_code": "0",
@@ -213,12 +213,10 @@ class PlcService(QObject):
                 "ai_score": 91.0,
                 }
         """
-        print(plc_id, self._plc_id)
         if plc_id != self._plc_id:
             return
         if self.plc_client is None:
             return
-        print(plc_id, test_result)
         plc_values = [
             ("res_error_code_offset", "string", test_result.get("error_code")),
             ("res_sn_code_offset", "string", test_result.get("sn_code")),

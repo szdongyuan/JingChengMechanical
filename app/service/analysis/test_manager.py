@@ -1797,7 +1797,7 @@ class TestManager(QObject):
             self._bus.log.emit("[TestManager] PLC 测试结果未写入：未找到 plc_id")
             return
         test_result = self._make_plc_test_result_payload(session, review_payload)
-        self._bus.write_test_result_to_plc.emit(plc_id, test_result)
+        self._bus.write_test_result_sign.emit(plc_id, test_result)
 
     @staticmethod
     def _plc_id_from_session_workorder(session) -> int | None:
