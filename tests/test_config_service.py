@@ -201,6 +201,25 @@ def _config_payload(
     return payload
 
 
+def _summary_layout(*, columns: int = 1) -> dict:
+    return {
+        "version": 1,
+        "columns": columns,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "summary",
+                "type": "result_summary",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "none",
+            }
+        ],
+    }
+
+
 def _write_temp_wav(
     path: Path,
     *,
@@ -276,6 +295,209 @@ def test_create_config_no_channel_rows():
     assert ChannelConfigTable.select().where(ChannelConfigTable.config == config_id).count() == 0
 
 
+def test_load_config_defaults_missing_result_dashboard_layout():
+    svc = _service()
+    cfg = ConfigTable.create(config_name="Cfg1", selected_channels="[0]")
+
+    loaded = svc.load_config(cfg.config_id)
+
+    assert loaded["result_dashboard_layout"]["columns"] == 3
+    assert loaded["result_dashboard_layout"]["panels"][0]["type"] == "result_summary"
+
+
+def test_save_config_persists_result_dashboard_layout():
+    svc = _service()
+    cfg = ConfigTable.create(config_name="Cfg1", selected_channels="[0]")
+    payload = _config_payload(
+        cfg.config_id,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    payload["result_dashboard_layout"] = _summary_layout()
+
+    svc.save_config(payload)
+
+    loaded = svc.load_config(cfg.config_id)
+    assert loaded["result_dashboard_layout"]["columns"] == 1
+
+
+def test_prepare_import_payload_preserves_result_dashboard_layout():
+    svc = _service()
+    source = _config_payload(
+        999,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    source["result_dashboard_layout"] = _summary_layout()
+
+    assert svc.prepare_import_payload(source)["result_dashboard_layout"]["columns"] == 1
+
+
+def test_create_config_writes_default_result_dashboard_layout():
+    svc = _service()
+
+    config_id = svc.create_config("NewCfg")
+    loaded = svc.load_config(config_id)
+
+    assert loaded["result_dashboard_layout"]["columns"] == 3
+    assert loaded["result_dashboard_layout"]["panels"][0]["type"] == "result_summary"
+
+
+def test_load_config_preserves_malformed_layout_so_editor_can_repair_it():
+    svc = _service()
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        selected_channels="[0]",
+        result_dashboard_layout="{bad json",
+    )
+
+    loaded = svc.load_config(cfg.config_id)
+
+    assert loaded["result_dashboard_layout"] == "{bad json"
+    assert "结果展示布局" in loaded["_result_dashboard_layout_error"]
+
+
+def test_load_config_for_result_dashboard_falls_back_for_malformed_layout():
+    svc = _service()
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        selected_channels="[0]",
+        result_dashboard_layout="{bad json",
+    )
+
+    loaded = svc.load_config_for_result_dashboard(cfg.config_id)
+
+    assert loaded["result_dashboard_layout"]["columns"] == 3
+    assert loaded["result_dashboard_layout"]["panels"][0]["id"] == "summary"
+
+
+def test_load_config_for_result_dashboard_falls_back_when_layout_binding_exceeds_selected_channels():
+    svc = _service()
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        selected_channels="[0]",
+        result_dashboard_layout=json.dumps(
+            {
+                "version": 1,
+                "columns": 2,
+                "rows": 1,
+                "panels": [
+                    {
+                        "id": "summary",
+                        "type": "result_summary",
+                        "row": 0,
+                        "column": 0,
+                        "row_span": 1,
+                        "column_span": 1,
+                        "channel": "none",
+                    },
+                    {
+                        "id": "spectrum",
+                        "type": "spectrum",
+                        "row": 0,
+                        "column": 1,
+                        "row_span": 1,
+                        "column_span": 1,
+                        "channel": "selected_2",
+                    },
+                ],
+            }
+        ),
+    )
+
+    loaded = svc.load_config_for_result_dashboard(cfg.config_id)
+
+    assert loaded["result_dashboard_layout"]["columns"] == 3
+    assert loaded["result_dashboard_layout"]["panels"][0]["id"] == "summary"
+
+
+def test_prepare_import_payload_rejects_malformed_result_dashboard_layout():
+    svc = _service()
+    source = _config_payload(
+        999,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    source["result_dashboard_layout"] = "{bad json"
+
+    with pytest.raises(ValueError, match="结果展示布局|JSON|invalid"):
+        svc.prepare_import_payload(source)
+
+
+def test_prepare_import_payload_rejects_unknown_layout_panel_type():
+    svc = _service()
+    source = _config_payload(
+        999,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    source["result_dashboard_layout"] = {
+        "version": 1,
+        "columns": 2,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "summary",
+                "type": "result_summary",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "none",
+            },
+            {
+                "id": "custom",
+                "type": "custom_widget",
+                "row": 0,
+                "column": 1,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "primary_acoustic",
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError, match="结果展示布局|面板|panel|type"):
+        svc.prepare_import_payload(source)
+
+
+def test_prepare_import_payload_rejects_invalid_layout_channel_key():
+    svc = _service()
+    source = _config_payload(
+        999,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    source["result_dashboard_layout"] = {
+        "version": 1,
+        "columns": 2,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "summary",
+                "type": "result_summary",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "none",
+            },
+            {
+                "id": "spectrum",
+                "type": "spectrum",
+                "row": 0,
+                "column": 1,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "bad_channel",
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError, match="结果展示布局|通道|channel"):
+        svc.prepare_import_payload(source)
+
+
 def test_load_config_returns_hardware_fields_with_cleaned_trigger_model():
     svc = _service()
     cfg = ConfigTable.create(
@@ -310,6 +532,7 @@ def test_load_config_returns_hardware_fields_with_cleaned_trigger_model():
         "monitor_channel_index",
         "monitor_gain_db",
         "vibration_view_channel_index",
+        "result_dashboard_layout",
         "current_meter",
         "channels",
     }
@@ -358,6 +581,7 @@ def test_load_config_returns_plc_id_and_not_legacy_plc_text_fields():
         "monitor_channel_index",
         "monitor_gain_db",
         "vibration_view_channel_index",
+        "result_dashboard_layout",
         "current_meter",
         "channels",
     }
@@ -412,6 +636,7 @@ def test_save_config_persists_hardware_fields():
         "monitor_channel_index",
         "monitor_gain_db",
         "vibration_view_channel_index",
+        "result_dashboard_layout",
         "current_meter",
         "channels",
     }
@@ -1692,6 +1917,134 @@ def test_validate_device_without_channels_error():
     )
 
     assert "已选择输入设备但未选择任何通道" in errors
+
+
+def test_validate_rejects_more_than_two_selected_channels():
+    svc = _service()
+    data = _config_payload(
+        1,
+        channels=[_channel_payload(0), _channel_payload(1), _channel_payload(2)],
+        selected_channels=[0, 1, 2],
+    )
+
+    errors = svc.validate(data)
+
+    assert any("最多" in error and "两个通道" in error for error in errors)
+
+
+def test_validate_rejects_invalid_result_dashboard_layout():
+    svc = _service()
+    data = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    data["result_dashboard_layout"] = "{bad json"
+
+    errors = svc.validate(data)
+
+    assert any("结果展示布局" in error for error in errors)
+
+
+def test_validate_rejects_selected_2_layout_binding_for_one_selected_channel():
+    svc = _service()
+    data = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    data["result_dashboard_layout"] = {
+        "version": 1,
+        "columns": 2,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "summary",
+                "type": "result_summary",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "none",
+            },
+            {
+                "id": "spectrum",
+                "type": "spectrum",
+                "row": 0,
+                "column": 1,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "selected_2",
+            },
+        ],
+    }
+
+    errors = svc.validate(data)
+
+    assert any("结果展示布局" in error and "通道2" in error for error in errors)
+
+
+def test_validate_rejects_unknown_layout_panel_type():
+    svc = _service()
+    data = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    data["result_dashboard_layout"] = {
+        "version": 1,
+        "columns": 2,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "summary",
+                "type": "result_summary",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "none",
+            },
+            {
+                "id": "custom",
+                "type": "custom_widget",
+                "row": 0,
+                "column": 1,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "primary_acoustic",
+            },
+        ],
+    }
+
+    errors = svc.validate(data)
+
+    assert any(
+        "结果展示布局" in error and ("面板" in error or "type" in error)
+        for error in errors
+    )
+
+
+def test_validate_rejects_invalid_layout_channel_key():
+    svc = _service()
+    data = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    data["result_dashboard_layout"] = {
+        "version": 1,
+        "columns": 2,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "summary",
+                "type": "result_summary",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "none",
+            },
+            {
+                "id": "spectrum",
+                "type": "spectrum",
+                "row": 0,
+                "column": 1,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "bad_channel",
+            },
+        ],
+    }
+
+    errors = svc.validate(data)
+
+    assert any("结果展示布局" in error and "通道" in error for error in errors)
 
 
 @pytest.mark.parametrize("monitor_channel_index", [True, "1", 1.5, -1])

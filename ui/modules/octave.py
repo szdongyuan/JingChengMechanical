@@ -15,6 +15,7 @@ class OctaveModule(QWidget):
         self.services = services
         self.selected_display_channel_provider = None
         self.selected_display_channel_sync = None
+        self.strict_selected_display_channel = False
         self._factory_state = getattr(
             services.factory_mode,
             "state",
@@ -155,8 +156,13 @@ class OctaveModule(QWidget):
         chart_payload: dict[int, dict],
     ) -> tuple[int | None, dict | None]:
         selected_channel = self._selected_channel_index()
-        if selected_channel is not None and selected_channel in chart_payload:
-            return selected_channel, chart_payload[selected_channel]
+        if self.strict_selected_display_channel and selected_channel is None:
+            return None, None
+        if selected_channel is not None:
+            if selected_channel in chart_payload:
+                return selected_channel, chart_payload[selected_channel]
+            if self.strict_selected_display_channel:
+                return selected_channel, None
 
         for channel_index, channel_payload in chart_payload.items():
             self._sync_selected_channel(selected_channel, channel_index)

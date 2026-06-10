@@ -41,6 +41,7 @@ def test_test_config_table_exposes_nullable_plc_id_field():
         "output_device_samplerate",
         "selected_channels",
         "vibration_view_channel_index",
+        "result_dashboard_layout",
         "plc_device_key",
         "plc_device_label",
         "analysis_window_offset_ms",
@@ -62,6 +63,7 @@ def test_test_config_table_exposes_nullable_plc_id_field():
     assert config.input_device_name is None
     assert config.selected_channels == "[]"
     assert config.vibration_view_channel_index is None
+    assert config.result_dashboard_layout is None
     assert config.plc_device_key is None
     assert config.plc_device_label is None
     assert config.analysis_window_offset_ms == 0

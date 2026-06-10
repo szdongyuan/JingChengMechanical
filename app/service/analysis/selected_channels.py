@@ -64,6 +64,9 @@ def normalize_selected_channels(
         seen.add(real_channel)
         normalized.append(real_channel)
 
+    if len(normalized) > 2:
+        raise ValueError("selected_channels must contain at most two channels")
+
     return tuple(normalized)
 
 

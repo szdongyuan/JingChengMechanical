@@ -123,6 +123,60 @@ def test_stft_module_clears_when_selected_channel_has_no_cached_frames_yet(qapp)
     assert module.current_image_payload() is None
 
 
+def test_acoustic_stft_strict_panel_binding_does_not_fallback_when_provider_returns_none(
+    qapp,
+):
+    module, services = _make_module()
+    module.strict_selected_display_channel = True
+    module.selected_display_channel_provider = lambda: None
+    module.set_vibration_mode(False)
+    _show(module, qapp)
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="running",
+            trigger_source="manual",
+        )
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        0,
+        _make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)),
+    )
+
+    assert module.current_render_cache_key() is None
+    assert module.current_image_payload() is None
+
+
+def test_vibration_stft_strict_panel_binding_does_not_fallback_for_invalid_provider_channel(
+    qapp,
+):
+    module, services = _make_module()
+    module.strict_selected_display_channel = True
+    module.selected_display_channel_provider = lambda: "1"
+    module.set_vibration_mode(True)
+    _show(module, qapp)
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="running",
+            trigger_source="manual",
+        )
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-101",
+        1,
+        _make_stft_frame(time=0.0, magnitudes=(3.0, 4.0)),
+    )
+
+    assert module.current_render_cache_key() is None
+    assert module.current_image_payload() is None
+
+
 def test_stft_module_live_cache_begins_at_earliest_pipeline_frame_time(qapp):
     module, services = _make_module()
     module.selected_display_channel_provider = lambda: 1

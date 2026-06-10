@@ -19,6 +19,7 @@ class LoudnessModule(QWidget):
         self.services = services
         self.selected_display_channel_provider = None
         self.selected_display_channel_sync = None
+        self.strict_selected_display_channel = False
         self._factory_state = getattr(
             services.factory_mode,
             "state",
@@ -115,7 +116,13 @@ class LoudnessModule(QWidget):
             else None
         )
         if not isinstance(loudness_payload, dict):
-            self._clear_plot()
+            self._clear_plot(
+                rendered_channel_index=(
+                    channel_index
+                    if self.strict_selected_display_channel and channel_payload is None
+                    else None
+                )
+            )
             return
 
         times_sec = loudness_payload.get("times_sec") or []
@@ -151,9 +158,9 @@ class LoudnessModule(QWidget):
         }
         self._emit_title_for_unit(unit)
 
-    def _clear_plot(self) -> None:
+    def _clear_plot(self, *, rendered_channel_index: int | None = None) -> None:
         self._has_plot_data = False
-        self._rendered_channel_index = None
+        self._rendered_channel_index = rendered_channel_index
         self._current_payload = None
         self.plot.clear_data()
         self.plot.plot_item.setLabel("bottom", "时间 (s)")
@@ -190,8 +197,13 @@ class LoudnessModule(QWidget):
         chart_payload: dict[int, dict],
     ) -> tuple[int | None, dict | None]:
         selected_channel = self._selected_channel_index()
-        if selected_channel is not None and selected_channel in chart_payload:
-            return selected_channel, chart_payload[selected_channel]
+        if self.strict_selected_display_channel and selected_channel is None:
+            return None, None
+        if selected_channel is not None:
+            if selected_channel in chart_payload:
+                return selected_channel, chart_payload[selected_channel]
+            if self.strict_selected_display_channel:
+                return selected_channel, None
 
         for channel_index, channel_payload in chart_payload.items():
             self._sync_selected_channel(selected_channel, channel_index)

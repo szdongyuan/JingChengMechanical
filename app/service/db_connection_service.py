@@ -53,7 +53,12 @@ class DbConnectionService:
             "stft_score_harmonic_end_order",
         }
     )
-    _REQUIRED_TEST_CONFIG_COLUMNS = frozenset({"vibration_view_channel_index"})
+    _REQUIRED_TEST_CONFIG_COLUMNS = frozenset(
+        {
+            "vibration_view_channel_index",
+            "result_dashboard_layout",
+        }
+    )
 
     def connect(self):
         self._ensure_database_file_exists()
