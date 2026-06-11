@@ -202,6 +202,8 @@ class EventBus(QObject):
     refresh_channels = pyqtSignal()
     # 写入plc信号：plc_id, test_result
     write_test_result_sign = pyqtSignal(int, dict)
+    # 写入 PLC 限值信号：plc_id, limit_values
+    write_limit_sign = pyqtSignal(int, dict)
 
     # 配置变化（供外部模块监听，如工单模块刷新可选配置列表）
     config_changed = pyqtSignal()

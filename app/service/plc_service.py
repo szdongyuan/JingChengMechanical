@@ -20,6 +20,17 @@ class PlcService(QObject):
     connect_result = pyqtSignal(bool, str)
     # 连接状态通知界面信号
     state_changed = pyqtSignal(str)
+    read_time_ms = 60000
+    limit_field = (
+        "res_product_model_offset",
+        "res_spl_limit_up_offset",
+        "res_spl_limit_down_offset",
+        "res_loudness_limit_up_offset",
+        "res_loudness_limit_down_offset",
+        "res_vibrate_limit_up_offset",
+        "res_vibrate_limit_down_offset",
+        "res_ai_score_limit_down_offset",
+    )
 
     def __init__(self,
         bus,
@@ -60,6 +71,7 @@ class PlcService(QObject):
         # 与PLC 通信的客户端实例
         self.plc_client = None
         self.timer = None
+        self.value_timer = None
         self._last_value = None
         self._reconnect_timer_ms = 0  # 重连计时器
         self._last_connect_error = ""
@@ -92,6 +104,7 @@ class PlcService(QObject):
             f"DB{self._db_number}"
         )
         self.read_plc_limit()
+        # self._start_value_timer()
 
     @pyqtSlot()
     def stop_plc_service(self):
@@ -101,6 +114,10 @@ class PlcService(QObject):
             self.timer.stop()
             self.timer.deleteLater()
             self.timer = None
+        if self.value_timer is not None:
+            self.value_timer.stop()
+            self.value_timer.deleteLater()
+            self.value_timer = None
         self._disconnect()
         self.state_changed.emit("未连接")
         self._last_value = None
@@ -244,6 +261,51 @@ class PlcService(QObject):
             self.bus.log.emit(f"PLC {self._plc_id} 写入测试结果失败: {exc}")
             self.logger.error(f"PLC 写入测试结果失败: {exc}")
 
+    def last_write_limit_to_plc(self, plc_id, limit_values):
+        """
+        按 plc_id 写入当前 PLC 的机种和限值。
+        limit_values = {
+            "res_product_model_offset": "xxx",
+            "res_spl_limit_up_offset": 0.0,
+            "res_spl_limit_down_offset": 0.0,
+            "res_loudness_limit_up_offset": 0.0,
+            "res_loudness_limit_down_offset": 0.0,
+            "res_vibrate_limit_up_offset": 0.0,
+            "res_vibrate_limit_down_offset": 0.0,
+            "res_ai_score_limit_down_offset": 0.0,
+        }
+        """
+        if plc_id != self._plc_id:
+            return
+        if self.plc_client is None:
+            return
+
+        field_types = {
+            "res_product_model_offset": "string",
+            "res_spl_limit_up_offset": "real",
+            "res_spl_limit_down_offset": "real",
+            "res_loudness_limit_up_offset": "real",
+            "res_loudness_limit_down_offset": "real",
+            "res_vibrate_limit_up_offset": "real",
+            "res_vibrate_limit_down_offset": "real",
+            "res_ai_score_limit_down_offset": "real",
+        }
+
+        try:
+            for field_name in self.limit_field:
+                if field_name not in limit_values:
+                    continue
+                offset = self._field_offsets_dict.get(field_name)
+                if not offset:
+                    self.logger.warning(f"PLC {self._plc_id} 未找到偏移配置: {field_name}")
+                    continue
+                self.write_plc_value(offset, field_types[field_name], limit_values.get(field_name))
+
+            self.bus.log.emit(f"PLC {self._plc_id} 写入限值完成")
+        except Exception as exc:
+            self.bus.log.emit(f"PLC {self._plc_id} 写入限值失败: {exc}")
+            self.logger.error(f"PLC 写入限值失败: {exc}")
+
     def read_offset_value(self, offset, type):
         if type == "string":
             byte_index = int(str(offset).split(".", 1)[0])
@@ -318,18 +380,19 @@ class PlcService(QObject):
 
     def read_plc_limit(self):
         # PLC 连接成功后读取一次机种和各项上下限，后续测试可直接按 plc_id 取用。
-        values = self.read_plc_values(
-            "res_product_model_offset",
-            "res_spl_limit_up_offset",
-            "res_spl_limit_down_offset",
-            "res_loudness_limit_up_offset",
-            "res_loudness_limit_down_offset",
-            "res_vibrate_limit_up_offset",
-            "res_vibrate_limit_down_offset",
-            "res_ai_score_limit_down_offset",
-        )
+        values = self.read_plc_values(*self.limit_field)
         self.bus.plc_limit_values_dict[self._plc_id] = values
+        print(f"PLC {self._plc_id} 读取限值:", values)
+        print("PLC 限值共享字典:", self.bus.plc_limit_values_dict)
         self.bus.log.emit(f"PLC {self._plc_id} 读取限值完成: {values}")
+
+    def _start_value_timer(self):
+        if self.value_timer is not None:
+            return
+        self.value_timer = QTimer(self)
+        self.value_timer.setInterval(self.read_time_ms)
+        self.value_timer.timeout.connect(self.read_plc_limit)
+        self.value_timer.start()
 
     def _emit_plc_workorder(self):
         payload = {}
