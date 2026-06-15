@@ -1846,6 +1846,7 @@ def _build_fft_chart(
     golden_cache: GoldenReferenceCache,
     golden_bundle_loader,
 ) -> dict | None:
+    weighting = _fft_weighting(channel_config.get("fft_weighting", "Z"))
     mode = _golden_mode(channel_config.get("fft_golden_mode"))
     overlay_requested = bool(channel_config.get("fft_show_golden_overlay")) and mode != "delta"
     nfft = channel_config.get(
@@ -1865,6 +1866,7 @@ def _build_fft_chart(
             signal,
             sample_rate,
             nfft=nfft,
+            weighting=weighting,
         )
     except Exception as exc:
         _log_chart_warning("FFT chart payload omitted", channel_index=channel_index, error=exc)
@@ -1873,10 +1875,15 @@ def _build_fft_chart(
     configured_fft_bands = channel_config.get("fft_band_limits", [])
     x_axis_scale = _fft_x_axis_scale(channel_config.get("fft_x_axis_scale"))
     if mode == "off":
+        chart_frequencies_hz, chart_levels_db = _normalize_chart_pairs(
+            frequencies_hz,
+            measured_levels_db,
+        )
         try:
             chart = {
-                "frequencies_hz": _normalize_chart_list(frequencies_hz),
-                "levels_db": _normalize_chart_list(measured_levels_db),
+                "frequencies_hz": _normalize_chart_list(chart_frequencies_hz),
+                "levels_db": _normalize_chart_list(chart_levels_db),
+                "weighting": weighting,
                 "golden_mode": "off",
                 "x_axis_scale": x_axis_scale,
                 "limit_bands": _limit_bands_for_chart(
@@ -1904,12 +1911,26 @@ def _build_fft_chart(
                 golden_freqs_hz, golden_levels_db = golden_cache.ensure_fft(
                     golden_bundle,
                     nfft=nfft,
+                    weighting=weighting,
                 )
                 _validate_matching_axis(frequencies_hz, golden_freqs_hz, "FFT")
             except Exception as exc:
                 logger.warning("黄金样本加载失败，FFT 对比曲线已忽略: %s", exc)
             else:
-                chart["golden_overlay_levels_db"] = _normalize_chart_list(golden_levels_db)
+                (
+                    chart_frequencies_hz,
+                    chart_levels_db,
+                    chart_golden_levels_db,
+                ) = _normalize_chart_triples(
+                    frequencies_hz,
+                    measured_levels_db,
+                    golden_levels_db,
+                )
+                chart["frequencies_hz"] = _normalize_chart_list(chart_frequencies_hz)
+                chart["levels_db"] = _normalize_chart_list(chart_levels_db)
+                chart["golden_overlay_levels_db"] = _normalize_chart_list(
+                    chart_golden_levels_db,
+                )
         return chart
 
     try:
@@ -1917,19 +1938,30 @@ def _build_fft_chart(
         golden_freqs_hz, golden_levels_db = golden_cache.ensure_fft(
             golden_bundle,
             nfft=nfft,
+            weighting=weighting,
         )
         _validate_matching_axis(frequencies_hz, golden_freqs_hz, "FFT")
     except Exception as exc:
         _log_chart_warning("FFT chart payload omitted", channel_index=channel_index, error=exc)
         return None
 
+    chart_frequencies_hz, chart_measured_levels_db, chart_golden_levels_db = (
+        _normalize_chart_triples(
+            frequencies_hz,
+            measured_levels_db,
+            golden_levels_db,
+        )
+    )
     plotted_levels_db = (
-        measured_levels_db if mode == "absolute" else measured_levels_db - golden_levels_db
+        chart_measured_levels_db
+        if mode == "absolute"
+        else chart_measured_levels_db - chart_golden_levels_db
     )
     try:
         chart = {
-            "frequencies_hz": _normalize_chart_list(frequencies_hz),
+            "frequencies_hz": _normalize_chart_list(chart_frequencies_hz),
             "levels_db": _normalize_chart_list(plotted_levels_db),
+            "weighting": weighting,
             "golden_mode": mode,
             "x_axis_scale": x_axis_scale,
             "limit_bands": _limit_bands_for_chart(
@@ -1956,7 +1988,7 @@ def _build_fft_chart(
     if mode == "delta":
         chart["show_zero_reference"] = True
     elif overlay_requested:
-        chart["golden_overlay_levels_db"] = _normalize_chart_list(golden_levels_db)
+        chart["golden_overlay_levels_db"] = _normalize_chart_list(chart_golden_levels_db)
     return chart
 
 
@@ -2095,8 +2127,14 @@ def _measure_fft_levels(
     sample_rate: float,
     *,
     nfft: int,
+    weighting: str,
 ) -> tuple[np.ndarray, np.ndarray]:
-    frequencies_hz, magnitudes_db = dsp.compute_fft_spectrum(signal, sample_rate, nfft)
+    frequencies_hz, magnitudes_db = dsp.compute_fft_spectrum(
+        signal,
+        sample_rate,
+        nfft,
+        weighting=weighting,
+    )
     return np.asarray(frequencies_hz, dtype=np.float64), _absolute_levels_db(magnitudes_db)
 
 
@@ -2123,6 +2161,11 @@ def _golden_mode(value) -> str:
 
 def _fft_x_axis_scale(value) -> str:
     return "log" if str(value or "").strip().lower() == "log" else "linear"
+
+
+def _fft_weighting(value) -> str:
+    weighting = str(value or "Z").strip().upper()
+    return weighting if weighting in {"A", "C", "Z"} else "Z"
 
 
 def _validate_matching_axis(
@@ -3039,6 +3082,26 @@ def _normalize_chart_pairs(
     y_axis = y_axis[:length]
     finite_mask = np.isfinite(x_axis) & np.isfinite(y_axis)
     return x_axis[finite_mask], y_axis[finite_mask]
+
+
+def _normalize_chart_triples(
+    x_values: np.ndarray | list[float],
+    y_values: np.ndarray | list[float],
+    z_values: np.ndarray | list[float],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    x_axis = np.asarray(x_values, dtype=np.float64)
+    y_axis = np.asarray(y_values, dtype=np.float64)
+    z_axis = np.asarray(z_values, dtype=np.float64)
+    if x_axis.size <= 0 or y_axis.size <= 0 or z_axis.size <= 0:
+        empty = np.asarray([], dtype=np.float64)
+        return empty, empty, empty
+
+    length = min(int(x_axis.size), int(y_axis.size), int(z_axis.size))
+    x_axis = x_axis[:length]
+    y_axis = y_axis[:length]
+    z_axis = z_axis[:length]
+    finite_mask = np.isfinite(x_axis) & np.isfinite(y_axis) & np.isfinite(z_axis)
+    return x_axis[finite_mask], y_axis[finite_mask], z_axis[finite_mask]
 
 
 def _normalize_chart_number(value) -> float | None:

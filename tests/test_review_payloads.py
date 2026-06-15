@@ -219,6 +219,7 @@ class _GoldenCacheStub:
         self.bundle_calls = 0
         self.ensure_fft_calls = 0
         self.ensure_fft_nffts: list[int] = []
+        self.ensure_fft_weightings: list[str] = []
         self.ensure_octave_calls = 0
         self.fft_axis = np.asarray(fft_axis or [], dtype=np.float64)
         self.fft_levels = np.asarray(fft_levels or [], dtype=np.float64)
@@ -234,9 +235,10 @@ class _GoldenCacheStub:
             raise self.bundle_error
         return object()
 
-    def ensure_fft(self, bundle, *, nfft):
+    def ensure_fft(self, bundle, *, nfft, weighting="Z"):
         self.ensure_fft_calls += 1
         self.ensure_fft_nffts.append(int(nfft))
+        self.ensure_fft_weightings.append(str(weighting))
         if self.fft_error is not None:
             raise self.fft_error
         return self.fft_axis, self.fft_levels
@@ -328,7 +330,7 @@ def _patch_basic_chart_backends(
     )
     monkeypatch.setattr(
         "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
-        lambda signal, sample_rate, nfft: (
+        lambda signal, sample_rate, nfft, weighting="Z": (
             np.asarray(fft_axis, dtype=np.float64),
             np.asarray(fft_levels, dtype=np.float64) + ref_db,
         ),
@@ -2524,7 +2526,7 @@ def test_build_chart_payload_returns_render_ready_series_per_channel(monkeypatch
     def fake_compute_spl(signal, sample_rate, weighting, time_constant):
         return float(np.mean(signal) * 10.0)
 
-    def fake_compute_fft_spectrum(signal, sample_rate, nfft):
+    def fake_compute_fft_spectrum(signal, sample_rate, nfft, weighting="Z"):
         if float(signal[0]) < 0.15:
             levels_db = np.array([67.0, 45.0], dtype=np.float64) + ref_db
         else:
@@ -3573,7 +3575,7 @@ def test_build_chart_payload_maps_real_channel_key_to_selected_logical_column(mo
     )
     monkeypatch.setattr(
         "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
-        lambda signal, sample_rate, nfft: (
+        lambda signal, sample_rate, nfft, weighting="Z": (
             np.array([1000.0], dtype=np.float64),
             np.array([67.0], dtype=np.float64) + ref_db,
         ),
@@ -3764,6 +3766,97 @@ def test_build_chart_payload_uses_corrected_loudness_trace_for_calibrator():
     assert max(loudness["values"]) == pytest.approx(94.0, abs=0.75)
     assert float(np.mean(loudness["values"][-25:])) == pytest.approx(94.0, abs=0.75)
     assert max(loudness["values"]) < 95.0
+
+
+def test_build_chart_payload_fft_passes_weighting_to_measured_and_golden(monkeypatch):
+    calls = []
+    ref_db = 20.0 * math.log10(20e-6)
+
+    def fake_fft(signal, sample_rate, nfft, weighting="Z"):
+        calls.append(str(weighting))
+        return (
+            np.array([1000.0, 2000.0], dtype=np.float64),
+            np.array([64.0, 45.0], dtype=np.float64) + ref_db,
+        )
+
+    _patch_basic_chart_backends(monkeypatch)
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
+        fake_fft,
+    )
+    cache = _GoldenCacheStub(
+        fft_axis=(1000.0, 2000.0),
+        fft_levels=(60.0, 41.0),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.GoldenReferenceCache",
+        lambda: cache,
+    )
+
+    payload = build_chart_payload(
+        buffer=np.full((200, 1), 0.1, dtype=np.float32),
+        config=_make_single_channel_config(
+            fft_weighting="C",
+            fft_golden_mode="absolute",
+            fft_show_golden_overlay=True,
+            oct_band_limits=[],
+        ),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.0, 2.0),
+    )
+
+    assert calls == ["C"]
+    assert cache.ensure_fft_weightings == ["C"]
+    assert payload[0]["fft"]["weighting"] == "C"
+
+
+def test_build_chart_payload_fft_filters_non_finite_measured_and_golden_pairs(monkeypatch):
+    ref_db = 20.0 * math.log10(20e-6)
+
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
+        lambda signal, sample_rate, nfft, weighting="Z": (
+            np.array([0.0, 1000.0, 2000.0], dtype=np.float64),
+            np.array([-np.inf, 64.0, 45.0], dtype=np.float64) + ref_db,
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_spl",
+        lambda signal, sample_rate, weighting, time_constant: 70.0,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_octave_bands",
+        lambda signal, sample_rate, weighting: (
+            np.array([], dtype=np.float64),
+            np.array([], dtype=np.float64),
+        ),
+    )
+    cache = _GoldenCacheStub(
+        fft_axis=(0.0, 1000.0, 2000.0),
+        fft_levels=(-np.inf, 60.0, 41.0),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.GoldenReferenceCache",
+        lambda: cache,
+    )
+
+    payload = build_chart_payload(
+        buffer=np.full((200, 1), 0.1, dtype=np.float32),
+        config=_make_single_channel_config(
+            fft_golden_mode="absolute",
+            fft_show_golden_overlay=True,
+            oct_band_limits=[],
+        ),
+        sample_rate=100.0,
+        mic_cal={},
+        analysis_window=(0.0, 2.0),
+    )
+
+    fft = payload[0]["fft"]
+    assert fft["frequencies_hz"] == [1000.0, 2000.0]
+    assert fft["levels_db"] == [64.0, 45.0]
+    assert fft["golden_overlay_levels_db"] == [60.0, 41.0]
 
 
 def test_build_chart_payload_fft_absolute_mode_uses_serialized_markers_and_overlay(
@@ -4312,7 +4405,7 @@ def test_build_chart_payload_omits_only_fft_item_when_measured_recompute_fails_i
     _patch_basic_chart_backends(monkeypatch)
     monkeypatch.setattr(
         "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
-        lambda signal, sample_rate, nfft: (_ for _ in ()).throw(
+        lambda signal, sample_rate, nfft, weighting="Z": (_ for _ in ()).throw(
             ValueError("empty fft input")
         ),
     )
@@ -4565,7 +4658,7 @@ def test_build_chart_payload_keeps_loudness_payload_shape_with_time_varying_trac
     )
     monkeypatch.setattr(
         "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
-        lambda signal, sample_rate, nfft: (
+        lambda signal, sample_rate, nfft, weighting="Z": (
             np.array([1000.0], dtype=np.float64),
             np.array([67.0], dtype=np.float64) + ref_db,
         ),
@@ -4782,7 +4875,7 @@ def test_build_chart_payload_omits_loudness_for_channel_when_recompute_fails(mon
     )
     monkeypatch.setattr(
         "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
-        lambda signal, sample_rate, nfft: (
+        lambda signal, sample_rate, nfft, weighting="Z": (
             np.array([1000.0], dtype=np.float64),
             np.array([67.0], dtype=np.float64) + ref_db,
         ),
@@ -4841,7 +4934,7 @@ def test_build_chart_payload_omits_loudness_when_serialized_judgment_marks_chann
     )
     monkeypatch.setattr(
         "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
-        lambda signal, sample_rate, nfft: (
+        lambda signal, sample_rate, nfft, weighting="Z": (
             np.array([1000.0], dtype=np.float64),
             np.array([67.0], dtype=np.float64) + ref_db,
         ),
@@ -4899,7 +4992,7 @@ def test_build_chart_payload_octave_filters_non_finite_levels_without_axis_misma
     )
     monkeypatch.setattr(
         "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
-        lambda signal, sample_rate, nfft: (
+        lambda signal, sample_rate, nfft, weighting="Z": (
             np.array([1000.0], dtype=np.float64),
             np.array([67.0], dtype=np.float64) + ref_db,
         ),
@@ -4964,7 +5057,7 @@ def test_build_chart_payload_octave_omits_limit_band_when_configured_bin_level_i
     )
     monkeypatch.setattr(
         "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
-        lambda signal, sample_rate, nfft: (
+        lambda signal, sample_rate, nfft, weighting="Z": (
             np.array([1000.0], dtype=np.float64),
             np.array([67.0], dtype=np.float64) + ref_db,
         ),
