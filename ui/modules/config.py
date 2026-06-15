@@ -2110,6 +2110,16 @@ class ConfigModule(QWidget):
         fft_axis.setCurrentIndex(fft_axis_index if fft_axis_index >= 0 else 0)
         fft_controls_form.addRow("FFT 横轴", fft_axis)
 
+        fft_weighting = _NoWheelComboBox()
+        fft_weighting.addItems(["A", "C", "Z"])
+        fft_weighting.setObjectName("fft_weighting")
+        fft_weighting_value = data.get("fft_weighting", "Z") if data else "Z"
+        fft_weighting_index = fft_weighting.findText(fft_weighting_value)
+        fft_weighting.setCurrentIndex(
+            fft_weighting_index if fft_weighting_index >= 0 else 2
+        )
+        fft_controls_form.addRow("计权模式", fft_weighting)
+
         fft_mode = _NoWheelComboBox()
         fft_mode.setObjectName("fft_golden_mode")
         fft_mode.addItem("关闭", "off")
@@ -2499,6 +2509,9 @@ class ConfigModule(QWidget):
 
         fft_axis = container.findChild(QComboBox, "fft_x_axis_scale")
         ch["fft_x_axis_scale"] = fft_axis.currentData() if fft_axis else "linear"
+
+        fft_weighting = container.findChild(QComboBox, "fft_weighting")
+        ch["fft_weighting"] = fft_weighting.currentText() if fft_weighting else "Z"
 
         combo_overlap = container.findChild(QComboBox, "stft_overlap")
         ch["stft_overlap"] = combo_overlap.currentData() if combo_overlap else 0.5

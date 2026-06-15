@@ -2982,6 +2982,18 @@ def test_populate_detail_restores_fft_x_axis_scale(qapp):
     assert combo.currentData() == "log"
 
 
+def test_populate_detail_restores_fft_weighting(qapp):
+    module = _make_module()
+    payload = _detail_payload([_channel_payload(0, fft_weighting="C")])
+
+    module._populate_detail(payload)
+    container = module._channel_containers[0]
+    combo = container.findChild(QComboBox, "fft_weighting")
+
+    assert combo is not None
+    assert combo.currentText() == "C"
+
+
 def test_collect_data_includes_fft_x_axis_scale(qapp):
     module = _make_module()
     module._current_config_id = 7
@@ -2994,6 +3006,20 @@ def test_collect_data_includes_fft_x_axis_scale(qapp):
     data = module._collect_data()
 
     assert data["channels"][0]["fft_x_axis_scale"] == "log"
+
+
+def test_collect_data_includes_fft_weighting(qapp):
+    module = _make_module()
+    module._current_config_id = 7
+    module._populate_detail(_detail_payload([_channel_payload(0)]))
+    container = module._channel_containers[0]
+    combo = container.findChild(QComboBox, "fft_weighting")
+    assert combo is not None
+    combo.setCurrentIndex(combo.findText("A"))
+
+    data = module._collect_data()
+
+    assert data["channels"][0]["fft_weighting"] == "A"
 
 
 def test_config_module_loads_legacy_fft_and_octave_limits_as_separate_limit_tables(

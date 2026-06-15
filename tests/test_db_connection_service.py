@@ -67,6 +67,7 @@ def _create_sqlite_file(db_path: Path) -> None:
 
 
 CHANNEL_CONFIG_COLUMN_SQL = {
+    "fft_weighting": "TEXT NOT NULL DEFAULT 'Z'",
     "fft_x_axis_scale": "TEXT NOT NULL DEFAULT 'linear'",
     "stft_color_scale_enabled": "INTEGER NOT NULL DEFAULT 0",
     "stft_color_scale_min_db": "REAL NOT NULL DEFAULT -120.0",
@@ -275,6 +276,10 @@ def test_connect_existing_prepared_database_accepts_required_channel_columns(
     assert expected_tables == EXPECTED_RUNTIME_TABLES
     assert _table_columns(tmp_db, "users_table") == expected_user_columns
     channel_columns = _table_columns(tmp_db, "channel_config_table")
+    assert channel_columns["fft_weighting"][2] == "TEXT"
+    assert tmp_db.execute_sql(
+        "SELECT fft_weighting FROM channel_config_table WHERE id = 1"
+    ).fetchone() == ("Z",)
     assert channel_columns["fft_x_axis_scale"][2] == "TEXT"
     assert tmp_db.execute_sql(
         "SELECT fft_x_axis_scale FROM channel_config_table WHERE id = 1"

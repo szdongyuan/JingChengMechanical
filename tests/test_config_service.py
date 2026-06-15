@@ -1722,6 +1722,34 @@ def test_save_config_persists_fft_x_axis_scale():
     assert getattr(row, "fft_x_axis_scale", None) == "log"
 
 
+def test_save_config_persists_fft_weighting():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    channel = _channel_payload(0)
+    channel["fft_weighting"] = "C"
+
+    svc.save_config(
+        {
+            "config_id": config_id,
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "scan_triggers_test": False,
+            "selected_channels": [0],
+            "channels": [channel],
+        }
+    )
+
+    loaded = svc.load_config(config_id)
+    row = ChannelConfigTable.get(
+        (ChannelConfigTable.config == config_id)
+        & (ChannelConfigTable.channel_index == 0)
+    )
+
+    assert loaded["channels"][0]["fft_weighting"] == "C"
+    assert row.fft_weighting == "C"
+
+
 def test_save_config_preserves_grouped_fft_and_octave_limits():
     svc = _service()
     config_id = ConfigTable.create(config_name="Cfg1").config_id
@@ -2241,6 +2269,25 @@ def test_validate_rejects_invalid_fft_x_axis_scale():
     )
 
     assert any("FFT 横轴模式" in err for err in errors)
+
+
+def test_validate_rejects_invalid_fft_weighting():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_weighting"] = "B"
+
+    errors = svc.validate(
+        {
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "scan_triggers_test": False,
+            "selected_channels": [0],
+            "channels": [channel],
+        }
+    )
+
+    assert "通道 1: FFT 计权模式无效" in errors
 
 
 def test_validate_rejects_enabled_stft_color_scale_with_invalid_range():

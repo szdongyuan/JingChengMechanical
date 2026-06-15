@@ -38,6 +38,7 @@ class DbConnectionService:
     )
     _REQUIRED_CHANNEL_CONFIG_COLUMNS = frozenset(
         {
+            "fft_weighting",
             "fft_x_axis_scale",
             "stft_color_scale_enabled",
             "stft_color_scale_min_db",

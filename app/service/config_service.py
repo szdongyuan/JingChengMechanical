@@ -70,6 +70,7 @@ _CHANNEL_DEFAULTS = {
     "loudness_average_upper_enabled": False,
     "loudness_average_upper_limit": 60.0,
     "fft_x_axis_scale": "linear",
+    "fft_weighting": "Z",
     "fft_band_limits": "[]",
     "oct_weighting": "A",
     "oct_band_limits": "[]",
@@ -451,6 +452,13 @@ class ConfigService:
                             ch,
                             "fft_x_axis_scale",
                             _CHANNEL_DEFAULTS["fft_x_axis_scale"],
+                        )
+                    ),
+                    "fft_weighting": self._normalize_weighting(
+                        getattr(
+                            ch,
+                            "fft_weighting",
+                            _CHANNEL_DEFAULTS["fft_weighting"],
                         )
                     ),
                     "fft_band_limits": self._parse_json(ch.fft_band_limits, []),
@@ -986,6 +994,11 @@ class ConfigService:
                 not in _VALID_FFT_X_AXIS_SCALES
             ):
                 errors.append(f"{prefix}: FFT 横轴模式无效")
+            if (
+                ch.get("fft_weighting", _CHANNEL_DEFAULTS["fft_weighting"])
+                not in _VALID_WEIGHTING
+            ):
+                errors.append(f"{prefix}: FFT 计权模式无效")
             if ch.get("stft_overlap") not in _VALID_OVERLAP:
                 errors.append(f"{prefix}: STFT 重叠率无效")
             fixed_color_scale_enabled = ch.get(
@@ -1521,6 +1534,12 @@ class ConfigService:
                     _CHANNEL_DEFAULTS["fft_x_axis_scale"],
                 )
             ),
+            "fft_weighting": self._normalize_weighting(
+                channel.get(
+                    "fft_weighting",
+                    _CHANNEL_DEFAULTS["fft_weighting"],
+                )
+            ),
             "fft_band_limits": deepcopy(channel.get("fft_band_limits", [])),
             "oct_weighting": channel.get(
                 "oct_weighting",
@@ -1621,6 +1640,12 @@ class ConfigService:
                 normalized_channel.get(
                     "fft_x_axis_scale",
                     _CHANNEL_DEFAULTS["fft_x_axis_scale"],
+                )
+            ),
+            "fft_weighting": self._normalize_weighting(
+                normalized_channel.get(
+                    "fft_weighting",
+                    _CHANNEL_DEFAULTS["fft_weighting"],
                 )
             ),
             "fft_band_limits": json.dumps(normalized_channel["fft_band_limits"]),
@@ -1821,6 +1846,11 @@ class ConfigService:
     def _normalize_fft_x_axis_scale(value) -> str:
         text = str(value or "").strip().lower()
         return text if text in _VALID_FFT_X_AXIS_SCALES else "linear"
+
+    @staticmethod
+    def _normalize_weighting(value) -> str:
+        text = str(value or "").strip().upper()
+        return text if text in _VALID_WEIGHTING else "Z"
 
     def _normalized_stft_color_scale_fields(self, channel: dict) -> dict:
         enabled = channel.get(
