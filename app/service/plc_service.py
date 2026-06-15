@@ -79,7 +79,7 @@ class PlcService(QObject):
     @pyqtSlot()
     def start_plc_service(self):
         # 启动 PLC 监听；如果已经启动过，就直接返回，避免重复创建定时器。
-        self.logger.info(f"启动 PLC 服务")
+        self.logger.info(f"启动 PLC{self._plc_id} 服务")
         if self.timer is not None:
             return
         self.state_changed.emit("连接中")
@@ -97,10 +97,10 @@ class PlcService(QObject):
         self.timer.start()
         self.connect_result.emit(True, "")
 
-        self.logger.info(f"PLC开始监听: ip={self._ip}, rack={self._rack}, slot={self._slot}, "
+        self.logger.info(f"PLC{self._plc_id}开始监听: ip={self._ip}, rack={self._rack}, slot={self._slot}, "
             f"DB{self._db_number}")
         self.bus.log.emit(
-            f"PLC开始监听: ip={self._ip}, rack={self._rack}, slot={self._slot}, "
+            f"PLC{self._plc_id}开始监听: ip={self._ip}, rack={self._rack}, slot={self._slot}, "
             f"DB{self._db_number}"
         )
         self.read_plc_limit()
@@ -121,11 +121,11 @@ class PlcService(QObject):
         self._disconnect()
         self.state_changed.emit("未连接")
         self._last_value = None
-        self.bus.log.emit("PLC 停止监听")
-        self.logger.info("PLC 停止监听")
+        self.bus.log.emit(f"PLC{self._plc_id}停止监听")
+        self.logger.info(f"PLC{self._plc_id}停止监听")
 
     def _connect_once(self):
-        self.logger.info("开始尝试连接 PLC")
+        self.logger.info(f"开始尝试连接 PLC {self._plc_id}")
         # 尝试建立一次 PLC 连接；如果当前已经连上，就不重复连接。
         if self.plc_client is not None:
             self.logger.info("已有 PLC 客户端，不重复连接")
@@ -134,21 +134,21 @@ class PlcService(QObject):
         try:
             client = snap7.client.Client()
             client.connect(self._ip, self._rack, self._slot)
-            self.logger.info(f"PLC连接参数: ip={self._ip}, rack={self._rack}, slot={self._slot}")
-            self.logger.info(f"PLC地址参数: db_number数据块号={self._db_number}")
-            self.bus.log.emit(f"PLC连接参数: ip={self._ip}, rack={self._rack}, slot={self._slot}")
-            self.bus.log.emit(f"PLC地址参数: db_number数据块号={self._db_number}")
+            self.logger.info(f"PLC{self._plc_id}连接参数: ip={self._ip}, rack={self._rack}, slot={self._slot}")
+            self.logger.info(f"PLC{self._plc_id}地址参数: db_number数据块号={self._db_number}")
+            self.bus.log.emit(f"PLC{self._plc_id}连接参数: ip={self._ip}, rack={self._rack}, slot={self._slot}")
+            self.bus.log.emit(f"PLC{self._plc_id}地址参数: db_number数据块号={self._db_number}")
             self.plc_client = client
             self._reconnect_timer_ms = 0
             self._last_connect_error = ""
             self.state_changed.emit("已连接")
-            self.logger.info(f"PLC 连接成功: {self._ip}")
-            self.bus.log.emit(f"PLC 连接成功: {self._ip}")
+            self.logger.info(f"PLC{self._plc_id}连接成功: {self._ip}")
+            self.bus.log.emit(f"PLC{self._plc_id}连接成功: {self._ip}")
         except Exception as exc:
             self.plc_client = None
             self._last_connect_error = str(exc)
-            self.logger.error(f"PLC 连接失败: {exc}")
-            self.bus.log.emit(f"PLC 连接失败: {exc}")
+            self.logger.error(f"PLC{self._plc_id}连接失败: {exc}")
+            self.bus.log.emit(f"PLC{self._plc_id}连接失败: {exc}")
 
     def _disconnect(self):
         # 断开当前 PLC 连接，并清空 plc_client，供后续重连使用。
@@ -165,7 +165,7 @@ class PlcService(QObject):
             self.state_changed.emit("未连接")
 
     def _try_reconnect(self):
-        self.logger.info("触发重新连接")
+        self.logger.info(f"{self._plc_id}触发重新连接")
         # 按重连间隔尝试重新连接，避免每次轮询失败都立刻重连。
         if self.timer is None:
             return
@@ -190,8 +190,8 @@ class PlcService(QObject):
             return bool(data)
         except Exception as exc:
             self._disconnect()
-            self.bus.log.emit(f"PLC 读取失败: {exc}")
-            self.logger.error(f"PLC 读取失败: {exc}")
+            self.bus.log.emit(f"PLC{self._plc_id}读取失败: {exc}")
+            self.logger.error(f"PLC{self._plc_id}读取失败: {exc}")
             return None
 
     def write_plc_value(self, offset, type, value):
@@ -382,8 +382,6 @@ class PlcService(QObject):
         # PLC 连接成功后读取一次机种和各项上下限，后续测试可直接按 plc_id 取用。
         values = self.read_plc_values(*self.limit_field)
         self.bus.plc_limit_values_dict[self._plc_id] = values
-        print(f"PLC {self._plc_id} 读取限值:", values)
-        print("PLC 限值共享字典:", self.bus.plc_limit_values_dict)
         self.bus.log.emit(f"PLC {self._plc_id} 读取限值完成: {values}")
 
     def _start_value_timer(self):
@@ -435,8 +433,8 @@ class PlcService(QObject):
         try:
             self._on_start_requested(self._plc_id)
         except Exception as exc:
-            self.bus.log.emit(f"PLC 开始回调失败: {exc}")
-            self.logger.error(f"PLC 开始回调失败: {exc}")
+            self.bus.log.emit(f"PLC{self._plc_id}开始回调失败: {exc}")
+            self.logger.error(f"PLC{self._plc_id}开始回调失败: {exc}")
 
         # 如果需要，触发后自动清零，方便 PLC 下次再次置 1 触发。
         if self._auto_reset_bit:

@@ -269,6 +269,9 @@ class ServiceContainer:
         self.config_service = ConfigService(self.bus)
         self.audio_data_service = AudioDataService()
 
+        # 把 plc工艺表里的读取方法，挂到 services 上
+        self.get_process_param_values = None
+
         self.ai_service = AiService()
         self.config_package_service = ConfigPackageService(
             config_service=self.config_service,
