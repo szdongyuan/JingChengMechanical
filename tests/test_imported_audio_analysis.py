@@ -169,7 +169,7 @@ def _patch_imported_chart_backends(monkeypatch):
     )
     monkeypatch.setattr(
         "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
-        lambda signal, sample_rate, nfft: (
+        lambda signal, sample_rate, nfft, weighting="Z": (
             np.asarray([1000.0, 2000.0], dtype=np.float64),
             np.asarray([67.0, 45.0], dtype=np.float64) + ref_db,
         ),
