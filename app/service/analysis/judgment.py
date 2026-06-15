@@ -476,6 +476,7 @@ class JudgmentEngine:
         allow_golden_runtime_resample: bool = False,
     ) -> tuple[list[BandResult], bool, str | None]:
         band_limits = channel_config.get("fft_band_limits", [])
+        weighting = self._fft_weighting(channel_config.get("fft_weighting", "Z"))
         mode = self._golden_mode(channel_config.get("fft_golden_mode"))
         overlay_requested = bool(channel_config.get("fft_show_golden_overlay"))
         nfft = channel_config.get("fft_nfft", _CHANNEL_DEFAULTS["fft_nfft"])
@@ -502,6 +503,7 @@ class JudgmentEngine:
                 golden_freqs, golden_levels = golden_cache.ensure_fft(
                     golden_bundle,
                     nfft=nfft,
+                    weighting=weighting,
                 )
             except GoldenReferenceError as exc:
                 return [], False, str(exc)
@@ -523,6 +525,7 @@ class JudgmentEngine:
                 sig,
                 sample_rate,
                 nfft=nfft,
+                weighting=weighting,
             )
         except Exception as exc:
             return [], False, str(exc) or exc.__class__.__name__
@@ -652,8 +655,9 @@ class JudgmentEngine:
         sample_rate: float,
         *,
         nfft: int,
+        weighting: str = "Z",
     ) -> tuple[np.ndarray, np.ndarray]:
-        freqs, mag_db = dsp.compute_fft_spectrum(sig, sample_rate, nfft)
+        freqs, mag_db = dsp.compute_fft_spectrum(sig, sample_rate, nfft, weighting)
         return np.asarray(freqs, dtype=np.float64), self._absolute_levels_db(mag_db)
 
     def _measure_octave(
@@ -862,6 +866,11 @@ class JudgmentEngine:
         if mode in {"absolute", "delta"}:
             return mode
         return "off"
+
+    @staticmethod
+    def _fft_weighting(value) -> str:
+        weighting = str(value or "Z").strip().upper()
+        return weighting if weighting in {"A", "C", "Z"} else "Z"
 
     @staticmethod
     def _absolute_levels_db(levels_db: np.ndarray | list[float]) -> np.ndarray:
