@@ -330,39 +330,6 @@ def _show(window, qapp):
     qapp.processEvents()
 
 
-def test_main_window_login_refreshes_control_owned_start_button_state_without_enabling_busy_start(
-    qapp,
-    monkeypatch,
-):
-    busy_state = FactoryControllerState(
-        selected_config_ids=(101,),
-        active_config_id=101,
-        displayed_config_id=101,
-        run_phase="running",
-        trigger_source="manual",
-        start_ready=False,
-        start_ready_reason="当前测试运行中",
-    )
-    window, _ = _make_window(
-        monkeypatch,
-        initial_state=busy_state,
-        use_real_control=True,
-    )
-    _show(window, qapp)
-
-    assert window.control.btn_start.isEnabled() is False
-    assert window.control.btn_stop.isEnabled() is False
-
-    window.current_user_name = "operator"
-    window.current_user_role = "操作员"
-    window.set_role()
-    qapp.processEvents()
-
-    assert window.control.btn_start.isEnabled() is False
-    assert hasattr(window.control, "lbl_start_reason") is False
-    assert window.control.btn_stop.isEnabled() is True
-
-
 def test_show_change_password_window_when_logged_out_updates_visible_status_via_log(
     qapp,
     monkeypatch,

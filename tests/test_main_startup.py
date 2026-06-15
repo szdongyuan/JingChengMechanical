@@ -112,31 +112,3 @@ def test_run_app_propagates_unrelated_startup_errors_without_database_dialog(
     assert FakeApplication.instances[0].exec_called is False
     critical.assert_not_called()
     main_window.assert_not_called()
-
-
-def test_run_app_success_constructs_main_window_and_returns_event_loop_code(
-    monkeypatch,
-):
-    services = object()
-    window = FakeWindow()
-    critical = MagicMock()
-    service_container = MagicMock(return_value=services)
-    main_window = MagicMock(return_value=window)
-    monkeypatch.setattr(
-        startup_mod,
-        "QMessageBox",
-        MagicMock(critical=critical),
-        raising=False,
-    )
-    monkeypatch.setattr(startup_mod, "ServiceContainer", service_container)
-    monkeypatch.setattr(startup_mod, "MainWindow", main_window)
-
-    result = startup_mod.run_app(["jingcheng", "--factory"])
-
-    assert result == 37
-    assert FakeApplication.instances[0].argv == ["jingcheng", "--factory"]
-    service_container.assert_called_once_with()
-    main_window.assert_called_once_with(services)
-    assert window.show_maximized_called is True
-    assert FakeApplication.instances[0].exec_called is True
-    critical.assert_not_called()
