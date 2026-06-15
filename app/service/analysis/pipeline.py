@@ -36,6 +36,7 @@ class AnalysisPipeline:
         # STFT config
         self._nfft: int = channel_config["stft_nfft"]
         self._fft_nfft: int = channel_config["fft_nfft"]
+        self._fft_weighting = str(channel_config.get("fft_weighting", "Z") or "Z")
         self._overlap: float = channel_config["stft_overlap"]
 
         # SPL config
@@ -111,11 +112,13 @@ class AnalysisPipeline:
                     self._fft_buffer,
                     self.sample_rate,
                     self._fft_nfft,
+                    self._fft_weighting,
                 )
                 fft_frame = FftFrame(
                     time=elapsed_time,
                     frequencies=freqs,
                     magnitudes=mag_db,
+                    weighting=self._fft_weighting,
                 )
 
         # Octave bands — opt-in; need enough samples for low-freq resolution

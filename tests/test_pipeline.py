@@ -357,13 +357,36 @@ class TestAnalysisPipeline:
         assert isinstance(second["fft"], FftFrame)
         assert second["fft"].frequencies.shape[0] == 4096 // 2 + 1
 
+    def test_live_fft_uses_channel_fft_weighting(self, monkeypatch):
+        calls = []
+
+        def fake_fft(signal, sample_rate, nfft, weighting="Z"):
+            calls.append(weighting)
+            return np.array([100.0]), np.array([42.0])
+
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_fft_spectrum",
+            fake_fft,
+        )
+        pipeline = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(fft_nfft=4, fft_weighting="A"),
+            sample_rate=1000.0,
+        )
+
+        result = pipeline.process_chunk(np.ones(4, dtype=np.float32), elapsed_time=0.004)
+
+        assert calls == ["A"]
+        assert isinstance(result["fft"], FftFrame)
+        assert result["fft"].weighting == "A"
+
     def test_live_fft_waits_for_rolling_buffer_then_emits_one_frame_per_chunk(
         self,
         monkeypatch,
     ):
         captured_fft_inputs: list[np.ndarray] = []
 
-        def fake_compute_fft_spectrum(signal, sample_rate, nfft):
+        def fake_compute_fft_spectrum(signal, sample_rate, nfft, weighting="Z"):
             captured_fft_inputs.append(np.asarray(signal, dtype=np.float64).copy())
             return (
                 np.arange(nfft // 2 + 1, dtype=np.float64),

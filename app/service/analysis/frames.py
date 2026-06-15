@@ -43,6 +43,7 @@ class FftFrame:
     time: float
     frequencies: np.ndarray    # freq axis (Hz)
     magnitudes: np.ndarray     # magnitude spectrum (dB)
+    weighting: str = "Z"       # "A", "C", or "Z"
 
 
 @dataclass
