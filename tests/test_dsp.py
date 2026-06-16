@@ -979,6 +979,34 @@ class TestComputeFftSpectrum:
         assert freqs.shape[0] == 4096 // 2 + 1
         assert mag_db.shape == freqs.shape
 
+    def test_a_weighting_attenuates_low_frequency_fft_bin_relative_to_z(self):
+        sample_rate = 48_000.0
+        nfft = 4096
+        bin_index = 10
+        freq_hz = bin_index * sample_rate / nfft
+        t = np.arange(nfft, dtype=np.float64) / sample_rate
+        signal = np.sin(2.0 * np.pi * freq_hz * t)
+
+        freqs_z, levels_z = compute_fft_spectrum(signal, sample_rate, nfft, weighting="Z")
+        freqs_a, levels_a = compute_fft_spectrum(signal, sample_rate, nfft, weighting="A")
+
+        np.testing.assert_allclose(freqs_a, freqs_z)
+        assert levels_a[bin_index] < levels_z[bin_index] - 10.0
+
+    def test_c_weighting_is_flatter_than_a_weighting_at_low_frequency_fft_bin(self):
+        sample_rate = 48_000.0
+        nfft = 4096
+        bin_index = 10
+        freq_hz = bin_index * sample_rate / nfft
+        t = np.arange(nfft, dtype=np.float64) / sample_rate
+        signal = np.sin(2.0 * np.pi * freq_hz * t)
+
+        _, levels_z = compute_fft_spectrum(signal, sample_rate, nfft, weighting="Z")
+        _, levels_a = compute_fft_spectrum(signal, sample_rate, nfft, weighting="A")
+        _, levels_c = compute_fft_spectrum(signal, sample_rate, nfft, weighting="C")
+
+        assert levels_a[bin_index] < levels_c[bin_index] < levels_z[bin_index]
+
     @pytest.mark.parametrize(
         ("signal", "sample_rate", "nfft"),
         [

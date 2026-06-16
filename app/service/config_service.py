@@ -18,6 +18,13 @@ from app.service.current_meter_service import (
     validate_current_meter_config,
 )
 from app.service.golden_sample_service import GoldenSampleService, StagedGoldenSample
+from app.service.result_dashboard_layout import (
+    DEFAULT_RESULT_DASHBOARD_LAYOUT,
+    ResultDashboardLayoutError,
+    normalize_result_dashboard_layout,
+    normalize_result_dashboard_layout_for_display,
+    serialize_result_dashboard_layout,
+)
 from consts.time_consts import now_str
 from model.channel_config_table import ChannelConfigTable
 from model.device_table import DeviceTable
@@ -63,6 +70,7 @@ _CHANNEL_DEFAULTS = {
     "loudness_average_upper_enabled": False,
     "loudness_average_upper_limit": 60.0,
     "fft_x_axis_scale": "linear",
+    "fft_weighting": "Z",
     "fft_band_limits": "[]",
     "oct_weighting": "A",
     "oct_band_limits": "[]",
@@ -183,6 +191,7 @@ _CONFIG_LOAD_FIELD_NAMES = (
     "output_device_samplerate",
     "selected_channels",
     "vibration_view_channel_index",
+    "result_dashboard_layout",
     *_MONITOR_CONFIG_FIELDS,
     *_CURRENT_METER_CONFIG_FIELDS,
 )
@@ -445,6 +454,13 @@ class ConfigService:
                             _CHANNEL_DEFAULTS["fft_x_axis_scale"],
                         )
                     ),
+                    "fft_weighting": self._normalize_weighting(
+                        getattr(
+                            ch,
+                            "fft_weighting",
+                            _CHANNEL_DEFAULTS["fft_weighting"],
+                        )
+                    ),
                     "fft_band_limits": self._parse_json(ch.fft_band_limits, []),
                     "oct_weighting": ch.oct_weighting,
                     "oct_band_limits": self._parse_json(ch.oct_band_limits, []),
@@ -474,11 +490,56 @@ class ConfigService:
             result["selected_channels"] = [
                 ch["channel_index"] for ch in result["channels"]
             ]
+        (
+            result["result_dashboard_layout"],
+            result_dashboard_layout_error,
+        ) = self._normalize_loaded_result_dashboard_layout(
+            cfg.get("result_dashboard_layout"),
+            selected_channels=result["selected_channels"],
+        )
+        if result_dashboard_layout_error is not None:
+            result["_result_dashboard_layout_error"] = result_dashboard_layout_error
         result["monitor_channel_index"] = self._resolve_monitor_channel_index(
             cfg.get("monitor_channel_index"),
             selected_channels=result["selected_channels"],
         )
         return result
+
+    def load_config_for_result_dashboard(self, config_id: int) -> dict:
+        result = self.load_config(config_id)
+        result["result_dashboard_layout"] = normalize_result_dashboard_layout_for_display(
+            result.get("result_dashboard_layout"),
+            selected_channels=result.get("selected_channels", []),
+        )
+        result.pop("_result_dashboard_layout_error", None)
+        return result
+
+    def _normalize_loaded_result_dashboard_layout(
+        self,
+        raw_layout,
+        *,
+        selected_channels: list,
+    ) -> tuple[object, str | None]:
+        try:
+            return (
+                normalize_result_dashboard_layout(
+                    raw_layout,
+                    selected_channels=selected_channels,
+                ),
+                None,
+            )
+        except ResultDashboardLayoutError as exc:
+            return raw_layout, f"结果展示布局：{exc}"
+
+    @staticmethod
+    def _selected_channels_for_layout_validation(selected_channels) -> list[int]:
+        if not isinstance(selected_channels, (list, tuple)):
+            return []
+        normalized = []
+        for channel in selected_channels:
+            if isinstance(channel, int) and not isinstance(channel, bool):
+                normalized.append(channel)
+        return normalized
 
     def create_config(self, config_name: str) -> int:
         name = config_name.strip()
@@ -495,6 +556,9 @@ class ConfigService:
                     "allow_incomplete_recording_analysis": False,
                     "scan_triggers_test": False,
                     "selected_channels": "[]",
+                    "result_dashboard_layout": serialize_result_dashboard_layout(
+                        DEFAULT_RESULT_DASHBOARD_LAYOUT
+                    ),
                     "analysis_window_offset_ms": 0,
                     "created_time": now_str(),
                     "updated_time": now_str(),
@@ -641,6 +705,13 @@ class ConfigService:
         monitor_gain_db = source.get("monitor_gain_db", MONITOR_GAIN_DEFAULT_DB)
         if monitor_gain_db is None:
             monitor_gain_db = MONITOR_GAIN_DEFAULT_DB
+        try:
+            result_dashboard_layout = normalize_result_dashboard_layout(
+                source.get("result_dashboard_layout"),
+                selected_channels=selected_channels,
+            )
+        except ResultDashboardLayoutError as exc:
+            raise ValueError(f"结果展示布局：{exc}") from exc
 
         return {
             "config_name": str(source.get("config_name", "")).strip(),
@@ -665,6 +736,7 @@ class ConfigService:
             ),
             "monitor_channel_index": source.get("monitor_channel_index"),
             "monitor_gain_db": monitor_gain_db,
+            "result_dashboard_layout": result_dashboard_layout,
             "current_meter": normalize_current_meter_config(
                 source.get("current_meter")
             ),
@@ -846,6 +918,17 @@ class ConfigService:
         errors.extend(self.validate_factory_runtime(data))
         errors.extend(validate_current_meter_config(data.get("current_meter")))
 
+        selected_channels_for_layout = self._selected_channels_for_layout_validation(
+            data.get("selected_channels", [])
+        )
+        try:
+            normalize_result_dashboard_layout(
+                data.get("result_dashboard_layout"),
+                selected_channels=selected_channels_for_layout,
+            )
+        except ResultDashboardLayoutError as exc:
+            errors.append(f"结果展示布局：{exc}")
+
         input_dev = data.get("input_device_name")
         sel_ch = data.get("selected_channels", [])
         if input_dev and not sel_ch:
@@ -911,6 +994,11 @@ class ConfigService:
                 not in _VALID_FFT_X_AXIS_SCALES
             ):
                 errors.append(f"{prefix}: FFT 横轴模式无效")
+            if (
+                ch.get("fft_weighting", _CHANNEL_DEFAULTS["fft_weighting"])
+                not in _VALID_WEIGHTING
+            ):
+                errors.append(f"{prefix}: FFT 计权模式无效")
             if ch.get("stft_overlap") not in _VALID_OVERLAP:
                 errors.append(f"{prefix}: STFT 重叠率无效")
             fixed_color_scale_enabled = ch.get(
@@ -996,6 +1084,9 @@ class ConfigService:
 
     def validate_factory_runtime(self, data: dict) -> list[str]:
         errors = []
+        selected_channels = data.get("selected_channels", [])
+        if isinstance(selected_channels, (list, tuple)) and len(selected_channels) > 2:
+            errors.append("最多选择两个通道")
         offset = data.get("analysis_window_offset_ms", 0)
         if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
             errors.append("分析窗起始偏移必须为不小于 0 的整数")
@@ -1443,6 +1534,12 @@ class ConfigService:
                     _CHANNEL_DEFAULTS["fft_x_axis_scale"],
                 )
             ),
+            "fft_weighting": self._normalize_weighting(
+                channel.get(
+                    "fft_weighting",
+                    _CHANNEL_DEFAULTS["fft_weighting"],
+                )
+            ),
             "fft_band_limits": deepcopy(channel.get("fft_band_limits", [])),
             "oct_weighting": channel.get(
                 "oct_weighting",
@@ -1545,6 +1642,12 @@ class ConfigService:
                     _CHANNEL_DEFAULTS["fft_x_axis_scale"],
                 )
             ),
+            "fft_weighting": self._normalize_weighting(
+                normalized_channel.get(
+                    "fft_weighting",
+                    _CHANNEL_DEFAULTS["fft_weighting"],
+                )
+            ),
             "fft_band_limits": json.dumps(normalized_channel["fft_band_limits"]),
             "oct_weighting": normalized_channel["oct_weighting"],
             "oct_band_limits": json.dumps(normalized_channel["oct_band_limits"]),
@@ -1612,6 +1715,10 @@ class ConfigService:
         ):
             values["vibration_view_channel_index"] = data.get(
                 "vibration_view_channel_index"
+            )
+        if self._config_field_exists("result_dashboard_layout", available_columns):
+            values["result_dashboard_layout"] = serialize_result_dashboard_layout(
+                data.get("result_dashboard_layout")
             )
         current_meter = normalize_current_meter_config(data.get("current_meter"))
         self._add_current_meter_row_values(
@@ -1739,6 +1846,11 @@ class ConfigService:
     def _normalize_fft_x_axis_scale(value) -> str:
         text = str(value or "").strip().lower()
         return text if text in _VALID_FFT_X_AXIS_SCALES else "linear"
+
+    @staticmethod
+    def _normalize_weighting(value) -> str:
+        text = str(value or "").strip().upper()
+        return text if text in _VALID_WEIGHTING else "Z"
 
     def _normalized_stft_color_scale_fields(self, channel: dict) -> dict:
         enabled = channel.get(

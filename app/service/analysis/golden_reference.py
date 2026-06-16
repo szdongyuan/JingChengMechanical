@@ -24,7 +24,9 @@ class GoldenReferenceError(RuntimeError):
 class GoldenReferenceBundle:
     signal: np.ndarray
     sample_rate: float
-    fft_by_nfft: dict[int, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+    fft_by_key: dict[tuple[int, str], tuple[np.ndarray, np.ndarray]] = field(
+        default_factory=dict
+    )
     octave_center_freqs_hz: np.ndarray | None = None
     octave_levels_db: np.ndarray | None = None
 
@@ -115,10 +117,13 @@ class GoldenReferenceCache:
         bundle: GoldenReferenceBundle,
         *,
         nfft: int,
+        weighting: str = "Z",
     ) -> tuple[np.ndarray, np.ndarray]:
         try:
             resolved_nfft = _validated_positive_nfft(nfft)
-            cached = bundle.fft_by_nfft.get(resolved_nfft)
+            resolved_weighting = _normalize_fft_weighting(weighting)
+            cache_key = (resolved_nfft, resolved_weighting)
+            cached = bundle.fft_by_key.get(cache_key)
             if cached is not None:
                 return cached
 
@@ -126,6 +131,7 @@ class GoldenReferenceCache:
                 bundle.signal,
                 bundle.sample_rate,
                 resolved_nfft,
+                resolved_weighting,
             )
         except Exception as exc:
             message = str(exc) or "黄金样本 FFT 参考计算失败"
@@ -135,7 +141,7 @@ class GoldenReferenceCache:
             np.asarray(frequencies_hz, dtype=np.float64),
             _absolute_levels_db(magnitudes_db),
         )
-        bundle.fft_by_nfft[resolved_nfft] = cached
+        bundle.fft_by_key[cache_key] = cached
         return cached
 
     def ensure_octave(
@@ -178,6 +184,11 @@ def _read_wav(path: str) -> tuple[int, object]:
 def _absolute_levels_db(levels_db: np.ndarray | list[float]) -> np.ndarray:
     levels = np.asarray(levels_db, dtype=np.float64)
     return levels - _REF_PRESSURE_DB
+
+
+def _normalize_fft_weighting(weighting: str) -> str:
+    normalized = str(weighting or "Z").strip().upper()
+    return normalized if normalized in {"A", "C", "Z"} else "Z"
 
 
 def _resample_signal(

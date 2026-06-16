@@ -169,7 +169,7 @@ def _patch_imported_chart_backends(monkeypatch):
     )
     monkeypatch.setattr(
         "app.service.analysis.review_payloads.dsp.compute_fft_spectrum",
-        lambda signal, sample_rate, nfft: (
+        lambda signal, sample_rate, nfft, weighting="Z": (
             np.asarray([1000.0, 2000.0], dtype=np.float64),
             np.asarray([67.0, 45.0], dtype=np.float64) + ref_db,
         ),
@@ -1618,13 +1618,15 @@ def test_judgment_engine_run_ai_false_does_not_resolve_ai_binding():
 
 def test_judgment_engine_passes_runtime_resample_option_to_golden_cache(monkeypatch):
     captured = []
+    fft_weightings = []
 
     class GoldenCacheStub:
         def bundle_for_channel(self, **kwargs):
             captured.append(kwargs["allow_runtime_resample"])
             return object()
 
-        def ensure_fft(self, bundle, *, nfft):
+        def ensure_fft(self, bundle, *, nfft, weighting="Z"):
+            fft_weightings.append(str(weighting))
             return (
                 np.asarray([1000.0, 2000.0], dtype=np.float64),
                 np.asarray([60.0, 60.0], dtype=np.float64),
@@ -1680,3 +1682,4 @@ def test_judgment_engine_passes_runtime_resample_option_to_golden_cache(monkeypa
     )
 
     assert captured == [True]
+    assert fft_weightings == ["Z"]

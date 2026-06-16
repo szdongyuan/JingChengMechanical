@@ -890,8 +890,12 @@ def compute_stft(signal: np.ndarray, sample_rate: float, nfft: int,
 # ---------------------------------------------------------------------------
 
 
-def compute_fft_spectrum(signal: np.ndarray, sample_rate: float,
-                         nfft: int) -> tuple[np.ndarray, np.ndarray]:
+def compute_fft_spectrum(
+    signal: np.ndarray,
+    sample_rate: float,
+    nfft: int,
+    weighting: str = "Z",
+) -> tuple[np.ndarray, np.ndarray]:
     """Compute single-sided FFT magnitude spectrum.
 
     Returns
@@ -929,9 +933,19 @@ def compute_fft_spectrum(signal: np.ndarray, sample_rate: float,
             mag_sum += np.abs(spectrum) * 2.0 / resolved_nfft
             window_count += 1
         mag = mag_sum / max(window_count, 1)
-    mag_db = 20.0 * np.log10(np.maximum(mag, 1e-30))
     freqs = np.fft.rfftfreq(resolved_nfft, d=1.0 / resolved_sample_rate)
+    mag_db = 20.0 * np.log10(np.maximum(mag, 1e-30))
+    mag_db = mag_db + _fft_weighting_db(freqs, weighting)
     return freqs, mag_db
+
+
+def _fft_weighting_db(frequencies: np.ndarray, weighting: str) -> np.ndarray:
+    normalized = str(weighting or "Z").strip().upper()
+    if normalized == "A":
+        return a_weighting(frequencies)
+    if normalized == "C":
+        return c_weighting(frequencies)
+    return np.zeros_like(np.asarray(frequencies, dtype=np.float64))
 
 
 def _iter_fft_window_starts(signal_size: int, nfft: int):

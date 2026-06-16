@@ -54,6 +54,7 @@ class ChannelConfigTable(BaseModel):
     loudness_average_upper_enabled = BooleanField(default=False)
     loudness_average_upper_limit = FloatField(default=60.0)
     fft_x_axis_scale = TextField(default="linear")
+    fft_weighting = TextField(default="Z")
     fft_band_limits = TextField(default="[]")
     oct_weighting = TextField(default="A")
     oct_band_limits = TextField(default="[]")

@@ -355,7 +355,7 @@ def test_ensure_octave_wraps_derivation_failures_in_golden_reference_error(
         cache.ensure_octave(bundle, weighting="A")
 
 
-def test_cache_reuses_loaded_bundle_and_derived_fft_by_nfft_and_octave_once_per_channel(
+def test_cache_reuses_loaded_bundles_and_derived_metrics(
     tmp_path,
     monkeypatch,
 ):
@@ -371,11 +371,11 @@ def test_cache_reuses_loaded_bundle_and_derived_fft_by_nfft_and_octave_once_per_
         read_calls.append(str(path))
         return real_read(path)
 
-    fft_calls: list[tuple[float, int]] = []
+    fft_calls: list[tuple[float, int, str]] = []
     octave_calls: list[tuple[float, str]] = []
 
-    def fake_fft(signal, sample_rate, nfft):
-        fft_calls.append((float(sample_rate), int(nfft)))
+    def fake_fft(signal, sample_rate, nfft, weighting="Z"):
+        fft_calls.append((float(sample_rate), int(nfft), str(weighting)))
         axis = np.arange((int(nfft) // 2) + 1, dtype=np.float64)
         levels = np.full(axis.shape, 1.0, dtype=np.float64)
         return axis, levels
@@ -412,22 +412,27 @@ def test_cache_reuses_loaded_bundle_and_derived_fft_by_nfft_and_octave_once_per_
 
     assert bundle1 is bundle2
 
-    fft_ref_1 = cache.ensure_fft(bundle1, nfft=4096)
-    fft_ref_2 = cache.ensure_fft(bundle1, nfft=2048)
-    fft_ref_3 = cache.ensure_fft(bundle1, nfft=4096)
-    fft_ref_b = cache.ensure_fft(bundle_b, nfft=4096)
+    fft_ref_z = cache.ensure_fft(bundle1, nfft=4096, weighting="Z")
+    fft_ref_a = cache.ensure_fft(bundle1, nfft=4096, weighting="A")
+    fft_ref_z_again = cache.ensure_fft(bundle1, nfft=4096, weighting="Z")
+    fft_ref_2048 = cache.ensure_fft(bundle1, nfft=2048, weighting="Z")
+    fft_ref_b = cache.ensure_fft(bundle_b, nfft=8192, weighting="Z")
     octave_ref_1 = cache.ensure_octave(bundle1, weighting="A")
     octave_ref_2 = cache.ensure_octave(bundle1, weighting="A")
 
-    assert len(fft_ref_1[0]) == 2049
-    assert len(fft_ref_2[0]) == 1025
-    assert fft_ref_1[0] is fft_ref_3[0]
-    assert fft_ref_b[0] is not fft_ref_1[0]
+    assert len(fft_ref_z[0]) == 2049
+    assert len(fft_ref_2048[0]) == 1025
+    assert fft_ref_z[0] is fft_ref_z_again[0]
+    assert fft_ref_a[0] is not fft_ref_z[0]
+    assert fft_ref_b[0] is not fft_ref_z[0]
     assert octave_ref_1[0].tolist() == octave_ref_2[0].tolist()
     assert len(read_calls) == 2
+    assert fft_calls.count((48_000.0, 4096, "Z")) == 1
+    assert fft_calls.count((48_000.0, 4096, "A")) == 1
     assert fft_calls == [
-        (48_000.0, 4096),
-        (48_000.0, 2048),
-        (48_000.0, 4096),
+        (48_000.0, 4096, "Z"),
+        (48_000.0, 4096, "A"),
+        (48_000.0, 2048, "Z"),
+        (48_000.0, 8192, "Z"),
     ]
     assert octave_calls == [(48_000.0, "A")]

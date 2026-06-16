@@ -301,6 +301,7 @@ class StftModule(QWidget):
         super().__init__()
         self.services = services
         self.selected_display_channel_provider = None
+        self.strict_selected_display_channel = False
         self._factory_state = getattr(
             services.factory_mode, "state", FactoryControllerState()
         )
@@ -2205,8 +2206,13 @@ class StftModule(QWidget):
         provider = self.selected_display_channel_provider
         if callable(provider):
             provided_channel = provider()
-            if isinstance(provided_channel, int):
+            if isinstance(provided_channel, int) and (
+                not isinstance(provided_channel, bool)
+                or not self.strict_selected_display_channel
+            ):
                 selected_channel = provided_channel
+            if self.strict_selected_display_channel:
+                return selected_channel
 
         if selected_channel is not None:
             return selected_channel

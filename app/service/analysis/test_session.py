@@ -22,6 +22,11 @@ from app.service.analysis.judgment import JudgmentEngine, _runtime_channel_defau
 from app.service.analysis.live_display_dispatcher import LiveDisplayDispatcher
 from app.service.analysis.pipeline import AnalysisPipeline
 from app.service.analysis.selected_channels import project_selected_channels
+from app.service.result_dashboard_layout import (
+    CHANNEL_PRIMARY_ACOUSTIC,
+    PANEL_FAMILY_ACOUSTIC,
+    resolve_layout_channel,
+)
 from model.audio_data_table import AudioDataTable
 
 _TZ8 = timezone(timedelta(hours=8))
@@ -93,7 +98,7 @@ class TestSession:
         """Create one AnalysisPipeline per selected channel."""
         self.stop_live_display()
         selected = self._config.get("selected_channels", [])
-        self._live_loudness_channel_index = self._first_selected_channel(selected)
+        self._live_loudness_channel_index = self._default_live_loudness_channel(selected)
         channels_cfg = {ch["channel_index"]: ch for ch in self._config.get("channels", [])}
         self._pipelines = []
         for ch_idx in selected:
@@ -738,13 +743,24 @@ class TestSession:
             return text
         return None
 
-    @staticmethod
-    def _first_selected_channel(selected_channels) -> int | None:
-        for channel in selected_channels or ():
-            normalized = TestSession._as_non_bool_int(channel)
+    def _default_live_loudness_channel(self, selected_channels) -> int | None:
+        return resolve_layout_channel(
+            CHANNEL_PRIMARY_ACOUSTIC,
+            selected_channels=self._normalized_channel_indexes(selected_channels),
+            vibration_view_channel_index=self._as_non_bool_int(
+                self._config.get("vibration_view_channel_index")
+            ),
+            panel_family=PANEL_FAMILY_ACOUSTIC,
+        )
+
+    @classmethod
+    def _normalized_channel_indexes(cls, channels) -> list[int]:
+        normalized_channels = []
+        for channel in channels or ():
+            normalized = cls._as_non_bool_int(channel)
             if normalized is not None:
-                return normalized
-        return None
+                normalized_channels.append(normalized)
+        return normalized_channels
 
     @staticmethod
     def _as_non_bool_int(value) -> int | None:

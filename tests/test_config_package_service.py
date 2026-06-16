@@ -225,6 +225,25 @@ def _config_payload(
     }
 
 
+def _summary_layout(*, columns: int = 1) -> dict:
+    return {
+        "version": 1,
+        "columns": columns,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "summary",
+                "type": "result_summary",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "none",
+            }
+        ],
+    }
+
+
 def _channel_payload_with_golden(channel_index: int, **binding) -> dict:
     channel = _channel_payload(channel_index)
     if "label" in binding:
@@ -418,7 +437,10 @@ def _write_package(path: Path, entries: dict[str, object]) -> Path:
 
 
 def test_export_writes_manifest_and_single_config_payload(tmp_path: Path, services: SimpleNamespace):
-    config_id = _create_saved_config(services, name="Cfg1")
+    config_id = services.config_service.create_config("Cfg1")
+    saved_payload = _config_payload(config_id, config_name="Cfg1")
+    saved_payload["result_dashboard_layout"] = _summary_layout()
+    services.config_service.save_config(saved_payload)
     target = tmp_path / "export.dy"
 
     services.config_package_service.export_package(
@@ -439,6 +461,8 @@ def test_export_writes_manifest_and_single_config_payload(tmp_path: Path, servic
     assert isinstance(manifest["exported_at"], str)
     assert manifest["contents"]["config"] is True
     assert payload["config"]["config_name"] == "Cfg1"
+    assert payload["config"]["result_dashboard_layout"]["columns"] == 1
+    assert payload["config"]["result_dashboard_layout"]["panels"][0]["id"] == "summary"
     channel = payload["config"]["channels"][0]
     assert channel["spl_lower_enabled"] is False
     assert channel["spl_average_upper_limit"] == 85.0
@@ -1557,6 +1581,27 @@ def test_import_package_round_trips_vibration_view_channel(
 
     loaded = services.config_service.load_config(result.config_id)
     assert loaded["vibration_view_channel_index"] == 0
+
+
+def test_import_package_round_trips_result_dashboard_layout(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    imported_config = _config_payload(999, config_name="Imported")
+    imported_config["result_dashboard_layout"] = _summary_layout()
+    path = _write_package(
+        tmp_path / "dashboard-layout.dy",
+        _package_entries(config_payload=imported_config),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    loaded = services.config_service.load_config(result.config_id)
+    assert loaded["result_dashboard_layout"]["columns"] == 1
+    assert loaded["result_dashboard_layout"]["panels"][0]["id"] == "summary"
 
 
 def test_import_package_overwrite_rollback_preserves_old_golden_binding(

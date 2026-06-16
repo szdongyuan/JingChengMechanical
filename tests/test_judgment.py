@@ -128,6 +128,52 @@ def _stable_calibrator_signal(
     return amplitude * np.sin(2.0 * np.pi * freq_hz * times), sample_rate
 
 
+class TestJudgmentEngine:
+    def test_fft_judgment_passes_weighting_to_measured_and_golden_fft(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+        engine = JudgmentEngine(MagicMock(), golden_sample_service=service)
+        calls: list[str] = []
+
+        def fake_fft(signal, sample_rate, nfft, weighting="Z"):
+            calls.append(str(weighting))
+            return (
+                np.array([100.0, 200.0], dtype=np.float64),
+                np.array([50.0 + _REF_DB, 52.0 + _REF_DB], dtype=np.float64),
+            )
+
+        monkeypatch.setattr(dsp, "compute_fft_spectrum", fake_fft)
+        golden_path = _write_temp_wav(tmp_path / "managed" / "config_1" / "gold.wav")
+        config = _make_config(
+            input_device_samplerate=48_000.0,
+            channels=[
+                _make_channel_config(
+                    0,
+                    fft_weighting="A",
+                    fft_golden_mode="absolute",
+                    fft_band_limits=[
+                        {"freq": 100.0, "lower": -10.0, "upper": 10.0},
+                        {"freq": 200.0, "lower": -10.0, "upper": 10.0},
+                    ],
+                    **_golden_binding(golden_path),
+                )
+            ],
+        )
+
+        engine.judge(
+            config,
+            np.ones((int(48_000.0 * 3.0), 1)),
+            48_000.0,
+            mic_cal={},
+            audio_file_path="/tmp/a.wav",
+        )
+
+        assert calls == ["A", "A"]
+
+
 class TestLimitChecks:
     def _make_engine(self, *, golden_sample_service=None):
         mock_ai = MagicMock()
@@ -551,7 +597,7 @@ class TestLimitChecks:
             ]
         )
 
-        def fake_fft(signal, sample_rate, nfft):
+        def fake_fft(signal, sample_rate, nfft, weighting="Z"):
             return np.array([0.0, 100.0, 200.0, 300.0, 400.0]), np.array(
                 [
                     0.0 + _REF_DB,
@@ -592,7 +638,7 @@ class TestLimitChecks:
             ]
         )
 
-        def fake_fft(signal, sample_rate, nfft):
+        def fake_fft(signal, sample_rate, nfft, weighting="Z"):
             return np.array([50.0, 100.0, 200.0, 300.0, 400.0]), np.array(
                 [
                     90.0 + _REF_DB,
@@ -631,7 +677,7 @@ class TestLimitChecks:
             ]
         )
 
-        def fake_fft(signal, sample_rate, nfft):
+        def fake_fft(signal, sample_rate, nfft, weighting="Z"):
             return np.array([100.0, 200.0]), np.array([50.0 + _REF_DB, 50.0 + _REF_DB])
 
         monkeypatch.setattr(dsp, "compute_fft_spectrum", fake_fft)
@@ -665,7 +711,7 @@ class TestLimitChecks:
             ]
         )
 
-        def fake_fft(signal, sample_rate, nfft):
+        def fake_fft(signal, sample_rate, nfft, weighting="Z"):
             return np.array([100.0, 200.0, 300.0]), np.array(
                 [40.0 + _REF_DB, 57.0 + _REF_DB, 45.0 + _REF_DB]
             )
@@ -701,7 +747,7 @@ class TestLimitChecks:
             ]
         )
 
-        def fake_fft(signal, sample_rate, nfft):
+        def fake_fft(signal, sample_rate, nfft, weighting="Z"):
             return np.array([100.0, 200.0, 300.0]), np.array(
                 [45.0 + _REF_DB, 65.0 + _REF_DB, 60.0 + _REF_DB]
             )
@@ -748,7 +794,7 @@ class TestLimitChecks:
         monkeypatch.setattr(
             dsp,
             "compute_fft_spectrum",
-            lambda signal, sample_rate, nfft: (
+            lambda signal, sample_rate, nfft, weighting="Z": (
                 np.array([1000.0, 1500.0, 2000.0], dtype=np.float64),
                 np.array([40.0, 60.0, 40.0], dtype=np.float64) + _REF_DB,
             ),
@@ -794,7 +840,7 @@ class TestLimitChecks:
         monkeypatch.setattr(
             dsp,
             "compute_fft_spectrum",
-            lambda signal, sample_rate, nfft: (
+            lambda signal, sample_rate, nfft, weighting="Z": (
                 np.array([1000.0, 1500.0, 2000.0], dtype=np.float64),
                 np.array([50.0, 30.0, 50.0], dtype=np.float64) + _REF_DB,
             ),
@@ -842,7 +888,7 @@ class TestLimitChecks:
         monkeypatch.setattr(
             dsp,
             "compute_fft_spectrum",
-            lambda signal, sample_rate, nfft: (
+            lambda signal, sample_rate, nfft, weighting="Z": (
                 np.asarray([1500.0, 2000.0, 2500.0], dtype=np.float64),
                 np.asarray([90.0, 75.0, 75.0], dtype=np.float64) + _REF_DB,
             ),
@@ -883,7 +929,7 @@ class TestLimitChecks:
         monkeypatch.setattr(
             dsp,
             "compute_fft_spectrum",
-            lambda signal, sample_rate, nfft: (
+            lambda signal, sample_rate, nfft, weighting="Z": (
                 np.array([1000.0, 2000.0], dtype=np.float64),
                 np.array([40.0, 40.0], dtype=np.float64) + _REF_DB,
             ),
@@ -932,7 +978,7 @@ class TestLimitChecks:
             ],
         )
 
-        def fake_fft(signal, sample_rate, nfft):
+        def fake_fft(signal, sample_rate, nfft, weighting="Z"):
             if np.isclose(float(signal[0]), 0.25):
                 levels = [10.0, 16.0, 10.0]
             elif np.isclose(float(signal[0]), 0.5):
@@ -984,7 +1030,7 @@ class TestLimitChecks:
         monkeypatch.setattr(
             dsp,
             "compute_fft_spectrum",
-            lambda signal, sample_rate, nfft: (
+            lambda signal, sample_rate, nfft, weighting="Z": (
                 np.array([1000.0], dtype=np.float64),
                 np.array([11.0 + _REF_DB], dtype=np.float64),
             ),
@@ -1029,7 +1075,7 @@ class TestLimitChecks:
         monkeypatch.setattr(
             dsp,
             "compute_fft_spectrum",
-            lambda signal, sample_rate, nfft: (
+            lambda signal, sample_rate, nfft, weighting="Z": (
                 np.array([1000.0, 1500.0, 2000.0], dtype=np.float64),
                 np.array([15.0, 15.0, 15.0], dtype=np.float64) + _REF_DB,
             ),
@@ -1090,7 +1136,7 @@ class TestLimitChecks:
         monkeypatch.setattr(
             dsp,
             "compute_fft_spectrum",
-            lambda signal, sample_rate, nfft: (
+            lambda signal, sample_rate, nfft, weighting="Z": (
                 np.array([1000.0, 1500.0, 2000.0], dtype=np.float64),
                 np.array([11.0, 11.0, 11.0], dtype=np.float64) + _REF_DB,
             ),
@@ -1139,7 +1185,7 @@ class TestLimitChecks:
             ],
         )
 
-        def fake_fft(signal, sample_rate, nfft):
+        def fake_fft(signal, sample_rate, nfft, weighting="Z"):
             if np.isclose(float(signal[0]), 0.25):
                 levels = [10.0, 18.0, 10.0]
             elif np.isclose(float(signal[0]), 0.5):
@@ -1194,7 +1240,7 @@ class TestLimitChecks:
         )
         fft_calls: list[int] = []
 
-        def fake_fft(signal, sample_rate, nfft):
+        def fake_fft(signal, sample_rate, nfft, weighting="Z"):
             fft_calls.append(int(nfft))
             return np.array([1000.0, 1500.0, 2000.0], dtype=np.float64), np.array(
                 [11.0 + _REF_DB, 14.0 + _REF_DB, 11.0 + _REF_DB],
@@ -1244,7 +1290,7 @@ class TestLimitChecks:
             ],
         )
 
-        def fake_fft(signal, sample_rate, nfft):
+        def fake_fft(signal, sample_rate, nfft, weighting="Z"):
             if np.isclose(float(signal[0]), 0.25):
                 levels = [11.0, 13.0, 11.0]
             elif np.isclose(float(signal[0]), 0.5):
@@ -1307,7 +1353,7 @@ class TestLimitChecks:
         )
         fft_calls: list[dict[str, int | str]] = []
 
-        def fake_fft(signal, sample_rate, nfft):
+        def fake_fft(signal, sample_rate, nfft, weighting="Z"):
             if np.isclose(float(signal[0]), 0.25):
                 source = "measured"
                 level = 11.0
@@ -1361,7 +1407,7 @@ class TestLimitChecks:
         )
         fft_calls: list[int] = []
 
-        def raising_fft(signal, sample_rate, nfft):
+        def raising_fft(signal, sample_rate, nfft, weighting="Z"):
             fft_calls.append(int(nfft))
             raise ValueError("empty fft input")
 
@@ -1454,7 +1500,7 @@ class TestLimitChecks:
             ],
         )
 
-        def fake_fft(signal, sample_rate, nfft):
+        def fake_fft(signal, sample_rate, nfft, weighting="Z"):
             if np.isclose(float(signal[0]), 0.25):
                 levels = [7.0, 14.0, 7.0]
             elif np.isclose(float(signal[0]), 0.5):
@@ -2125,7 +2171,7 @@ class TestLimitChecks:
         monkeypatch.setattr(
             dsp,
             "compute_fft_spectrum",
-            lambda signal, sample_rate, nfft: (
+            lambda signal, sample_rate, nfft, weighting="Z": (
                 np.array([1000.0, 2000.0], dtype=np.float64),
                 np.array([11.0 + _REF_DB, 11.0 + _REF_DB], dtype=np.float64),
             ),
@@ -2185,7 +2231,7 @@ class TestLimitChecks:
             read_calls.append(str(path))
             return real_read(path)
 
-        def fake_fft(signal, sample_rate, nfft):
+        def fake_fft(signal, sample_rate, nfft, weighting="Z"):
             fft_calls.append(float(signal[0]))
             if np.isclose(float(signal[0]), 0.25):
                 levels = [7.0 + _REF_DB, 8.0 + _REF_DB]
