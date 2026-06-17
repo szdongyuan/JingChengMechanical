@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from app.services_container import FactoryControllerState, FactoryRuntimeConfigPayload
+from app.services_container import (
+    FactoryControllerState,
+    FactoryReviewPayload,
+    FactoryRuntimeConfigPayload,
+)
 from tests.test_stft_module._support import (
     _make_module,
     _make_stft_frame,
@@ -20,6 +24,19 @@ def _current_trace(values=(1.2, 1.4), times=(0.0, 1.0)):
     }
 
 
+def _review_chart_without_current_trace():
+    return {
+        0: {
+            "stft": {
+                "times_sec": [0.0, 1.0],
+                "frequencies_hz": [100.0, 200.0],
+                "magnitude_db": [[1.0, 2.0], [3.0, 4.0]],
+            },
+            "stft_score": {"score": 87.0},
+        }
+    }
+
+
 def test_stft_applies_live_current_trace_for_displayed_run(qapp):
     module, services = _make_module()
     module.selected_display_channel_provider = lambda: 0
@@ -32,6 +49,56 @@ def test_stft_applies_live_current_trace_for_displayed_run(qapp):
     payload = module.canvas.heatmap.current_trace_payload()
     assert payload is not None
     assert payload["values_a"] == [1.2, 1.6]
+
+
+def test_review_without_current_trace_falls_back_to_live_current_for_same_run(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(module, services, qapp, displayed_config_id=101, run_id="run-101")
+
+    services.bus.current_trace_updated.emit(101, "run-101", _current_trace((1.2, 1.6)))
+    qapp.processEvents()
+
+    assert module.canvas.heatmap.current_trace_payload()["values_a"] == [1.2, 1.6]
+
+    services.bus.factory_review_changed.emit(
+        FactoryReviewPayload(
+            displayed_config_id=101,
+            run_id="run-101",
+            chart_payload=_review_chart_without_current_trace(),
+        )
+    )
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
+    )
+    qapp.processEvents()
+
+    assert module.canvas.heatmap.current_trace_payload()["values_a"] == [1.2, 1.6]
+
+
+def test_review_current_trace_fallback_requires_same_run(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    _show(module, qapp)
+    _seed_stft_history(module, services, qapp, displayed_config_id=101, run_id="run-101")
+
+    services.bus.current_trace_updated.emit(101, "run-101", _current_trace((1.2, 1.6)))
+    qapp.processEvents()
+
+    services.bus.factory_review_changed.emit(
+        FactoryReviewPayload(
+            displayed_config_id=101,
+            run_id="run-102",
+            chart_payload=_review_chart_without_current_trace(),
+        )
+    )
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
+    )
+    qapp.processEvents()
+
+    assert module.canvas.heatmap.current_trace_payload() is None
 
 
 def test_stft_ignores_live_current_trace_for_other_config_or_run(qapp):

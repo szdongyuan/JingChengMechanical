@@ -140,6 +140,8 @@ class AiToolManagementModule(QWidget):
         detail_lay.setSpacing(10)
 
         form_host = QWidget()
+        form_host.setObjectName("ai_tool_management_form")
+        self._form_host = form_host
         form_lay = QFormLayout(form_host)
         form_lay.setContentsMargins(0, 0, 0, 0)
         form_lay.setHorizontalSpacing(10)
@@ -149,7 +151,6 @@ class AiToolManagementModule(QWidget):
         self.lb_toolchain_id_value.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        form_lay.addRow("内部标识", self.lb_toolchain_id_value)
 
         self.ed_display_name = QLineEdit()
         form_lay.addRow("显示名称", self.ed_display_name)

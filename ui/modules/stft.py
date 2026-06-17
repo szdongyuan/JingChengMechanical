@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.service.analysis.frames import StftFrame
+from app.service.current_meter_service import current_trace_display_at_time
 from app.services_container import FactoryControllerState, FactoryReviewPayload
 from ui.widgets.analysis_charts import StftImageChartWidget
 
@@ -278,7 +279,7 @@ class _HeatmapCanvas(QWidget):
     def __init__(self, owner: "StftModule"):
         super().__init__(owner)
         self._owner = owner
-        self.heatmap = StftImageChartWidget(self)
+        self.heatmap = StftImageChartWidget(self, hide_left_axis_label=True)
 
     def resizeEvent(self, event):
         self.heatmap.setGeometry(self.rect())
@@ -296,6 +297,7 @@ class StftModule(QWidget):
     _LIVE_FLUSH_INTERVAL_MS = 50
     _SCORE_TITLE_PLACEHOLDER = "得分：--"
     _MIN_MANUAL_SELECTION_DURATION_SEC = 0.1
+    _ANALYSIS_SELECT_BOTTOM_RESERVE_PX = 24
 
     def __init__(self, services):
         super().__init__()
@@ -320,6 +322,7 @@ class StftModule(QWidget):
         self._current_score_text = self._SCORE_TITLE_PLACEHOLDER
         self._score_times_sec: list[float] = []
         self._score_values: list[float] = []
+        self._score_time_lookup_sec: list[float | None] = []
         self._score_series_channel: int | None = None
         self._vibration_mode = False
         self._pinned_score_index: int | None = None
@@ -334,6 +337,7 @@ class StftModule(QWidget):
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
+        self._content_layout = lay
 
         self.canvas = _HeatmapCanvas(self)
         lay.addWidget(self.canvas, 1)
@@ -871,6 +875,7 @@ class StftModule(QWidget):
         self._live_current_trace_payload_by_run.clear()
         self._score_times_sec = []
         self._score_values = []
+        self._score_time_lookup_sec = []
         self._score_series_channel = None
         self._clear_score_inspection_state()
         self._clear_pending_live_flush()
@@ -931,6 +936,7 @@ class StftModule(QWidget):
             return
 
         self._live_current_trace_payload_by_run[key] = dict(current_trace)
+        self._refresh_score_overlay_after_current_trace_update()
 
         if (
             self._render_cache_key is not None
@@ -1174,21 +1180,20 @@ class StftModule(QWidget):
     ) -> None:
         self._current_trace_payload_by_channel.clear()
         chart_payload = getattr(review, "chart_payload", None)
-        if not isinstance(chart_payload, dict):
-            return
-
-        for channel_key, channel_payload in chart_payload.items():
-            try:
-                channel_index = int(channel_key)
-            except (TypeError, ValueError):
-                continue
-            if channel_index in self._current_trace_payload_by_channel:
-                continue
-            if not isinstance(channel_payload, dict):
-                continue
-            current_trace = channel_payload.get("current_trace")
-            if isinstance(current_trace, dict):
-                self._current_trace_payload_by_channel[channel_index] = current_trace
+        if isinstance(chart_payload, dict):
+            for channel_key, channel_payload in chart_payload.items():
+                try:
+                    channel_index = int(channel_key)
+                except (TypeError, ValueError):
+                    continue
+                if channel_index in self._current_trace_payload_by_channel:
+                    continue
+                if not isinstance(channel_payload, dict):
+                    continue
+                current_trace = channel_payload.get("current_trace")
+                if isinstance(current_trace, dict):
+                    self._current_trace_payload_by_channel[channel_index] = current_trace
+        self._refresh_score_overlay_after_current_trace_update()
 
     def _refresh_score_title(self) -> None:
         self._set_score_title(self._score_title_for_current_context())
@@ -1240,7 +1245,15 @@ class StftModule(QWidget):
         if channel_index is None:
             return None
         if self._review_payload_matches_score_context(self._review_payload):
-            return self._current_trace_payload_by_channel.get(channel_index)
+            current_trace = self._current_trace_payload_by_channel.get(channel_index)
+            if current_trace is not None:
+                return current_trace
+            return self._live_current_trace_payload_by_run.get(
+                (
+                    self._review_payload.displayed_config_id,
+                    self._review_payload.run_id,
+                )
+            )
         if self._factory_state.run_phase not in {"running", "analyzing"}:
             return None
         config_id = self._factory_state.displayed_config_id
@@ -1268,11 +1281,13 @@ class StftModule(QWidget):
             self._score_series_channel,
             tuple(self._score_times_sec),
             tuple(self._score_values),
+            tuple(self._score_time_lookup_sec),
         )
         selected_channel = self._selected_display_channel()
         self._score_series_channel = selected_channel
         self._score_times_sec = []
         self._score_values = []
+        self._score_time_lookup_sec = []
 
         if (
             selected_channel is not None
@@ -1281,12 +1296,17 @@ class StftModule(QWidget):
             score_payload = self._score_payload_by_channel.get(selected_channel)
             series = self._score_series_from_payload(score_payload)
             if series is not None:
-                self._score_times_sec, self._score_values = series
+                (
+                    self._score_times_sec,
+                    self._score_values,
+                    self._score_time_lookup_sec,
+                ) = series
 
         current_series = (
             self._score_series_channel,
             tuple(self._score_times_sec),
             tuple(self._score_values),
+            tuple(self._score_time_lookup_sec),
         )
         if current_series != previous_series:
             self._clear_score_inspection_state()
@@ -1294,29 +1314,43 @@ class StftModule(QWidget):
     def _score_series_from_payload(
         self,
         score_payload: dict | None,
-    ) -> tuple[list[float], list[float]] | None:
+    ) -> tuple[list[float], list[float], list[float | None]] | None:
         if not isinstance(score_payload, dict):
             return None
         if score_payload.get("enabled") is False:
             return None
 
         try:
-            times_sec = np.asarray(score_payload.get("times_sec"), dtype=float)
             scores = np.asarray(score_payload.get("scores"), dtype=float)
         except (TypeError, ValueError):
             return None
 
         if (
-            times_sec.ndim != 1
-            or scores.ndim != 1
-            or times_sec.size == 0
-            or times_sec.size != scores.size
-            or not np.all(np.isfinite(times_sec))
+            scores.ndim != 1
+            or scores.size == 0
             or not np.all(np.isfinite(scores))
         ):
             return None
 
-        return (times_sec.astype(float).tolist(), scores.astype(float).tolist())
+        score_values = scores.astype(float).tolist()
+        score_time_lookup: list[float | None] = [None] * len(score_values)
+        score_times: list[float] = []
+
+        try:
+            times_sec = np.asarray(score_payload.get("times_sec"), dtype=float)
+        except (TypeError, ValueError):
+            times_sec = None
+
+        if (
+            times_sec is not None
+            and times_sec.ndim == 1
+            and times_sec.size == scores.size
+            and np.all(np.isfinite(times_sec))
+        ):
+            score_times = times_sec.astype(float).tolist()
+            score_time_lookup = list(score_times)
+
+        return (score_times, score_values, score_time_lookup)
 
     def _nearest_score_index(self, time_sec: float) -> int | None:
         if not self._score_times_sec or not self._score_values:
@@ -1362,7 +1396,25 @@ class StftModule(QWidget):
         score = float(self._score_values[index])
         if not np.isfinite(score):
             return None
-        return f"得分：{score:.2f}"
+        current_text = None
+        if index < len(self._score_time_lookup_sec):
+            score_time = self._score_time_lookup_sec[index]
+            current_text = current_trace_display_at_time(
+                self._current_trace_for_channel(self._score_series_channel),
+                score_time,
+            )
+        return f"得分：{score:.2f}\n电流：{current_text or '--'}"
+
+    def _refresh_score_overlay_after_current_trace_update(self) -> None:
+        score_index = (
+            self._pinned_score_index
+            if self._pinned_score_index is not None
+            else self._hover_score_index
+        )
+        if score_index is None:
+            return
+        if 0 <= score_index < len(self._score_values):
+            self._update_score_overlay_label()
 
     def _show_hover_score_for_time(self, time_sec: float) -> None:
         if self._analysis_selection_mode:
@@ -1709,6 +1761,7 @@ class StftModule(QWidget):
         )
         self.analysis_select_button.setVisible(selection_tool_visible)
         self.analysis_select_button.setEnabled(selection_tool_enabled)
+        self._set_analysis_select_bottom_reserve(selection_tool_visible)
         if not selection_tool_visible and self._analysis_selection_mode:
             self._set_analysis_selection_mode(False, refresh_overlay=False)
         else:
@@ -1813,10 +1866,11 @@ class StftModule(QWidget):
 
         host = self._ensure_analysis_select_button_host()
         margin = 4
+        bottom_margin = 0
         spacing = 6
         size_hint = self.analysis_select_button.sizeHint()
         width = max(size_hint.width() + 28, 144)
-        height = max(size_hint.height(), 28)
+        height = max(size_hint.height(), 24)
         reset_button = getattr(
             getattr(self.canvas.heatmap, "chart_interactions", None),
             "reset_button",
@@ -1829,12 +1883,20 @@ class StftModule(QWidget):
         if reset_button is not None and reset_button.isVisible():
             x = module_offset_x + reset_button.x() + reset_button.width() + spacing
         if host is self:
-            y = self.height() - height - margin
+            y = self.height() - height - bottom_margin
         else:
-            y = host.height() - height - margin
+            y = host.height() - height - bottom_margin
         y = max(margin, y)
         self.analysis_select_button.setGeometry(x, y, width, height)
         self.analysis_select_button.raise_()
+
+    def _set_analysis_select_bottom_reserve(self, enabled: bool) -> None:
+        bottom = self._ANALYSIS_SELECT_BOTTOM_RESERVE_PX if enabled else 0
+        left, top, right, current_bottom = self._content_layout.getContentsMargins()
+        if current_bottom == bottom:
+            return
+        self._content_layout.setContentsMargins(left, top, right, bottom)
+        self._content_layout.activate()
 
     def _ensure_analysis_select_button_host(self) -> QWidget:
         host = self.parentWidget()

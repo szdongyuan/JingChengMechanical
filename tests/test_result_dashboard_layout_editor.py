@@ -606,14 +606,19 @@ def test_editor_add_and_remove_row_buttons_update_rows(qapp):
     remove_button = editor.findChild(QPushButton, "result_dashboard_remove_row_button")
     remove_row = editor.findChild(QSpinBox, "result_dashboard_remove_row_spin")
 
+    assert remove_row.minimum() == 1
+    assert remove_row.value() == 1
+
     add_button.click()
     qapp.processEvents()
     assert editor.layout_data()["rows"] == 2
+    assert remove_row.maximum() == 2
 
-    remove_row.setValue(1)
+    remove_row.setValue(2)
     remove_button.click()
     qapp.processEvents()
     assert editor.layout_data()["rows"] == 1
+    assert remove_row.maximum() == 1
 
 
 def test_editor_blocks_span_change_that_would_overlap(qapp):

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -22,6 +23,7 @@ class ControlModule(QWidget):
     _BUSY_START_READY_REASONS = frozenset(
         {_REVIEW_CLEANUP_BUSY_REASON, _PENDING_START_REASON}
     )
+    _BLOCKED_START_DIALOG_DELAY_MS = 180
 
     def __init__(self, services):
         super().__init__()
@@ -30,6 +32,13 @@ class ControlModule(QWidget):
         self._factory_state = getattr(services.factory_mode, "state", FactoryControllerState())
         self._blocked_start_dialog = None
         self._blocked_start_dialog_source: str | None = None
+        self._pending_blocked_start_reason: str | None = None
+        self._pending_blocked_start_source: str | None = None
+        self._blocked_start_dialog_timer = QTimer(self)
+        self._blocked_start_dialog_timer.setSingleShot(True)
+        self._blocked_start_dialog_timer.timeout.connect(
+            self._open_pending_blocked_start_dialog
+        )
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
@@ -93,6 +102,8 @@ class ControlModule(QWidget):
             return
         reason = reason.strip()
         if not reason:
+            return
+        if reason in self._BUSY_START_READY_REASONS:
             return
         self._show_or_update_blocked_start_dialog(reason, source="blocked_start")
 
@@ -223,6 +234,7 @@ class ControlModule(QWidget):
         return self._factory_state.start_ready_reason
 
     def _sync_blocked_start_dialog(self) -> None:
+        self._sync_pending_blocked_start_dialog()
         if self._blocked_start_dialog is None:
             return
         if self._blocked_start_dialog_source != "blocked_start":
@@ -234,6 +246,13 @@ class ControlModule(QWidget):
         self._update_blocked_start_dialog(reason)
 
     def _show_or_update_blocked_start_dialog(self, reason: str, *, source: str) -> None:
+        if source == "blocked_start" and self._blocked_start_dialog is None:
+            self._schedule_blocked_start_dialog(reason, source=source)
+            return
+        self._cancel_pending_blocked_start_dialog()
+        self._open_or_update_blocked_start_dialog(reason, source=source)
+
+    def _open_or_update_blocked_start_dialog(self, reason: str, *, source: str) -> None:
         self._blocked_start_dialog_source = source
         if self._blocked_start_dialog is None:
             dialog = self._create_blocked_start_dialog()
@@ -246,6 +265,34 @@ class ControlModule(QWidget):
                 open_dialog()
             return
         self._update_blocked_start_dialog(reason)
+
+    def _schedule_blocked_start_dialog(self, reason: str, *, source: str) -> None:
+        self._pending_blocked_start_reason = reason
+        self._pending_blocked_start_source = source
+        self._blocked_start_dialog_timer.start(self._BLOCKED_START_DIALOG_DELAY_MS)
+
+    def _sync_pending_blocked_start_dialog(self) -> None:
+        if self._pending_blocked_start_source != "blocked_start":
+            return
+        reason = self._current_idle_blocking_reason()
+        if not reason:
+            self._cancel_pending_blocked_start_dialog()
+            return
+        self._pending_blocked_start_reason = reason
+
+    def _cancel_pending_blocked_start_dialog(self) -> None:
+        self._blocked_start_dialog_timer.stop()
+        self._pending_blocked_start_reason = None
+        self._pending_blocked_start_source = None
+
+    def _open_pending_blocked_start_dialog(self) -> None:
+        reason = self._pending_blocked_start_reason
+        source = self._pending_blocked_start_source
+        self._pending_blocked_start_reason = None
+        self._pending_blocked_start_source = None
+        if not isinstance(reason, str) or not reason.strip():
+            return
+        self._open_or_update_blocked_start_dialog(reason, source=source or "blocked_start")
 
     def _create_blocked_start_dialog(self):
         return QMessageBox(self)
@@ -282,6 +329,7 @@ class ControlModule(QWidget):
             activate_window()
 
     def _close_blocked_start_dialog(self) -> None:
+        self._cancel_pending_blocked_start_dialog()
         dialog = self._blocked_start_dialog
         self._blocked_start_dialog = None
         self._blocked_start_dialog_source = None

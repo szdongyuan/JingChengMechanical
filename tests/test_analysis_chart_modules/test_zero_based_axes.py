@@ -202,6 +202,61 @@ def test_line_chart_widget_uses_zero_based_x_axis_without_horizontal_padding(qap
         widget.close()
 
 
+def test_chart_compact_display_mode_is_opt_in(qapp):
+    widget = LineChartWidget(hide_left_axis_label=True)
+
+    try:
+        _show_widget(widget, qapp)
+        normal_margins = tuple(widget.plot_item.layout.getContentsMargins())
+        normal_left_width = widget.plot_item.getAxis("left").width()
+        normal_bottom_height = widget.plot_item.getAxis("bottom").height()
+
+        assert widget.compact_display_mode_enabled() is False
+        widget.set_compact_display_mode(False)
+        assert tuple(widget.plot_item.layout.getContentsMargins()) == normal_margins
+        assert widget.plot_item.getAxis("left").width() == normal_left_width
+        assert widget.plot_item.getAxis("bottom").height() == normal_bottom_height
+
+        widget.set_compact_display_mode(True)
+        qapp.processEvents()
+
+        compact_margins = tuple(widget.plot_item.layout.getContentsMargins())
+        compact_left_width = widget.plot_item.getAxis("left").width()
+        compact_bottom_height = widget.plot_item.getAxis("bottom").height()
+
+        assert widget.compact_display_mode_enabled() is True
+        assert max(compact_margins) <= 2
+        assert compact_left_width <= 30
+        assert 28 <= compact_bottom_height <= 32
+
+        widget.set_compact_display_mode(False)
+        qapp.processEvents()
+
+        assert widget.compact_display_mode_enabled() is False
+        assert tuple(widget.plot_item.layout.getContentsMargins()) == normal_margins
+        assert widget.plot_item.getAxis("left").fixedWidth is None
+        assert widget.plot_item.getAxis("bottom").fixedHeight is None
+    finally:
+        widget.close()
+
+
+def test_stft_compact_display_mode_keeps_frequency_ticks_readable(qapp):
+    widget = StftImageChartWidget(hide_left_axis_label=True)
+
+    try:
+        _show_widget(widget, qapp)
+        widget.set_compact_display_mode(True)
+        qapp.processEvents()
+
+        left_axis = widget.plot_item.getAxis("left")
+        assert widget.compact_display_mode_enabled() is True
+        assert left_axis.labelText == ""
+        assert left_axis.style.get("showValues") is True
+        assert left_axis.width() >= 44
+    finally:
+        widget.close()
+
+
 def test_line_chart_widget_uses_explicit_x_axis_range_without_padding(qapp):
     widget = LineChartWidget()
 

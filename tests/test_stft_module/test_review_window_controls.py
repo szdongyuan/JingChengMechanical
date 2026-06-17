@@ -54,7 +54,14 @@ def test_review_success_hides_analysis_box_until_selection_mode(qapp):
         module.height()
         - module.analysis_select_button.geometry().bottom()
         - 1
-    ) == 4
+    ) == 0
+    assert module._content_layout.getContentsMargins()[3] == (
+        module._ANALYSIS_SELECT_BOTTOM_RESERVE_PX
+    )
+    assert (
+        module.analysis_select_button.y()
+        - module.canvas.geometry().bottom()
+    ) >= 0
 
     module.move_selection_to_start(2.25)
 
@@ -104,8 +111,11 @@ def test_review_selection_button_uses_card_bottom_padding_when_embedded(qapp):
     assert button.isVisible() is True
     assert button.parentWidget() is card
     assert button.height() >= button.sizeHint().height()
-    assert button.geometry().bottom() == card.height() - 5
+    assert button.geometry().bottom() == card.height() - 1
     assert button.geometry().bottom() > module.geometry().bottom()
+    assert module._content_layout.getContentsMargins()[3] == (
+        module._ANALYSIS_SELECT_BOTTOM_RESERVE_PX
+    )
     assert module.analysis_select_button.text() == "框选分析"
 
 

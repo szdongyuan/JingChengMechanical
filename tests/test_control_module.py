@@ -630,6 +630,7 @@ def test_blocked_start_signal_opens_and_updates_single_modal(qapp, monkeypatch):
     services.bus.factory_start_blocked.emit(
         FactoryStartBlockedPayload(reason="配置已失效", trigger_source="manual")
     )
+    module._open_pending_blocked_start_dialog()
     services.bus.factory_state_changed.emit(_idle_blocked_state("配置加载失败"))
     services.bus.factory_start_blocked.emit(
         FactoryStartBlockedPayload(reason="配置加载失败", trigger_source="plc")
@@ -639,6 +640,76 @@ def test_blocked_start_signal_opens_and_updates_single_modal(qapp, monkeypatch):
     assert recorder.latest_text == "配置加载失败"
     assert recorder.latest_title == "自动开始已阻止"
     assert hasattr(module, "lbl_start_reason") is False
+
+
+@pytest.mark.parametrize("reason", ["当前测试运行中", "启动请求处理中"])
+def test_busy_blocked_start_reasons_do_not_open_modal(qapp, monkeypatch, reason):
+    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
+
+    services.bus.factory_start_blocked.emit(
+        FactoryStartBlockedPayload(reason=reason, trigger_source="manual")
+    )
+
+    assert recorder.open_count == 0
+    assert recorder.latest_text == ""
+    assert module._blocked_start_dialog is None
+
+
+@pytest.mark.parametrize("reason", ["当前测试运行中", "启动请求处理中"])
+def test_busy_blocked_start_reason_does_not_replace_existing_failure_modal(
+    qapp,
+    monkeypatch,
+    reason,
+):
+    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
+
+    services.bus.factory_start_blocked.emit(
+        FactoryStartBlockedPayload(reason="配置加载失败", trigger_source="manual")
+    )
+    module._open_pending_blocked_start_dialog()
+    services.bus.factory_start_blocked.emit(
+        FactoryStartBlockedPayload(reason=reason, trigger_source="manual")
+    )
+
+    assert recorder.open_count == 1
+    assert recorder.latest_text == "配置加载失败"
+    assert module._blocked_start_dialog is not None
+
+
+@pytest.mark.parametrize(
+    "next_state",
+    [
+        _ready_state(),
+        FactoryControllerState(
+            selected_config_ids=(101,),
+            run_phase="armed",
+            selection_ready=True,
+            start_ready=False,
+            start_ready_reason="启动请求处理中",
+        ),
+        FactoryControllerState(selected_config_ids=(101,), run_phase="running"),
+    ],
+)
+def test_transient_blocked_start_cleared_before_delay_does_not_open_modal(
+    qapp,
+    monkeypatch,
+    next_state,
+):
+    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
+
+    services.bus.factory_state_changed.emit(_idle_blocked_state("配置加载失败"))
+    services.bus.factory_start_blocked.emit(
+        FactoryStartBlockedPayload(reason="配置加载失败", trigger_source="manual")
+    )
+
+    assert recorder.open_count == 0
+    assert module._pending_blocked_start_reason == "配置加载失败"
+
+    services.bus.factory_state_changed.emit(next_state)
+    module._open_pending_blocked_start_dialog()
+
+    assert recorder.open_count == 0
+    assert module._blocked_start_dialog is None
 
 
 def test_blocked_start_signal_does_not_require_inline_reason_without_state_change(
@@ -658,6 +729,7 @@ def test_blocked_start_signal_does_not_require_inline_reason_without_state_chang
     services.bus.factory_start_blocked.emit(
         FactoryStartBlockedPayload(reason="请至少启用一个配置", trigger_source="manual")
     )
+    module._open_pending_blocked_start_dialog()
 
     assert recorder.open_count == 1
     assert recorder.latest_text == "请至少启用一个配置"
@@ -670,6 +742,7 @@ def test_blocked_modal_closes_after_reason_clears(qapp, monkeypatch):
     services.bus.factory_start_blocked.emit(
         FactoryStartBlockedPayload(reason="配置已失效", trigger_source="manual")
     )
+    module._open_pending_blocked_start_dialog()
     services.bus.factory_state_changed.emit(
         FactoryControllerState(
             selected_config_ids=(101,),
@@ -693,6 +766,7 @@ def test_open_blocked_modal_updates_when_background_state_refresh_changes_reason
     services.bus.factory_start_blocked.emit(
         FactoryStartBlockedPayload(reason="配置已失效", trigger_source="manual")
     )
+    module._open_pending_blocked_start_dialog()
     services.bus.factory_state_changed.emit(_idle_blocked_state("配置加载失败"))
 
     assert recorder.open_count == 1
@@ -707,6 +781,7 @@ def test_blocked_external_trigger_signal_uses_same_modal_flow(qapp, monkeypatch,
     services.bus.factory_start_blocked.emit(
         FactoryStartBlockedPayload(reason="配置加载失败", trigger_source=trigger_source)
     )
+    module._open_pending_blocked_start_dialog()
 
     assert recorder.open_count == 1
     assert recorder.latest_text == "配置加载失败"
@@ -773,6 +848,7 @@ def test_runtime_abort_replaces_blocked_start_dialog_and_disables_ready_state_au
     services.bus.factory_start_blocked.emit(
         FactoryStartBlockedPayload(reason="配置加载失败", trigger_source="manual")
     )
+    module._open_pending_blocked_start_dialog()
     services.bus.factory_runtime_aborted.emit(_runtime_abort_payload("Device lost"))
     services.bus.factory_state_changed.emit(_ready_state())
 

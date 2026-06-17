@@ -29,6 +29,10 @@ def test_default_layout_matches_spec():
         "vibration_frequency_stability",
         "vibration_pulse",
     ]
+    assert PANEL_TITLES["stft"] == "时频图（频率Hz，幅值dB）"
+    assert PANEL_TITLES["spectrum"] == "频谱（dB）"
+    assert PANEL_TITLES["octave"] == "倍频程（dB）"
+    assert PANEL_TITLES["spl"] == "声压级（dB）"
     assert PANEL_TITLES["vibration_stft"] == "时频图（振动）"
 
 

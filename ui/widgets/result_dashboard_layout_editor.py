@@ -427,13 +427,13 @@ class ResultDashboardLayoutEditor(QWidget):
         toolbar.addWidget(QLabel("删除行"))
         self.remove_row_spin = QSpinBox()
         self.remove_row_spin.setObjectName("result_dashboard_remove_row_spin")
-        self.remove_row_spin.setRange(0, 0)
+        self.remove_row_spin.setRange(1, 1)
         toolbar.addWidget(self.remove_row_spin)
 
         self.remove_row_button = QPushButton("删除行")
         self.remove_row_button.setObjectName("result_dashboard_remove_row_button")
         self.remove_row_button.clicked.connect(
-            lambda _checked=False: self.remove_row(self.remove_row_spin.value())
+            lambda _checked=False: self.remove_row(self.remove_row_spin.value() - 1)
         )
         toolbar.addWidget(self.remove_row_button)
         toolbar.addStretch(1)
@@ -500,7 +500,7 @@ class ResultDashboardLayoutEditor(QWidget):
         self._updating_controls = True
         try:
             self._set_combo_data(self.column_count_combo, self._layout["columns"])
-            self.remove_row_spin.setMaximum(max(0, self._layout["rows"] - 1))
+            self.remove_row_spin.setRange(1, max(1, self._layout["rows"]))
             self.remove_row_spin.setEnabled(self._layout["rows"] > MIN_ROWS)
             self.remove_row_button.setEnabled(self._layout["rows"] > MIN_ROWS)
             self._refresh_panel_list()
