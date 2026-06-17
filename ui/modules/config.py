@@ -2760,29 +2760,29 @@ class ConfigModule(QWidget):
 
     @classmethod
     def _plc_limit_values_from_config(cls, config_data: dict) -> dict:
-        channel = cls._plc_limit_channel(config_data)
+        acoustic_channel = cls._plc_acoustic_limit_channel(config_data)
         product_model = config_data.get("product_model") or config_data.get("config_name")
         if product_model in (None, ""):
             product_model = "-1.0"
         return {
             "res_product_model_offset": str(product_model),
             "res_spl_limit_up_offset": cls._plc_real_limit(
-                channel,
+                acoustic_channel,
                 "spl_upper_enabled",
                 "spl_upper_limit",
             ),
             "res_spl_limit_down_offset": cls._plc_real_limit(
-                channel,
+                acoustic_channel,
                 "spl_lower_enabled",
                 "spl_lower_limit",
             ),
             "res_loudness_limit_up_offset": cls._plc_real_limit(
-                channel,
+                acoustic_channel,
                 "loudness_upper_enabled",
                 "loudness_upper_limit",
             ),
             "res_loudness_limit_down_offset": cls._plc_real_limit(
-                channel,
+                acoustic_channel,
                 "loudness_lower_enabled",
                 "loudness_lower_limit",
             ),
@@ -2792,23 +2792,23 @@ class ConfigModule(QWidget):
         }
 
     @staticmethod
-    def _plc_limit_channel(config_data: dict) -> dict:
+    def _plc_acoustic_limit_channel(config_data: dict) -> dict:
         channels = config_data.get("channels")
         if not isinstance(channels, list):
             return {}
         selected_channels = config_data.get("selected_channels")
         if not isinstance(selected_channels, (list, tuple)):
             selected_channels = ()
+        vibration_channel = config_data.get("vibration_view_channel_index")
         for selected_index in selected_channels:
+            if selected_index == vibration_channel:
+                continue
             for channel in channels:
                 if (
                     isinstance(channel, dict)
                     and channel.get("channel_index") == selected_index
                 ):
                     return channel
-        for channel in channels:
-            if isinstance(channel, dict):
-                return channel
         return {}
 
     @staticmethod
