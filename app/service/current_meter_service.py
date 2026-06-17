@@ -176,6 +176,47 @@ def build_current_trace_payload(
     return payload
 
 
+def current_trace_display_at_time(current_trace: dict | None, time_sec) -> str | None:
+    value = current_trace_value_at_time(current_trace, time_sec)
+    if value is None:
+        return None
+    unit = ""
+    if isinstance(current_trace, dict):
+        unit = str(current_trace.get("unit") or "").strip()
+    text = f"{value:.3f}"
+    return f"{text} {unit}" if unit else text
+
+
+def current_trace_value_at_time(current_trace: dict | None, time_sec) -> float | None:
+    if not isinstance(current_trace, dict):
+        return None
+    try:
+        target_time = float(time_sec)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(target_time):
+        return None
+
+    pairs = _normalize_current_trace_pairs(current_trace)
+    if not pairs:
+        return None
+
+    for sample_time, value in pairs:
+        if target_time == sample_time:
+            return value
+
+    first_time = pairs[0][0]
+    last_time = pairs[-1][0]
+    if target_time < first_time or target_time > last_time or len(pairs) == 1:
+        return None
+
+    for (left_time, left_value), (right_time, right_value) in zip(pairs, pairs[1:]):
+        if left_time <= target_time <= right_time:
+            fraction = (target_time - left_time) / (right_time - left_time)
+            return left_value + (right_value - left_value) * fraction
+    return None
+
+
 class CurrentMeterCollector:
     def __init__(
         self,
@@ -379,6 +420,30 @@ def _normalize_samples(samples: Iterable[CurrentSample | dict]) -> list[CurrentS
             normalized.append(CurrentSample(time_value, current_value))
     normalized.sort(key=lambda item: item.time_sec)
     return normalized
+
+
+def _normalize_current_trace_pairs(current_trace: dict) -> list[tuple[float, float]]:
+    times = current_trace.get("times_sec")
+    values = current_trace.get("values_a")
+    if not isinstance(times, Iterable) or isinstance(times, (str, bytes)):
+        return []
+    if not isinstance(values, Iterable) or isinstance(values, (str, bytes)):
+        return []
+
+    pairs_by_time: dict[float, float] = {}
+    for time_sec, current_a in zip(times, values):
+        try:
+            time_value = float(time_sec)
+            current_value = float(current_a)
+        except (TypeError, ValueError):
+            continue
+        if (
+            math.isfinite(time_value)
+            and math.isfinite(current_value)
+            and time_value not in pairs_by_time
+        ):
+            pairs_by_time[time_value] = current_value
+    return sorted(pairs_by_time.items())
 
 
 def _int_or_default(value, default: int, *, minimum: int, maximum: int) -> int:

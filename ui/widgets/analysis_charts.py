@@ -463,6 +463,44 @@ class _BasePlotChart(QWidget):
         self._apply_x_axis_policy(payload_values=None)
         if self._hide_left_axis_label:
             self.apply_left_axis_label_hidden_style()
+        self._compact_display_mode = False
+        self._default_plot_layout_margins = tuple(
+            self.plot_item.layout.getContentsMargins()
+        )
+        self._default_left_axis_fixed_width = getattr(
+            self.plot_item.getAxis("left"),
+            "fixedWidth",
+            None,
+        )
+        self._default_bottom_axis_fixed_height = getattr(
+            self.plot_item.getAxis("bottom"),
+            "fixedHeight",
+            None,
+        )
+
+    def set_compact_display_mode(self, enabled: bool = True) -> None:
+        enabled = bool(enabled)
+        if self._compact_display_mode == enabled:
+            return
+
+        self._compact_display_mode = enabled
+        left_axis = self.plot_item.getAxis("left")
+        bottom_axis = self.plot_item.getAxis("bottom")
+        if enabled:
+            self.plot_item.layout.setContentsMargins(2, 2, 2, 2)
+            left_axis.setWidth(self._compact_left_axis_width())
+            bottom_axis.setHeight(30)
+            return
+
+        self.plot_item.layout.setContentsMargins(*self._default_plot_layout_margins)
+        left_axis.setWidth(self._default_left_axis_fixed_width)
+        bottom_axis.setHeight(self._default_bottom_axis_fixed_height)
+
+    def compact_display_mode_enabled(self) -> bool:
+        return self._compact_display_mode
+
+    def _compact_left_axis_width(self) -> int:
+        return 30
 
     def apply_left_axis_label_hidden_style(self) -> None:
         left_axis = self.plot_item.getAxis("left")
@@ -517,6 +555,8 @@ class _BasePlotChart(QWidget):
 
 
 class StftImageChartWidget(_BasePlotChart):
+    _COMPACT_LEFT_AXIS_WIDTH = 46
+
     hover_time_changed = pyqtSignal(float)
     left_time_clicked = pyqtSignal(float)
     right_clicked = pyqtSignal()
@@ -556,7 +596,7 @@ class StftImageChartWidget(_BasePlotChart):
         self._current_view_box.setMouseEnabled(x=False, y=False)
         self._current_view_box.setZValue(10)
         self._current_curve_item = _ViewBoxClippedPlotCurveItem(
-            pen=pg.mkPen(color="#f59e0b", width=2),
+            pen=pg.mkPen(color="#ff2d95", width=1.5),
         )
         self._current_curve_item.setZValue(10)
         self.plot_item.scene().addItem(self._current_view_box)
@@ -579,6 +619,9 @@ class StftImageChartWidget(_BasePlotChart):
             pass_through_right_clicks=True,
             context_menu_actions=("reset_view", "save_png", "copy_image"),
         )
+
+    def _compact_left_axis_width(self) -> int:
+        return self._COMPACT_LEFT_AXIS_WIDTH
 
     def eventFilter(self, watched, event):
         if watched is self.plot_widget.viewport():

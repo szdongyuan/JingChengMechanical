@@ -30,7 +30,7 @@ _DISPLAY_LABEL_MAP = {
     "平均Loudness": "响度（平均）",
     "FFT": "频谱",
     "Octave": "倍频程",
-    "频谱平均评分": "频谱平均评分",
+    "频谱平均评分": "频谱最低得分",
 }
 _RESULT_LABEL_MAP = {
     "PASS": "通过",
@@ -50,9 +50,7 @@ class ResultModule(QWidget):
         ("spl_average", "声压级（平均）"),
         ("loudness", _LOUDNESS_PEAK_LABEL),
         ("loudness_average", "响度（平均）"),
-        ("fft", "频谱"),
-        ("octave", "倍频程"),
-        ("stft_score", "频谱平均评分"),
+        ("stft_score", "频谱最低得分"),
         ("ai", "AI分析"),
     )
     _ROW_LABELS = tuple(label for _item_key, label in _ROW_DEFS)
@@ -83,20 +81,20 @@ class ResultModule(QWidget):
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(8)
+        lay.setSpacing(3)
 
         top = QWidget()
         top.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         top_lay = QHBoxLayout(top)
         top_lay.setContentsMargins(0, 0, 0, 0)
-        top_lay.setSpacing(8)
+        top_lay.setSpacing(4)
         top_lay.addWidget(QLabel("总结果："))
 
         self.lb_overall = QLabel("-")
         self.lb_overall.setObjectName("ResultBadge")
         self.lb_overall.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lb_overall.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.lb_overall.setMinimumHeight(36)
+        self.lb_overall.setMinimumHeight(28)
         self.lb_overall.setMinimumWidth(180)
         self.lb_overall.setProperty("resultLevel", "unknown")
         top_lay.addStretch(1)
@@ -106,7 +104,7 @@ class ResultModule(QWidget):
         metrics = QWidget()
         metrics_lay = QHBoxLayout(metrics)
         metrics_lay.setContentsMargins(0, 0, 0, 0)
-        metrics_lay.setSpacing(8)
+        metrics_lay.setSpacing(4)
 
         spl_metric = self._create_metric_badge(_SPL_PEAK_LABEL, "--")
         self.lb_spl_metric_label = spl_metric["label"]
@@ -143,7 +141,7 @@ class ResultModule(QWidget):
 
         self.table = QTableWidget(len(self._ROW_LABELS), 4)
         self.table.setObjectName("ResultSummaryTable")
-        self.table.setHorizontalHeaderLabels(["项目", "实测值", "通道", "结果"])
+        self.table.setHorizontalHeaderLabels(["项目", "实测值", "电流", "结果"])
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
@@ -154,9 +152,15 @@ class ResultModule(QWidget):
         self.table.setColumnWidth(1, 110)
         self.table.setColumnWidth(2, 80)
         self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setFixedHeight(22)
+        self.table.verticalHeader().setDefaultSectionSize(22)
+        for row in range(self.table.rowCount()):
+            self.table.setRowHeight(row, 22)
         self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.table.setFixedHeight(
-            self.table.horizontalHeader().height() + self.table.rowHeight(0) * len(self._ROW_LABELS) + 18
+            self.table.horizontalHeader().height()
+            + self.table.rowHeight(0) * len(self._ROW_LABELS)
+            + 6
         )
         lay.addWidget(self.table)
         lay.addStretch(1)
@@ -189,10 +193,10 @@ class ResultModule(QWidget):
         badge = QWidget()
         badge.setObjectName("ResultMetricBadge")
         badge.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        badge.setMinimumHeight(58)
+        badge.setMinimumHeight(40)
 
         lay = QVBoxLayout(badge)
-        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setContentsMargins(8, 3, 8, 3)
         lay.setSpacing(2)
 
         label = QLabel(label_text)
@@ -271,8 +275,16 @@ class ResultModule(QWidget):
 
     def _render_summary(self, summary_payload: dict) -> None:
         overall_status = summary_payload.get("overall_status")
+        rows = summary_payload.get("rows")
+        if not isinstance(rows, list):
+            rows = []
         overall_label = self._display_result_label(
             self._text_or_default(summary_payload.get("overall_label"), "-")
+        )
+        overall_label = self._overall_label_with_failure_type(
+            overall_label,
+            overall_status=overall_status,
+            rows=rows,
         )
         badge_level = {
             "pass": "pass",
@@ -292,9 +304,6 @@ class ResultModule(QWidget):
             )
         self._set_error_message(error_message)
 
-        rows = summary_payload.get("rows")
-        if not isinstance(rows, list):
-            rows = []
         rows_by_key = {
             row_payload.get("item_key"): row_payload
             for row_payload in rows
@@ -317,17 +326,46 @@ class ResultModule(QWidget):
                     else {}
                 )
             status = self._display_result_label(
-                self._text_or_default(row_payload.get("status"), "-")
+                self._text_or_default(
+                    row_payload.get("result_display", row_payload.get("status")),
+                    "-",
+                )
             )
             self._set_row(
                 row_index,
                 self._display_label(row_payload.get("label"), default_label),
                 self._summary_value_display(row_payload),
-                self._display_channel(row_payload.get("channel_label"), "-"),
+                self._display_current(row_payload.get("channel_label"), "-"),
                 status,
                 result_foreground=self._summary_result_foreground(row_payload, status),
             )
         self._refresh_metric_display()
+
+    @classmethod
+    def _overall_label_with_failure_type(
+        cls,
+        overall_label: str | None,
+        *,
+        overall_status,
+        rows: list,
+    ) -> str | None:
+        if overall_status != "fail":
+            return overall_label
+        failure_label = cls._ai_failure_label(rows)
+        if not failure_label:
+            return overall_label
+        base_label = overall_label or "不通过"
+        return f"{base_label}（{failure_label}）"
+
+    @staticmethod
+    def _ai_failure_label(rows: list) -> str | None:
+        for row in rows:
+            if not isinstance(row, dict) or row.get("item_key") != "ai":
+                continue
+            label = row.get("failure_label")
+            if isinstance(label, str) and label.strip():
+                return label.strip()
+        return None
 
     def _import_warning_message(self) -> str | None:
         warnings = getattr(self._review_payload, "import_warnings", ()) or ()
@@ -869,11 +907,10 @@ class ResultModule(QWidget):
         return _RESULT_LABEL_MAP.get(value, value)
 
     @staticmethod
-    def _display_channel(value, default: str | None) -> str | None:
+    def _display_current(value, default: str | None) -> str | None:
         text = ResultModule._text_or_default(value, default)
         if text is None:
             return None
-        match = _CHANNEL_LABEL_RE.fullmatch(text.strip())
-        if match:
-            return f"通道{match.group(1)}"
+        if _CHANNEL_LABEL_RE.fullmatch(text.strip()):
+            return default
         return text

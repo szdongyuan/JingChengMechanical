@@ -99,8 +99,8 @@ class _StubModule(QWidget):
         self.services = services
 
 
-def _make_guarded_ai_tool_management_module(confirm_leave_result: bool):
-    class _GuardedAiToolManagementModule(_StubModule):
+def _make_guarded_module(confirm_leave_result: bool):
+    class _GuardedModule(_StubModule):
         def __init__(self, services=None):
             super().__init__(services)
             self.confirm_leave_calls = 0
@@ -109,7 +109,11 @@ def _make_guarded_ai_tool_management_module(confirm_leave_result: bool):
             self.confirm_leave_calls += 1
             return confirm_leave_result
 
-    return _GuardedAiToolManagementModule
+    return _GuardedModule
+
+
+def _make_guarded_ai_tool_management_module(confirm_leave_result: bool):
+    return _make_guarded_module(confirm_leave_result)
 
 
 class _ChannelProbeModule(_StubModule):
@@ -307,9 +311,17 @@ def _make_window(
     initial_state: FactoryControllerState | None = None,
     initial_review_payload: FactoryReviewPayload | None = None,
     use_real_control: bool = False,
+    config_cls: type[QWidget] | None = None,
     ai_tool_management_cls: type[QWidget] | None = None,
 ):
     _patch_non_target_modules(monkeypatch, use_real_control=use_real_control)
+    if config_cls is not None:
+        monkeypatch.setattr(
+            main_window_mod,
+            "ConfigModule",
+            config_cls,
+            raising=False,
+        )
     if ai_tool_management_cls is not None:
         monkeypatch.setattr(
             main_window_mod,
@@ -352,8 +364,8 @@ def test_main_window_includes_ai_tool_management_tab_in_topbar(qapp, monkeypatch
     window, _ = _make_window(monkeypatch)
     _show(window, qapp)
 
-    assert window.tab_names == ["测试", "数据管理", "配置", "AI工具管理", "硬件"]
-    assert list(window.top_button_dict) == ["测试", "数据管理", "配置", "AI工具管理", "硬件"]
+    assert window.tab_names == ["测试", "数据管理", "配置", "AI管理", "硬件"]
+    assert list(window.top_button_dict) == ["测试", "数据管理", "配置", "AI管理", "硬件"]
 
 
 def test_engineer_role_can_access_ai_tool_management_tab(qapp, monkeypatch):
@@ -363,7 +375,7 @@ def test_engineer_role_can_access_ai_tool_management_tab(qapp, monkeypatch):
     window.current_user_role = "工程师"
     window.set_role()
 
-    assert window.top_button_dict["AI工具管理"].isEnabled() is True
+    assert window.top_button_dict["AI管理"].isEnabled() is True
 
 
 def test_admin_role_can_access_ai_tool_management_tab(qapp, monkeypatch):
@@ -373,7 +385,7 @@ def test_admin_role_can_access_ai_tool_management_tab(qapp, monkeypatch):
     window.current_user_role = "管理员"
     window.set_role()
 
-    assert window.top_button_dict["AI工具管理"].isEnabled() is True
+    assert window.top_button_dict["AI管理"].isEnabled() is True
 
 
 def test_operator_role_cannot_access_ai_tool_management_tab(qapp, monkeypatch):
@@ -383,7 +395,7 @@ def test_operator_role_cannot_access_ai_tool_management_tab(qapp, monkeypatch):
     window.current_user_role = "操作员"
     window.set_role()
 
-    assert window.top_button_dict["AI工具管理"].isEnabled() is False
+    assert window.top_button_dict["AI管理"].isEnabled() is False
 
 
 def test_no_role_programmatic_page_reentry_remains_allowed(qapp, monkeypatch):
@@ -413,14 +425,14 @@ def test_operator_cannot_activate_ai_tool_management_via_programmatic_tab_change
     window.current_user_role = "操作员"
     window.set_role()
 
-    ai_index = window.tab_names.index("AI工具管理")
+    ai_index = window.tab_names.index("AI管理")
 
     window.tab.setCurrentIndex(ai_index)
     qapp.processEvents()
 
     assert window.tab.currentIndex() == 0
     assert window.top_button_dict["测试"].isChecked() is True
-    assert window.top_button_dict["AI工具管理"].isChecked() is False
+    assert window.top_button_dict["AI管理"].isChecked() is False
 
 
 def test_switching_away_from_ai_tool_management_is_blocked_when_confirm_leave_rejects(
@@ -436,8 +448,8 @@ def test_switching_away_from_ai_tool_management_is_blocked_when_confirm_leave_re
     window.current_user_role = "管理员"
     window.set_role()
 
-    ai_index = window.tab_names.index("AI工具管理")
-    window.top_button_dict["AI工具管理"].click()
+    ai_index = window.tab_names.index("AI管理")
+    window.top_button_dict["AI管理"].click()
     qapp.processEvents()
 
     assert window.tab.currentIndex() == ai_index
@@ -462,10 +474,10 @@ def test_programmatic_tab_change_reverts_when_ai_tool_management_rejects_leave(
     window.current_user_role = "管理员"
     window.set_role()
 
-    ai_index = window.tab_names.index("AI工具管理")
+    ai_index = window.tab_names.index("AI管理")
     hardware_index = window.tab_names.index("硬件")
 
-    window.top_button_dict["AI工具管理"].click()
+    window.top_button_dict["AI管理"].click()
     qapp.processEvents()
 
     assert window.tab.currentIndex() == ai_index
@@ -474,9 +486,61 @@ def test_programmatic_tab_change_reverts_when_ai_tool_management_rejects_leave(
     qapp.processEvents()
 
     assert window.tab.currentIndex() == ai_index
-    assert window.top_button_dict["AI工具管理"].isChecked() is True
+    assert window.top_button_dict["AI管理"].isChecked() is True
     assert window.top_button_dict["硬件"].isChecked() is False
     assert window.ai_tool_management_module.confirm_leave_calls == 1
+
+
+def test_switching_away_from_config_is_blocked_when_confirm_leave_rejects(
+    qapp,
+    monkeypatch,
+):
+    window, _ = _make_window(
+        monkeypatch,
+        config_cls=_make_guarded_module(False),
+    )
+    _show(window, qapp)
+
+    window.current_user_role = "管理员"
+    window.set_role()
+
+    config_index = window.tab_names.index("配置")
+    window.top_button_dict["配置"].click()
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == config_index
+
+    window.top_button_dict["硬件"].click()
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == config_index
+    assert window.config_module.confirm_leave_calls == 1
+
+
+def test_switching_away_from_config_is_allowed_when_confirm_leave_accepts(
+    qapp,
+    monkeypatch,
+):
+    window, _ = _make_window(
+        monkeypatch,
+        config_cls=_make_guarded_module(True),
+    )
+    _show(window, qapp)
+
+    window.current_user_role = "管理员"
+    window.set_role()
+
+    hardware_index = window.tab_names.index("硬件")
+    window.top_button_dict["配置"].click()
+    qapp.processEvents()
+
+    window.top_button_dict["硬件"].click()
+    qapp.processEvents()
+
+    assert window.tab.currentIndex() == hardware_index
+    assert window.top_button_dict["配置"].isChecked() is False
+    assert window.top_button_dict["硬件"].isChecked() is True
+    assert window.config_module.confirm_leave_calls == 1
 
 
 def test_role_switch_from_admin_to_operator_stays_consistent_when_ai_leave_is_rejected(
@@ -493,8 +557,8 @@ def test_role_switch_from_admin_to_operator_stays_consistent_when_ai_leave_is_re
     window.current_user_role = "管理员"
     window.set_role()
 
-    ai_index = window.tab_names.index("AI工具管理")
-    window.top_button_dict["AI工具管理"].click()
+    ai_index = window.tab_names.index("AI管理")
+    window.top_button_dict["AI管理"].click()
     qapp.processEvents()
 
     assert window.tab.currentIndex() == ai_index
@@ -507,8 +571,8 @@ def test_role_switch_from_admin_to_operator_stays_consistent_when_ai_leave_is_re
     assert window.current_user_name == "admin"
     assert window.current_user_role == "管理员"
     assert window.tab.currentIndex() == ai_index
-    assert window.top_button_dict["AI工具管理"].isEnabled() is True
-    assert window.top_button_dict["AI工具管理"].isChecked() is True
+    assert window.top_button_dict["AI管理"].isEnabled() is True
+    assert window.top_button_dict["AI管理"].isChecked() is True
     assert window.top_button_dict["测试"].isChecked() is False
     assert window.ai_tool_management_module.confirm_leave_calls == 1
 
@@ -522,6 +586,10 @@ def test_closing_main_window_is_blocked_when_ai_tool_management_rejects_leave(
         ai_tool_management_cls=_make_guarded_ai_tool_management_module(False),
     )
     _show(window, qapp)
+    window.current_user_role = "管理员"
+    window.set_role()
+    window.top_button_dict["AI管理"].click()
+    qapp.processEvents()
 
     close_event = QCloseEvent()
     window.closeEvent(close_event)
@@ -530,6 +598,29 @@ def test_closing_main_window_is_blocked_when_ai_tool_management_rejects_leave(
     services.shutdown.assert_not_called()
     services.db.close.assert_not_called()
     assert window.ai_tool_management_module.confirm_leave_calls == 1
+
+
+def test_closing_main_window_is_blocked_when_config_rejects_leave(
+    qapp,
+    monkeypatch,
+):
+    window, services = _make_window(
+        monkeypatch,
+        config_cls=_make_guarded_module(False),
+    )
+    _show(window, qapp)
+    window.current_user_role = "管理员"
+    window.set_role()
+    window.top_button_dict["配置"].click()
+    qapp.processEvents()
+
+    close_event = QCloseEvent()
+    window.closeEvent(close_event)
+
+    assert close_event.isAccepted() is False
+    services.shutdown.assert_not_called()
+    services.db.close.assert_not_called()
+    assert window.config_module.confirm_leave_calls == 1
 
 
 @pytest.mark.parametrize("role", ["管理员", "工程师"])
@@ -1266,10 +1357,37 @@ def test_main_window_keeps_fixed_left_column_modules_unchanged(qapp, monkeypatch
     assert window.video.parentWidget() is not window.result_dashboard
 
 
+def test_card_compact_dashboard_mode_reduces_layout_chrome(qapp):
+    body = QWidget()
+    card = Card("频谱", body)
+
+    normal_margins = card.layout().contentsMargins()
+    assert normal_margins.left() == 12
+    assert normal_margins.top() == 10
+    assert normal_margins.right() == 12
+    assert normal_margins.bottom() == 12
+    assert card.layout().spacing() == 8
+    assert card.title_metric_value_label.minimumWidth() == 68
+    assert card.title_metric_value_label.minimumHeight() == 26
+    assert card.property("dashboardCompact") in (None, False)
+
+    card.set_compact_dashboard_mode(True)
+
+    compact_margins = card.layout().contentsMargins()
+    assert compact_margins.left() == 4
+    assert compact_margins.top() == 4
+    assert compact_margins.right() == 4
+    assert compact_margins.bottom() == 4
+    assert card.layout().spacing() == 3
+    assert card.title_metric_value_label.minimumWidth() <= 56
+    assert card.title_metric_value_label.minimumHeight() <= 22
+    assert card.property("dashboardCompact") is True
+
+
 def test_card_title_suffix_does_not_overlap_title_at_narrow_width(qapp):
     body = QWidget()
     card = Card("时频图", body)
-    card.set_title_metric("频谱平均得分：", "87.42")
+    card.set_title_metric("频谱最低得分：", "87.42")
     card.resize(220, 120)
     card.show()
     qapp.processEvents()
@@ -1289,6 +1407,21 @@ def test_card_title_metric_uses_score_value_box_style():
     assert "font-size: 15px;" in label_style
     assert "font-size: 15px;" in value_style
     assert "border: 1px solid #cbd5e1;" in value_style
+
+
+def test_dashboard_compact_card_qss_removes_card_chrome():
+    style = APP_QSS.split('QFrame#Card[dashboardCompact="true"]', 1)[1].split(
+        "}", 1
+    )[0]
+    metric_value_style = APP_QSS.split(
+        'QFrame#Card[dashboardCompact="true"] QLabel#CardTitleMetricValue',
+        1,
+    )[1].split("}", 1)[0]
+
+    assert "border: 0px solid transparent;" in style
+    assert "border-radius: 0px;" in style
+    assert "font-size: 12px;" in metric_value_style
+    assert "padding: 1px 6px;" in metric_value_style
 
 
 def test_card_empty_title_suffix_is_hidden_and_title_uses_row_width(qapp):

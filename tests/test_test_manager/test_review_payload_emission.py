@@ -567,6 +567,110 @@ class TestReviewPayloadEmission:
         assert payload.no_result is False
         assert payload.error_message is None
 
+    def test_auto_analysis_review_emits_event_current_labels_after_chart_payload_exists(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        chart_payload = {
+            0: {
+                "spl": {
+                    "times_sec": [0.0, 1.0, 2.0],
+                    "values_db": [60.0, 77.0, 70.0],
+                },
+                "loudness": {
+                    "times_sec": [0.0, 1.0, 2.0],
+                    "values": [2.0, 7.0, 5.0],
+                    "unit": "sone",
+                },
+                "stft_score": {
+                    "enabled": True,
+                    "summary_score": 72.0,
+                    "times_sec": [0.0, 1.0, 2.0],
+                    "scores": [90.0, 72.0, 80.0],
+                },
+                "current_trace": {
+                    "times_sec": [0.0, 2.0],
+                    "values_a": [1.0, 3.0],
+                    "average_a": 2.0,
+                    "max_a": 3.0,
+                    "latest_a": 3.0,
+                    "unit": "mA",
+                },
+            }
+        }
+        session = MagicMock()
+        session.config_id = 1
+        session._config = {
+            "config_id": 1,
+            "analysis_duration": 2.0,
+            "analysis_window_offset_ms": 0,
+            "selected_channels": [0],
+            "channels": [
+                {
+                    "channel_index": 0,
+                    "spl_lower_enabled": True,
+                    "spl_lower_limit": 40.0,
+                    "spl_upper_enabled": True,
+                    "spl_upper_limit": 80.0,
+                    "loudness_lower_enabled": True,
+                    "loudness_lower_limit": 1.0,
+                    "loudness_upper_enabled": True,
+                    "loudness_upper_limit": 10.0,
+                    "loudness_unit": "sone",
+                }
+            ],
+        }
+        session._workorder = {
+            "trigger_source": "scan",
+            "factory_run_id": "run-1",
+        }
+        session._buffer = np.zeros((300, 1), dtype=np.float32)
+        session._sample_rate = 100.0
+        session._audio_file_path = "captured.wav"
+        session.last_ai_review = {"status": "not_enabled"}
+        session._run_judgment.return_value = JudgmentResult(
+            overall="合格",
+            limit_pass=True,
+            ai_pass=None,
+            ai_score=None,
+            analysis_window=(0.0, 2.0),
+            channel_results=[
+                ChannelJudgment(
+                    channel_index=0,
+                    spl_db=70.0,
+                    spl_min_db=60.0,
+                    spl_max_db=77.0,
+                    spl_pass=True,
+                    loudness_min_sone=2.0,
+                    loudness_max_sone=7.0,
+                    loudness_pass=True,
+                    loudness_available=True,
+                )
+            ],
+        )
+        monkeypatch.setattr(
+            mgr,
+            "_build_chart_payload",
+            lambda *_args, **_kwargs: chart_payload,
+        )
+        mgr._sessions[1] = session
+
+        assert mgr._emit_auto_analysis_review(1, session) is True
+
+        payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
+        rows_by_key = {
+            row["item_key"]: row
+            for row in payload.summary_payload["rows"]
+            if isinstance(row, dict)
+        }
+        assert rows_by_key["spl"]["channel_label"] == "2.000 mA"
+        assert rows_by_key["loudness"]["channel_label"] == "2.000 mA"
+        assert rows_by_key["stft_score"]["actual_display"] == "72.00"
+        assert rows_by_key["stft_score"]["channel_label"] == "2.000 mA"
+
     def test_on_session_done_emits_partial_no_result_summary_when_ai_fails_but_rules_pass(
         self,
         monkeypatch,

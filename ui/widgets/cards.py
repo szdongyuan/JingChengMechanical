@@ -14,13 +14,13 @@ class Card(QFrame):
         super().__init__()
         self.setObjectName("Card")
 
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(12, 10, 12, 12)
-        lay.setSpacing(8)
+        self._root_layout = QVBoxLayout(self)
+        self._root_layout.setContentsMargins(12, 10, 12, 12)
+        self._root_layout.setSpacing(8)
 
-        title_row = QHBoxLayout()
-        title_row.setContentsMargins(0, 0, 0, 0)
-        title_row.setSpacing(8)
+        self._title_row = QHBoxLayout()
+        self._title_row.setContentsMargins(0, 0, 0, 0)
+        self._title_row.setSpacing(8)
 
         self.title_label = QLabel(title)
         self.title_label.setObjectName("CardTitle")
@@ -29,7 +29,7 @@ class Card(QFrame):
             QSizePolicy.Policy.Ignored,
             QSizePolicy.Policy.Preferred,
         )
-        title_row.addWidget(self.title_label, 1)
+        self._title_row.addWidget(self.title_label, 1)
 
         self._title_suffix_text = ""
 
@@ -43,20 +43,20 @@ class Card(QFrame):
             QSizePolicy.Policy.Preferred,
         )
         self.title_suffix_label.setVisible(False)
-        title_row.addWidget(self.title_suffix_label, 0)
+        self._title_row.addWidget(self.title_suffix_label, 0)
 
         self.title_metric_widget = QWidget()
         self.title_metric_widget.setObjectName("CardTitleMetric")
-        metric_lay = QHBoxLayout(self.title_metric_widget)
-        metric_lay.setContentsMargins(0, 0, 0, 0)
-        metric_lay.setSpacing(6)
+        self._title_metric_layout = QHBoxLayout(self.title_metric_widget)
+        self._title_metric_layout.setContentsMargins(0, 0, 0, 0)
+        self._title_metric_layout.setSpacing(6)
 
         self.title_metric_label = QLabel("")
         self.title_metric_label.setObjectName("CardTitleMetricLabel")
         self.title_metric_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
-        metric_lay.addWidget(self.title_metric_label, 0)
+        self._title_metric_layout.addWidget(self.title_metric_label, 0)
 
         self.title_metric_value_label = QLabel("")
         self.title_metric_value_label.setObjectName("CardTitleMetricValue")
@@ -66,13 +66,13 @@ class Card(QFrame):
             QSizePolicy.Policy.Minimum,
             QSizePolicy.Policy.Fixed,
         )
-        metric_lay.addWidget(self.title_metric_value_label, 0)
+        self._title_metric_layout.addWidget(self.title_metric_value_label, 0)
 
         self.title_metric_widget.setVisible(False)
-        title_row.addWidget(self.title_metric_widget, 0)
+        self._title_row.addWidget(self.title_metric_widget, 0)
 
-        lay.addLayout(title_row)
-        lay.addWidget(body, 1)
+        self._root_layout.addLayout(self._title_row)
+        self._root_layout.addWidget(body, 1)
 
     def set_title(self, title: str) -> None:
         self.title_label.setText(str(title))
@@ -98,4 +98,21 @@ class Card(QFrame):
 
     def title_suffix(self) -> str:
         return self._title_suffix_text
+
+    def set_compact_dashboard_mode(self, enabled: bool = True) -> None:
+        if enabled:
+            self.setProperty("dashboardCompact", True)
+            self._root_layout.setContentsMargins(4, 4, 4, 4)
+            self._root_layout.setSpacing(3)
+            self._title_row.setSpacing(4)
+            self._title_metric_layout.setSpacing(4)
+            self.title_metric_value_label.setMinimumSize(56, 22)
+            return
+
+        self.setProperty("dashboardCompact", False)
+        self._root_layout.setContentsMargins(12, 10, 12, 12)
+        self._root_layout.setSpacing(8)
+        self._title_row.setSpacing(8)
+        self._title_metric_layout.setSpacing(6)
+        self.title_metric_value_label.setMinimumSize(68, 26)
 

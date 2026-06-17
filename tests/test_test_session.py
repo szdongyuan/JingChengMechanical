@@ -2080,6 +2080,22 @@ class TestScoreThresholdDecision:
         assert session.last_ai_review["threshold"] == 0.8
         assert session.last_ai_review["score"] == 0.9
 
+    def test_chinese_defect_label_marks_ai_failed_and_preserves_label(self, tmp_path):
+        ai = MagicMock()
+        ai.run_ai_analysis.return_value = self._make_success_envelope(
+            ai_label="嗡嗡音",
+            score=0.91,
+        )
+        session = self._make_session(tmp_path, ai, {"enabled": True})
+        result = session._run_ai(self._make_base_result())
+        assert result.ai_pass is False
+        assert result.ai_score == 0.91
+        assert result.overall == "不合格"
+        assert session.last_ai_review["status"] == "success"
+        assert session.last_ai_review["score"] == 0.91
+        assert session.last_ai_review["passed"] is False
+        assert session.last_ai_review["ai_label"] == "嗡嗡音"
+
     def test_score_below_envelope_threshold_fails_even_if_ai_label_is_pass(self, tmp_path):
         ai = MagicMock()
         ai.run_ai_analysis.return_value = self._make_success_envelope(score=0.3)

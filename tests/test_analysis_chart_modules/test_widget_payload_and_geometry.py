@@ -16,8 +16,14 @@ from ui.widgets.analysis_charts import (
 from ._support import _show_widget
 
 
-def _is_orange_current_pixel(color) -> bool:
-    return color.red() > 220 and 120 < color.green() < 190 and color.blue() < 70
+def _is_stft_current_pixel(color) -> bool:
+    return (
+        color.red() > 180
+        and color.green() < 140
+        and color.blue() > 110
+        and color.red() - color.green() > 80
+        and color.blue() - color.green() > 40
+    )
 
 
 def _dispose_chart_widget(widget, qapp) -> None:
@@ -100,6 +106,64 @@ def test_stft_image_chart_widget_exposes_view_box_geometry_in_widget_coordinates
         widget.close()
 
 
+def test_stft_image_chart_widget_compact_display_mode_preserves_overlay_geometry(
+    qapp,
+):
+    widget = StftImageChartWidget()
+
+    try:
+        widget.set_compact_display_mode(True)
+        widget.resize(640, 260)
+        widget.show()
+        qapp.processEvents()
+
+        widget.set_image(
+            times_sec=[0.0, 0.5, 1.0],
+            frequencies_hz=[100.0, 200.0],
+            magnitude_db=np.array([[1.0, 2.0, 3.0], [3.5, 4.5, 5.5]]),
+        )
+        widget.set_current_trace(
+            {
+                "times_sec": [0.0, 0.5, 1.0],
+                "values_a": [1.2, 1.4, 1.6],
+                "average_a": 1.4,
+                "max_a": 1.6,
+                "latest_a": 1.6,
+                "unit": "mA",
+            }
+        )
+        qapp.processEvents()
+
+        plot_rect = widget.plot_area_rect_in_widget()
+        main_view_rect = widget.plot_item.vb.sceneBoundingRect()
+        current_view_rect = widget._current_view_box.geometry()
+
+        assert widget.compact_display_mode_enabled() is True
+        assert plot_rect is not None
+        assert plot_rect.width() > 0
+        assert plot_rect.height() > 0
+        assert current_view_rect.width() > 0
+        assert current_view_rect.height() > 0
+        assert current_view_rect.left() == pytest.approx(
+            main_view_rect.left(),
+            abs=1.0,
+        )
+        assert current_view_rect.top() == pytest.approx(
+            main_view_rect.top(),
+            abs=1.0,
+        )
+        assert current_view_rect.right() == pytest.approx(
+            main_view_rect.right(),
+            abs=1.0,
+        )
+        assert current_view_rect.bottom() == pytest.approx(
+            main_view_rect.bottom(),
+            abs=1.0,
+        )
+    finally:
+        widget.close()
+
+
 def test_stft_image_chart_widget_reports_rendered_time_extent_from_payload(qapp):
     widget = StftImageChartWidget()
 
@@ -174,14 +238,14 @@ def test_stft_image_chart_widget_renders_constant_current_trace_visibly(qapp):
         qapp.processEvents()
 
         image = widget.grab().toImage()
-        orange_pixels = 0
+        current_pixels = 0
         for y in range(image.height()):
             for x in range(image.width()):
                 color = image.pixelColor(x, y)
-                if _is_orange_current_pixel(color):
-                    orange_pixels += 1
+                if _is_stft_current_pixel(color):
+                    current_pixels += 1
 
-        assert orange_pixels > 20
+        assert current_pixels > 20
     finally:
         widget.close()
 
@@ -218,7 +282,7 @@ def test_stft_image_chart_widget_clips_current_trace_to_plot_area(qapp):
         for y in range(image.height()):
             for x in range(image.width()):
                 color = image.pixelColor(x, y)
-                if not _is_orange_current_pixel(color):
+                if not _is_stft_current_pixel(color):
                     continue
                 if plot_rect.contains(x, y):
                     visible_current_pixels += 1

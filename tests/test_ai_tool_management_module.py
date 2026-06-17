@@ -437,7 +437,7 @@ def test_tall_detail_pane_keeps_form_host_near_compact_height(qapp, monkeypatch)
     module.show()
     qapp.processEvents()
 
-    form_host = module.lb_toolchain_id_value.parentWidget()
+    form_host = module._form_host
     assert form_host.height() < module.detail.height()
     assert form_host.height() <= form_host.sizeHint().height() + 40
 
@@ -493,6 +493,16 @@ def test_runtime_helper_copy_is_removed(qapp):
     assert not any("protocol_version" in text for text in labels_text)
     assert not any("resident_process" in text for text in labels_text)
     assert not any("oneshot_process" in text for text in labels_text)
+
+
+def test_internal_toolchain_id_is_not_shown_to_user(qapp):
+    module, _service, _bus = _make_module(toolchains=[_toolchain("motor-ai")])
+    _show(module, qapp)
+
+    labels_text = [label.text() for label in module.findChildren(QLabel)]
+
+    assert "内部标识" not in labels_text
+    assert module.lb_toolchain_id_value.parentWidget() is None
 
 
 def test_package_dir_browse_populates_editor_and_marks_dirty(qapp, tmp_path, monkeypatch):
