@@ -2758,21 +2758,6 @@ class ConfigModule(QWidget):
             "timeout_ms": timeout if timeout > 0 else None,
         }
 
-    def _emit_plc_limit_values(self, config_data: dict) -> None:
-        plc_id = config_data.get("plc_id")
-        if plc_id is None:
-            return
-        write_limit_sign = getattr(self.services.bus, "write_limit_sign", None)
-        if write_limit_sign is None:
-            return
-        limit_values = self._plc_limit_values_from_config(config_data)
-        try:
-            write_limit_sign.emit(plc_id, limit_values)
-        except Exception as exc:
-            log_signal = getattr(self.services.bus, "log", None)
-            if log_signal is not None:
-                log_signal.emit(f"PLC {plc_id} 写入限值信号发送失败: {exc}")
-
     @classmethod
     def _plc_limit_values_from_config(cls, config_data: dict) -> dict:
         channel = cls._plc_limit_channel(config_data)
@@ -3100,7 +3085,10 @@ class ConfigModule(QWidget):
             self._restore_collapsible_section_state(section_state)
             self._restore_selected_channel_tab(selected_channel_index)
             self.services.bus.status.emit("配置已保存")
-            self._emit_plc_limit_values(loaded)
+            plc_id = loaded.get("plc_id")
+            if plc_id is not None:
+                limit_values = self._plc_limit_values_from_config(loaded)
+                self.services.bus.write_limit_sign.emit(plc_id, limit_values)
             self._mark_editor_snapshot_clean()
             if show_success:
                 QMessageBox.information(self, "保存成功", "配置保存成功！")
