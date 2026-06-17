@@ -368,6 +368,7 @@ class DataManagementModule(QWidget):
         self.btn_select_all = QPushButton("全选")
         self.btn_select_all.setCheckable(True)
         self.btn_export = QPushButton("打包导出")
+        self.btn_delete_selected = QPushButton("删除选中")
         self.lb_selected = QLabel("已选 0 条")
         self.btn_prev_page = QPushButton("上一页")
         self.btn_next_page = QPushButton("下一页")
@@ -380,6 +381,7 @@ class DataManagementModule(QWidget):
         toolbar_layout.addWidget(self.btn_filter)
         toolbar_layout.addWidget(self.btn_select_all)
         toolbar_layout.addWidget(self.btn_export)
+        toolbar_layout.addWidget(self.btn_delete_selected)
         toolbar_layout.addStretch(1)
         toolbar_layout.addWidget(self.lb_selected)
         toolbar_layout.addWidget(self.btn_prev_page)
@@ -403,6 +405,7 @@ class DataManagementModule(QWidget):
         self.btn_filter.clicked.connect(self._show_filter_dialog)
         self.btn_select_all.clicked.connect(self._toggle_select_all)
         self.btn_export.clicked.connect(self._export_selected_rows)
+        self.btn_delete_selected.clicked.connect(self._delete_selected_rows)
         self.btn_prev_page.clicked.connect(lambda: self._change_page(-1))
         self.btn_next_page.clicked.connect(lambda: self._change_page(1))
         self.combo_page_size.currentTextChanged.connect(self._on_page_size_changed)
@@ -612,6 +615,34 @@ class DataManagementModule(QWidget):
             if item is not None and item.checkState() == Qt.CheckState.Checked:
                 selected.append(record)
         return selected
+
+    def _delete_selected_rows(self) -> None:
+        """删除当前页勾选的数据和本地音频。"""
+        records = self._selected_records()
+        if not records:
+            QMessageBox.warning(self, "提示", "请先勾选要删除的数据")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "确认删除",
+            f"确定删除选中的 {len(records)} 条数据和本地音频吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            sd.stop()
+            for record in records:
+                self.services.audio_data_service.delete_record(record.get("audio_data_id"))
+        except Exception as exc:
+            QMessageBox.warning(self, "删除失败", f"删除失败: {exc}")
+            return
+
+        self._emit_log(f"[DataManagement] 已删除 {len(records)} 条音频数据")
+        self.refresh_table()
 
     def _export_selected_rows(self) -> None:
         records = self._selected_records()
