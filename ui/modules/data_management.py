@@ -336,6 +336,9 @@ class DataManagementModule(QWidget):
         # 列名和记录都直接从 audio_data_table 动态读取，避免手写表头。
         self._column_names: list[str] = []
         self._records: list[dict[str, object]] = []
+        self._current_page = 1
+        self._page_size = 50
+        self._total_records = 0
         self._filters: dict[str, object] = {
             "product_model": "ALL",
             "start_time": "",
@@ -366,6 +369,12 @@ class DataManagementModule(QWidget):
         self.btn_select_all.setCheckable(True)
         self.btn_export = QPushButton("打包导出")
         self.lb_selected = QLabel("已选 0 条")
+        self.btn_prev_page = QPushButton("上一页")
+        self.btn_next_page = QPushButton("下一页")
+        self.lb_page = QLabel("第 1 / 1 页，共 0 条")
+        self.combo_page_size = QComboBox()
+        self.combo_page_size.addItems(["20", "50", "100", "200"])
+        self.combo_page_size.setCurrentText(str(self._page_size))
 
         toolbar_layout.addWidget(self.btn_refresh)
         toolbar_layout.addWidget(self.btn_filter)
@@ -373,6 +382,12 @@ class DataManagementModule(QWidget):
         toolbar_layout.addWidget(self.btn_export)
         toolbar_layout.addStretch(1)
         toolbar_layout.addWidget(self.lb_selected)
+        toolbar_layout.addWidget(self.btn_prev_page)
+        toolbar_layout.addWidget(self.lb_page)
+        toolbar_layout.addWidget(self.btn_next_page)
+        toolbar_layout.addWidget(QLabel("每页"))
+        toolbar_layout.addWidget(self.combo_page_size)
+        toolbar_layout.addWidget(QLabel("条"))
         layout.addWidget(toolbar)
 
         self.table = QTableWidget(0, 0, self)
@@ -388,16 +403,31 @@ class DataManagementModule(QWidget):
         self.btn_filter.clicked.connect(self._show_filter_dialog)
         self.btn_select_all.clicked.connect(self._toggle_select_all)
         self.btn_export.clicked.connect(self._export_selected_rows)
+        self.btn_prev_page.clicked.connect(lambda: self._change_page(-1))
+        self.btn_next_page.clicked.connect(lambda: self._change_page(1))
+        self.combo_page_size.currentTextChanged.connect(self._on_page_size_changed)
         self.table.itemChanged.connect(lambda _item: self._update_selected_count())
 
     def refresh_table(self) -> None:
-        # 每次刷新都重新读表结构和数据，适配数据库字段变化。
+        """刷新当前页表格数据。"""
         service = self.services.audio_data_service
         self._column_names = [
             name for name in service.list_column_names() if name != "config_content"
         ]
-        self._records = service.list_records(self._filters)
+        self._total_records = service.count_records(self._filters)
+        total_pages = max(1, (self._total_records + self._page_size - 1) // self._page_size)
+        self._current_page = min(self._current_page, total_pages)
+        self._records = service.list_records_page(
+            self._filters,
+            self._current_page,
+            self._page_size,
+        )
         self._render_table()
+        self.lb_page.setText(
+            f"第 {self._current_page} / {total_pages} 页，共 {self._total_records} 条"
+        )
+        self.btn_prev_page.setEnabled(self._current_page > 1)
+        self.btn_next_page.setEnabled(self._current_page < total_pages)
 
     def _show_filter_dialog(self) -> None:
         service = self.services.audio_data_service
@@ -412,6 +442,24 @@ class DataManagementModule(QWidget):
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._filters = dialog.filters()
+        self._current_page = 1
+        self.refresh_table()
+
+    def _change_page(self, step: int) -> None:
+        """切换上一页或下一页。"""
+        self._current_page += step
+        self.refresh_table()
+
+    def _on_page_size_changed(self, text: str) -> None:
+        """修改每页显示条数。"""
+        try:
+            page_size = int(text)
+        except ValueError:
+            return
+        if page_size == self._page_size:
+            return
+        self._page_size = page_size
+        self._current_page = 1
         self.refresh_table()
 
     def _render_table(self) -> None:

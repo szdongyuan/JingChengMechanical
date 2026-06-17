@@ -4,6 +4,9 @@ from model.base_mode import BaseModel
 
 
 class PlcProcessParamOffsetTable(BaseModel):
+    process_ip = TextField(null=True)
+    process_db_number = TextField(null=True)
+    process_reconnect_interval_ms = TextField(null=True)
     load_cw_scan_offset = TextField(null=True)
     load_cw_load_offset = TextField(null=True)
     load_pause_offset = TextField(null=True)

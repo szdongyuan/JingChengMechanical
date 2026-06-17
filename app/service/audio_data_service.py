@@ -33,10 +33,23 @@ class AudioDataService:
 
     def list_records(self, filters: dict[str, object] | None = None) -> list[dict[str, object]]:
         # 查询：读取音频表数据，按创建时间倒序给数据管理页展示。
+        return list(self._filtered_query(filters).dicts())
+
+    def count_records(self, filters: dict[str, object] | None = None) -> int:
+        """返回筛选后的总条数。"""
+        return self._apply_filters(AudioDataTable.select(), filters).count()
+
+    def list_records_page(self, filters=None, page=1, page_size=50):
+        """分页读取音频数据。"""
+        page = max(1, int(page))
+        page_size = max(1, int(page_size))
+        return list(self._filtered_query(filters).paginate(page, page_size).dicts())
+
+    def _filtered_query(self, filters: dict[str, object] | None = None):
+        """生成带筛选和倒序排序的查询。"""
         query = AudioDataTable.select()
         query = self._apply_filters(query, filters)
-        query = query.order_by(AudioDataTable.record_date.desc()).dicts()
-        return list(query)
+        return query.order_by(AudioDataTable.record_date.desc())
 
     def delete_record(self, audio_data_id: object) -> None:
         record_id = str(audio_data_id or "").strip()

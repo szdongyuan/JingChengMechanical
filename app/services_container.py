@@ -200,8 +200,10 @@ class EventBus(QObject):
     result_changed = pyqtSignal(dict)
     # 刷新通道
     refresh_channels = pyqtSignal()
-    # 写入plc信号
-    write_test_result_to_plc = pyqtSignal(dict)
+    # 写入plc信号：plc_id, test_result
+    write_test_result_sign = pyqtSignal(int, dict)
+    # 写入 PLC 限值信号：plc_id, limit_values
+    write_limit_sign = pyqtSignal(int, dict)
 
     # 配置变化（供外部模块监听，如工单模块刷新可选配置列表）
     config_changed = pyqtSignal()
@@ -266,6 +268,9 @@ class ServiceContainer:
         # 配置服务
         self.config_service = ConfigService(self.bus)
         self.audio_data_service = AudioDataService()
+
+        # 把 plc工艺表里的读取方法，挂到 services 上
+        self.get_process_param_values = None
 
         self.ai_service = AiService()
         self.config_package_service = ConfigPackageService(

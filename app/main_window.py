@@ -406,6 +406,7 @@ class MainWindow(QMainWindow):
         channel_card = Card("通道选择", channel)
 
         self.plc_settings_module = PlcSettingsModule(self.services)
+        self.services.get_process_param_values = self.plc_settings_module.get_process_param_values
         self.plc_settings_card = Card("PLC设置", self.plc_settings_module)
 
         main_lay.addWidget(channel_card, 1)

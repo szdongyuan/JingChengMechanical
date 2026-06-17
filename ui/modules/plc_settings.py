@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
 from app.service.log_manager import LogManager
 from base.utils import int_or_none, text_or_empty, text_or_none
 from consts.style import APP_QSS
+from app.service.plc_process_param_service import PlcProcessParamService
 from app.service.plc_service import PlcService
 from model.plc_field_offset_table import PlcFieldOffsetTable
 from model.plc_process_param_offset_table import PlcProcessParamOffsetTable
@@ -114,20 +115,85 @@ class PlcFieldOffsetDialog(QDialog):
 
 
 class PlcProcessParamOffsetDialog(QDialog):
-    def __init__(self, values=None, parent=None):
+    def __init__(self, process_state="未连接", parent=None):
         super().__init__(parent)
         self.setWindowTitle("工艺参数偏移配置")
-        self.resize(520, 520)
+        self.resize(560, 660)
         self.setStyleSheet(APP_QSS + "\nQDialog { background: white; }")
-        self.edits = {}
 
         form = QFormLayout()
-        values = values or {}
-        for key, label in PLC_PROCESS_PARAM_OFFSETS:
-            edit = QLineEdit(text_or_empty(values.get(key)))
+        row = PlcProcessParamOffsetTable.select().first()
+
+        # 工艺 PLC 连接参数保存在同一张工艺偏移表里，弹窗打开时自己读取数据库第一条。
+        self.ed_process_ip = QLineEdit(text_or_empty(row.process_ip if row else None))
+        self.ed_process_db_number = QLineEdit(text_or_empty(row.process_db_number if row else None))
+        self.ed_process_reconnect_interval = QLineEdit(
+            text_or_empty(row.process_reconnect_interval_ms if row else None)
+        )
+        self.lb_process_state = QLabel(process_state)
+        self.btn_process_connect = QPushButton("连接")
+        self.btn_process_connect.setObjectName("Primary")
+        self.btn_process_connect.setFixedWidth(72)
+        for edit in (
+            self.ed_process_ip,
+            self.ed_process_db_number,
+            self.ed_process_reconnect_interval,
+        ):
             edit.setMinimumHeight(34)
-            self.edits[key] = edit
-            form.addRow(f"{label}：", edit)
+
+        form.addRow("IP：", self.ed_process_ip)
+        form.addRow("数据块号：", self.ed_process_db_number)
+        form.addRow("断线重连时间(ms)：", self.ed_process_reconnect_interval)
+        form.addRow("连接状态：", self.lb_process_state)
+
+        # 下面这些是工艺参数在 PLC DB 里的偏移地址。
+        self.ed_load_cw_scan_offset = QLineEdit(text_or_empty(row.load_cw_scan_offset if row else None))
+        self.ed_load_cw_load_offset = QLineEdit(text_or_empty(row.load_cw_load_offset if row else None))
+        self.ed_load_pause_offset = QLineEdit(text_or_empty(row.load_pause_offset if row else None))
+        self.ed_load_ccw_scan_offset = QLineEdit(text_or_empty(row.load_ccw_scan_offset if row else None))
+        self.ed_load_ccw_load_offset = QLineEdit(text_or_empty(row.load_ccw_load_offset if row else None))
+        self.ed_load_to_noload_waiting_time_offset = QLineEdit(
+            text_or_empty(row.load_to_noload_waiting_time_offset if row else None)
+        )
+        self.ed_switch_sound_cw_1_offset = QLineEdit(text_or_empty(row.switch_sound_cw_1_offset if row else None))
+        self.ed_switch_sound_ccw_1_offset = QLineEdit(text_or_empty(row.switch_sound_ccw_1_offset if row else None))
+        self.ed_switch_sound_cw_2_offset = QLineEdit(text_or_empty(row.switch_sound_cw_2_offset if row else None))
+        self.ed_switch_sound_ccw_2_offset = QLineEdit(text_or_empty(row.switch_sound_ccw_2_offset if row else None))
+        self.ed_noload_cw_offset = QLineEdit(text_or_empty(row.noload_cw_offset if row else None))
+        self.ed_noload_pause_offset = QLineEdit(text_or_empty(row.noload_pause_offset if row else None))
+        self.ed_noload_ccw_offset = QLineEdit(text_or_empty(row.noload_ccw_offset if row else None))
+
+        process_offset_edits = (
+            self.ed_load_cw_scan_offset,
+            self.ed_load_cw_load_offset,
+            self.ed_load_pause_offset,
+            self.ed_load_ccw_scan_offset,
+            self.ed_load_ccw_load_offset,
+            self.ed_load_to_noload_waiting_time_offset,
+            self.ed_switch_sound_cw_1_offset,
+            self.ed_switch_sound_ccw_1_offset,
+            self.ed_switch_sound_cw_2_offset,
+            self.ed_switch_sound_ccw_2_offset,
+            self.ed_noload_cw_offset,
+            self.ed_noload_pause_offset,
+            self.ed_noload_ccw_offset,
+        )
+        for edit in process_offset_edits:
+            edit.setMinimumHeight(34)
+
+        form.addRow("加载Cw扫描 LoadCwScan：", self.ed_load_cw_scan_offset)
+        form.addRow("加载CwLoad LoadCwLoad：", self.ed_load_cw_load_offset)
+        form.addRow("加载停顿 LoadPause：", self.ed_load_pause_offset)
+        form.addRow("加载Ccw扫描 LoadCcwScan：", self.ed_load_ccw_scan_offset)
+        form.addRow("加载CcwLoad LoadCcwLoad：", self.ed_load_ccw_load_offset)
+        form.addRow("负载到空载等待时间：", self.ed_load_to_noload_waiting_time_offset)
+        form.addRow("切换音Cw1 SwitchSoundCw_1：", self.ed_switch_sound_cw_1_offset)
+        form.addRow("切换音Ccw1 SwitchSoundCcw_1：", self.ed_switch_sound_ccw_1_offset)
+        form.addRow("切换音Cw2 SwitchSoundCw_2：", self.ed_switch_sound_cw_2_offset)
+        form.addRow("切换音Ccw2 SwitchSoundCcw_2：", self.ed_switch_sound_ccw_2_offset)
+        form.addRow("空载Cw NoloadCw：", self.ed_noload_cw_offset)
+        form.addRow("空载停顿 NoloadPause：", self.ed_noload_pause_offset)
+        form.addRow("空载Ccw NoloadCcw：", self.ed_noload_ccw_offset)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -138,25 +204,91 @@ class PlcProcessParamOffsetDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
-        layout.addWidget(buttons)
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        button_row.addWidget(self.btn_process_connect)
+        button_row.addWidget(buttons)
+        layout.addLayout(button_row)
 
     def get_values(self):
-        return {
-            key: text_or_none(edit.text())
-            for key, edit in self.edits.items()
-        }
+        values = {}
+        values["process_ip"] = text_or_none(self.ed_process_ip.text())
+        values["process_db_number"] = text_or_none(self.ed_process_db_number.text())
+        values["process_reconnect_interval_ms"] = text_or_none(self.ed_process_reconnect_interval.text())
+        values["load_cw_scan_offset"] = text_or_none(self.ed_load_cw_scan_offset.text())
+        values["load_cw_load_offset"] = text_or_none(self.ed_load_cw_load_offset.text())
+        values["load_pause_offset"] = text_or_none(self.ed_load_pause_offset.text())
+        values["load_ccw_scan_offset"] = text_or_none(self.ed_load_ccw_scan_offset.text())
+        values["load_ccw_load_offset"] = text_or_none(self.ed_load_ccw_load_offset.text())
+        values["load_to_noload_waiting_time_offset"] = text_or_none(
+            self.ed_load_to_noload_waiting_time_offset.text()
+        )
+        values["switch_sound_cw_1_offset"] = text_or_none(self.ed_switch_sound_cw_1_offset.text())
+        values["switch_sound_ccw_1_offset"] = text_or_none(self.ed_switch_sound_ccw_1_offset.text())
+        values["switch_sound_cw_2_offset"] = text_or_none(self.ed_switch_sound_cw_2_offset.text())
+        values["switch_sound_ccw_2_offset"] = text_or_none(self.ed_switch_sound_ccw_2_offset.text())
+        values["noload_cw_offset"] = text_or_none(self.ed_noload_cw_offset.text())
+        values["noload_pause_offset"] = text_or_none(self.ed_noload_pause_offset.text())
+        values["noload_ccw_offset"] = text_or_none(self.ed_noload_ccw_offset.text())
+        return values
 
-    def validate_values(self):
-        for key, label in PLC_PROCESS_PARAM_OFFSETS:
-            value = self.edits[key].text().strip()
+    def process_params_validate(self):
+        """
+        工艺参数校验格式
+        """
+        # 连接参数必须可用，否则后台服务无法自动连接工艺 PLC。
+        if not self.ed_process_ip.text().strip():
+            QMessageBox.warning(self, "提示", "请填写工艺 PLC IP")
+            self.ed_process_ip.setFocus()
+            return False
+        try:
+            if int_or_none(self.ed_process_db_number.text(), "数据块号") is None:
+                self.ed_process_db_number.setFocus()
+                return False
+            if int_or_none(self.ed_process_reconnect_interval.text(), "断线重连时间") is None:
+                self.ed_process_reconnect_interval.setFocus()
+                return False
+        except ValueError as exc:
+            QMessageBox.warning(self, "提示", str(exc))
+            return False
+        validate_items = (
+            ("加载Cw扫描 LoadCwScan", self.ed_load_cw_scan_offset),
+            ("加载CwLoad LoadCwLoad", self.ed_load_cw_load_offset),
+            ("加载停顿 LoadPause", self.ed_load_pause_offset),
+            ("加载Ccw扫描 LoadCcwScan", self.ed_load_ccw_scan_offset),
+            ("加载CcwLoad LoadCcwLoad", self.ed_load_ccw_load_offset),
+            ("负载到空载等待时间", self.ed_load_to_noload_waiting_time_offset),
+            ("切换音Cw1 SwitchSoundCw_1", self.ed_switch_sound_cw_1_offset),
+            ("切换音Ccw1 SwitchSoundCcw_1", self.ed_switch_sound_ccw_1_offset),
+            ("切换音Cw2 SwitchSoundCw_2", self.ed_switch_sound_cw_2_offset),
+            ("切换音Ccw2 SwitchSoundCcw_2", self.ed_switch_sound_ccw_2_offset),
+            ("空载Cw NoloadCw", self.ed_noload_cw_offset),
+            ("空载停顿 NoloadPause", self.ed_noload_pause_offset),
+            ("空载Ccw NoloadCcw", self.ed_noload_ccw_offset),
+        )
+        for label, edit in validate_items:
+            value = edit.text().strip()
             if not re.fullmatch(r"\d+\.\d+", value):
                 QMessageBox.warning(self, "提示", f"{label} 偏移格式错误，请输入类似 0.0 的格式")
-                self.edits[key].setFocus()
+                edit.setFocus()
                 return False
         return True
 
+    def set_process_state(self, state):
+        # 后台服务状态变化时，弹窗如果正在打开，就同步刷新这里的显示。
+        self.lb_process_state.setText(state)
+        if state == "已连接":
+            self.lb_process_state.setStyleSheet("color: #16a34a;")
+            self.btn_process_connect.setText("断开")
+        elif state in ("连接中", "重连中"):
+            self.lb_process_state.setStyleSheet("color: #d97706;")
+            self.btn_process_connect.setText("断开")
+        else:
+            self.lb_process_state.setStyleSheet("color: #dc2626;")
+            self.btn_process_connect.setText("连接")
+
     def accept(self):
-        if not self.validate_values():
+        if not self.process_params_validate():
             return
         super().accept()
     
@@ -170,10 +302,15 @@ class PlcSettingsModule(QWidget):
         self.services.plc_services = {}
         self.services.plc_threads = {}
         self.services.plc_state = {}
+        self.services.process_plc_service = None
+        self.services.process_plc_thread = None
+        self.services.process_plc_state = "未连接"
+        self.process_param_dialog = None
 
         self.init_ui()
         self.init_fun()
         self.reload_rows()
+        self.start_process_param_service()
 
     def init_ui(self):
         root = QVBoxLayout(self)
@@ -283,6 +420,7 @@ class PlcSettingsModule(QWidget):
             rows = list(PlcTable.select().order_by(PlcTable.id))
         except Exception as exc:
             rows = []
+            self.logger.error(f"读取 PLC 配置失败: {exc}")
             self.services.bus.log.emit(f"读取 PLC 配置失败: {exc}")
             QMessageBox.warning(self, "提示", f"读取 PLC 配置失败: {exc}")
 
@@ -413,25 +551,30 @@ class PlcSettingsModule(QWidget):
             PlcFieldOffsetTable.update(**dialog.get_values()).where(
                 PlcFieldOffsetTable.plc_id == row.id
             ).execute()
+            self.logger.info(f"PLC {row.id} 偏移设置保存成功")
             self.services.bus.log.emit(f"PLC {row.id} 偏移设置保存成功")
             QMessageBox.information(self, "成功", f"PLC {row.id} 偏移设置保存成功!")
         except Exception as exc:
+            self.logger.error(f"PLC {row.id} 偏移设置保存失败: {exc}")
             self.services.bus.log.emit(f"PLC {row.id} 偏移设置保存失败: {exc}")
             QMessageBox.warning(self, "提示", f"偏移设置保存失败: {exc}")
 
     def open_process_param_offset_dialog(self):
-        offset_row = PlcProcessParamOffsetTable.select().first()
-        if offset_row is None:
+        # 工艺配置只有一条记录：既保存 PLC 连接参数，也保存每个工艺字段的偏移。
+        row = PlcProcessParamOffsetTable.select().first()
+        if row is None:
             QMessageBox.warning(self, "提示", "未配置工艺参数偏移数据")
             return
-
-        values = {
-            field_name: getattr(offset_row, field_name)
-            for field_name, _label in PLC_PROCESS_PARAM_OFFSETS
-        }
-
-        dialog = PlcProcessParamOffsetDialog(values, self)
+        dialog = PlcProcessParamOffsetDialog(
+            self.services.process_plc_state,
+            self,
+        )
+        self.process_param_dialog = dialog
+        # 弹窗里的连接按钮只控制后台工艺 PLC 服务，不影响普通测试 PLC。
+        dialog.btn_process_connect.clicked.connect(self.toggle_process_param_connect)
+        dialog.set_process_state(self.services.process_plc_state)
         if dialog.exec() != QDialog.DialogCode.Accepted:
+            self.process_param_dialog = None
             return
 
         try:
@@ -441,6 +584,127 @@ class PlcSettingsModule(QWidget):
         except Exception as exc:
             self.services.bus.log.emit(f"工艺参数偏移保存失败: {exc}")
             QMessageBox.warning(self, "提示", f"工艺参数偏移保存失败: {exc}")
+        finally:
+            self.process_param_dialog = None
+
+    def start_process_param_service(self):
+        # 看下后台有没有挂着工艺线程process_plc_thread 和工艺对象, 没有才启动
+        if getattr(self.services, "process_plc_service", None) is not None:
+            return
+        if getattr(self.services, "process_plc_thread", None) is not None:
+            return
+
+        # 从工艺配置表读取连接参数；没有 IP 时不启动。
+        row = PlcProcessParamOffsetTable.select().first()
+        if row is None:
+            return
+
+        # 工艺 PLC 单独用一个服务和线程，避免和普通测试 PLC 的 StartSignal 逻辑混在一起。
+        process_service = PlcProcessParamService(
+            bus=self.services.bus,
+            ip=row.process_ip,
+            db_number=row.process_db_number,
+            reconnect_interval_ms=row.process_reconnect_interval_ms,
+            rack=0,
+            slot=1,
+        )
+        process_thread = QThread(self)
+        process_service.moveToThread(process_thread)
+        process_thread.started.connect(process_service.start_service)
+        process_thread.finished.connect(process_service.deleteLater)
+        process_thread.finished.connect(self._on_process_param_thread_stopped)
+        process_service.state_changed.connect(self.on_process_param_state_changed)
+        process_service.connect_result.connect(self.on_process_param_connect_result)
+
+        self.services.process_plc_service = process_service
+        self.services.process_plc_thread = process_thread
+        self.services.process_plc_state = "连接中"
+        process_thread.start()
+
+    def stop_process_param_service(self):
+        # 主动断开工艺 PLC：先让服务在线程里停止，再退出线程。
+        process_service = getattr(self.services, "process_plc_service", None)
+        process_thread = getattr(self.services, "process_plc_thread", None)
+        if process_service is not None:
+            try:
+                QMetaObject.invokeMethod(
+                    process_service,
+                    "stop_service",
+                    Qt.ConnectionType.BlockingQueuedConnection,
+                )
+            except Exception as exc:
+                self.logger.error(f"工艺 PLC 断开失败: {exc}")
+                self.services.bus.log.emit(f"工艺 PLC 断开失败: {exc}")
+        if process_thread is not None:
+            process_thread.quit()
+            process_thread.wait(2000)
+        self.services.process_plc_service = None
+        self.services.process_plc_thread = None
+        self.services.process_plc_state = "未连接"
+
+    def toggle_process_param_connect(self):
+        # 弹窗按钮：已连接/重连中则断开，未连接则启动后台自动重连。
+        state = getattr(self.services, "process_plc_state", "未连接")
+        if state in ("连接中", "重连中", "已连接"):
+            self.stop_process_param_service()
+        else:
+            self.start_process_param_service()
+        if self.process_param_dialog is not None:
+            self.process_param_dialog.set_process_state(self.services.process_plc_state)
+
+    def on_process_param_state_changed(self, state):
+        # 后台服务发来的连接状态，保存起来；弹窗打开时也同步刷新。
+        self.services.process_plc_state = state
+        if self.process_param_dialog is not None:
+            self.process_param_dialog.set_process_state(self.services.process_plc_state)
+
+    def on_process_param_connect_result(self, success, message):
+        if success:
+            self.logger.info("工艺 PLC 连接成功")
+            self.services.bus.log.emit("工艺 PLC 连接成功")
+        elif message:
+            self.logger.error(f"工艺 PLC 连接失败: {message}")
+            self.services.bus.log.emit(f"工艺 PLC 连接失败: {message}")
+
+    def _on_process_param_thread_stopped(self):
+        # 线程退出后清理引用，避免下次无法重新启动。
+        self.services.process_plc_thread = None
+        self.services.process_plc_service = None
+        self.services.process_plc_state = "未连接"
+        if self.process_param_dialog is not None:
+            self.process_param_dialog.set_process_state(self.services.process_plc_state)
+
+    def get_process_param_values(self):
+        """
+        外部读取工艺参数用。
+        已连接时返回布尔状态和 PLC 里读到的工艺参数；未连接时 values 返回 None。
+        """
+        state = self.services.process_plc_state
+        result = {"state": False, "values": None}
+        if state != "已连接":
+            return result
+
+        process_service = self.services.process_plc_service
+        if process_service is None:
+            return result
+
+        row = PlcProcessParamOffsetTable.select().first()
+        if row is None:
+            return result
+
+        offset_dict = {}
+        for field_name, _label in PLC_PROCESS_PARAM_OFFSETS:
+            offset_dict[field_name] = getattr(row, field_name)
+
+        try:
+            result["state"] = True
+            result["values"] = process_service.read_process_params(offset_dict)
+        except Exception as exc:
+            result["state"] = False
+            result["values"] = None
+            self.logger.error(f"读取工艺参数失败: {exc}")
+            self.services.bus.log.emit(f"读取工艺参数失败: {exc}")
+        return result
 
     def get_field_offsets(self, plc_id):
         offset_row = (
@@ -461,7 +725,9 @@ class PlcSettingsModule(QWidget):
     def save_current(self):
         row = self.get_current_row()
         if row is None:
+            self.logger.error("plc_table表无此数据")
             self.services.bus.log.emit("plc_table表无此数据")
+            QMessageBox.warning(self, "提示", "plc_table表无此数据")
             return
         try:
             # 从界面收集数据，并把需要为整数的字段先转换掉。
@@ -485,16 +751,20 @@ class PlcSettingsModule(QWidget):
             PlcTable.update(**values).where(PlcTable.id == row.id).execute()
             self.on_combo_changed()
             self.btn_save.setText("保存")
+            self.logger.info(f"PLC {row.id} 保存成功")
             self.services.bus.log.emit(f"PLC {row.id} 保存成功")
             QMessageBox.information(self, "成功", f"PLC {row.id}      配置保存成功!")
         except Exception as exc:
+            self.logger.error(f"保存 PLC 配置失败: {exc}")
             self.services.bus.log.emit(f"保存 PLC 配置失败: {exc}")
             QMessageBox.warning(self, "提示", f"保存 PLC 配置失败: {exc}")
 
     def toggle_state(self):
         row = self.get_current_row()
         if row is None:
+            self.logger.error("plc_table表无此数据")
             self.services.bus.log.emit("plc_table表无此数据")
+            QMessageBox.warning(self, "提示", "plc_table表无此数据")
             return
 
         # plc_open_state: 0=关闭, 1=开启
@@ -502,12 +772,14 @@ class PlcSettingsModule(QWidget):
         try:
             PlcTable.update(plc_open_state=new_state).where(PlcTable.id == row.id).execute()
             self.on_combo_changed()
+            self.logger.info(f"PLC {row.id}: {row.plc_name or '-'} 开机自启动 已{'开启' if new_state == 1 else '关闭'}")
             self.services.bus.log.emit(
                 f"PLC {row.id}: {row.plc_name or '-'} 开机自启动 已{'开启' if new_state == 1 else '关闭'}"
             )
             QMessageBox.information(self, "成功",
                                     f"PLC {row.id}: {row.plc_name or '-'} 开机自启动 已{'开启' if new_state == 1 else '关闭'}")
         except Exception as exc:
+            self.logger.error(f"更新 PLC 状态失败: {exc}")
             self.services.bus.log.emit(f"更新 PLC 状态失败: {exc}")
             QMessageBox.warning(self, "提示", f"更新 PLC 状态失败: {exc}")
 
@@ -515,7 +787,9 @@ class PlcSettingsModule(QWidget):
         self.logger.info(f"点击连接按钮")
         row = self.get_current_row()
         if row is None:
+            self.logger.error("plc_table表无此数据")
             self.services.bus.log.emit("plc_table表无此数据")
+            QMessageBox.warning(self, "提示", "plc_table表无此数据")
             return
 
         # 连接按钮四态：未连接=连接，连接中=禁用，重连中=断开，已连接=断开
@@ -548,10 +822,9 @@ class PlcSettingsModule(QWidget):
         field_offsets_dict = self.get_field_offsets(row.id)
         if field_offsets_dict is None:
             return
-        print(f"row.id: {row.id}")
         plc_service = PlcService(
             bus=self.services.bus,
-            on_start_requested=lambda plc_id=row.id: self.services._start_from_plc(plc_id),
+            on_start_requested=self.services._start_from_plc,
             ip=row.plc_ip,
             rack=row.plc_rack,
             slot=row.plc_slot,
@@ -585,6 +858,8 @@ class PlcSettingsModule(QWidget):
         # 连接结束后，把这次对应的 plc_id 和 plc_service 一起传回处理函数。
         plc_service.connect_result.connect(on_connect_finished)
         plc_service.state_changed.connect(on_state_changed)
+        self.services.bus.write_test_result_sign.connect(plc_service.last_write_test_result_to_plc)
+        self.services.bus.write_limit_sign.connect(plc_service.last_write_limit_to_plc)
         # 线程彻底结束后，把这条 PLC 对应的线程记录清掉。
         connect_thread.finished.connect(on_connect_thread_stopped)
         # 启动后台连接线程，避免界面卡住。
