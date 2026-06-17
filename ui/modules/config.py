@@ -55,6 +55,13 @@ _GOLDEN_BINDING_FIELDS = (
     "golden_sample_duration_ms",
     "golden_sample_sample_rate",
 )
+_LEGACY_STFT_SCORE_DEFAULTS = (
+    ("stft_score_harmonic_ratio_reference", 0.25),
+    ("stft_score_frequency_instability_reference", 0.05),
+    ("stft_score_harmonic_start_order", 2),
+    ("stft_score_harmonic_end_order", 100),
+)
+_LEGACY_STFT_SCORE_PROPERTY = "legacy_stft_score_fields"
 _PRESERVE_PLC_SELECTION = object()
 
 
@@ -502,7 +509,7 @@ class ConfigModule(QWidget):
         self.spin_analysis_window_offset.setSingleStep(100)
         self.spin_analysis_window_offset.setSuffix(" ms")
         self.spin_analysis_window_offset.setValue(0)
-        gf_lay.addRow("默认分析窗起始偏移(ms)", self.spin_analysis_window_offset)
+        gf_lay.addRow("起始分析时间", self.spin_analysis_window_offset)
 
         self.chk_allow_incomplete_recording_analysis = QCheckBox(
             "允许分析不完整录音"
@@ -721,7 +728,7 @@ class ConfigModule(QWidget):
             launcher_layout=top_launcher_layout,
             launcher_index=top_launcher_index,
             section_id="ai_binding",
-            title="AI 工具链绑定",
+            title="AI设置",
             content=ai_bind_form,
             default_position_anchor=top_launcher_panel,
             button_object_name="open_ai_binding_card",
@@ -1290,7 +1297,7 @@ class ConfigModule(QWidget):
             return False
         return current != self._loaded_config_editor_snapshot
 
-    def _prompt_unsaved_config_changes(self, action: str) -> bool:
+    def _prompt_unsaved_config_changes(self, action: str) -> str:
         action_label = {
             "switch": "切换配置",
             "new": "新建配置",
@@ -1302,22 +1309,51 @@ class ConfigModule(QWidget):
         dialog.setIcon(QMessageBox.Icon.Warning)
         dialog.setWindowTitle("未保存的更改")
         dialog.setText(f"当前配置有未保存的更改。是否保存后再{action_label}？")
-        save_button = dialog.addButton("保存", QMessageBox.ButtonRole.AcceptRole)
+        save_button = dialog.addButton("保存并继续", QMessageBox.ButtonRole.AcceptRole)
+        discard_button = dialog.addButton(
+            "放弃保存",
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
         cancel_button = dialog.addButton("取消", QMessageBox.ButtonRole.RejectRole)
         dialog.setDefaultButton(save_button)
         dialog.setEscapeButton(cancel_button)
         dialog.exec()
-        return dialog.clickedButton() is save_button
+        clicked = dialog.clickedButton()
+        if clicked is save_button:
+            return "save"
+        if clicked is discard_button:
+            return "discard"
+        return "cancel"
 
     def _resolve_unsaved_changes_before(self, action: str) -> bool:
         if not self._has_unsaved_changes():
             return True
-        if not self._prompt_unsaved_config_changes(action):
+        decision = self._prompt_unsaved_config_changes(action)
+        if decision is True:
+            decision = "save"
+        elif decision is False:
+            decision = "cancel"
+
+        if decision == "cancel":
             return False
-        return self._save_current_config(show_success=False)
+        if decision == "discard":
+            return self._discard_unsaved_config_changes()
+        if decision == "save":
+            return self._save_current_config(show_success=False)
+        return False
 
     def confirm_leave(self) -> bool:
         return self._resolve_unsaved_changes_before("leave")
+
+    def _discard_unsaved_config_changes(self) -> bool:
+        if self._current_config_id is None:
+            return True
+        try:
+            self._reload_authoritative_config_state(self._current_config_id)
+        except Exception as exc:
+            QMessageBox.warning(self, "加载失败", f"无法恢复已保存配置：{exc}")
+            return False
+        return True
 
     def _finalize_failed_save(
         self,
@@ -1688,6 +1724,13 @@ class ConfigModule(QWidget):
     def _build_channel_tab(self, ch_index: int, data: dict | None) -> QWidget:
         container = QWidget()
         container.setProperty("channel_index", ch_index)
+        container.setProperty(
+            _LEGACY_STFT_SCORE_PROPERTY,
+            {
+                field: data.get(field, default) if data else default
+                for field, default in _LEGACY_STFT_SCORE_DEFAULTS
+            },
+        )
         golden_binding = self._normalize_golden_binding(data)
         self._set_channel_binding(container, golden_binding)
         self._set_committed_channel_binding(container, golden_binding)
@@ -1789,7 +1832,7 @@ class ConfigModule(QWidget):
 
         score_summary = _NoWheelComboBox()
         score_summary.setObjectName("stft_score_summary_mode")
-        score_summary.addItem("10%分位数", "percentile")
+        score_summary.addItem("分位数", "percentile")
         score_summary.addItem("平均分", "mean")
         score_summary.addItem("最低分", "min")
         val = (
@@ -1823,64 +1866,19 @@ class ConfigModule(QWidget):
 
         score_modulation_reference = _NoWheelSpinBox()
         score_modulation_reference.setObjectName("stft_score_modulation_reference")
-        score_modulation_reference.setRange(0.001, 10.0)
-        score_modulation_reference.setDecimals(3)
+        score_modulation_reference.setRange(0.00001, 10.0)
+        score_modulation_reference.setDecimals(5)
+        score_modulation_reference.setSingleStep(0.00001)
         score_modulation_reference.setValue(
             data.get("stft_score_modulation_reference", 0.20) if data else 0.20
         )
-        ss_lay.addRow("调制参考值", score_modulation_reference)
-
-        score_harmonic_reference = _NoWheelSpinBox()
-        score_harmonic_reference.setObjectName(
-            "stft_score_harmonic_ratio_reference"
-        )
-        score_harmonic_reference.setRange(0.001, 1.0)
-        score_harmonic_reference.setDecimals(3)
-        score_harmonic_reference.setValue(
-            data.get("stft_score_harmonic_ratio_reference", 0.25)
-            if data
-            else 0.25
-        )
-        ss_lay.addRow("谐波占比参考值", score_harmonic_reference)
-
-        score_frequency_reference = _NoWheelSpinBox()
-        score_frequency_reference.setObjectName(
-            "stft_score_frequency_instability_reference"
-        )
-        score_frequency_reference.setRange(0.001, 10.0)
-        score_frequency_reference.setDecimals(3)
-        score_frequency_reference.setValue(
-            data.get("stft_score_frequency_instability_reference", 0.05)
-            if data
-            else 0.05
-        )
-        ss_lay.addRow("频率不稳定参考值", score_frequency_reference)
-
-        score_harmonic_start = _NoWheelSpinBoxInt()
-        score_harmonic_start.setObjectName("stft_score_harmonic_start_order")
-        score_harmonic_start.setRange(2, 10000)
-        score_harmonic_start.setValue(
-            data.get("stft_score_harmonic_start_order", 2) if data else 2
-        )
-        ss_lay.addRow("谐波起始阶次", score_harmonic_start)
-
-        score_harmonic_end = _NoWheelSpinBoxInt()
-        score_harmonic_end.setObjectName("stft_score_harmonic_end_order")
-        score_harmonic_end.setRange(2, 10000)
-        score_harmonic_end.setValue(
-            data.get("stft_score_harmonic_end_order", 100) if data else 100
-        )
-        ss_lay.addRow("谐波结束阶次", score_harmonic_end)
+        ss_lay.addRow("响度变化参考值（sone）", score_modulation_reference)
 
         score_controls = (
             score_summary,
             score_percentile,
             score_loudness_reference,
             score_modulation_reference,
-            score_harmonic_reference,
-            score_frequency_reference,
-            score_harmonic_start,
-            score_harmonic_end,
         )
 
         def set_score_controls_enabled(checked: bool) -> None:
@@ -2584,41 +2582,11 @@ class ConfigModule(QWidget):
             else 0.20
         )
 
-        stft_score_harmonic_reference = container.findChild(
-            QDoubleSpinBox, "stft_score_harmonic_ratio_reference"
-        )
-        ch["stft_score_harmonic_ratio_reference"] = (
-            stft_score_harmonic_reference.value()
-            if stft_score_harmonic_reference
-            else 0.25
-        )
-
-        stft_score_frequency_reference = container.findChild(
-            QDoubleSpinBox, "stft_score_frequency_instability_reference"
-        )
-        ch["stft_score_frequency_instability_reference"] = (
-            stft_score_frequency_reference.value()
-            if stft_score_frequency_reference
-            else 0.05
-        )
-
-        stft_score_harmonic_start = container.findChild(
-            QSpinBox, "stft_score_harmonic_start_order"
-        )
-        ch["stft_score_harmonic_start_order"] = (
-            stft_score_harmonic_start.value()
-            if stft_score_harmonic_start
-            else 2
-        )
-
-        stft_score_harmonic_end = container.findChild(
-            QSpinBox, "stft_score_harmonic_end_order"
-        )
-        ch["stft_score_harmonic_end_order"] = (
-            stft_score_harmonic_end.value()
-            if stft_score_harmonic_end
-            else 100
-        )
+        legacy_stft_score = container.property(_LEGACY_STFT_SCORE_PROPERTY)
+        if not isinstance(legacy_stft_score, dict):
+            legacy_stft_score = {}
+        for field, default in _LEGACY_STFT_SCORE_DEFAULTS:
+            ch[field] = legacy_stft_score.get(field, default)
 
         combo_spl_w = container.findChild(QComboBox, "spl_weighting")
         ch["spl_weighting"] = combo_spl_w.currentText() if combo_spl_w else "A"
@@ -2789,6 +2757,71 @@ class ConfigModule(QWidget):
             "toolchain_id": tc_id,
             "timeout_ms": timeout if timeout > 0 else None,
         }
+
+    @classmethod
+    def _plc_limit_values_from_config(cls, config_data: dict) -> dict:
+        acoustic_channel = cls._plc_acoustic_limit_channel(config_data)
+        product_model = config_data.get("product_model") or config_data.get("config_name")
+        if product_model in (None, ""):
+            product_model = "-1.0"
+        return {
+            "res_product_model_offset": str(product_model),
+            "res_spl_limit_up_offset": cls._plc_real_limit(
+                acoustic_channel,
+                "spl_upper_enabled",
+                "spl_upper_limit",
+            ),
+            "res_spl_limit_down_offset": cls._plc_real_limit(
+                acoustic_channel,
+                "spl_lower_enabled",
+                "spl_lower_limit",
+            ),
+            "res_loudness_limit_up_offset": cls._plc_real_limit(
+                acoustic_channel,
+                "loudness_upper_enabled",
+                "loudness_upper_limit",
+            ),
+            "res_loudness_limit_down_offset": cls._plc_real_limit(
+                acoustic_channel,
+                "loudness_lower_enabled",
+                "loudness_lower_limit",
+            ),
+            "res_vibrate_limit_up_offset": -1.0,
+            "res_vibrate_limit_down_offset": -1.0,
+            "res_ai_score_limit_down_offset": -1.0,
+        }
+
+    @staticmethod
+    def _plc_acoustic_limit_channel(config_data: dict) -> dict:
+        channels = config_data.get("channels")
+        if not isinstance(channels, list):
+            return {}
+        selected_channels = config_data.get("selected_channels")
+        if not isinstance(selected_channels, (list, tuple)):
+            selected_channels = ()
+        vibration_channel = config_data.get("vibration_view_channel_index")
+        for selected_index in selected_channels:
+            if selected_index == vibration_channel:
+                continue
+            for channel in channels:
+                if (
+                    isinstance(channel, dict)
+                    and channel.get("channel_index") == selected_index
+                ):
+                    return channel
+        return {}
+
+    @staticmethod
+    def _plc_real_limit(channel: dict, enabled_key: str, value_key: str) -> float:
+        if not isinstance(channel, dict) or not channel.get(enabled_key):
+            return -1.0
+        value = channel.get(value_key)
+        if isinstance(value, bool):
+            return -1.0
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return -1.0
 
     # ── Populate UI from data ───────────────────────────────
 
@@ -3052,6 +3085,10 @@ class ConfigModule(QWidget):
             self._restore_collapsible_section_state(section_state)
             self._restore_selected_channel_tab(selected_channel_index)
             self.services.bus.status.emit("配置已保存")
+            plc_id = loaded.get("plc_id")
+            if plc_id is not None:
+                limit_values = self._plc_limit_values_from_config(loaded)
+                self.services.bus.write_limit_sign.emit(plc_id, limit_values)
             self._mark_editor_snapshot_clean()
             if show_success:
                 QMessageBox.information(self, "保存成功", "配置保存成功！")

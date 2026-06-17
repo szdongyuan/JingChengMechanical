@@ -737,7 +737,7 @@ def test_top_level_config_launchers_open_cards_and_keep_plc_visible(qapp):
             "top_level_current_meter_card_dialog",
         ),
         "open_ai_binding_card": (
-            "AI 工具链绑定",
+            "AI设置",
             "top_level_ai_binding_card_dialog",
         ),
     }
@@ -1170,6 +1170,90 @@ def test_config_confirm_leave_save_persists_without_success_popup(qapp, monkeypa
 
     assert module.confirm_leave() is True
     assert prompts == ["leave"]
+
+
+def test_config_unsaved_prompt_uses_save_discard_and_cancel_buttons(qapp, monkeypatch):
+    module = _make_module(
+        config_service=_ConfigServiceStub(
+            loaded_configs={7: _detail_payload([], config_id=7, config_name="Cfg1")}
+        )
+    )
+    button_calls = []
+
+    class _FakeMessageBox:
+        class Icon:
+            Warning = object()
+
+        class ButtonRole:
+            AcceptRole = object()
+            DestructiveRole = object()
+            RejectRole = object()
+
+        def __init__(self, parent):
+            self.parent = parent
+            self.clicked = object()
+
+        def setIcon(self, icon):
+            self.icon = icon
+
+        def setWindowTitle(self, title):
+            self.title = title
+
+        def setText(self, text):
+            self.text = text
+
+        def addButton(self, text, role):
+            button = object()
+            button_calls.append((text, role, button))
+            return button
+
+        def setDefaultButton(self, button):
+            self.default_button = button
+
+        def setEscapeButton(self, button):
+            self.escape_button = button
+
+        def exec(self):
+            self.clicked = button_calls[1][2]
+
+        def clickedButton(self):
+            return self.clicked
+
+    monkeypatch.setattr("ui.modules.config.QMessageBox", _FakeMessageBox)
+
+    assert module._prompt_unsaved_config_changes("leave") == "discard"
+    assert [text for text, _role, _button in button_calls] == [
+        "保存并继续",
+        "放弃保存",
+        "取消",
+    ]
+    assert button_calls[1][1] is _FakeMessageBox.ButtonRole.DestructiveRole
+
+
+def test_config_confirm_leave_discard_restores_loaded_config_without_saving(
+    qapp,
+    monkeypatch,
+):
+    loaded = {
+        7: _detail_payload([], config_id=7, config_name="Cfg1"),
+    }
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service)
+    qapp.processEvents()
+
+    original_record_duration = module.spin_record.value()
+    module.spin_record.setValue(original_record_duration + 1.0)
+
+    monkeypatch.setattr(
+        module,
+        "_prompt_unsaved_config_changes",
+        lambda action: "discard",
+    )
+
+    assert module.confirm_leave() is True
+    assert config_service.begin_calls == 0
+    assert module.spin_record.value() == pytest.approx(original_record_duration)
+    assert module._has_unsaved_changes() is False
 
 
 def test_config_list_switch_cancel_restores_previous_dirty_config(qapp, monkeypatch):
@@ -2866,6 +2950,8 @@ def test_populate_detail_restores_stft_score_controls(qapp):
         container.findChild(QComboBox, "stft_score_summary_mode").currentData()
         == "mean"
     )
+    summary_combo = container.findChild(QComboBox, "stft_score_summary_mode")
+    assert summary_combo.itemText(summary_combo.findData("percentile")) == "分位数"
     assert container.findChild(
         QDoubleSpinBox, "stft_score_percentile"
     ).value() == pytest.approx(20.0)
@@ -2875,20 +2961,28 @@ def test_populate_detail_restores_stft_score_controls(qapp):
     assert container.findChild(
         QDoubleSpinBox, "stft_score_modulation_reference"
     ).value() == pytest.approx(0.3)
-    assert container.findChild(
-        QDoubleSpinBox, "stft_score_harmonic_ratio_reference"
-    ).value() == pytest.approx(0.4)
-    assert container.findChild(
-        QDoubleSpinBox, "stft_score_frequency_instability_reference"
-    ).value() == pytest.approx(0.08)
+    change_reference = container.findChild(
+        QDoubleSpinBox, "stft_score_modulation_reference"
+    )
+    assert change_reference.decimals() == 5
+    assert change_reference.minimum() == pytest.approx(0.00001)
+    assert change_reference.singleStep() == pytest.approx(0.00001)
     assert (
-        container.findChild(QSpinBox, "stft_score_harmonic_start_order").value()
-        == 3
+        _field_label_text(container, "stft_score_modulation_reference")
+        == "响度变化参考值（sone）"
     )
     assert (
-        container.findChild(QSpinBox, "stft_score_harmonic_end_order").value()
-        == 80
+        container.findChild(QDoubleSpinBox, "stft_score_harmonic_ratio_reference")
+        is None
     )
+    assert (
+        container.findChild(
+            QDoubleSpinBox, "stft_score_frequency_instability_reference"
+        )
+        is None
+    )
+    assert container.findChild(QSpinBox, "stft_score_harmonic_start_order") is None
+    assert container.findChild(QSpinBox, "stft_score_harmonic_end_order") is None
     assert (
         _ancestor_group_title(
             container.findChild(QComboBox, "stft_score_summary_mode")
@@ -2908,12 +3002,6 @@ def test_stft_score_inputs_disable_when_unchecked(qapp):
         container.findChild(QDoubleSpinBox, "stft_score_percentile"),
         container.findChild(QDoubleSpinBox, "stft_score_loudness_reference_sone"),
         container.findChild(QDoubleSpinBox, "stft_score_modulation_reference"),
-        container.findChild(QDoubleSpinBox, "stft_score_harmonic_ratio_reference"),
-        container.findChild(
-            QDoubleSpinBox, "stft_score_frequency_instability_reference"
-        ),
-        container.findChild(QSpinBox, "stft_score_harmonic_start_order"),
-        container.findChild(QSpinBox, "stft_score_harmonic_end_order"),
     ]
 
     assert enabled.isChecked() is True
@@ -2930,7 +3018,19 @@ def test_stft_score_inputs_disable_when_unchecked(qapp):
 
 def test_collect_data_includes_stft_score_fields(qapp):
     module = _make_module()
-    module._populate_detail(_detail_payload([_channel_payload(0)]))
+    module._populate_detail(
+        _detail_payload(
+            [
+                _channel_payload(
+                    0,
+                    stft_score_harmonic_ratio_reference=0.45,
+                    stft_score_frequency_instability_reference=0.09,
+                    stft_score_harmonic_start_order=4,
+                    stft_score_harmonic_end_order=90,
+                )
+            ]
+        )
+    )
     container = module._channel_containers[0]
 
     container.findChild(QCheckBox, "stft_score_enabled").setChecked(False)
@@ -2942,15 +3042,7 @@ def test_collect_data_includes_stft_score_fields(qapp):
     ).setValue(11.5)
     container.findChild(
         QDoubleSpinBox, "stft_score_modulation_reference"
-    ).setValue(0.35)
-    container.findChild(
-        QDoubleSpinBox, "stft_score_harmonic_ratio_reference"
-    ).setValue(0.45)
-    container.findChild(
-        QDoubleSpinBox, "stft_score_frequency_instability_reference"
-    ).setValue(0.09)
-    container.findChild(QSpinBox, "stft_score_harmonic_start_order").setValue(4)
-    container.findChild(QSpinBox, "stft_score_harmonic_end_order").setValue(90)
+    ).setValue(0.00001)
 
     data = module._collect_data()
 
@@ -2959,7 +3051,7 @@ def test_collect_data_includes_stft_score_fields(qapp):
     assert channel["stft_score_summary_mode"] == "min"
     assert channel["stft_score_percentile"] == pytest.approx(25.0)
     assert channel["stft_score_loudness_reference_sone"] == pytest.approx(11.5)
-    assert channel["stft_score_modulation_reference"] == pytest.approx(0.35)
+    assert channel["stft_score_modulation_reference"] == pytest.approx(0.00001)
     assert channel["stft_score_harmonic_ratio_reference"] == pytest.approx(0.45)
     assert channel["stft_score_frequency_instability_reference"] == pytest.approx(
         0.09

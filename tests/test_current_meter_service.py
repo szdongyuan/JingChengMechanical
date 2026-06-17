@@ -9,6 +9,7 @@ from app.service.current_meter_service import (
     CurrentMeterCollector,
     CurrentSample,
     build_current_trace_payload,
+    current_trace_display_at_time,
     decode_current_registers,
     normalize_current_meter_config,
     validate_current_meter_config,
@@ -253,6 +254,78 @@ def test_build_current_trace_payload_sorts_and_clips_analysis_window():
         "latest_a": 3.5,
         "unit": "mA",
     }
+
+
+def test_current_trace_display_at_time_interpolates_between_samples():
+    payload = {
+        "times_sec": [0.0, 1.0, 2.0],
+        "values_a": [1.0, 2.0, 4.0],
+        "average_a": 2.333333,
+        "max_a": 4.0,
+        "latest_a": 4.0,
+        "unit": "mA",
+    }
+
+    assert current_trace_display_at_time(payload, 1.5) == "3.000 mA"
+
+
+def test_current_trace_display_at_time_returns_exact_sample_value():
+    payload = {
+        "times_sec": [0.0, 1.0, 2.0],
+        "values_a": [1.0, 2.0, 4.0],
+        "unit": "mA",
+    }
+
+    assert current_trace_display_at_time(payload, 0.0) == "1.000 mA"
+
+
+def test_current_trace_display_at_time_returns_none_outside_range():
+    payload = {
+        "times_sec": [0.0, 1.0, 2.0],
+        "values_a": [1.0, 2.0, 4.0],
+        "unit": "mA",
+    }
+
+    assert current_trace_display_at_time(payload, -0.1) is None
+    assert current_trace_display_at_time(payload, 2.1) is None
+
+
+@pytest.mark.parametrize(
+    ("payload", "target_time"),
+    [
+        (None, 1.0),
+        ([], 1.0),
+        ({}, 1.0),
+        ({"times_sec": [0.0], "values_a": ["bad"]}, 0.0),
+        ({"times_sec": [0.0], "values_a": [1.0]}, "bad"),
+    ],
+)
+def test_current_trace_display_at_time_returns_none_for_invalid_inputs(
+    payload,
+    target_time,
+):
+    assert current_trace_display_at_time(payload, target_time) is None
+
+
+def test_current_trace_display_at_time_single_sample_requires_exact_match():
+    payload = {
+        "times_sec": [1.0],
+        "values_a": [2.0],
+        "unit": "mA",
+    }
+
+    assert current_trace_display_at_time(payload, 1.0) == "2.000 mA"
+    assert current_trace_display_at_time(payload, 1.5) is None
+
+
+def test_current_trace_display_at_time_omits_empty_unit():
+    payload = {
+        "times_sec": [0.0],
+        "values_a": [1.0],
+        "unit": " ",
+    }
+
+    assert current_trace_display_at_time(payload, 0.0) == "1.000"
 
 
 def test_build_current_trace_payload_includes_default_lingli_current_unit():

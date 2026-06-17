@@ -106,6 +106,22 @@ QLabel#CardTitleMetricValue {
   font-weight: 700;
   padding: 2px 10px;
 }
+QFrame#Card[dashboardCompact="true"] {
+  background: white;
+  border: 0px solid transparent;
+  border-radius: 0px;
+}
+QFrame#Card[dashboardCompact="true"] QLabel#CardTitle {
+  font-size: 12px;
+}
+QFrame#Card[dashboardCompact="true"] QLabel#CardTitleMetricLabel {
+  font-size: 12px;
+}
+QFrame#Card[dashboardCompact="true"] QLabel#CardTitleMetricValue {
+  font-size: 12px;
+  border-radius: 3px;
+  padding: 1px 6px;
+}
 QGroupBox {
   border: 1px solid #e5e7eb;
   border-radius: 10px;
@@ -129,14 +145,14 @@ QLabel#CurrentDevice {
   border-radius: 8px;
 }
 QLabel#ResultBadge {
-  padding: 6px 14px;
-  border-radius: 10px;
+  padding: 2px 12px;
+  border-radius: 8px;
   border: 1px solid #e5e7eb;
   background: #f8fafc;
   color: #334155;
   font-weight: 700;
-  font-size: 26px;
-  min-height: 36px;
+  font-size: 22px;
+  min-height: 28px;
 }
 QLabel#ResultBadge[resultLevel="pass"] {
   border: 1px solid rgba(22, 163, 74, 0.35);
@@ -160,7 +176,7 @@ QLabel#ResultMetricLabel {
 }
 QLabel#ResultMetricValue {
   color: #0f172a;
-  font-size: 18px;
+  font-size: 16px;
   font-weight: 700;
 }
 QWidget#EmptyState { background: transparent; }

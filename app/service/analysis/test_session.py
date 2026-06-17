@@ -519,18 +519,22 @@ class TestSession:
         effective_threshold = envelope_threshold
         score = self._coerce_ai_score(envelope.get("score"))
         ai_label = envelope.get("ai_label")
+        normalized_ai_label = self._normalize_ai_label(ai_label)
+        chinese_label_decision = self._ai_pass_from_chinese_label(normalized_ai_label)
 
         ai_pass = None
         ai_review_status = "success"
         ai_review_error = None
 
-        if score is not None:
+        if score is not None and chinese_label_decision is not None:
+            ai_pass = chinese_label_decision
+        elif score is not None:
             if effective_threshold is not None:
                 ai_pass = (score >= effective_threshold)
             else:
                 ai_review_error = "AI decision threshold unavailable"
-        elif isinstance(ai_label, str):
-            label = ai_label.strip().upper()
+        elif isinstance(normalized_ai_label, str):
+            label = normalized_ai_label.upper()
             if label == "PASS":
                 ai_pass = True
                 ai_review_status = "missing_score"
@@ -552,12 +556,15 @@ class TestSession:
             ai_review_status = "missing_score"
             ai_review_error = "AI score and usable AI label are unavailable"
 
+        review_threshold = None if chinese_label_decision is not None else effective_threshold
         self._last_ai_review = self._make_ai_review(
             status=ai_review_status,
-            threshold=effective_threshold,
+            threshold=review_threshold,
             score=score,
             channel_index=channel_index,
             error_message=ai_review_error,
+            ai_label=normalized_ai_label,
+            passed=ai_pass,
         )
 
         result.ai_pass = ai_pass
@@ -800,6 +807,26 @@ class TestSession:
         return fallback
 
     @staticmethod
+    def _normalize_ai_label(label) -> str | None:
+        if not isinstance(label, str):
+            return None
+        normalized = label.strip()
+        return normalized or None
+
+    @classmethod
+    def _ai_pass_from_chinese_label(cls, label: str | None) -> bool | None:
+        if label is None or not cls._contains_cjk(label):
+            return None
+        normalized = label.strip()
+        if normalized in {"通过", "合格", "正常"}:
+            return True
+        return False
+
+    @staticmethod
+    def _contains_cjk(text: str) -> bool:
+        return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+    @staticmethod
     def _make_ai_review(
         *,
         status: str,
@@ -807,6 +834,8 @@ class TestSession:
         score: float | None,
         channel_index: int | None,
         error_message: str | None,
+        ai_label: str | None = None,
+        passed: bool | None = None,
     ) -> dict[str, Any]:
         return {
             "status": status,
@@ -814,4 +843,6 @@ class TestSession:
             "score": score,
             "channel_index": channel_index,
             "error_message": error_message,
+            "ai_label": ai_label,
+            "passed": passed,
         }

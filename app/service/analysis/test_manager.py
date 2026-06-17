@@ -25,6 +25,7 @@ from app.service.analysis.monitor_playback import (
     OneShotReplayPlayer,
 )
 from app.service.analysis.review_payloads import (
+    attach_event_current_labels,
     attach_stft_score_summary,
     build_chart_payload,
     build_summary_payload,
@@ -960,6 +961,7 @@ class TestManager(QObject):
             judgment_payload=result_dict,
             chart_payload=chart_payload,
         )
+        attach_event_current_labels(summary_payload, chart_payload)
         self._bus.test_finished.emit(config_id, result_dict)
         self._bus.result_changed.emit(result_dict)
         self._emit_optional_signal(
@@ -1314,6 +1316,7 @@ class TestManager(QObject):
                 judgment_payload=result_dict,
                 chart_payload=chart_payload,
             )
+            attach_event_current_labels(summary_payload, chart_payload)
             if not self._auto_analysis_review_still_owned(
                 config_id,
                 session,

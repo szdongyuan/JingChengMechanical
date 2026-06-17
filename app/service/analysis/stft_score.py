@@ -205,7 +205,7 @@ def compute_stft_score_payload(
 
     summary = summary_score(
         score_array,
-        mode=config["stft_score_summary_mode"],
+        mode="min",
         percentile=config["stft_score_percentile"],
     )
     if summary is None:
@@ -216,7 +216,7 @@ def compute_stft_score_payload(
         "summary_score": float(summary),
         "times_sec": [float(value) for value in absolute_times],
         "scores": [float(value) for value in score_array],
-        "summary_mode": config["stft_score_summary_mode"],
+        "summary_mode": "min",
         "percentile": float(config["stft_score_percentile"]),
     }
 

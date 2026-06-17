@@ -16,6 +16,7 @@ from app.service.analysis.limit_tables import (
     normalize_limit_tables,
 )
 from app.service.analysis.vibration_payloads import build_vibration_payload
+from app.service.current_meter_service import current_trace_display_at_time
 
 _SUMMARY_ROW_DEFS = (
     ("spl", "SPL"),
@@ -24,7 +25,7 @@ _SUMMARY_ROW_DEFS = (
     ("loudness_average", "平均Loudness"),
     ("fft", "FFT"),
     ("octave", "倍频程"),
-    ("stft_score", "频谱平均评分"),
+    ("stft_score", "频谱最低得分"),
     ("ai", "AI分析"),
 )
 _NO_RESULT_FALLBACK_MESSAGE = "分析结果不可用"
@@ -140,7 +141,7 @@ def build_summary_payload(
         ai_row,
     ]
     overall_status = _overall_status(rows)
-    return {
+    summary_payload = {
         "overall_status": overall_status,
         "overall_label": _overall_label(overall_status),
         "error_message": (
@@ -159,6 +160,8 @@ def build_summary_payload(
         ),
         "rows": rows,
     }
+    attach_event_current_labels(summary_payload, chart_payload)
+    return summary_payload
 
 
 def build_chart_payload(
@@ -912,17 +915,65 @@ def attach_stft_score_summary(
         judgment_payload=judgment_payload,
         chart_payload=chart_payload,
     )
+    replaced = False
     for index, existing in enumerate(rows):
         if isinstance(existing, dict) and existing.get("item_key") == "stft_score":
             rows[index] = row
-            return summary_payload
-
-    insert_index = len(rows)
-    for index, existing in enumerate(rows):
-        if isinstance(existing, dict) and existing.get("item_key") == "ai":
-            insert_index = index
+            replaced = True
             break
-    rows.insert(insert_index, row)
+
+    if not replaced:
+        insert_index = len(rows)
+        for index, existing in enumerate(rows):
+            if isinstance(existing, dict) and existing.get("item_key") == "ai":
+                insert_index = index
+                break
+        rows.insert(insert_index, row)
+    attach_event_current_labels(summary_payload, chart_payload)
+    return summary_payload
+
+
+def attach_event_current_labels(
+    summary_payload: dict,
+    chart_payload: dict | None,
+) -> dict:
+    if not isinstance(summary_payload, dict):
+        return summary_payload
+    rows = summary_payload.get("rows")
+    if not isinstance(rows, list):
+        return summary_payload
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        item_key = row.get("item_key")
+        if item_key == "spl":
+            _apply_event_current_label(
+                row,
+                chart_payload,
+                payload_key="spl",
+                time_key="times_sec",
+                value_key="values_db",
+                use_minimum=False,
+            )
+        elif item_key == "loudness":
+            _apply_event_current_label(
+                row,
+                chart_payload,
+                payload_key="loudness",
+                time_key="times_sec",
+                value_key="values",
+                use_minimum=False,
+            )
+        elif item_key == "stft_score":
+            _apply_event_current_label(
+                row,
+                chart_payload,
+                payload_key="stft_score",
+                time_key="times_sec",
+                value_key="scores",
+                use_minimum=True,
+            )
     return summary_payload
 
 
@@ -945,7 +996,7 @@ def _build_stft_score_summary_row(
         if score is not None and math.isfinite(score):
             return _build_row(
                 item_key="stft_score",
-                label="频谱平均评分",
+                label="频谱最低得分",
                 deviation_value=None,
                 actual_value=score,
                 actual_display=_format_actual_number(score),
@@ -957,7 +1008,7 @@ def _build_stft_score_summary_row(
 
     return _build_row(
         item_key="stft_score",
-        label="频谱平均评分",
+        label="频谱最低得分",
         deviation_value=None,
         actual_value=None,
         channel_index=channel_index,
@@ -971,15 +1022,117 @@ def _stft_score_payload_for_channel(
     chart_payload: dict | None,
     channel_index: int | None,
 ) -> dict | None:
+    channel_payload = _channel_payload_for_channel(chart_payload, channel_index)
+    if not isinstance(channel_payload, dict):
+        return None
+    score_payload = channel_payload.get("stft_score")
+    return score_payload if isinstance(score_payload, dict) else None
+
+
+def _apply_event_current_label(
+    row: dict,
+    chart_payload: dict | None,
+    *,
+    payload_key: str,
+    time_key: str,
+    value_key: str,
+    use_minimum: bool,
+) -> None:
+    channel_index = row.get("channel_index") if isinstance(row, dict) else None
+    channel_payload = _channel_payload_for_channel(chart_payload, channel_index)
+    event_payload = (
+        channel_payload.get(payload_key)
+        if isinstance(channel_payload, dict)
+        else None
+    )
+    if use_minimum:
+        event_time = _first_time_for_min_value(event_payload, time_key, value_key)
+    else:
+        event_time = _first_time_for_max_value(event_payload, time_key, value_key)
+    row["channel_label"] = _current_display_for_channel_event(
+        chart_payload,
+        channel_index,
+        event_time,
+    )
+
+
+def _channel_payload_for_channel(
+    chart_payload: dict | None,
+    channel_index,
+) -> dict | None:
     if channel_index is None or not isinstance(chart_payload, dict):
         return None
     channel_payload = chart_payload.get(channel_index)
     if not isinstance(channel_payload, dict):
         channel_payload = chart_payload.get(str(channel_index))
-    if not isinstance(channel_payload, dict):
+    return channel_payload if isinstance(channel_payload, dict) else None
+
+
+def _finite_pairs(times, values) -> list[tuple[float, float]]:
+    if isinstance(times, (str, bytes)) or isinstance(values, (str, bytes)):
+        return []
+    try:
+        pairs = zip(times, values)
+    except TypeError:
+        return []
+
+    finite_pairs = []
+    for time_sec, value in pairs:
+        time_value = _coerce_number(time_sec)
+        finite_value = _coerce_number(value)
+        if time_value is not None and finite_value is not None:
+            finite_pairs.append((time_value, finite_value))
+    return finite_pairs
+
+
+def _first_time_for_max_value(
+    payload: dict | None,
+    time_key: str,
+    value_key: str,
+) -> float | None:
+    if not isinstance(payload, dict):
         return None
-    score_payload = channel_payload.get("stft_score")
-    return score_payload if isinstance(score_payload, dict) else None
+    pairs = _finite_pairs(payload.get(time_key), payload.get(value_key))
+    if not pairs:
+        return None
+    maximum = max(value for _time_sec, value in pairs)
+    for time_sec, value in pairs:
+        if value == maximum:
+            return time_sec
+    return None
+
+
+def _first_time_for_min_value(
+    payload: dict | None,
+    time_key: str,
+    value_key: str,
+) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    pairs = _finite_pairs(payload.get(time_key), payload.get(value_key))
+    if not pairs:
+        return None
+    minimum = min(value for _time_sec, value in pairs)
+    for time_sec, value in pairs:
+        if value == minimum:
+            return time_sec
+    return None
+
+
+def _current_display_for_channel_event(
+    chart_payload: dict | None,
+    channel_index,
+    event_time: float | None,
+) -> str:
+    if event_time is None:
+        return "--"
+    channel_payload = _channel_payload_for_channel(chart_payload, channel_index)
+    current_trace = (
+        channel_payload.get("current_trace")
+        if isinstance(channel_payload, dict)
+        else None
+    )
+    return current_trace_display_at_time(current_trace, event_time) or "--"
 
 
 def _build_ai_row(
@@ -993,6 +1146,8 @@ def _build_ai_row(
     status = str(ai_review.get("status") or "").strip().lower()
     threshold = _coerce_number(ai_review.get("threshold"))
     score = _coerce_number(ai_review.get("score"))
+    passed = ai_review.get("passed")
+    ai_label = _normalize_ai_label(ai_review.get("ai_label"))
     channel_index = _normalize_ai_channel_index(
         ai_review.get("channel_index"),
         selected_channels=selected_channels,
@@ -1002,26 +1157,37 @@ def _build_ai_row(
         return _build_unconstrained_row("ai", "AI分析"), None
     if status == "" and threshold is None:
         return _build_unconstrained_row("ai", "AI分析"), None
-    if status == "success" and score is not None and threshold is None:
+    if (
+        status == "success"
+        and score is not None
+        and threshold is None
+        and not isinstance(passed, bool)
+    ):
         return (
             _build_constrained_no_result_row("ai", "AI分析", channel_index=channel_index),
             "AI decision threshold unavailable",
         )
-    if status == "success" and score is not None and threshold is not None:
+    if status == "success" and score is not None and (
+        threshold is not None or isinstance(passed, bool)
+    ):
         deviation = _compute_deviation(actual=score, lower=threshold, upper=None)
-        return (
-            _build_row(
-                item_key="ai",
-                label="AI分析",
-                deviation_value=deviation,
-                actual_value=score,
-                channel_index=channel_index,
-                status=_status_from_deviation(deviation),
-                constrained=True,
-                unit=None,
-            ),
-            None,
+        row_status = (
+            ("OK" if passed else "NG")
+            if isinstance(passed, bool)
+            else _status_from_deviation(deviation)
         )
+        row = _build_row(
+            item_key="ai",
+            label="AI分析",
+            deviation_value=deviation,
+            actual_value=score,
+            channel_index=channel_index,
+            status=row_status,
+            constrained=True,
+            unit=None,
+        )
+        _attach_ai_fault_label(row, ai_label=ai_label)
+        return row, None
     return (
         _build_row(
             item_key="ai",
@@ -1035,6 +1201,22 @@ def _build_ai_row(
         ),
         _normalize_error_message(ai_review.get("error_message")),
     )
+
+
+def _normalize_ai_label(label) -> str | None:
+    if not isinstance(label, str):
+        return None
+    normalized = label.strip()
+    return normalized or None
+
+
+def _attach_ai_fault_label(row: dict, *, ai_label: str | None) -> None:
+    if row.get("status") != "NG" or not ai_label:
+        return
+    if ai_label in {"通过", "合格", "正常", "PASS", "OK"}:
+        return
+    row["failure_label"] = ai_label
+    row["result_display"] = f"NG（{ai_label}）"
 
 
 def _build_row_from_candidate(
@@ -3140,6 +3322,7 @@ def _loudness_limits_sone(
 
 
 __all__ = [
+    "attach_event_current_labels",
     "attach_stft_score_summary",
     "build_chart_payload",
     "build_summary_payload",

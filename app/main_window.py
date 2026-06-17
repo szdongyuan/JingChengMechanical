@@ -41,11 +41,11 @@ from ui.modules.delete_user import DeleteUserWindow
 
 ROLE_PERMISSIONS = {
     "管理员": {
-        "tabs": {"测试", "数据管理", "配置", "AI工具管理", "硬件"},
+        "tabs": {"测试", "数据管理", "配置", "AI管理", "硬件"},
         "actions": {"切换用户", "添加用户", "删除用户", "修改密码"},
     },
     "工程师": {
-        "tabs": {"测试", "数据管理", "配置", "AI工具管理", "硬件"},
+        "tabs": {"测试", "数据管理", "配置", "AI管理", "硬件"},
         "actions": {"切换用户", "修改密码"},
     },
     "操作员": {
@@ -106,7 +106,7 @@ class MainWindow(QMainWindow):
 
         self._connect_bus_signals()
 
-        # 页面：测试/数据管理/配置/AI工具管理/硬件
+        # 页面：测试/数据管理/配置/AI管理/硬件
         self.tab.addWidget(self.build_test_page())
         self.tab.addWidget(self.build_data_page())
         self.tab.addWidget(self.build_config_page())
@@ -207,7 +207,7 @@ class MainWindow(QMainWindow):
             group.addButton(b)
             lay.addWidget(b)
             return b
-        self.tab_names = ["测试", "数据管理", "配置", "AI工具管理", "硬件"]
+        self.tab_names = ["测试", "数据管理", "配置", "AI管理", "硬件"]
         for i, name in enumerate(self.tab_names):
             b = add_tab(name, checked=(i == 0))
             self.top_button_dict[name] = b
@@ -370,7 +370,7 @@ class MainWindow(QMainWindow):
         lay.setSpacing(0)
 
         self.ai_tool_management_module = AiToolManagementModule(self.services)
-        lay.addWidget(Card("AI工具管理", self.ai_tool_management_module), 1)
+        lay.addWidget(Card("AI管理", self.ai_tool_management_module), 1)
         return page
 
     def build_hardware_page(self) -> QWidget:
@@ -612,11 +612,9 @@ class MainWindow(QMainWindow):
         return None
 
     def _can_leave_main_tab(self, index: int | None) -> bool:
-        if index != self._ai_tool_management_tab_index():
-            return True
-
+        guarded_module = self._guarded_main_tab_module(index)
         confirm_leave = getattr(
-            getattr(self, "ai_tool_management_module", None),
+            guarded_module,
             "confirm_leave",
             None,
         )
@@ -624,9 +622,22 @@ class MainWindow(QMainWindow):
             return bool(confirm_leave())
         return True
 
+    def _guarded_main_tab_module(self, index: int | None):
+        if index == self._config_tab_index():
+            return getattr(self, "config_module", None)
+        if index == self._ai_tool_management_tab_index():
+            return getattr(self, "ai_tool_management_module", None)
+        return None
+
+    def _config_tab_index(self) -> int | None:
+        try:
+            return self.tab_names.index("配置")
+        except ValueError:
+            return None
+
     def _ai_tool_management_tab_index(self) -> int | None:
         try:
-            return self.tab_names.index("AI工具管理")
+            return self.tab_names.index("AI管理")
         except ValueError:
             return None
 
@@ -950,7 +961,7 @@ class MainWindow(QMainWindow):
             self.loudness_card.set_title(title)
 
     def _set_stft_score_title(self, text: str) -> None:
-        self.stft_card.set_title_metric("频谱平均得分：", self._stft_score_value(text))
+        self.stft_card.set_title_metric("频谱最低得分：", self._stft_score_value(text))
 
     @staticmethod
     def _stft_score_value(text: str) -> str:
@@ -981,8 +992,8 @@ class MainWindow(QMainWindow):
             self.loudness_stack.setCurrentWidget(self.vibration_axis)
             self.spl_stack.setCurrentWidget(self.vibration_trend)
         else:
-            self.stft_card.set_title("时频图")
-            self.spectrum_card.set_title("频谱")
+            self.stft_card.set_title("时频图（频率Hz，幅值dB）")
+            self.spectrum_card.set_title("频谱（dB）")
             self.loudness_card.set_title(self.loudness.current_title())
             self.spl_card.set_title("声压级（dB）")
             self.octave_card.set_title("倍频程（dB）")
@@ -1000,7 +1011,7 @@ class MainWindow(QMainWindow):
             set_vibration_mode(enabled)
 
     def closeEvent(self, event: QCloseEvent):
-        if not self._can_leave_main_tab(self._ai_tool_management_tab_index()):
+        if not self._can_leave_main_tab(self.tab.currentIndex()):
             event.ignore()
             return
         self.services.bus.log.emit("[App] 关闭程序")

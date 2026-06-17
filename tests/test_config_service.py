@@ -2447,7 +2447,7 @@ def test_validate_rejects_invalid_stft_score_percentile(percentile):
     ("field", "label"),
     [
         ("stft_score_loudness_reference_sone", "响度参考值"),
-        ("stft_score_modulation_reference", "调制参考值"),
+        ("stft_score_modulation_reference", "响度变化参考值"),
         ("stft_score_harmonic_ratio_reference", "谐波占比参考值"),
         ("stft_score_frequency_instability_reference", "频率不稳定参考值"),
     ],

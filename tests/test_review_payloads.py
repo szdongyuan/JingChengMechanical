@@ -875,7 +875,7 @@ def test_build_summary_payload_aggregates_selected_acoustic_channels_for_summary
         "平均Loudness",
         "FFT",
         "倍频程",
-        "频谱平均评分",
+        "频谱最低得分",
         "AI分析",
     ]
     assert summary["rows"][0]["label"] == "SPL"
@@ -884,12 +884,12 @@ def test_build_summary_payload_aggregates_selected_acoustic_channels_for_summary
     assert summary["rows"][0]["deviation_display"] == "6 dB"
     assert summary["rows"][0]["actual_display"] == "86.00 dB"
     assert summary["rows"][0]["channel_index"] == 1
-    assert summary["rows"][0]["channel_label"] == "CH2"
+    assert summary["rows"][0]["channel_label"] == "--"
     assert summary["rows"][0]["status"] == "NG"
     assert summary["rows"][0]["constrained"] is True
     assert summary["rows"][2]["label"] == "Loudness"
     assert summary["rows"][2]["channel_index"] == 1
-    assert summary["rows"][2]["channel_label"] == "CH2"
+    assert summary["rows"][2]["channel_label"] == "--"
     assert summary["rows"][2]["status"] == "NG"
     assert summary["rows"][4]["label"] == "FFT"
     assert summary["rows"][4]["deviation_value"] == 5.0
@@ -921,11 +921,11 @@ def test_build_summary_payload_reports_primary_mic_when_vibration_channel_is_wor
         "stft_score",
         "ai",
     ]
-    assert summary["rows"][0]["channel_label"] == "CH1"
+    assert summary["rows"][0]["channel_label"] == "--"
     assert summary["rows"][0]["status"] == "OK"
     assert summary["rows"][0]["actual_value"] == pytest.approx(77.0)
     assert summary["rows"][0]["actual_display"] == "77.00 dB"
-    assert summary["rows"][2]["channel_label"] == "CH1"
+    assert summary["rows"][2]["channel_label"] == "--"
     assert summary["rows"][2]["actual_value"] == pytest.approx(2.0)
     assert summary["rows"][2]["actual_display"] == "2.00 sone"
     assert summary["rows"][4]["channel_label"] == "CH1"
@@ -933,6 +933,108 @@ def test_build_summary_payload_reports_primary_mic_when_vibration_channel_is_wor
     assert summary["rows"][4]["actual_frequency_hz"] == pytest.approx(1000.0)
     assert summary["rows"][4]["actual_display"] == "57.00 dB @ 1000 Hz"
     assert summary["rows"][5]["actual_display"] == "55.00 dB @ 500 Hz"
+
+
+def test_build_summary_payload_sets_peak_rows_channel_label_to_current_at_event():
+    config = _make_single_channel_config(
+        spl_lower_limit=40.0,
+        spl_upper_limit=80.0,
+        loudness_lower_limit=1.0,
+        loudness_upper_limit=10.0,
+    )
+    judgment_payload = _make_single_channel_judgment_payload(
+        spl_db=70.0,
+        spl_min_db=60.0,
+        spl_max_db=77.0,
+        loudness_max_sone=7.0,
+    )
+    chart_payload = {
+        0: {
+            "spl": {"times_sec": [0.0, 1.0, 2.0], "values_db": [60.0, 77.0, 70.0]},
+            "loudness": {
+                "times_sec": [0.0, 1.0, 2.0],
+                "values": [2.0, 7.0, 5.0],
+                "unit": "sone",
+            },
+            "current_trace": {
+                "times_sec": [0.0, 2.0],
+                "values_a": [1.0, 3.0],
+                "average_a": 2.0,
+                "max_a": 3.0,
+                "latest_a": 3.0,
+                "unit": "mA",
+            },
+        }
+    }
+
+    summary = build_summary_payload(
+        config=config,
+        judgment_payload=judgment_payload,
+        chart_payload=chart_payload,
+    )
+
+    assert summary["rows"][0]["item_key"] == "spl"
+    assert summary["rows"][0]["channel_label"] == "2.000 mA"
+    assert summary["rows"][0]["channel_index"] == 0
+    assert summary["rows"][2]["item_key"] == "loudness"
+    assert summary["rows"][2]["channel_label"] == "2.000 mA"
+    assert summary["rows"][2]["channel_index"] == 0
+    assert summary["rows"][1]["channel_label"] == "CH1"
+
+    chart_payload[0].pop("current_trace")
+
+    summary = build_summary_payload(
+        config=config,
+        judgment_payload=judgment_payload,
+        chart_payload=chart_payload,
+    )
+
+    assert summary["rows"][0]["channel_label"] == "--"
+
+
+def test_attach_stft_score_summary_sets_channel_label_to_current_at_min_score():
+    config = _make_config()
+    config["vibration_view_channel_index"] = 1
+    summary = build_summary_payload(
+        config=config,
+        judgment_payload=_make_judgment_payload(),
+    )
+
+    attach_stft_score_summary(
+        summary,
+        config=config,
+        judgment_payload=_make_judgment_payload(),
+        chart_payload={
+            0: {
+                "stft_score": {
+                    "enabled": True,
+                    "summary_score": 72.0,
+                    "times_sec": [0.0, 1.0, 2.0],
+                    "scores": [90.0, 72.0, 80.0],
+                },
+                "current_trace": {
+                    "times_sec": [0.0, 2.0],
+                    "values_a": [1.0, 3.0],
+                    "average_a": 2.0,
+                    "max_a": 3.0,
+                    "latest_a": 3.0,
+                    "unit": "mA",
+                },
+            },
+            1: {
+                "stft_score": {"enabled": True, "summary_score": 12.0},
+            },
+        },
+    )
+
+    score_row = summary["rows"][6]
+    assert score_row["item_key"] == "stft_score"
+    assert score_row["channel_label"] == "2.000 mA"
+    assert score_row["channel_index"] == 0
+    assert score_row["actual_value"] == pytest.approx(72.0)
+    assert score_row["actual_display"] == "72.00"
+    assert score_row["status"] == "OK"
+    assert score_row["constrained"] is False
 
 
 def test_attach_stft_score_summary_uses_primary_mic_and_ignores_vibration_score():
@@ -954,8 +1056,8 @@ def test_attach_stft_score_summary_uses_primary_mic_and_ignores_vibration_score(
 
     score_row = summary["rows"][6]
     assert score_row["item_key"] == "stft_score"
-    assert score_row["label"] == "频谱平均评分"
-    assert score_row["channel_label"] == "CH1"
+    assert score_row["label"] == "频谱最低得分"
+    assert score_row["channel_label"] == "--"
     assert score_row["actual_value"] == pytest.approx(86.456)
     assert score_row["actual_display"] == "86.46"
     assert score_row["status"] == "OK"
@@ -1017,7 +1119,7 @@ def test_build_summary_payload_handles_bounded_pass_margin_and_exact_boundary():
     assert summary["rows"][2]["deviation_value"] == -2.0
     assert summary["rows"][2]["deviation_display"] == "-2 sone"
     assert summary["rows"][2]["actual_display"] == "2.00 sone"
-    assert summary["rows"][2]["channel_label"] == "CH1"
+    assert summary["rows"][2]["channel_label"] == "--"
     assert summary["rows"][2]["status"] == "OK"
     assert summary["rows"][3]["label"] == "平均Loudness"
     assert summary["rows"][3]["deviation_value"] == -4.0
@@ -1050,6 +1152,29 @@ def test_build_summary_payload_uses_ai_threshold_for_numeric_success():
     assert summary["rows"][-1]["deviation_display"] == "0.02"
     assert summary["rows"][-1]["status"] == "NG"
     assert summary["rows"][-1]["constrained"] is True
+
+
+def test_build_summary_payload_displays_chinese_ai_defect_label_with_score():
+    summary = build_summary_payload(
+        config=_make_ai_only_config(),
+        judgment_payload=_make_ai_only_judgment_payload(ai_pass=False, ai_score=0.91),
+        ai_review={
+            "status": "success",
+            "threshold": 0.5,
+            "score": 0.91,
+            "passed": False,
+            "ai_label": "嗡嗡音",
+        },
+    )
+
+    ai_row = summary["rows"][-1]
+    assert summary["overall_status"] == "fail"
+    assert ai_row["label"] == "AI分析"
+    assert ai_row["actual_display"] == "0.91"
+    assert ai_row["status"] == "NG"
+    assert ai_row["failure_label"] == "嗡嗡音"
+    assert ai_row["result_display"] == "NG（嗡嗡音）"
+    assert ai_row["constrained"] is True
 
 
 def test_build_summary_payload_keeps_scoreless_success_with_ai_threshold_as_no_result_even_when_judgment_used_ai_label():
@@ -1157,7 +1282,7 @@ def test_build_summary_payload_renders_unconstrained_rows_and_scoreless_success_
     assert summary["rows"][5]["label"] == "倍频程"
     assert summary["rows"][5]["status"] == "OK"
     assert summary["rows"][5]["deviation_display"] == "--"
-    assert summary["rows"][6]["label"] == "频谱平均评分"
+    assert summary["rows"][6]["label"] == "频谱最低得分"
     assert summary["rows"][6]["status"] == "OK"
     assert summary["rows"][6]["constrained"] is False
     assert summary["rows"][7]["label"] == "AI分析"
@@ -1984,7 +2109,7 @@ def test_build_summary_payload_uses_canonical_sone_ranking_for_loudness_but_disp
 
     assert summary["rows"][2]["label"] == "Loudness"
     assert summary["rows"][2]["channel_index"] == 1
-    assert summary["rows"][2]["channel_label"] == "CH2"
+    assert summary["rows"][2]["channel_label"] == "--"
     assert summary["rows"][2]["status"] == "NG"
     assert summary["rows"][2]["deviation_value"] == pytest.approx(10.0)
     assert summary["rows"][2]["deviation_display"] == "10 phon"
@@ -2191,7 +2316,7 @@ def test_build_summary_payload_keeps_loudness_row_ng_when_serialized_loudness_pa
     assert summary["rows"][2]["deviation_value"] == -5.0
     assert summary["rows"][2]["deviation_display"] == "-5 sone"
     assert summary["rows"][2]["status"] == "NG"
-    assert summary["rows"][2]["channel_label"] == "CH1"
+    assert summary["rows"][2]["channel_label"] == "--"
 
 
 def test_build_summary_payload_ranks_loudness_using_unrounded_raw_canonical_deviation():
@@ -2287,7 +2412,7 @@ def test_build_summary_payload_ranks_loudness_using_unrounded_raw_canonical_devi
     assert summary["overall_status"] == "pass"
     assert summary["rows"][2]["label"] == "Loudness"
     assert summary["rows"][2]["channel_index"] == 1
-    assert summary["rows"][2]["channel_label"] == "CH2"
+    assert summary["rows"][2]["channel_label"] == "--"
     assert summary["rows"][2]["deviation_value"] == -1e-06
     assert summary["rows"][2]["deviation_display"] == "-1e-06 sone"
     assert summary["rows"][4]["status"] == "OK"
@@ -2402,7 +2527,7 @@ def test_build_summary_payload_renders_eight_no_result_rows_for_full_no_result()
         "平均Loudness",
         "FFT",
         "倍频程",
-        "频谱平均评分",
+        "频谱最低得分",
         "AI分析",
     ]
     assert len(summary["rows"]) == 8

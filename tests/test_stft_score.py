@@ -176,6 +176,56 @@ def test_compute_stft_score_returns_summary_and_frame_scores_for_stable_signal()
     assert min(payload["times_sec"]) >= 1.0
 
 
+@pytest.mark.parametrize("configured_mode", ["mean", "percentile"])
+def test_compute_stft_score_payload_always_reports_minimum_summary(
+    monkeypatch,
+    configured_mode,
+):
+    score_times = np.array([0.20, 0.40, 0.60], dtype=np.float64)
+    trace_times = np.arange(
+        0.0,
+        0.900 + 1e-12,
+        1.0 / stft_score.dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ,
+    )
+    trace_values = np.interp(trace_times, [0.0, 0.90], [2.0, 8.0])
+    _patch_single_frame_stft(monkeypatch, times=score_times)
+    monkeypatch.setattr(
+        stft_score.dsp,
+        "compute_loudness_trace",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cached loudness trace must be reused")
+        ),
+    )
+    monkeypatch.setattr(
+        stft_score.dsp,
+        "compute_loudness_trace_for_window",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("cached contextual loudness trace must be reused")
+        ),
+    )
+
+    payload = stft_score.compute_stft_score_payload(
+        signal=np.ones(int(0.9 * 2000), dtype=np.float64),
+        sample_rate=2000.0,
+        stft_nfft=16,
+        stft_overlap=0.5,
+        score_config=_default_config(
+            stft_score_summary_mode=configured_mode,
+            stft_score_percentile=50.0,
+            stft_score_loudness_reference_sone=10.0,
+            stft_score_modulation_reference=2.0,
+        ),
+        absolute_start_sec=0.0,
+        loudness_trace=_loudness_trace_entry(trace_times, trace_values),
+    )
+
+    assert payload is not None
+    assert payload["scores"]
+    assert max(payload["scores"]) > min(payload["scores"])
+    assert payload["summary_score"] == pytest.approx(min(payload["scores"]))
+    assert payload["summary_mode"] == "min"
+
+
 def test_stft_score_interpolates_from_internal_loudness_trace_without_display_downsampling(monkeypatch):
     internal_times = (np.arange(7, dtype=np.float64) / 150.0).tolist()
     internal_values = [1.0, 10.0, 2.0, 8.0, 3.0, 7.0, 4.0]
