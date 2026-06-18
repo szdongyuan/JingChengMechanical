@@ -50,8 +50,13 @@ class HistoricalMetricReportService:
     def current_calibration_hash(self) -> str:
         return self._cache.current_calibration_hash()
 
-    def source_signature_for_record(self, record: AudioDataTable) -> SourceSignature:
-        return self._cache.source_signature_for_record(record)
+    def source_signature_for_record(
+        self,
+        record: AudioDataTable,
+        *,
+        mic_cal: dict | None = None,
+    ) -> SourceSignature:
+        return self._cache.source_signature_for_record(record, mic_cal=mic_cal)
 
     def generate_report(
         self,
@@ -71,10 +76,18 @@ class HistoricalMetricReportService:
             if cancel_check is not None and cancel_check():
                 raise ReportCanceled()
 
-            signature = self._cache.source_signature_for_record(record)
+            mic_cal = self._cache.current_mic_calibration()
+            signature = self._cache.source_signature_for_record(
+                record,
+                mic_cal=mic_cal,
+            )
             cache_rows = self._cache.valid_cache_rows_for_record(record, signature)
             if not cache_rows:
-                cache_rows = self._cache.refresh_record_cache(record, signature)
+                cache_rows = self._cache.refresh_record_cache(
+                    record,
+                    signature,
+                    mic_cal=mic_cal,
+                )
             converted = [
                 self._cache_row_to_metric_value(record, row) for row in cache_rows
             ]

@@ -33,8 +33,10 @@ class HistoricalMetricCacheComputer:
         mic_cal = devices.get("mic_cal") if isinstance(devices, dict) else None
         return mic_cal if isinstance(mic_cal, dict) else {}
 
-    def current_calibration_hash(self) -> str:
-        return _stable_hash(self.current_mic_calibration())
+    def current_calibration_hash(self, mic_cal: dict | None = None) -> str:
+        if mic_cal is None:
+            mic_cal = self.current_mic_calibration()
+        return _stable_hash(mic_cal)
 
     def config_hash(self, config_content: object) -> str:
         text = "" if config_content is None else str(config_content)
@@ -46,7 +48,12 @@ class HistoricalMetricCacheComputer:
             return "__invalid_config__:" + _sha256_text(text)
         return _stable_hash(parsed)
 
-    def source_signature_for_record(self, record: AudioDataTable) -> SourceSignature:
+    def source_signature_for_record(
+        self,
+        record: AudioDataTable,
+        *,
+        mic_cal: dict | None = None,
+    ) -> SourceSignature:
         normalized_path = _normalize_file_path(record.file_path)
         file_size, file_mtime_ns = _file_identity(normalized_path)
         return SourceSignature(
@@ -54,7 +61,7 @@ class HistoricalMetricCacheComputer:
             file_size=file_size,
             file_mtime_ns=file_mtime_ns,
             config_hash=self.config_hash(record.config_content),
-            calibration_hash=self.current_calibration_hash(),
+            calibration_hash=self.current_calibration_hash(mic_cal),
             algorithm_version=self._algorithm_version,
         )
 
@@ -87,8 +94,16 @@ class HistoricalMetricCacheComputer:
         self,
         record: AudioDataTable,
         signature: SourceSignature,
+        *,
+        mic_cal: dict | None = None,
     ) -> list[HistoricalMetricCacheTable]:
-        rows = self._compute_record_cache_rows(record, signature)
+        if mic_cal is None:
+            mic_cal = self.current_mic_calibration()
+        signature = replace(
+            signature,
+            calibration_hash=self.current_calibration_hash(mic_cal),
+        )
+        rows = self._compute_record_cache_rows(record, signature, mic_cal)
         database = HistoricalMetricCacheTable._meta.database
         with database.atomic():
             HistoricalMetricCacheTable.delete().where(
@@ -139,6 +154,7 @@ class HistoricalMetricCacheComputer:
         self,
         record: AudioDataTable,
         signature: SourceSignature,
+        mic_cal: dict,
     ) -> list[dict[str, object]]:
         config_result = _parse_config(record.config_content)
         if isinstance(config_result, str):
@@ -199,7 +215,6 @@ class HistoricalMetricCacheComputer:
             selected_channel: column_index
             for column_index, selected_channel in enumerate(selected_channels)
         }
-        mic_cal = self.current_mic_calibration()
         loudness_trace_cache: dict[int, dict] = {}
         try:
             judgment_result = self._judgment_engine.rejudge(

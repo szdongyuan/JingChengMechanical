@@ -1,3 +1,4 @@
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -129,6 +130,68 @@ def test_calibration_hash_changes_with_mic_calibration():
     assert _service({"In1": {"sensitivity": 1.0}}).current_calibration_hash() != (
         _service({"In1": {"sensitivity": 2.0}}).current_calibration_hash()
     )
+
+
+def test_cache_calibration_hash_matches_computation_snapshot(tmp_path, monkeypatch):
+    wav_path = tmp_path / "one_channel.wav"
+    wavfile.write(wav_path, 1000, np.zeros((1000, 1), dtype=np.float32))
+    config = {
+        "selected_channels": [0],
+        "analysis_window_offset_ms": 0,
+        "analysis_duration": 0.5,
+        "channels": [{"channel_index": 0}],
+    }
+    _create_audio_row(file_path=str(wav_path), config_content=json.dumps(config))
+
+    first_mic_cal = {"In1": {"sensitivity": 1.0}}
+    second_mic_cal = {"In1": {"sensitivity": 2.0}}
+    calibration_snapshots = [first_mic_cal, second_mic_cal]
+
+    def alternating_devices():
+        mic_cal = calibration_snapshots.pop(0)
+        calibration_snapshots.append(mic_cal)
+        return {"mic_cal": mic_cal}
+
+    seen_mic_cal = {}
+
+    class FakeJudgment:
+        def rejudge(self, config, buffer, sample_rate, mic_cal, *args, **kwargs):
+            seen_mic_cal["judgment"] = mic_cal
+            return JudgmentResult(
+                overall="合格",
+                limit_pass=True,
+                ai_pass=None,
+                ai_score=None,
+                analysis_window=(0.0, 0.5),
+                channel_results=[
+                    ChannelJudgment(
+                        channel_index=0,
+                        spl_db=60.0,
+                        spl_pass=True,
+                        spl_max_db=61.0,
+                    )
+                ],
+            )
+
+    def chart_payload(**kwargs):
+        seen_mic_cal["chart"] = kwargs["mic_cal"]
+        return {}
+
+    monkeypatch.setattr(
+        "app.service.historical_metric_report_cache.build_chart_payload",
+        chart_payload,
+    )
+    service = HistoricalMetricReportService(
+        audio_data_service=AudioDataService(),
+        hss_service=SimpleNamespace(load_io_devices=alternating_devices),
+        judgment_engine=FakeJudgment(),
+    )
+
+    service.generate_report({"labels": ["OK", "NG"]})
+
+    row = HistoricalMetricCacheTable.get()
+    assert seen_mic_cal["judgment"] is seen_mic_cal["chart"]
+    assert row.calibration_hash == _stable_json_hash(seen_mic_cal["judgment"])
 
 
 def test_missing_wav_writes_failed_record_cache_row():
@@ -823,3 +886,8 @@ def test_generate_report_summary_counts_are_distinct_records_not_metric_rows():
     assert result.failed_record_count == 1
     assert result.skipped_record_count == 1
     assert result.label_counts == {"OK": 1, "NG": 1, "not_labeled": 1}
+
+
+def _stable_json_hash(value):
+    content = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
