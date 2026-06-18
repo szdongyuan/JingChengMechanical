@@ -224,6 +224,65 @@ def test_invalid_config_writes_failed_record_cache_row():
     assert "配置" in result.failures[0].error_message
 
 
+def test_invalid_selected_channels_writes_failed_row_and_continues_to_cached_record():
+    bad_config = {
+        "selected_channels": None,
+        "analysis_window_offset_ms": 0,
+        "analysis_duration": 0.1,
+        "channels": [{"channel_index": 0}],
+    }
+    _create_audio_row(
+        audio_data_id="bad-selected-channels",
+        record_date="2026-06-18T10:01:00+08:00",
+        config_content=json.dumps(bad_config),
+    )
+    cached_record = _create_audio_row(
+        audio_data_id="cached-ok",
+        record_date="2026-06-18T10:00:00+08:00",
+    )
+    service = _service()
+    current_signature = service.source_signature_for_record(cached_record)
+    HistoricalMetricCacheTable.create(
+        audio_data_id=cached_record.audio_data_id,
+        file_path=current_signature.file_path,
+        file_size=current_signature.file_size,
+        file_mtime_ns=current_signature.file_mtime_ns,
+        record_date=cached_record.record_date,
+        product_model=cached_record.product_model,
+        barcode=cached_record.barcode,
+        label=cached_record.labels,
+        label_source=cached_record.label_source,
+        analyse_config=cached_record.analyse_config,
+        config_hash=current_signature.config_hash,
+        calibration_hash=current_signature.calibration_hash,
+        algorithm_version=current_signature.algorithm_version,
+        channel_index=0,
+        channel_label="CH1",
+        metric_key="spl_peak_db",
+        metric_label=METRIC_DEFINITIONS["spl_peak_db"][0],
+        metric_value=60.0,
+        metric_unit=METRIC_DEFINITIONS["spl_peak_db"][1],
+        status="ok",
+        error_message=None,
+        computed_at="2026-06-18T10:05:00+08:00",
+    )
+
+    result = service.generate_report({"labels": ["OK", "NG"]})
+
+    assert result.total_records == 2
+    assert result.valid_record_count == 1
+    assert result.failed_record_count == 1
+    assert result.failures[0].audio_data_id == "bad-selected-channels"
+    assert result.failures[0].status == "failed"
+    assert result.failures[0].channel_index == -1
+    assert result.failures[0].metric_key == "__record__"
+    assert "配置未包含有效通道" in result.failures[0].error_message
+    assert any(
+        row.audio_data_id == "cached-ok" and row.status == "ok"
+        for row in result.metric_rows
+    )
+
+
 def test_projected_runtime_wav_maps_selected_channel_to_column_zero(
     tmp_path,
     monkeypatch,

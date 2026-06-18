@@ -167,7 +167,10 @@ class HistoricalMetricCacheComputer:
             ]
         config = config_result
 
-        selected_channels = selected_config_channels(config)
+        try:
+            selected_channels = selected_config_channels(config)
+        except Exception:
+            selected_channels = ()
         if not selected_channels:
             return [
                 self._record_failure(
