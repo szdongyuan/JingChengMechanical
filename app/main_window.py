@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 
-from PyQt6.QtCore import QMetaObject, QSize, Qt
+from PyQt6.QtCore import QMetaObject, QSize, Qt, QTimer
 from PyQt6.QtGui import QAction, QCloseEvent, QIcon, QPainter, QPixmap
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
@@ -239,6 +239,29 @@ class MainWindow(QMainWindow):
         self.user_btn.setMenu(user_menu)
         lay.addWidget(self.user_btn)
 
+        plc_state_bar = QWidget()
+        plc_state_lay = QHBoxLayout(plc_state_bar)
+        plc_state_lay.setContentsMargins(66, 0, 0, 0)
+        plc_state_lay.setSpacing(12)
+        self.plc1_state_label = QLabel("PLC1：未连接")
+        self.plc2_state_label = QLabel("PLC2：未连接")
+        self.process_plc_state_label = QLabel("工艺：未连接")
+        for label in (
+            self.plc1_state_label,
+            self.plc2_state_label,
+            self.process_plc_state_label,
+        ):
+            label.setStyleSheet("color: #475569; font-size: 12px;")
+            plc_state_lay.addWidget(label)
+        lay.addWidget(plc_state_bar)
+
+        self.plc_state_timer = QTimer(self)
+        # 2秒刷一下
+        self.plc_state_timer.setInterval(2000)
+        self.plc_state_timer.timeout.connect(self._refresh_plc_state_labels)
+        self.plc_state_timer.start()
+        self._refresh_plc_state_labels()
+
         lay.addStretch(1)
         return topbar
 
@@ -329,6 +352,28 @@ class MainWindow(QMainWindow):
         main_lay.addWidget(self.result_dashboard, 1)
         content_lay.addWidget(main, 1)
         return page
+
+    def _refresh_plc_state_labels(self):
+        plc_states = getattr(self.services, "plc_state", {})
+        if not isinstance(plc_states, dict):
+            plc_states = {}
+
+        process_state = getattr(self.services, "process_plc_state", "未连接")
+        plc1_state = plc_states.get(1, "未连接")
+        plc2_state = plc_states.get(2, "未连接")
+        self._set_plc_state_label(self.plc1_state_label, "PLC1", plc1_state)
+        self._set_plc_state_label(self.plc2_state_label, "PLC2", plc2_state)
+        self._set_plc_state_label(self.process_plc_state_label, "工艺", process_state)
+
+    @staticmethod
+    def _set_plc_state_label(label, name, state):
+        if state == "已连接":
+            color = "#16a34a"
+        elif state in ("连接中", "重连中"):
+            color = "#d97706"
+        else:
+            color = "#dc2626"
+        label.setText(f"{name}：<span style='color: {color};'>{state}</span>")
 
     def build_placeholder_page(self, title: str) -> QWidget:
         page = QWidget()
