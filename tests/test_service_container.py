@@ -49,6 +49,57 @@ def test_services_container_cold_imports_in_subprocess():
     assert result.stdout.strip() == "ok"
 
 
+def test_service_container_constructs_historical_report_service_without_circular_import(
+    monkeypatch,
+):
+    from app.service.historical_metric_report_service import HistoricalMetricReportService
+    import app.service.factory_mode_controller as factory_mode_controller
+
+    class FakeDb:
+        def connect(self):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeConfigService:
+        golden_sample_service = object()
+
+    class FakeAiService:
+        def shutdown(self):
+            pass
+
+    monkeypatch.setattr(mod, "DbConnectionService", FakeDb)
+    monkeypatch.setattr(mod, "HardwareSelectService", lambda: object())
+    monkeypatch.setattr(mod, "InputCalibrationService", lambda bus: object())
+    monkeypatch.setattr(mod, "ConfigService", lambda bus: FakeConfigService())
+    monkeypatch.setattr(mod, "AudioDataService", lambda: object())
+    monkeypatch.setattr(mod, "AiService", FakeAiService)
+    monkeypatch.setattr(
+        mod,
+        "ConfigPackageService",
+        lambda *, config_service, ai_service: object(),
+    )
+    monkeypatch.setattr(mod, "FactorySelectionSettings", lambda: object())
+    monkeypatch.setattr(mod, "TestManager", lambda bus, services: object())
+    monkeypatch.setattr(
+        factory_mode_controller,
+        "FactoryModeController",
+        lambda bus, services: object(),
+    )
+
+    services = mod.ServiceContainer()
+
+    assert isinstance(
+        services.historical_metric_report_service,
+        HistoricalMetricReportService,
+    )
+    assert (
+        services.historical_metric_report_service._audio_data_service
+        is services.audio_data_service
+    )
+
+
 def test_service_container_has_ai_service():
     source = inspect.getsource(mod.ServiceContainer.__post_init__)
     assert "ai_service" in source

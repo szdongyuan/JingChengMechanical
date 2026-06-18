@@ -273,6 +273,15 @@ class ServiceContainer:
         self.get_process_param_values = None
 
         self.ai_service = AiService()
+
+        from app.service.historical_metric_report_service import HistoricalMetricReportService
+
+        self.historical_metric_report_service = HistoricalMetricReportService(
+            audio_data_service=self.audio_data_service,
+            hss_service=self.hss_service,
+            ai_service=self.ai_service,
+            golden_sample_service=self.config_service.golden_sample_service,
+        )
         self.config_package_service = ConfigPackageService(
             config_service=self.config_service,
             ai_service=self.ai_service,

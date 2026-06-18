@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
 
 from consts.running_consts import base_dir
 from base.utils import format_datetime_display, normalize_path
+from ui.popups.historical_metric_report_dialog import HistoricalMetricReportDialog
 
 
 class AudioDataFilterDialog(QDialog):
@@ -348,6 +349,7 @@ class DataManagementModule(QWidget):
         }
         self._export_thread = None
         self._export_progress_dialog = None
+        self._report_dialog = None
 
         self._build_ui()
         self.refresh_table()
@@ -365,6 +367,7 @@ class DataManagementModule(QWidget):
 
         self.btn_refresh = QPushButton("刷新")
         self.btn_filter = QPushButton("条件筛选")
+        self.btn_statistics_report = QPushButton("统计报告")
         self.btn_select_all = QPushButton("全选")
         self.btn_select_all.setCheckable(True)
         self.btn_export = QPushButton("打包导出")
@@ -379,6 +382,7 @@ class DataManagementModule(QWidget):
 
         toolbar_layout.addWidget(self.btn_refresh)
         toolbar_layout.addWidget(self.btn_filter)
+        toolbar_layout.addWidget(self.btn_statistics_report)
         toolbar_layout.addWidget(self.btn_select_all)
         toolbar_layout.addWidget(self.btn_export)
         toolbar_layout.addWidget(self.btn_delete_selected)
@@ -403,6 +407,7 @@ class DataManagementModule(QWidget):
 
         self.btn_refresh.clicked.connect(self.refresh_table)
         self.btn_filter.clicked.connect(self._show_filter_dialog)
+        self.btn_statistics_report.clicked.connect(self._show_statistics_report)
         self.btn_select_all.clicked.connect(self._toggle_select_all)
         self.btn_export.clicked.connect(self._export_selected_rows)
         self.btn_delete_selected.clicked.connect(self._delete_selected_rows)
@@ -447,6 +452,19 @@ class DataManagementModule(QWidget):
         self._filters = dialog.filters()
         self._current_page = 1
         self.refresh_table()
+
+    def _show_statistics_report(self) -> None:
+        if self._report_dialog is None:
+            self._report_dialog = HistoricalMetricReportDialog(
+                services=self.services,
+                parent=self,
+            )
+            self._report_dialog.destroyed.connect(
+                lambda *_: setattr(self, "_report_dialog", None)
+            )
+        self._report_dialog.show()
+        self._report_dialog.raise_()
+        self._report_dialog.activateWindow()
 
     def _change_page(self, step: int) -> None:
         """切换上一页或下一页。"""
