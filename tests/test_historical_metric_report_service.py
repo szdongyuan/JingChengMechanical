@@ -11,7 +11,12 @@ from app.service.audio_data_service import AudioDataService
 from app.service.historical_metric_report_types import (
     HISTORICAL_REPORT_ALGORITHM_VERSION,
     METRIC_DEFINITIONS,
+    HistoricalMetricValue,
     ReportCanceled,
+)
+from app.service.historical_metric_report_statistics import (
+    compute_outliers,
+    compute_statistics,
 )
 from app.service.historical_metric_report_service import (
     HistoricalMetricReportService,
@@ -51,6 +56,25 @@ def _service(
         hss_service=hss,
         judgment_engine=judgment_engine,
         algorithm_version=algorithm_version,
+    )
+
+
+def _metric_row(audio_data_id, value, *, product_model="M1", metric_key="spl_peak_db"):
+    return HistoricalMetricValue(
+        audio_data_id=audio_data_id,
+        record_date="2026-06-18T10:00:00+08:00",
+        product_model=product_model,
+        barcode=None,
+        label="OK",
+        label_source="auto",
+        analyse_config="Cfg",
+        channel_index=0,
+        channel_label="CH1",
+        metric_key=metric_key,
+        metric_label="声压级峰值",
+        metric_value=value,
+        metric_unit="dB",
+        status="ok",
     )
 
 
@@ -945,6 +969,145 @@ def test_generate_report_summary_counts_are_distinct_records_not_metric_rows():
     assert result.failed_record_count == 1
     assert result.skipped_record_count == 1
     assert result.label_counts == {"OK": 1, "NG": 1, "not_labeled": 1}
+
+
+def test_generate_report_returns_computed_statistics_and_outliers():
+    service = _service()
+    for value in range(20):
+        record = _create_audio_row(
+            audio_data_id=f"cached-{value}",
+            record_date=f"2026-06-18T10:{value:02d}:00+08:00",
+            product_model="M1",
+        )
+        current_signature = service.source_signature_for_record(record)
+        HistoricalMetricCacheTable.create(
+            audio_data_id=record.audio_data_id,
+            file_path=current_signature.file_path,
+            file_size=current_signature.file_size,
+            file_mtime_ns=current_signature.file_mtime_ns,
+            record_date=record.record_date,
+            product_model=record.product_model,
+            barcode=record.barcode,
+            label=record.labels,
+            label_source=record.label_source,
+            analyse_config=record.analyse_config,
+            config_hash=current_signature.config_hash,
+            calibration_hash=current_signature.calibration_hash,
+            algorithm_version=current_signature.algorithm_version,
+            channel_index=0,
+            channel_label="CH1",
+            metric_key="spl_peak_db",
+            metric_label=METRIC_DEFINITIONS["spl_peak_db"][0],
+            metric_value=float(value),
+            metric_unit=METRIC_DEFINITIONS["spl_peak_db"][1],
+            status="ok",
+            error_message=None,
+            computed_at="2026-06-18T10:05:00+08:00",
+        )
+
+    result = service.generate_report({"labels": ["OK", "NG"]})
+    stat = next(item for item in result.stats if item.product_model == "M1")
+
+    assert stat.n == 20
+    assert stat.mean == pytest.approx(9.5)
+    assert {row.audio_data_id for row in result.outliers} == {
+        "cached-0",
+        "cached-19",
+    }
+
+
+def test_statistics_use_sample_std_and_linear_percentiles():
+    rows = [
+        HistoricalMetricValue(
+            audio_data_id=f"a{i}",
+            record_date="2026-06-18T10:00:00+08:00",
+            product_model="M1",
+            barcode=None,
+            label="OK",
+            label_source="auto",
+            analyse_config="Cfg",
+            channel_index=0,
+            channel_label="CH1",
+            metric_key="spl_peak_db",
+            metric_label="声压级峰值",
+            metric_value=float(value),
+            metric_unit="dB",
+            status="ok",
+        )
+        for i, value in enumerate([1, 2, 3, 4, 5], start=1)
+    ]
+
+    stats = compute_statistics(rows)
+    stat = next(item for item in stats if item.product_model == "M1")
+
+    assert stat.n == 5
+    assert stat.mean == pytest.approx(3.0)
+    assert stat.std == pytest.approx(np.std([1, 2, 3, 4, 5], ddof=1))
+    assert stat.p5 == pytest.approx(
+        np.percentile([1, 2, 3, 4, 5], 5, method="linear")
+    )
+    assert stat.normal_available is True
+
+
+def test_statistics_ignore_non_finite_values():
+    rows = [
+        _metric_row("finite-1", 1.0),
+        _metric_row("finite-2", 2.0),
+        _metric_row("nan", float("nan")),
+        _metric_row("inf", float("inf")),
+    ]
+
+    stat = next(item for item in compute_statistics(rows) if item.product_model == "M1")
+
+    assert stat.n == 2
+    assert stat.mean == pytest.approx(1.5)
+
+
+def test_statistics_suppress_normal_curve_for_small_samples():
+    stat = next(
+        item
+        for item in compute_statistics(
+            [_metric_row(f"a{i}", float(i)) for i in range(4)]
+        )
+        if item.product_model == "M1"
+    )
+
+    assert stat.n == 4
+    assert stat.normal_available is False
+    assert stat.normal_x == []
+    assert stat.normal_y == []
+
+
+def test_statistics_include_empty_model_bucket_and_all_models_aggregate():
+    rows = [
+        _metric_row("blank", 1.0, product_model=""),
+        _metric_row("m1", 3.0, product_model="M1"),
+    ]
+
+    stats = compute_statistics(rows)
+    by_model = {item.product_model: item for item in stats}
+
+    assert by_model["未填写型号"].n == 1
+    assert by_model["未填写型号"].mean == pytest.approx(1.0)
+    assert by_model["全部型号"].n == 2
+    assert by_model["全部型号"].mean == pytest.approx(2.0)
+
+
+def test_outliers_use_three_std_and_percentile_rules():
+    three_std_rows = [
+        _metric_row(f"std-{i}", 10.0, product_model="STD")
+        for i in range(19)
+    ] + [_metric_row("std-high", 100.0, product_model="STD")]
+    percentile_rows = [
+        _metric_row(f"pct-{i}", float(i), product_model="PCTL")
+        for i in range(20)
+    ]
+
+    outliers = compute_outliers(three_std_rows + percentile_rows)
+    outlier_ids = {row.audio_data_id for row in outliers}
+
+    assert "std-high" in outlier_ids
+    assert {"pct-0", "pct-19"} <= outlier_ids
 
 
 def _stable_json_hash(value):

@@ -5,6 +5,10 @@ from datetime import datetime
 from app.service.analysis.judgment import JudgmentEngine
 from app.service.audio_data_service import AudioDataService
 from app.service.historical_metric_report_cache import HistoricalMetricCacheComputer
+from app.service.historical_metric_report_statistics import (
+    compute_outliers,
+    compute_statistics,
+)
 from app.service.historical_metric_report_types import (
     CancelCheck,
     HISTORICAL_REPORT_ALGORITHM_VERSION,
@@ -127,9 +131,9 @@ class HistoricalMetricReportService:
             failed_record_count=len(failed_record_ids),
             label_counts=_label_counts(records),
             metric_rows=metric_rows,
-            stats=[],
+            stats=compute_statistics(metric_rows),
             failures=failures,
-            outliers=[],
+            outliers=compute_outliers(metric_rows),
         )
 
     def _cache_row_to_metric_value(
