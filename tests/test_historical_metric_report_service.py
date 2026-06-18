@@ -1093,6 +1093,43 @@ def test_statistics_include_empty_model_bucket_and_all_models_aggregate():
     assert by_model["全部型号"].mean == pytest.approx(2.0)
 
 
+def test_statistics_keep_display_label_collisions_as_separate_groups():
+    rows = [
+        _metric_row("all-model-1", 100.0, product_model="全部型号"),
+        _metric_row("all-model-2", 110.0, product_model="全部型号"),
+        _metric_row("real-blank-label-1", 10.0, product_model="未填写型号"),
+        _metric_row("real-blank-label-2", 20.0, product_model="未填写型号"),
+        _metric_row("blank-model", 1.0, product_model=""),
+        _metric_row("m1", 3.0, product_model="M1"),
+    ]
+
+    stats = compute_statistics(rows)
+    all_model_stats = {
+        stat.n: stat for stat in stats if stat.product_model == "全部型号"
+    }
+    blank_label_stats = {
+        stat.n: stat for stat in stats if stat.product_model == "未填写型号"
+    }
+
+    assert len(stats) == 5
+    assert len({stat.group_key for stat in stats}) == len(stats)
+    assert set(all_model_stats) == {2, 6}
+    assert all_model_stats[2].mean == pytest.approx(105.0)
+    assert all_model_stats[6].mean == pytest.approx(244.0 / 6.0)
+    assert set(blank_label_stats) == {1, 2}
+    assert blank_label_stats[1].mean == pytest.approx(1.0)
+    assert blank_label_stats[2].mean == pytest.approx(15.0)
+
+
+def test_outliers_do_not_use_all_models_aggregate_groups():
+    rows = [
+        _metric_row(f"same-{i}", 0.0, product_model="M1")
+        for i in range(19)
+    ] + [_metric_row("single-high", 1000.0, product_model="全部型号")]
+
+    assert compute_outliers(rows) == []
+
+
 def test_outliers_use_three_std_and_percentile_rules():
     three_std_rows = [
         _metric_row(f"std-{i}", 10.0, product_model="STD")

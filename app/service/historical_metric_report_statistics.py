@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+import json
 import math
+from typing import NamedTuple
 
 import numpy as np
 
@@ -13,6 +15,13 @@ from app.service.historical_metric_report_types import (
 
 BLANK_MODEL_LABEL = "未填写型号"
 ALL_MODELS_LABEL = "全部型号"
+
+
+class _GroupKey(NamedTuple):
+    scope: str
+    product_model_identity: str | None
+    metric_key: str
+    channel_label: str
 
 
 def compute_statistics(rows: list[HistoricalMetricValue]) -> list[MetricGroupStats]:
@@ -74,35 +83,38 @@ def _group_metric_rows(
     rows: list[HistoricalMetricValue],
     *,
     include_all_models: bool,
-) -> OrderedDict[str, list[HistoricalMetricValue]]:
-    groups: OrderedDict[str, list[HistoricalMetricValue]] = OrderedDict()
+) -> OrderedDict[_GroupKey, list[HistoricalMetricValue]]:
+    groups: OrderedDict[_GroupKey, list[HistoricalMetricValue]] = OrderedDict()
     for row in rows:
-        _append_group(groups, _group_key(row, _product_model_label(row.product_model)), row)
+        _append_group(groups, _product_group_key(row), row)
         if include_all_models:
-            _append_group(groups, _group_key(row, ALL_MODELS_LABEL), row)
+            _append_group(groups, _aggregate_group_key(row), row)
     return groups
 
 
 def _append_group(
-    groups: OrderedDict[str, list[HistoricalMetricValue]],
-    group_key: str,
+    groups: OrderedDict[_GroupKey, list[HistoricalMetricValue]],
+    group_key: _GroupKey,
     row: HistoricalMetricValue,
 ) -> None:
     groups.setdefault(group_key, []).append(row)
 
 
-def _group_key(row: HistoricalMetricValue, product_model: str) -> str:
-    return "|".join(
-        (
-            product_model,
-            row.metric_key,
-            row.channel_label,
-        )
+def _product_group_key(row: HistoricalMetricValue) -> _GroupKey:
+    return _GroupKey(
+        "product",
+        _product_model_identity(row.product_model),
+        row.metric_key,
+        row.channel_label,
     )
 
 
+def _aggregate_group_key(row: HistoricalMetricValue) -> _GroupKey:
+    return _GroupKey("aggregate", None, row.metric_key, row.channel_label)
+
+
 def _compute_group_stats(
-    group_key: str,
+    group_key: _GroupKey,
     rows: list[HistoricalMetricValue],
 ) -> MetricGroupStats:
     values = _row_values(rows)
@@ -122,8 +134,8 @@ def _compute_group_stats(
     )
 
     return MetricGroupStats(
-        group_key=group_key,
-        product_model=group_key.split("|", 1)[0],
+        group_key=_serialize_group_key(group_key),
+        product_model=_product_model_label(group_key),
         metric_key=first.metric_key,
         metric_label=first.metric_label,
         metric_unit=first.metric_unit,
@@ -198,9 +210,28 @@ def _row_values(rows: list[HistoricalMetricValue]) -> list[float]:
     return [float(row.metric_value) for row in rows]
 
 
-def _product_model_label(value: object) -> str:
+def _product_model_identity(value: object) -> str | None:
     label = "" if value is None else str(value).strip()
-    return label or BLANK_MODEL_LABEL
+    return label or None
+
+
+def _product_model_label(group_key: _GroupKey) -> str:
+    if group_key.scope == "aggregate":
+        return ALL_MODELS_LABEL
+    return group_key.product_model_identity or BLANK_MODEL_LABEL
+
+
+def _serialize_group_key(group_key: _GroupKey) -> str:
+    return json.dumps(
+        [
+            group_key.scope,
+            group_key.product_model_identity,
+            group_key.metric_key,
+            group_key.channel_label,
+        ],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 def _finite(value: object) -> bool:
