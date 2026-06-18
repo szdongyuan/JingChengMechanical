@@ -360,6 +360,60 @@ def test_report_dialog_cancel_requests_worker_and_restores_controls(qapp, monkey
     assert dialog.btn_cancel.isEnabled() is False
 
 
+def test_report_dialog_close_defers_until_running_worker_is_cleaned_up(
+    qapp, monkeypatch
+):
+    workers = []
+
+    class FakeWorker:
+        def __init__(self, report_service, filters):
+            self.progress_changed = _SignalStub()
+            self.succeeded = _SignalStub()
+            self.failed = _SignalStub()
+            self.canceled = _SignalStub()
+            self.finished = _SignalStub()
+            self.interruption_requests = 0
+            self.deleted = False
+            self._running = True
+            workers.append(self)
+
+        def start(self):
+            pass
+
+        def isRunning(self):
+            return self._running
+
+        def requestInterruption(self):
+            self.interruption_requests += 1
+
+        def deleteLater(self):
+            self.deleted = True
+
+    monkeypatch.setattr(
+        "ui.popups.historical_metric_report_dialog.HistoricalReportWorkerThread",
+        FakeWorker,
+    )
+    dialog = _dialog()
+    dialog.show()
+    qapp.processEvents()
+
+    dialog.btn_generate.click()
+
+    assert dialog.close() is False
+    assert dialog.isVisible() is True
+    assert workers[0].interruption_requests == 1
+    assert dialog.btn_cancel.isEnabled() is False
+
+    workers[0].canceled.emit()
+    workers[0]._running = False
+    workers[0].finished.emit()
+    qapp.processEvents()
+
+    assert dialog._worker is None
+    assert workers[0].deleted is True
+    assert dialog.isVisible() is False
+
+
 def test_report_dialog_empty_result_shows_failures_and_allows_export(qapp):
     failure = _failure_row(
         audio_data_id="a1",

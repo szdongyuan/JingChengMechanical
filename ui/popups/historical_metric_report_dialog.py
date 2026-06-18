@@ -73,6 +73,9 @@ class HistoricalMetricReportDialog(QDialog):
         self.services = services
         self._current_result: HistoricalMetricReportResult | None = None
         self._worker: HistoricalReportWorkerThread | None = None
+        self._deferred_close_requested = False
+        self._worker_terminal_signal_received = False
+        self._worker_finished_signal_received = False
         self._stats_by_row: list[MetricGroupStats] = []
 
         self.setWindowTitle("测量结果正态分布统计报告")
@@ -270,10 +273,15 @@ class HistoricalMetricReportDialog(QDialog):
             self.combo_product_model.addItem(str(model))
 
     def _generate_report(self) -> None:
-        if self._worker is not None and self._worker.isRunning():
+        if self._worker is not None:
+            self._maybe_cleanup_worker()
+        if self._worker is not None:
             return
         self.lb_progress.setText("正在生成...")
         self._set_running_state(True)
+        self._deferred_close_requested = False
+        self._worker_terminal_signal_received = False
+        self._worker_finished_signal_received = False
         self._worker = HistoricalReportWorkerThread(
             self.services.historical_metric_report_service,
             self.current_filters(),
@@ -283,7 +291,7 @@ class HistoricalMetricReportDialog(QDialog):
         self._worker.failed.connect(self._on_report_failed)
         self._worker.canceled.connect(self._on_report_canceled)
         if hasattr(self._worker, "finished"):
-            self._worker.finished.connect(self._cleanup_worker)
+            self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
 
     def _cancel_generation(self) -> None:
@@ -307,7 +315,8 @@ class HistoricalMetricReportDialog(QDialog):
 
     def _on_report_failed(self, message: str) -> None:
         self.lb_progress.setText("生成失败")
-        QMessageBox.warning(self, "生成失败", message)
+        if not self._deferred_close_requested:
+            QMessageBox.warning(self, "生成失败", message)
         self._finish_generation()
 
     def _on_report_canceled(self) -> None:
@@ -315,13 +324,42 @@ class HistoricalMetricReportDialog(QDialog):
         self._finish_generation()
 
     def _finish_generation(self) -> None:
+        self._worker_terminal_signal_received = True
         self._set_running_state(False)
+        self._maybe_cleanup_worker()
+
+    def _on_worker_finished(self) -> None:
+        self._worker_finished_signal_received = True
+        self._maybe_cleanup_worker()
+
+    def _maybe_cleanup_worker(self) -> None:
+        worker = self._worker
+        if worker is None:
+            return
+        has_finished_signal = hasattr(worker, "finished")
+        if has_finished_signal and not (
+            self._worker_terminal_signal_received
+            and self._worker_finished_signal_received
+        ):
+            return
+        if (not has_finished_signal) and not self._worker_terminal_signal_received:
+            return
+        self._cleanup_worker()
 
     def _cleanup_worker(self) -> None:
         worker = self._worker
-        if worker is not None:
-            worker.deleteLater()
+        close_after_cleanup = self._deferred_close_requested
         self._worker = None
+        self._deferred_close_requested = False
+        self._worker_terminal_signal_received = False
+        self._worker_finished_signal_received = False
+        if worker is not None and hasattr(worker, "deleteLater"):
+            try:
+                worker.deleteLater()
+            except RuntimeError:
+                pass
+        if close_after_cleanup:
+            self.close()
 
     def _render_result(self, result: HistoricalMetricReportResult) -> None:
         self._current_result = result
@@ -533,9 +571,24 @@ class HistoricalMetricReportDialog(QDialog):
         return table
 
     def closeEvent(self, event) -> None:
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.requestInterruption()
+        if self._worker is not None:
+            self._deferred_close_requested = True
+            if self._worker_is_running(self._worker):
+                self._worker.requestInterruption()
+                self.lb_progress.setText("正在取消...")
+            self.btn_generate.setEnabled(False)
+            self.btn_cancel.setEnabled(False)
+            self.btn_export.setEnabled(False)
+            event.ignore()
+            return
         super().closeEvent(event)
+
+    @staticmethod
+    def _worker_is_running(worker) -> bool:
+        try:
+            return bool(worker.isRunning())
+        except RuntimeError:
+            return False
 
     @staticmethod
     def _failure_rows(
