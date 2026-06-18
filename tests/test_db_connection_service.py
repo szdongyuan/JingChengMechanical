@@ -24,6 +24,7 @@ EXPECTED_RUNTIME_TABLES = {
     "system_info_table",
     "training_model_table",
     "plc_table",
+    "historical_metric_cache_table",
 }
 
 
@@ -90,6 +91,66 @@ TEST_CONFIG_COLUMN_SQL = {
 }
 
 
+HISTORICAL_METRIC_CACHE_COLUMN_SQL = {
+    "cache_id": "INTEGER NOT NULL PRIMARY KEY",
+    "audio_data_id": "TEXT NOT NULL",
+    "file_path": "TEXT NOT NULL",
+    "file_size": "INTEGER NOT NULL",
+    "file_mtime_ns": "INTEGER NOT NULL",
+    "record_date": "TEXT NOT NULL",
+    "product_model": "TEXT NOT NULL",
+    "barcode": "TEXT",
+    "label": "TEXT",
+    "label_source": "TEXT",
+    "analyse_config": "TEXT",
+    "config_hash": "TEXT NOT NULL",
+    "calibration_hash": "TEXT NOT NULL",
+    "algorithm_version": "TEXT NOT NULL",
+    "channel_index": "INTEGER NOT NULL",
+    "channel_label": "TEXT NOT NULL",
+    "metric_key": "TEXT NOT NULL",
+    "metric_label": "TEXT NOT NULL",
+    "metric_value": "REAL",
+    "metric_unit": "TEXT NOT NULL",
+    "status": "TEXT NOT NULL",
+    "error_message": "TEXT",
+    "computed_at": "TEXT NOT NULL",
+}
+
+
+def _create_historical_metric_cache_indexes(tmp_db: SqliteDatabase) -> None:
+    tmp_db.execute_sql(
+        """
+        CREATE UNIQUE INDEX historical_metric_cache_unique_metric
+        ON historical_metric_cache_table (
+            audio_data_id,
+            config_hash,
+            algorithm_version,
+            channel_index,
+            metric_key
+        )
+        """
+    )
+    tmp_db.execute_sql(
+        """
+        CREATE INDEX historical_metric_cache_audio_data_id
+        ON historical_metric_cache_table (audio_data_id)
+        """
+    )
+    tmp_db.execute_sql(
+        """
+        CREATE INDEX historical_metric_cache_product_date
+        ON historical_metric_cache_table (product_model, record_date)
+        """
+    )
+    tmp_db.execute_sql(
+        """
+        CREATE INDEX historical_metric_cache_metric_status
+        ON historical_metric_cache_table (metric_key, status)
+        """
+    )
+
+
 def _create_table(tmp_db: SqliteDatabase, table_name: str) -> None:
     if table_name == "test_config_table":
         column_sql = ", ".join(
@@ -108,6 +169,14 @@ def _create_table(tmp_db: SqliteDatabase, table_name: str) -> None:
         tmp_db.execute_sql(
             f"CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, {column_sql})"
         )
+        return
+    if table_name == "historical_metric_cache_table":
+        column_sql = ", ".join(
+            f"{name} {definition}"
+            for name, definition in HISTORICAL_METRIC_CACHE_COLUMN_SQL.items()
+        )
+        tmp_db.execute_sql(f"CREATE TABLE {table_name} ({column_sql})")
+        _create_historical_metric_cache_indexes(tmp_db)
         return
     tmp_db.execute_sql(f"CREATE TABLE {table_name} (id INTEGER PRIMARY KEY)")
 
@@ -347,6 +416,47 @@ def test_connect_existing_prepared_database_accepts_stft_score_columns(
     tmp_db.close()
 
 
+def test_connect_existing_prepared_database_accepts_historical_metric_cache_table(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "jingchen.db"
+    tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    tmp_db.connect()
+    _create_runtime_tables(tmp_db)
+    tmp_db.close()
+    monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    svc_mod.DbConnectionService().connect()
+
+    columns = _table_columns(tmp_db, "historical_metric_cache_table")
+    assert columns["audio_data_id"][2] == "TEXT"
+    assert columns["audio_data_id"][3] == 1
+    assert columns["file_mtime_ns"][2] == "INTEGER"
+    assert columns["file_mtime_ns"][3] == 1
+    assert columns["metric_value"][2] == "REAL"
+    assert columns["metric_value"][3] == 0
+    assert columns["cache_id"][5] == 1
+    indexes = _index_definitions(tmp_db, "historical_metric_cache_table")
+    assert (
+        "historical_metric_cache_unique_metric",
+        (
+            "audio_data_id",
+            "config_hash",
+            "algorithm_version",
+            "channel_index",
+            "metric_key",
+        ),
+        True,
+    ) in indexes
+    assert any(
+        columns == ("metric_key", "status") and unique is False
+        for _name, columns, unique in indexes
+    )
+    tmp_db.close()
+
+
 def test_connect_rejects_incomplete_channel_config_schema_without_mutating(
     monkeypatch,
     tmp_path,
@@ -403,6 +513,92 @@ def test_connect_rejects_missing_vibration_view_column_without_mutating(
         ).fetchall() == [(1,)]
     finally:
         check_db.close()
+
+
+def test_connect_rejects_missing_historical_metric_cache_column_without_mutating(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "jingchen.db"
+    tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    tmp_db.connect()
+    for table_name in sorted(
+        EXPECTED_RUNTIME_TABLES - {"historical_metric_cache_table"}
+    ):
+        _create_table(tmp_db, table_name)
+    broken_columns = {
+        name: definition
+        for name, definition in HISTORICAL_METRIC_CACHE_COLUMN_SQL.items()
+        if name != "calibration_hash"
+    }
+    tmp_db.execute_sql(
+        "CREATE TABLE historical_metric_cache_table ("
+        + ", ".join(
+            f"{name} {definition}" for name, definition in broken_columns.items()
+        )
+        + ")"
+    )
+    tmp_db.close()
+    monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    with pytest.raises(
+        DatabaseStartupError,
+        match="missing required historical_metric_cache_table",
+    ):
+        svc_mod.DbConnectionService().connect()
+
+
+def test_connect_rejects_missing_historical_metric_cache_unique_index_without_mutating(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "jingchen.db"
+    tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    tmp_db.connect()
+    _create_runtime_tables(tmp_db)
+    tmp_db.execute_sql("DROP INDEX historical_metric_cache_unique_metric")
+    tmp_db.close()
+    monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    with pytest.raises(
+        DatabaseStartupError,
+        match="missing required historical_metric_cache_table indexes",
+    ):
+        svc_mod.DbConnectionService().connect()
+
+
+def test_connect_rejects_wrong_historical_metric_cache_column_definition_without_mutating(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "jingchen.db"
+    tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    tmp_db.connect()
+    for table_name in sorted(
+        EXPECTED_RUNTIME_TABLES - {"historical_metric_cache_table"}
+    ):
+        _create_table(tmp_db, table_name)
+    broken_columns = dict(HISTORICAL_METRIC_CACHE_COLUMN_SQL)
+    broken_columns["metric_value"] = "TEXT"
+    tmp_db.execute_sql(
+        "CREATE TABLE historical_metric_cache_table ("
+        + ", ".join(
+            f"{name} {definition}" for name, definition in broken_columns.items()
+        )
+        + ")"
+    )
+    _create_historical_metric_cache_indexes(tmp_db)
+    tmp_db.close()
+    monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    with pytest.raises(
+        DatabaseStartupError,
+        match="invalid historical_metric_cache_table column definitions",
+    ):
+        svc_mod.DbConnectionService().connect()
 
 
 def test_connect_rejects_missing_result_dashboard_layout_column_without_mutating(

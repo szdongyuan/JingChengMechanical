@@ -34,6 +34,7 @@ class DbConnectionService:
             "system_info_table",
             "training_model_table",
             "plc_table",
+            "historical_metric_cache_table",
         }
     )
     _REQUIRED_CHANNEL_CONFIG_COLUMNS = frozenset(
@@ -60,6 +61,73 @@ class DbConnectionService:
             "result_dashboard_layout",
         }
     )
+    _REQUIRED_HISTORICAL_METRIC_CACHE_COLUMNS = frozenset(
+        {
+            "cache_id",
+            "audio_data_id",
+            "file_path",
+            "file_size",
+            "file_mtime_ns",
+            "record_date",
+            "product_model",
+            "barcode",
+            "label",
+            "label_source",
+            "analyse_config",
+            "config_hash",
+            "calibration_hash",
+            "algorithm_version",
+            "channel_index",
+            "channel_label",
+            "metric_key",
+            "metric_label",
+            "metric_value",
+            "metric_unit",
+            "status",
+            "error_message",
+            "computed_at",
+        }
+    )
+    _REQUIRED_HISTORICAL_METRIC_CACHE_INDEXES = {
+        (
+            (
+                "audio_data_id",
+                "config_hash",
+                "algorithm_version",
+                "channel_index",
+                "metric_key",
+            ),
+            True,
+        ),
+        (("audio_data_id",), False),
+        (("product_model", "record_date"), False),
+        (("metric_key", "status"), False),
+    }
+    _REQUIRED_HISTORICAL_METRIC_CACHE_COLUMN_DEFINITIONS = {
+        "cache_id": ("INTEGER", True, True),
+        "audio_data_id": ("TEXT", True, False),
+        "file_path": ("TEXT", True, False),
+        "file_size": ("INTEGER", True, False),
+        "file_mtime_ns": ("INTEGER", True, False),
+        "record_date": ("TEXT", True, False),
+        "product_model": ("TEXT", True, False),
+        "barcode": ("TEXT", False, False),
+        "label": ("TEXT", False, False),
+        "label_source": ("TEXT", False, False),
+        "analyse_config": ("TEXT", False, False),
+        "config_hash": ("TEXT", True, False),
+        "calibration_hash": ("TEXT", True, False),
+        "algorithm_version": ("TEXT", True, False),
+        "channel_index": ("INTEGER", True, False),
+        "channel_label": ("TEXT", True, False),
+        "metric_key": ("TEXT", True, False),
+        "metric_label": ("TEXT", True, False),
+        "metric_value": ("REAL", False, False),
+        "metric_unit": ("TEXT", True, False),
+        "status": ("TEXT", True, False),
+        "error_message": ("TEXT", False, False),
+        "computed_at": ("TEXT", True, False),
+    }
 
     def connect(self):
         self._ensure_database_file_exists()
@@ -123,6 +191,12 @@ class DbConnectionService:
             "test_config_table",
             self._REQUIRED_TEST_CONFIG_COLUMNS,
         )
+        self._ensure_required_table_columns(
+            "historical_metric_cache_table",
+            self._REQUIRED_HISTORICAL_METRIC_CACHE_COLUMNS,
+        )
+        self._ensure_historical_metric_cache_column_definitions()
+        self._ensure_historical_metric_cache_indexes()
 
     def _ensure_required_table_columns(
         self,
@@ -141,6 +215,61 @@ class DbConnectionService:
     def _table_columns(self, table_name: str) -> set[str]:
         cursor = db.execute_sql(f"PRAGMA table_info({table_name})")
         return {row[1] for row in cursor.fetchall()}
+
+    def _ensure_historical_metric_cache_column_definitions(self) -> None:
+        actual_definitions = self._table_column_definitions(
+            "historical_metric_cache_table"
+        )
+        expected_definitions = (
+            self._REQUIRED_HISTORICAL_METRIC_CACHE_COLUMN_DEFINITIONS
+        )
+        invalid_columns = sorted(
+            column_name
+            for column_name, expected in expected_definitions.items()
+            if actual_definitions.get(column_name) != expected
+        )
+        if invalid_columns:
+            raise DatabaseStartupError(
+                "Database schema is incomplete: invalid "
+                "historical_metric_cache_table column definitions: "
+                f"{', '.join(invalid_columns)}. "
+                "Copy a prepared database before starting the application."
+            )
+
+    def _table_column_definitions(
+        self,
+        table_name: str,
+    ) -> dict[str, tuple[str, bool, bool]]:
+        cursor = db.execute_sql(f"PRAGMA table_info({table_name})")
+        return {
+            row[1]: (row[2].upper(), bool(row[3]), bool(row[5]))
+            for row in cursor.fetchall()
+        }
+
+    def _ensure_historical_metric_cache_indexes(self) -> None:
+        existing_indexes = self._table_index_definitions(
+            "historical_metric_cache_table"
+        )
+        missing_indexes = (
+            self._REQUIRED_HISTORICAL_METRIC_CACHE_INDEXES - existing_indexes
+        )
+        if missing_indexes:
+            raise DatabaseStartupError(
+                "Database schema is incomplete: missing required "
+                "historical_metric_cache_table indexes. "
+                "Copy a prepared database before starting the application."
+            )
+
+    def _table_index_definitions(
+        self,
+        table_name: str,
+    ) -> set[tuple[tuple[str, ...], bool]]:
+        cursor = db.execute_sql(f"PRAGMA index_list({table_name})")
+        definitions = set()
+        for _, index_name, unique, *_ in cursor.fetchall():
+            info = db.execute_sql(f"PRAGMA index_info({index_name})").fetchall()
+            definitions.add((tuple(row[2] for row in info), bool(unique)))
+        return definitions
 
     def _is_sqlite_file_open_error(self, error: OperationalError) -> bool:
         if DB_PATH == ":memory:":
