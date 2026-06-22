@@ -14,6 +14,7 @@ import pytest
 
 import app.services_container as mod
 from app.service.factory_selection_settings import FactorySelectionSettings
+from app.service.historical_metric_report_service import HistoricalMetricReportService
 from app.service.analysis.test_manager import TestManager
 from app.services_container import EventBus
 
@@ -52,7 +53,6 @@ def test_services_container_cold_imports_in_subprocess():
 def test_service_container_constructs_historical_report_service_without_circular_import(
     monkeypatch,
 ):
-    from app.service.historical_metric_report_service import HistoricalMetricReportService
     import app.service.factory_mode_controller as factory_mode_controller
 
     class FakeDb:

@@ -37,6 +37,7 @@ from app.service.current_meter_service import (
     build_current_trace_payload,
     normalize_current_meter_config,
 )
+from app.service.factory_review_payloads import FactoryReviewPayload, FactoryReviewWindow
 from consts.running_consts import base_dir
 
 
@@ -1738,8 +1739,6 @@ class TestManager(QObject):
         no_result: bool = False,
         error_message: str | None = None,
     ):
-        from app.services_container import FactoryReviewPayload, FactoryReviewWindow
-
         config = getattr(session, "_config", {}) or {}
         analysis_duration = self._analysis_duration_sec(config)
         captured_duration_sec = self._captured_duration_sec(session)
