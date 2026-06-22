@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
+import json
+import re
 
 from app.service.analysis.judgment import JudgmentEngine
 from app.service.audio_data_service import AudioDataService
@@ -46,7 +48,8 @@ class HistoricalMetricReportService:
         )
 
     def list_source_records(self, filters: dict[str, object] | None):
-        return list(self._audio_data_service._filtered_query(filters))
+        records = list(self._audio_data_service._filtered_query(filters))
+        return _filter_records_by_barcode_regex(records, filters)
 
     def config_hash(self, config_content: object) -> str:
         return self._cache.config_hash(config_content)
@@ -131,9 +134,9 @@ class HistoricalMetricReportService:
             failed_record_count=len(failed_record_ids),
             label_counts=_label_counts(records),
             metric_rows=metric_rows,
-            stats=compute_statistics(metric_rows),
+            stats=compute_statistics(metric_rows, group_by_metric_only=True),
             failures=failures,
-            outliers=compute_outliers(metric_rows),
+            outliers=compute_outliers(metric_rows, group_by_metric_only=True),
         )
 
     def _cache_row_to_metric_value(
@@ -150,7 +153,7 @@ class HistoricalMetricReportService:
             label_source=record.label_source,
             analyse_config=record.analyse_config,
             channel_index=row.channel_index,
-            channel_label=row.channel_label,
+            channel_label=_display_channel_label(record, row),
             metric_key=row.metric_key,
             metric_label=row.metric_label,
             metric_value=(
@@ -177,3 +180,95 @@ def _label_counts(records: list[AudioDataTable]) -> dict[str, int]:
 
 def _generated_at() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _filter_records_by_barcode_regex(
+    records: list[AudioDataTable],
+    filters: dict[str, object] | None,
+) -> list[AudioDataTable]:
+    if not filters or not filters.get("barcode_regex"):
+        return records
+    pattern = _compile_barcode_regex(filters.get("barcode"))
+    if pattern is None:
+        return records
+    return [
+        record
+        for record in records
+        if pattern.search(str(record.barcode or ""))
+    ]
+
+
+def _compile_barcode_regex(value: object) -> re.Pattern[str] | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return re.compile(text)
+    except re.error as exc:
+        raise ValueError(f"SN 正则表达式无效: {exc}") from exc
+
+
+def _display_channel_label(
+    record: AudioDataTable,
+    row: HistoricalMetricCacheTable,
+) -> str:
+    channel_index = _as_non_bool_int(row.channel_index)
+    if channel_index is None or channel_index < 0:
+        return row.channel_label
+
+    config = _parse_config_dict(record.config_content)
+    if not config:
+        return row.channel_label
+
+    selected_channels = _selected_channels(config)
+    vibration_channel = _valid_vibration_channel(config, selected_channels)
+    if vibration_channel is None or len(selected_channels) != 2:
+        return row.channel_label
+    if channel_index not in selected_channels:
+        return row.channel_label
+
+    role = "振动" if channel_index == vibration_channel else "麦克风"
+    return f"{role}({_canonical_channel_label(channel_index)})"
+
+
+def _parse_config_dict(config_content: object) -> dict | None:
+    text = "" if config_content is None else str(config_content)
+    if not text.strip():
+        return None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _selected_channels(config: dict) -> tuple[int, ...]:
+    selected: list[int] = []
+    seen: set[int] = set()
+    for value in config.get("selected_channels", []):
+        channel_index = _as_non_bool_int(value)
+        if channel_index is None or channel_index < 0 or channel_index in seen:
+            continue
+        selected.append(channel_index)
+        seen.add(channel_index)
+    return tuple(selected)
+
+
+def _valid_vibration_channel(
+    config: dict,
+    selected_channels: tuple[int, ...],
+) -> int | None:
+    value = _as_non_bool_int(config.get("vibration_view_channel_index"))
+    if value is None:
+        return None
+    return value if value in selected_channels else None
+
+
+def _as_non_bool_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def _canonical_channel_label(channel_index: int) -> str:
+    return f"CH{channel_index + 1}"

@@ -187,10 +187,12 @@ class AudioDataFilterDialog(QDialog):
         calendar = edit.calendarWidget()
         if not calendar:
             return
-        calendar.setMinimumSize(360, 260)
+        calendar.setMinimumSize(420, 320)
         calendar.setGridVisible(True)
         calendar.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
-        calendar.setHorizontalHeaderFormat(QCalendarWidget.HorizontalHeaderFormat.ShortDayNames)
+        calendar.setHorizontalHeaderFormat(
+            QCalendarWidget.HorizontalHeaderFormat.SingleLetterDayNames
+        )
         calendar.setStyleSheet(
             """
             QCalendarWidget QWidget {
@@ -198,7 +200,7 @@ class AudioDataFilterDialog(QDialog):
                 color: #111827;
             }
             QCalendarWidget QToolButton {
-                min-width: 56px;
+                min-width: 72px;
                 background: #ffffff;
                 color: #111827;
                 border: 1px solid #d1d5db;
@@ -210,16 +212,20 @@ class AudioDataFilterDialog(QDialog):
                 color: #111827;
             }
             QCalendarWidget QSpinBox {
-                min-width: 72px;
+                min-width: 80px;
                 color: #111827;
                 background: #ffffff;
                 selection-background-color: #dbeafe;
+                selection-color: #111827;
             }
             QCalendarWidget QAbstractItemView:enabled {
+                min-width: 320px;
+                min-height: 220px;
                 background: #ffffff;
                 color: #111827;
                 selection-background-color: #dbeafe;
                 selection-color: #111827;
+                alternate-background-color: #ffffff;
             }
             """
         )

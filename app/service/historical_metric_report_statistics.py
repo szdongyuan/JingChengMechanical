@@ -15,35 +15,56 @@ from app.service.historical_metric_report_types import (
 
 BLANK_MODEL_LABEL = "未填写型号"
 ALL_MODELS_LABEL = "全部型号"
+SELECTED_MODELS_LABEL = "所选型号"
+ALL_CHANNELS_LABEL = "全部通道"
 
 
 class _GroupKey(NamedTuple):
     scope: str
     product_model_identity: str | None
     metric_key: str
-    channel_label: str
+    channel_label: str | None
 
 
-def compute_statistics(rows: list[HistoricalMetricValue]) -> list[MetricGroupStats]:
+def compute_statistics(
+    rows: list[HistoricalMetricValue],
+    *,
+    include_product_groups: bool = True,
+    include_all_models: bool = True,
+    group_by_metric_only: bool = False,
+) -> list[MetricGroupStats]:
     ok_rows = [
         row
         for row in rows
         if row.status == "ok" and _finite(row.metric_value)
     ]
-    groups = _group_metric_rows(ok_rows, include_all_models=True)
+    groups = _group_metric_rows(
+        ok_rows,
+        include_product_groups=include_product_groups,
+        include_all_models=include_all_models,
+        group_by_metric_only=group_by_metric_only,
+    )
     return [
         _compute_group_stats(group_key, group_rows)
         for group_key, group_rows in groups.items()
     ]
 
 
-def compute_outliers(rows: list[HistoricalMetricValue]) -> list[HistoricalMetricValue]:
+def compute_outliers(
+    rows: list[HistoricalMetricValue],
+    *,
+    group_by_metric_only: bool = False,
+) -> list[HistoricalMetricValue]:
     ok_rows = [
         row
         for row in rows
         if row.status == "ok" and _finite(row.metric_value)
     ]
-    groups = _group_metric_rows(ok_rows, include_all_models=False)
+    groups = _group_metric_rows(
+        ok_rows,
+        include_all_models=False,
+        group_by_metric_only=group_by_metric_only,
+    )
     outliers: list[HistoricalMetricValue] = []
     seen: set[tuple[str, int, str]] = set()
 
@@ -82,11 +103,17 @@ def compute_outliers(rows: list[HistoricalMetricValue]) -> list[HistoricalMetric
 def _group_metric_rows(
     rows: list[HistoricalMetricValue],
     *,
+    include_product_groups: bool = True,
     include_all_models: bool,
+    group_by_metric_only: bool = False,
 ) -> OrderedDict[_GroupKey, list[HistoricalMetricValue]]:
     groups: OrderedDict[_GroupKey, list[HistoricalMetricValue]] = OrderedDict()
     for row in rows:
-        _append_group(groups, _product_group_key(row), row)
+        if group_by_metric_only:
+            _append_group(groups, _metric_group_key(row), row)
+            continue
+        if include_product_groups:
+            _append_group(groups, _product_group_key(row), row)
         if include_all_models:
             _append_group(groups, _aggregate_group_key(row), row)
     return groups
@@ -111,6 +138,10 @@ def _product_group_key(row: HistoricalMetricValue) -> _GroupKey:
 
 def _aggregate_group_key(row: HistoricalMetricValue) -> _GroupKey:
     return _GroupKey("aggregate", None, row.metric_key, row.channel_label)
+
+
+def _metric_group_key(row: HistoricalMetricValue) -> _GroupKey:
+    return _GroupKey("metric", None, row.metric_key, None)
 
 
 def _compute_group_stats(
@@ -139,7 +170,7 @@ def _compute_group_stats(
         metric_key=first.metric_key,
         metric_label=first.metric_label,
         metric_unit=first.metric_unit,
-        channel_label=first.channel_label,
+        channel_label=_channel_label(group_key, first),
         n=n,
         mean=mean,
         std=std,
@@ -216,9 +247,20 @@ def _product_model_identity(value: object) -> str | None:
 
 
 def _product_model_label(group_key: _GroupKey) -> str:
+    if group_key.scope == "metric":
+        return SELECTED_MODELS_LABEL
     if group_key.scope == "aggregate":
         return ALL_MODELS_LABEL
     return group_key.product_model_identity or BLANK_MODEL_LABEL
+
+
+def _channel_label(
+    group_key: _GroupKey,
+    first: HistoricalMetricValue,
+) -> str:
+    if group_key.scope == "metric":
+        return ALL_CHANNELS_LABEL
+    return first.channel_label
 
 
 def _serialize_group_key(group_key: _GroupKey) -> str:

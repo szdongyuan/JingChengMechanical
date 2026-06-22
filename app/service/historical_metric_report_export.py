@@ -152,9 +152,7 @@ def _render_filters(filters: dict[str, object]) -> str:
 
 def _render_stats(stats: list[MetricGroupStats]) -> str:
     headers = [
-        "型号",
-        "通道",
-        "指标",
+        "结果",
         "样本数",
         "均值",
         "标准差",
@@ -166,8 +164,6 @@ def _render_stats(stats: list[MetricGroupStats]) -> str:
     ]
     rows = [
         [
-            stat.product_model,
-            stat.channel_label,
             stat.metric_label,
             stat.n,
             _format_number(stat.mean),
@@ -198,10 +194,7 @@ def _render_charts(stats: list[MetricGroupStats]) -> str:
 
     charts = []
     for stat in stats:
-        title = (
-            f"{stat.product_model} / {stat.channel_label} / "
-            f"{stat.metric_label}"
-        )
+        title = stat.metric_label
         charts.append(
             '<article class="chart-block">'
             f"<h3>{_escape(title)}</h3>"
@@ -286,10 +279,7 @@ def _render_svg_chart(stat: MetricGroupStats) -> str:
         )
 
     x_axis_y = margin_top + plot_height
-    chart_title = (
-        f"{stat.product_model} {stat.channel_label} "
-        f"{stat.metric_label} 直方图"
-    )
+    chart_title = f"{stat.metric_label} 直方图"
     return "".join(
         [
         f'<svg class="chart" width="{width}" height="{height}" '
@@ -438,10 +428,7 @@ def _empty_svg(
     message: str,
     stat: MetricGroupStats,
 ) -> str:
-    chart_title = (
-        f"{stat.product_model} {stat.channel_label} "
-        f"{stat.metric_label} 直方图"
-    )
+    chart_title = f"{stat.metric_label} 直方图"
     return (
         f'<svg class="chart" width="{width}" height="{height}" '
         f'viewBox="0 0 {width} {height}" role="img" '

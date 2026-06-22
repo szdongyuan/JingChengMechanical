@@ -179,12 +179,25 @@ class AudioDataService:
             fn.replace(fn.Substr(AudioDataTable.record_date, 1, 19), "T", " ")
         )
 
-        product_model = str(filters.get("product_model") or "").strip()
-        if product_model and product_model != "ALL":
-            query = query.where(AudioDataTable.product_model == product_model)
+        product_models = filters.get("product_models")
+        normalized_models = []
+        if isinstance(product_models, (list, tuple, set)):
+            normalized_models = [
+                str(model).strip()
+                for model in product_models
+                if str(model).strip()
+            ]
+        if normalized_models:
+            query = query.where(
+                AudioDataTable.product_model.in_(normalized_models)
+            )
+        else:
+            product_model = str(filters.get("product_model") or "").strip()
+            if product_model and product_model != "ALL":
+                query = query.where(AudioDataTable.product_model == product_model)
 
         barcode = str(filters.get("barcode") or "").strip()
-        if barcode:
+        if barcode and not bool(filters.get("barcode_regex")):
             query = query.where(AudioDataTable.barcode.contains(barcode))
 
         start_time = str(filters.get("start_time") or "").strip()

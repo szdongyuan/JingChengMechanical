@@ -59,7 +59,15 @@ def _service(
     )
 
 
-def _metric_row(audio_data_id, value, *, product_model="M1", metric_key="spl_peak_db"):
+def _metric_row(
+    audio_data_id,
+    value,
+    *,
+    product_model="M1",
+    metric_key="spl_peak_db",
+    channel_index=0,
+    channel_label="CH1",
+):
     return HistoricalMetricValue(
         audio_data_id=audio_data_id,
         record_date="2026-06-18T10:00:00+08:00",
@@ -68,13 +76,49 @@ def _metric_row(audio_data_id, value, *, product_model="M1", metric_key="spl_pea
         label="OK",
         label_source="auto",
         analyse_config="Cfg",
-        channel_index=0,
-        channel_label="CH1",
+        channel_index=channel_index,
+        channel_label=channel_label,
         metric_key=metric_key,
         metric_label="声压级峰值",
         metric_value=value,
         metric_unit="dB",
         status="ok",
+    )
+
+
+def _create_cached_metric(
+    service,
+    record,
+    value,
+    *,
+    metric_key="spl_peak_db",
+    channel_index=0,
+    channel_label="CH1",
+):
+    current_signature = service.source_signature_for_record(record)
+    HistoricalMetricCacheTable.create(
+        audio_data_id=record.audio_data_id,
+        file_path=current_signature.file_path,
+        file_size=current_signature.file_size,
+        file_mtime_ns=current_signature.file_mtime_ns,
+        record_date=record.record_date,
+        product_model=record.product_model,
+        barcode=record.barcode,
+        label=record.labels,
+        label_source=record.label_source,
+        analyse_config=record.analyse_config,
+        config_hash=current_signature.config_hash,
+        calibration_hash=current_signature.calibration_hash,
+        algorithm_version=current_signature.algorithm_version,
+        channel_index=channel_index,
+        channel_label=channel_label,
+        metric_key=metric_key,
+        metric_label=METRIC_DEFINITIONS[metric_key][0],
+        metric_value=float(value),
+        metric_unit=METRIC_DEFINITIONS[metric_key][1],
+        status="ok",
+        error_message=None,
+        computed_at="2026-06-18T10:05:00+08:00",
     )
 
 
@@ -114,6 +158,82 @@ def test_report_service_reuses_audio_data_filter_semantics():
     assert [row.audio_data_id for row in rows] == ["blank", "ok"]
 
 
+def test_report_service_can_filter_barcode_by_regex():
+    _create_audio_row(
+        audio_data_id="match-end",
+        barcode="ABC-033",
+        record_date="2026-06-18T10:00:00+08:00",
+    )
+    _create_audio_row(
+        audio_data_id="match-mid",
+        barcode="XYZ-033",
+        record_date="2026-06-18T10:01:00+08:00",
+    )
+    _create_audio_row(
+        audio_data_id="literal-text",
+        barcode="SN-.*-033",
+        record_date="2026-06-18T10:02:00+08:00",
+    )
+    _create_audio_row(
+        audio_data_id="no-match",
+        barcode="ABC-034",
+        record_date="2026-06-18T10:03:00+08:00",
+    )
+
+    rows = _service().list_source_records(
+        {
+            "product_model": "ALL",
+            "barcode": r"^.*-033$",
+            "barcode_regex": True,
+            "labels": ["OK", "NG"],
+        }
+    )
+
+    assert [row.audio_data_id for row in rows] == [
+        "literal-text",
+        "match-mid",
+        "match-end",
+    ]
+
+
+def test_report_service_keeps_barcode_regex_characters_literal_without_regex_flag():
+    _create_audio_row(
+        audio_data_id="literal-text",
+        barcode="SN-.*-033",
+        record_date="2026-06-18T10:01:00+08:00",
+    )
+    _create_audio_row(
+        audio_data_id="regex-looking-match",
+        barcode="SN-ABC-033",
+        record_date="2026-06-18T10:02:00+08:00",
+    )
+
+    rows = _service().list_source_records(
+        {
+            "product_model": "ALL",
+            "barcode": ".*",
+            "barcode_regex": False,
+            "labels": ["OK", "NG"],
+        }
+    )
+
+    assert [row.audio_data_id for row in rows] == ["literal-text"]
+
+
+def test_report_service_rejects_invalid_barcode_regex():
+    _create_audio_row(audio_data_id="record", barcode="SN-1")
+
+    with pytest.raises(ValueError, match="SN 正则表达式无效"):
+        _service().list_source_records(
+            {
+                "product_model": "ALL",
+                "barcode": "[",
+                "barcode_regex": True,
+                "labels": ["OK", "NG"],
+            }
+        )
+
+
 def test_report_service_applies_time_range_filter_semantics():
     _create_audio_row(
         audio_data_id="early",
@@ -139,6 +259,20 @@ def test_report_service_applies_time_range_filter_semantics():
     )
 
     assert [row.audio_data_id for row in rows] == ["inside"]
+
+
+def test_report_service_treats_product_models_values_as_literal_models():
+    _create_audio_row(audio_data_id="literal-all", product_model="ALL")
+    _create_audio_row(audio_data_id="other", product_model="M1")
+
+    rows = _service().list_source_records(
+        {
+            "product_models": ["ALL"],
+            "labels": ["OK", "NG"],
+        }
+    )
+
+    assert [row.audio_data_id for row in rows] == ["literal-all"]
 
 
 def test_config_hash_is_deterministic_for_json_content():
@@ -1006,13 +1140,141 @@ def test_generate_report_returns_computed_statistics_and_outliers():
         )
 
     result = service.generate_report({"labels": ["OK", "NG"]})
-    stat = next(item for item in result.stats if item.product_model == "M1")
+    stat = result.stats[0]
 
     assert stat.n == 20
     assert stat.mean == pytest.approx(9.5)
     assert {row.audio_data_id for row in result.outliers} == {
         "cached-0",
         "cached-19",
+    }
+
+
+def test_generate_report_all_model_returns_aggregate_stats_only():
+    service = _service()
+    first = _create_audio_row(audio_data_id="m1", product_model="M1")
+    second = _create_audio_row(audio_data_id="m2", product_model="M2")
+    _create_cached_metric(service, first, 10.0)
+    _create_cached_metric(service, second, 20.0)
+
+    result = service.generate_report({"product_model": "ALL", "labels": ["OK", "NG"]})
+
+    assert [stat.product_model for stat in result.stats] == ["所选型号"]
+    assert [stat.channel_label for stat in result.stats] == ["全部通道"]
+    assert result.stats[0].n == 2
+    assert result.stats[0].mean == pytest.approx(15.0)
+
+
+def test_generate_report_specific_model_returns_selected_model_stats_only():
+    service = _service()
+    first = _create_audio_row(audio_data_id="m1", product_model="M1")
+    second = _create_audio_row(audio_data_id="m2", product_model="M2")
+    _create_cached_metric(service, first, 10.0)
+    _create_cached_metric(service, second, 20.0)
+
+    result = service.generate_report({"product_model": "M1", "labels": ["OK", "NG"]})
+
+    assert result.total_records == 1
+    assert [stat.product_model for stat in result.stats] == ["所选型号"]
+    assert [stat.channel_label for stat in result.stats] == ["全部通道"]
+    assert result.stats[0].n == 1
+    assert result.stats[0].mean == pytest.approx(10.0)
+
+
+def test_generate_report_multiple_product_models_filters_before_statistics():
+    service = _service()
+    first = _create_audio_row(audio_data_id="m1", product_model="M1")
+    second = _create_audio_row(audio_data_id="m2", product_model="M2")
+    third = _create_audio_row(audio_data_id="m3", product_model="M3")
+    _create_cached_metric(service, first, 10.0)
+    _create_cached_metric(service, second, 20.0)
+    _create_cached_metric(service, third, 30.0)
+
+    result = service.generate_report(
+        {"product_models": ["M1", "M3"], "labels": ["OK", "NG"]}
+    )
+
+    assert result.total_records == 2
+    assert len(result.stats) == 1
+    assert result.stats[0].product_model == "所选型号"
+    assert result.stats[0].channel_label == "全部通道"
+    assert result.stats[0].n == 2
+    assert result.stats[0].mean == pytest.approx(20.0)
+
+
+def test_generate_report_outliers_use_metric_only_population():
+    service = _service()
+    for value in range(20):
+        record = _create_audio_row(
+            audio_data_id=f"metric-only-{value}",
+            product_model="M1" if value < 10 else "M2",
+            record_date=f"2026-06-18T10:{value:02d}:00+08:00",
+        )
+        _create_cached_metric(service, record, float(value))
+
+    result = service.generate_report({"product_model": "ALL", "labels": ["OK", "NG"]})
+
+    assert result.stats[0].n == 20
+    assert {row.audio_data_id for row in result.outliers} == {
+        "metric-only-0",
+        "metric-only-19",
+    }
+
+
+def test_generate_report_empty_product_models_returns_all_records():
+    service = _service()
+    first = _create_audio_row(audio_data_id="m1", product_model="M1")
+    second = _create_audio_row(audio_data_id="m2", product_model="M2")
+    _create_cached_metric(service, first, 10.0)
+    _create_cached_metric(service, second, 20.0)
+
+    result = service.generate_report({"product_models": [], "labels": ["OK", "NG"]})
+
+    assert result.total_records == 2
+    assert [stat.product_model for stat in result.stats] == ["所选型号"]
+    assert [stat.channel_label for stat in result.stats] == ["全部通道"]
+    assert result.stats[0].mean == pytest.approx(15.0)
+
+
+def test_generate_report_labels_vibration_pair_channels_by_role():
+    config = {
+        "selected_channels": [0, 1],
+        "vibration_view_channel_index": 1,
+        "analysis_window_offset_ms": 0,
+        "analysis_duration": 0.5,
+        "channels": [{"channel_index": 0}, {"channel_index": 1}],
+    }
+    record = _create_audio_row(
+        audio_data_id="pair",
+        config_content=json.dumps(config, ensure_ascii=False),
+    )
+    service = _service()
+    _create_cached_metric(
+        service,
+        record,
+        60.0,
+        metric_key="spl_peak_db",
+        channel_index=0,
+        channel_label="CH1",
+    )
+    _create_cached_metric(
+        service,
+        record,
+        1.25,
+        metric_key="vibration_rms",
+        channel_index=1,
+        channel_label="CH2",
+    )
+
+    result = service.generate_report({"product_model": "ALL", "labels": ["OK", "NG"]})
+    by_metric = {row.metric_key: row for row in result.metric_rows}
+
+    assert by_metric["spl_peak_db"].channel_label == "麦克风(CH1)"
+    assert by_metric["vibration_rms"].channel_label == "振动(CH2)"
+    assert {stat.channel_label for stat in result.stats} == {"全部通道"}
+    assert {stat.metric_key for stat in result.stats} == {
+        "spl_peak_db",
+        "vibration_rms",
     }
 
 
@@ -1047,6 +1309,33 @@ def test_statistics_use_sample_std_and_linear_percentiles():
         np.percentile([1, 2, 3, 4, 5], 5, method="linear")
     )
     assert stat.normal_available is True
+
+
+def test_statistics_can_group_by_metric_without_model_or_channel():
+    rows = [
+        _metric_row(
+            "m1-ch1",
+            10.0,
+            product_model="M1",
+            channel_index=0,
+            channel_label="CH1",
+        ),
+        _metric_row(
+            "m2-ch2",
+            30.0,
+            product_model="M2",
+            channel_index=1,
+            channel_label="CH2",
+        ),
+    ]
+
+    stats = compute_statistics(rows, group_by_metric_only=True)
+
+    assert len(stats) == 1
+    assert stats[0].product_model == "所选型号"
+    assert stats[0].channel_label == "全部通道"
+    assert stats[0].n == 2
+    assert stats[0].mean == pytest.approx(20.0)
 
 
 def test_statistics_ignore_non_finite_values():

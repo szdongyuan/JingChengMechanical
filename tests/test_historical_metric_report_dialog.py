@@ -8,7 +8,13 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QDateTime
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCalendarWidget,
+    QCheckBox,
+    QDialog,
+    QListWidget,
+)
 
 from app.service.historical_metric_report_types import (
     HistoricalMetricReportResult,
@@ -151,6 +157,38 @@ def _report_result_with_stats_and_failure():
     )
 
 
+def _stats_row(
+    *,
+    product_model="所选型号",
+    channel_label="全部通道",
+    metric_key="spl_peak_db",
+    metric_label="声压级峰值",
+    metric_unit="dB",
+    mean=60.0,
+):
+    return MetricGroupStats(
+        group_key=f"{product_model}|{channel_label}|{metric_key}",
+        product_model=product_model,
+        metric_key=metric_key,
+        metric_label=metric_label,
+        metric_unit=metric_unit,
+        channel_label=channel_label,
+        n=5,
+        mean=mean,
+        std=1.5,
+        min=58.0,
+        max=62.0,
+        p5=58.2,
+        p50=60.0,
+        p95=61.8,
+        histogram_bins=[58.0, 60.0, 62.0],
+        histogram_counts=[2, 3],
+        normal_x=[58.0, 60.0, 62.0],
+        normal_y=[1.0, 3.0, 1.0],
+        normal_available=True,
+    )
+
+
 def test_report_dialog_defaults_to_all_models_no_time_ok_ng(qapp):
     service = _ReportServiceStub()
     dialog = HistoricalMetricReportDialog(
@@ -160,7 +198,8 @@ def test_report_dialog_defaults_to_all_models_no_time_ok_ng(qapp):
         )
     )
 
-    assert dialog.combo_product_model.currentText() == "ALL"
+    assert dialog._selected_product_models == []
+    assert dialog.btn_product_models.text() == "全部型号"
     assert dialog.cb_enable_time_range.isChecked() is False
     assert dialog.cb_ok.isChecked() is True
     assert dialog.cb_ng.isChecked() is True
@@ -175,10 +214,38 @@ def test_report_dialog_populates_product_models_from_audio_data_service(qapp):
         )
     )
 
-    assert [
-        dialog.combo_product_model.itemText(index)
-        for index in range(dialog.combo_product_model.count())
-    ] == ["ALL", "M1", "M2"]
+    assert dialog._available_product_models == ["M1", "M2"]
+    assert dialog._selected_product_models == ["M1", "M2"]
+    assert dialog.btn_product_models.text() == "已选全部"
+
+
+def test_report_dialog_product_model_selector_uses_select_all_control(qapp, monkeypatch):
+    seen = {}
+
+    def fake_exec(dialog: QDialog):
+        model_list = dialog.findChild(QListWidget, "HistoricalReportProductModelList")
+        select_all = dialog.findChild(QCheckBox, "HistoricalReportSelectAllModels")
+        seen["select_all_text"] = select_all.text()
+        seen["select_all_checked"] = select_all.isChecked()
+        seen["items"] = [
+            model_list.item(row).text()
+            for row in range(model_list.count())
+        ]
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(
+        "ui.popups.historical_metric_report_dialog.QDialog.exec",
+        fake_exec,
+    )
+    dialog = _dialog(product_models=["M1", "M2"])
+
+    dialog._open_product_model_selector()
+
+    assert seen == {
+        "select_all_text": "全选",
+        "select_all_checked": True,
+        "items": ["M1", "M2"],
+    }
 
 
 def test_report_dialog_collects_filters_without_selected_rows(qapp):
@@ -187,10 +254,44 @@ def test_report_dialog_collects_filters_without_selected_rows(qapp):
     filters = dialog.current_filters()
 
     assert filters["product_model"] == "ALL"
+    assert filters["product_models"] == []
     assert filters["start_time"] == ""
     assert filters["end_time"] == ""
     assert filters["barcode"] == ""
+    assert filters["barcode_regex"] is False
     assert filters["labels"] == ["OK", "NG"]
+
+
+def test_report_dialog_collects_barcode_regex_filter(qapp):
+    dialog = _dialog()
+    dialog.ed_barcode.setText(r"^SN-\\d+$")
+    dialog.cb_barcode_regex.setChecked(True)
+
+    filters = dialog.current_filters()
+
+    assert filters["barcode"] == r"^SN-\\d+$"
+    assert filters["barcode_regex"] is True
+
+
+def test_report_dialog_collects_select_all_as_no_model_filter(qapp):
+    dialog = _dialog(product_models=["M1", "M2"])
+
+    filters = dialog.current_filters()
+
+    assert filters["product_model"] == "ALL"
+    assert filters["product_models"] == []
+
+
+def test_report_dialog_collects_multiple_product_models_before_generation(qapp):
+    dialog = _dialog(product_models=["M1", "M2", "M3"])
+    dialog._selected_product_models = ["M1", "M3"]
+    dialog._update_product_model_button()
+
+    filters = dialog.current_filters()
+
+    assert dialog.btn_product_models.text() == "已选 2 个型号"
+    assert filters["product_model"] == ""
+    assert filters["product_models"] == ["M1", "M3"]
 
 
 def test_report_dialog_serializes_enabled_time_range(qapp):
@@ -219,11 +320,60 @@ def test_report_dialog_render_result_fills_summary_and_stats_table(qapp):
     assert dialog.lb_failed_records.text() == "1"
     assert dialog.lb_label_counts.text() == "OK 2 / NG 1 / 未标注 0"
     assert dialog.stats_table.rowCount() == 1
-    assert dialog.stats_table.item(0, 0).text() == "全部型号"
-    assert dialog.stats_table.item(0, 1).text() == "CH1"
-    assert dialog.stats_table.item(0, 2).text() == "声压级峰值"
-    assert dialog.stats_table.item(0, 3).text() == "5"
-    assert dialog.stats_table.item(0, 4).text() == "60.000"
+    assert dialog.stats_table.item(0, 0).text() == "声压级峰值"
+    assert dialog.stats_table.item(0, 1).text() == "5"
+    assert dialog.stats_table.item(0, 2).text() == "60.000"
+
+
+def test_report_dialog_stats_table_selects_result_plot(qapp):
+    first = _stats_row(metric_label="声压级峰值", metric_key="spl_peak_db")
+    second = _stats_row(
+        metric_key="loudness_average_sone",
+        metric_label="平均响度",
+        metric_unit="sone",
+        mean=2.0,
+    )
+    result = HistoricalMetricReportResult(
+        filters={"product_model": "ALL", "labels": ["OK", "NG"]},
+        generated_at="2026-06-18T10:05:00+08:00",
+        total_records=5,
+        valid_record_count=5,
+        skipped_record_count=0,
+        failed_record_count=0,
+        label_counts={"OK": 5, "NG": 0, "not_labeled": 0},
+        metric_rows=[],
+        stats=[first, second],
+        failures=[],
+        outliers=[],
+    )
+    dialog = _dialog()
+    rendered = []
+    dialog._render_plot = lambda stat: rendered.append(stat.metric_label)
+
+    dialog._render_result(result)
+
+    assert not hasattr(dialog, "chart_list")
+    assert dialog.stats_table.rowCount() == 2
+    assert dialog.stats_table.item(0, 0).text() == "声压级峰值"
+    assert dialog.stats_table.item(1, 0).text() == "平均响度"
+    assert rendered[-1] == "声压级峰值"
+
+    dialog.stats_table.selectRow(1)
+
+    assert rendered[-1] == "平均响度"
+
+
+def test_report_dialog_calendar_popup_keeps_date_numbers_readable(qapp):
+    dialog = _dialog()
+    calendar = dialog.dt_start_time.calendarWidget()
+
+    assert calendar.minimumWidth() >= 420
+    assert calendar.minimumHeight() >= 320
+    assert (
+        calendar.horizontalHeaderFormat()
+        == QCalendarWidget.HorizontalHeaderFormat.SingleLetterDayNames
+    )
+    assert "selection-color: #111827" in calendar.styleSheet()
 
 
 def test_report_dialog_failures_table_shows_reasons(qapp):
@@ -241,7 +391,16 @@ def test_report_dialog_export_calls_html_and_csv_exporters(qapp, monkeypatch, tm
     calls = []
     html_path = tmp_path / "historical-report.html"
     dialog = _dialog()
-    dialog._render_result(_report_result_with_stats_and_failure())
+    result = _report_result_with_stats_and_failure()
+    result.stats.append(
+        _stats_row(
+            metric_key="loudness_average_sone",
+            metric_label="平均响度",
+            metric_unit="sone",
+            mean=2.0,
+        )
+    )
+    dialog._render_result(result)
 
     monkeypatch.setattr(
         "ui.popups.historical_metric_report_dialog.QFileDialog.getSaveFileName",
@@ -266,7 +425,11 @@ def test_report_dialog_export_calls_html_and_csv_exporters(qapp, monkeypatch, tm
         ("html", str(html_path)),
         ("csv", str(tmp_path / "historical-report.csv")),
     ]
-    assert all(result is dialog._current_result for _kind, result, _path in calls)
+    assert calls[0][1] is calls[1][1]
+    assert [stat.metric_label for stat in calls[0][1].stats] == [
+        "声压级峰值",
+        "平均响度",
+    ]
 
 
 def test_report_worker_emits_canceled_for_report_canceled(qapp):
@@ -319,6 +482,42 @@ def test_report_dialog_generate_starts_worker_and_updates_progress(qapp, monkeyp
     assert starts and starts[0]["labels"] == ["OK", "NG"]
     assert "1 / 3" in dialog.lb_progress.text()
     assert "audio-1" in dialog.lb_progress.text()
+
+
+def test_report_dialog_rejects_invalid_barcode_regex_before_generation(
+    qapp, monkeypatch
+):
+    starts = []
+    warnings = []
+
+    class FakeWorker:
+        def __init__(self, report_service, filters):
+            self.progress_changed = _SignalStub()
+            self.succeeded = _SignalStub()
+            self.failed = _SignalStub()
+            self.canceled = _SignalStub()
+
+        def start(self):
+            starts.append(True)
+
+    monkeypatch.setattr(
+        "ui.popups.historical_metric_report_dialog.HistoricalReportWorkerThread",
+        FakeWorker,
+    )
+    monkeypatch.setattr(
+        "ui.popups.historical_metric_report_dialog.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+    dialog = _dialog()
+    dialog.ed_barcode.setText("[")
+    dialog.cb_barcode_regex.setChecked(True)
+
+    dialog.btn_generate.click()
+
+    assert starts == []
+    assert warnings
+    assert "SN 正则表达式无效" in warnings[0][2]
+    assert dialog._worker is None
 
 
 def test_report_dialog_cancel_requests_worker_and_restores_controls(qapp, monkeypatch):

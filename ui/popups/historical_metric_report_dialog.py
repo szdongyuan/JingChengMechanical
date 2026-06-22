@@ -2,15 +2,17 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+import re
 
 import pyqtgraph as pg
 from PyQt6.QtCore import QDateTime, QThread, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QCalendarWidget,
     QCheckBox,
-    QComboBox,
     QDateTimeEdit,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFormLayout,
     QGridLayout,
@@ -18,6 +20,8 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPushButton,
     QSplitter,
@@ -77,6 +81,8 @@ class HistoricalMetricReportDialog(QDialog):
         self._worker_terminal_signal_received = False
         self._worker_finished_signal_received = False
         self._stats_by_row: list[MetricGroupStats] = []
+        self._available_product_models: list[str] = []
+        self._selected_product_models: list[str] = []
 
         self.setWindowTitle("测量结果正态分布统计报告")
         self.resize(1180, 760)
@@ -97,7 +103,8 @@ class HistoricalMetricReportDialog(QDialog):
             labels.append("not_labeled")
 
         return {
-            "product_model": self.combo_product_model.currentText(),
+            "product_model": self._legacy_product_model_filter(),
+            "product_models": self._product_models_filter(),
             "start_time": (
                 self.dt_start_time.dateTime().toString("yyyy-MM-dd HH:mm:ss")
                 if self.cb_enable_time_range.isChecked()
@@ -109,6 +116,7 @@ class HistoricalMetricReportDialog(QDialog):
                 else ""
             ),
             "barcode": self.ed_barcode.text().strip(),
+            "barcode_regex": self.cb_barcode_regex.isChecked(),
             "labels": labels,
         }
 
@@ -122,10 +130,12 @@ class HistoricalMetricReportDialog(QDialog):
         filter_layout.setContentsMargins(0, 0, 0, 0)
         filter_layout.setSpacing(8)
 
-        self.combo_product_model = QComboBox(self)
-        self.combo_product_model.setMinimumWidth(130)
+        self.btn_product_models = QPushButton("全部型号", self)
+        self.btn_product_models.setObjectName("HistoricalReportProductModelSelector")
+        self.btn_product_models.setMinimumWidth(130)
+        self.btn_product_models.clicked.connect(self._open_product_model_selector)
         filter_layout.addWidget(QLabel("型号", self))
-        filter_layout.addWidget(self.combo_product_model)
+        filter_layout.addWidget(self.btn_product_models)
 
         self.cb_enable_time_range = QCheckBox("时间", self)
         filter_layout.addWidget(self.cb_enable_time_range)
@@ -138,6 +148,7 @@ class HistoricalMetricReportDialog(QDialog):
             edit.setDateTime(QDateTime.currentDateTime())
             edit.setEnabled(False)
             edit.setMinimumWidth(170)
+            self._setup_calendar_popup(edit)
         self.cb_enable_time_range.toggled.connect(self.dt_start_time.setEnabled)
         self.cb_enable_time_range.toggled.connect(self.dt_end_time.setEnabled)
         filter_layout.addWidget(self.dt_start_time)
@@ -149,6 +160,10 @@ class HistoricalMetricReportDialog(QDialog):
         self.ed_barcode.setMinimumWidth(130)
         filter_layout.addWidget(QLabel("SN码", self))
         filter_layout.addWidget(self.ed_barcode)
+        self.cb_barcode_regex = QCheckBox("正则", self)
+        self.cb_barcode_regex.setObjectName("HistoricalReportBarcodeRegex")
+        self.cb_barcode_regex.setToolTip("勾选后 SN 码按正则表达式匹配")
+        filter_layout.addWidget(self.cb_barcode_regex)
 
         self.cb_ok = QCheckBox("OK", self)
         self.cb_ng = QCheckBox("NG", self)
@@ -209,11 +224,18 @@ class HistoricalMetricReportDialog(QDialog):
         main_splitter = QSplitter(Qt.Orientation.Vertical, self)
         top_splitter = QSplitter(Qt.Orientation.Horizontal, main_splitter)
 
+        selector_host = QWidget(self)
+        selector_layout = QVBoxLayout(selector_host)
+        selector_layout.setContentsMargins(0, 0, 0, 0)
+        selector_layout.setSpacing(6)
+
+        table_title = QLabel("结果选择", self)
+        table_title.setObjectName("HistoricalReportStatsTableTitle")
+        selector_layout.addWidget(table_title)
+
         self.stats_table = self._make_table(
             [
-                "型号",
-                "通道",
-                "指标",
+                "结果",
                 "样本数",
                 "均值",
                 "标准差",
@@ -224,7 +246,8 @@ class HistoricalMetricReportDialog(QDialog):
             "HistoricalReportStatsTable",
         )
         self.stats_table.itemSelectionChanged.connect(self._on_stats_selection_changed)
-        top_splitter.addWidget(self.stats_table)
+        selector_layout.addWidget(self.stats_table, 1)
+        top_splitter.addWidget(selector_host)
 
         chart_host = QWidget(self)
         chart_layout = QVBoxLayout(chart_host)
@@ -263,19 +286,206 @@ class HistoricalMetricReportDialog(QDialog):
         root.addWidget(main_splitter, 1)
 
     def _load_product_models(self) -> None:
-        self.combo_product_model.clear()
-        self.combo_product_model.addItem("ALL")
         try:
             product_models = self.services.audio_data_service.list_product_models()
         except Exception:
             product_models = []
-        for model in product_models:
-            self.combo_product_model.addItem(str(model))
+        self._available_product_models = [
+            str(model).strip() for model in product_models if str(model).strip()
+        ]
+        self._selected_product_models = list(self._available_product_models)
+        self._update_product_model_button()
+
+    def _legacy_product_model_filter(self) -> str:
+        if not self._selected_product_models:
+            return "ALL"
+        if self._all_product_models_selected():
+            return "ALL"
+        if len(self._selected_product_models) == 1:
+            return self._selected_product_models[0]
+        return ""
+
+    def _product_models_filter(self) -> list[str]:
+        if not self._selected_product_models or self._all_product_models_selected():
+            return []
+        return list(self._selected_product_models)
+
+    def _all_product_models_selected(self) -> bool:
+        return bool(self._available_product_models) and set(
+            self._selected_product_models
+        ) == set(self._available_product_models)
+
+    def _update_product_model_button(self) -> None:
+        selected = list(self._selected_product_models)
+        if not self._available_product_models:
+            text = "全部型号"
+        elif not selected:
+            text = "未选择型号"
+        elif self._all_product_models_selected():
+            text = "已选全部"
+        elif len(selected) == 1:
+            text = selected[0]
+        else:
+            text = f"已选 {len(selected)} 个型号"
+        self.btn_product_models.setText(text)
+
+    def _open_product_model_selector(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("选择型号")
+        dialog.resize(360, 420)
+
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        model_list = QListWidget(dialog)
+        model_list.setObjectName("HistoricalReportProductModelList")
+        model_list.setAlternatingRowColors(True)
+        model_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        selected = set(self._selected_product_models)
+
+        for model in self._available_product_models:
+            item = QListWidgetItem(model)
+            item.setData(Qt.ItemDataRole.UserRole, model)
+            item.setFlags(
+                Qt.ItemFlag.ItemIsEnabled
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            item.setCheckState(
+                Qt.CheckState.Checked if model in selected else Qt.CheckState.Unchecked
+            )
+            model_list.addItem(item)
+
+        cb_select_all = QCheckBox("全选", dialog)
+        cb_select_all.setObjectName("HistoricalReportSelectAllModels")
+
+        syncing_model_checks = False
+
+        def set_all_model_checks(state: Qt.CheckState) -> None:
+            nonlocal syncing_model_checks
+            syncing_model_checks = True
+            try:
+                for item_row in range(model_list.count()):
+                    model_list.item(item_row).setCheckState(state)
+            finally:
+                syncing_model_checks = False
+
+        def sync_select_all_check() -> None:
+            nonlocal syncing_model_checks
+            if syncing_model_checks:
+                return
+            syncing_model_checks = True
+            try:
+                all_checked = bool(model_list.count()) and all(
+                    model_list.item(item_row).checkState() == Qt.CheckState.Checked
+                    for item_row in range(model_list.count())
+                )
+                cb_select_all.setChecked(all_checked)
+            finally:
+                syncing_model_checks = False
+
+        def on_select_all_toggled(checked: bool) -> None:
+            if syncing_model_checks:
+                return
+            set_all_model_checks(
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+            )
+
+        def toggle_model_item(item: QListWidgetItem) -> None:
+            item.setCheckState(
+                Qt.CheckState.Unchecked
+                if item.checkState() == Qt.CheckState.Checked
+                else Qt.CheckState.Checked
+            )
+
+        cb_select_all.setEnabled(model_list.count() > 0)
+        cb_select_all.toggled.connect(on_select_all_toggled)
+        model_list.itemChanged.connect(lambda _item: sync_select_all_check())
+        model_list.itemDoubleClicked.connect(toggle_model_item)
+        sync_select_all_check()
+
+        layout.addWidget(cb_select_all)
+        layout.addWidget(model_list, 1)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel,
+            dialog,
+        )
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        chosen: list[str] = []
+        for row in range(model_list.count()):
+            item = model_list.item(row)
+            if item.checkState() == Qt.CheckState.Checked:
+                chosen.append(str(item.data(Qt.ItemDataRole.UserRole)))
+        if not chosen:
+            QMessageBox.information(self, "提示", "请至少选择一个型号")
+            return
+        self._selected_product_models = chosen
+        self._update_product_model_button()
+
+    @staticmethod
+    def _setup_calendar_popup(edit: QDateTimeEdit) -> None:
+        calendar = edit.calendarWidget()
+        if not calendar:
+            return
+        calendar.setMinimumSize(420, 320)
+        calendar.setGridVisible(True)
+        calendar.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+        calendar.setHorizontalHeaderFormat(
+            QCalendarWidget.HorizontalHeaderFormat.SingleLetterDayNames
+        )
+        calendar.setStyleSheet(
+            """
+            QCalendarWidget QWidget {
+                background: #ffffff;
+                color: #111827;
+            }
+            QCalendarWidget QToolButton {
+                min-width: 72px;
+                background: #ffffff;
+                color: #111827;
+                border: 1px solid #d1d5db;
+                border-radius: 4px;
+                padding: 4px 8px;
+            }
+            QCalendarWidget QMenu {
+                background: #ffffff;
+                color: #111827;
+            }
+            QCalendarWidget QSpinBox {
+                min-width: 80px;
+                color: #111827;
+                background: #ffffff;
+                selection-background-color: #dbeafe;
+                selection-color: #111827;
+            }
+            QCalendarWidget QAbstractItemView:enabled {
+                min-width: 320px;
+                min-height: 220px;
+                background: #ffffff;
+                color: #111827;
+                selection-background-color: #dbeafe;
+                selection-color: #111827;
+                alternate-background-color: #ffffff;
+            }
+            """
+        )
 
     def _generate_report(self) -> None:
         if self._worker is not None:
             self._maybe_cleanup_worker()
         if self._worker is not None:
+            return
+        filters = self.current_filters()
+        if not self._validate_filters(filters):
             return
         self.lb_progress.setText("正在生成...")
         self._set_running_state(True)
@@ -284,7 +494,7 @@ class HistoricalMetricReportDialog(QDialog):
         self._worker_finished_signal_received = False
         self._worker = HistoricalReportWorkerThread(
             self.services.historical_metric_report_service,
-            self.current_filters(),
+            filters,
         )
         self._worker.progress_changed.connect(self._on_progress_changed)
         self._worker.succeeded.connect(self._on_report_succeeded)
@@ -293,6 +503,19 @@ class HistoricalMetricReportDialog(QDialog):
         if hasattr(self._worker, "finished"):
             self._worker.finished.connect(self._on_worker_finished)
         self._worker.start()
+
+    def _validate_filters(self, filters: dict[str, object]) -> bool:
+        if not filters.get("barcode_regex"):
+            return True
+        barcode = str(filters.get("barcode") or "").strip()
+        if not barcode:
+            return True
+        try:
+            re.compile(barcode)
+        except re.error as exc:
+            QMessageBox.warning(self, "筛选条件无效", f"SN 正则表达式无效: {exc}")
+            return False
+        return True
 
     def _cancel_generation(self) -> None:
         if self._worker is None:
@@ -407,11 +630,10 @@ class HistoricalMetricReportDialog(QDialog):
     def _render_stats_table(self, stats: list[MetricGroupStats]) -> None:
         self._stats_by_row = list(stats)
         self.stats_table.setSortingEnabled(False)
+        self.stats_table.clearSelection()
         self.stats_table.setRowCount(len(self._stats_by_row))
         for row_index, stat in enumerate(self._stats_by_row):
             values = [
-                stat.product_model,
-                stat.channel_label,
                 stat.metric_label,
                 stat.n,
                 self._format_number(stat.mean, digits=3),

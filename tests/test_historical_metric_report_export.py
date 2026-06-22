@@ -136,6 +136,9 @@ def test_html_export_is_static_and_contains_summary_and_chart_data(tmp_path):
     assert "声压级峰值" in text
     assert "失败" in text
     assert "<svg" in text
+    assert "<th>结果</th>" in text
+    assert "M1 / CH1 / 声压级峰值" not in text
+    assert "M1 CH1 声压级峰值 直方图" not in text
     assert "http://" not in text
     assert "https://" not in text
 
