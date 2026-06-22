@@ -22,7 +22,7 @@ from app.service.analysis.review_payloads import (
     build_summary_payload,
     canonical_channel_label,
 )
-from app.services_container import (
+from app.service.factory_review_payloads import (
     FactoryReviewPayload,
     FactoryReviewWindow,
     ImportAudioWarning,

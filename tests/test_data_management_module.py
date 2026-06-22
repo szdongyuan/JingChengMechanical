@@ -86,6 +86,14 @@ class _AudioDataServiceStub:
             },
         ]
 
+    def count_records(self, _filters=None):
+        return len(self.list_records(_filters))
+
+    def list_records_page(self, filters=None, page=1, page_size=50):
+        start = (page - 1) * page_size
+        end = start + page_size
+        return self.list_records(filters)[start:end]
+
     def list_product_models(self):
         return ["M"]
 
@@ -117,3 +125,46 @@ def test_data_management_displays_label_source_column(qapp):
     assert module.table.item(2, source_column).text() == ""
     assert module.table.item(3, source_column).text() == ""
     assert module.table.item(4, source_column).text() == "operator"
+
+
+def test_data_management_shows_statistics_report_button(qapp):
+    services = SimpleNamespace(
+        audio_data_service=_AudioDataServiceStub(),
+        historical_metric_report_service=object(),
+    )
+    module = DataManagementModule(services)
+
+    assert module.btn_statistics_report.text() == "统计报告"
+
+
+def test_statistics_report_opens_without_selected_rows(qapp, monkeypatch):
+    opened = []
+
+    class FakeDialog:
+        def __init__(self, services, parent=None):
+            self.destroyed = SimpleNamespace(connect=lambda callback: None)
+            opened.append((services, parent))
+
+        def show(self):
+            opened.append("show")
+
+        def raise_(self):
+            opened.append("raise")
+
+        def activateWindow(self):
+            opened.append("activate")
+
+    monkeypatch.setattr(
+        "ui.modules.data_management.HistoricalMetricReportDialog",
+        FakeDialog,
+    )
+    services = SimpleNamespace(
+        audio_data_service=_AudioDataServiceStub(),
+        historical_metric_report_service=object(),
+    )
+    module = DataManagementModule(services)
+
+    module.btn_statistics_report.click()
+
+    assert opened[0][0] is services
+    assert "show" in opened

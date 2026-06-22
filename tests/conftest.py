@@ -12,6 +12,7 @@ from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable
 from model.device_table import DeviceTable
 from model.audio_data_table import AudioDataTable
+from model.historical_metric_cache_table import HistoricalMetricCacheTable
 
 ALL_TABLES = [
     TestConfigTable,
@@ -22,6 +23,7 @@ ALL_TABLES = [
     AiExecutionTable,
     DeviceTable,
     AudioDataTable,
+    HistoricalMetricCacheTable,
 ]
 
 _test_db = SqliteDatabase(":memory:", pragmas={"foreign_keys": 1})

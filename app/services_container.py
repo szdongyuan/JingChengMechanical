@@ -11,6 +11,12 @@ from app.service.config_service import ConfigService
 from app.service.db_connection_service import DbConnectionService
 from app.service.factory_selection_settings import FactorySelectionSettings
 from app.service.hardwareselect_service import HardwareSelectService
+from app.service.factory_review_payloads import (
+    FactoryReviewPayload,
+    FactoryReviewWindow,
+    ImportAudioWarning,
+)
+from app.service.historical_metric_report_service import HistoricalMetricReportService
 from app.service.input_calibration_service import InputCalibrationService
 
 
@@ -98,41 +104,6 @@ class FactoryControllerState:
     @property
     def is_ready(self) -> bool:
         return self.selection_ready
-
-
-@dataclass(frozen=True)
-class FactoryReviewWindow:
-    start_sec: float
-    end_sec: float
-
-
-@dataclass(frozen=True)
-class ImportAudioWarning:
-    code: str
-    message: str
-    severity: str = "warning"
-    channel_index: int | None = None
-    wav_channel_index: int | None = None
-    metric: str | None = None
-
-
-@dataclass(frozen=True)
-class FactoryReviewPayload:
-    displayed_config_id: int | None = None
-    config_payload: dict | None = None
-    run_id: str | None = None
-    trigger_source: str | None = None
-    captured_duration_sec: float | None = None
-    default_window: FactoryReviewWindow | None = None
-    fallback_window: FactoryReviewWindow | None = None
-    manual_reanalysis_allowed: bool = False
-    no_result: bool = False
-    error_message: str | None = None
-    judgment_payload: dict | None = None
-    summary_payload: dict | None = None
-    chart_payload: dict | None = None
-    import_warnings: tuple[ImportAudioWarning, ...] = ()
-    display_channel_labels: dict[int, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -273,6 +244,13 @@ class ServiceContainer:
         self.get_process_param_values = None
 
         self.ai_service = AiService()
+
+        self.historical_metric_report_service = HistoricalMetricReportService(
+            audio_data_service=self.audio_data_service,
+            hss_service=self.hss_service,
+            ai_service=self.ai_service,
+            golden_sample_service=self.config_service.golden_sample_service,
+        )
         self.config_package_service = ConfigPackageService(
             config_service=self.config_service,
             ai_service=self.ai_service,
