@@ -83,19 +83,18 @@ class PlcService(QObject):
         if self.timer is not None:
             return
         self.state_changed.emit("连接中")
-        # 启动时先尝试连一次 PLC。
+        # 启动定时器前 先尝试连一次 PLC；失败也启动定时器，后面继续自动重连。
         self._connect_once()
-        if self.plc_client is None:
-            self.state_changed.emit("未连接")
-            self.connect_result.emit(False, self._last_connect_error or "PLC 连接失败")
-            return
 
         # 创建轮询定时器，按固定周期读取 PLC 开始位。
         self.timer = QTimer(self)
         self.timer.setInterval(self._poll_interval_ms)
         self.timer.timeout.connect(self.poll_once)
         self.timer.start()
-        self.connect_result.emit(True, "")
+
+        if self.plc_client is None:
+            self.state_changed.emit("重连中")
+            return
 
         self.logger.info(f"PLC{self._plc_id}开始监听: ip={self._ip}, rack={self._rack}, slot={self._slot}, "
             f"DB{self._db_number}")
@@ -103,7 +102,6 @@ class PlcService(QObject):
             f"PLC{self._plc_id}开始监听: ip={self._ip}, rack={self._rack}, slot={self._slot}, "
             f"DB{self._db_number}"
         )
-        self.read_plc_limit()
         # self._start_value_timer()
 
     @pyqtSlot()
@@ -125,6 +123,9 @@ class PlcService(QObject):
         self.logger.info(f"PLC{self._plc_id}停止监听")
 
     def _connect_once(self):
+        """
+        连接一次plc
+        """
         self.logger.info(f"开始尝试连接 PLC {self._plc_id}")
         # 尝试建立一次 PLC 连接；如果当前已经连上，就不重复连接。
         if self.plc_client is not None:
@@ -144,9 +145,11 @@ class PlcService(QObject):
             self.state_changed.emit("已连接")
             self.logger.info(f"PLC{self._plc_id}连接成功: {self._ip}")
             self.bus.log.emit(f"PLC{self._plc_id}连接成功: {self._ip}")
+            self.connect_result.emit(True, "")
         except Exception as exc:
             self.plc_client = None
             self._last_connect_error = str(exc)
+            self.state_changed.emit("重连中")
             self.logger.error(f"PLC{self._plc_id}连接失败: {exc}")
             self.bus.log.emit(f"PLC{self._plc_id}连接失败: {exc}")
 
