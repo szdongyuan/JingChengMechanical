@@ -30,6 +30,23 @@ CSV_HEADERS = [
     "error_message",
 ]
 
+_FILTER_LABELS = {
+    "product_model": "型号",
+    "product_models": "型号",
+    "start_time": "开始时间",
+    "end_time": "结束时间",
+    "barcode": "SN码",
+    "barcode_regex": "SN码匹配方式",
+    "labels": "状态标签",
+}
+
+_FILTER_VALUE_LABELS = {
+    "ALL": "全部型号",
+    "OK": "OK",
+    "NG": "NG",
+    "not_labeled": "未标注",
+}
+
 _STATUS_LABELS = {
     "ok": "正常",
     "skipped": "跳过",
@@ -130,14 +147,9 @@ def _render_summary(result: HistoricalMetricReportResult) -> str:
 def _render_filters(filters: dict[str, object]) -> str:
     rows = []
     for key in sorted(filters):
-        value = filters[key]
-        if isinstance(value, (list, tuple, set)):
-            rendered = ", ".join(str(item) for item in value)
-        else:
-            rendered = "" if value is None else str(value)
-        rows.append((key, rendered))
+        rows.append((_filter_label(key), _filter_value(key, filters[key])))
     if not rows:
-        rows.append(("filters", ""))
+        rows.append(("筛选条件", "全部记录"))
     return (
         '<section aria-labelledby="filters-title">'
         '<h2 id="filters-title">筛选条件</h2>'
@@ -148,6 +160,27 @@ def _render_filters(filters: dict[str, object]) -> str:
         )
         + "</tbody></table></section>"
     )
+
+
+def _filter_label(key: str) -> str:
+    return _FILTER_LABELS.get(key, str(key))
+
+
+def _filter_value(key: str, value: object) -> str:
+    if key == "barcode_regex":
+        return "正则匹配" if bool(value) else "普通匹配"
+    if isinstance(value, (list, tuple, set)):
+        if not value:
+            return "全部"
+        return "，".join(_filter_scalar_value(item) for item in value)
+    if value is None or value == "":
+        return "全部" if key in {"product_model", "product_models", "labels"} else ""
+    return _filter_scalar_value(value)
+
+
+def _filter_scalar_value(value: object) -> str:
+    text = str(value)
+    return _FILTER_VALUE_LABELS.get(text, text)
 
 
 def _render_stats(stats: list[MetricGroupStats]) -> str:
@@ -223,6 +256,8 @@ def _render_svg_chart(stat: MetricGroupStats) -> str:
     normal_points = _normal_points(stat)
     x_values = [item for left, right, _count in histogram_points for item in (left, right)]
     x_values.extend(x for x, _y in normal_points)
+    sigma_markers = _sigma_markers(stat)
+    x_values.extend(marker[0] for marker in sigma_markers)
     y_values = [count for _left, _right, count in histogram_points]
     y_values.extend(y for _x, y in normal_points)
 
@@ -242,6 +277,13 @@ def _render_svg_chart(stat: MetricGroupStats) -> str:
         x_max += 0.5
     if y_max <= 0.0:
         y_max = 1.0
+    x_ticks = _nice_ticks(x_min, x_max, 6)
+    y_ticks = _nice_ticks(0.0, y_max, 5)
+    if len(x_ticks) >= 2:
+        x_min = x_ticks[0]
+        x_max = x_ticks[-1]
+    if len(y_ticks) >= 2:
+        y_max = y_ticks[-1]
 
     def scale_x(value: float) -> float:
         return margin_left + ((value - x_min) / (x_max - x_min) * plot_width)
@@ -279,6 +321,47 @@ def _render_svg_chart(stat: MetricGroupStats) -> str:
         )
 
     x_axis_y = margin_top + plot_height
+    tick_elements = []
+    for tick in x_ticks:
+        x = scale_x(tick)
+        tick_elements.append(
+            f'<line class="grid-line vertical-grid" '
+            f'x1="{_svg_number(x)}" y1="{margin_top}" '
+            f'x2="{_svg_number(x)}" y2="{x_axis_y}" />'
+            f'<line class="tick-mark" '
+            f'x1="{_svg_number(x)}" y1="{x_axis_y}" '
+            f'x2="{_svg_number(x)}" y2="{x_axis_y + 4}" />'
+            f'<text class="x-tick-label" '
+            f'x="{_svg_number(x)}" y="{height - 22}" '
+            f'text-anchor="middle">{_escape(_format_number(tick))}</text>'
+        )
+    for tick in y_ticks:
+        y = scale_y(tick)
+        tick_elements.append(
+            f'<line class="grid-line horizontal-grid" '
+            f'x1="{margin_left}" y1="{_svg_number(y)}" '
+            f'x2="{width - margin_right}" y2="{_svg_number(y)}" />'
+            f'<line class="tick-mark" '
+            f'x1="{margin_left - 4}" y1="{_svg_number(y)}" '
+            f'x2="{margin_left}" y2="{_svg_number(y)}" />'
+            f'<text class="y-tick-label" '
+            f'x="{margin_left - 8}" y="{_svg_number(y + 4)}" '
+            f'text-anchor="end">{_escape(_format_number(tick))}</text>'
+        )
+
+    sigma_lines = []
+    sigma_label_y = margin_top + 14
+    for x_value, label, css_class in sigma_markers:
+        x = scale_x(x_value)
+        sigma_lines.append(
+            f'<line class="sigma-line {css_class}" '
+            f'x1="{_svg_number(x)}" y1="{margin_top}" '
+            f'x2="{_svg_number(x)}" y2="{x_axis_y}" />'
+            f'<text class="sigma-label {css_class}" '
+            f'x="{_svg_number(x)}" y="{sigma_label_y}" '
+            f'text-anchor="middle">{_escape(label)}</text>'
+        )
+
     chart_title = f"{stat.metric_label} 直方图"
     return "".join(
         [
@@ -289,16 +372,12 @@ def _render_svg_chart(stat: MetricGroupStats) -> str:
             f"<desc>{_escape(_chart_description(stat))}</desc>",
         f'<line class="axis" x1="{margin_left}" y1="{x_axis_y}" '
             f'x2="{width - margin_right}" y2="{x_axis_y}" />',
-        f'<line class="axis" x1="{margin_left}" y1="{margin_top}" '
+            f'<line class="axis" x1="{margin_left}" y1="{margin_top}" '
             f'x2="{margin_left}" y2="{x_axis_y}" />',
+            "".join(tick_elements),
             "".join(bars),
             normal_polyline,
-            f'<text class="axis-label" x="{margin_left}" y="{height - 22}">',
-            f"{_escape(_format_number(x_min))}</text>",
-            f'<text class="axis-label" x="{width - margin_right - 56}" ',
-            f'y="{height - 22}">{_escape(_format_number(x_max))}</text>',
-            f'<text class="axis-label" x="4" y="{margin_top + 8}">',
-            f"{_escape(_format_number(y_max))}</text>",
+            "".join(sigma_lines),
             "</svg>",
         ]
     )
@@ -420,6 +499,84 @@ def _normal_points(stat: MetricGroupStats) -> list[tuple[float, float]]:
         if _is_finite(x) and _is_finite(y):
             points.append((float(x), max(0.0, float(y))))
     return points
+
+
+def _sigma_markers(stat: MetricGroupStats) -> list[tuple[float, str, str]]:
+    if not (_is_finite(stat.mean) and _is_finite(stat.std)):
+        return []
+    mean = float(stat.mean)
+    std = float(stat.std)
+    if std <= 0.0:
+        return []
+    return [
+        (mean, "均值", "sigma-mean"),
+        (mean - std, "-1σ", "sigma-1"),
+        (mean + std, "+1σ", "sigma-1"),
+        (mean - (2.0 * std), "-2σ", "sigma-2"),
+        (mean + (2.0 * std), "+2σ", "sigma-2"),
+        (mean - (3.0 * std), "-3σ", "sigma-3"),
+        (mean + (3.0 * std), "+3σ", "sigma-3"),
+    ]
+
+
+def _nice_ticks(
+    min_value: float,
+    max_value: float,
+    target_count: int,
+) -> list[float]:
+    if not (_is_finite(min_value) and _is_finite(max_value)):
+        return []
+    min_value = float(min_value)
+    max_value = float(max_value)
+    target_count = max(2, int(target_count))
+    if min_value > max_value:
+        min_value, max_value = max_value, min_value
+    if min_value == max_value:
+        padding = 0.5 if min_value == 0.0 else abs(min_value) * 0.1
+        min_value -= padding
+        max_value += padding
+
+    span = max_value - min_value
+    step = _nice_step(span / float(target_count - 1))
+    if step <= 0.0:
+        return [min_value, max_value]
+
+    first = math.floor(min_value / step) * step
+    last = math.ceil(max_value / step) * step
+    ticks = []
+    current = first
+    epsilon = step * 1e-9
+    while current <= last + epsilon and len(ticks) < 64:
+        ticks.append(_clean_tick(current, step))
+        current += step
+    if len(ticks) < 2:
+        return [min_value, max_value]
+    return ticks
+
+
+def _nice_step(raw_step: float) -> float:
+    if not _is_finite(raw_step) or raw_step <= 0.0:
+        return 0.0
+    exponent = math.floor(math.log10(raw_step))
+    scale = 10.0 ** exponent
+    fraction = raw_step / scale
+    if fraction <= 1.0:
+        nice_fraction = 1.0
+    elif fraction <= 2.0:
+        nice_fraction = 2.0
+    elif fraction <= 2.5:
+        nice_fraction = 2.5
+    elif fraction <= 5.0:
+        nice_fraction = 5.0
+    else:
+        nice_fraction = 10.0
+    return nice_fraction * scale
+
+
+def _clean_tick(value: float, step: float) -> float:
+    if abs(value) < abs(step) * 1e-9:
+        return 0.0
+    return round(value, 12)
 
 
 def _empty_svg(
@@ -563,7 +720,16 @@ th {
   stroke: #73808f;
   stroke-width: 1;
 }
-.axis-label,
+.grid-line {
+  stroke: #e4e8ef;
+  stroke-width: 1;
+}
+.tick-mark {
+  stroke: #73808f;
+  stroke-width: 1;
+}
+.x-tick-label,
+.y-tick-label,
 .note {
   font-size: 12px;
   fill: #667085;
@@ -575,5 +741,29 @@ th {
 .normal-line {
   stroke: #d1495b;
   stroke-width: 2;
+}
+.sigma-line {
+  stroke-width: 1;
+  stroke-dasharray: 5 4;
+}
+.sigma-label {
+  font-size: 11px;
+  font-weight: 600;
+}
+.sigma-mean {
+  stroke: #111827;
+  fill: #111827;
+}
+.sigma-1 {
+  stroke: #2f855a;
+  fill: #2f855a;
+}
+.sigma-2 {
+  stroke: #b7791f;
+  fill: #b7791f;
+}
+.sigma-3 {
+  stroke: #6b46c1;
+  fill: #6b46c1;
 }
 """.strip()

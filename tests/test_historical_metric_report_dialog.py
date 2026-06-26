@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QDialog,
     QListWidget,
 )
+import pyqtgraph as pg
 
 from app.service.historical_metric_report_types import (
     HistoricalMetricReportResult,
@@ -363,6 +364,25 @@ def test_report_dialog_stats_table_selects_result_plot(qapp):
     assert rendered[-1] == "平均响度"
 
 
+def test_report_dialog_plot_marks_mean_and_sigma_lines(qapp):
+    dialog = _dialog()
+
+    dialog._render_plot(_stats_row(mean=55.0))
+
+    infinite_lines = [
+        item
+        for item in dialog.plot_widget.plotItem.items
+        if isinstance(item, pg.InfiniteLine)
+    ]
+    labels = {
+        _plot_text(item)
+        for item in dialog.plot_widget.plotItem.items
+        if isinstance(item, pg.TextItem)
+    }
+    assert len(infinite_lines) == 7
+    assert {"均值", "-1σ", "+1σ", "-2σ", "+2σ", "-3σ", "+3σ"} <= labels
+
+
 def test_report_dialog_calendar_popup_keeps_date_numbers_readable(qapp):
     dialog = _dialog()
     calendar = dialog.dt_start_time.calendarWidget()
@@ -611,6 +631,15 @@ def test_report_dialog_close_defers_until_running_worker_is_cleaned_up(
     assert dialog._worker is None
     assert workers[0].deleted is True
     assert dialog.isVisible() is False
+
+
+def _plot_text(item):
+    if hasattr(item, "toPlainText"):
+        return item.toPlainText()
+    text_item = getattr(item, "textItem", None)
+    if text_item is not None and hasattr(text_item, "toPlainText"):
+        return text_item.toPlainText()
+    return ""
 
 
 def test_report_dialog_empty_result_shows_failures_and_allows_export(qapp):

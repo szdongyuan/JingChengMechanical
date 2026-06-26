@@ -139,8 +139,59 @@ def test_html_export_is_static_and_contains_summary_and_chart_data(tmp_path):
     assert "<th>结果</th>" in text
     assert "M1 / CH1 / 声压级峰值" not in text
     assert "M1 CH1 声压级峰值 直方图" not in text
+    assert 'class="sigma-line sigma-mean"' in text
+    assert "均值" in text
+    assert "+1σ" in text
+    assert "-3σ" in text
+    assert "stroke-dasharray" in text
     assert "http://" not in text
     assert "https://" not in text
+
+
+def test_html_export_renders_filters_as_chinese_report_fields(tmp_path):
+    result = _sample_report_result()
+    result.filters.update(
+        {
+            "product_model": "ALL",
+            "product_models": ["DEMO-A", "DEMO-B"],
+            "start_time": "2026-06-01 09:00:00",
+            "end_time": "2026-06-22 18:00:00",
+            "barcode": r"^SN-\d+$",
+            "barcode_regex": True,
+            "labels": ["OK", "NG", "not_labeled"],
+        }
+    )
+    target = tmp_path / "report.html"
+
+    export_html_report(result, str(target))
+
+    text = target.read_text(encoding="utf-8")
+    assert "<h2 id=\"filters-title\">筛选条件</h2>" in text
+    assert "<td>型号</td><td>全部型号</td>" in text
+    assert "<td>型号</td><td>DEMO-A，DEMO-B</td>" in text
+    assert "<td>开始时间</td><td>2026-06-01 09:00:00</td>" in text
+    assert "<td>结束时间</td><td>2026-06-22 18:00:00</td>" in text
+    assert "<td>SN码</td><td>^SN-\\d+$</td>" in text
+    assert "<td>SN码匹配方式</td><td>正则匹配</td>" in text
+    assert "<td>状态标签</td><td>OK，NG，未标注</td>" in text
+    assert "<td>product_model</td>" not in text
+    assert "<td>product_models</td>" not in text
+    assert "<td>barcode_regex</td>" not in text
+    assert "not_labeled" not in text
+
+
+def test_html_export_chart_renders_multiple_axis_ticks_and_gridlines(tmp_path):
+    result = _sample_report_result()
+    target = tmp_path / "report.html"
+
+    export_html_report(result, str(target))
+
+    text = target.read_text(encoding="utf-8")
+    assert text.count('class="x-tick-label"') >= 5
+    assert text.count('class="y-tick-label"') >= 4
+    assert text.count('class="grid-line vertical-grid"') >= 3
+    assert text.count('class="grid-line horizontal-grid"') >= 3
+    assert 'class="tick-mark"' in text
 
 
 def test_html_export_escapes_report_content(tmp_path):
