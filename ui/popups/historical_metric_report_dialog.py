@@ -718,6 +718,7 @@ class HistoricalMetricReportDialog(QDialog):
                     y_values,
                     pen=pg.mkPen(color="#d1495b", width=2),
                 )
+        self._add_sigma_markers(stat)
 
         if not histogram:
             self.chart_state_label.setText("无可用直方图数据")
@@ -730,6 +731,31 @@ class HistoricalMetricReportDialog(QDialog):
     def _render_empty_chart(self, message: str) -> None:
         self.plot_widget.clear()
         self.chart_state_label.setText(message)
+
+    def _add_sigma_markers(self, stat: MetricGroupStats) -> None:
+        markers = self._sigma_markers(stat)
+        if not markers:
+            return
+        y_top = self._sigma_label_y(stat)
+        for marker in markers:
+            line = pg.InfiniteLine(
+                pos=marker["x"],
+                angle=90,
+                movable=False,
+                pen=pg.mkPen(
+                    color=marker["color"],
+                    width=1,
+                    style=Qt.PenStyle.DashLine,
+                ),
+            )
+            self.plot_widget.addItem(line)
+            label = pg.TextItem(
+                marker["label"],
+                color=marker["color"],
+                anchor=(0.5, 1.0),
+            )
+            label.setPos(marker["x"], y_top)
+            self.plot_widget.addItem(label)
 
     def _export_report(self) -> None:
         if self._current_result is None:
@@ -867,6 +893,40 @@ class HistoricalMetricReportDialog(QDialog):
             ) and HistoricalMetricReportDialog._is_finite(y_value):
                 points.append((float(x_value), max(0.0, float(y_value))))
         return points
+
+    @staticmethod
+    def _sigma_markers(stat: MetricGroupStats) -> list[dict[str, object]]:
+        if not (
+            HistoricalMetricReportDialog._is_finite(stat.mean)
+            and HistoricalMetricReportDialog._is_finite(stat.std)
+        ):
+            return []
+        mean = float(stat.mean)
+        std = float(stat.std)
+        if std <= 0.0:
+            return []
+        return [
+            {"x": mean, "label": "均值", "color": "#111827"},
+            {"x": mean - std, "label": "-1σ", "color": "#2f855a"},
+            {"x": mean + std, "label": "+1σ", "color": "#2f855a"},
+            {"x": mean - (2.0 * std), "label": "-2σ", "color": "#b7791f"},
+            {"x": mean + (2.0 * std), "label": "+2σ", "color": "#b7791f"},
+            {"x": mean - (3.0 * std), "label": "-3σ", "color": "#6b46c1"},
+            {"x": mean + (3.0 * std), "label": "+3σ", "color": "#6b46c1"},
+        ]
+
+    @staticmethod
+    def _sigma_label_y(stat: MetricGroupStats) -> float:
+        y_values: list[float] = []
+        y_values.extend(float(value) for value in stat.histogram_counts if value >= 0)
+        y_values.extend(
+            float(value)
+            for value in stat.normal_y
+            if HistoricalMetricReportDialog._is_finite(value) and float(value) >= 0.0
+        )
+        if not y_values:
+            return 1.0
+        return max(y_values) * 0.96
 
     @staticmethod
     def _format_number(value: object, *, digits: int) -> str:
