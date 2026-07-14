@@ -50,6 +50,12 @@ def _assert_no_generation_state(manager: TestManager, config_id: int = 1) -> Non
     assert config_id not in manager._current_collection_generations
     assert config_id not in manager._current_collector_generations
     assert config_id not in manager._current_sample_generations
+    assert set(manager._current_publication_gates).issubset(
+        set(manager._current_collection_generations.values())
+    )
+    assert manager._ready_staged_current_sample_generations.issubset(
+        set(manager._staged_current_samples_by_generation)
+    )
 
 
 class _StartRecorder(_CaptureRecorderDoubleMixin):
@@ -544,6 +550,159 @@ class TestGenerationRetirement:
         assert manager._current_collection_generations == {}
         assert manager._current_collector_generations == {}
         assert manager._session_generations == {}
+
+    def test_pending_factory_stop_commits_current_from_stable_nonzero_freeze(
+        self,
+        monkeypatch,
+    ):
+        start_entered = threading.Event()
+        release_start = threading.Event()
+        stop_ingress = threading.Event()
+        freeze_entered = threading.Event()
+        allow_freeze = threading.Event()
+        stop_thread_ref = {}
+        tagged_samples = [_raw_current_sample(0.1, 8.25)]
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+
+            def start(self):
+                start_entered.set()
+                assert release_start.wait(2.0)
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return tagged_samples
+
+        bus, services, manager = _make_current_start_manager(monkeypatch, Collector)
+        services.config_service.load_config.return_value[
+            "allow_incomplete_recording_analysis"
+        ] = True
+        manager._stop_is_analysis_eligible = lambda *_args, **_kwargs: True
+        manager._build_chart_payload = lambda *_args, **_kwargs: {}
+        original_pending_lookup = manager._pending_current_for_identity_locked
+
+        def observed_pending_lookup(*args, **kwargs):
+            pending = original_pending_lookup(*args, **kwargs)
+            if (
+                threading.current_thread() is stop_thread_ref.get("thread")
+                and pending is not None
+            ):
+                stop_ingress.set()
+            return pending
+
+        manager._pending_current_for_identity_locked = observed_pending_lookup
+        start_results = []
+        start_thread = threading.Thread(
+            target=lambda: start_results.append(
+                manager.start({"config_id": 1, "sn": "SN-stable-freeze"})
+            )
+        )
+        start_thread.start()
+        assert start_entered.wait(2.0)
+        session = manager._sessions[1]
+        session._run_judgment = MagicMock(return_value=_successful_judgment())
+        original_freeze_capture = session.freeze_capture
+
+        def blocking_freeze_capture():
+            freeze_entered.set()
+            assert allow_freeze.wait(2.0)
+            return original_freeze_capture()
+
+        session.freeze_capture = blocking_freeze_capture
+        stop_results = []
+        stop_thread = threading.Thread(
+            target=lambda: stop_results.append(manager.stop_active_run(config_id=1))
+        )
+        stop_thread_ref["thread"] = stop_thread
+        stop_thread.start()
+        assert stop_ingress.wait(2.0)
+
+        release_start.set()
+        assert freeze_entered.wait(2.0)
+        session._captured_frame_count = 1
+        allow_freeze.set()
+        start_thread.join(2.0)
+        stop_thread.join(2.0)
+
+        assert not start_thread.is_alive()
+        assert not stop_thread.is_alive()
+        assert start_results == [True]
+        assert stop_results == [True]
+        assert session._buffer.shape[0] == 1
+        completed_session = manager._completed_sessions[1]
+        trace = manager._current_trace_payload(
+            1,
+            current_meter=completed_session._config["current_meter"],
+            session=completed_session,
+        )
+        assert trace is not None
+        assert trace["times_sec"] == [0.1]
+        assert trace["values_a"] == [8.25]
+
+    def test_live_current_emit_reentrant_stop_and_restart_does_not_deadlock(
+        self,
+        monkeypatch,
+    ):
+        collectors = []
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.sample_callback = sample_callback
+                self.stop_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return []
+
+        bus, _, manager = _make_current_start_manager(monkeypatch, Collector)
+        assert manager.start({"config_id": 1, "sn": "SN-reentrant-old"}) is True
+        old_session = manager._sessions[1]
+        old_generation = manager._session_generations[1]
+        restart_results = []
+
+        def reentrant_stop_and_restart(*_args):
+            manager.stop(config_id=1, silent=True)
+            restart_results.append(
+                manager.start({"config_id": 1, "sn": "SN-reentrant-new"})
+            )
+
+        bus.current_trace_updated.emit.side_effect = reentrant_stop_and_restart
+        sample = _raw_current_sample(0.1, 9.0)
+        callback_errors = []
+        callback_done = threading.Event()
+
+        def publish_current():
+            try:
+                collectors[0].sample_callback(sample, (sample,))
+            except BaseException as exc:
+                callback_errors.append(exc)
+            finally:
+                callback_done.set()
+
+        callback_thread = threading.Thread(target=publish_current, daemon=True)
+        callback_thread.start()
+        assert callback_done.wait(2.0), "reentrant current stop/start deadlocked"
+        callback_thread.join(2.0)
+
+        assert not callback_thread.is_alive()
+        assert callback_errors == []
+        assert restart_results == [True]
+        assert manager._sessions[1] is not old_session
+        assert manager._session_generations[1] is not old_generation
+        assert old_generation not in manager._current_publication_gates
+        assert manager._session_generations[1] in manager._current_publication_gates
+        manager.stop(config_id=1, silent=True)
 
     def test_collector_stop_reentrant_completion_never_waits_on_its_owner_thread(
         self,

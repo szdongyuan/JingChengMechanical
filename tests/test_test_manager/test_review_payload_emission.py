@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from threading import Event, Thread
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock, call
 
 import numpy as np
 import pytest
@@ -295,6 +296,7 @@ def test_stop_current_collection_stores_the_same_rebased_set_used_by_review(monk
             retain_samples=True,
         )
     cleanup = manager._stop_current_collection_claim(claim)
+    manager._settle_current_samples_for_capture(claim, retained_frames=1)
 
     assert [
         (sample.time_sec, sample.current_a, sample.monotonic_time)
@@ -336,6 +338,143 @@ def test_effective_current_samples_keep_each_session_epoch_isolated():
     assert [sample.current_a for sample in manager._effective_current_samples(2, raw)] == [
         2.0,
     ]
+
+
+def test_live_current_retirement_cancels_callback_blocked_in_epoch(monkeypatch):
+    bus = _mock_bus()
+    bus.current_trace_updated = MagicMock()
+    bus.current_trace_updated.emit = MagicMock()
+    epoch_entered = Event()
+    allow_epoch = Event()
+
+    class FakeCollector:
+        instances = []
+
+        def __init__(self, _config, *, sample_callback=None, log_callback=None):
+            self.sample_callback = sample_callback
+            FakeCollector.instances.append(self)
+
+        def start(self):
+            return True
+
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.CurrentMeterCollector",
+        FakeCollector,
+    )
+
+    def blocking_epoch():
+        epoch_entered.set()
+        assert allow_epoch.wait(2.0)
+        return 10.0
+
+    manager = TestManager(bus, _mock_services(bus))
+    old_session = SimpleNamespace(
+        _config={
+            "config_id": 7,
+            "current_meter": {"enabled": True, "host": "127.0.0.1"},
+        },
+        _workorder={"factory_run_id": "old-run"},
+        current_epoch=blocking_epoch,
+    )
+    manager._sessions[7] = old_session
+    old_generation = _bind_manager_run_generation(manager, 7, old_session)
+    manager._start_current_collection(7, old_session)
+    publication_gate = manager._current_publication_gates[old_generation]
+    sample = CurrentSample(0.1, 1.5, 10.1)
+    callback_thread = Thread(
+        target=lambda: FakeCollector.instances[0].sample_callback(sample, (sample,))
+    )
+    callback_thread.start()
+    assert epoch_entered.wait(2.0)
+
+    new_generation = object()
+    new_session = SimpleNamespace(
+        _manager_generation_token=new_generation,
+        current_epoch=lambda: 20.0,
+    )
+    replacement_done = Event()
+
+    def replace_generation():
+        with manager._lifecycle_lock:
+            manager._retire_session_generation_locked(7, old_generation)
+            manager._sessions[7] = new_session
+            manager._session_generations[7] = new_generation
+        replacement_done.set()
+
+    replacement_thread = Thread(target=replace_generation)
+    replacement_thread.start()
+    assert publication_gate.retirement_requested.wait(2.0)
+    allow_epoch.set()
+    callback_thread.join(2.0)
+    replacement_thread.join(2.0)
+
+    assert not callback_thread.is_alive()
+    assert not replacement_thread.is_alive()
+    assert replacement_done.is_set()
+    bus.current_trace_updated.emit.assert_not_called()
+    assert manager._sessions[7] is new_session
+    assert manager._session_generations[7] is new_generation
+
+
+def test_live_current_publication_keeps_shared_sessions_on_their_own_epochs(monkeypatch):
+    bus = _mock_bus()
+    bus.current_trace_updated = MagicMock()
+    bus.current_trace_updated.emit = MagicMock()
+
+    class FakeCollector:
+        instances = []
+
+        def __init__(self, _config, *, sample_callback=None, log_callback=None):
+            self.sample_callback = sample_callback
+            FakeCollector.instances.append(self)
+
+        def start(self):
+            return True
+
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.CurrentMeterCollector",
+        FakeCollector,
+    )
+    manager = TestManager(bus, _mock_services(bus))
+    for config_id, run_id, epoch in (
+        (7, "shared-a", 10.0),
+        (8, "shared-b", 20.0),
+    ):
+        session = SimpleNamespace(
+            _config={
+                "config_id": config_id,
+                "current_meter": {"enabled": True, "host": "127.0.0.1"},
+            },
+            _workorder={"factory_run_id": run_id},
+            current_epoch=lambda value=epoch: value,
+        )
+        manager._sessions[config_id] = session
+        _bind_manager_run_generation(manager, config_id, session)
+        manager._start_current_collection(config_id, session)
+
+    first = CurrentSample(99.0, 1.0, 10.1)
+    second = CurrentSample(99.0, 2.0, 20.2)
+    FakeCollector.instances[0].sample_callback(first, (first,))
+    FakeCollector.instances[1].sample_callback(second, (second,))
+
+    assert bus.current_trace_updated.emit.call_args_list == [
+        call(
+            7,
+            "shared-a",
+            ANY,
+        ),
+        call(
+            8,
+            "shared-b",
+            ANY,
+        ),
+    ]
+    first_payload = bus.current_trace_updated.emit.call_args_list[0].args[2]
+    second_payload = bus.current_trace_updated.emit.call_args_list[1].args[2]
+    assert first_payload["times_sec"] == [0.1]
+    assert first_payload["values_a"] == [1.0]
+    assert second_payload["times_sec"] == [0.2]
+    assert second_payload["values_a"] == [2.0]
 
 
 class TestReviewPayloadEmission:

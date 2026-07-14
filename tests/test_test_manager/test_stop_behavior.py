@@ -70,10 +70,12 @@ class TestTestManagerStartStop:
                 retain_samples=True,
             )
         cleanup = mgr._stop_current_collection_claim(claim)
+        mgr._settle_current_samples_for_capture(claim, retained_frames=0)
 
         assert captured.shape == (0, 1)
-        assert cleanup.samples == []
+        assert cleanup.samples == [CurrentSample(0.0, 1.5, 10.05)]
         assert 1 not in mgr._current_samples_by_config_id
+        assert generation not in mgr._staged_current_samples_by_generation
 
     def test_stop_one_detaches_only_old_generation_current_state_before_cleanup(
         self,

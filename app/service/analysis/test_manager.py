@@ -185,6 +185,8 @@ class _CurrentCollectionClaim:
         "_cleanup_owner_thread_id",
         "_cleanup_result",
         "_cleanup_complete",
+        "_capture_settled",
+        "_settled_retained_frames",
     )
 
     def __init__(
@@ -208,6 +210,43 @@ class _CurrentCollectionClaim:
         self._cleanup_owner_thread_id = None
         self._cleanup_result = None
         self._cleanup_complete = threading.Event()
+        self._capture_settled = False
+        self._settled_retained_frames = None
+
+
+class _CurrentPublicationGate:
+    """Linearize one run's current callback publication with retirement."""
+
+    __slots__ = (
+        "session",
+        "generation",
+        "lock",
+        "retirement_requested",
+        "active",
+    )
+
+    def __init__(self, *, session, generation):
+        self.session = session
+        self.generation = generation
+        self.lock = threading.RLock()
+        self.retirement_requested = threading.Event()
+        self.active = True
+
+    def can_publish(self, *, session, generation) -> bool:
+        return (
+            self.active
+            and not self.retirement_requested.is_set()
+            and self.session is session
+            and self.generation is generation
+        )
+
+    def deactivate(self) -> None:
+        # Set the cancellation marker before waiting for a callback that may be
+        # blocked while reading the session epoch.  Its final gate check will
+        # then decline publication and release ``lock`` for retirement.
+        self.retirement_requested.set()
+        with self.lock:
+            self.active = False
 
 
 @dataclass(frozen=True)
@@ -525,6 +564,8 @@ class TestManager(QObject):
         self._current_sample_generations: dict[int, object] = {}
         self._current_samples_by_config_id: dict[int, list] = {}
         self._staged_current_samples_by_generation: dict[object, list] = {}
+        self._ready_staged_current_sample_generations: set[object] = set()
+        self._current_publication_gates: dict[object, _CurrentPublicationGate] = {}
         self._replay_player = OneShotReplayPlayer()
         self._replay_config_id: int | None = None
         self._lifecycle_lock = threading.RLock()
@@ -894,6 +935,9 @@ class TestManager(QObject):
             with self._lifecycle_lock:
                 # A same-config replacement begins with fresh lifecycle flags;
                 # cleanup from the displaced generation must not own them.
+                prior_generation = self._session_generations.get(config_id)
+                if prior_generation is not run_generation:
+                    self._retire_current_publication_gate_locked(prior_generation)
                 self._analyzing_sessions.discard(config_id)
                 self._accepted_factory_stops.discard(config_id)
                 self._sessions[config_id] = session
@@ -2164,15 +2208,27 @@ class TestManager(QObject):
         )
 
     def _retire_session_generation_locked(self, config_id: int, generation) -> None:
+        self._retire_current_publication_gate_locked(generation)
         if (
             generation is not None
             and self._session_generations.get(config_id) is generation
         ):
             self._session_generations.pop(config_id, None)
 
+    def _retire_current_publication_gate_locked(self, generation) -> None:
+        if generation is None:
+            return
+        gate = self._current_publication_gates.get(generation)
+        if gate is None:
+            return
+        gate.deactivate()
+        if self._current_publication_gates.get(generation) is gate:
+            self._current_publication_gates.pop(generation, None)
+
     def _retire_current_samples_locked(self, config_id: int, generation) -> None:
         if generation is not None:
             self._staged_current_samples_by_generation.pop(generation, None)
+            self._ready_staged_current_sample_generations.discard(generation)
         if (
             generation is not None
             and self._current_sample_generations.get(config_id) is generation
@@ -2208,13 +2264,15 @@ class TestManager(QObject):
                 prior_completed_session,
             )
 
+        staged_ready = generation in self._ready_staged_current_sample_generations
+        self._ready_staged_current_sample_generations.discard(generation)
         staged_present = generation in self._staged_current_samples_by_generation
         staged_samples = self._staged_current_samples_by_generation.pop(
             generation,
             None,
         )
         self._completed_sessions[config_id] = session
-        if not staged_present:
+        if not staged_present or not staged_ready:
             return
         if staged_samples:
             self._current_samples_by_config_id[config_id] = staged_samples
@@ -2600,12 +2658,17 @@ class TestManager(QObject):
         cleanup_settled_payload = self._make_cleanup_settled_payload(config_id, session)
         try:
             capture_error = None
+            retained_frames = 0
             cleanup_errors: list[_CleanupFailureRecord] = list(
                 route_cleanup_errors
             )
             if rec is not None:
                 try:
-                    self._freeze_and_capture_session_buffer(session, rec)
+                    captured_buffer = self._freeze_and_capture_session_buffer(
+                        session,
+                        rec,
+                    )
+                    retained_frames = int(captured_buffer.shape[0])
                 except BaseException as exc:
                     if isinstance(exc, Exception):
                         capture_error = exc
@@ -2657,6 +2720,20 @@ class TestManager(QObject):
                             f"for config={config_id}: "
                         ),
                     )
+            else:
+                try:
+                    retained_frames = int(session.freeze_capture())
+                except BaseException as exc:
+                    if isinstance(exc, Exception):
+                        capture_error = exc
+                    else:
+                        cleanup_errors.append(
+                            self._capture_finalization_failure(
+                                session,
+                                exc,
+                                phase="recording completion capture",
+                            )
+                        )
 
             self._extend_cleanup_failures(
                 cleanup_errors,
@@ -2666,9 +2743,10 @@ class TestManager(QObject):
                     context="recording completion",
                 ),
             )
-            self._collect_current_cleanup_failures(
+            self._collect_current_cleanup_after_capture(
                 current_collection_claim,
                 cleanup_errors,
+                retained_frames=retained_frames,
             )
 
             cleanup_errors.extend(
@@ -3385,6 +3463,11 @@ class TestManager(QObject):
                 rec=rec,
                 mon=mon,
                 current_collection_claim=current_collection_claim,
+                retained_frames=(
+                    int(capture["partial_buf"].shape[0])
+                    if isinstance(capture.get("partial_buf"), np.ndarray)
+                    else 0
+                ),
             ),
         )
 
@@ -3444,11 +3527,13 @@ class TestManager(QObject):
         cleanup_errors: list[_CleanupFailureRecord] = list(
             initial_cleanup_errors
         )
+        retained_frames = 0
         try:
             if rec is not None:
-                self._freeze_and_capture_session_buffer(session, rec)
+                captured_buffer = self._freeze_and_capture_session_buffer(session, rec)
+                retained_frames = int(captured_buffer.shape[0])
             else:
-                session.freeze_capture()
+                retained_frames = int(session.freeze_capture())
         except BaseException as exc:
             cleanup_errors.append(
                 self._capture_finalization_failure(
@@ -3498,6 +3583,7 @@ class TestManager(QObject):
                 rec=rec,
                 mon=mon,
                 current_collection_claim=current_collection_claim,
+                retained_frames=retained_frames,
             ),
         )
 
@@ -3740,6 +3826,7 @@ class TestManager(QObject):
         rec,
         mon,
         current_collection_claim,
+        retained_frames: int,
     ) -> list[_CleanupFailureRecord]:
         cleanup_errors = self._cleanup_monitor_recorder_safely(
             config_id,
@@ -3756,9 +3843,10 @@ class TestManager(QObject):
                 if self._monitors.get(config_id) is mon:
                     self._monitors.pop(config_id, None)
 
-        self._collect_current_cleanup_failures(
+        self._collect_current_cleanup_after_capture(
             current_collection_claim,
             cleanup_errors,
+            retained_frames=retained_frames,
         )
         return cleanup_errors
 
@@ -4153,13 +4241,33 @@ class TestManager(QObject):
                 return
         if not current_config["enabled"]:
             return
+        with self._lifecycle_lock:
+            if (
+                self._sessions.get(config_id) is not session
+                or self._session_generations.get(config_id) is not generation
+                or getattr(session, "_manager_generation_token", None)
+                is not generation
+            ):
+                return
+            publication_gate = self._current_publication_gates.get(generation)
+            if publication_gate is None:
+                publication_gate = _CurrentPublicationGate(
+                    session=session,
+                    generation=generation,
+                )
+                self._current_publication_gates[generation] = publication_gate
+            elif not publication_gate.can_publish(
+                session=session,
+                generation=generation,
+            ):
+                return
         run_id = self._factory_run_id(session)
         sample_callback = None
         if isinstance(run_id, str) and run_id:
             sample_callback = (
                 lambda _sample, samples_snapshot, cid=config_id, rid=run_id,
                 cfg=current_meter_config, expected_generation=generation,
-                expected_session=session:
+                expected_session=session, gate=publication_gate:
                 self._emit_current_trace_update(
                     cid,
                     rid,
@@ -4167,15 +4275,21 @@ class TestManager(QObject):
                     cfg,
                     expected_generation=expected_generation,
                     session=expected_session,
+                    publication_gate=gate,
                 )
             )
-        collector = CurrentMeterCollector(
-            current_config,
-            log_callback=lambda message, cid=config_id: self._bus.log.emit(
-                f"[CurrentMeter] config={cid}: {message}"
-            ),
-            sample_callback=sample_callback,
-        )
+        try:
+            collector = CurrentMeterCollector(
+                current_config,
+                log_callback=lambda message, cid=config_id: self._bus.log.emit(
+                    f"[CurrentMeter] config={cid}: {message}"
+                ),
+                sample_callback=sample_callback,
+            )
+        except BaseException:
+            with self._lifecycle_lock:
+                self._retire_current_publication_gate_locked(generation)
+            raise
         pending = _PendingCurrentCollection(
             config_id=config_id,
             session=session,
@@ -4190,6 +4304,7 @@ class TestManager(QObject):
                 is not generation
             ):
                 register_pending = False
+                self._retire_current_publication_gate_locked(generation)
             else:
                 self._current_collection_generations[config_id] = generation
                 self._pending_current_collections[config_id] = pending
@@ -4271,6 +4386,7 @@ class TestManager(QObject):
                     is generation
                 ):
                     self._current_collection_generations.pop(config_id, None)
+                self._retire_current_publication_gate_locked(generation)
                 retain_samples = (
                     start_error is None
                     and selected_continuation is not None
@@ -4627,6 +4743,7 @@ class TestManager(QObject):
     ) -> _CurrentCollectionClaim | None:
         if generation is None:
             return None
+        self._retire_current_publication_gate_locked(generation)
         if self._current_collection_generations.get(config_id) is generation:
             self._current_collection_generations.pop(config_id, None)
 
@@ -4750,11 +4867,6 @@ class TestManager(QObject):
                     samples,
                     session=claim.session,
                 )
-                if (
-                    claim.retain_samples
-                    and not self._session_has_retained_capture(claim.session)
-                ):
-                    samples = []
 
             if stop_failure is not None:
                 label = "fatal cleanup" if stop_failure.is_fatal else "cleanup diagnostic"
@@ -4816,28 +4928,9 @@ class TestManager(QObject):
                     and result.samples_diagnostic_error is None
                     and result.fatal_error is None
                 ):
-                    prior_completed_session = self._completed_sessions.get(
-                        claim.config_id
-                    )
-                    if (
-                        prior_completed_session is not None
-                        and prior_completed_session is not claim.session
-                    ):
-                        self._staged_current_samples_by_generation[
-                            claim.generation
-                        ] = samples
-                    elif samples:
-                        self._current_samples_by_config_id[
-                            claim.config_id
-                        ] = samples
-                        self._current_sample_generations[claim.config_id] = (
-                            claim.generation
-                        )
-                    else:
-                        self._retire_current_samples_locked(
-                            claim.config_id,
-                            claim.generation,
-                        )
+                    self._staged_current_samples_by_generation[
+                        claim.generation
+                    ] = samples
                 else:
                     self._retire_current_samples_locked(
                         claim.config_id,
@@ -4862,6 +4955,81 @@ class TestManager(QObject):
         if result.fatal_error is not None:
             raise result.fatal_error
         return result
+
+    def _collect_current_cleanup_after_capture(
+        self,
+        claim: _CurrentCollectionClaim | None,
+        failures,
+        *,
+        retained_frames: int,
+    ) -> _CurrentCollectionCleanupResult | None:
+        result = self._collect_current_cleanup_failures(claim, failures)
+        if claim is not None and claim.retain_samples:
+            self._settle_current_samples_for_capture(
+                claim,
+                retained_frames=retained_frames,
+            )
+        return result
+
+    def _settle_current_samples_for_capture(
+        self,
+        claim: _CurrentCollectionClaim,
+        *,
+        retained_frames: int,
+    ) -> None:
+        retained_frames = int(retained_frames)
+        if retained_frames < 0:
+            raise ValueError("retained_frames must be non-negative")
+        with claim._cleanup_lock:
+            if claim._capture_settled:
+                if claim._settled_retained_frames != retained_frames:
+                    raise RuntimeError(
+                        "current samples were settled with a different frozen frame count"
+                    )
+                return
+            claim._capture_settled = True
+            claim._settled_retained_frames = retained_frames
+
+        with self._lifecycle_lock:
+            still_owned = (
+                self._sessions.get(claim.config_id) is claim.session
+                and getattr(
+                    claim.session,
+                    "_manager_generation_token",
+                    None,
+                )
+                is claim.generation
+            )
+            staged_present = (
+                claim.generation in self._staged_current_samples_by_generation
+            )
+            if not still_owned or retained_frames <= 0 or not staged_present:
+                self._retire_current_samples_locked(
+                    claim.config_id,
+                    claim.generation,
+                )
+                return
+
+            self._ready_staged_current_sample_generations.add(claim.generation)
+            prior_completed_session = self._completed_sessions.get(claim.config_id)
+            if (
+                prior_completed_session is not None
+                and prior_completed_session is not claim.session
+            ):
+                return
+
+            samples = self._staged_current_samples_by_generation.pop(
+                claim.generation
+            )
+            self._ready_staged_current_sample_generations.discard(claim.generation)
+            if samples:
+                self._current_samples_by_config_id[claim.config_id] = samples
+                self._current_sample_generations[claim.config_id] = claim.generation
+            else:
+                self._retire_current_samples_locked(
+                    claim.config_id,
+                    claim.generation,
+                )
 
     def _current_trace_payload(
         self,
@@ -4922,6 +5090,8 @@ class TestManager(QObject):
                         elif (
                             active_generation
                             in self._staged_current_samples_by_generation
+                            and active_generation
+                            in self._ready_staged_current_sample_generations
                         ):
                             samples = self._staged_current_samples_by_generation[
                                 active_generation
@@ -4937,7 +5107,10 @@ class TestManager(QObject):
                     is generation
                 ):
                     collector = self._current_collectors.get(normalized_config_id)
-                if generation in self._staged_current_samples_by_generation:
+                if (
+                    generation in self._staged_current_samples_by_generation
+                    and generation in self._ready_staged_current_sample_generations
+                ):
                     samples = self._staged_current_samples_by_generation[generation]
                 elif (
                     generation is not None
@@ -4970,21 +5143,6 @@ class TestManager(QObject):
             return []
         return rebase_current_samples(raw_samples, current_epoch=epoch)
 
-    @staticmethod
-    def _session_has_retained_capture(session) -> bool:
-        finalization = getattr(
-            session,
-            "_manager_capture_finalization_state",
-            None,
-        )
-        if isinstance(finalization, _CaptureFinalizationState) and finalization.complete:
-            buffer = finalization.buffer
-            return isinstance(buffer, np.ndarray) and buffer.shape[0] > 0
-        try:
-            return int(getattr(session, "captured_frame_count", 0)) > 0
-        except (TypeError, ValueError):
-            return False
-
     def _emit_current_trace_update(
         self,
         config_id: int,
@@ -4994,28 +5152,40 @@ class TestManager(QObject):
         *,
         expected_generation=None,
         session=None,
+        publication_gate=None,
     ) -> None:
         if not isinstance(run_id, str) or not run_id:
             return
-        if expected_generation is not None:
-            with self._lifecycle_lock:
-                if (
-                    self._current_collection_generations.get(config_id)
-                    is not expected_generation
-                ):
-                    return
-        samples = self._effective_current_samples(
-            config_id,
-            samples,
-            session=session,
-        )
-        payload = build_current_trace_payload(samples, config=current_meter)
-        if payload is None:
+        if (
+            expected_generation is None
+            or session is None
+            or not isinstance(publication_gate, _CurrentPublicationGate)
+        ):
             return
-        signal = getattr(self._bus, "current_trace_updated", None)
-        emit = getattr(signal, "emit", None)
-        if callable(emit):
-            emit(config_id, run_id, payload)
+        with publication_gate.lock:
+            if not publication_gate.can_publish(
+                session=session,
+                generation=expected_generation,
+            ):
+                return
+            effective_samples = self._effective_current_samples(
+                config_id,
+                samples,
+                session=session,
+            )
+            payload = build_current_trace_payload(
+                effective_samples,
+                config=current_meter,
+            )
+            if payload is None or not publication_gate.can_publish(
+                session=session,
+                generation=expected_generation,
+            ):
+                return
+            signal = getattr(self._bus, "current_trace_updated", None)
+            emit = getattr(signal, "emit", None)
+            if callable(emit):
+                emit(config_id, run_id, payload)
 
     @staticmethod
     def _capture_session_recorder_buffer(
