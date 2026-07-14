@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from threading import Event, Lock, Thread
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -8,6 +9,7 @@ import pytest
 from PyQt6.QtCore import QCoreApplication, QEventLoop
 from scipy.io import wavfile
 
+from app.service.analysis.audio_recorder import AudioRecorder
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.selected_channels import project_selected_channels
 from app.service.analysis.session_capture import (
@@ -217,98 +219,57 @@ class TestLateAttachBufferSlice:
             "monitor_channel": 0,
         }
 
-        class TaggedRecorder:
-            instances = []
+        class HardwarelessRecorder(AudioRecorder):
+            """Use the production capture path without opening PortAudio."""
 
-            def __init__(
-                self,
-                *,
-                device_name,
-                hostapi,
-                sample_rate,
-                n_channels,
-                record_duration,
-            ):
-                self._sample_rate = float(sample_rate)
-                self._n_channels = int(n_channels)
-                self._record_duration = float(record_duration)
-                self._buffer = np.empty((0, self._n_channels), dtype=np.float32)
-                self._write_pos = 0
-                self._running = False
-                self._accepting_captures = True
-                self._owners = []
-                self.captured_block_ready = _DummySignal()
-                self.recording_done = _DummySignal()
-                self.error_occurred = _DummySignal()
-                TaggedRecorder.instances.append(self)
-
-            def request_capture(self, *, record_duration):
-                owner = RecorderAttachment(
-                    request_monotonic=attach_sample / self._sample_rate,
-                    warmup_samples=frames_for_duration(self._sample_rate, 0.05),
-                    target_samples=frames_for_duration(
-                        self._sample_rate,
-                        record_duration,
-                    ),
-                )
-                self._owners.append(owner)
-                return owner
-
-            def release_capture(self, owner):
-                if owner in self._owners:
-                    self._owners.remove(owner)
-                owner._mark_released()
-
-            def get_capture_buffer(self, owner, *, retained_frames):
-                bounds = owner.resolution
-                assert bounds is not None
-                start = bounds.retained_start
-                return self._buffer[start : start + retained_frames].copy()
+            _hardwareless_running = False
 
             def isRunning(self):
-                return self._running
+                return self._hardwareless_running
 
             def start(self):
-                self._running = True
+                self._hardwareless_running = True
 
             def stop(self):
-                self._running = False
-                self._accepting_captures = False
-
-            def stop_if_no_capture_owners(self):
-                if self._owners:
-                    return False
-                self.stop()
-                return True
+                self._hardwareless_running = False
+                super().stop()
 
             def wait(self, timeout):
                 return True
 
-            def emit_tagged_range(self, start, end):
-                assert start == self._write_pos
-                data = np.arange(start, end, dtype=np.float32).reshape(-1, 1)
-                self._buffer = np.concatenate((self._buffer, data), axis=0)
-                self._write_pos = end
-                for owner in self._owners:
-                    if owner.resolution is None:
-                        assert start <= attach_sample < end
-                        owner._resolve_once(
-                            ResolvedCaptureBounds(
-                                attach_sample=attach_sample,
-                                attach_monotonic=attach_sample / self._sample_rate,
-                                warmup_samples=owner.warmup_samples,
-                                target_samples=owner.target_samples,
-                            )
-                        )
-                self.captured_block_ready.emit(
-                    CapturedAudioBlock(
-                        data=data,
-                        sample_start=start,
-                        sample_end=end,
-                        monotonic_start=start / self._sample_rate,
-                        monotonic_end=end / self._sample_rate,
-                    )
-                )
+        clock_values = iter([0.02, 0.04, 0.10, 0.12, 0.17])
+        recorder = HardwarelessRecorder(
+            device_name="Mic",
+            hostapi="MME",
+            sample_rate=sample_rate,
+            n_channels=1,
+            record_duration=0.1,
+            monotonic_func=lambda: next(clock_values),
+        )
+        recorder_factory_calls = []
+
+        def recorder_factory(**kwargs):
+            recorder_factory_calls.append(dict(kwargs))
+            return recorder
+
+        def emit_tagged_range(start, end):
+            data = np.arange(start, end, dtype=np.float32).reshape(-1, 1)
+            recorder._sd_callback(
+                data,
+                data.shape[0],
+                SimpleNamespace(
+                    inputBufferAdcTime=start / sample_rate,
+                    currentTime=end / sample_rate,
+                ),
+                None,
+            )
+            block = recorder._queue.get_nowait()
+            assert (block.sample_start, block.sample_end) == (start, end)
+            assert (block.monotonic_start, block.monotonic_end) == pytest.approx(
+                (start / sample_rate, end / sample_rate)
+            )
+            recorder._feed_captured_block(block)
+            recorder._emit_captured_block(block)
 
         class TaggedMonitor:
             instances = []
@@ -382,7 +343,7 @@ class TestLateAttachBufferSlice:
 
         monkeypatch.setattr(
             "app.service.analysis.test_manager.AudioRecorder",
-            TaggedRecorder,
+            recorder_factory,
         )
         monkeypatch.setattr(
             "app.service.analysis.test_manager.AudioMonitor",
@@ -410,22 +371,53 @@ class TestLateAttachBufferSlice:
             }
         ) is True
         session = mgr._sessions[1]
-        recorder = TaggedRecorder.instances[0]
+        owner = session.capture_attachment
+        assert isinstance(owner, RecorderAttachment)
+        assert owner.resolution is None
+        assert recorder_factory_calls == [
+            {
+                "device_name": "Mic",
+                "hostapi": "MME",
+                "sample_rate": 100.0,
+                "n_channels": 1,
+                "record_duration": 0.1,
+            }
+        ]
+        freeze_capture = MagicMock(wraps=session.freeze_capture)
+        get_capture_buffer = MagicMock(wraps=recorder.get_capture_buffer)
+        monkeypatch.setattr(session, "freeze_capture", freeze_capture)
+        monkeypatch.setattr(recorder, "get_capture_buffer", get_capture_buffer)
 
-        recorder.emit_tagged_range(0, 4)
-        recorder.emit_tagged_range(4, 10)
-        recorder.emit_tagged_range(10, 12)
+        emit_tagged_range(0, 4)
+        assert owner.resolution is not None
+        assert owner.resolution.attach_sample == attach_sample
+        assert owner.resolution.retained_end == (
+            attach_sample + warmup_frames + target_frames
+        )
+        assert recorder._buffer.shape[0] >= owner.resolution.retained_end
+        emit_tagged_range(4, 10)
+        emit_tagged_range(10, 12)
 
         assert recorder._write_pos == attach_sample + target_frames
+        assert recorder._capture_sample_cursor == attach_sample + target_frames
+        assert recorder._capture_complete() is False
         assert session.captured_frame_count == 5
         assert 1 in mgr._sessions
         assert 1 not in mgr._completed_sessions
 
-        recorder.emit_tagged_range(12, 17)
+        emit_tagged_range(12, 17)
 
         completed = mgr._completed_sessions[1]
         assert recorder._write_pos == attach_sample + warmup_frames + target_frames
+        assert recorder._capture_sample_cursor == (
+            attach_sample + warmup_frames + target_frames
+        )
         assert completed.captured_frame_count == target_frames
+        freeze_capture.assert_called_once_with()
+        get_capture_buffer.assert_called_once_with(
+            owner,
+            retained_frames=target_frames,
+        )
         np.testing.assert_array_equal(completed._buffer[:, 0], expected_tags)
         assert completed._tagged_dispatcher.spans[0] == (0, 3)
         np.testing.assert_array_equal(
