@@ -8,6 +8,7 @@ import pytest
 from app.service.analysis.test_manager import TestManager
 
 from ._support import (
+    _CaptureRecorderDoubleMixin,
     _DummySignal,
     _FakeSession,
     _factory_runtime_config,
@@ -16,7 +17,7 @@ from ._support import (
 )
 
 
-class _CountingRecorder:
+class _CountingRecorder(_CaptureRecorderDoubleMixin):
     instances = []
 
     def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -142,7 +143,7 @@ class TestTestManagerStartStop:
                 "output_device_name": None,
             }
 
-            class FakeRecorder:
+            class FakeRecorder(_CaptureRecorderDoubleMixin):
                 instances = []
 
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -290,7 +291,7 @@ class TestTestManagerStartStop:
                 "output_device_samplerate": 48000,
             }
 
-            class FakeRecorder:
+            class FakeRecorder(_CaptureRecorderDoubleMixin):
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
                     self._sample_rate = sample_rate
                     self._n_channels = n_channels
@@ -396,7 +397,7 @@ class TestTestManagerStartStop:
                 "output_device_samplerate": 48000,
             }
 
-            class FakeRecorder:
+            class FakeRecorder(_CaptureRecorderDoubleMixin):
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
                     self._sample_rate = sample_rate
                     self._n_channels = n_channels

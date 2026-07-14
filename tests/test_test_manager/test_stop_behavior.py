@@ -16,6 +16,34 @@ from ._support import (
 
 
 class TestTestManagerStartStop:
+    def test_stop_active_run_before_warmup_saves_and_analyzes_nothing(
+        self,
+        monkeypatch,
+    ):
+        empty = np.empty((0, 1), dtype=np.float32)
+        bus, _, mgr, session, recorder, monitor, _ = _make_running_factory_manager(
+            monkeypatch,
+            allow_incomplete_recording_analysis=True,
+            partial_buf=empty,
+            sample_rate=100.0,
+        )
+        session._run_judgment = MagicMock()
+
+        stopped = mgr.stop_active_run(config_id=1)
+
+        assert stopped is True
+        assert session.saved_wavs == []
+        session._run_judgment.assert_not_called()
+        assert recorder.get_capture_buffer_calls == []
+        assert recorder.release_capture_calls == [session.capture_attachment]
+        bus.factory_runtime_stopped.emit.assert_called_once()
+        bus.factory_runtime_analyzing_entered.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_succeeded.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_no_result.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_error.emit.assert_not_called()
+        assert recorder.stop_calls == 1
+        assert monitor.stop_calls == 1
+
     def test_stop_all(self):
         bus = _mock_bus()
         services = _mock_services(bus)
@@ -53,7 +81,10 @@ class TestTestManagerStartStop:
         assert mgr._monitors == {}
         assert mgr._shared_recorders == {}
         assert mgr._completed_sessions == {}
-        assert recorder.get_buffer_from_calls == [session._attach_snapshot]
+        assert recorder.get_capture_buffer_calls == [
+            (session.capture_attachment, partial_buf.shape[0])
+        ]
+        assert recorder.release_capture_calls == [session.capture_attachment]
         np.testing.assert_array_equal(session._buffer, partial_buf)
         assert session._sample_rate == recorder._sample_rate
         assert recorder.stop_calls == 1
@@ -105,7 +136,10 @@ class TestTestManagerStartStop:
         assert mgr._recorders == {}
         assert mgr._monitors == {}
         assert mgr._shared_recorders == {}
-        assert recorder.get_buffer_from_calls == [session._attach_snapshot]
+        assert recorder.get_capture_buffer_calls == [
+            (session.capture_attachment, partial_buf.shape[0])
+        ]
+        assert recorder.release_capture_calls == [session.capture_attachment]
         np.testing.assert_array_equal(session._buffer, partial_buf)
         assert session._sample_rate == recorder._sample_rate
         assert len(session.saved_wavs) == 1
@@ -179,7 +213,10 @@ class TestTestManagerStartStop:
         stopped = mgr.stop_active_run(config_id=1)
 
         assert stopped is True
-        assert recorder.get_buffer_from_calls == [session._attach_snapshot]
+        assert recorder.get_capture_buffer_calls == [
+            (session.capture_attachment, partial_buf.shape[0])
+        ]
+        assert recorder.release_capture_calls == [session.capture_attachment]
         session._run_judgment.assert_not_called()
         assert session._buffer is None
         assert session.saved_wavs == []
@@ -354,7 +391,10 @@ class TestTestManagerStartStop:
         assert mgr._recorders == {}
         assert mgr._monitors == {}
         assert mgr._shared_recorders == {}
-        assert recorder.get_buffer_from_calls == [session._attach_snapshot]
+        assert recorder.get_capture_buffer_calls == [
+            (session.capture_attachment, partial_buf.shape[0])
+        ]
+        assert recorder.release_capture_calls == [session.capture_attachment]
         np.testing.assert_array_equal(session._buffer, partial_buf)
         assert session._sample_rate == recorder._sample_rate
         assert len(session.saved_wavs) == 1
@@ -393,7 +433,7 @@ class TestTestManagerStartStop:
             partial_buf=partial_buf,
             sample_rate=100.0,
         )
-        recorder.get_buffer_from = MagicMock(side_effect=RuntimeError("buffer exploded"))
+        recorder.get_capture_buffer = MagicMock(side_effect=RuntimeError("buffer exploded"))
         session._run_judgment = MagicMock(
             side_effect=AssertionError("capture failure should not launch analysis")
         )
@@ -401,11 +441,11 @@ class TestTestManagerStartStop:
         stopped = mgr.stop_active_run(config_id=1)
 
         assert stopped is True
-        bus.factory_runtime_stopped.emit.assert_called_once()
-        bus.factory_runtime_analyzing_entered.emit.assert_not_called()
+        bus.factory_runtime_stopped.emit.assert_not_called()
+        bus.factory_runtime_analyzing_entered.emit.assert_called_once()
         bus.factory_runtime_auto_analysis_succeeded.emit.assert_not_called()
         bus.factory_runtime_auto_analysis_no_result.emit.assert_not_called()
-        bus.factory_runtime_auto_analysis_error.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_error.emit.assert_called_once()
         bus.factory_runtime_aborted.emit.assert_not_called()
         assert mgr.is_running(config_id=1) is False
         assert recorder.stop_calls == 1

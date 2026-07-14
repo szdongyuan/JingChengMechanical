@@ -22,6 +22,37 @@ class _DummySignal:
         for callback in list(self._callbacks):
             callback(*args, **kwargs)
 
+
+class _CaptureRecorderDoubleMixin:
+    """Exact-capture defaults for manager recorder doubles."""
+
+    def __getattr__(self, name):
+        if name == "captured_block_ready":
+            signal = _DummySignal()
+            self.__dict__[name] = signal
+            return signal
+        raise AttributeError(name)
+
+    def request_capture(self, *, record_duration):
+        owner = object()
+        self.__dict__.setdefault("request_capture_calls", []).append(record_duration)
+        self.__dict__.setdefault("capture_owners", []).append(owner)
+        return owner
+
+    def get_capture_buffer(self, attachment, *, retained_frames):
+        self.__dict__.setdefault("get_capture_buffer_calls", []).append(
+            (attachment, retained_frames)
+        )
+        buffer = getattr(self, "_buffer", None)
+        if not isinstance(buffer, np.ndarray):
+            n_channels = int(getattr(self, "_n_channels", 0) or 0)
+            return np.empty((0, n_channels), dtype=np.float32)
+        return buffer[:retained_frames].copy()
+
+    def release_capture(self, attachment):
+        self.__dict__.setdefault("release_capture_calls", []).append(attachment)
+
+
 class _FakeSession:
     def __init__(self, config, bus, ai_service, mic_cal, workorder, audio_dir):
         self.config_id = config["config_id"]
@@ -35,19 +66,35 @@ class _FakeSession:
         self._real_to_logical_channel = {}
         self.last_ai_review = None
         self._finished = False
-        self._attach_snapshot = None
-        self._attach_chunk_index = 0
+        self.capture_attachment = None
+        self._captured_frame_count = 0
+        self._source_token = None
+        self._monitor_feed = None
         self._on_session_done_cb = None
 
     def _setup_pipelines(self):
         return None
 
-    def attach_to_recorder(self, *, chunk_index, snapshot=None):
-        self._attach_chunk_index = chunk_index
-        self._attach_snapshot = snapshot
+    def prepare_for_attach(self, source_token):
+        self._source_token = source_token
+        self.capture_attachment = None
 
-    def _on_chunk(self, *args, **kwargs):
+    def attach_to_recorder(self, attachment, *, source_token):
+        assert source_token is self._source_token
+        self.capture_attachment = attachment
+
+    def _on_captured_block(self, *args, **kwargs):
         return None
+
+    def set_monitor_feed(self, callback):
+        self._monitor_feed = callback
+
+    @property
+    def captured_frame_count(self):
+        return self._captured_frame_count
+
+    def freeze_capture(self):
+        return self._captured_frame_count
 
     def _run_judgment(self):
         raise AssertionError("not used in this test")
@@ -139,14 +186,17 @@ def _make_running_factory_manager(
             self._n_channels = n_channels
             self._record_duration = record_duration
             self._buffer = partial_buf
+            self._n_channels = n_channels
+            self.captured_block_ready = _DummySignal()
             self.chunk_ready = _DummySignal()
             self.recording_done = _DummySignal()
             self.error_occurred = _DummySignal()
             self._running = False
             self.stop_calls = 0
             self.wait_calls = []
-            self.attach_calls = []
-            self.get_buffer_from_calls = []
+            self.request_capture_calls = []
+            self.get_capture_buffer_calls = []
+            self.release_capture_calls = []
             FakeRecorder.instances.append(self)
 
         def isRunning(self):
@@ -163,13 +213,16 @@ def _make_running_factory_manager(
             self.wait_calls.append(timeout)
             return True
 
-        def attach_session(self, *, record_duration):
-            self.attach_calls.append(record_duration)
-            return MagicMock(chunk_index=0, sample_index=0)
+        def request_capture(self, *, record_duration):
+            self.request_capture_calls.append(record_duration)
+            return object()
 
-        def get_buffer_from(self, snapshot):
-            self.get_buffer_from_calls.append(snapshot)
-            return self._buffer
+        def get_capture_buffer(self, attachment, *, retained_frames):
+            self.get_capture_buffer_calls.append((attachment, retained_frames))
+            return self._buffer[:retained_frames].copy()
+
+        def release_capture(self, attachment):
+            self.release_capture_calls.append(attachment)
 
     class FakeMonitor:
         instances = []
@@ -212,6 +265,7 @@ def _make_running_factory_manager(
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
+            self._captured_frame_count = int(partial_buf.shape[0])
             self.saved_wavs = []
             FakeSession.instances.append(self)
 

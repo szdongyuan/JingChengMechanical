@@ -9,6 +9,7 @@ from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.test_manager import TestManager
 
 from ._support import (
+    _CaptureRecorderDoubleMixin,
     _DummySignal,
     _FakeSession,
     _factory_runtime_config,
@@ -158,7 +159,7 @@ class TestTestManagerStartStop:
                 "mic_cal": {},
             }
 
-            class FakeRecorder:
+            class FakeRecorder(_CaptureRecorderDoubleMixin):
                 instances = []
 
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -289,7 +290,7 @@ class TestTestManagerStartStop:
                 "output_device_samplerate": 44100,
             }
 
-            class FakeRecorder:
+            class FakeRecorder(_CaptureRecorderDoubleMixin):
                 instances = []
 
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -393,7 +394,7 @@ class TestTestManagerStartStop:
                 output_device_samplerate="bad",
             )
 
-            class FakeRecorder:
+            class FakeRecorder(_CaptureRecorderDoubleMixin):
                 instances = []
 
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -486,7 +487,7 @@ class TestTestManagerStartStop:
 
             events: list[str] = []
 
-            class FakeRecorder:
+            class FakeRecorder(_CaptureRecorderDoubleMixin):
                 instances = []
 
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -583,7 +584,7 @@ class TestTestManagerStartStop:
             services = _mock_services(bus)
             services.config_service.load_config.return_value = _start_config()
 
-            class FakeRecorder:
+            class FakeRecorder(_CaptureRecorderDoubleMixin):
                 instances = []
 
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -669,7 +670,7 @@ class TestTestManagerStartStop:
 
             events: list[str] = []
 
-            class FakeRecorder:
+            class FakeRecorder(_CaptureRecorderDoubleMixin):
                 instances = []
 
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -779,7 +780,7 @@ class TestTestManagerStartStop:
 
             events: list[str] = []
 
-            class FakeRecorder:
+            class FakeRecorder(_CaptureRecorderDoubleMixin):
                 instances = []
 
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -906,7 +907,7 @@ class TestTestManagerStartStop:
             }
             events: list[str] = []
 
-            class FastRecorder:
+            class FastRecorder(_CaptureRecorderDoubleMixin):
                 instances = []
 
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -928,7 +929,7 @@ class TestTestManagerStartStop:
 
                 def start(self):
                     self._running = True
-                    self.recording_done.emit()
+                    self.captured_block_ready.emit(object())
 
                 def stop(self):
                     self._running = False
@@ -957,6 +958,15 @@ class TestTestManagerStartStop:
                         ai_score=0.95,
                         analysis_window=(0.0, 1.0),
                     )
+
+                def _on_captured_block(self, block, *, source_token):
+                    if source_token is not self._source_token:
+                        return
+                    self._captured_frame_count = int(
+                        self._sample_rate * self._config["record_duration"]
+                    )
+                    self._finished = True
+                    self._on_session_done_cb(self.config_id)
 
             monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FastRecorder)
             monkeypatch.setattr("app.service.analysis.test_manager.TestSession", FastSession)
@@ -1020,7 +1030,7 @@ class TestTestManagerStartStop:
 
             events: list[str] = []
 
-            class ErrorRecorder:
+            class ErrorRecorder(_CaptureRecorderDoubleMixin):
                 instances = []
 
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):

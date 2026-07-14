@@ -8,6 +8,12 @@ import pytest
 
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.selected_channels import project_selected_channels
+from app.service.analysis.session_capture import (
+    CapturedAudioBlock,
+    RecorderAttachment,
+    ResolvedCaptureBounds,
+    frames_for_duration,
+)
 from app.service.analysis.test_manager import TestManager
 
 from ._support import (
@@ -48,20 +54,110 @@ class _InlineDisplayDispatcher:
         return None
 
 
+def _install_completed_capture(session, recorder, buffer: np.ndarray):
+    attachment = object()
+    session.capture_attachment = attachment
+    session.captured_frame_count = int(buffer.shape[0])
+    session.freeze_capture = MagicMock(return_value=int(buffer.shape[0]))
+    recorder._n_channels = int(buffer.shape[1])
+    recorder.get_capture_buffer.return_value = buffer
+    recorder.captured_block_ready = _DummySignal()
+    return attachment
+
+
+class _ExactStreamingRecorder:
+    def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+        self._sample_rate = float(sample_rate)
+        self._n_channels = int(n_channels)
+        self._record_duration = float(record_duration)
+        self._buffer = np.empty((0, self._n_channels), dtype=np.float32)
+        self._chunk_samples = int(self._sample_rate * 0.05)
+        self._write_pos = 0
+        self._running = False
+        self._attach_emit_value = None
+        self.captured_block_ready = _DummySignal()
+        self.chunk_ready = _DummySignal()
+        self.recording_done = _DummySignal()
+        self.error_occurred = _DummySignal()
+        self._owners = set()
+
+    def request_capture(self, *, record_duration):
+        warmup_samples = frames_for_duration(self._sample_rate, 0.05)
+        target_samples = frames_for_duration(self._sample_rate, record_duration)
+        owner = RecorderAttachment(
+            request_monotonic=float(self._write_pos) / self._sample_rate,
+            warmup_samples=warmup_samples,
+            target_samples=target_samples,
+        )
+        owner._resolve_once(
+            ResolvedCaptureBounds(
+                attach_sample=self._write_pos,
+                attach_monotonic=float(self._write_pos) / self._sample_rate,
+                warmup_samples=warmup_samples,
+                target_samples=target_samples,
+            )
+        )
+        self._owners.add(owner)
+        if self._attach_emit_value is not None:
+            emit_value = self._attach_emit_value
+            self._attach_emit_value = None
+            self.emit_chunk(emit_value)
+        return owner
+
+    def release_capture(self, owner):
+        self._owners.discard(owner)
+        owner._mark_released()
+
+    def get_capture_buffer(self, owner, *, retained_frames):
+        bounds = owner.resolution
+        start = bounds.retained_start
+        end = min(start + retained_frames, self._write_pos)
+        return self._buffer[start:end].copy()
+
+    def isRunning(self):
+        return self._running
+
+    def start(self):
+        self._running = True
+
+    def stop(self):
+        self._running = False
+
+    def wait(self, timeout):
+        return True
+
+    def emit_chunk(self, fill_value, *, new_samples=None):
+        frame_count = self._chunk_samples if new_samples is None else int(new_samples)
+        data = np.full(
+            (frame_count, self._n_channels),
+            fill_value,
+            dtype=np.float32,
+        )
+        sample_start = self._write_pos
+        self._buffer = np.concatenate((self._buffer, data), axis=0)
+        self._write_pos += frame_count
+        self.captured_block_ready.emit(
+            CapturedAudioBlock(
+                data=data,
+                sample_start=sample_start,
+                sample_end=self._write_pos,
+                monotonic_start=None,
+                monotonic_end=None,
+            )
+        )
+
+
 class TestLateAttachBufferSlice:
     def test_on_session_done_uses_recorder_owned_post_attach_buffer_slice(self):
         bus = _mock_bus()
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(10, 20, dtype=np.float32).reshape(10, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
         session.stop_live_display = MagicMock()
         session._run_judgment.return_value = JudgmentResult(
             overall="合格",
@@ -69,12 +165,17 @@ class TestLateAttachBufferSlice:
             ai_pass=None,
             ai_score=None,
         )
+        attachment = _install_completed_capture(session, rec, post_attach)
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
         mgr._on_session_done(1)
 
-        rec.get_buffer_from.assert_called_once_with(attach_snapshot)
+        rec.get_capture_buffer.assert_called_once_with(
+            attachment,
+            retained_frames=10,
+        )
+        rec.release_capture.assert_called_once_with(attachment)
         np.testing.assert_array_equal(session._buffer, post_attach)
         assert session._sample_rate == 100.0
         session._run_judgment.assert_called_once_with()
@@ -87,9 +188,7 @@ class TestLateAttachBufferSlice:
         post_attach = np.column_stack(
             [np.full(10, channel, dtype=np.float32) for channel in range(6)]
         )
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         observed = {}
 
@@ -99,7 +198,6 @@ class TestLateAttachBufferSlice:
             def __init__(self):
                 self._buffer = None
                 self._sample_rate = None
-                self._attach_snapshot = attach_snapshot
                 self._config = {
                     "analysis_duration": 0.1,
                     "analysis_window_offset_ms": 0,
@@ -135,12 +233,17 @@ class TestLateAttachBufferSlice:
                 )
 
         session = Session()
+        attachment = _install_completed_capture(session, rec, post_attach)
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
         mgr._on_session_done(1)
 
-        rec.get_buffer_from.assert_called_once_with(attach_snapshot)
+        rec.get_capture_buffer.assert_called_once_with(
+            attachment,
+            retained_frames=10,
+        )
+        rec.release_capture.assert_called_once_with(attachment)
         np.testing.assert_array_equal(session._buffer, post_attach[:, [3]])
         np.testing.assert_array_equal(observed["buffer"], post_attach[:, [3]])
         assert observed["map"] == {3: 0}
@@ -152,9 +255,7 @@ class TestLateAttachBufferSlice:
         post_attach = np.column_stack(
             [np.full(10, channel, dtype=np.float32) for channel in range(2)]
         )
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         mon = MagicMock()
         expected_error = "selected channel 3 is outside hardware channel range 0..1"
@@ -165,7 +266,6 @@ class TestLateAttachBufferSlice:
             def __init__(self):
                 self._buffer = None
                 self._sample_rate = None
-                self._attach_snapshot = attach_snapshot
                 self._config = {
                     "analysis_duration": 0.1,
                     "analysis_window_offset_ms": 0,
@@ -197,13 +297,18 @@ class TestLateAttachBufferSlice:
                 return self._buffer
 
         session = Session()
+        attachment = _install_completed_capture(session, rec, post_attach)
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
         mgr._monitors[1] = mon
 
         mgr._on_session_done(1)
 
-        rec.get_buffer_from.assert_called_once_with(attach_snapshot)
+        rec.get_capture_buffer.assert_called_once_with(
+            attachment,
+            retained_frames=10,
+        )
+        rec.release_capture.assert_called_once_with(attachment)
         session._run_judgment.assert_not_called()
         assert session._buffer is None
         bus.test_finished.emit.assert_called_once_with(
@@ -240,9 +345,7 @@ class TestLateAttachBufferSlice:
         post_attach = np.column_stack(
             [np.full(10, channel, dtype=np.float32) for channel in range(2)]
         )
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         rec.stop.side_effect = RuntimeError("recorder stop exploded")
         rec.wait.side_effect = RuntimeError("recorder wait exploded")
@@ -257,7 +360,6 @@ class TestLateAttachBufferSlice:
             def __init__(self):
                 self._buffer = None
                 self._sample_rate = None
-                self._attach_snapshot = attach_snapshot
                 self._config = {
                     "analysis_duration": 0.1,
                     "analysis_window_offset_ms": 0,
@@ -289,13 +391,18 @@ class TestLateAttachBufferSlice:
                 return self._buffer
 
         session = Session()
+        attachment = _install_completed_capture(session, rec, post_attach)
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
         mgr._monitors[1] = mon
 
         mgr._on_session_done(1)
 
-        rec.get_buffer_from.assert_called_once_with(attach_snapshot)
+        rec.get_capture_buffer.assert_called_once_with(
+            attachment,
+            retained_frames=10,
+        )
+        rec.release_capture.assert_called_once_with(attachment)
         session._run_judgment.assert_not_called()
         assert session._buffer is None
         bus.test_finished.emit.assert_called_once_with(
@@ -329,14 +436,11 @@ class TestLateAttachBufferSlice:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(500, dtype=np.float32).reshape(500, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
         session._config = {
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 0,
@@ -353,6 +457,7 @@ class TestLateAttachBufferSlice:
             ai_score=0.93,
             analysis_window=(1.0, 3.0),
         )
+        _install_completed_capture(session, rec, post_attach)
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
@@ -398,14 +503,11 @@ class TestLateAttachBufferSlice:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(500, dtype=np.float32).reshape(500, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
         session._config = {
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 0,
@@ -429,6 +531,7 @@ class TestLateAttachBufferSlice:
             session._run_judgment.side_effect = ValueError("analysis window not fully captured")
         else:
             session._run_judgment.side_effect = RuntimeError("analysis crashed")
+        _install_completed_capture(session, rec, post_attach)
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
@@ -524,14 +627,11 @@ class TestLateAttachBufferSlice:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(10, 20, dtype=np.float32).reshape(10, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
         session._audio_file_path = None
         session._audio_data_id = None
         session._workorder = {"factory_run_id": "run-1"}
@@ -546,13 +646,17 @@ class TestLateAttachBufferSlice:
             raise ValueError("analysis window not fully captured")
 
         session._run_judgment.side_effect = raise_required_window_failure
+        attachment = _install_completed_capture(session, rec, post_attach)
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
         mgr._on_session_done(1)
 
         payload = _expected_no_result_payload("analysis window not fully captured")
-        rec.get_buffer_from.assert_called_once_with(attach_snapshot)
+        rec.get_capture_buffer.assert_called_once_with(
+            attachment,
+            retained_frames=10,
+        )
         np.testing.assert_array_equal(session._buffer, post_attach)
         assert session._sample_rate == 100.0
         assert session._audio_file_path == "captured.wav"
@@ -575,14 +679,11 @@ class TestLateAttachBufferSlice:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(10, 20, dtype=np.float32).reshape(10, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
         session._audio_file_path = None
         session._audio_data_id = None
         session._workorder = {"factory_run_id": "run-1"}
@@ -597,13 +698,17 @@ class TestLateAttachBufferSlice:
             raise RuntimeError("analysis crashed")
 
         session._run_judgment.side_effect = raise_unexpected_failure
+        attachment = _install_completed_capture(session, rec, post_attach)
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
         mgr._on_session_done(1)
 
         payload = _expected_no_result_payload("analysis crashed")
-        rec.get_buffer_from.assert_called_once_with(attach_snapshot)
+        rec.get_capture_buffer.assert_called_once_with(
+            attachment,
+            retained_frames=10,
+        )
         np.testing.assert_array_equal(session._buffer, post_attach)
         assert session._sample_rate == 100.0
         assert session._audio_file_path == "captured.wav"
@@ -626,14 +731,11 @@ class TestLateAttachBufferSlice:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(10, 20, dtype=np.float32).reshape(10, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
         session._workorder = {"factory_run_id": "run-1"}
         session._config = {
             "analysis_duration": 2.0,
@@ -650,6 +752,7 @@ class TestLateAttachBufferSlice:
             )
 
         session._run_judgment.side_effect = stop_then_return_result
+        _install_completed_capture(session, rec, post_attach)
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
@@ -874,56 +977,8 @@ class TestLateAttachBufferSlice:
                 self._live_values.append(float(mono[0]))
                 return {"stft_frames": [], "stft": None, "spl": None, "octave": None, "fft": None}
 
-        class FakeAttachSnapshot:
-            def __init__(self, chunk_index, sample_index):
-                self.chunk_index = chunk_index
-                self.sample_index = sample_index
-
-        class FakeRecorder:
-            def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
-                self._sample_rate = float(sample_rate)
-                self._n_channels = n_channels
-                self._record_duration = float(record_duration)
-                self._buffer = np.zeros((int(self._sample_rate * self._record_duration), n_channels), dtype=np.float32)
-                self._chunk_samples = int(self._sample_rate * 0.05)
-                self._write_pos = 0
-                self._emitted_chunk_index = 0
-                self._running = False
-                self._attach_emit_value = None
-                self.chunk_ready = _DummySignal()
-                self.recording_done = _DummySignal()
-                self.error_occurred = _DummySignal()
-
-            def attach_session(self, *, record_duration):
-                snapshot = FakeAttachSnapshot(self._emitted_chunk_index, self._write_pos)
-                if self._attach_emit_value is not None:
-                    self.emit_chunk(self._attach_emit_value)
-                    self._attach_emit_value = None
-                return snapshot
-
-            def isRunning(self):
-                return self._running
-
-            def start(self):
-                self._running = True
-
-            def stop(self):
-                self._running = False
-
-            def wait(self, timeout):
-                return True
-
-            def get_buffer_from(self, snapshot):
-                return self._buffer[snapshot.sample_index : self._write_pos].copy()
-
-            def emit_chunk(self, fill_value):
-                chunk = np.full((self._chunk_samples, self._n_channels), fill_value, dtype=np.float32)
-                end = self._write_pos + self._chunk_samples
-                self._buffer[self._write_pos : end] = chunk
-                chunk_index = self._emitted_chunk_index
-                self._write_pos = end
-                self._emitted_chunk_index += 1
-                self.chunk_ready.emit(chunk, chunk_index)
+        class FakeRecorder(_ExactStreamingRecorder):
+            pass
 
         def fake_setup_pipelines(self):
             self._live_chunk_values = []
@@ -953,13 +1008,14 @@ class TestLateAttachBufferSlice:
         shared_rec._attach_emit_value = 4.0
         mgr.start({"config_id": 2, "sn": "SN2"})
         shared_rec.emit_chunk(5.0)
+        shared_rec.emit_chunk(6.0)
 
         late_session = mgr._completed_sessions[2]
-        assert late_session._live_chunk_values == [4.0, 5.0]
+        assert late_session._live_chunk_values == [5.0, 6.0]
         expected = np.concatenate(
             [
-                np.full((5, 1), 4.0, dtype=np.float32),
                 np.full((5, 1), 5.0, dtype=np.float32),
+                np.full((5, 1), 6.0, dtype=np.float32),
             ],
             axis=0,
         )
@@ -1042,51 +1098,8 @@ class TestLateAttachBufferSlice:
             def process_chunk(self, mono, elapsed, compute_loudness=True):
                 return {"stft_frames": [], "stft": None, "spl": None, "octave": None, "fft": None}
 
-        class FakeAttachSnapshot:
-            def __init__(self, chunk_index, sample_index):
-                self.chunk_index = chunk_index
-                self.sample_index = sample_index
-
-        class FakeRecorder:
-            def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
-                self._sample_rate = float(sample_rate)
-                self._n_channels = n_channels
-                self._record_duration = float(record_duration)
-                self._buffer = np.zeros((int(self._sample_rate * self._record_duration), n_channels), dtype=np.float32)
-                self._chunk_samples = int(self._sample_rate * 0.05)
-                self._write_pos = 0
-                self._emitted_chunk_index = 0
-                self._running = False
-                self.chunk_ready = _DummySignal()
-                self.recording_done = _DummySignal()
-                self.error_occurred = _DummySignal()
-
-            def attach_session(self, *, record_duration):
-                return FakeAttachSnapshot(self._emitted_chunk_index, self._write_pos)
-
-            def isRunning(self):
-                return self._running
-
-            def start(self):
-                self._running = True
-
-            def stop(self):
-                self._running = False
-
-            def wait(self, timeout):
-                return True
-
-            def get_buffer_from(self, snapshot):
-                return self._buffer[snapshot.sample_index : self._write_pos].copy()
-
-            def emit_chunk(self, fill_value):
-                chunk = np.full((self._chunk_samples, self._n_channels), fill_value, dtype=np.float32)
-                end = self._write_pos + self._chunk_samples
-                self._buffer[self._write_pos : end] = chunk
-                chunk_index = self._emitted_chunk_index
-                self._write_pos = end
-                self._emitted_chunk_index += 1
-                self.chunk_ready.emit(chunk, chunk_index)
+        class FakeRecorder(_ExactStreamingRecorder):
+            pass
 
         def fake_setup_pipelines(self):
             self._pipelines = [FakePipeline()]
@@ -1115,12 +1128,13 @@ class TestLateAttachBufferSlice:
         mgr.start({"config_id": 2, "sn": "SN2"})
         shared_rec.emit_chunk(4.0)
         shared_rec.emit_chunk(5.0)
+        shared_rec.emit_chunk(6.0)
 
         late_session = mgr._completed_sessions[2]
         expected = np.concatenate(
             [
-                np.full((5, 1), 4.0, dtype=np.float32),
                 np.full((5, 1), 5.0, dtype=np.float32),
+                np.full((5, 1), 6.0, dtype=np.float32),
             ],
             axis=0,
         )
@@ -1207,56 +1221,8 @@ class TestLateAttachBufferSlice:
                 self._elapsed_values.append(elapsed)
                 return {"stft_frames": [], "stft": None, "spl": None, "octave": None, "fft": None}
 
-        class FakeAttachSnapshot:
-            def __init__(self, chunk_index, sample_index):
-                self.chunk_index = chunk_index
-                self.sample_index = sample_index
-
-        class FakeRecorder:
-            def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
-                self._sample_rate = float(sample_rate)
-                self._n_channels = n_channels
-                self._record_duration = float(record_duration)
-                self._buffer = np.zeros(
-                    (int(self._sample_rate * self._record_duration), n_channels),
-                    dtype=np.float32,
-                )
-                self._chunk_samples = int(self._sample_rate * 0.05)
-                self._write_pos = 0
-                self._emitted_chunk_index = 0
-                self._running = False
-                self.chunk_ready = _DummySignal()
-                self.recording_done = _DummySignal()
-                self.error_occurred = _DummySignal()
-
-            def attach_session(self, *, record_duration):
-                return FakeAttachSnapshot(self._emitted_chunk_index, self._write_pos)
-
-            def isRunning(self):
-                return self._running
-
-            def start(self):
-                self._running = True
-
-            def stop(self):
-                self._running = False
-
-            def wait(self, timeout):
-                return True
-
-            def get_buffer_from(self, snapshot):
-                return self._buffer[snapshot.sample_index : self._write_pos].copy()
-
-            def emit_chunk(self, fill_value, *, new_samples=None):
-                n_write = self._chunk_samples if new_samples is None else int(new_samples)
-                end = self._write_pos + n_write
-                self._buffer[self._write_pos : end] = fill_value
-                self._write_pos = end
-                start = max(0, self._write_pos - self._chunk_samples)
-                chunk = self._buffer[start : self._write_pos].copy()
-                chunk_index = self._emitted_chunk_index
-                self._emitted_chunk_index += 1
-                self.chunk_ready.emit(chunk, chunk_index)
+        class FakeRecorder(_ExactStreamingRecorder):
+            pass
 
         def fake_setup_pipelines(self):
             self._elapsed_values = []
@@ -1289,20 +1255,24 @@ class TestLateAttachBufferSlice:
 
         assert 2 not in mgr._completed_sessions
 
-        shared_rec.emit_chunk(6.0, new_samples=1)
+        shared_rec.emit_chunk(6.0)
+
+        assert 2 not in mgr._completed_sessions
+
+        shared_rec.emit_chunk(7.0, new_samples=2)
 
         late_session = mgr._completed_sessions[2]
-        expected_elapsed_values = [1102 / 22050.0, 2204 / 22050.0, 2205 / 22050.0]
+        expected_elapsed_values = [1101 / 22050.0, 2203 / 22050.0, 2205 / 22050.0]
         progress_elapsed_values = [
             call.args[1]
             for call in bus.recording_progress.emit.call_args_list
-            if call.args[0] == 2
+            if call.args[0] == 2 and call.args[1] > 0
         ]
         expected_buffer = np.concatenate(
             [
-                np.full((1102, 1), 4.0, dtype=np.float32),
-                np.full((1102, 1), 5.0, dtype=np.float32),
-                np.full((1, 1), 6.0, dtype=np.float32),
+                np.full((1101, 1), 5.0, dtype=np.float32),
+                np.full((1102, 1), 6.0, dtype=np.float32),
+                np.full((2, 1), 7.0, dtype=np.float32),
             ],
             axis=0,
         )

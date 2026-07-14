@@ -20,6 +20,16 @@ from ._support import (
 )
 
 
+def _install_completed_capture(session, recorder, buffer: np.ndarray):
+    attachment = object()
+    session.capture_attachment = attachment
+    session.captured_frame_count = int(buffer.shape[0])
+    session.freeze_capture = MagicMock(return_value=int(buffer.shape[0]))
+    recorder._n_channels = int(buffer.shape[1])
+    recorder.get_capture_buffer.return_value = buffer
+    return attachment
+
+
 def test_start_current_collection_emits_live_current_trace_update_with_run_id(monkeypatch):
     bus = _mock_bus()
     bus.current_trace_updated = MagicMock()
@@ -444,14 +454,12 @@ class TestReviewPayloadEmission:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(500, dtype=np.float32).reshape(500, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
+        _install_completed_capture(session, rec, post_attach)
         session._config = {
             "config_id": 1,
             "analysis_duration": 2.0,
@@ -679,14 +687,12 @@ class TestReviewPayloadEmission:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(500, dtype=np.float32).reshape(500, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
+        _install_completed_capture(session, rec, post_attach)
         session._config = {
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 0,
@@ -746,14 +752,12 @@ class TestReviewPayloadEmission:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(500, dtype=np.float32).reshape(500, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
+        _install_completed_capture(session, rec, post_attach)
         session._config = {
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 0,
@@ -824,14 +828,12 @@ class TestReviewPayloadEmission:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(10, 20, dtype=np.float32).reshape(10, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
+        _install_completed_capture(session, rec, post_attach)
         session._audio_file_path = None
         session._audio_data_id = None
         session._workorder = {"factory_run_id": "run-1"}
@@ -908,14 +910,12 @@ class TestReviewPayloadEmission:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(10, 20, dtype=np.float32).reshape(10, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
+        _install_completed_capture(session, rec, post_attach)
         session._audio_file_path = "captured.wav"
         session._audio_data_id = "audio-123"
         session._workorder = {"factory_run_id": "run-1"}
@@ -1463,14 +1463,12 @@ class TestReviewPayloadEmission:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(500, dtype=np.float32).reshape(500, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
+        _install_completed_capture(session, rec, post_attach)
         session._config = {
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 0,

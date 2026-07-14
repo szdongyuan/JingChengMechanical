@@ -15,7 +15,14 @@ import pytest
 from scipy.io import wavfile
 
 from app.service.analysis import dsp
+from app.service.analysis import test_session as test_session_module
 from app.service.analysis.frames import JudgmentResult
+from app.service.analysis.session_capture import (
+    CapturedAudioBlock,
+    RecorderAttachment,
+    ResolvedCaptureBounds,
+    frames_for_duration,
+)
 from app.service.analysis.test_manager import TestManager
 from app.service.analysis.test_session import TestSession
 from app.service.config_service import _CHANNEL_DEFAULTS
@@ -93,14 +100,21 @@ def _make_config(**overrides) -> dict:
 
 class _FakeRecorder:
     def __init__(self, *args, **kwargs):
+        self.captured_block_ready = _SignalStub()
         self.chunk_ready = _SignalStub()
         self.recording_done = _SignalStub()
         self.error_occurred = _SignalStub()
         self._sample_rate = float(kwargs.get("sample_rate", 44100.0))
         self.started = False
 
-    def attach_session(self, *, record_duration):
-        return SimpleNamespace(chunk_index=0)
+    def request_capture(self, *, record_duration):
+        return object()
+
+    def release_capture(self, attachment):
+        return None
+
+    def get_capture_buffer(self, attachment, *, retained_frames):
+        return np.empty((0, 1), dtype=np.float32)
 
     def isRunning(self):
         return False
@@ -141,6 +155,72 @@ class _CapturingLiveDisplayDispatcher:
 
     def stop(self):
         self.stopped = True
+
+
+def _capture_owner(
+    session: TestSession,
+    *,
+    attach_sample: int = 10,
+    attach_monotonic: float = 20.0,
+    resolved: bool = True,
+) -> RecorderAttachment:
+    warmup_samples = frames_for_duration(session._sample_rate, 0.05)
+    target_samples = frames_for_duration(
+        session._sample_rate,
+        session._record_duration,
+    )
+    owner = RecorderAttachment(
+        request_monotonic=attach_monotonic,
+        warmup_samples=warmup_samples,
+        target_samples=target_samples,
+    )
+    if resolved:
+        owner._resolve_once(
+            ResolvedCaptureBounds(
+                attach_sample=attach_sample,
+                attach_monotonic=attach_monotonic,
+                warmup_samples=warmup_samples,
+                target_samples=target_samples,
+            )
+        )
+    return owner
+
+
+def _captured_block(sample_start: int, values) -> CapturedAudioBlock:
+    data = np.asarray(values, dtype=np.float32)
+    if data.ndim == 1:
+        data = data.reshape(-1, 1)
+    return CapturedAudioBlock(
+        data=data,
+        sample_start=sample_start,
+        sample_end=sample_start + data.shape[0],
+        monotonic_start=None,
+        monotonic_end=None,
+    )
+
+
+def _bind_resolved_capture(
+    session: TestSession,
+    *,
+    attach_sample: int = 0,
+) -> tuple[object, int]:
+    token = object()
+    owner = _capture_owner(session, attach_sample=attach_sample)
+    session.prepare_for_attach(token)
+    session.attach_to_recorder(owner, source_token=token)
+    return token, owner.resolution.retained_start
+
+
+def _emit_captured_data(
+    session: TestSession,
+    token: object,
+    sample_start: int,
+    data: np.ndarray,
+) -> None:
+    session._on_captured_block(
+        _captured_block(sample_start, data),
+        source_token=token,
+    )
 
 
 class TestTestManagerDisplayChannelRouting:
@@ -189,11 +269,23 @@ class TestTestManagerDisplayChannelRouting:
                 events.append(("set_live", channel_index))
                 self._live_loudness_channel_index = channel_index
 
-            def prepare_for_attach(self):
-                events.append("prepare")
+            def set_monitor_feed(self, callback):
+                self._monitor_feed = callback
 
-            def attach_to_recorder(self, *, chunk_index, snapshot=None):
-                events.append(("attach", chunk_index))
+            def prepare_for_attach(self, source_token):
+                events.append("prepare")
+                self._source_token = source_token
+
+            def attach_to_recorder(self, attachment, *, source_token):
+                assert source_token is self._source_token
+                self.capture_attachment = attachment
+                events.append(("attach", attachment))
+
+            def _on_captured_block(self, block, *, source_token):
+                return None
+
+            def freeze_capture(self):
+                return 0
 
         config = _make_config(selected_channels=[0, 1])
         config["channels"] = [
@@ -259,11 +351,21 @@ class TestTestManagerDisplayChannelRouting:
                 events.append(("set_live", channel_index))
                 self._live_loudness_channel_index = channel_index
 
-            def prepare_for_attach(self):
-                pass
+            def set_monitor_feed(self, callback):
+                self._monitor_feed = callback
 
-            def attach_to_recorder(self, *, chunk_index, snapshot=None):
-                pass
+            def prepare_for_attach(self, source_token):
+                self._source_token = source_token
+
+            def attach_to_recorder(self, attachment, *, source_token):
+                assert source_token is self._source_token
+                self.capture_attachment = attachment
+
+            def _on_captured_block(self, block, *, source_token):
+                return None
+
+            def freeze_capture(self):
+                return 0
 
         config = _make_config(selected_channels=[0, 1])
         services = SimpleNamespace(
@@ -307,6 +409,367 @@ class TestTestSessionInit:
         )
         assert session.config_id == 1
         assert session._record_duration == 2.0
+
+
+class TestTestSessionCaptureRouting:
+    @staticmethod
+    def _session(*, sample_rate: float = 100.0, record_duration: float = 0.1):
+        bus = _make_mock_bus()
+        session = TestSession(
+            config=_make_config(
+                input_device_samplerate=sample_rate,
+                record_duration=record_duration,
+            ),
+            bus=bus,
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={},
+            audio_dir="/tmp/audio",
+        )
+        return session, bus
+
+    def test_unbound_capture_buffers_exact_block_and_publishes_only_zero_progress(self):
+        session, bus = self._session()
+        dispatcher = _CapturingLiveDisplayDispatcher()
+        monitor_calls = []
+        session._live_display_dispatcher = dispatcher
+        session.set_monitor_feed(lambda data: monitor_calls.append(data.copy()))
+        token = object()
+        session.prepare_for_attach(token)
+        block = _captured_block(10, np.arange(8, dtype=np.float32))
+
+        session._on_captured_block(block, source_token=token)
+
+        assert monitor_calls == []
+        assert dispatcher.calls == []
+        bus.recording_progress.emit.assert_called_once_with(1, 0.0)
+
+        owner = _capture_owner(session, attach_sample=10)
+        session.attach_to_recorder(owner, source_token=token)
+
+        assert len(monitor_calls) == 1
+        np.testing.assert_array_equal(monitor_calls[0][:, 0], [5.0, 6.0, 7.0])
+        np.testing.assert_array_equal(dispatcher.calls[0]["chunk"], monitor_calls[0])
+
+    def test_prewarmup_block_reaches_neither_monitor_nor_live_display(self):
+        session, bus = self._session()
+        dispatcher = _CapturingLiveDisplayDispatcher()
+        monitor = MagicMock()
+        session._live_display_dispatcher = dispatcher
+        session.set_monitor_feed(monitor)
+        token = object()
+        session.prepare_for_attach(token)
+        session.attach_to_recorder(
+            _capture_owner(session, attach_sample=10),
+            source_token=token,
+        )
+
+        session._on_captured_block(
+            _captured_block(10, np.arange(5, dtype=np.float32)),
+            source_token=token,
+        )
+
+        monitor.assert_not_called()
+        assert dispatcher.calls == []
+        assert bus.recording_progress.emit.call_args.args == (1, 0.0)
+        assert session.captured_frame_count == 0
+
+    def test_crossing_block_fans_retained_suffix_to_monitor_before_display(self):
+        session, bus = self._session()
+        events = []
+
+        class OrderedDispatcher(_CapturingLiveDisplayDispatcher):
+            def submit(self, chunk, **kwargs):
+                events.append(("display", np.asarray(chunk).copy()))
+                return super().submit(chunk, **kwargs)
+
+        dispatcher = OrderedDispatcher()
+        session._live_display_dispatcher = dispatcher
+        session.set_monitor_feed(
+            lambda data: events.append(("monitor", np.asarray(data).copy()))
+        )
+        token = object()
+        session.prepare_for_attach(token)
+        session.attach_to_recorder(
+            _capture_owner(session, attach_sample=10),
+            source_token=token,
+        )
+
+        session._on_captured_block(
+            _captured_block(12, np.arange(12, 19, dtype=np.float32)),
+            source_token=token,
+        )
+
+        assert [kind for kind, _ in events] == ["monitor", "display"]
+        np.testing.assert_array_equal(events[0][1][:, 0], [15.0, 16.0, 17.0, 18.0])
+        assert dispatcher.calls[0]["sample_start"] == 0
+        assert dispatcher.calls[0]["sample_end"] == 4
+        assert dispatcher.calls[0]["elapsed_time"] == pytest.approx(0.04)
+        assert bus.recording_progress.emit.call_args.args == (1, pytest.approx(0.04))
+
+    def test_adjacent_blocks_use_exact_sample_elapsed_at_non_round_rate(self):
+        session, bus = self._session(sample_rate=101.0, record_duration=0.1)
+        dispatcher = _CapturingLiveDisplayDispatcher()
+        session._live_display_dispatcher = dispatcher
+        session._on_session_done_cb = MagicMock()
+        token = object()
+        session.prepare_for_attach(token)
+        session.attach_to_recorder(
+            _capture_owner(session, attach_sample=10),
+            source_token=token,
+        )
+
+        session._on_captured_block(
+            _captured_block(16, np.arange(4, dtype=np.float32)),
+            source_token=token,
+        )
+        session._on_captured_block(
+            _captured_block(20, np.arange(4, 11, dtype=np.float32)),
+            source_token=token,
+        )
+
+        assert [call["sample_start"] for call in dispatcher.calls] == [0, 4]
+        assert [call["sample_end"] for call in dispatcher.calls] == [4, 11]
+        assert [call["elapsed_time"] for call in dispatcher.calls] == pytest.approx(
+            [4 / 101.0, 11 / 101.0]
+        )
+        assert [call.args[1] for call in bus.recording_progress.emit.call_args_list] == pytest.approx(
+            [4 / 101.0, 11 / 101.0]
+        )
+        session._on_session_done_cb.assert_called_once_with(1)
+
+    def test_target_crossing_is_clipped_and_completion_callback_runs_after_unlock(self):
+        session, bus = self._session()
+        dispatcher = _CapturingLiveDisplayDispatcher()
+        session._live_display_dispatcher = dispatcher
+        callback_lock_states = []
+        session._on_session_done_cb = lambda config_id: callback_lock_states.append(
+            (config_id, session._capture_lock._is_owned())
+        )
+        token = object()
+        session.prepare_for_attach(token)
+        session.attach_to_recorder(
+            _capture_owner(session, attach_sample=10),
+            source_token=token,
+        )
+
+        session._on_captured_block(
+            _captured_block(14, np.arange(14, 30, dtype=np.float32)),
+            source_token=token,
+        )
+        session._on_captured_block(
+            _captured_block(25, np.arange(25, 28, dtype=np.float32)),
+            source_token=token,
+        )
+
+        assert dispatcher.calls[0]["sample_start"] == 0
+        assert dispatcher.calls[0]["sample_end"] == 10
+        np.testing.assert_array_equal(
+            dispatcher.calls[0]["chunk"][:, 0],
+            np.arange(15, 25, dtype=np.float32),
+        )
+        assert bus.recording_progress.emit.call_args.args == (1, pytest.approx(0.1))
+        assert callback_lock_states == [(1, False)]
+
+    def test_freeze_linearizes_after_inflight_fanout_and_rejects_later_blocks(self):
+        session, _bus = self._session()
+        dispatcher = _CapturingLiveDisplayDispatcher()
+        monitor_entered = threading.Event()
+        release_monitor = threading.Event()
+        session._live_display_dispatcher = dispatcher
+
+        def blocking_monitor(_data):
+            monitor_entered.set()
+            assert release_monitor.wait(2)
+
+        session.set_monitor_feed(blocking_monitor)
+        token = object()
+        session.prepare_for_attach(token)
+        session.attach_to_recorder(
+            _capture_owner(session, attach_sample=10),
+            source_token=token,
+        )
+        callback_thread = threading.Thread(
+            target=session._on_captured_block,
+            args=(_captured_block(15, np.arange(4, dtype=np.float32)),),
+            kwargs={"source_token": token},
+        )
+        callback_thread.start()
+        assert monitor_entered.wait(2)
+
+        frozen_counts = []
+        freeze_thread = threading.Thread(
+            target=lambda: frozen_counts.append(session.freeze_capture())
+        )
+        freeze_thread.start()
+        release_monitor.set()
+        callback_thread.join(2)
+        freeze_thread.join(2)
+
+        assert not callback_thread.is_alive()
+        assert not freeze_thread.is_alive()
+        assert frozen_counts == [4]
+        assert len(dispatcher.calls) == 1
+
+        session._on_captured_block(
+            _captured_block(19, np.arange(4, 8, dtype=np.float32)),
+            source_token=token,
+        )
+        assert len(dispatcher.calls) == 1
+        assert session.freeze_capture() == 4
+
+    def test_freeze_winning_prevents_callback_fanout(self):
+        session, _bus = self._session()
+        dispatcher = _CapturingLiveDisplayDispatcher()
+        monitor = MagicMock()
+        session._live_display_dispatcher = dispatcher
+        session.set_monitor_feed(monitor)
+        token = object()
+        session.prepare_for_attach(token)
+        session.attach_to_recorder(
+            _capture_owner(session, attach_sample=10),
+            source_token=token,
+        )
+
+        assert session.freeze_capture() == 0
+        session._on_captured_block(
+            _captured_block(15, np.arange(4, dtype=np.float32)),
+            source_token=token,
+        )
+
+        monitor.assert_not_called()
+        assert dispatcher.calls == []
+        assert session.captured_frame_count == 0
+
+    def test_rotated_source_token_drops_rejected_generation_pending_and_delayed_blocks(self):
+        session, bus = self._session()
+        dispatcher = _CapturingLiveDisplayDispatcher()
+        session._live_display_dispatcher = dispatcher
+        rejected_token = object()
+        accepted_token = object()
+        rejected_block = _captured_block(15, np.full(3, -1.0, dtype=np.float32))
+        accepted_block = _captured_block(15, np.arange(3, dtype=np.float32))
+
+        session.prepare_for_attach(rejected_token)
+        session._on_captured_block(rejected_block, source_token=rejected_token)
+        session.prepare_for_attach(accepted_token)
+        session._on_captured_block(rejected_block, source_token=rejected_token)
+        session.attach_to_recorder(
+            _capture_owner(session, attach_sample=10),
+            source_token=accepted_token,
+        )
+        session._on_captured_block(accepted_block, source_token=accepted_token)
+
+        assert len(dispatcher.calls) == 1
+        np.testing.assert_array_equal(
+            dispatcher.calls[0]["chunk"][:, 0],
+            np.arange(3, dtype=np.float32),
+        )
+        assert bus.recording_progress.emit.call_count == 2
+
+    def test_callback_first_pending_append_is_drained_once_by_bind(self):
+        session, bus = self._session()
+        dispatcher = _CapturingLiveDisplayDispatcher()
+        session._live_display_dispatcher = dispatcher
+        token = object()
+        session.prepare_for_attach(token)
+        pending_emitted = threading.Event()
+        release_callback = threading.Event()
+
+        def block_pending_progress(*_args):
+            pending_emitted.set()
+            assert release_callback.wait(2)
+
+        bus.recording_progress.emit.side_effect = block_pending_progress
+        callback_thread = threading.Thread(
+            target=session._on_captured_block,
+            args=(_captured_block(15, np.arange(3, dtype=np.float32)),),
+            kwargs={"source_token": token},
+        )
+        callback_thread.start()
+        assert pending_emitted.wait(2)
+
+        bind_started = threading.Event()
+
+        def bind():
+            bind_started.set()
+            session.attach_to_recorder(
+                _capture_owner(session, attach_sample=10),
+                source_token=token,
+            )
+
+        bind_thread = threading.Thread(target=bind)
+        bind_thread.start()
+        assert bind_started.wait(2)
+        release_callback.set()
+        callback_thread.join(2)
+        bind_thread.join(2)
+
+        assert not callback_thread.is_alive()
+        assert not bind_thread.is_alive()
+        assert len(dispatcher.calls) == 1
+        np.testing.assert_array_equal(
+            dispatcher.calls[0]["chunk"][:, 0],
+            np.arange(3, dtype=np.float32),
+        )
+
+    def test_bind_first_drains_older_pending_before_callback_processes_directly(
+        self,
+        monkeypatch,
+    ):
+        session, _bus = self._session()
+        monitor_chunks = []
+        session.set_monitor_feed(lambda data: monitor_chunks.append(data.copy()))
+        token = object()
+        session.prepare_for_attach(token)
+        session._on_captured_block(
+            _captured_block(15, [0.0, 1.0]),
+            source_token=token,
+        )
+
+        real_window = test_session_module.SessionCaptureWindow
+        bind_holds_lock = threading.Event()
+        release_bind = threading.Event()
+
+        def blocking_window(**kwargs):
+            bind_holds_lock.set()
+            assert release_bind.wait(2)
+            return real_window(**kwargs)
+
+        monkeypatch.setattr(
+            test_session_module,
+            "SessionCaptureWindow",
+            blocking_window,
+        )
+        bind_thread = threading.Thread(
+            target=session.attach_to_recorder,
+            args=(_capture_owner(session, attach_sample=10),),
+            kwargs={"source_token": token},
+        )
+        bind_thread.start()
+        assert bind_holds_lock.wait(2)
+
+        callback_started = threading.Event()
+
+        def callback():
+            callback_started.set()
+            session._on_captured_block(
+                _captured_block(17, [2.0, 3.0, 4.0]),
+                source_token=token,
+            )
+
+        callback_thread = threading.Thread(target=callback)
+        callback_thread.start()
+        assert callback_started.wait(2)
+        release_bind.set()
+        bind_thread.join(2)
+        callback_thread.join(2)
+
+        assert not bind_thread.is_alive()
+        assert not callback_thread.is_alive()
+        assert len(monitor_chunks) == 2
+        np.testing.assert_array_equal(monitor_chunks[0][:, 0], [0.0, 1.0])
+        np.testing.assert_array_equal(monitor_chunks[1][:, 0], [2.0, 3.0, 4.0])
 
 
 class TestTestSessionProcessing:
@@ -392,7 +855,13 @@ class TestTestSessionProcessing:
         )
 
         session._setup_pipelines()
-        session._on_chunk(np.ones((2048, 2), dtype=np.float32), 0)
+        token, retained_start = _bind_resolved_capture(session)
+        _emit_captured_data(
+            session,
+            token,
+            retained_start,
+            np.ones((2048, 2), dtype=np.float32),
+        )
 
         assert created_dispatchers[-1].calls[-1]["live_loudness_channel_index"] == 0
 
@@ -431,7 +900,13 @@ class TestTestSessionProcessing:
         )
 
         session._setup_pipelines()
-        session._on_chunk(np.ones((2048, 1), dtype=np.float32), 0)
+        token, retained_start = _bind_resolved_capture(session)
+        _emit_captured_data(
+            session,
+            token,
+            retained_start,
+            np.ones((2048, 1), dtype=np.float32),
+        )
 
         assert created_dispatchers[-1].calls[-1]["live_loudness_channel_index"] is None
 
@@ -455,7 +930,13 @@ class TestTestSessionProcessing:
         session._live_display_dispatcher = dispatcher
         session.set_live_loudness_channel_index(1)
 
-        session._on_chunk(np.ones((2048, 2), dtype=np.float32), 0)
+        token, retained_start = _bind_resolved_capture(session)
+        _emit_captured_data(
+            session,
+            token,
+            retained_start,
+            np.ones((2048, 2), dtype=np.float32),
+        )
 
         assert dispatcher.calls[-1]["live_loudness_channel_index"] == 1
 
@@ -472,7 +953,8 @@ class TestTestSessionProcessing:
         session._live_display_dispatcher = dispatcher
         chunk = np.random.randn(2048, 1).astype(np.float32)
 
-        session._on_chunk(chunk, 0)
+        token, retained_start = _bind_resolved_capture(session)
+        _emit_captured_data(session, token, retained_start, chunk)
 
         assert len(dispatcher.calls) == 1
         np.testing.assert_array_equal(dispatcher.calls[0]["chunk"], chunk)
@@ -491,11 +973,11 @@ class TestTestSessionProcessing:
         )
         dispatcher = _CapturingLiveDisplayDispatcher()
         session._live_display_dispatcher = dispatcher
-        session.attach_to_recorder(chunk_index=4)
+        token, retained_start = _bind_resolved_capture(session, attach_sample=400)
         chunk = np.ones((100, 1), dtype=np.float32)
 
-        session._on_chunk(chunk, 4)
-        session._on_chunk(chunk, 5)
+        _emit_captured_data(session, token, retained_start, chunk)
+        _emit_captured_data(session, token, retained_start + 100, chunk)
 
         assert dispatcher.calls[0]["sample_start"] == 0
         assert dispatcher.calls[0]["sample_end"] == 100
@@ -519,7 +1001,8 @@ class TestTestSessionProcessing:
 
         chunk = np.random.randn(2048, 1).astype(np.float32)
 
-        session._on_chunk(chunk, 0)
+        token, retained_start = _bind_resolved_capture(session)
+        _emit_captured_data(session, token, retained_start, chunk)
 
         assert dispatcher.calls[0]["frame_run_id"] == "factory-run-1"
 
@@ -597,7 +1080,13 @@ class TestTestSessionProcessing:
         )
 
         try:
-            session._on_chunk(np.ones((512, 1), dtype=np.float32), 0)
+            token, retained_start = _bind_resolved_capture(session)
+            _emit_captured_data(
+                session,
+                token,
+                retained_start,
+                np.ones((512, 1), dtype=np.float32),
+            )
         finally:
             stop_live_display = getattr(session, "stop_live_display", None)
             if callable(stop_live_display):
@@ -623,7 +1112,8 @@ class TestTestSessionProcessing:
         session._on_session_done_cb = MagicMock()
         chunk = np.ones((int(session._sample_rate * 0.05), 1), dtype=np.float32)
 
-        session._on_chunk(chunk, 0)
+        token, retained_start = _bind_resolved_capture(session)
+        _emit_captured_data(session, token, retained_start, chunk)
 
         bus.recording_progress.emit.assert_called_once()
         session._on_session_done_cb.assert_called_once_with(1)
@@ -646,9 +1136,15 @@ class TestTestSessionProcessing:
         session._on_session_done_cb = MagicMock()
 
         chunk = np.random.randn(int(session._sample_rate * 0.05), 1).astype(np.float32)
+        token, retained_start = _bind_resolved_capture(session)
 
-        session._on_chunk(chunk, 2)
-        session._on_chunk(chunk, 3)
+        _emit_captured_data(session, token, retained_start, chunk)
+        _emit_captured_data(
+            session,
+            token,
+            retained_start + chunk.shape[0],
+            chunk,
+        )
 
         session._on_session_done_cb.assert_called_once_with(1)
 
@@ -664,14 +1160,19 @@ class TestTestSessionProcessing:
         )
         session._setup_pipelines()
         session._on_session_done_cb = MagicMock()
-        session.attach_to_recorder(chunk_index=4)
+        token, retained_start = _bind_resolved_capture(session, attach_sample=400)
 
         chunk = np.random.randn(int(session._sample_rate * 0.05), 1).astype(np.float32)
 
-        session._on_chunk(chunk, 3)
+        _emit_captured_data(session, object(), retained_start, chunk)
         bus.recording_progress.emit.assert_not_called()
-        session._on_chunk(chunk, 4)
-        session._on_chunk(chunk, 5)
+        _emit_captured_data(session, token, retained_start, chunk)
+        _emit_captured_data(
+            session,
+            token,
+            retained_start + chunk.shape[0],
+            chunk,
+        )
         bus.recording_progress.emit.assert_any_call(1, 0.05)
         bus.recording_progress.emit.assert_any_call(1, 0.1)
         session._on_session_done_cb.assert_called_once_with(1)
@@ -693,8 +1194,9 @@ class TestTestSessionProcessing:
         session._live_display_dispatcher = dispatcher
         chunk = np.ones((int(22050 * 0.05), 1), dtype=np.float32)
         expected_elapsed = chunk.shape[0] / 22050.0
+        token, retained_start = _bind_resolved_capture(session)
 
-        session._on_chunk(chunk, 0)
+        _emit_captured_data(session, token, retained_start, chunk)
 
         assert dispatcher.calls[0]["elapsed_time"] == pytest.approx(expected_elapsed)
         assert bus.recording_progress.emit.call_args.args == (1, pytest.approx(expected_elapsed))
@@ -716,20 +1218,30 @@ class TestTestSessionProcessing:
         dispatcher = _CapturingLiveDisplayDispatcher()
         session._live_display_dispatcher = dispatcher
         session._on_session_done_cb = MagicMock()
-        session.attach_to_recorder(chunk_index=4)
+        token, retained_start = _bind_resolved_capture(session, attach_sample=400)
         chunk_window_samples = int(22050 * 0.05)
-        total_target_samples = int(22050 * config["record_duration"])
+        total_target_samples = frames_for_duration(22050, config["record_duration"])
         chunk = np.ones((chunk_window_samples, 1), dtype=np.float32)
         expected_elapsed_values = [
             samples / 22050.0
             for samples in (chunk_window_samples, chunk_window_samples * 2, total_target_samples)
         ]
 
-        session._on_chunk(chunk, 4)
+        _emit_captured_data(session, token, retained_start, chunk)
         session._on_session_done_cb.assert_not_called()
-        session._on_chunk(chunk, 5)
+        _emit_captured_data(
+            session,
+            token,
+            retained_start + chunk_window_samples,
+            chunk,
+        )
         session._on_session_done_cb.assert_not_called()
-        session._on_chunk(chunk, 6)
+        _emit_captured_data(
+            session,
+            token,
+            retained_start + 2 * chunk_window_samples,
+            chunk,
+        )
 
         observed_elapsed_values = [
             call["elapsed_time"]
@@ -741,7 +1253,7 @@ class TestTestSessionProcessing:
             for call in bus.recording_progress.emit.call_args_list
         ]
         assert progress_elapsed_values == pytest.approx(expected_elapsed_values)
-        assert observed_elapsed_values[-1] == pytest.approx(config["record_duration"])
+        assert observed_elapsed_values[-1] == pytest.approx(total_target_samples / 22050.0)
         session._on_session_done_cb.assert_called_once_with(1)
 
 

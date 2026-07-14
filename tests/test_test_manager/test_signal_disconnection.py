@@ -7,11 +7,19 @@ import numpy as np
 import pytest
 from PyQt6.QtCore import QCoreApplication, QEventLoop
 
+from app.service.analysis.session_capture import (
+    CaptureNotAcceptedError,
+    CapturedAudioBlock,
+    RecorderAttachment,
+    frames_for_duration,
+)
 from app.service.analysis.test_manager import TestManager
 
 from ._support import (
+    _CaptureRecorderDoubleMixin,
     _DummySignal,
     _FakeSession,
+    _factory_runtime_config,
     _make_running_factory_manager,
     _mock_bus,
     _mock_services,
@@ -33,6 +41,112 @@ def _process_qt_events_until(predicate, *, timeout: float = 1.0):
 
 
 class TestSignalDisconnection:
+    def test_rejected_shared_candidate_rotates_token_disconnects_and_retries_once(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        config = _factory_runtime_config()
+        config["output_device_name"] = None
+        services.config_service.load_config.return_value = config
+        events = []
+
+        class RejectingRecorder:
+            def __init__(self):
+                self._sample_rate = 44100.0
+                self._n_channels = 2
+                self.captured_block_ready = _DummySignal()
+                self.error_occurred = _DummySignal()
+                self.saved_callback = None
+                self.request_calls = 0
+
+            def request_capture(self, *, record_duration):
+                self.request_calls += 1
+                events.append("rejected.request")
+                self.saved_callback = self.captured_block_ready._callbacks[0]
+                self.captured_block_ready.emit(
+                    CapturedAudioBlock(
+                        np.ones((1, 2), dtype=np.float32),
+                        0,
+                        1,
+                        None,
+                        None,
+                    )
+                )
+                raise CaptureNotAcceptedError("terminal race")
+
+        class ReplacementRecorder:
+            instances = []
+
+            def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+                self._sample_rate = float(sample_rate)
+                self._n_channels = int(n_channels)
+                self._buffer = np.empty((0, self._n_channels), dtype=np.float32)
+                self.captured_block_ready = _DummySignal()
+                self.error_occurred = _DummySignal()
+                self._running = False
+                self.request_calls = 0
+                self.release_calls = []
+                ReplacementRecorder.instances.append(self)
+
+            def request_capture(self, *, record_duration):
+                self.request_calls += 1
+                events.append("replacement.request")
+                return RecorderAttachment(
+                    request_monotonic=1.0,
+                    warmup_samples=frames_for_duration(self._sample_rate, 0.05),
+                    target_samples=frames_for_duration(self._sample_rate, record_duration),
+                )
+
+            def release_capture(self, owner):
+                self.release_calls.append(owner)
+                owner._mark_released()
+
+            def isRunning(self):
+                return self._running
+
+            def start(self):
+                self._running = True
+
+            def stop(self):
+                self._running = False
+
+            def wait(self, timeout):
+                return True
+
+        rejecting = RejectingRecorder()
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.AudioRecorder",
+            ReplacementRecorder,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_session.TestSession._setup_pipelines",
+            lambda self: None,
+        )
+        mgr = TestManager(bus, services)
+        device_key = mgr._device_key(config)
+        mgr._shared_recorders[device_key] = rejecting
+
+        assert mgr.start({"config_id": 1, "sn": "SN1"}) is True
+
+        replacement = ReplacementRecorder.instances[0]
+        session = mgr._sessions[1]
+        assert events == ["rejected.request", "replacement.request"]
+        assert rejecting.request_calls == 1
+        assert replacement.request_calls == 1
+        assert rejecting.captured_block_ready._callbacks == []
+        assert replacement.captured_block_ready._callbacks == [
+            session._captured_block_conn
+        ]
+        assert mgr._shared_recorders[device_key] is replacement
+        assert session._pending_capture_blocks == []
+
+        rejecting.saved_callback(object())
+
+        assert session._pending_capture_blocks == []
+        mgr.stop(config_id=1, silent=True)
+
     @pytest.mark.parametrize(
         "message",
         [
@@ -145,7 +259,7 @@ class TestSignalDisconnection:
             "output_device_samplerate": 48000,
         }
 
-        class FakeRecorder:
+        class FakeRecorder(_CaptureRecorderDoubleMixin):
             instances = []
 
             def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -209,23 +323,23 @@ class TestSignalDisconnection:
         recorder = FakeRecorder.instances[0]
         monitor = FakeMonitor.instances[0]
         session = mgr._sessions[1]
-        done_lambda = getattr(session, "_done_lambda", None)
+        captured_block_conn = getattr(session, "_captured_block_conn", None)
         error_lambda = getattr(session, "_error_lambda", None)
-        monitor_lambda = getattr(session, "_monitor_lambda", None)
         monitor_error_lambda = getattr(session, "_monitor_error_lambda", None)
 
-        assert session._on_chunk in recorder.chunk_ready._callbacks
-        assert done_lambda in recorder.recording_done._callbacks
+        assert recorder.captured_block_ready._callbacks == [captured_block_conn]
+        assert recorder.chunk_ready._callbacks == []
+        assert recorder.recording_done._callbacks == []
         assert error_lambda in recorder.error_occurred._callbacks
-        assert monitor_lambda in recorder.chunk_ready._callbacks
+        assert session._monitor_feed == monitor.feed
         assert monitor_error_lambda in monitor.error_occurred._callbacks
 
         mgr.stop(config_id=1)
 
-        assert session._on_chunk not in recorder.chunk_ready._callbacks
-        assert done_lambda not in recorder.recording_done._callbacks
+        assert captured_block_conn not in recorder.captured_block_ready._callbacks
+        assert recorder.chunk_ready._callbacks == []
+        assert recorder.recording_done._callbacks == []
         assert error_lambda not in recorder.error_occurred._callbacks
-        assert monitor_lambda not in recorder.chunk_ready._callbacks
         assert monitor_error_lambda not in monitor.error_occurred._callbacks
 
     def test_monitor_feed_is_connected_before_live_display_chunk_handler(self, monkeypatch):
@@ -260,11 +374,12 @@ class TestSignalDisconnection:
         }
         events = []
 
-        class FakeRecorder:
+        class FakeRecorder(_CaptureRecorderDoubleMixin):
             instances = []
 
             def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
                 self._sample_rate = sample_rate
+                self._n_channels = n_channels
                 self.chunk_ready = _DummySignal()
                 self.recording_done = _DummySignal()
                 self.error_occurred = _DummySignal()
@@ -302,8 +417,12 @@ class TestSignalDisconnection:
                 return True
 
         class FakeSession(_FakeSession):
-            def _on_chunk(self, chunk, chunk_index):
-                events.append(("display", chunk_index))
+            def _on_captured_block(self, block, *, source_token):
+                if source_token is not self._source_token:
+                    return
+                if self._monitor_feed is not None:
+                    self._monitor_feed(block.data)
+                events.append(("display", block.sample_start))
 
         monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
         monkeypatch.setattr("app.service.analysis.test_manager.AudioMonitor", FakeMonitor)
@@ -315,7 +434,9 @@ class TestSignalDisconnection:
         chunk = np.column_stack(
             [np.full(4, channel, dtype=np.float32) for channel in range(4)]
         )
-        FakeRecorder.instances[0].chunk_ready.emit(chunk, 0)
+        FakeRecorder.instances[0].captured_block_ready.emit(
+            CapturedAudioBlock(chunk, 0, 4, None, None)
+        )
 
         assert events[0][0] == "monitor"
         np.testing.assert_array_equal(events[0][1], chunk[:, 3])
@@ -356,7 +477,7 @@ class TestSignalDisconnection:
         events = []
         mgr = None
 
-        class FakeRecorder:
+        class FakeRecorder(_CaptureRecorderDoubleMixin):
             instances = []
 
             def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -425,7 +546,11 @@ class TestSignalDisconnection:
                 return True
 
         class FakeSession(_FakeSession):
-            def _on_chunk(self, chunk, chunk_index):
+            def _on_captured_block(self, block, *, source_token):
+                if source_token is not self._source_token:
+                    return
+                if self._monitor_feed is not None:
+                    self._monitor_feed(block.data)
                 events.append(("session_chunk", mgr.is_running(config_id=1)))
 
         monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
@@ -436,9 +561,14 @@ class TestSignalDisconnection:
         assert mgr.start({"config_id": 1, "sn": "SN1"}) is True
 
         try:
-            FakeRecorder.instances[0].chunk_ready.emit(
-                np.ones((4, 1), dtype=np.float32),
-                0,
+            FakeRecorder.instances[0].captured_block_ready.emit(
+                CapturedAudioBlock(
+                    np.ones((4, 1), dtype=np.float32),
+                    0,
+                    4,
+                    None,
+                    None,
+                )
             )
 
             assert events[0] == ("feed_after_error", True, 0, [])

@@ -13,25 +13,62 @@ from ._support import (
 )
 
 
+def _install_capture(session, recorder, buffer: np.ndarray, *, retained_frames=None):
+    retained_frames = buffer.shape[0] if retained_frames is None else retained_frames
+    attachment = object()
+    session.capture_attachment = attachment
+    session.captured_frame_count = int(retained_frames)
+    session.freeze_capture = MagicMock(return_value=int(retained_frames))
+    recorder._n_channels = int(buffer.shape[1])
+    recorder.get_capture_buffer.return_value = buffer[:retained_frames]
+    return attachment
+
+
 class TestUserStopPartialSave:
+    def test_user_stop_before_first_retained_frame_saves_nothing(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+        rec = MagicMock()
+        rec._sample_rate = 100.0
+        rec._n_channels = 2
+        session = MagicMock()
+        session.config_id = 1
+        session._buffer = None
+        session.capture_attachment = object()
+        session.captured_frame_count = 0
+        session.freeze_capture.return_value = 0
+        mgr._sessions[1] = session
+        mgr._recorders[1] = rec
+
+        mgr._stop_one(1, silent=False)
+
+        rec.get_capture_buffer.assert_not_called()
+        session._save_wav.assert_not_called()
+        session._run_judgment.assert_not_called()
+        assert session._buffer is None
+        rec.release_capture.assert_called_once_with(session.capture_attachment)
+
     def test_user_stop_copies_buffer_and_saves(self):
         """User-initiated stop should copy recorder buffer and save partial WAV."""
         bus = _mock_bus()
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         partial_buf = np.random.randn(44100, 1).astype(np.float32)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = partial_buf
         rec._sample_rate = 44100.0
         session = MagicMock()
         session._buffer = None
         session.config_id = 1
-        session._attach_snapshot = attach_snapshot
+        attachment = _install_capture(session, rec, partial_buf)
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
         mgr._stop_one(1, silent=False)
-        rec.get_buffer_from.assert_called_once_with(attach_snapshot)
+        rec.get_capture_buffer.assert_called_once_with(
+            attachment,
+            retained_frames=44100,
+        )
+        rec.release_capture.assert_called_once_with(attachment)
         np.testing.assert_array_equal(session._buffer, partial_buf)
         assert session._sample_rate == 44100.0
         saved_buf, saved_sr = session._save_wav.call_args.args
@@ -43,20 +80,21 @@ class TestUserStopPartialSave:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(20, 30, dtype=np.float32).reshape(10, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session._buffer = None
         session.config_id = 1
-        session._attach_snapshot = attach_snapshot
+        attachment = _install_capture(session, rec, post_attach)
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
         mgr._stop_one(1, silent=False)
 
-        rec.get_buffer_from.assert_called_once_with(attach_snapshot)
+        rec.get_capture_buffer.assert_called_once_with(
+            attachment,
+            retained_frames=10,
+        )
         np.testing.assert_array_equal(session._buffer, post_attach)
         assert session._sample_rate == 100.0
         saved_buf, saved_sr = session._save_wav.call_args.args
@@ -70,9 +108,7 @@ class TestUserStopPartialSave:
         hardware_buf = np.column_stack(
             [np.full(10, channel, dtype=np.float32) for channel in range(6)]
         )
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = hardware_buf
         rec._sample_rate = 100.0
 
         class Session:
@@ -81,7 +117,6 @@ class TestUserStopPartialSave:
             def __init__(self):
                 self._buffer = None
                 self._sample_rate = None
-                self._attach_snapshot = attach_snapshot
                 self._config = {
                     "selected_channels": [3],
                     "channels": [{"channel_index": 3}],
@@ -102,12 +137,16 @@ class TestUserStopPartialSave:
                 return self._buffer
 
         session = Session()
+        attachment = _install_capture(session, rec, hardware_buf)
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
         mgr._stop_one(1, silent=False)
 
-        rec.get_buffer_from.assert_called_once_with(attach_snapshot)
+        rec.get_capture_buffer.assert_called_once_with(
+            attachment,
+            retained_frames=10,
+        )
         np.testing.assert_array_equal(session._buffer, hardware_buf[:, [3]])
         assert session._real_to_logical_channel == {3: 0}
         saved_buf, saved_sr = session._save_wav.call_args.args
@@ -121,9 +160,7 @@ class TestUserStopPartialSave:
         hardware_buf = np.column_stack(
             [np.full(10, channel, dtype=np.float32) for channel in range(2)]
         )
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = hardware_buf
         rec._sample_rate = 100.0
         mon = MagicMock()
         expected_error = "selected channel 3 is outside hardware channel range 0..1"
@@ -134,7 +171,6 @@ class TestUserStopPartialSave:
             def __init__(self):
                 self._buffer = None
                 self._sample_rate = None
-                self._attach_snapshot = attach_snapshot
                 self._config = {
                     "selected_channels": [3],
                     "channels": [{"channel_index": 3}],
@@ -155,13 +191,18 @@ class TestUserStopPartialSave:
                 return self._buffer
 
         session = Session()
+        attachment = _install_capture(session, rec, hardware_buf)
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
         mgr._monitors[1] = mon
 
         mgr._stop_one(1, silent=False)
 
-        rec.get_buffer_from.assert_called_once_with(attach_snapshot)
+        rec.get_capture_buffer.assert_called_once_with(
+            attachment,
+            retained_frames=10,
+        )
+        rec.release_capture.assert_called_once_with(attachment)
         assert session._buffer is None
         assert session._sample_rate is None
         session._save_wav.assert_not_called()
@@ -185,9 +226,7 @@ class TestUserStopPartialSave:
         hardware_buf = np.column_stack(
             [np.full(10, channel, dtype=np.float32) for channel in range(2)]
         )
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = hardware_buf
         rec._sample_rate = 100.0
         rec.stop.side_effect = RuntimeError("recorder stop exploded")
         rec.wait.side_effect = RuntimeError("recorder wait exploded")
@@ -202,7 +241,6 @@ class TestUserStopPartialSave:
             def __init__(self):
                 self._buffer = None
                 self._sample_rate = None
-                self._attach_snapshot = attach_snapshot
                 self._config = {
                     "selected_channels": [3],
                     "channels": [{"channel_index": 3}],
@@ -223,6 +261,7 @@ class TestUserStopPartialSave:
                 return self._buffer
 
         session = Session()
+        attachment = _install_capture(session, rec, hardware_buf)
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
         mgr._monitors[1] = mon
@@ -231,7 +270,11 @@ class TestUserStopPartialSave:
 
         mgr._stop_one(1, silent=False)
 
-        rec.get_buffer_from.assert_called_once_with(attach_snapshot)
+        rec.get_capture_buffer.assert_called_once_with(
+            attachment,
+            retained_frames=10,
+        )
+        rec.release_capture.assert_called_once_with(attachment)
         assert session._buffer is None
         assert session._sample_rate is None
         session._save_wav.assert_not_called()

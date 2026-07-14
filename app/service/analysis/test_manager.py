@@ -31,6 +31,7 @@ from app.service.analysis.review_payloads import (
     build_summary_payload,
 )
 from app.service.analysis.selected_channels import normalize_selected_channels
+from app.service.analysis.session_capture import CaptureNotAcceptedError
 from app.service.analysis.test_session import ManualLabelUpdateResult, TestSession
 from app.service.current_meter_service import (
     CurrentMeterCollector,
@@ -228,6 +229,7 @@ class TestManager(QObject):
         session = None
         recorder = None
         monitor = None
+        requested_capture = None
 
         try:
             session = TestSession(
@@ -266,7 +268,6 @@ class TestManager(QObject):
                     monitor_channel=resolved_monitor_channel,
                     gain_db=resolved_monitor_gain_db,
                 )
-                session._monitor_lambda = lambda data, idx, m=monitor: m.feed(data)
                 session._monitor_error_lambda = (
                     lambda msg, cid=config_id: self._deferred_monitor_error_occurred.emit(
                         cid,
@@ -274,22 +275,59 @@ class TestManager(QObject):
                     )
                 )
 
-            session._chunk_conn = session._on_chunk
-            session._done_lambda = lambda cid=config_id: self._on_recording_done(cid)
+            session.set_monitor_feed(monitor.feed if monitor is not None else None)
             session._error_lambda = lambda msg, cid=config_id: self._on_error(cid, msg)
-            prepare_for_attach = getattr(session, "prepare_for_attach", None)
-            if callable(prepare_for_attach):
-                prepare_for_attach()
             if monitor is not None:
-                recorder.chunk_ready.connect(session._monitor_lambda)
                 monitor.error_occurred.connect(session._monitor_error_lambda)
-            recorder.chunk_ready.connect(session._chunk_conn)
-            attach_snapshot = recorder.attach_session(record_duration=record_duration)
-            session.attach_to_recorder(
-                chunk_index=attach_snapshot.chunk_index,
-                snapshot=attach_snapshot,
-            )
-            recorder.recording_done.connect(session._done_lambda)
+
+            for capture_attempt in range(2):
+                source_token = object()
+                session.prepare_for_attach(source_token)
+                captured_block_conn = (
+                    lambda block, s=session, token=source_token: s._on_captured_block(
+                        block,
+                        source_token=token,
+                    )
+                )
+                session._captured_block_conn = captured_block_conn
+                recorder.captured_block_ready.connect(captured_block_conn)
+                try:
+                    requested_capture = recorder.request_capture(
+                        record_duration=record_duration,
+                    )
+                except CaptureNotAcceptedError:
+                    self._disconnect(
+                        recorder.captured_block_ready,
+                        captured_block_conn,
+                    )
+                    self._discard_shared_recorder(recorder)
+                    if capture_attempt:
+                        raise
+                    recorder = AudioRecorder(
+                        device_name=config.get("input_device_name", ""),
+                        hostapi=config.get("input_device_hostapi", ""),
+                        sample_rate=sample_rate,
+                        n_channels=n_channels,
+                        record_duration=record_duration,
+                    )
+                    self._shared_recorders[device_key] = recorder
+                    if session._sample_rate != recorder._sample_rate:
+                        session._sample_rate = recorder._sample_rate
+                        session._setup_pipelines()
+                        self._apply_stored_live_loudness_channel(session, config)
+                    continue
+
+                try:
+                    session.attach_to_recorder(
+                        requested_capture,
+                        source_token=source_token,
+                    )
+                except Exception:
+                    recorder.release_capture(requested_capture)
+                    requested_capture = None
+                    raise
+                break
+
             recorder.error_occurred.connect(session._error_lambda)
 
             self._sessions[config_id] = session
@@ -297,6 +335,7 @@ class TestManager(QObject):
             if monitor is not None:
                 self._monitors[config_id] = monitor
             self._start_current_collection(config_id, session)
+            self._bus.recording_progress.emit(config_id, 0.0)
 
             if mon := self._monitors.get(config_id):
                 mon.start()
@@ -310,7 +349,13 @@ class TestManager(QObject):
                 on_start_accepted(session_workorder["factory_run_id"])
         except Exception as exc:
             self._bus.log.emit(f"[TestManager] ERROR starting config {config_id}: {exc}")
-            self._cleanup_failed_start_setup(config_id, session, recorder, monitor)
+            self._cleanup_failed_start_setup(
+                config_id,
+                session,
+                recorder,
+                monitor,
+                requested_capture=requested_capture,
+            )
             return self._fail_start_before_acceptance(
                 request_id,
                 f"启动失败：{exc}",
@@ -322,6 +367,23 @@ class TestManager(QObject):
             return False
 
         prior_completed_session = self._completed_sessions.pop(config_id, None)
+
+        # A running shared recorder can deliver enough queued retained audio
+        # while attach_to_recorder() drains its pending handoff.  The session
+        # marks itself finished even though its manager dictionaries are not
+        # registered until the bind completes, so settle that deferred
+        # completion before deciding whether this recorder needs starting.
+        if getattr(session, "_finished", False):
+            self._on_session_done(config_id)
+            if self._sessions.get(config_id) is not session:
+                if (
+                    prior_completed_session is not None
+                    and config_id not in self._completed_sessions
+                ):
+                    self._completed_sessions[config_id] = prior_completed_session
+                self._clear_pending_factory_start(request_id)
+                self._clear_last_start_error()
+                return True
 
         try:
             if not recorder.isRunning():
@@ -579,13 +641,34 @@ class TestManager(QObject):
         notify_factory_runtime_abort: bool = False,
     ):
         self._stop_replay_if_config(config_id)
-        self._stop_current_collection(config_id)
         session = self._sessions.pop(config_id, None)
         rec = self._recorders.pop(config_id, None)
         mon = self._monitors.pop(config_id, None)
 
-        if session is not None and rec is not None:
-            self._disconnect_session_signals(session, rec, mon)
+        partial_buf = None
+        capture_error = None
+        if session is not None:
+            try:
+                if rec is not None and not silent:
+                    partial_buf = self._freeze_and_capture_session_buffer(session, rec)
+                else:
+                    session.freeze_capture()
+            except Exception as exc:
+                capture_error = exc
+            finally:
+                if rec is not None:
+                    self._disconnect_session_signals(session, rec, mon)
+                    try:
+                        self._release_session_capture(session, rec)
+                    except Exception as exc:
+                        self._bus.log.emit(
+                            f"[TestManager] ERROR releasing capture while stopping "
+                            f"config={config_id}: {exc}"
+                        )
+                        if capture_error is None:
+                            capture_error = exc
+
+        self._stop_current_collection(config_id)
         if session is not None:
             self._stop_session_live_display_safely(
                 config_id,
@@ -603,33 +686,24 @@ class TestManager(QObject):
         cleanup_errors = []
         try:
             if session is not None and rec is not None and not silent:
-                try:
-                    partial_buf = rec.get_buffer_from(
-                        getattr(session, "_attach_snapshot", None)
-                    )
-                    if isinstance(partial_buf, np.ndarray) and partial_buf.size > 0:
-                        saved_buf = self._capture_session_recorder_buffer(
-                            session,
-                            partial_buf,
-                            rec._sample_rate,
-                        )
-                        try:
-                            session._save_wav(saved_buf, rec._sample_rate)
-                        except Exception as exc:
-                            self._bus.log.emit(
-                                f"[TestManager] ERROR saving partial recording for "
-                                f"config={config_id}: {exc}"
-                            )
-                        else:
-                            self._bus.log.emit(
-                                f"[TestManager] saved partial recording for config={config_id}"
-                            )
-                except Exception as exc:
-                    factory_abort_error_message = str(exc)
+                if capture_error is not None:
+                    factory_abort_error_message = str(capture_error)
                     self._bus.log.emit(
                         f"[TestManager] ERROR capturing partial recording for "
-                        f"config={config_id}: {exc}"
+                        f"config={config_id}: {capture_error}"
                     )
+                elif isinstance(partial_buf, np.ndarray) and partial_buf.shape[0] > 0:
+                    try:
+                        session._save_wav(partial_buf, rec._sample_rate)
+                    except Exception as exc:
+                        self._bus.log.emit(
+                            f"[TestManager] ERROR saving partial recording for "
+                            f"config={config_id}: {exc}"
+                        )
+                    else:
+                        self._bus.log.emit(
+                            f"[TestManager] saved partial recording for config={config_id}"
+                        )
         finally:
             cleanup_errors = self._cleanup_monitor_recorder_safely(
                 config_id,
@@ -665,6 +739,8 @@ class TestManager(QObject):
         session=None,
         recorder=None,
         monitor=None,
+        *,
+        requested_capture=None,
     ) -> None:
         registered_session = self._sessions.pop(config_id, None)
         self._stop_current_collection(config_id)
@@ -674,6 +750,15 @@ class TestManager(QObject):
         cleanup_session = registered_session or session
         cleanup_recorder = registered_recorder or recorder
         cleanup_monitor = registered_monitor or monitor
+
+        if cleanup_session is not None:
+            try:
+                cleanup_session.freeze_capture()
+            except Exception as exc:
+                self._bus.log.emit(
+                    f"[TestManager] ERROR freezing failed start capture for "
+                    f"config={config_id}: {exc}"
+                )
 
         if cleanup_session is not None and cleanup_recorder is not None:
             try:
@@ -685,6 +770,18 @@ class TestManager(QObject):
             except Exception as exc:
                 self._bus.log.emit(
                     f"[TestManager] ERROR cleaning failed start signals for "
+                    f"config={config_id}: {exc}"
+                )
+
+            try:
+                self._release_session_capture(
+                    cleanup_session,
+                    cleanup_recorder,
+                    attachment=requested_capture,
+                )
+            except Exception as exc:
+                self._bus.log.emit(
+                    f"[TestManager] ERROR releasing failed start capture for "
                     f"config={config_id}: {exc}"
                 )
 
@@ -976,18 +1073,6 @@ class TestManager(QObject):
             ),
         )
 
-    def _on_recording_done(self, config_id: int):
-        """Called when a recorder fills its buffer."""
-        session = self._sessions.get(config_id)
-        if (
-            session is None
-            or getattr(session, "_finished", False)
-            or config_id in self._accepted_factory_stops
-        ):
-            return
-        session._finished = True
-        self._on_session_done(config_id)
-
     def _on_session_done(self, config_id: int):
         session = self._sessions.get(config_id)
         if session is None or config_id in self._accepted_factory_stops:
@@ -1007,18 +1092,20 @@ class TestManager(QObject):
             capture_error = None
             if rec is not None:
                 try:
-                    recorder_buffer = rec.get_buffer_from(
-                        getattr(session, "_attach_snapshot", None)
-                    )
-                    self._capture_session_recorder_buffer(
-                        session,
-                        recorder_buffer,
-                        rec._sample_rate,
-                    )
+                    self._freeze_and_capture_session_buffer(session, rec)
                 except Exception as exc:
                     capture_error = exc
                 finally:
                     self._disconnect_session_signals(session, rec, mon)
+                    try:
+                        self._release_session_capture(session, rec)
+                    except Exception as exc:
+                        self._bus.log.emit(
+                            f"[TestManager] ERROR releasing completed capture "
+                            f"for config={config_id}: {exc}"
+                        )
+                        if capture_error is None:
+                            capture_error = exc
 
             self._stop_session_live_display_safely(
                 config_id,
@@ -1439,15 +1526,24 @@ class TestManager(QObject):
     def _stop_recording_with_optional_analysis(self, config_id: int, session) -> bool:
         rec = self._recorders.get(config_id)
         mon = self._monitors.get(config_id)
+        capture = self._capture_partial_stop_buffer(config_id, session, rec)
         if rec is not None:
             self._disconnect_session_signals(session, rec, mon)
+            try:
+                self._release_session_capture(session, rec)
+            except Exception as exc:
+                self._bus.log.emit(
+                    f"[TestManager] ERROR releasing stopped capture for "
+                    f"config={config_id}: {exc}"
+                )
+                if capture.get("capture_error") is None:
+                    capture["capture_error"] = exc
         self._stop_session_live_display_safely(
             config_id,
             session,
             context="factory stop",
         )
 
-        capture = self._capture_partial_stop_buffer(config_id, session, rec)
         try:
             self._stop_factory_runtime_io(config_id, rec=rec, mon=mon)
         except Exception as exc:
@@ -1481,8 +1577,18 @@ class TestManager(QObject):
     def _stop_to_stopped(self, config_id: int, session) -> bool:
         rec = self._recorders.get(config_id)
         mon = self._monitors.get(config_id)
-        if rec is not None:
-            self._disconnect_session_signals(session, rec, mon)
+        try:
+            session.freeze_capture()
+        finally:
+            if rec is not None:
+                self._disconnect_session_signals(session, rec, mon)
+                try:
+                    self._release_session_capture(session, rec)
+                except Exception as exc:
+                    self._bus.log.emit(
+                        f"[TestManager] ERROR releasing stopped capture for "
+                        f"config={config_id}: {exc}"
+                    )
         self._stop_session_live_display_safely(
             config_id,
             session,
@@ -1506,6 +1612,7 @@ class TestManager(QObject):
         partial_wav_ok = False
 
         if rec is None:
+            session.freeze_capture()
             return {
                 "partial_buf": None,
                 "partial_wav_ok": False,
@@ -1514,7 +1621,7 @@ class TestManager(QObject):
             }
 
         try:
-            partial_buf = rec.get_buffer_from(getattr(session, "_attach_snapshot", None))
+            partial_buf = self._freeze_and_capture_session_buffer(session, rec)
         except Exception as exc:
             self._bus.log.emit(
                 f"[TestManager] ERROR capturing partial recording for config={config_id}: {exc}"
@@ -1523,30 +1630,11 @@ class TestManager(QObject):
                 "partial_buf": None,
                 "partial_wav_ok": False,
                 "captured_duration_sec": None,
-                "capture_error": None,
+                "capture_error": exc,
             }
 
-        if isinstance(partial_buf, np.ndarray):
-            try:
-                partial_buf = self._capture_session_recorder_buffer(
-                    session,
-                    partial_buf,
-                    rec._sample_rate,
-                )
-            except Exception as exc:
-                self._bus.log.emit(
-                    f"[TestManager] ERROR capturing partial recording for "
-                    f"config={config_id}: {exc}"
-                )
-                return {
-                    "partial_buf": None,
-                    "partial_wav_ok": False,
-                    "captured_duration_sec": None,
-                    "capture_error": exc,
-                }
-
         captured_duration_sec = self._captured_duration_sec(session)
-        if isinstance(partial_buf, np.ndarray) and partial_buf.size > 0:
+        if isinstance(partial_buf, np.ndarray) and partial_buf.shape[0] > 0:
             try:
                 saved_path = session._save_wav(partial_buf, rec._sample_rate)
             except Exception as exc:
@@ -2071,6 +2159,77 @@ class TestManager(QObject):
         session._sample_rate = sample_rate
         return hardware_buffer
 
+    def _freeze_and_capture_session_buffer(self, session, recorder) -> np.ndarray:
+        """Freeze one session and extract exactly its retained canonical prefix."""
+
+        retained_frames = int(session.freeze_capture())
+        if retained_frames <= 0:
+            return np.empty(
+                (0, self._recorder_channel_count(recorder, session=session)),
+                dtype=np.float32,
+            )
+
+        attachment = self._session_capture_attachment(session)
+        if attachment is None:
+            raise RuntimeError("session capture attachment is unavailable")
+        raw = recorder.get_capture_buffer(
+            attachment,
+            retained_frames=retained_frames,
+        )
+        if not isinstance(raw, np.ndarray) or raw.ndim < 1:
+            raise TypeError("recorder capture buffer must be a numpy array")
+        if raw.shape[0] != retained_frames:
+            raise RuntimeError(
+                "recorder capture buffer does not match the frozen retained prefix"
+            )
+        return self._capture_session_recorder_buffer(
+            session,
+            raw,
+            recorder._sample_rate,
+        )
+
+    def _release_session_capture(
+        self,
+        session,
+        recorder,
+        *,
+        attachment=None,
+    ) -> None:
+        """Release one recorder owner once; repeated cleanup calls are harmless."""
+
+        if session is None or recorder is None:
+            return
+        if attachment is None:
+            attachment = self._session_capture_attachment(session)
+        if attachment is None:
+            return
+        if getattr(session, "_released_capture_attachment", None) is attachment:
+            return
+        recorder.release_capture(attachment)
+        session._released_capture_attachment = attachment
+
+    @staticmethod
+    def _session_capture_attachment(session):
+        attachment = getattr(session, "capture_attachment", None)
+        return attachment() if callable(attachment) else attachment
+
+    @staticmethod
+    def _recorder_channel_count(recorder, *, session=None) -> int:
+        value = getattr(recorder, "_n_channels", None)
+        if isinstance(value, Integral) and not isinstance(value, bool) and value >= 0:
+            return int(value)
+        buffer = getattr(recorder, "_buffer", None)
+        if isinstance(buffer, np.ndarray) and buffer.ndim >= 2:
+            return int(buffer.shape[1])
+        config = getattr(session, "_config", {}) if session is not None else {}
+        selected = config.get("selected_channels", []) if isinstance(config, dict) else []
+        normalized = [
+            int(channel)
+            for channel in selected
+            if isinstance(channel, Integral) and not isinstance(channel, bool) and channel >= 0
+        ]
+        return max(normalized, default=-1) + 1
+
     @staticmethod
     def _session_channel_column_map(session) -> dict[int, int] | None:
         channel_map = getattr(session, "_real_to_logical_channel", None)
@@ -2173,12 +2332,24 @@ class TestManager(QObject):
     def _captured_duration_sec(session) -> float | None:
         if session is None:
             return None
-        buffer = getattr(session, "_buffer", None)
         try:
             sample_rate = float(getattr(session, "_sample_rate", 0) or 0)
         except (TypeError, ValueError):
             sample_rate = 0.0
-        if not isinstance(buffer, np.ndarray) or buffer.size <= 0 or sample_rate <= 0:
+        if sample_rate <= 0:
+            return None
+
+        captured_frame_count = getattr(session, "captured_frame_count", None)
+        if callable(captured_frame_count):
+            captured_frame_count = captured_frame_count()
+        if isinstance(captured_frame_count, Integral) and not isinstance(
+            captured_frame_count,
+            bool,
+        ):
+            return max(0, int(captured_frame_count)) / sample_rate
+
+        buffer = getattr(session, "_buffer", None)
+        if not isinstance(buffer, np.ndarray) or buffer.size <= 0:
             return None
         return float(buffer.shape[0]) / sample_rate
 
@@ -2493,10 +2664,11 @@ class TestManager(QObject):
             pass
 
     def _disconnect_session_signals(self, session, recorder, monitor=None):
-        self._disconnect(recorder.chunk_ready, getattr(session, "_chunk_conn", None))
-        self._disconnect(recorder.recording_done, getattr(session, "_done_lambda", None))
+        self._disconnect(
+            recorder.captured_block_ready,
+            getattr(session, "_captured_block_conn", None),
+        )
         self._disconnect(recorder.error_occurred, getattr(session, "_error_lambda", None))
-        self._disconnect(recorder.chunk_ready, getattr(session, "_monitor_lambda", None))
         if monitor is not None:
             self._disconnect(monitor.error_occurred, getattr(session, "_monitor_error_lambda", None))
 
