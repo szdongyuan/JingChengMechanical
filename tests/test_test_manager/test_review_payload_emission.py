@@ -535,11 +535,13 @@ class TestReviewPayloadEmission:
         )
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
+        generation = _bind_manager_run_generation(mgr, 1, session)
         mgr._current_samples_by_config_id[1] = [
             CurrentSample(time_sec=0.5, current_a=1.0),
             CurrentSample(time_sec=1.5, current_a=2.0),
             CurrentSample(time_sec=2.5, current_a=3.0),
         ]
+        mgr._current_sample_generations[1] = generation
 
         _complete_current_session(mgr, 1)
 
@@ -1171,11 +1173,14 @@ class TestReviewPayloadEmission:
             raising=False,
         )
         mgr._completed_sessions[1] = mock_session
+        generation = object()
+        mock_session._manager_generation_token = generation
         mgr._current_samples_by_config_id[1] = [
             CurrentSample(time_sec=0.5, current_a=1.0),
             CurrentSample(time_sec=1.5, current_a=2.0),
             CurrentSample(time_sec=2.5, current_a=3.0),
         ]
+        mgr._current_sample_generations[1] = generation
 
         mgr.rejudge(config_id=1, start_sec=1.0, end_sec=3.0)
 

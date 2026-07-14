@@ -179,6 +179,10 @@ class _CurrentCollectionClaim:
         "generation",
         "collector",
         "retain_samples",
+        "pending_start",
+        "_cleanup_lock",
+        "_cleanup_started",
+        "_cleanup_complete",
     )
 
     def __init__(
@@ -189,12 +193,52 @@ class _CurrentCollectionClaim:
         generation,
         collector,
         retain_samples,
+        pending_start=None,
     ):
         self.config_id = config_id
         self.session = session
         self.generation = generation
         self.collector = collector
         self.retain_samples = retain_samples
+        self.pending_start = pending_start
+        self._cleanup_lock = threading.RLock()
+        self._cleanup_started = False
+        self._cleanup_complete = threading.Event()
+
+
+class _PendingCurrentCollection:
+    """Exact collector ownership while its external start call is in flight."""
+
+    __slots__ = (
+        "config_id",
+        "session",
+        "generation",
+        "collector",
+        "start_owner_thread_id",
+        "start_returned",
+        "settled",
+        "start_succeeded",
+        "start_error",
+        "completion_requested",
+        "deferred_completion",
+        "cleanup_claim",
+        "deferred_cleanup",
+    )
+
+    def __init__(self, *, config_id, session, generation, collector):
+        self.config_id = config_id
+        self.session = session
+        self.generation = generation
+        self.collector = collector
+        self.start_owner_thread_id = threading.get_ident()
+        self.start_returned = threading.Event()
+        self.settled = threading.Event()
+        self.start_succeeded = None
+        self.start_error = None
+        self.completion_requested = False
+        self.deferred_completion = False
+        self.cleanup_claim = None
+        self.deferred_cleanup = False
 
 
 class _CaptureFinalizationState:
@@ -246,9 +290,11 @@ class TestManager(QObject):
         self._live_loudness_channel_by_config_id: dict[int, int] = {}
         self._current_collectors: dict[int, CurrentMeterCollector] = {}
         self._current_collector_generations: dict[int, object] = {}
+        self._pending_current_collections: dict[int, _PendingCurrentCollection] = {}
         self._current_collection_generations: dict[int, object] = {}
         self._current_sample_generations: dict[int, object] = {}
         self._current_samples_by_config_id: dict[int, list] = {}
+        self._staged_current_samples_by_generation: dict[object, list] = {}
         self._replay_player = OneShotReplayPlayer()
         self._replay_config_id: int | None = None
         self._lifecycle_lock = threading.RLock()
@@ -700,22 +746,6 @@ class TestManager(QObject):
             self._clear_last_start_error()
             return True
 
-        with self._lifecycle_lock:
-            if self._completed_sessions.get(config_id) is session:
-                prior_completed_session = None
-            else:
-                prior_completed_session = self._completed_sessions.pop(
-                    config_id,
-                    None,
-                )
-
-        def restore_prior_completed_session():
-            if prior_completed_session is None:
-                return
-            with self._lifecycle_lock:
-                if config_id not in self._completed_sessions:
-                    self._completed_sessions[config_id] = prior_completed_session
-
         # A running shared recorder can deliver enough queued retained audio
         # while attach_to_recorder() drains its pending handoff.  The session
         # marks itself finished even though its manager dictionaries are not
@@ -728,7 +758,6 @@ class TestManager(QObject):
                 expected_generation=run_generation,
             )
             if self._startup_error_route_state(error_route) != "active":
-                restore_prior_completed_session()
                 self._clear_pending_factory_start(request_id)
                 self._clear_last_start_error()
                 return True
@@ -736,7 +765,6 @@ class TestManager(QObject):
         try:
             recorder_running = recorder.isRunning()
             if self._startup_error_route_state(error_route) != "active":
-                restore_prior_completed_session()
                 self._clear_pending_factory_start(request_id)
                 self._clear_last_start_error()
                 return True
@@ -745,7 +773,6 @@ class TestManager(QObject):
             runtime_error = startup_error_latch.error_snapshot(source_token)
             if runtime_error is not None:
                 self._on_error(error_route, runtime_error)
-                restore_prior_completed_session()
                 self._clear_pending_factory_start(request_id)
                 self._clear_last_start_error()
                 return True
@@ -765,15 +792,25 @@ class TestManager(QObject):
                         error_message=str(exc),
                     ),
                 )
-            restore_prior_completed_session()
             self._clear_pending_factory_start(request_id)
             return not stopped
 
         if self._startup_error_route_state(error_route) != "active":
-            restore_prior_completed_session()
             self._clear_pending_factory_start(request_id)
             self._clear_last_start_error()
             return True
+
+        with self._lifecycle_lock:
+            if self._error_route_is_current_locked(error_route):
+                prior_completed_session = self._completed_sessions.get(config_id)
+                if (
+                    prior_completed_session is not None
+                    and prior_completed_session is not session
+                ):
+                    self._retire_completed_owner_locked(
+                        config_id,
+                        prior_completed_session,
+                    )
 
         self._clear_pending_factory_start(request_id)
         self._clear_last_start_error()
@@ -1400,12 +1437,56 @@ class TestManager(QObject):
             self._session_generations.pop(config_id, None)
 
     def _retire_current_samples_locked(self, config_id: int, generation) -> None:
+        if generation is not None:
+            self._staged_current_samples_by_generation.pop(generation, None)
         if (
             generation is not None
             and self._current_sample_generations.get(config_id) is generation
         ):
             self._current_sample_generations.pop(config_id, None)
             self._current_samples_by_config_id.pop(config_id, None)
+
+    def _retire_completed_owner_locked(
+        self,
+        config_id: int,
+        completed_session,
+    ) -> bool:
+        if self._completed_sessions.get(config_id) is not completed_session:
+            return False
+        generation = self._run_generation_token(completed_session)
+        self._completed_sessions.pop(config_id, None)
+        self._retire_current_samples_locked(config_id, generation)
+        return True
+
+    def _commit_completed_owner_locked(
+        self,
+        config_id: int,
+        session,
+        generation,
+    ) -> None:
+        prior_completed_session = self._completed_sessions.get(config_id)
+        if (
+            prior_completed_session is not None
+            and prior_completed_session is not session
+        ):
+            self._retire_completed_owner_locked(
+                config_id,
+                prior_completed_session,
+            )
+
+        staged_present = generation in self._staged_current_samples_by_generation
+        staged_samples = self._staged_current_samples_by_generation.pop(
+            generation,
+            None,
+        )
+        self._completed_sessions[config_id] = session
+        if not staged_present:
+            return
+        if staged_samples:
+            self._current_samples_by_config_id[config_id] = staged_samples
+            self._current_sample_generations[config_id] = generation
+        else:
+            self._retire_current_samples_locked(config_id, generation)
 
     def _completion_ingress_is_current_locked(
         self,
@@ -1693,6 +1774,12 @@ class TestManager(QObject):
         expected_session,
         expected_generation,
     ):
+        if not self._await_pending_current_collection_for_completion(
+            config_id,
+            session=expected_session,
+            generation=expected_generation,
+        ):
+            return
         error_route = None
         current_collection_claim = None
         with self._lifecycle_lock:
@@ -1806,7 +1893,11 @@ class TestManager(QObject):
                     final_error_route = None
                 else:
                     self._sessions.pop(config_id, None)
-                    self._completed_sessions[config_id] = session
+                    self._commit_completed_owner_locked(
+                        config_id,
+                        session,
+                        expected_generation,
+                    )
                     if rec is not None:
                         self._recorders.pop(config_id, None)
                     if mon is not None:
@@ -2440,7 +2531,11 @@ class TestManager(QObject):
                     final_commit_won = False
                 else:
                     self._sessions.pop(config_id, None)
-                    self._completed_sessions[config_id] = session
+                    self._commit_completed_owner_locked(
+                        config_id,
+                        session,
+                        self._run_generation_token(session),
+                    )
                     self._analyzing_sessions.discard(config_id)
                     self._accepted_factory_stops.discard(config_id)
                     final_commit_won = True
@@ -2488,7 +2583,11 @@ class TestManager(QObject):
                     final_commit_won = False
                 else:
                     self._sessions.pop(config_id, None)
-                    self._completed_sessions[config_id] = session
+                    self._commit_completed_owner_locked(
+                        config_id,
+                        session,
+                        self._run_generation_token(session),
+                    )
                     self._analyzing_sessions.discard(config_id)
                     self._accepted_factory_stops.discard(config_id)
                     final_commit_won = True
@@ -2563,7 +2662,11 @@ class TestManager(QObject):
                         getattr(completed_session, "apply_manual_label", None)
                     )
                 ):
-                    self._completed_sessions[config_id] = completed_session
+                    self._commit_completed_owner_locked(
+                        config_id,
+                        completed_session,
+                        self._run_generation_token(completed_session),
+                    )
                 else:
                     self._retire_current_samples_locked(
                         config_id,
@@ -2883,6 +2986,7 @@ class TestManager(QObject):
             current_trace_payload=self._current_trace_payload(
                 self._session_config(session).get("config_id"),
                 current_meter=self._session_config(session).get("current_meter"),
+                session=session,
             ),
         )
         self._warn_loudness_chart_issues(
@@ -2907,16 +3011,7 @@ class TestManager(QObject):
                 or self._session_generations.get(config_id) is not generation
             ):
                 return
-            self._current_collection_generations[config_id] = generation
-            self._current_samples_by_config_id.pop(config_id, None)
-            self._current_sample_generations.pop(config_id, None)
         if not current_config["enabled"]:
-            with self._lifecycle_lock:
-                if (
-                    self._current_collection_generations.get(config_id)
-                    is generation
-                ):
-                    self._current_collection_generations.pop(config_id, None)
             return
         run_id = self._factory_run_id(session)
         sample_callback = None
@@ -2939,47 +3034,147 @@ class TestManager(QObject):
             ),
             sample_callback=sample_callback,
         )
-        try:
-            collector_started = collector.start()
-        except BaseException:
-            with self._lifecycle_lock:
-                if (
-                    self._current_collection_generations.get(config_id)
-                    is generation
-                ):
-                    self._current_collection_generations.pop(config_id, None)
-            raise
-        if not collector_started:
-            with self._lifecycle_lock:
-                if (
-                    self._current_collection_generations.get(config_id)
-                    is generation
-                ):
-                    self._current_collection_generations.pop(config_id, None)
+        pending = _PendingCurrentCollection(
+            config_id=config_id,
+            session=session,
+            generation=generation,
+            collector=collector,
+        )
+        with self._lifecycle_lock:
+            if (
+                self._sessions.get(config_id) is not session
+                or self._session_generations.get(config_id) is not generation
+                or getattr(session, "_manager_generation_token", None)
+                is not generation
+            ):
+                register_pending = False
+            else:
+                self._current_collection_generations[config_id] = generation
+                self._pending_current_collections[config_id] = pending
+                register_pending = True
+        if not register_pending:
+            collector.stop()
             return
 
+        start_error = None
+        try:
+            collector_started = bool(collector.start())
+        except BaseException as exc:
+            collector_started = False
+            start_error = exc
+
         with self._lifecycle_lock:
+            pending.start_succeeded = collector_started
+            pending.start_error = start_error
+            pending.start_returned.set()
             generation_is_current = (
                 self._current_collection_generations.get(config_id)
                 is generation
                 and self._session_generations.get(config_id) is generation
             )
             session_is_current = self._sessions.get(config_id) is session
-            if generation_is_current and session_is_current:
+            pending_is_current = (
+                self._pending_current_collections.get(config_id) is pending
+            )
+            cleanup_claim = pending.cleanup_claim
+            if (
+                start_error is None
+                and collector_started
+                and cleanup_claim is None
+                and pending_is_current
+                and generation_is_current
+                and session_is_current
+            ):
+                self._pending_current_collections.pop(config_id, None)
                 self._current_collectors[config_id] = collector
                 self._current_collector_generations[config_id] = generation
                 collector_registered = True
             else:
-                if (
-                    self._current_collection_generations.get(config_id)
-                    is generation
-                ):
-                    self._current_collection_generations.pop(config_id, None)
                 collector_registered = False
+                if cleanup_claim is None:
+                    cleanup_claim = _CurrentCollectionClaim(
+                        config_id=config_id,
+                        session=session,
+                        generation=generation,
+                        collector=collector,
+                        retain_samples=(
+                            pending.completion_requested and start_error is None
+                        ),
+                        pending_start=pending,
+                    )
+                    pending.cleanup_claim = cleanup_claim
+                    cleanup_claim_created_here = True
+                else:
+                    cleanup_claim_created_here = False
+            deferred_completion = pending.deferred_completion
+
+        cleanup_error = None
+        if cleanup_claim is not None:
+            try:
+                if cleanup_claim_created_here or pending.deferred_cleanup:
+                    self._stop_current_collection_claim(cleanup_claim)
+            except BaseException as exc:
+                cleanup_error = exc
+            finally:
+                with self._lifecycle_lock:
+                    if self._pending_current_collections.get(config_id) is pending:
+                        self._pending_current_collections.pop(config_id, None)
+                    if (
+                        self._current_collection_generations.get(config_id)
+                        is generation
+                    ):
+                        self._current_collection_generations.pop(config_id, None)
+        pending.settled.set()
+
+        if start_error is not None:
+            if cleanup_error is not None:
+                raise start_error from cleanup_error
+            raise start_error
+        if cleanup_error is not None:
+            raise cleanup_error
         if collector_registered:
             self._bus.log.emit(f"[CurrentMeter] started for config={config_id}")
-        else:
-            collector.stop()
+        if deferred_completion:
+            self._on_session_done(
+                config_id,
+                expected_session=session,
+                expected_generation=generation,
+            )
+
+    def _await_pending_current_collection_for_completion(
+        self,
+        config_id: int,
+        *,
+        session,
+        generation,
+    ) -> bool:
+        while True:
+            with self._lifecycle_lock:
+                if not self._completion_ingress_is_current_locked(
+                    config_id,
+                    session=session,
+                    generation=generation,
+                ):
+                    return False
+                pending = self._pending_current_collections.get(config_id)
+                if (
+                    pending is None
+                    or pending.session is not session
+                    or pending.generation is not generation
+                ):
+                    return True
+                pending.completion_requested = True
+                if (
+                    not pending.start_returned.is_set()
+                    and pending.start_owner_thread_id == threading.get_ident()
+                ):
+                    pending.deferred_completion = True
+                    return False
+                settled = pending.settled
+
+            settled.wait()
+            if pending.start_error is not None:
+                return False
 
     def _detach_current_collection_locked(
         self,
@@ -2993,6 +3188,27 @@ class TestManager(QObject):
             return None
         if self._current_collection_generations.get(config_id) is generation:
             self._current_collection_generations.pop(config_id, None)
+
+        pending = self._pending_current_collections.get(config_id)
+        if (
+            pending is not None
+            and pending.session is session
+            and pending.generation is generation
+        ):
+            self._pending_current_collections.pop(config_id, None)
+            if pending.cleanup_claim is not None:
+                return None
+            claim = _CurrentCollectionClaim(
+                config_id=config_id,
+                session=session,
+                generation=generation,
+                collector=pending.collector,
+                retain_samples=retain_samples,
+                pending_start=pending,
+            )
+            pending.cleanup_claim = claim
+            return claim
+
         collector = self._current_collectors.get(config_id)
         collector_generation = self._current_collector_generations.get(config_id)
         if collector_generation is not generation:
@@ -3015,57 +3231,162 @@ class TestManager(QObject):
     ) -> None:
         if claim is None:
             return
+        pending = claim.pending_start
+        if pending is not None and not pending.start_returned.is_set():
+            if pending.start_owner_thread_id == threading.get_ident():
+                pending.deferred_cleanup = True
+                return
+            pending.start_returned.wait()
+
+        with claim._cleanup_lock:
+            if claim._cleanup_started:
+                cleanup_complete = claim._cleanup_complete
+                perform_cleanup = False
+            else:
+                claim._cleanup_started = True
+                cleanup_complete = None
+                perform_cleanup = True
+        if not perform_cleanup:
+            cleanup_complete.wait()
+            return
+
         try:
-            claim.collector.stop()
-        finally:
-            samples = claim.collector.samples()
-            with self._lifecycle_lock:
-                still_owned = (
-                    self._sessions.get(claim.config_id) is claim.session
-                    and getattr(
-                        claim.session,
-                        "_manager_generation_token",
-                        None,
-                    )
-                    is claim.generation
-                )
-                if claim.retain_samples and still_owned:
-                    if samples:
-                        self._current_samples_by_config_id[claim.config_id] = samples
-                        self._current_sample_generations[claim.config_id] = (
-                            claim.generation
+            try:
+                claim.collector.stop()
+            finally:
+                samples = claim.collector.samples()
+                with self._lifecycle_lock:
+                    still_owned = (
+                        self._sessions.get(claim.config_id) is claim.session
+                        and getattr(
+                            claim.session,
+                            "_manager_generation_token",
+                            None,
                         )
-                    elif (
-                        self._current_sample_generations.get(claim.config_id)
                         is claim.generation
-                    ):
-                        self._current_samples_by_config_id.pop(claim.config_id, None)
-                        self._current_sample_generations.pop(claim.config_id, None)
-                else:
-                    self._retire_current_samples_locked(
-                        claim.config_id,
-                        claim.generation,
                     )
-            self._bus.log.emit(
-                f"[CurrentMeter] stopped for config={claim.config_id}, "
-                f"samples={len(samples)}"
-            )
+                    if claim.retain_samples and still_owned:
+                        prior_completed_session = self._completed_sessions.get(
+                            claim.config_id
+                        )
+                        if (
+                            prior_completed_session is not None
+                            and prior_completed_session is not claim.session
+                        ):
+                            self._staged_current_samples_by_generation[
+                                claim.generation
+                            ] = samples
+                        elif samples:
+                            self._current_samples_by_config_id[
+                                claim.config_id
+                            ] = samples
+                            self._current_sample_generations[claim.config_id] = (
+                                claim.generation
+                            )
+                        else:
+                            self._retire_current_samples_locked(
+                                claim.config_id,
+                                claim.generation,
+                            )
+                    else:
+                        self._retire_current_samples_locked(
+                            claim.config_id,
+                            claim.generation,
+                        )
+                self._bus.log.emit(
+                    f"[CurrentMeter] stopped for config={claim.config_id}, "
+                    f"samples={len(samples)}"
+                )
+        finally:
+            claim._cleanup_complete.set()
 
     def _current_trace_payload(
         self,
         config_id,
         *,
         current_meter: dict | None = None,
+        session=None,
     ) -> dict | None:
         normalized_config_id = self._as_non_bool_int(config_id)
         if normalized_config_id is None:
             return None
-        collector = self._current_collectors.get(normalized_config_id)
-        samples = (
-            collector.samples()
-            if collector is not None
-            else self._current_samples_by_config_id.get(normalized_config_id, [])
-        )
+        with self._lifecycle_lock:
+            if session is None:
+                completed_session = self._completed_sessions.get(normalized_config_id)
+                completed_generation = self._run_generation_token(completed_session)
+                if completed_session is not None:
+                    collector = None
+                    if (
+                        completed_generation is not None
+                        and self._current_sample_generations.get(normalized_config_id)
+                        is completed_generation
+                    ):
+                        samples = self._current_samples_by_config_id.get(
+                            normalized_config_id,
+                            [],
+                        )
+                    else:
+                        samples = []
+                else:
+                    active_session = self._sessions.get(normalized_config_id)
+                    active_generation = self._run_generation_token(active_session)
+                    if (
+                        active_session is not None
+                        and active_generation is not None
+                        and self._current_collector_generations.get(
+                            normalized_config_id
+                        )
+                        is active_generation
+                    ):
+                        collector = self._current_collectors.get(normalized_config_id)
+                        samples = []
+                    else:
+                        collector = None
+                        if (
+                            active_session is not None
+                            and active_generation is not None
+                            and self._current_sample_generations.get(
+                                normalized_config_id
+                            )
+                            is active_generation
+                        ):
+                            samples = self._current_samples_by_config_id.get(
+                                normalized_config_id,
+                                [],
+                            )
+                        elif (
+                            active_generation
+                            in self._staged_current_samples_by_generation
+                        ):
+                            samples = self._staged_current_samples_by_generation[
+                                active_generation
+                            ]
+                        else:
+                            samples = []
+            else:
+                generation = self._run_generation_token(session)
+                collector = None
+                if (
+                    generation is not None
+                    and self._current_collector_generations.get(normalized_config_id)
+                    is generation
+                ):
+                    collector = self._current_collectors.get(normalized_config_id)
+                if generation in self._staged_current_samples_by_generation:
+                    samples = self._staged_current_samples_by_generation[generation]
+                elif (
+                    generation is not None
+                    and self._current_sample_generations.get(normalized_config_id)
+                    is generation
+                ):
+                    samples = self._current_samples_by_config_id.get(
+                        normalized_config_id,
+                        [],
+                    )
+                else:
+                    samples = []
+        if collector is not None:
+            samples = collector.samples()
         return build_current_trace_payload(samples, config=current_meter)
 
     def _emit_current_trace_update(

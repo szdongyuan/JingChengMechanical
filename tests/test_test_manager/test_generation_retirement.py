@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import threading
 import weakref
 from unittest.mock import MagicMock
 
@@ -9,6 +10,7 @@ import pytest
 
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.test_manager import TestManager
+from app.service.current_meter_service import CurrentSample
 
 from ._support import (
     _CaptureRecorderDoubleMixin,
@@ -94,7 +96,509 @@ def _make_current_start_manager(monkeypatch, collector_type):
     return bus, services, TestManager(bus, services)
 
 
+def _seed_completed_current_owner(manager: TestManager):
+    prior_generation = object()
+    prior_session = MagicMock(name="prior_completed_session")
+    prior_session._manager_generation_token = prior_generation
+    prior_session._config = {
+        "config_id": 1,
+        "current_meter": {"enabled": True},
+        "selected_channels": [0],
+        "channels": [{"channel_index": 0}],
+    }
+    prior_session._sample_rate = 100.0
+    prior_session._buffer = np.ones((20, 1), dtype=np.float32)
+    prior_samples = [
+        CurrentSample(time_sec=0.1, current_a=1.25),
+        CurrentSample(time_sec=0.2, current_a=2.5),
+    ]
+    manager._completed_sessions[1] = prior_session
+    manager._current_samples_by_config_id[1] = prior_samples
+    manager._current_sample_generations[1] = prior_generation
+    expected_trace = manager._current_trace_payload(
+        1,
+        current_meter=prior_session._config["current_meter"],
+    )
+    assert expected_trace is not None
+    return prior_session, prior_generation, prior_samples, expected_trace
+
+
+def _assert_completed_current_owner_unchanged(
+    manager: TestManager,
+    *,
+    prior_session,
+    prior_generation,
+    prior_samples,
+    expected_trace,
+):
+    assert manager._completed_sessions.get(1) is prior_session
+    assert manager._current_samples_by_config_id.get(1) is prior_samples
+    assert manager._current_sample_generations.get(1) is prior_generation
+    assert manager._current_trace_payload(
+        1,
+        current_meter=prior_session._config["current_meter"],
+    ) == expected_trace
+    assert manager._current_trace_payload(
+        1,
+        current_meter=prior_session._config["current_meter"],
+        session=prior_session,
+    ) == expected_trace
+
+
 class TestGenerationRetirement:
+    @pytest.mark.parametrize(
+        "failure_phase",
+        ["setup", "current_start", "progress", "acceptance", "recorder_start"],
+    )
+    def test_failed_replacement_preserves_completed_current_owner_as_one_unit(
+        self,
+        monkeypatch,
+        failure_phase,
+    ):
+        collectors = []
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                if failure_phase == "current_start":
+                    raise RuntimeError("current collector failed")
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return []
+
+        bus, _, manager = _make_current_start_manager(monkeypatch, Collector)
+        prior_session, prior_generation, prior_samples, expected_trace = (
+            _seed_completed_current_owner(manager)
+        )
+
+        if failure_phase == "setup":
+            monkeypatch.setattr(
+                _FakeSession,
+                "_setup_pipelines",
+                lambda self: (_ for _ in ()).throw(RuntimeError("setup failed")),
+            )
+        elif failure_phase == "progress":
+            bus.recording_progress.emit.side_effect = RuntimeError("progress failed")
+        elif failure_phase == "recorder_start":
+            monkeypatch.setattr(
+                _StartRecorder,
+                "start",
+                lambda self: (_ for _ in ()).throw(RuntimeError("recorder failed")),
+            )
+
+        on_start_accepted = None
+        if failure_phase == "acceptance":
+            on_start_accepted = lambda _run_id: (_ for _ in ()).throw(
+                RuntimeError("acceptance failed")
+            )
+
+        assert manager.start(
+            {"config_id": 1, "sn": "SN2"},
+            on_start_accepted=on_start_accepted,
+        ) is False
+
+        _assert_completed_current_owner_unchanged(
+            manager,
+            prior_session=prior_session,
+            prior_generation=prior_generation,
+            prior_samples=prior_samples,
+            expected_trace=expected_trace,
+        )
+
+    def test_successful_replacement_retires_prior_owner_and_matching_trace_atomically(
+        self,
+        monkeypatch,
+    ):
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+
+            def start(self):
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return []
+
+        _, _, manager = _make_current_start_manager(monkeypatch, Collector)
+        prior_session, prior_generation, prior_samples, expected_trace = (
+            _seed_completed_current_owner(manager)
+        )
+        accepted_snapshot = []
+
+        def accepted(_run_id):
+            accepted_snapshot.append(
+                (
+                    manager._completed_sessions.get(1),
+                    manager._current_samples_by_config_id.get(1),
+                    manager._current_sample_generations.get(1),
+                    manager._current_trace_payload(
+                        1,
+                        current_meter=prior_session._config["current_meter"],
+                    ),
+                )
+            )
+
+        assert manager.start(
+            {"config_id": 1, "sn": "SN2"},
+            on_start_accepted=accepted,
+        ) is True
+        assert accepted_snapshot == [
+            (prior_session, prior_samples, prior_generation, expected_trace)
+        ]
+        assert 1 not in manager._completed_sessions
+        assert 1 not in manager._current_samples_by_config_id
+        assert 1 not in manager._current_sample_generations
+
+        replacement_generation = manager._session_generations[1]
+        replacement_samples = [CurrentSample(time_sec=0.3, current_a=3.75)]
+        manager._current_samples_by_config_id[1] = replacement_samples
+        manager._current_sample_generations[1] = replacement_generation
+        with manager._lifecycle_lock:
+            manager._retire_current_samples_locked(1, prior_generation)
+        assert manager._current_samples_by_config_id[1] is replacement_samples
+        assert manager._current_sample_generations[1] is replacement_generation
+
+        manager.stop(config_id=1, silent=True)
+
+    def test_collector_start_reentrant_completion_retains_trace_once(self, monkeypatch):
+        holder = {}
+        collectors = []
+        tagged_samples = [CurrentSample(time_sec=0.1, current_a=4.5)]
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                session = holder["manager"]._sessions[1]
+                session._captured_frame_count = 1
+                session._on_session_done_cb(1)
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return tagged_samples
+
+        _, _, manager = _make_current_start_manager(monkeypatch, Collector)
+        holder["manager"] = manager
+        reviews = []
+        manager._emit_auto_analysis_review = (
+            lambda config_id, session, **_kwargs: reviews.append(
+                manager._current_trace_payload(
+                    config_id,
+                    current_meter=session._config["current_meter"],
+                )
+            )
+            or True
+        )
+
+        assert manager.start({"config_id": 1, "sn": "SN1"}) is True
+
+        assert len(reviews) == 1
+        assert reviews[0]["values_a"] == [4.5]
+        assert collectors[0].stop_calls == 1
+        assert manager._completed_sessions.get(1) is not None
+        assert manager._current_samples_by_config_id.get(1) is tagged_samples
+        assert manager._current_collection_generations == {}
+        assert manager._current_collector_generations == {}
+        assert getattr(manager, "_pending_current_collections", {}) == {}
+
+    def test_reentrant_replacement_completion_stages_new_trace_until_owner_commit(
+        self,
+        monkeypatch,
+    ):
+        holder = {}
+        tagged_samples = [CurrentSample(time_sec=0.15, current_a=5.5)]
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+
+            def start(self):
+                session = holder["manager"]._sessions[1]
+                session._captured_frame_count = 1
+                session._on_session_done_cb(1)
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return tagged_samples
+
+        _, _, manager = _make_current_start_manager(monkeypatch, Collector)
+        holder["manager"] = manager
+        prior_session, prior_generation, prior_samples, expected_trace = (
+            _seed_completed_current_owner(manager)
+        )
+        review_snapshots = []
+
+        def review(config_id, session, **_kwargs):
+            review_snapshots.append(
+                {
+                    "completed": manager._completed_sessions.get(config_id),
+                    "public_samples": manager._current_samples_by_config_id.get(
+                        config_id
+                    ),
+                    "public_generation": manager._current_sample_generations.get(
+                        config_id
+                    ),
+                    "old_trace": manager._current_trace_payload(
+                        config_id,
+                        current_meter=prior_session._config["current_meter"],
+                    ),
+                    "new_trace": manager._current_trace_payload(
+                        config_id,
+                        current_meter=session._config["current_meter"],
+                        session=session,
+                    ),
+                }
+            )
+            return True
+
+        manager._emit_auto_analysis_review = review
+
+        assert manager.start({"config_id": 1, "sn": "SN2"}) is True
+
+        assert review_snapshots == [
+            {
+                "completed": prior_session,
+                "public_samples": prior_samples,
+                "public_generation": prior_generation,
+                "old_trace": expected_trace,
+                "new_trace": {
+                    "times_sec": [0.15],
+                    "values_a": [5.5],
+                    "average_a": 5.5,
+                    "max_a": 5.5,
+                    "latest_a": 5.5,
+                    "unit": "mA",
+                },
+            }
+        ]
+        replacement_session = manager._completed_sessions[1]
+        replacement_generation = replacement_session._manager_generation_token
+        assert replacement_session is not prior_session
+        assert manager._current_samples_by_config_id[1] is tagged_samples
+        assert manager._current_sample_generations[1] is replacement_generation
+        assert manager._staged_current_samples_by_generation == {}
+
+    def test_collector_start_concurrent_completion_waits_for_settle_and_retains_trace_once(
+        self,
+        monkeypatch,
+    ):
+        start_entered = threading.Event()
+        release_start = threading.Event()
+        completion_ingress = threading.Event()
+        tagged_samples = [CurrentSample(time_sec=0.2, current_a=6.25)]
+        collectors = []
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                start_entered.set()
+                assert release_start.wait(2.0)
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return tagged_samples
+
+        _, _, manager = _make_current_start_manager(monkeypatch, Collector)
+        reviews = []
+        manager._emit_auto_analysis_review = (
+            lambda config_id, session, **_kwargs: reviews.append(
+                manager._current_trace_payload(
+                    config_id,
+                    current_meter=session._config["current_meter"],
+                )
+            )
+            or True
+        )
+        original_ingress = manager._completion_ingress_is_current_locked
+
+        def observed_ingress(*args, **kwargs):
+            completion_ingress.set()
+            return original_ingress(*args, **kwargs)
+
+        manager._completion_ingress_is_current_locked = observed_ingress
+        start_result = []
+        start_thread = threading.Thread(
+            target=lambda: start_result.append(
+                manager.start({"config_id": 1, "sn": "SN1"})
+            )
+        )
+        start_thread.start()
+        assert start_entered.wait(2.0)
+        session = manager._sessions[1]
+        session._captured_frame_count = 1
+        completion_thread = threading.Thread(target=lambda: session._on_session_done_cb(1))
+        completion_thread.start()
+        assert completion_ingress.wait(2.0)
+        assert reviews == []
+
+        release_start.set()
+        start_thread.join(2.0)
+        completion_thread.join(2.0)
+
+        assert not start_thread.is_alive()
+        assert not completion_thread.is_alive()
+        assert start_result == [True]
+        assert len(reviews) == 1
+        assert reviews[0]["values_a"] == [6.25]
+        assert collectors[0].stop_calls == 1
+        assert manager._current_samples_by_config_id.get(1) is tagged_samples
+        assert manager._current_collection_generations == {}
+        assert manager._current_collector_generations == {}
+        assert getattr(manager, "_pending_current_collections", {}) == {}
+
+    def test_concurrent_repeated_stop_claims_pending_collector_exactly_once(
+        self,
+        monkeypatch,
+    ):
+        start_entered = threading.Event()
+        release_start = threading.Event()
+        stop_claimed = threading.Event()
+        collectors = []
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                start_entered.set()
+                assert release_start.wait(2.0)
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return []
+
+        _, _, manager = _make_current_start_manager(monkeypatch, Collector)
+        start_result = []
+        start_thread = threading.Thread(
+            target=lambda: start_result.append(
+                manager.start({"config_id": 1, "sn": "SN1"})
+            )
+        )
+        start_thread.start()
+        assert start_entered.wait(2.0)
+        session = manager._sessions[1]
+        original_freeze = session.freeze_capture
+
+        def observed_freeze():
+            stop_claimed.set()
+            return original_freeze()
+
+        session.freeze_capture = observed_freeze
+        stop_thread = threading.Thread(
+            target=lambda: (
+                manager.stop(config_id=1, silent=True),
+                manager.stop(config_id=1, silent=True),
+            )
+        )
+        stop_thread.start()
+        assert stop_claimed.wait(2.0)
+
+        release_start.set()
+        start_thread.join(2.0)
+        stop_thread.join(2.0)
+
+        assert not start_thread.is_alive()
+        assert not stop_thread.is_alive()
+        assert start_result == [False]
+        assert collectors[0].stop_calls == 1
+        assert manager._pending_current_collections == {}
+        assert manager._current_collectors == {}
+        assert manager._current_samples_by_config_id == {}
+        _assert_no_generation_state(manager)
+
+    def test_collector_start_exception_stops_pending_collector_exactly_once(
+        self,
+        monkeypatch,
+    ):
+        collectors = []
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                raise RuntimeError("collector startup failed")
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return []
+
+        _, _, manager = _make_current_start_manager(monkeypatch, Collector)
+
+        assert manager.start({"config_id": 1, "sn": "SN1"}) is False
+        assert collectors[0].stop_calls == 1
+        assert getattr(manager, "_pending_current_collections", {}) == {}
+        _assert_no_generation_state(manager)
+
+    def test_reentrant_completion_followed_by_start_exception_aborts_without_review(
+        self,
+        monkeypatch,
+    ):
+        holder = {}
+        collectors = []
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                session = holder["manager"]._sessions[1]
+                session._captured_frame_count = 1
+                session._on_session_done_cb(1)
+                raise RuntimeError("collector failed after completion ingress")
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return [CurrentSample(time_sec=0.1, current_a=9.0)]
+
+        _, _, manager = _make_current_start_manager(monkeypatch, Collector)
+        holder["manager"] = manager
+        reviews = []
+        manager._emit_auto_analysis_review = (
+            lambda *_args, **_kwargs: reviews.append(object()) or True
+        )
+
+        assert manager.start({"config_id": 1, "sn": "SN1"}) is False
+        assert reviews == []
+        assert collectors[0].stop_calls == 1
+        assert manager._pending_current_collections == {}
+        assert manager._current_samples_by_config_id == {}
+        _assert_no_generation_state(manager)
+
     def test_completion_ingress_has_no_config_only_fallback(self, monkeypatch):
         _, _, manager, _, _, _, _ = _make_running_factory_manager(monkeypatch)
 
@@ -271,12 +775,21 @@ class TestGenerationRetirement:
         self,
         monkeypatch,
     ):
+        collectors = []
+
         class Collector:
             def __init__(self, _config, *, log_callback, sample_callback):
-                pass
+                self.stop_calls = 0
+                collectors.append(self)
 
             def start(self):
                 return False
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return []
 
         _, _, manager = _make_current_start_manager(monkeypatch, Collector)
 
@@ -285,6 +798,7 @@ class TestGenerationRetirement:
             assert 1 in manager._session_generations
             assert 1 not in manager._current_collection_generations
             assert 1 not in manager._current_collector_generations
+            assert collectors[0].stop_calls == 1
         finally:
             manager.stop(config_id=1, silent=True)
 
@@ -352,6 +866,7 @@ class TestGenerationRetirement:
             def start(self):
                 self.start_lock_owned = holder["manager"]._lifecycle_lock._is_owned()
                 holder["manager"].stop(config_id=1, silent=True)
+                holder["manager"].stop(config_id=1, silent=True)
                 return True
 
             def stop(self):
@@ -373,4 +888,5 @@ class TestGenerationRetirement:
         assert manager.is_running(config_id=1) is False
         assert manager._current_collectors == {}
         assert manager._current_samples_by_config_id == {}
+        assert manager._pending_current_collections == {}
         _assert_no_generation_state(manager)
