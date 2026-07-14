@@ -54,6 +54,7 @@ def _successful_judgment() -> JudgmentResult:
 
 
 def _assert_no_generation_state(manager: TestManager, config_id: int = 1) -> None:
+    assert config_id not in manager._start_reservations
     assert config_id not in manager._session_generations
     assert config_id not in manager._current_collection_generations
     assert config_id not in manager._current_collector_generations
@@ -178,6 +179,407 @@ def _assert_completed_current_owner_unchanged(
 
 
 class TestGenerationRetirement:
+    def test_same_config_concurrent_start_rejects_second_before_resource_setup(
+        self,
+        monkeypatch,
+    ):
+        first_load_entered = threading.Event()
+        release_first_load = threading.Event()
+        load_calls = []
+        load_calls_lock = threading.Lock()
+        recorders = []
+        collectors = []
+
+        class Recorder(_StartRecorder):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                recorders.append(self)
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return []
+
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        config = _factory_runtime_config()
+        config["output_device_name"] = None
+        config["current_meter"] = {"enabled": True}
+
+        def load_config(config_id):
+            with load_calls_lock:
+                load_calls.append(config_id)
+                call_number = len(load_calls)
+            if call_number == 1:
+                first_load_entered.set()
+                assert release_first_load.wait(2.0)
+            return dict(config)
+
+        services.config_service.load_config.side_effect = load_config
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.AudioRecorder",
+            Recorder,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.TestSession",
+            _FakeSession,
+        )
+        monkeypatch.setattr(
+            _FakeSession,
+            "current_epoch",
+            property(lambda _self: _TEST_CURRENT_EPOCH),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.CurrentMeterCollector",
+            Collector,
+        )
+        manager = TestManager(bus, services)
+        first_results = []
+        first_errors = []
+
+        def start_first():
+            try:
+                first_results.append(
+                    manager.start({"config_id": 1, "sn": "SN-concurrent-first"})
+                )
+            except BaseException as exc:
+                first_errors.append(exc)
+
+        first_thread = threading.Thread(target=start_first, daemon=True)
+        first_thread.start()
+        assert first_load_entered.wait(2.0)
+        second_acceptances = []
+
+        try:
+            second_result = manager.start(
+                {"config_id": 1, "sn": "SN-concurrent-second"},
+                on_start_accepted=second_acceptances.append,
+            )
+        finally:
+            release_first_load.set()
+            first_thread.join(3.0)
+
+        assert not first_thread.is_alive()
+        assert first_errors == []
+        assert first_results == [True]
+        assert second_result is False
+        assert second_acceptances == []
+        assert load_calls == [1]
+        assert len(recorders) == 1
+        assert len(collectors) == 1
+        assert len(recorders[0].capture_owners) == 1
+        assert len(recorders[0].captured_block_ready._callbacks) == 1
+        assert collectors[0].stop_calls == 0
+
+        manager.stop(config_id=1, silent=True)
+
+        assert recorders[0]._running is False
+        assert recorders[0].capture_owners == []
+        assert recorders[0].captured_block_ready._callbacks == []
+        assert recorders[0].stop_calls == 1
+        assert collectors[0].stop_calls == 1
+
+    @pytest.mark.parametrize("outcome", ["return", "exception", "fatal"])
+    def test_start_reservation_releases_on_every_reserved_exit(
+        self,
+        monkeypatch,
+        outcome,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        manager = TestManager(bus, services)
+        reserved_tokens = []
+        raised = (
+            RuntimeError("reserved start failed")
+            if outcome == "exception"
+            else KeyboardInterrupt("reserved start interrupted")
+        )
+
+        def reserved_start(*_args, config_id, **_kwargs):
+            reserved_tokens.append(manager._start_reservations[config_id])
+            if outcome == "return":
+                return False
+            raise raised
+
+        monkeypatch.setattr(manager, "_start_reserved", reserved_start)
+
+        if outcome == "return":
+            assert manager.start({"config_id": 1}) is False
+        else:
+            with pytest.raises(type(raised)) as exc_info:
+                manager.start({"config_id": 1})
+            assert exc_info.value is raised
+
+        assert len(reserved_tokens) == 1
+        assert manager._start_reservations == {}
+
+        monkeypatch.setattr(
+            manager,
+            "_start_reserved",
+            lambda *_args, **_kwargs: True,
+        )
+        assert manager.start({"config_id": 1}) is True
+        assert manager._start_reservations == {}
+
+    def test_start_reservation_release_uses_exact_token_identity(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        manager = TestManager(bus, services)
+        successor = object()
+
+        def replace_reservation(*_args, config_id, **_kwargs):
+            assert manager._start_reservations[config_id] is not successor
+            manager._start_reservations[config_id] = successor
+            return False
+
+        monkeypatch.setattr(manager, "_start_reserved", replace_reservation)
+
+        assert manager.start({"config_id": 1}) is False
+        assert manager._start_reservations[1] is successor
+
+        manager._start_reservations.clear()
+
+    def test_acceptance_callback_reentrant_same_config_start_is_rejected_without_waiting(
+        self,
+        monkeypatch,
+    ):
+        collectors = []
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return []
+
+        _, _, manager = _make_current_start_manager(monkeypatch, Collector)
+        nested_results = []
+
+        def accepted(_run_id):
+            nested_results.append(
+                manager.start({"config_id": 1, "sn": "SN-reentrant-conflict"})
+            )
+
+        assert manager.start(
+            {"config_id": 1, "sn": "SN-outer"},
+            on_start_accepted=accepted,
+        ) is True
+
+        assert nested_results == [False]
+        assert len(collectors) == 1
+        assert manager._sessions[1]._workorder["sn"] == "SN-outer"
+        assert manager._start_reservations == {}
+        manager.stop(config_id=1, silent=True)
+
+    def test_different_config_start_is_not_blocked_by_existing_reservation(
+        self,
+        monkeypatch,
+    ):
+        first_load_entered = threading.Event()
+        release_first_load = threading.Event()
+        recorders = []
+
+        class Recorder(_StartRecorder):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                recorders.append(self)
+
+        configs = {
+            config_id: {
+                **_factory_runtime_config(config_id=config_id),
+                "output_device_name": None,
+            }
+            for config_id in (1, 2)
+        }
+        bus = _mock_bus()
+        services = _mock_services(bus)
+
+        def load_config(config_id):
+            if config_id == 1:
+                first_load_entered.set()
+                assert release_first_load.wait(2.0)
+            return dict(configs[config_id])
+
+        services.config_service.load_config.side_effect = load_config
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.AudioRecorder",
+            Recorder,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.TestSession",
+            _FakeSession,
+        )
+        manager = TestManager(bus, services)
+        first_results = []
+        first_errors = []
+
+        def start_first():
+            try:
+                first_results.append(manager.start({"config_id": 1, "sn": "SN1"}))
+            except BaseException as exc:
+                first_errors.append(exc)
+
+        first_thread = threading.Thread(target=start_first, daemon=True)
+        first_thread.start()
+        assert first_load_entered.wait(2.0)
+
+        try:
+            second_result = manager.start({"config_id": 2, "sn": "SN2"})
+        finally:
+            release_first_load.set()
+            first_thread.join(3.0)
+
+        assert not first_thread.is_alive()
+        assert first_errors == []
+        assert first_results == [True]
+        assert second_result is True
+        assert set(manager._sessions) == {1, 2}
+        assert manager._start_reservations == {}
+
+        manager.stop(silent=True)
+        assert all(recorder.capture_owners == [] for recorder in recorders)
+        assert all(
+            recorder.captured_block_ready._callbacks == []
+            for recorder in recorders
+        )
+
+    @pytest.mark.parametrize(
+        "second_request_id",
+        ["shared-request", "other-request"],
+    )
+    @pytest.mark.parametrize("cancel_first", [False, True])
+    def test_conflicting_start_does_not_mutate_factory_pending_request(
+        self,
+        monkeypatch,
+        second_request_id,
+        cancel_first,
+    ):
+        session_setup_entered = threading.Event()
+        release_session_setup = threading.Event()
+
+        class BlockingSession(_FakeSession):
+            def __init__(self, *args, **kwargs):
+                session_setup_entered.set()
+                assert release_session_setup.wait(2.0)
+                super().__init__(*args, **kwargs)
+
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        config = _factory_runtime_config()
+        config["output_device_name"] = None
+        services.config_service.load_config.return_value = config
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.AudioRecorder",
+            _StartRecorder,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.TestSession",
+            BlockingSession,
+        )
+        manager = TestManager(bus, services)
+        first_results = []
+        first_errors = []
+        first_workorder = {
+            "config_id": 1,
+            "sn": "SN-factory-first",
+            "factory_start_request_id": "shared-request",
+        }
+
+        def start_first():
+            try:
+                first_results.append(manager.start(first_workorder))
+            except BaseException as exc:
+                first_errors.append(exc)
+
+        first_thread = threading.Thread(target=start_first, daemon=True)
+        first_thread.start()
+        assert session_setup_entered.wait(2.0)
+        assert manager._pending_factory_starts == {"shared-request": 1}
+        if cancel_first:
+            assert manager.cancel_pending_start(
+                request_id="shared-request",
+                config_id=1,
+            ) is True
+        expected_cancellations = {"shared-request"} if cancel_first else set()
+
+        try:
+            assert manager.start(
+                {
+                    "config_id": 1,
+                    "sn": "SN-factory-conflict",
+                    "factory_start_request_id": second_request_id,
+                }
+            ) is False
+            assert manager._pending_factory_starts == {"shared-request": 1}
+            assert manager._canceled_factory_start_requests == expected_cancellations
+        finally:
+            release_session_setup.set()
+            first_thread.join(3.0)
+
+        assert not first_thread.is_alive()
+        assert first_errors == []
+        assert first_results == [not cancel_first]
+        assert manager._pending_factory_starts == {}
+        assert manager._canceled_factory_start_requests == set()
+        assert manager._start_reservations == {}
+        manager.stop(config_id=1, silent=True)
+
+    def test_sequential_same_config_start_keeps_replace_semantics(
+        self,
+        monkeypatch,
+    ):
+        collectors = []
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return []
+
+        _, _, manager = _make_current_start_manager(monkeypatch, Collector)
+        assert manager.start({"config_id": 1, "sn": "SN-sequential-first"}) is True
+        first_session = manager._sessions[1]
+        first_recorder = manager._recorders[1]
+        first_attachment = first_session.capture_attachment
+
+        assert manager.start({"config_id": 1, "sn": "SN-sequential-second"}) is True
+
+        assert manager._sessions[1] is not first_session
+        assert manager._sessions[1]._workorder["sn"] == "SN-sequential-second"
+        assert first_attachment not in first_recorder.capture_owners
+        assert first_recorder.captured_block_ready._callbacks == []
+        assert collectors[0].stop_calls == 1
+        assert manager._start_reservations == {}
+        manager.stop(config_id=1, silent=True)
+
     @pytest.mark.parametrize(
         "failure_phase",
         ["setup", "current_start", "progress", "acceptance", "recorder_start"],
@@ -235,6 +637,7 @@ class TestGenerationRetirement:
             {"config_id": 1, "sn": "SN2"},
             on_start_accepted=on_start_accepted,
         ) is False
+        assert manager._start_reservations == {}
 
         _assert_completed_current_owner_unchanged(
             manager,

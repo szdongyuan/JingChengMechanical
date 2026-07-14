@@ -555,6 +555,7 @@ class TestManager(QObject):
         self._session_error_routes: dict[int, _SessionErrorRoute] = {}
         self._session_generations: dict[int, object] = {}
         self._shared_recorders: dict[str, AudioRecorder] = {}
+        self._start_reservations: dict[int, object] = {}
         self._pending_factory_starts: dict[str, int] = {}
         self._canceled_factory_start_requests: set[str] = set()
         self._last_start_error: str | None = None
@@ -638,6 +639,30 @@ class TestManager(QObject):
                 request_id,
                 "无法解析启动配置，请重新选择配置。",
             )
+
+        reservation = self._try_reserve_start(config_id)
+        if reservation is None:
+            self._last_start_error = "配置正在启动，请稍后重试。"
+            return False
+        try:
+            return self._start_reserved(
+                workorder,
+                on_start_accepted=on_start_accepted,
+                config_id=config_id,
+                request_id=request_id,
+            )
+        finally:
+            self._release_start_reservation(config_id, reservation)
+
+    def _start_reserved(
+        self,
+        workorder: dict,
+        *,
+        on_start_accepted,
+        config_id,
+        request_id: str | None,
+    ) -> bool:
+        """Start one config while its exact non-blocking reservation is held."""
 
         if config_id in self._sessions:
             self._bus.log.emit(f"[TestManager] config {config_id} already running, stopping first")
@@ -2110,6 +2135,23 @@ class TestManager(QObject):
 
     def _clear_last_start_error(self) -> None:
         self._last_start_error = None
+
+    def _try_reserve_start(self, config_id: int) -> object | None:
+        reservation = object()
+        with self._lifecycle_lock:
+            if config_id in self._start_reservations:
+                return None
+            self._start_reservations[config_id] = reservation
+        return reservation
+
+    def _release_start_reservation(
+        self,
+        config_id: int,
+        reservation: object,
+    ) -> None:
+        with self._lifecycle_lock:
+            if self._start_reservations.get(config_id) is reservation:
+                self._start_reservations.pop(config_id, None)
 
     def _fail_start_exception_before_acceptance(
         self,
