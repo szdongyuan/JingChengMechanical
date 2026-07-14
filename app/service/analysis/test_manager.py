@@ -56,10 +56,9 @@ class _StartupRecorderErrorLatch:
         self._route_runtime_error = route_runtime_error
         self._source_token = source_token
         self._phase = self._STARTUP
-        self._latched_error: str | None = None
+        self._latched_error = None
 
     def handle(self, source_token, message) -> None:
-        normalized_message = str(message)
         route_runtime_error = None
         with self._lock:
             if (
@@ -68,11 +67,11 @@ class _StartupRecorderErrorLatch:
             ):
                 return
             if self._latched_error is None:
-                self._latched_error = normalized_message
+                self._latched_error = message
             if self._phase != self._RUNTIME:
                 return
             route_runtime_error = self._route_runtime_error
-        route_runtime_error(normalized_message)
+        route_runtime_error(message)
 
     def checkpoint(self, source_token) -> bool:
         """Raise the first setup error and report whether this generation is live."""
@@ -101,7 +100,7 @@ class _StartupRecorderErrorLatch:
             self._phase = self._ACCEPTING
             return True
 
-    def complete_startup(self, source_token) -> tuple[bool, str | None]:
+    def complete_startup(self, source_token) -> tuple[bool, object | None]:
         """Transition acceptance to runtime, or return its boundary error."""
 
         with self._lock:
@@ -117,7 +116,7 @@ class _StartupRecorderErrorLatch:
             self._phase = self._RUNTIME
             return True, None
 
-    def error_snapshot(self, source_token) -> str | None:
+    def error_snapshot(self, source_token):
         with self._lock:
             if (
                 source_token is not self._source_token
@@ -353,7 +352,7 @@ class _PendingErrorContinuation(_PendingCurrentContinuation):
             generation=error_route.generation,
         )
         self.error_route = error_route
-        self.message = str(message)
+        self.message = message
 
 
 @dataclass(frozen=True)
@@ -497,8 +496,8 @@ class TestManager(QObject):
     __test__ = False
     _MIN_MANUAL_REANALYSIS_DURATION_SEC = 0.1
 
-    _deferred_runtime_error_occurred = pyqtSignal(object, str)
-    _deferred_monitor_error_occurred = pyqtSignal(object, str)
+    _deferred_runtime_error_occurred = pyqtSignal(object, object)
+    _deferred_monitor_error_occurred = pyqtSignal(object, object)
 
     def __init__(self, bus, services):
         super().__init__()
@@ -534,6 +533,7 @@ class TestManager(QObject):
         self._cleanup_failure_sequence = 0
         self._cleanup_action_lock = threading.RLock()
         self._cleanup_action_states: dict[tuple, _CleanupActionState] = {}
+        self._last_fatal_failures: tuple[_CleanupFailureRecord, ...] = ()
 
         display_channel_signal = getattr(self._bus, "factory_display_channel_changed", None)
         connect = getattr(display_channel_signal, "connect", None)
@@ -600,19 +600,23 @@ class TestManager(QObject):
         try:
             config = self._services.config_service.load_config(config_id)
         except Exception as exc:
-            self._bus.log.emit(f"[TestManager] ERROR loading config {config_id}: {exc}")
-            return self._fail_start_before_acceptance(
+            return self._fail_start_exception_before_acceptance(
                 request_id,
-                f"配置加载失败：{exc}",
+                exc,
+                log_prefix=f"[TestManager] ERROR loading config {config_id}: ",
+                user_prefix="配置加载失败：",
+                phase="config load",
             )
 
         try:
             device_info = self._services.hss_service.load_io_devices()
         except Exception as exc:
-            self._bus.log.emit(f"[TestManager] ERROR loading input hardware: {exc}")
-            return self._fail_start_before_acceptance(
+            return self._fail_start_exception_before_acceptance(
                 request_id,
-                f"读取硬件配置失败：{exc}",
+                exc,
+                log_prefix="[TestManager] ERROR loading input hardware: ",
+                user_prefix="读取硬件配置失败：",
+                phase="input hardware load",
             )
 
         hardware_error = self._saved_input_hardware_error(device_info)
@@ -656,12 +660,15 @@ class TestManager(QObject):
                 hardware_channel_count=n_channels,
             )
         except ValueError as exc:
-            self._bus.log.emit(
-                f"[TestManager] ERROR config {config_id} invalid selected_channels: {exc}"
-            )
-            return self._fail_start_before_acceptance(
+            return self._fail_start_exception_before_acceptance(
                 request_id,
-                f"选择的输入通道无效：{exc}",
+                exc,
+                log_prefix=(
+                    f"[TestManager] ERROR config {config_id} "
+                    "invalid selected_channels: "
+                ),
+                user_prefix="选择的输入通道无效：",
+                phase="selected channel validation",
             )
         config = dict(config)
         config["selected_channels"] = list(normalized_selected_channels)
@@ -671,10 +678,16 @@ class TestManager(QObject):
                 hardware_channel_count=n_channels,
             )
         except ValueError as exc:
-            self._bus.log.emit(
-                f"[TestManager] ERROR config {config_id} invalid vibration view channel: {exc}"
+            return self._fail_start_exception_before_acceptance(
+                request_id,
+                exc,
+                log_prefix=(
+                    f"[TestManager] ERROR config {config_id} "
+                    "invalid vibration view channel: "
+                ),
+                user_prefix="",
+                phase="vibration view validation",
             )
-            return self._fail_start_before_acceptance(request_id, str(exc))
         try:
             resolved_monitor_channel = self._resolve_monitor_channel(
                 config,
@@ -682,10 +695,16 @@ class TestManager(QObject):
             )
             resolved_monitor_gain_db = self._resolve_monitor_gain_db(config)
         except ValueError as exc:
-            self._bus.log.emit(
-                f"[TestManager] ERROR config {config_id} invalid monitor controls: {exc}"
+            return self._fail_start_exception_before_acceptance(
+                request_id,
+                exc,
+                log_prefix=(
+                    f"[TestManager] ERROR config {config_id} "
+                    "invalid monitor controls: "
+                ),
+                user_prefix="",
+                phase="monitor control validation",
             )
-            return self._fail_start_before_acceptance(request_id, str(exc))
 
         record_duration = config.get("record_duration", 5.0)
         session_workorder = dict(workorder)
@@ -857,14 +876,13 @@ class TestManager(QObject):
                     latch=startup_error_latch,
                     token=source_token,
                 ):
-                    normalized_message = str(message)
-                    if self._is_nonfatal_monitor_diagnostic(normalized_message):
+                    if self._is_nonfatal_monitor_diagnostic(message):
                         self._deferred_monitor_error_occurred.emit(
                             route,
-                            normalized_message,
+                            message,
                         )
                         return
-                    latch.handle(token, normalized_message)
+                    latch.handle(token, message)
 
                 session._monitor_error_lambda = monitor_error_conn
                 monitor.error_occurred.connect(
@@ -976,10 +994,11 @@ class TestManager(QObject):
                 return False
         except BaseException as exc:
             rollback_logging_errors = []
-            self._report_cleanup_safely(
+            root_error_text = self._report_cleanup_safely(
                 rollback_logging_errors,
-                f"[TestManager] ERROR starting config {config_id}: {exc}",
                 phase="failed start root reporting",
+                error=exc,
+                message_prefix=f"[TestManager] ERROR starting config {config_id}: ",
             )
             if failed_start_cleanup_errors is None:
                 failed_start_cleanup_errors = self._cleanup_failed_start_setup(
@@ -994,30 +1013,14 @@ class TestManager(QObject):
                 rollback_logging_errors + failed_start_cleanup_errors
             )
             self._clear_pending_factory_start(request_id)
-            if not isinstance(exc, Exception):
-                for failure in self._ordered_cleanup_failures(
-                    failed_start_cleanup_errors,
-                    phase="failed start rollback",
-                ):
-                    cleanup_exc = failure.error
-                    if not failure.is_fatal or cleanup_exc is exc:
-                        continue
-                    self._note_secondary_fatal(
-                        exc,
-                        cleanup_exc,
-                        context=f"failed start rollback [{failure.phase}]",
-                    )
-                raise
-            cleanup_fatal = self._first_fatal(failed_start_cleanup_errors)
-            if cleanup_fatal is not None:
-                self._raise_first_fatal(
-                    failed_start_cleanup_errors,
-                    context="failed start rollback",
-                )
-            return self._fail_start_before_acceptance(
-                request_id,
-                f"启动失败：{exc}",
+            if isinstance(exc, Exception):
+                self._last_start_error = f"启动失败：{root_error_text}"
+            self._raise_first_fatal(
+                failed_start_cleanup_errors,
+                context="failed start rollback",
+                root_error=(exc if not isinstance(exc, Exception) else None),
             )
+            return False
 
         try:
             state = self._startup_error_route_state(error_route)
@@ -1121,10 +1124,11 @@ class TestManager(QObject):
         error: BaseException,
     ) -> bool:
         cleanup_errors = []
-        self._report_cleanup_safely(
+        root_error_text = self._report_cleanup_safely(
             cleanup_errors,
-            f"[TestManager] ERROR starting config {config_id}: {error}",
             phase="accepted start rollback reporting",
+            error=error,
+            message_prefix=f"[TestManager] ERROR starting config {config_id}: ",
         )
         try:
             stopped = self._stop_one(
@@ -1148,7 +1152,7 @@ class TestManager(QObject):
                     self._make_factory_runtime_abort_payload(
                         config_id,
                         session,
-                        error_message=str(error),
+                        error_message=root_error_text,
                     ),
                 )
             except BaseException as cleanup_exc:
@@ -1159,22 +1163,10 @@ class TestManager(QObject):
                     )
                 )
         self._clear_pending_factory_start(request_id)
-        if not isinstance(error, Exception):
-            for failure in self._ordered_cleanup_failures(
-                cleanup_errors,
-                phase="accepted start rollback",
-            ):
-                if not failure.is_fatal:
-                    continue
-                self._note_secondary_fatal(
-                    error,
-                    failure.error,
-                    context=f"accepted start rollback [{failure.phase}]",
-                )
-            raise error
         self._raise_first_fatal(
             cleanup_errors,
             context="accepted start rollback",
+            root_error=(error if not isinstance(error, Exception) else None),
         )
         return not stopped
 
@@ -1665,8 +1657,11 @@ class TestManager(QObject):
             cleanup_errors.append(failure)
             self._report_cleanup_safely(
                 cleanup_errors,
-                f"[TestManager] ERROR stopping replay for config={config_id}: {exc}",
                 phase="manual stop replay",
+                error=exc,
+                message_prefix=(
+                    f"[TestManager] ERROR stopping replay for config={config_id}: "
+                ),
             )
 
         partial_buf = None
@@ -1690,9 +1685,12 @@ class TestManager(QObject):
                     )
                     self._report_cleanup_safely(
                         cleanup_errors,
-                        f"[TestManager] ERROR fatal capture while stopping "
-                        f"config={config_id}: {exc}",
                         phase="manual stop capture freeze",
+                        error=exc,
+                        message_prefix=(
+                            "[TestManager] ERROR fatal capture while stopping "
+                            f"config={config_id}: "
+                        ),
                     )
             if rec is not None:
                 disconnect_failures = self._disconnect_session_signals(
@@ -1730,9 +1728,12 @@ class TestManager(QObject):
                         )
                     self._report_cleanup_safely(
                         cleanup_errors,
-                        f"[TestManager] ERROR releasing capture while stopping "
-                        f"config={config_id}: {exc}",
                         phase="manual stop capture release",
+                        error=exc,
+                        message_prefix=(
+                            "[TestManager] ERROR releasing capture while stopping "
+                            f"config={config_id}: "
+                        ),
                     )
 
         self._collect_current_cleanup_failures(
@@ -1759,12 +1760,14 @@ class TestManager(QObject):
         try:
             if session is not None and rec is not None and not silent:
                 if capture_error is not None:
-                    factory_abort_error_message = str(capture_error)
-                    self._report_cleanup_safely(
+                    factory_abort_error_message = self._report_cleanup_safely(
                         cleanup_errors,
-                        f"[TestManager] ERROR capturing partial recording for "
-                        f"config={config_id}: {capture_error}",
                         phase="manual stop capture reporting",
+                        error=capture_error,
+                        message_prefix=(
+                            "[TestManager] ERROR capturing partial recording for "
+                            f"config={config_id}: "
+                        ),
                     )
                 elif isinstance(partial_buf, np.ndarray) and partial_buf.shape[0] > 0:
                     try:
@@ -1779,9 +1782,12 @@ class TestManager(QObject):
                             )
                         self._report_cleanup_safely(
                             cleanup_errors,
-                            f"[TestManager] ERROR saving partial recording for "
-                            f"config={config_id}: {exc}",
                             phase="manual stop partial save",
+                            error=exc,
+                            message_prefix=(
+                                "[TestManager] ERROR saving partial recording for "
+                                f"config={config_id}: "
+                            ),
                         )
                     else:
                         self._report_cleanup_safely(
@@ -1812,24 +1818,25 @@ class TestManager(QObject):
                     ]
                     if fatal_cleanup_errors:
                         factory_abort_error_message = "; ".join(
-                            str(error) for error in fatal_cleanup_errors
+                            self._format_exception_safely(
+                                cleanup_errors,
+                                error,
+                                phase="manual stop factory abort message",
+                            )
+                            for error in tuple(fatal_cleanup_errors)
                         )
-                try:
-                    self._emit_optional_signal(
+                self._run_reporting_effect_safely(
+                    cleanup_errors,
+                    lambda: self._emit_optional_signal(
                         "factory_runtime_aborted",
                         self._make_factory_runtime_abort_payload(
                             config_id,
                             session,
                             error_message=factory_abort_error_message,
                         ),
-                    )
-                except BaseException as exc:
-                    cleanup_errors.append(
-                        self._record_cleanup_failure(
-                            exc,
-                            phase="manual stop factory abort signal",
-                        )
-                    )
+                    ),
+                    phase="manual stop factory abort signal",
+                )
 
             if not silent:
                 self._report_cleanup_safely(
@@ -1837,15 +1844,11 @@ class TestManager(QObject):
                     f"[TestManager] stopped config={config_id}",
                     phase="manual stop reporting",
                 )
-                try:
-                    self._bus.status.emit("Stopped")
-                except BaseException as exc:
-                    cleanup_errors.append(
-                        self._record_cleanup_failure(
-                            exc,
-                            phase="manual stop status",
-                        )
-                    )
+                self._emit_status_safely(
+                    cleanup_errors,
+                    "Stopped",
+                    phase="manual stop status",
+                )
         self._raise_first_fatal(
             cleanup_errors,
             context="manual stop cleanup",
@@ -1949,9 +1952,12 @@ class TestManager(QObject):
                 )
                 self._report_cleanup_safely(
                     cleanup_errors,
-                    f"[TestManager] ERROR freezing failed start capture for "
-                    f"config={config_id}: {exc}",
                     phase="failed start capture freeze",
+                    error=exc,
+                    message_prefix=(
+                        "[TestManager] ERROR freezing failed start capture for "
+                        f"config={config_id}: "
+                    ),
                 )
 
         if cleanup_session is not None and cleanup_recorder is not None:
@@ -1980,9 +1986,12 @@ class TestManager(QObject):
                 )
                 self._report_cleanup_safely(
                     cleanup_errors,
-                    f"[TestManager] ERROR releasing failed start capture for "
-                    f"config={config_id}: {exc}",
                     phase="failed start capture release",
+                    error=exc,
+                    message_prefix=(
+                        "[TestManager] ERROR releasing failed start capture for "
+                        f"config={config_id}: "
+                    ),
                 )
 
         if cleanup_session is not None:
@@ -2015,6 +2024,30 @@ class TestManager(QObject):
 
     def _clear_last_start_error(self) -> None:
         self._last_start_error = None
+
+    def _fail_start_exception_before_acceptance(
+        self,
+        request_id: str | None,
+        error: Exception,
+        *,
+        log_prefix: str,
+        user_prefix: str,
+        phase: str,
+    ) -> bool:
+        failures: list[_CleanupFailureRecord] = []
+        error_text = self._report_cleanup_safely(
+            failures,
+            phase=phase,
+            error=error,
+            message_prefix=log_prefix,
+        )
+        self._last_start_error = f"{user_prefix}{error_text}"
+        self._clear_pending_factory_start(request_id)
+        self._raise_first_fatal(
+            failures,
+            context=f"{phase} reporting",
+        )
+        return False
 
     def _fail_start_before_acceptance(self, request_id: str | None, message: str) -> bool:
         self._last_start_error = message
@@ -2616,9 +2649,12 @@ class TestManager(QObject):
                         )
                     self._report_cleanup_safely(
                         cleanup_errors,
-                        f"[TestManager] ERROR releasing completed capture "
-                        f"for config={config_id}: {exc}",
                         phase="recording completion capture release",
+                        error=exc,
+                        message_prefix=(
+                            "[TestManager] ERROR releasing completed capture "
+                            f"for config={config_id}: "
+                        ),
                     )
 
             self._extend_cleanup_failures(
@@ -2755,7 +2791,7 @@ class TestManager(QObject):
                     self._analyzing_sessions.discard(config_id)
                 self._completion_claims.discard(completion_key)
 
-    def _on_error(self, error_route, message: str) -> bool:
+    def _on_error(self, error_route, message) -> bool:
         if not isinstance(error_route, _SessionErrorRoute):
             return False
         with self._lifecycle_lock:
@@ -2799,18 +2835,13 @@ class TestManager(QObject):
     def _continue_error(
         self,
         error_route,
-        message: str,
+        message,
         *,
         preclaimed_current_collection=None,
     ) -> bool:
         if not isinstance(error_route, _SessionErrorRoute):
             return False
         config_id = error_route.config_id
-        abort_payload = self._make_factory_runtime_abort_payload(
-            config_id,
-            error_route.session,
-            error_message=message,
-        )
         cleanup_failures: list[_CleanupFailureRecord] = []
         try:
             stopped = self._continue_stop_one(
@@ -2839,36 +2870,40 @@ class TestManager(QObject):
             )
             return False
 
+        message_text = self._format_exception_safely(
+            cleanup_failures,
+            message,
+            phase="runtime error message",
+        )
         self._report_cleanup_safely(
             cleanup_failures,
-            f"[TestManager] ERROR config={config_id}: {message}",
+            f"[TestManager] ERROR config={config_id}: {message_text}",
             phase="runtime error reporting",
         )
-        try:
-            self._bus.status.emit(f"Error: {message}")
-        except BaseException as exc:
-            cleanup_failures.append(
-                self._record_cleanup_failure(
-                    exc,
-                    phase="runtime error status",
-                )
-            )
-        try:
-            self._emit_optional_signal("factory_runtime_aborted", abort_payload)
-        except BaseException as exc:
-            cleanup_failures.append(
-                self._record_cleanup_failure(
-                    exc,
-                    phase="runtime error abort signal",
-                )
-            )
+        self._emit_status_safely(
+            cleanup_failures,
+            f"Error: {message_text}",
+            phase="runtime error status",
+        )
+        self._run_reporting_effect_safely(
+            cleanup_failures,
+            lambda: self._emit_optional_signal(
+                "factory_runtime_aborted",
+                self._make_factory_runtime_abort_payload(
+                    config_id,
+                    error_route.session,
+                    error_message=message_text,
+                ),
+            ),
+            phase="runtime error abort signal",
+        )
         self._raise_first_fatal(
             cleanup_failures,
             context="runtime error cleanup",
         )
         return True
 
-    def _on_monitor_error(self, error_route, message: str):
+    def _on_monitor_error(self, error_route, message):
         if not isinstance(error_route, _SessionErrorRoute):
             return
         config_id = error_route.config_id
@@ -2900,7 +2935,7 @@ class TestManager(QObject):
         return uuid.uuid4().hex
 
     @staticmethod
-    def _make_no_result_payload(error: Exception | str) -> dict:
+    def _make_no_result_payload(error_summary: str) -> dict:
         return {
             "no_result": True,
             "has_result": False,
@@ -2909,7 +2944,7 @@ class TestManager(QObject):
             "ai_label": None,
             "ai_score": None,
             "ai_summary": None,
-            "error_summary": str(error),
+            "error_summary": error_summary,
         }
 
     @staticmethod
@@ -2926,7 +2961,17 @@ class TestManager(QObject):
         context: str,
         still_owned=None,
     ):
-        payload = self._make_no_result_payload(error)
+        reporting_failures: list[_CleanupFailureRecord] = []
+        error_summary = self._format_exception_safely(
+            reporting_failures,
+            error,
+            phase=f"no-result {context}",
+        )
+        self._raise_first_fatal(
+            reporting_failures,
+            context=f"no-result {context} formatting",
+        )
+        payload = self._make_no_result_payload(error_summary)
         if callable(still_owned) and not still_owned():
             return None
         self._bus.test_finished.emit(config_id, payload)
@@ -2935,8 +2980,17 @@ class TestManager(QObject):
         self._bus.result_changed.emit(payload)
         if callable(still_owned) and not still_owned():
             return None
-        self._bus.log.emit(
-            f"[TestManager] no-result {context} for config={config_id}: {payload['error_summary']}"
+        self._report_cleanup_safely(
+            reporting_failures,
+            (
+                f"[TestManager] no-result {context} for config={config_id}: "
+                f"{payload['error_summary']}"
+            ),
+            phase=f"no-result {context}",
+        )
+        self._raise_first_fatal(
+            reporting_failures,
+            context=f"no-result {context} reporting",
         )
         return payload
 
@@ -3304,9 +3358,12 @@ class TestManager(QObject):
                 )
                 self._report_cleanup_safely(
                     cleanup_errors,
-                    f"[TestManager] ERROR releasing stopped capture for "
-                    f"config={config_id}: {exc}",
                     phase="factory stop capture release",
+                    error=exc,
+                    message_prefix=(
+                        "[TestManager] ERROR releasing stopped capture for "
+                        f"config={config_id}: "
+                    ),
                 )
                 if isinstance(exc, Exception) and capture.get("capture_error") is None:
                     capture["capture_error"] = exc
@@ -3331,29 +3388,28 @@ class TestManager(QObject):
         )
 
         fatal_error = self._first_fatal(cleanup_errors)
-        if fatal_error is not None:
-            self._emit_factory_stop_abort(
+        ordinary_cleanup_error = self._first_actionable_cleanup_exception(
+            cleanup_errors
+        )
+        terminal_error = (
+            fatal_error
+            if fatal_error is not None
+            else ordinary_cleanup_error
+        )
+        if terminal_error is not None:
+            abort_result = self._emit_factory_stop_abort(
                 config_id,
                 session,
-                fatal_error,
+                terminal_error,
                 rec=rec,
                 mon=mon,
+                cleanup_errors=cleanup_errors,
             )
             self._raise_first_fatal(
                 cleanup_errors,
                 context="factory stop cleanup",
             )
-        ordinary_cleanup_error = self._first_actionable_cleanup_exception(
-            cleanup_errors
-        )
-        if ordinary_cleanup_error is not None:
-            return self._emit_factory_stop_abort(
-                config_id,
-                session,
-                ordinary_cleanup_error,
-                rec=rec,
-                mon=mon,
-            )
+            return abort_result
 
         capture_error = capture.get("capture_error")
         if capture_error is not None:
@@ -3417,9 +3473,12 @@ class TestManager(QObject):
                 )
                 self._report_cleanup_safely(
                     cleanup_errors,
-                    f"[TestManager] ERROR releasing stopped capture for "
-                    f"config={config_id}: {exc}",
                     phase="factory stopped capture release",
+                    error=exc,
+                    message_prefix=(
+                        "[TestManager] ERROR releasing stopped capture for "
+                        f"config={config_id}: "
+                    ),
                 )
         self._extend_cleanup_failures(
             cleanup_errors,
@@ -3442,29 +3501,28 @@ class TestManager(QObject):
         )
 
         fatal_error = self._first_fatal(cleanup_errors)
-        if fatal_error is not None:
-            self._emit_factory_stop_abort(
+        ordinary_cleanup_error = self._first_actionable_cleanup_exception(
+            cleanup_errors
+        )
+        terminal_error = (
+            fatal_error
+            if fatal_error is not None
+            else ordinary_cleanup_error
+        )
+        if terminal_error is not None:
+            abort_result = self._emit_factory_stop_abort(
                 config_id,
                 session,
-                fatal_error,
+                terminal_error,
                 rec=rec,
                 mon=mon,
+                cleanup_errors=cleanup_errors,
             )
             self._raise_first_fatal(
                 cleanup_errors,
                 context="factory stop cleanup",
             )
-        ordinary_cleanup_error = self._first_actionable_cleanup_exception(
-            cleanup_errors
-        )
-        if ordinary_cleanup_error is not None:
-            return self._emit_factory_stop_abort(
-                config_id,
-                session,
-                ordinary_cleanup_error,
-                rec=rec,
-                mon=mon,
-            )
+            return abort_result
         return self._emit_factory_runtime_stopped(config_id, session)
 
     def _capture_partial_stop_buffer(self, config_id: int, session, rec) -> dict[str, object]:
@@ -3487,8 +3545,12 @@ class TestManager(QObject):
         except Exception as exc:
             self._report_cleanup_safely(
                 cleanup_failures,
-                f"[TestManager] ERROR capturing partial recording for config={config_id}: {exc}",
                 phase="factory stop partial capture",
+                error=exc,
+                message_prefix=(
+                    "[TestManager] ERROR capturing partial recording for "
+                    f"config={config_id}: "
+                ),
             )
             return {
                 "partial_buf": None,
@@ -3512,8 +3574,12 @@ class TestManager(QObject):
                     )
                 self._report_cleanup_safely(
                     cleanup_failures,
-                    f"[TestManager] ERROR saving partial recording for config={config_id}: {exc}",
                     phase="factory stop partial save",
+                    error=exc,
+                    message_prefix=(
+                        "[TestManager] ERROR saving partial recording for "
+                        f"config={config_id}: "
+                    ),
                 )
             else:
                 if isinstance(saved_path, str) and saved_path:
@@ -3606,6 +3672,16 @@ class TestManager(QObject):
         session,
         error: Exception,
     ) -> bool:
+        formatting_failures: list[_CleanupFailureRecord] = []
+        error_text = self._format_exception_safely(
+            formatting_failures,
+            error,
+            phase="stop-triggered capture failure",
+        )
+        self._raise_first_fatal(
+            formatting_failures,
+            context="stop-triggered capture failure formatting",
+        )
         cleanup_settled_payload = self._make_cleanup_settled_payload(config_id, session)
         with self._lifecycle_lock:
             if self._sessions.get(config_id) is session:
@@ -3613,7 +3689,10 @@ class TestManager(QObject):
         self._emit_factory_analyzing_entered(
             config_id,
             session,
-            log_message=f"[TestManager] stop-triggered capture failed for config={config_id}: {error}",
+            log_message=(
+                f"[TestManager] stop-triggered capture failed for "
+                f"config={config_id}: {error_text}"
+            ),
         )
         try:
             if not self._emit_auto_analysis_failure_review(
@@ -3729,6 +3808,7 @@ class TestManager(QObject):
         *,
         rec,
         mon,
+        cleanup_errors,
     ) -> bool:
         with self._lifecycle_lock:
             if self._sessions.get(config_id) is not session:
@@ -3746,72 +3826,44 @@ class TestManager(QObject):
                 if self._monitors.get(config_id) is mon:
                     self._monitors.pop(config_id, None)
                 transition_won = True
-        cleanup_errors = []
         recorder_is_shared = rec is not None and any(
             shared_recorder is rec
             for shared_recorder in self._shared_recorders.values()
         )
         if recorder_is_shared:
-            cleanup_errors = self._cleanup_monitor_recorder_safely(
-                config_id,
-                session=session,
-                rec=rec,
-                context="factory stop abort",
+            self._extend_cleanup_failures(
+                cleanup_errors,
+                self._cleanup_monitor_recorder_safely(
+                    config_id,
+                    session=session,
+                    rec=rec,
+                    context="factory stop abort",
+                ),
             )
         if not transition_won:
-            if not isinstance(error, Exception):
-                raise error
-            self._raise_first_fatal(
-                cleanup_errors,
-                context="factory stop abort cleanup",
-            )
             return False
-        self._report_cleanup_safely(
+        error_text = self._report_cleanup_safely(
             cleanup_errors,
-            f"[TestManager] ERROR stopping config={config_id}: {error}",
             phase="factory stop abort reporting",
+            error=error,
+            message_prefix=f"[TestManager] ERROR stopping config={config_id}: ",
         )
-        try:
-            self._emit_optional_signal(
+        self._run_reporting_effect_safely(
+            cleanup_errors,
+            lambda: self._emit_optional_signal(
                 "factory_runtime_aborted",
                 self._make_factory_runtime_abort_payload(
                     config_id,
                     session,
-                    error_message=str(error),
+                    error_message=error_text,
                 ),
-            )
-        except BaseException as exc:
-            cleanup_errors.append(
-                self._record_cleanup_failure(
-                    exc,
-                    phase="factory stop abort signal",
-                )
-            )
-        try:
-            self._bus.status.emit(f"Error: {error}")
-        except BaseException as exc:
-            cleanup_errors.append(
-                self._record_cleanup_failure(
-                    exc,
-                    phase="factory stop abort status",
-                )
-            )
-        if not isinstance(error, Exception):
-            for failure in self._ordered_cleanup_failures(
-                cleanup_errors,
-                phase="factory stop abort cleanup",
-            ):
-                if not failure.is_fatal:
-                    continue
-                self._note_secondary_fatal(
-                    error,
-                    failure.error,
-                    context=f"factory stop abort cleanup [{failure.phase}]",
-                )
-            raise error
-        self._raise_first_fatal(
+            ),
+            phase="factory stop abort signal",
+        )
+        self._emit_status_safely(
             cleanup_errors,
-            context="factory stop abort cleanup",
+            f"Error: {error_text}",
+            phase="factory stop abort status",
         )
         return False
 
@@ -3822,7 +3874,10 @@ class TestManager(QObject):
     def _is_factory_no_result_error(error: Exception) -> bool:
         if isinstance(error, ValueError):
             return True
-        return isinstance(error, RuntimeError) and str(error) == "analysis result unavailable"
+        return (
+            isinstance(error, RuntimeError)
+            and error.args == ("analysis result unavailable",)
+        )
 
     def _make_factory_review_payload(
         self,
@@ -4324,18 +4379,25 @@ class TestManager(QObject):
             )
 
         if start_fatal_error is not None:
-            if cleanup_fatal_error is not None:
-                self._note_secondary_fatal(
-                    start_fatal_error,
-                    cleanup_fatal_error,
-                    context="current collector startup cleanup",
-                )
-                raise start_fatal_error from cleanup_fatal_error
-            raise start_fatal_error
+            startup_failures = list(
+                cleanup_result.failures
+                if cleanup_result is not None
+                else ()
+            )
+            self._raise_first_fatal(
+                startup_failures,
+                context="current collector startup cleanup",
+                root_error=start_fatal_error,
+            )
         if cleanup_fatal_error is not None and selected_continuation is None:
-            if isinstance(start_error, Exception):
-                raise cleanup_fatal_error from start_error
-            raise cleanup_fatal_error
+            self._raise_first_fatal(
+                (
+                    list(cleanup_result.failures)
+                    if cleanup_result is not None
+                    else [cleanup_fatal_error]
+                ),
+                context="current collector startup cleanup",
+            )
         if start_error is not None:
             if cleanup_diagnostic_error is not None:
                 raise start_error from cleanup_diagnostic_error
@@ -4683,9 +4745,12 @@ class TestManager(QObject):
                 label = "fatal cleanup" if stop_failure.is_fatal else "cleanup diagnostic"
                 self._report_cleanup_safely(
                     failures,
-                    f"[CurrentMeter] {label} for config={claim.config_id}: "
-                    f"stop failed: {stop_failure.error}",
                     phase="current collector stop",
+                    error=stop_failure.error,
+                    message_prefix=(
+                        f"[CurrentMeter] {label} for config={claim.config_id}: "
+                        "stop failed: "
+                    ),
                 )
             if samples_failure is not None:
                 label = (
@@ -4695,9 +4760,12 @@ class TestManager(QObject):
                 )
                 self._report_cleanup_safely(
                     failures,
-                    f"[CurrentMeter] {label} for config={claim.config_id}: "
-                    f"samples failed: {samples_failure.error}",
                     phase="current collector samples",
+                    error=samples_failure.error,
+                    message_prefix=(
+                        f"[CurrentMeter] {label} for config={claim.config_id}: "
+                        "samples failed: "
+                    ),
                 )
             if stop_failure is None and samples_failure is None:
                 self._report_cleanup_safely(
@@ -4707,11 +4775,15 @@ class TestManager(QObject):
                     phase="current collector stopped",
                 )
 
+            _, prepared_failures = self._prepare_fatal_failures(
+                failures,
+                context="current collector cleanup",
+            )
             result = _CurrentCollectionCleanupResult(
                 samples=samples,
                 stop_failure=stop_failure,
                 samples_failure=samples_failure,
-                failures=tuple(failures),
+                failures=prepared_failures,
             )
             with self._lifecycle_lock:
                 still_owned = (
@@ -4758,11 +4830,15 @@ class TestManager(QObject):
                     )
         finally:
             if "result" not in locals():
+                _, prepared_failures = self._prepare_fatal_failures(
+                    failures,
+                    context="current collector cleanup",
+                )
                 result = _CurrentCollectionCleanupResult(
                     samples=samples,
                     stop_failure=stop_failure,
                     samples_failure=samples_failure,
-                    failures=tuple(failures),
+                    failures=prepared_failures,
                 )
             with claim._cleanup_lock:
                 claim._cleanup_result = result
@@ -5440,10 +5516,24 @@ class TestManager(QObject):
         try:
             gain_db = self._resolve_monitor_gain_db(config)
         except ValueError as exc:
-            self._maybe_log_replay_failure(
-                log_failures,
-                normalized_config_id,
-                str(exc),
+            reporting_failures: list[_CleanupFailureRecord] = []
+            error_text = self._format_exception_safely(
+                reporting_failures,
+                exc,
+                phase="replay validation",
+            )
+            if log_failures:
+                self._report_cleanup_safely(
+                    reporting_failures,
+                    (
+                        "[TestManager] replay unavailable for "
+                        f"config={normalized_config_id}: {error_text}"
+                    ),
+                    phase="replay validation",
+                )
+            self._raise_first_fatal(
+                reporting_failures,
+                context="replay validation reporting",
             )
             return None
 
@@ -5492,16 +5582,46 @@ class TestManager(QObject):
             self._stop_replay()
 
     def _stop_replay(self) -> None:
+        cleanup_failures: list[_CleanupFailureRecord] = []
         player = getattr(self, "_replay_player", None)
         stop = getattr(player, "stop", None)
         if callable(stop):
             try:
                 stop(wait=True)
             except TypeError:
-                stop()
-            except Exception as exc:
-                self._bus.log.emit(f"[TestManager] ERROR stopping replay: {exc}")
+                try:
+                    stop()
+                except BaseException as exc:
+                    cleanup_failures.append(
+                        self._record_cleanup_failure(
+                            exc,
+                            phase="replay stop",
+                        )
+                    )
+                    self._report_cleanup_safely(
+                        cleanup_failures,
+                        phase="replay stop",
+                        error=exc,
+                        message_prefix="[TestManager] ERROR stopping replay: ",
+                    )
+            except BaseException as exc:
+                cleanup_failures.append(
+                    self._record_cleanup_failure(
+                        exc,
+                        phase="replay stop",
+                    )
+                )
+                self._report_cleanup_safely(
+                    cleanup_failures,
+                    phase="replay stop",
+                    error=exc,
+                    message_prefix="[TestManager] ERROR stopping replay: ",
+                )
         self._replay_config_id = None
+        self._raise_first_fatal(
+            cleanup_failures,
+            context="replay stop cleanup",
+        )
 
     @staticmethod
     def _window_from_payload(judgment_payload: dict | None, *, review_window_cls):
@@ -5569,7 +5689,7 @@ class TestManager(QObject):
         if isinstance(failure, _CleanupFailureRecord):
             return failure
         if not isinstance(failure, BaseException):
-            failure = RuntimeError(str(failure))
+            failure = RuntimeError("non-exception cleanup failure")
         return self._record_cleanup_failure(failure, phase=phase)
 
     @staticmethod
@@ -5589,24 +5709,83 @@ class TestManager(QObject):
             if isinstance(failure, _CleanupFailureRecord):
                 seen.add(failure.sequence)
 
-    def _report_cleanup_safely(
+    _UNAVAILABLE_EXCEPTION_TEXT = "<exception text unavailable>"
+
+    def _format_exception_safely(
         self,
         failures,
-        message: str,
+        error,
         *,
         phase: str,
-    ) -> None:
-        """Attempt one cleanup report without ever reporting its own failure."""
+    ) -> str:
+        """Return text without allowing hostile ``__str__`` to escape."""
 
         try:
-            self._bus.log.emit(message)
+            return str(error)
         except BaseException as exc:
             failures.append(
                 self._record_cleanup_failure(
                     exc,
-                    phase=f"{phase}.reporting",
+                    phase=f"{phase}.formatting",
                 )
             )
+            return self._UNAVAILABLE_EXCEPTION_TEXT
+
+    def _run_reporting_effect_safely(
+        self,
+        failures,
+        callback,
+        *,
+        phase: str,
+    ):
+        """Run one external reporting effect and return its value or ``None``."""
+
+        try:
+            return callback()
+        except BaseException as exc:
+            failures.append(
+                self._record_cleanup_failure(
+                    exc,
+                    phase=phase,
+                )
+            )
+            return None
+
+    def _report_cleanup_safely(
+        self,
+        failures,
+        message: str | None = None,
+        *,
+        phase: str,
+        error=None,
+        message_prefix: str = "",
+    ) -> str:
+        """Format and emit one report without recursively reporting failures."""
+
+        if error is not None:
+            error_text = self._format_exception_safely(
+                failures,
+                error,
+                phase=phase,
+            )
+            message = f"{message_prefix}{error_text}"
+        else:
+            error_text = "" if message is None else message
+        if message is None:
+            message = ""
+        self._run_reporting_effect_safely(
+            failures,
+            lambda: self._bus.log.emit(message),
+            phase=f"{phase}.reporting",
+        )
+        return error_text
+
+    def _emit_status_safely(self, failures, message: str, *, phase: str) -> None:
+        self._run_reporting_effect_safely(
+            failures,
+            lambda: self._bus.status.emit(message),
+            phase=phase,
+        )
 
     def _run_cleanup_action_once(
         self,
@@ -5667,8 +5846,9 @@ class TestManager(QObject):
             if report_message is not None:
                 self._report_cleanup_safely(
                     failures,
-                    f"{report_message}: {exc}",
                     phase=action,
+                    error=exc,
+                    message_prefix=f"{report_message}: ",
                 )
 
         with self._cleanup_action_lock:
@@ -5873,33 +6053,97 @@ class TestManager(QObject):
             return None
         return fatal_records[0].error
 
-    @staticmethod
-    def _note_secondary_fatal(
+    def _note_secondary_fatal_safely(
+        self,
+        failures,
         primary: BaseException,
-        secondary: BaseException,
+        secondary_record: _CleanupFailureRecord,
         *,
         context: str,
     ) -> None:
-        add_note = getattr(primary, "add_note", None)
-        if callable(add_note):
-            add_note(f"{context}: {type(secondary).__name__}: {secondary}")
+        """Attach one safe note; note failures become records, never recursion."""
 
-    def _raise_first_fatal(self, errors, *, context: str) -> None:
-        ordered = self._ordered_cleanup_failures(errors, phase=context)
-        fatals = [failure for failure in ordered if failure.is_fatal]
-        if not fatals:
-            return
-        fatal_error = fatals[0].error
-        for secondary_record in fatals[1:]:
-            secondary = secondary_record.error
-            if secondary is fatal_error:
-                continue
-            self._note_secondary_fatal(
-                fatal_error,
-                secondary,
-                context=f"{context} [{secondary_record.phase}]",
+        secondary = secondary_record.error
+        secondary_text = self._format_exception_safely(
+            failures,
+            secondary,
+            phase=f"{secondary_record.phase}.note",
+        )
+        note = f"{context} [{secondary_record.phase}]: {secondary_text}"
+        try:
+            add_note = getattr(primary, "add_note", None)
+        except BaseException as exc:
+            failures.append(
+                self._record_cleanup_failure(
+                    exc,
+                    phase=f"{secondary_record.phase}.note lookup",
+                )
             )
-        raise fatal_error
+            return
+        if not callable(add_note):
+            return
+        try:
+            add_note(note)
+        except BaseException as exc:
+            failures.append(
+                self._record_cleanup_failure(
+                    exc,
+                    phase=f"{secondary_record.phase}.note attachment",
+                )
+            )
+
+    def _prepare_fatal_failures(
+        self,
+        errors,
+        *,
+        context: str,
+        root_error: BaseException | None = None,
+    ) -> tuple[BaseException | None, tuple[_CleanupFailureRecord, ...]]:
+        """Merge chronology and attach notes without choosing propagation early."""
+
+        ordered = self._ordered_cleanup_failures(errors, phase=context)
+        working_failures = errors if isinstance(errors, list) else list(ordered)
+        fatal_records = [failure for failure in ordered if failure.is_fatal]
+        if root_error is not None and not isinstance(root_error, Exception):
+            primary = root_error
+        else:
+            primary = fatal_records[0].error if fatal_records else None
+
+        if primary is not None:
+            # Snapshot only: formatting/add-note failures are evidence, but are
+            # never themselves recursively formatted or noted in this pass.
+            for secondary_record in tuple(fatal_records):
+                if secondary_record.error is primary:
+                    continue
+                self._note_secondary_fatal_safely(
+                    working_failures,
+                    primary,
+                    secondary_record,
+                    context=context,
+                )
+
+        prepared = tuple(
+            self._ordered_cleanup_failures(working_failures, phase=context)
+        )
+        if isinstance(errors, list):
+            errors[:] = prepared
+        self._last_fatal_failures = prepared
+        return primary, prepared
+
+    def _raise_first_fatal(
+        self,
+        errors,
+        *,
+        context: str,
+        root_error: BaseException | None = None,
+    ) -> None:
+        fatal_error, _ = self._prepare_fatal_failures(
+            errors,
+            context=context,
+            root_error=root_error,
+        )
+        if fatal_error is not None:
+            raise fatal_error
 
     def _recorder_has_live_owner(
         self,

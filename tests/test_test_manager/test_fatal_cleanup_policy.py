@@ -20,6 +20,24 @@ class Fatal(BaseException):
     pass
 
 
+class BrokenStringFatal(Fatal):
+    def __init__(self, format_failure):
+        super().__init__()
+        self.format_failure = format_failure
+
+    def __str__(self):
+        raise self.format_failure
+
+
+class BrokenStringError(Exception):
+    def __init__(self, format_failure):
+        super().__init__()
+        self.format_failure = format_failure
+
+    def __str__(self):
+        raise self.format_failure
+
+
 class _TrackingMonitor:
     instances = []
 
@@ -1026,3 +1044,464 @@ def test_accepted_start_rollback_aggregates_logger_and_cleanup_fatals(
     _assert_runtime_maps_empty(manager)
     bus.factory_runtime_auto_analysis_succeeded.emit.assert_not_called()
     bus.factory_runtime_stopped.emit.assert_not_called()
+
+
+def test_broken_cleanup_fatal_text_keeps_action_event_owner_waiter_and_wait_once(
+    monkeypatch,
+):
+    format_fatal = Fatal("fatal while formatting monitor cleanup")
+    monitor_fatal = BrokenStringFatal(format_fatal)
+    stop_entered = threading.Event()
+    release_stop = threading.Event()
+    waiter_waiting = threading.Event()
+
+    class TrackingEvent:
+        def __init__(self):
+            self._event = threading.Event()
+
+        def is_set(self):
+            return self._event.is_set()
+
+        def set(self):
+            self._event.set()
+
+        def wait(self, timeout=None):
+            waiter_waiting.set()
+            return self._event.wait(timeout)
+
+    class Collector:
+        def __init__(self, _config, *, log_callback, sample_callback):
+            raise AssertionError("collector is not used in this action test")
+
+    class Session:
+        config_id = 1
+
+        def __init__(self):
+            self._manager_generation_token = object()
+
+    class Monitor:
+        def __init__(self):
+            self.stop_calls = 0
+            self.wait_calls = []
+
+        def stop(self):
+            self.stop_calls += 1
+            stop_entered.set()
+            assert release_stop.wait(2.0)
+            raise monitor_fatal
+
+        def wait(self, timeout):
+            self.wait_calls.append(timeout)
+            return True
+
+    _, _, manager = _make_current_start_manager(monkeypatch, Collector)
+    session = Session()
+    monitor = Monitor()
+    observed = {"owner": [], "waiter": []}
+    published_before_raise = {"owner": False, "waiter": False}
+
+    def cleanup(role):
+        try:
+            failures = manager._cleanup_monitor_recorder_safely(
+                1,
+                session=session,
+                mon=monitor,
+                context="broken formatting",
+            )
+            manager._raise_first_fatal(
+                failures,
+                context="broken formatting cleanup",
+            )
+        except BaseException as exc:
+            observed[role].append(exc)
+            states = session._manager_cleanup_action_states.values()
+            published_before_raise[role] = all(
+                state.complete.is_set() for state in states
+            )
+
+    owner = threading.Thread(target=cleanup, args=("owner",))
+    owner.start()
+    assert stop_entered.wait(2.0)
+    state = next(iter(session._manager_cleanup_action_states.values()))
+    tracking_complete = TrackingEvent()
+    state.complete = tracking_complete
+
+    waiter = threading.Thread(target=cleanup, args=("waiter",))
+    waiter.start()
+    assert waiter_waiting.wait(2.0)
+    release_stop.set()
+    owner.join(2.0)
+    waiter.join(2.0)
+    blocked_waiter = waiter.is_alive()
+    if blocked_waiter:
+        tracking_complete.set()
+        waiter.join(2.0)
+
+    assert not owner.is_alive()
+    assert not waiter.is_alive()
+    assert blocked_waiter is False
+    assert observed == {"owner": [monitor_fatal], "waiter": [monitor_fatal]}
+    assert published_before_raise == {"owner": True, "waiter": True}
+    assert monitor.stop_calls == 1
+    assert monitor.wait_calls == [1000]
+    stop_failures = [
+        failure
+        for action_state in session._manager_cleanup_action_states.values()
+        for failure in action_state.failures
+    ]
+    assert [failure.error for failure in stop_failures[:2]] == [
+        monitor_fatal,
+        format_fatal,
+    ]
+    assert stop_failures[0].sequence < stop_failures[1].sequence
+
+
+def test_broken_collector_start_fatal_text_rolls_back_every_start_resource(
+    monkeypatch,
+):
+    format_fatal = Fatal("fatal while formatting collector start")
+    root_fatal = BrokenStringFatal(format_fatal)
+    collectors = []
+    recorders = []
+    monitors = []
+
+    class Collector:
+        def __init__(self, _config, *, log_callback, sample_callback):
+            self.stop_calls = 0
+            self.samples_calls = 0
+            collectors.append(self)
+
+        def start(self):
+            raise root_fatal
+
+        def stop(self):
+            self.stop_calls += 1
+
+        def samples(self):
+            self.samples_calls += 1
+            return []
+
+    class Recorder(_StartRecorder):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.wait_calls = []
+            recorders.append(self)
+
+        def wait(self, timeout):
+            self.wait_calls.append(timeout)
+            return True
+
+    class Monitor(_TrackingMonitor):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            monitors.append(self)
+
+    bus, services, manager = _make_current_start_manager(monkeypatch, Collector)
+    services.config_service.load_config.return_value["output_device_name"] = "Speaker"
+    monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", Recorder)
+    monkeypatch.setattr("app.service.analysis.test_manager.AudioMonitor", Monitor)
+
+    with pytest.raises(Fatal) as raised:
+        manager.start(
+            {
+                "config_id": 1,
+                "sn": "SN1",
+                "factory_start_request_id": "request-1",
+            }
+        )
+
+    assert raised.value is root_fatal
+    assert collectors[0].stop_calls == collectors[0].samples_calls == 1
+    assert recorders[0].capture_owners == []
+    assert len(recorders[0].release_capture_calls) == 1
+    assert recorders[0].captured_block_ready._callbacks == []
+    assert recorders[0].error_occurred._callbacks == []
+    assert recorders[0].stop_calls == 1
+    assert recorders[0].wait_calls == [3000]
+    assert monitors[0].error_occurred._callbacks == []
+    assert monitors[0].stop_calls == 1
+    assert monitors[0].wait_calls == [1000]
+    assert manager._pending_factory_starts == {}
+    _assert_runtime_maps_empty(manager)
+    bus.factory_runtime_auto_analysis_succeeded.emit.assert_not_called()
+    bus.factory_runtime_stopped.emit.assert_not_called()
+
+
+def test_ordinary_start_error_with_broken_text_records_format_then_logger_fatals(
+    monkeypatch,
+):
+    format_fatal = Fatal("fatal while formatting ordinary start error")
+    logger_fatal = Fatal("logger fatal after formatting fatal")
+    root_error = BrokenStringError(format_fatal)
+    collectors = []
+    recorders = []
+    monitors = []
+
+    class Collector:
+        def __init__(self, _config, *, log_callback, sample_callback):
+            self.stop_calls = 0
+            self.samples_calls = 0
+            collectors.append(self)
+
+        def start(self):
+            return True
+
+        def stop(self):
+            self.stop_calls += 1
+
+        def samples(self):
+            self.samples_calls += 1
+            return []
+
+    class Recorder(_StartRecorder):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.wait_calls = []
+            recorders.append(self)
+
+        def wait(self, timeout):
+            self.wait_calls.append(timeout)
+            return True
+
+    class Monitor(_TrackingMonitor):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            monitors.append(self)
+
+    bus, services, manager = _make_current_start_manager(monkeypatch, Collector)
+    services.config_service.load_config.return_value["output_device_name"] = "Speaker"
+    monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", Recorder)
+    monkeypatch.setattr("app.service.analysis.test_manager.AudioMonitor", Monitor)
+
+    def fail_progress(*_args):
+        bus.log.emit.side_effect = logger_fatal
+        raise root_error
+
+    bus.recording_progress.emit.side_effect = fail_progress
+
+    with pytest.raises(Fatal) as raised:
+        manager.start(
+            {
+                "config_id": 1,
+                "sn": "SN1",
+                "factory_start_request_id": "request-1",
+            }
+        )
+
+    assert raised.value is format_fatal
+    assert manager.last_start_error() == "启动失败：<exception text unavailable>"
+    assert any(
+        "logger fatal after formatting fatal" in note
+        for note in getattr(format_fatal, "__notes__", [])
+    )
+    assert collectors[0].stop_calls == collectors[0].samples_calls == 1
+    assert recorders[0].capture_owners == []
+    assert len(recorders[0].release_capture_calls) == 1
+    assert recorders[0].stop_calls == 1
+    assert recorders[0].wait_calls == [3000]
+    assert monitors[0].stop_calls == 1
+    assert monitors[0].wait_calls == [1000]
+    assert manager._pending_factory_starts == {}
+    _assert_runtime_maps_empty(manager)
+
+
+def test_secondary_fatal_note_format_and_add_failures_are_structured_not_recursive(
+    monkeypatch,
+):
+    format_fatal = Fatal("secondary note formatting fatal")
+    add_note_fatal = Fatal("primary add-note fatal")
+    secondary = BrokenStringFatal(format_fatal)
+
+    class NoteFatal(Fatal):
+        def add_note(self, _note):
+            raise add_note_fatal
+
+    class Collector:
+        def __init__(self, _config, *, log_callback, sample_callback):
+            raise AssertionError("collector is not used in this note test")
+
+    primary = NoteFatal("primary fatal")
+    bus, _, manager = _make_current_start_manager(monkeypatch, Collector)
+    failures = [
+        manager._record_cleanup_failure(primary, phase="primary route fatal"),
+        manager._record_cleanup_failure(secondary, phase="secondary route fatal"),
+    ]
+
+    with pytest.raises(Fatal) as raised:
+        manager._raise_first_fatal(failures, context="route fatal merge")
+
+    assert raised.value is primary
+    recorded = [failure.error for failure in failures]
+    assert recorded[:2] == [primary, secondary]
+    assert format_fatal in recorded[2:]
+    assert add_note_fatal in recorded[2:]
+    assert recorded.count(format_fatal) == 1
+    assert recorded.count(add_note_fatal) == 1
+    bus.log.emit.assert_not_called()
+
+
+def _start_established_factory_fatal_manager(
+    monkeypatch,
+    *,
+    monitor_fatal,
+    collector_fatal,
+):
+    collectors = []
+    recorders = []
+    monitors = []
+
+    class Collector:
+        def __init__(self, _config, *, log_callback, sample_callback):
+            self.stop_calls = 0
+            self.samples_calls = 0
+            collectors.append(self)
+
+        def start(self):
+            return True
+
+        def stop(self):
+            self.stop_calls += 1
+            raise collector_fatal
+
+        def samples(self):
+            self.samples_calls += 1
+            return []
+
+    class Recorder(_StartRecorder):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.wait_calls = []
+            recorders.append(self)
+
+        def wait(self, timeout):
+            self.wait_calls.append(timeout)
+            return True
+
+    class Monitor(_TrackingMonitor):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            monitors.append(self)
+
+        def stop(self):
+            self.stop_calls += 1
+            raise monitor_fatal
+
+    bus, services, manager = _make_current_start_manager(monkeypatch, Collector)
+    services.config_service.load_config.return_value["output_device_name"] = "Speaker"
+    monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", Recorder)
+    monkeypatch.setattr("app.service.analysis.test_manager.AudioMonitor", Monitor)
+    assert manager.start(
+        {"config_id": 1, "sn": "SN1", "trigger_source": "manual"}
+    ) is True
+    bus.log.emit.reset_mock()
+    bus.status.emit.reset_mock()
+    bus.factory_runtime_aborted.emit.reset_mock()
+    return bus, manager, collectors, recorders, monitors
+
+
+def test_factory_stop_merges_monitor_then_collector_fatal_before_one_final_raise(
+    monkeypatch,
+):
+    monitor_fatal = Fatal("monitor fatal occurred first")
+    collector_fatal = Fatal("collector fatal occurred later")
+    bus, manager, collectors, recorders, monitors = (
+        _start_established_factory_fatal_manager(
+            monkeypatch,
+            monitor_fatal=monitor_fatal,
+            collector_fatal=collector_fatal,
+        )
+    )
+
+    with pytest.raises(Fatal) as raised:
+        manager.stop_active_run(config_id=1)
+
+    assert raised.value is monitor_fatal
+    assert any(
+        "collector fatal occurred later" in note
+        for note in getattr(monitor_fatal, "__notes__", [])
+    )
+    assert collectors[0].stop_calls == collectors[0].samples_calls == 1
+    assert monitors[0].stop_calls == 1
+    assert monitors[0].wait_calls == [1000]
+    assert recorders[0].stop_calls == 1
+    assert recorders[0].wait_calls == [3000]
+    assert len(recorders[0].release_capture_calls) == 1
+    _assert_runtime_maps_empty(manager)
+    bus.factory_runtime_aborted.emit.assert_called_once()
+    assert bus.status.emit.call_args_list == [call("Error: monitor fatal occurred first")]
+    bus.factory_runtime_auto_analysis_succeeded.emit.assert_not_called()
+    bus.factory_runtime_stopped.emit.assert_not_called()
+
+
+def test_factory_abort_fatal_is_later_than_monitor_and_collector_fatals(
+    monkeypatch,
+):
+    monitor_fatal = Fatal("monitor fatal occurred first")
+    collector_fatal = Fatal("collector fatal occurred second")
+    abort_fatal = Fatal("factory abort slot fatal occurred third")
+    bus, manager, collectors, recorders, monitors = (
+        _start_established_factory_fatal_manager(
+            monkeypatch,
+            monitor_fatal=monitor_fatal,
+            collector_fatal=collector_fatal,
+        )
+    )
+    bus.factory_runtime_aborted.emit.side_effect = abort_fatal
+
+    with pytest.raises(Fatal) as raised:
+        manager.stop_active_run(config_id=1)
+
+    assert raised.value is monitor_fatal
+    notes = "\n".join(getattr(monitor_fatal, "__notes__", []))
+    assert "collector fatal occurred second" in notes
+    assert "factory abort slot fatal occurred third" in notes
+    assert collectors[0].stop_calls == collectors[0].samples_calls == 1
+    assert monitors[0].stop_calls == 1
+    assert monitors[0].wait_calls == [1000]
+    assert recorders[0].stop_calls == 1
+    assert recorders[0].wait_calls == [3000]
+    assert len(recorders[0].release_capture_calls) == 1
+    _assert_runtime_maps_empty(manager)
+    bus.factory_runtime_aborted.emit.assert_called_once()
+    assert bus.status.emit.call_args_list == [call("Error: monitor fatal occurred first")]
+
+
+def test_factory_fatal_merge_uses_safe_notes_for_broken_secondary_text(
+    monkeypatch,
+):
+    monitor_fatal = Fatal("monitor fatal stays primary")
+    collector_format_fatal = Fatal("collector formatting fatal")
+    abort_format_fatal = Fatal("abort formatting fatal")
+    collector_fatal = BrokenStringFatal(collector_format_fatal)
+    abort_fatal = BrokenStringFatal(abort_format_fatal)
+    bus, manager, collectors, recorders, monitors = (
+        _start_established_factory_fatal_manager(
+            monkeypatch,
+            monitor_fatal=monitor_fatal,
+            collector_fatal=collector_fatal,
+        )
+    )
+    bus.factory_runtime_aborted.emit.side_effect = abort_fatal
+
+    with pytest.raises(Fatal) as raised:
+        manager.stop_active_run(config_id=1)
+
+    assert raised.value is monitor_fatal
+    notes = "\n".join(getattr(monitor_fatal, "__notes__", []))
+    assert "current collector stop" in notes
+    assert "factory stop abort signal" in notes
+    assert notes.count("<exception text unavailable>") >= 2
+    recorded = [failure.error for failure in manager._last_fatal_failures]
+    assert collector_fatal in recorded
+    assert abort_fatal in recorded
+    assert collector_format_fatal in recorded
+    assert abort_format_fatal in recorded
+    assert collectors[0].stop_calls == collectors[0].samples_calls == 1
+    assert monitors[0].stop_calls == 1
+    assert monitors[0].wait_calls == [1000]
+    assert recorders[0].stop_calls == 1
+    assert recorders[0].wait_calls == [3000]
+    assert len(recorders[0].release_capture_calls) == 1
+    _assert_runtime_maps_empty(manager)
+    bus.factory_runtime_aborted.emit.assert_called_once()
+    assert bus.status.emit.call_args_list == [call("Error: monitor fatal stays primary")]
