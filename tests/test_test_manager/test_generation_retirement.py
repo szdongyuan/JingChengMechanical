@@ -10,7 +10,7 @@ import pytest
 
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.test_manager import TestManager
-from app.service.current_meter_service import CurrentSample
+from app.service.current_meter_service import CurrentMeterCollector, CurrentSample
 
 from ._support import (
     _CaptureRecorderDoubleMixin,
@@ -581,7 +581,7 @@ class TestGenerationRetirement:
         _assert_no_generation_state(manager)
 
     @pytest.mark.parametrize("cleanup_failure", ["stop", "samples"])
-    def test_pending_terminal_is_not_published_before_external_cleanup_error(
+    def test_pending_terminal_waits_for_cleanup_diagnostic_before_selected_stop(
         self,
         monkeypatch,
         cleanup_failure,
@@ -590,8 +590,10 @@ class TestGenerationRetirement:
         release_start = threading.Event()
         completion_ingress = threading.Event()
         completion_returned = threading.Event()
+        stop_ingress = threading.Event()
         stop_entered = threading.Event()
         release_stop = threading.Event()
+        stop_thread_ref = {}
         collectors = []
         start_results = []
         stop_results = []
@@ -626,6 +628,18 @@ class TestGenerationRetirement:
             return original_ingress(*args, **kwargs)
 
         manager._completion_ingress_is_current_locked = observed_ingress
+        original_pending_lookup = manager._pending_current_for_identity_locked
+
+        def observed_pending_lookup(*args, **kwargs):
+            pending = original_pending_lookup(*args, **kwargs)
+            if (
+                threading.current_thread() is stop_thread_ref.get("thread")
+                and pending is not None
+            ):
+                stop_ingress.set()
+            return pending
+
+        manager._pending_current_for_identity_locked = observed_pending_lookup
         start_thread = threading.Thread(
             target=lambda: start_results.append(
                 manager.start({"config_id": 1, "sn": "SN1"})
@@ -646,7 +660,9 @@ class TestGenerationRetirement:
         stop_thread = threading.Thread(
             target=lambda: stop_results.append(manager.stop_active_run(config_id=1))
         )
+        stop_thread_ref["thread"] = stop_thread
         stop_thread.start()
+        assert stop_ingress.wait(2.0)
 
         release_start.set()
         assert stop_entered.wait(2.0)
@@ -664,9 +680,16 @@ class TestGenerationRetirement:
         assert not completion_thread.is_alive()
         assert not stop_thread.is_alive()
         assert start_results == [False]
-        assert stop_results == [False]
+        assert stop_results == [True]
         assert collectors[0].stop_calls == 1
         assert bus.factory_runtime_auto_analysis_succeeded.emit.call_count == 0
+        bus.factory_runtime_stopped.emit.assert_not_called()
+        assert bus.factory_runtime_aborted.emit.call_count == 0
+        assert bus.status.emit.call_args_list == [call("Stopped")]
+        assert any(
+            "collector cleanup failed" in str(log_call.args[0])
+            for log_call in bus.log.emit.call_args_list
+        )
         assert manager._completed_sessions == {}
         assert manager._current_samples_by_config_id == {}
         assert manager._pending_current_collections == {}
@@ -1193,7 +1216,7 @@ class TestGenerationRetirement:
         assert generation is not session
         assert generation is not recorder
 
-    def test_collector_start_false_fails_start_and_retires_unregistered_generation(
+    def test_collector_start_false_skips_current_and_keeps_audio_run_active(
         self,
         monkeypatch,
     ):
@@ -1213,13 +1236,357 @@ class TestGenerationRetirement:
             def samples(self):
                 return []
 
-        _, _, manager = _make_current_start_manager(monkeypatch, Collector)
+        bus, _, manager = _make_current_start_manager(monkeypatch, Collector)
 
-        assert manager.start({"config_id": 1, "sn": "SN1"}) is False
+        try:
+            assert manager.start({"config_id": 1, "sn": "SN1"}) is True
+            session = manager._sessions[1]
+            recorder = manager._recorders[1]
+            assert recorder.isRunning() is True
+            assert manager._session_generations.get(1) is (
+                session._manager_generation_token
+            )
+            assert collectors[0].stop_calls == 1
+            assert manager._pending_current_collections == {}
+            assert manager._current_collectors == {}
+            assert manager._current_collection_generations == {}
+            assert manager._current_collector_generations == {}
+            assert manager._current_samples_by_config_id == {}
+            bus.factory_runtime_aborted.emit.assert_not_called()
+            assert all(
+                "current collector did not start" not in str(log_call.args[0])
+                for log_call in bus.log.emit.call_args_list
+            )
+        finally:
+            manager.stop(config_id=1, silent=True)
+
         assert collectors[0].stop_calls == 1
+
+    def test_real_current_collector_without_host_skips_current_and_keeps_audio_running(
+        self,
+        monkeypatch,
+    ):
+        bus, _, manager = _make_current_start_manager(
+            monkeypatch,
+            CurrentMeterCollector,
+        )
+
+        try:
+            assert manager.start({"config_id": 1, "sn": "SN1"}) is True
+            assert manager.is_running(config_id=1) is True
+            assert manager._recorders[1].isRunning() is True
+            assert manager._pending_current_collections == {}
+            assert manager._current_collectors == {}
+            assert manager._current_collection_generations == {}
+            assert manager._current_collector_generations == {}
+            assert any(
+                "跳过采集" in str(log_call.args[0])
+                for log_call in bus.log.emit.call_args_list
+            )
+            bus.factory_runtime_aborted.emit.assert_not_called()
+        finally:
+            manager.stop(config_id=1, silent=True)
+
+    @pytest.mark.parametrize("cleanup_failure", ["stop", "samples"])
+    @pytest.mark.parametrize("root_event", ["runtime", "manual", "factory"])
+    def test_pending_root_event_outranks_current_cleanup_diagnostic(
+        self,
+        monkeypatch,
+        root_event,
+        cleanup_failure,
+    ):
+        holder = {}
+        collectors = []
+        cleanup_message = f"collector {cleanup_failure} boom"
+        tagged_samples = [CurrentSample(time_sec=0.1, current_a=2.5)]
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                self.samples_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                manager = holder["manager"]
+                holder["session"] = manager._sessions[1]
+                holder["recorder"] = manager._recorders[1]
+                if root_event == "runtime":
+                    assert manager._on_error(
+                        manager._session_error_routes[1],
+                        "runtime boom",
+                    ) is True
+                elif root_event == "manual":
+                    manager.stop(config_id=1, silent=False)
+                else:
+                    holder["session"]._captured_frame_count = 44100
+                    holder["session"]._run_judgment = MagicMock(
+                        return_value=_successful_judgment()
+                    )
+                    assert manager.stop_active_run(config_id=1) is True
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+                if cleanup_failure == "stop":
+                    raise RuntimeError(cleanup_message)
+
+            def samples(self):
+                self.samples_calls += 1
+                if cleanup_failure == "samples":
+                    raise RuntimeError(cleanup_message)
+                return tagged_samples
+
+        bus, services, manager = _make_current_start_manager(monkeypatch, Collector)
+        holder["manager"] = manager
+        if root_event == "factory":
+            services.config_service.load_config.return_value[
+                "allow_incomplete_recording_analysis"
+            ] = True
+            manager._build_chart_payload = lambda *_args, **_kwargs: {}
+
+        started = manager.start({"config_id": 1, "sn": "SN1"})
+
+        assert started is (root_event == "factory")
+        assert collectors[0].stop_calls == 1
+        assert collectors[0].samples_calls == 1
+        assert manager._sessions == {}
+        assert manager._recorders == {}
+        assert manager._monitors == {}
+        assert manager._session_error_routes == {}
+        assert manager._pending_current_collections == {}
+        assert manager._current_collectors == {}
+        assert manager._session_generations == {}
+        assert manager._current_collection_generations == {}
+        assert manager._current_collector_generations == {}
+        if root_event == "factory" and cleanup_failure == "stop":
+            assert manager._current_samples_by_config_id.get(1) == tagged_samples
+            assert manager._current_sample_generations.get(1) is (
+                holder["session"]._manager_generation_token
+            )
+        else:
+            assert manager._current_samples_by_config_id == {}
+            assert manager._current_sample_generations == {}
+        recorder = holder["recorder"]
+        assert recorder.capture_owners == []
+        assert len(recorder.release_capture_calls) == 1
+        assert recorder.stop_calls == 1
+        assert any(
+            cleanup_message in str(log_call.args[0])
+            for log_call in bus.log.emit.call_args_list
+        )
+
+        if root_event == "runtime":
+            assert bus.status.emit.call_args_list == [call("Error: runtime boom")]
+            bus.factory_runtime_aborted.emit.assert_called_once()
+            abort_payload = bus.factory_runtime_aborted.emit.call_args.args[0]
+            assert abort_payload.error_message == "runtime boom"
+            bus.factory_runtime_stopped.emit.assert_not_called()
+        elif root_event == "manual":
+            assert bus.status.emit.call_args_list == [call("Stopped")]
+            bus.factory_runtime_aborted.emit.assert_called_once()
+            abort_payload = bus.factory_runtime_aborted.emit.call_args.args[0]
+            assert cleanup_message not in str(abort_payload.error_message)
+            bus.factory_runtime_stopped.emit.assert_not_called()
+        else:
+            assert bus.status.emit.call_args_list == [
+                call("Analyzing..."),
+                call("Idle"),
+            ]
+            bus.factory_runtime_auto_analysis_succeeded.emit.assert_called_once()
+            bus.factory_runtime_stopped.emit.assert_not_called()
+            bus.factory_runtime_aborted.emit.assert_not_called()
+            assert manager._completed_sessions.get(1) is holder["session"]
+        if root_event != "factory":
+            bus.factory_runtime_auto_analysis_succeeded.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_error.emit.assert_not_called()
+
+    @pytest.mark.parametrize("cleanup_failure", ["stop", "samples"])
+    def test_registered_collector_cleanup_diagnostic_cannot_zombie_auto_completion(
+        self,
+        monkeypatch,
+        cleanup_failure,
+    ):
+        collectors = []
+        cleanup_message = f"collector {cleanup_failure} boom"
+        tagged_samples = [CurrentSample(time_sec=0.2, current_a=7.5)]
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                self.samples_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+                if cleanup_failure == "stop":
+                    raise RuntimeError(cleanup_message)
+
+            def samples(self):
+                self.samples_calls += 1
+                if cleanup_failure == "samples":
+                    raise RuntimeError(cleanup_message)
+                return tagged_samples
+
+        bus, _, manager = _make_current_start_manager(monkeypatch, Collector)
+        assert manager.start({"config_id": 1, "sn": "SN1"}) is True
+        session = manager._sessions[1]
+        recorder = manager._recorders[1]
+        generation = manager._session_generations[1]
+        session._captured_frame_count = 20
+        session._run_judgment = MagicMock(return_value=_successful_judgment())
+        completion = session._on_session_done_cb
+        completion_errors = []
+        completion_returned = threading.Event()
+
+        def complete():
+            try:
+                completion(1)
+            except BaseException as exc:
+                completion_errors.append(exc)
+            finally:
+                completion_returned.set()
+
+        worker = threading.Thread(target=complete, daemon=True)
+        worker.start()
+        assert completion_returned.wait(2.0), "auto completion did not settle"
+        worker.join(2.0)
+
+        assert not worker.is_alive()
+        assert completion_errors == []
+        assert collectors[0].stop_calls == 1
+        assert collectors[0].samples_calls == 1
+        assert manager._sessions == {}
+        assert manager._recorders == {}
+        assert manager._monitors == {}
+        assert manager._session_error_routes == {}
+        assert manager._pending_current_collections == {}
+        assert manager._current_collectors == {}
+        assert manager._current_collection_generations == {}
+        assert manager._current_collector_generations == {}
+        assert manager._session_generations == {}
+        assert manager._completed_sessions.get(1) is session
+        assert recorder.capture_owners == []
+        assert len(recorder.release_capture_calls) == 1
+        assert recorder.stop_calls == 1
+        assert any(
+            cleanup_message in str(log_call.args[0])
+            for log_call in bus.log.emit.call_args_list
+        )
+        bus.factory_runtime_auto_analysis_succeeded.emit.assert_called_once()
+        bus.factory_runtime_auto_analysis_no_result.emit.assert_not_called()
+        bus.factory_runtime_auto_analysis_error.emit.assert_not_called()
+        bus.factory_runtime_aborted.emit.assert_not_called()
+        session._run_judgment.assert_called_once()
+
+        if cleanup_failure == "stop":
+            assert manager._current_samples_by_config_id.get(1) == tagged_samples
+            assert manager._current_sample_generations.get(1) is generation
+        else:
+            assert 1 not in manager._current_samples_by_config_id
+            assert 1 not in manager._current_sample_generations
+
+    @pytest.mark.parametrize(
+        "fatal",
+        [
+            pytest.param(SystemExit("fatal system exit"), id="system-exit"),
+            pytest.param(None, id="custom-base-exception"),
+        ],
+    )
+    def test_collector_start_base_exception_rolls_back_then_propagates_same_object(
+        self,
+        monkeypatch,
+        fatal,
+    ):
+        class Fatal(BaseException):
+            pass
+
+        if fatal is None:
+            fatal = Fatal("fatal collector start")
+        collectors = []
+        recorders = []
+        monitors = []
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                self.samples_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                raise fatal
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                self.samples_calls += 1
+                return []
+
+        class Recorder(_StartRecorder):
+            def __init__(self, **kwargs):
+                super().__init__(**kwargs)
+                recorders.append(self)
+
+        class Monitor:
+            def __init__(self, **_kwargs):
+                self.error_occurred = _DummySignal()
+                self.start_calls = 0
+                self.stop_calls = 0
+                self.wait_calls = []
+                monitors.append(self)
+
+            def feed(self, _chunk):
+                return None
+
+            def start(self):
+                self.start_calls += 1
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def wait(self, timeout):
+                self.wait_calls.append(timeout)
+                return True
+
+        _, services, manager = _make_current_start_manager(monkeypatch, Collector)
+        services.config_service.load_config.return_value["output_device_name"] = (
+            "Speaker"
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.AudioRecorder",
+            Recorder,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.AudioMonitor",
+            Monitor,
+        )
+
+        with pytest.raises(type(fatal)) as raised:
+            manager.start({"config_id": 1, "sn": "SN1"})
+
+        assert raised.value is fatal
+        assert len(collectors) == len(recorders) == len(monitors) == 1
+        assert collectors[0].stop_calls == 1
+        assert collectors[0].samples_calls == 1
+        assert recorders[0].capture_owners == []
+        assert len(recorders[0].release_capture_calls) == 1
+        assert recorders[0].stop_calls == 1
+        assert monitors[0].start_calls == 0
+        assert monitors[0].stop_calls == 1
+        assert monitors[0].wait_calls == [1000]
+        assert manager._sessions == {}
+        assert manager._recorders == {}
+        assert manager._monitors == {}
+        assert manager._shared_recorders == {}
+        assert manager._session_error_routes == {}
         assert manager._pending_current_collections == {}
         assert manager._current_collectors == {}
         assert manager._current_samples_by_config_id == {}
+        assert manager._staged_current_samples_by_generation == {}
+        assert manager._completion_claims == set()
         _assert_no_generation_state(manager)
 
     def test_collector_start_failure_retires_failed_run_generation_state(

@@ -317,11 +317,6 @@ class _PendingCurrentTerminalSnapshot:
     continuation_kind: str | None
     continuation_request_id: object | None
 
-    @property
-    def error(self) -> BaseException | None:
-        return self.start_error if self.start_error is not None else self.cleanup_error
-
-
 class _PendingCurrentCollection:
     """Exact collector ownership until one complete terminal snapshot is published."""
 
@@ -868,16 +863,25 @@ class TestManager(QObject):
                 if state in {"completed", "completing"}:
                     return True
                 return False
-        except Exception as exc:
+        except BaseException as exc:
             self._bus.log.emit(f"[TestManager] ERROR starting config {config_id}: {exc}")
-            self._cleanup_failed_start_setup(
-                config_id,
-                session,
-                recorder,
-                monitor,
-                requested_capture=requested_capture,
-                error_route=error_route,
-            )
+            try:
+                self._cleanup_failed_start_setup(
+                    config_id,
+                    session,
+                    recorder,
+                    monitor,
+                    requested_capture=requested_capture,
+                    error_route=error_route,
+                )
+            except BaseException as cleanup_exc:
+                self._bus.log.emit(
+                    f"[TestManager] ERROR failed start rollback for "
+                    f"config={config_id}: {cleanup_exc}"
+                )
+            self._clear_pending_factory_start(request_id)
+            if not isinstance(exc, Exception):
+                raise
             return self._fail_start_before_acceptance(
                 request_id,
                 f"启动失败：{exc}",
@@ -3439,12 +3443,10 @@ class TestManager(QObject):
             collector_started = False
             start_error = exc
 
-        if not collector_started and start_error is None:
-            start_error = RuntimeError("current collector did not start")
-
         cleanup_claim = None
         cleanup_result = None
         cleanup_error = None
+        cleanup_call_error = None
         selected_continuation = None
         with self._lifecycle_lock:
             pending_is_current = (
@@ -3458,7 +3460,6 @@ class TestManager(QObject):
             selected_continuation = self._select_pending_current_continuation_locked(
                 pending,
                 start_error=start_error,
-                cleanup_error=None,
             )
             can_register = (
                 start_error is None
@@ -3525,19 +3526,28 @@ class TestManager(QObject):
         try:
             cleanup_result = self._stop_current_collection_claim(cleanup_claim)
         except BaseException as exc:
-            cleanup_error = exc
+            cleanup_call_error = exc
             cleanup_result = cleanup_claim._cleanup_result
+        cleanup_error = (
+            cleanup_call_error
+            if cleanup_call_error is not None
+            else (
+                cleanup_result.error
+                if cleanup_result is not None
+                else None
+            )
+        )
 
         with self._lifecycle_lock:
             selected_continuation = self._select_pending_current_continuation_locked(
                 pending,
                 start_error=start_error,
-                cleanup_error=cleanup_error,
             )
             terminal_kind = self._pending_current_terminal_kind(
                 start_error=start_error,
                 cleanup_error=cleanup_error,
                 continuation=selected_continuation,
+                start_succeeded=bool(collector_started),
                 pending_is_current=(
                     self._pending_current_collections.get(config_id) is pending
                 ),
@@ -3567,6 +3577,11 @@ class TestManager(QObject):
                 ),
             )
             pending.stage_terminal(snapshot)
+            if (
+                selected_continuation is None
+                and self._pending_current_collections.get(config_id) is pending
+            ):
+                self._pending_current_collections.pop(config_id, None)
 
         pending.publish_terminal(snapshot)
         if selected_continuation is not None:
@@ -3579,8 +3594,8 @@ class TestManager(QObject):
             if cleanup_error is not None:
                 raise start_error from cleanup_error
             raise start_error
-        if cleanup_error is not None:
-            raise cleanup_error
+        if cleanup_call_error is not None and selected_continuation is None:
+            raise cleanup_call_error
 
     @staticmethod
     def _pending_current_terminal_kind(
@@ -3588,39 +3603,39 @@ class TestManager(QObject):
         start_error,
         cleanup_error,
         continuation,
+        start_succeeded,
         pending_is_current,
     ) -> str:
         if start_error is not None:
-            return "failed_start"
-        if cleanup_error is not None and continuation is None:
-            return "cleanup_error"
-        if continuation is not None:
-            if cleanup_error is not None:
-                return f"{continuation.kind}_cleanup_error"
-            return continuation.kind
-        if not pending_is_current:
-            return "superseded"
-        return "stopped"
+            root_kind = "failed_start"
+        elif continuation is not None:
+            root_kind = continuation.kind
+        elif not pending_is_current:
+            root_kind = "superseded"
+        elif not start_succeeded:
+            root_kind = "skipped"
+        else:
+            root_kind = "stopped"
+        if cleanup_error is not None:
+            return f"{root_kind}_cleanup_error"
+        return root_kind
 
     @staticmethod
     def _select_pending_current_continuation_locked(
         pending: _PendingCurrentCollection,
         *,
         start_error,
-        cleanup_error,
     ):
         # Failed startup is terminal without a run continuation.  Runtime
         # errors outrank accepted stops, and stops outrank successful
-        # completion.  A collector cleanup error suppresses completion, while
-        # stop/error continuations still run so they can publish one abort.
+        # completion.  Collector cleanup errors are attached diagnostics and
+        # never participate in root-outcome selection.
         if start_error is not None:
             return None
         if pending.error_continuation is not None:
             return pending.error_continuation
         if pending.stop_continuation is not None:
             return pending.stop_continuation
-        if cleanup_error is not None:
-            return None
         return pending.completion_continuation
 
     def _pending_current_for_identity_locked(
@@ -3868,8 +3883,6 @@ class TestManager(QObject):
             result = claim._cleanup_result
             if result is None:
                 raise RuntimeError("collector cleanup completed without a result")
-            if result.error is not None:
-                raise result.error
             return result
 
         stop_error = None
@@ -3900,7 +3913,11 @@ class TestManager(QObject):
                     )
                     is claim.generation
                 )
-                if claim.retain_samples and still_owned and result.error is None:
+                if (
+                    claim.retain_samples
+                    and still_owned
+                    and result.samples_error is None
+                ):
                     prior_completed_session = self._completed_sessions.get(
                         claim.config_id
                     )
@@ -3928,6 +3945,17 @@ class TestManager(QObject):
                         claim.config_id,
                         claim.generation,
                     )
+            if result.stop_error is not None:
+                self._bus.log.emit(
+                    f"[CurrentMeter] cleanup diagnostic for "
+                    f"config={claim.config_id}: stop failed: {result.stop_error}"
+                )
+            if result.samples_error is not None:
+                self._bus.log.emit(
+                    f"[CurrentMeter] cleanup diagnostic for "
+                    f"config={claim.config_id}: samples failed: "
+                    f"{result.samples_error}"
+                )
             if result.error is None:
                 self._bus.log.emit(
                     f"[CurrentMeter] stopped for config={claim.config_id}, "
@@ -3944,8 +3972,6 @@ class TestManager(QObject):
                 claim._cleanup_result = result
             claim._cleanup_complete.set()
 
-        if result.error is not None:
-            raise result.error
         return result
 
     def _current_trace_payload(
