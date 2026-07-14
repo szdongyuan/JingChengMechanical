@@ -23,6 +23,18 @@ from ._support import (
 )
 
 
+_TEST_CURRENT_EPOCH = 100.0
+
+
+def _raw_current_sample(time_sec: float, current_a: float) -> CurrentSample:
+    completed_monotonic = _TEST_CURRENT_EPOCH + float(time_sec)
+    return CurrentSample(
+        time_sec=completed_monotonic - _TEST_CURRENT_EPOCH,
+        current_a=current_a,
+        monotonic_time=completed_monotonic,
+    )
+
+
 def _successful_judgment() -> JudgmentResult:
     return JudgmentResult(
         overall="合格",
@@ -88,6 +100,12 @@ def _make_current_start_manager(monkeypatch, collector_type):
     monkeypatch.setattr(
         "app.service.analysis.test_manager.TestSession",
         _FakeSession,
+    )
+    monkeypatch.setattr(
+        _FakeSession,
+        "current_epoch",
+        property(lambda _self: _TEST_CURRENT_EPOCH),
+        raising=False,
     )
     monkeypatch.setattr(
         "app.service.analysis.test_manager.CurrentMeterCollector",
@@ -273,7 +291,7 @@ class TestGenerationRetirement:
     def test_collector_start_reentrant_completion_retains_trace_once(self, monkeypatch):
         holder = {}
         collectors = []
-        tagged_samples = [CurrentSample(time_sec=0.1, current_a=4.5)]
+        tagged_samples = [_raw_current_sample(0.1, 4.5)]
 
         class Collector:
             def __init__(self, _config, *, log_callback, sample_callback):
@@ -311,7 +329,7 @@ class TestGenerationRetirement:
         assert reviews[0]["values_a"] == [4.5]
         assert collectors[0].stop_calls == 1
         assert manager._completed_sessions.get(1) is not None
-        assert manager._current_samples_by_config_id.get(1) is tagged_samples
+        assert manager._current_samples_by_config_id.get(1) == tagged_samples
         assert manager._current_collection_generations == {}
         assert manager._current_collector_generations == {}
         assert getattr(manager, "_pending_current_collections", {}) == {}
@@ -321,7 +339,7 @@ class TestGenerationRetirement:
         monkeypatch,
     ):
         holder = {}
-        tagged_samples = [CurrentSample(time_sec=0.15, current_a=5.5)]
+        tagged_samples = [_raw_current_sample(0.15, 5.5)]
 
         class Collector:
             def __init__(self, _config, *, log_callback, sample_callback):
@@ -392,7 +410,7 @@ class TestGenerationRetirement:
         replacement_session = manager._completed_sessions[1]
         replacement_generation = replacement_session._manager_generation_token
         assert replacement_session is not prior_session
-        assert manager._current_samples_by_config_id[1] is tagged_samples
+        assert manager._current_samples_by_config_id[1] == tagged_samples
         assert manager._current_sample_generations[1] is replacement_generation
         assert manager._staged_current_samples_by_generation == {}
 
@@ -403,7 +421,7 @@ class TestGenerationRetirement:
         start_entered = threading.Event()
         release_start = threading.Event()
         completion_ingress = threading.Event()
-        tagged_samples = [CurrentSample(time_sec=0.2, current_a=6.25)]
+        tagged_samples = [_raw_current_sample(0.2, 6.25)]
         collectors = []
 
         class Collector:
@@ -465,7 +483,7 @@ class TestGenerationRetirement:
         assert len(reviews) == 1
         assert reviews[0]["values_a"] == [6.25]
         assert collectors[0].stop_calls == 1
-        assert manager._current_samples_by_config_id.get(1) is tagged_samples
+        assert manager._current_samples_by_config_id.get(1) == tagged_samples
         assert manager._current_collection_generations == {}
         assert manager._current_collector_generations == {}
         assert getattr(manager, "_pending_current_collections", {}) == {}
@@ -477,7 +495,7 @@ class TestGenerationRetirement:
         holder = {}
         collectors = []
         stop_results = []
-        tagged_samples = [CurrentSample(time_sec=0.25, current_a=7.75)]
+        tagged_samples = [_raw_current_sample(0.25, 7.75)]
 
         class Collector:
             def __init__(self, _config, *, log_callback, sample_callback):
@@ -551,7 +569,7 @@ class TestGenerationRetirement:
                 session._on_session_done_cb(1)
 
             def samples(self):
-                return [CurrentSample(time_sec=0.1, current_a=8.0)]
+                return [_raw_current_sample(0.1, 8.0)]
 
         bus, _, manager = _make_current_start_manager(monkeypatch, Collector)
         holder["manager"] = manager
@@ -618,7 +636,7 @@ class TestGenerationRetirement:
             def samples(self):
                 if cleanup_failure == "samples":
                     raise RuntimeError("collector cleanup failed")
-                return [CurrentSample(time_sec=0.2, current_a=9.5)]
+                return [_raw_current_sample(0.2, 9.5)]
 
         bus, _, manager = _make_current_start_manager(monkeypatch, Collector)
         original_ingress = manager._completion_ingress_is_current_locked
@@ -715,7 +733,7 @@ class TestGenerationRetirement:
         holder = {}
         collectors = []
         action_results = []
-        tagged_samples = [CurrentSample(time_sec=0.3, current_a=11.0)]
+        tagged_samples = [_raw_current_sample(0.3, 11.0)]
 
         class Collector:
             def __init__(self, _config, *, log_callback, sample_callback):
@@ -810,10 +828,7 @@ class TestGenerationRetirement:
             start_results = []
             stop_results = []
             tagged_samples = [
-                CurrentSample(
-                    time_sec=0.4,
-                    current_a=20.0 + round_index,
-                )
+                _raw_current_sample(0.4, 20.0 + round_index)
             ]
 
             class Collector:
@@ -1028,7 +1043,7 @@ class TestGenerationRetirement:
                 self.stop_calls += 1
 
             def samples(self):
-                return [CurrentSample(time_sec=0.1, current_a=9.0)]
+                return [_raw_current_sample(0.1, 9.0)]
 
         _, _, manager = _make_current_start_manager(monkeypatch, Collector)
         holder["manager"] = manager
@@ -1173,7 +1188,7 @@ class TestGenerationRetirement:
         _assert_no_generation_state(manager)
         assert 1 not in manager._current_samples_by_config_id
 
-    def test_enabled_completion_retires_live_maps_and_keeps_only_sample_token(
+    def test_enabled_completion_retires_live_maps_and_drops_legacy_current_sample(
         self,
         monkeypatch,
     ):
@@ -1209,8 +1224,8 @@ class TestGenerationRetirement:
         assert 1 not in manager._session_generations
         assert 1 not in manager._current_collection_generations
         assert 1 not in manager._current_collector_generations
-        assert manager._current_sample_generations.get(1) is generation
-        assert manager._current_samples_by_config_id.get(1) == ["completed-sample"]
+        assert 1 not in manager._current_sample_generations
+        assert 1 not in manager._current_samples_by_config_id
         assert generation is route.generation
         assert generation is not route
         assert generation is not session
@@ -1298,7 +1313,7 @@ class TestGenerationRetirement:
         holder = {}
         collectors = []
         cleanup_message = f"collector {cleanup_failure} boom"
-        tagged_samples = [CurrentSample(time_sec=0.1, current_a=2.5)]
+        tagged_samples = [_raw_current_sample(0.1, 2.5)]
 
         class Collector:
             def __init__(self, _config, *, log_callback, sample_callback):
@@ -1408,7 +1423,7 @@ class TestGenerationRetirement:
     ):
         collectors = []
         cleanup_message = f"collector {cleanup_failure} boom"
-        tagged_samples = [CurrentSample(time_sec=0.2, current_a=7.5)]
+        tagged_samples = [_raw_current_sample(0.2, 7.5)]
 
         class Collector:
             def __init__(self, _config, *, log_callback, sample_callback):

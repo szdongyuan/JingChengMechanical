@@ -38,6 +38,7 @@ from app.service.current_meter_service import (
     CurrentMeterCollector,
     build_current_trace_payload,
     normalize_current_meter_config,
+    rebase_current_samples,
 )
 from app.service.factory_review_payloads import FactoryReviewPayload, FactoryReviewWindow
 from consts.running_consts import base_dir
@@ -4157,13 +4158,15 @@ class TestManager(QObject):
         if isinstance(run_id, str) and run_id:
             sample_callback = (
                 lambda _sample, samples_snapshot, cid=config_id, rid=run_id,
-                cfg=current_meter_config, expected_generation=generation:
+                cfg=current_meter_config, expected_generation=generation,
+                expected_session=session:
                 self._emit_current_trace_update(
                     cid,
                     rid,
                     samples_snapshot,
                     cfg,
                     expected_generation=expected_generation,
+                    session=expected_session,
                 )
             )
         collector = CurrentMeterCollector(
@@ -4741,6 +4744,18 @@ class TestManager(QObject):
                 )
                 failures.append(samples_failure)
 
+            if samples_failure is None:
+                samples = self._effective_current_samples(
+                    claim.config_id,
+                    samples,
+                    session=claim.session,
+                )
+                if (
+                    claim.retain_samples
+                    and not self._session_has_retained_capture(claim.session)
+                ):
+                    samples = []
+
             if stop_failure is not None:
                 label = "fatal cleanup" if stop_failure.is_fatal else "cleanup diagnostic"
                 self._report_cleanup_safely(
@@ -4858,6 +4873,7 @@ class TestManager(QObject):
         normalized_config_id = self._as_non_bool_int(config_id)
         if normalized_config_id is None:
             return None
+        gate_session = session
         with self._lifecycle_lock:
             if session is None:
                 completed_session = self._completed_sessions.get(normalized_config_id)
@@ -4877,6 +4893,7 @@ class TestManager(QObject):
                         samples = []
                 else:
                     active_session = self._sessions.get(normalized_config_id)
+                    gate_session = active_session
                     active_generation = self._run_generation_token(active_session)
                     if (
                         active_session is not None
@@ -4934,8 +4951,39 @@ class TestManager(QObject):
                 else:
                     samples = []
         if collector is not None:
-            samples = collector.samples()
+            samples = self._effective_current_samples(
+                normalized_config_id,
+                collector.samples(),
+                session=gate_session,
+            )
         return build_current_trace_payload(samples, config=current_meter)
+
+    def _effective_current_samples(self, config_id, raw_samples, *, session=None):
+        if session is None:
+            with self._lifecycle_lock:
+                session = self._sessions.get(config_id)
+        if session is None:
+            return []
+        epoch = getattr(session, "current_epoch", None)
+        epoch = epoch() if callable(epoch) else epoch
+        if epoch is None:
+            return []
+        return rebase_current_samples(raw_samples, current_epoch=epoch)
+
+    @staticmethod
+    def _session_has_retained_capture(session) -> bool:
+        finalization = getattr(
+            session,
+            "_manager_capture_finalization_state",
+            None,
+        )
+        if isinstance(finalization, _CaptureFinalizationState) and finalization.complete:
+            buffer = finalization.buffer
+            return isinstance(buffer, np.ndarray) and buffer.shape[0] > 0
+        try:
+            return int(getattr(session, "captured_frame_count", 0)) > 0
+        except (TypeError, ValueError):
+            return False
 
     def _emit_current_trace_update(
         self,
@@ -4945,6 +4993,7 @@ class TestManager(QObject):
         current_meter: dict | None,
         *,
         expected_generation=None,
+        session=None,
     ) -> None:
         if not isinstance(run_id, str) or not run_id:
             return
@@ -4955,6 +5004,11 @@ class TestManager(QObject):
                     is not expected_generation
                 ):
                     return
+        samples = self._effective_current_samples(
+            config_id,
+            samples,
+            session=session,
+        )
         payload = build_current_trace_payload(samples, config=current_meter)
         if payload is None:
             return

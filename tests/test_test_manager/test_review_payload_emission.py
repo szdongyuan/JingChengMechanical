@@ -8,6 +8,7 @@ import pytest
 
 from app.service.analysis import dsp, stft_score
 from app.service.analysis.frames import ChannelJudgment, JudgmentResult
+from app.service.analysis.session_capture import RecorderAttachment, ResolvedCaptureBounds
 from app.service.analysis.test_manager import TestManager
 from app.service.current_meter_service import CurrentSample, build_current_trace_payload
 
@@ -56,6 +57,11 @@ def test_start_current_collection_emits_live_current_trace_update_with_run_id(mo
     )
 
     manager = TestManager(bus, services)
+    attachment = RecorderAttachment(
+        request_monotonic=10.0,
+        warmup_samples=5,
+        target_samples=100,
+    )
     session = SimpleNamespace(
         _config={
             "config_id": 7,
@@ -66,16 +72,36 @@ def test_start_current_collection_emits_live_current_trace_update_with_run_id(mo
             },
         },
         _workorder={"factory_run_id": "run-live"},
+        current_epoch=attachment.current_epoch,
     )
     manager._sessions[7] = session
     _bind_manager_run_generation(manager, 7, session)
 
     manager._start_current_collection(7, session)
     FakeCollector.instances[0].sample_callback(
-        CurrentSample(time_sec=0.0, current_a=1.642),
+        CurrentSample(time_sec=0.01, current_a=1.0, monotonic_time=10.049),
         (
-            CurrentSample(time_sec=0.0, current_a=1.642),
-            CurrentSample(time_sec=0.2, current_a=1.7),
+            CurrentSample(time_sec=0.01, current_a=1.0, monotonic_time=10.049),
+            CurrentSample(time_sec=0.02, current_a=1.642, monotonic_time=10.075),
+        ),
+    )
+
+    bus.current_trace_updated.emit.assert_not_called()
+
+    attachment._resolve_once(
+        ResolvedCaptureBounds(
+            attach_sample=20,
+            attach_monotonic=10.0,
+            warmup_samples=5,
+            target_samples=100,
+        )
+    )
+    FakeCollector.instances[0].sample_callback(
+        CurrentSample(time_sec=0.03, current_a=1.7, monotonic_time=10.125),
+        (
+            CurrentSample(time_sec=0.01, current_a=1.0, monotonic_time=10.049),
+            CurrentSample(time_sec=0.02, current_a=1.642, monotonic_time=10.075),
+            CurrentSample(time_sec=0.03, current_a=1.7, monotonic_time=10.125),
         ),
     )
 
@@ -83,7 +109,7 @@ def test_start_current_collection_emits_live_current_trace_update_with_run_id(mo
         7,
         "run-live",
         {
-            "times_sec": [0.0, 0.2],
+            "times_sec": [0.025, 0.075],
             "values_a": [1.642, 1.7],
             "average_a": 1.671,
             "max_a": 1.7,
@@ -126,8 +152,8 @@ def test_start_current_collection_emits_live_current_trace_with_raw_meter_unit(m
         "scale": 1.0,
     }
     samples = (
-        CurrentSample(time_sec=0.0, current_a=1.642),
-        CurrentSample(time_sec=0.2, current_a=1.7),
+        CurrentSample(time_sec=99.0, current_a=1.642, monotonic_time=10.0),
+        CurrentSample(time_sec=99.2, current_a=1.7, monotonic_time=10.2),
     )
 
     manager = TestManager(bus, services)
@@ -138,6 +164,7 @@ def test_start_current_collection_emits_live_current_trace_with_raw_meter_unit(m
             "current_meter": raw_current_meter,
         },
         _workorder={"factory_run_id": "run-live"},
+        current_epoch=lambda: 10.0,
     )
     manager._sessions[7] = session
     _bind_manager_run_generation(manager, 7, session)
@@ -145,7 +172,13 @@ def test_start_current_collection_emits_live_current_trace_with_raw_meter_unit(m
     manager._start_current_collection(7, session)
     FakeCollector.instances[0].sample_callback(samples[-1], samples)
 
-    expected_payload = build_current_trace_payload(samples, config=raw_current_meter)
+    expected_payload = build_current_trace_payload(
+        (
+            CurrentSample(0.0, 1.642, 10.0),
+            CurrentSample(0.2, 1.7, 10.2),
+        ),
+        config=raw_current_meter,
+    )
     assert expected_payload["unit"] == "A"
     bus.current_trace_updated.emit.assert_called_once_with(
         7,
@@ -206,6 +239,103 @@ def test_start_current_collection_does_not_emit_live_current_when_meter_disabled
 
     assert FakeCollector.instances == []
     bus.current_trace_updated.emit.assert_not_called()
+
+
+def test_stop_current_collection_stores_the_same_rebased_set_used_by_review(monkeypatch):
+    bus = _mock_bus()
+    services = _mock_services(bus)
+    raw_samples = [
+        CurrentSample(0.01, 1.0, 10.049),
+        CurrentSample(0.02, 2.0, 10.050),
+        CurrentSample(0.08, 3.0, 10.125),
+    ]
+
+    class FakeCollector:
+        def __init__(self, _config, *, sample_callback=None, log_callback=None):
+            self.sample_callback = sample_callback
+
+        def start(self):
+            return True
+
+        def stop(self):
+            return None
+
+        def samples(self):
+            return list(raw_samples)
+
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.CurrentMeterCollector",
+        FakeCollector,
+    )
+    manager = TestManager(bus, services)
+    session = SimpleNamespace(
+        _config={
+            "config_id": 7,
+            "current_meter": {"enabled": True, "host": "127.0.0.1"},
+        },
+        _workorder={"factory_run_id": "run-current-stop"},
+        current_epoch=lambda: 10.050,
+        captured_frame_count=1,
+    )
+    manager._sessions[7] = session
+    generation = _bind_manager_run_generation(manager, 7, session)
+    manager._start_current_collection(7, session)
+
+    active_payload = manager._current_trace_payload(
+        7,
+        current_meter=session._config["current_meter"],
+        session=session,
+    )
+
+    with manager._lifecycle_lock:
+        claim = manager._detach_current_collection_locked(
+            7,
+            session=session,
+            generation=generation,
+            retain_samples=True,
+        )
+    cleanup = manager._stop_current_collection_claim(claim)
+
+    assert [
+        (sample.time_sec, sample.current_a, sample.monotonic_time)
+        for sample in cleanup.samples
+    ] == [
+        (pytest.approx(0.0), 2.0, 10.050),
+        (pytest.approx(0.075), 3.0, 10.125),
+    ]
+    assert manager._current_samples_by_config_id[7] == cleanup.samples
+    stored_payload = manager._current_trace_payload(
+        7,
+        current_meter=session._config["current_meter"],
+        session=session,
+    )
+    assert active_payload == build_current_trace_payload(
+        cleanup.samples,
+        config=session._config["current_meter"],
+    )
+    assert stored_payload == active_payload
+
+
+def test_effective_current_samples_keep_each_session_epoch_isolated():
+    bus = _mock_bus()
+    manager = TestManager(bus, _mock_services(bus))
+    first = SimpleNamespace(current_epoch=lambda: 10.05)
+    second = SimpleNamespace(current_epoch=lambda: 20.05)
+    manager._sessions[1] = first
+    manager._sessions[2] = second
+    raw = [
+        CurrentSample(0.0, 1.0, 10.10),
+        CurrentSample(0.0, 2.0, 20.10),
+    ]
+
+    assert [sample.current_a for sample in manager._effective_current_samples(1, raw)] == [
+        1.0,
+        2.0,
+    ]
+    manager._completed_sessions[1] = manager._sessions.pop(1)
+    assert [sample.current_a for sample in manager._effective_current_samples(2, raw)] == [
+        2.0,
+    ]
 
 
 class TestReviewPayloadEmission:

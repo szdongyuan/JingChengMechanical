@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from threading import Event, Thread
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
 
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.test_manager import TestManager
+from app.service.current_meter_service import CurrentSample
 
 from ._support import (
     _expected_no_result_payload,
@@ -17,6 +19,62 @@ from ._support import (
 
 
 class TestTestManagerStartStop:
+    def test_current_cleanup_discards_clock_edge_sample_when_capture_freezes_empty(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        mgr = TestManager(bus, _mock_services(bus))
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                pass
+
+            def start(self):
+                return True
+
+            def stop(self):
+                return None
+
+            def samples(self):
+                return [CurrentSample(0.05, 1.5, 10.05)]
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.CurrentMeterCollector",
+            Collector,
+        )
+        session = SimpleNamespace(
+            _config={
+                "config_id": 1,
+                "current_meter": {"enabled": True, "host": "127.0.0.1"},
+            },
+            _workorder={"factory_run_id": "empty-capture"},
+            current_epoch=lambda: 10.05,
+            captured_frame_count=99,
+            freeze_capture=MagicMock(return_value=0),
+        )
+        mgr._sessions[1] = session
+        generation = object()
+        session._manager_generation_token = generation
+        mgr._session_generations[1] = generation
+        mgr._start_current_collection(1, session)
+
+        recorder = MagicMock()
+        recorder._n_channels = 1
+        captured = mgr._freeze_and_capture_session_buffer(session, recorder)
+        with mgr._lifecycle_lock:
+            claim = mgr._detach_current_collection_locked(
+                1,
+                session=session,
+                generation=generation,
+                retain_samples=True,
+            )
+        cleanup = mgr._stop_current_collection_claim(claim)
+
+        assert captured.shape == (0, 1)
+        assert cleanup.samples == []
+        assert 1 not in mgr._current_samples_by_config_id
+
     def test_stop_one_detaches_only_old_generation_current_state_before_cleanup(
         self,
         monkeypatch,
