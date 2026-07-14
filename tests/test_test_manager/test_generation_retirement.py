@@ -3,7 +3,7 @@ from __future__ import annotations
 import gc
 import threading
 import weakref
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import numpy as np
 import pytest
@@ -470,13 +470,433 @@ class TestGenerationRetirement:
         assert manager._current_collector_generations == {}
         assert getattr(manager, "_pending_current_collections", {}) == {}
 
+    def test_collector_start_reentrant_factory_stop_defers_entire_stop_until_trace_is_ready(
+        self,
+        monkeypatch,
+    ):
+        holder = {}
+        collectors = []
+        stop_results = []
+        tagged_samples = [CurrentSample(time_sec=0.25, current_a=7.75)]
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                manager = holder["manager"]
+                session = manager._sessions[1]
+                session._captured_frame_count = 44100
+                session._run_judgment = MagicMock(return_value=_successful_judgment())
+                stop_results.append(manager.stop_active_run(config_id=1))
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return tagged_samples
+
+        bus, services, manager = _make_current_start_manager(monkeypatch, Collector)
+        holder["manager"] = manager
+        config = services.config_service.load_config.return_value
+        config["allow_incomplete_recording_analysis"] = True
+        manager._build_chart_payload = lambda *_args, **_kwargs: {}
+
+        assert manager.start({"config_id": 1, "sn": "SN1"}) is True
+
+        completed_session = manager._completed_sessions[1]
+        trace = manager._current_trace_payload(
+            1,
+            current_meter=config["current_meter"],
+            session=completed_session,
+        )
+        assert stop_results == [True]
+        assert completed_session._audio_data_id == "audio-123"
+        assert trace is not None
+        assert trace["values_a"] == [7.75]
+        assert bus.factory_runtime_auto_analysis_succeeded.emit.call_count == 1
+        assert bus.status.emit.call_args_list == [
+            call("Analyzing..."),
+            call("Idle"),
+        ]
+        assert collectors[0].stop_calls == 1
+        assert manager._pending_current_collections == {}
+        assert manager._current_collection_generations == {}
+        assert manager._current_collector_generations == {}
+        assert manager._session_generations == {}
+
+    def test_collector_stop_reentrant_completion_never_waits_on_its_owner_thread(
+        self,
+        monkeypatch,
+    ):
+        holder = {}
+        collectors = []
+        start_results = []
+        finished = threading.Event()
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                raise RuntimeError("collector start failed")
+
+            def stop(self):
+                self.stop_calls += 1
+                session = holder["manager"]._sessions[1]
+                session._captured_frame_count = 1
+                session._on_session_done_cb(1)
+
+            def samples(self):
+                return [CurrentSample(time_sec=0.1, current_a=8.0)]
+
+        bus, _, manager = _make_current_start_manager(monkeypatch, Collector)
+        holder["manager"] = manager
+        worker = threading.Thread(
+            target=lambda: (
+                start_results.append(manager.start({"config_id": 1, "sn": "SN1"})),
+                finished.set(),
+            ),
+            daemon=True,
+        )
+        worker.start()
+        try:
+            assert finished.wait(1.0), "collector.stop completion deadlocked its owner"
+        finally:
+            if worker.is_alive():
+                pending = manager._pending_current_collections.get(1)
+                if pending is not None:
+                    pending.settled.set()
+            worker.join(2.0)
+
+        assert start_results == [False]
+        assert collectors[0].stop_calls == 1
+        assert bus.factory_runtime_auto_analysis_succeeded.emit.call_count == 0
+        assert manager._completed_sessions == {}
+        assert manager._current_samples_by_config_id == {}
+        assert manager._pending_current_collections == {}
+        _assert_no_generation_state(manager)
+
+    @pytest.mark.parametrize("cleanup_failure", ["stop", "samples"])
+    def test_pending_terminal_is_not_published_before_external_cleanup_error(
+        self,
+        monkeypatch,
+        cleanup_failure,
+    ):
+        start_entered = threading.Event()
+        release_start = threading.Event()
+        completion_ingress = threading.Event()
+        completion_returned = threading.Event()
+        stop_entered = threading.Event()
+        release_stop = threading.Event()
+        collectors = []
+        start_results = []
+        stop_results = []
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                start_entered.set()
+                assert release_start.wait(2.0)
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+                stop_entered.set()
+                assert release_stop.wait(2.0)
+                if cleanup_failure == "stop":
+                    raise RuntimeError("collector cleanup failed")
+
+            def samples(self):
+                if cleanup_failure == "samples":
+                    raise RuntimeError("collector cleanup failed")
+                return [CurrentSample(time_sec=0.2, current_a=9.5)]
+
+        bus, _, manager = _make_current_start_manager(monkeypatch, Collector)
+        original_ingress = manager._completion_ingress_is_current_locked
+
+        def observed_ingress(*args, **kwargs):
+            completion_ingress.set()
+            return original_ingress(*args, **kwargs)
+
+        manager._completion_ingress_is_current_locked = observed_ingress
+        start_thread = threading.Thread(
+            target=lambda: start_results.append(
+                manager.start({"config_id": 1, "sn": "SN1"})
+            )
+        )
+        start_thread.start()
+        assert start_entered.wait(2.0)
+        session = manager._sessions[1]
+        session._captured_frame_count = 1
+        completion_thread = threading.Thread(
+            target=lambda: (
+                session._on_session_done_cb(1),
+                completion_returned.set(),
+            )
+        )
+        completion_thread.start()
+        assert completion_ingress.wait(2.0)
+        stop_thread = threading.Thread(
+            target=lambda: stop_results.append(manager.stop_active_run(config_id=1))
+        )
+        stop_thread.start()
+
+        release_start.set()
+        assert stop_entered.wait(2.0)
+        try:
+            assert not completion_returned.wait(0.2), (
+                "completion observed pending settlement before cleanup outcome"
+            )
+        finally:
+            release_stop.set()
+            start_thread.join(2.0)
+            completion_thread.join(2.0)
+            stop_thread.join(2.0)
+
+        assert not start_thread.is_alive()
+        assert not completion_thread.is_alive()
+        assert not stop_thread.is_alive()
+        assert start_results == [False]
+        assert stop_results == [False]
+        assert collectors[0].stop_calls == 1
+        assert bus.factory_runtime_auto_analysis_succeeded.emit.call_count == 0
+        assert manager._completed_sessions == {}
+        assert manager._current_samples_by_config_id == {}
+        assert manager._pending_current_collections == {}
+        _assert_no_generation_state(manager)
+
+    @pytest.mark.parametrize(
+        ("actions", "winner"),
+        [
+            (("completion", "completion"), "completion"),
+            (("factory_stop", "factory_stop"), "factory_stop"),
+            (("completion", "factory_stop"), "factory_stop"),
+            (("factory_stop", "completion"), "factory_stop"),
+            (("error", "factory_stop"), "error"),
+            (("factory_stop", "error"), "error"),
+        ],
+    )
+    def test_same_owner_pending_terminal_priority_and_deduplication(
+        self,
+        monkeypatch,
+        actions,
+        winner,
+    ):
+        holder = {}
+        collectors = []
+        action_results = []
+        tagged_samples = [CurrentSample(time_sec=0.3, current_a=11.0)]
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                collectors.append(self)
+
+            def start(self):
+                manager = holder["manager"]
+                session = manager._sessions[1]
+                session._captured_frame_count = 44100
+                session._run_judgment = MagicMock(return_value=_successful_judgment())
+                for action in actions:
+                    if action == "completion":
+                        action_results.append(session._on_session_done_cb(1))
+                    elif action == "factory_stop":
+                        action_results.append(
+                            manager.stop_active_run(config_id=1)
+                        )
+                    elif action == "error":
+                        action_results.append(
+                            manager._on_error(
+                                manager._session_error_routes[1],
+                                "pending runtime failure",
+                            )
+                        )
+                    else:
+                        raise AssertionError(action)
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return tagged_samples
+
+        bus, services, manager = _make_current_start_manager(monkeypatch, Collector)
+        holder["manager"] = manager
+        config = services.config_service.load_config.return_value
+        config["allow_incomplete_recording_analysis"] = True
+        manager._build_chart_payload = lambda *_args, **_kwargs: {}
+
+        expected_start = winner != "error"
+        assert manager.start({"config_id": 1, "sn": "SN1"}) is expected_start
+
+        assert action_results == [
+            None if action == "completion" else True
+            for action in actions
+        ]
+        assert collectors[0].stop_calls == 1
+        assert manager._pending_current_collections == {}
+        assert manager._current_collectors == {}
+        assert manager._current_collection_generations == {}
+        assert manager._current_collector_generations == {}
+        assert manager._session_generations == {}
+        if winner == "error":
+            assert bus.factory_runtime_auto_analysis_succeeded.emit.call_count == 0
+            assert bus.factory_runtime_aborted.emit.call_count == 1
+            assert manager._completed_sessions == {}
+            assert manager._current_samples_by_config_id == {}
+            assert bus.status.emit.call_args_list == [
+                call("Error: pending runtime failure")
+            ]
+        else:
+            assert bus.factory_runtime_auto_analysis_succeeded.emit.call_count == 1
+            assert bus.factory_runtime_aborted.emit.call_count == 0
+            completed_session = manager._completed_sessions[1]
+            trace = manager._current_trace_payload(
+                1,
+                current_meter=config["current_meter"],
+                session=completed_session,
+            )
+            assert trace is not None
+            assert trace["values_a"] == [11.0]
+            assert bus.status.emit.call_args_list == [
+                call("Analyzing..."),
+                call("Idle"),
+            ]
+
+    def test_concurrent_double_completion_and_double_stop_stress_is_at_most_once(
+        self,
+        monkeypatch,
+    ):
+        for round_index in range(5):
+            start_entered = threading.Event()
+            release_start = threading.Event()
+            request_gate_entered = threading.Event()
+            request_barrier = threading.Barrier(5)
+            request_count_lock = threading.Lock()
+            request_count = 0
+            request_threads = []
+            collectors = []
+            start_results = []
+            stop_results = []
+            tagged_samples = [
+                CurrentSample(
+                    time_sec=0.4,
+                    current_a=20.0 + round_index,
+                )
+            ]
+
+            class Collector:
+                def __init__(self, _config, *, log_callback, sample_callback):
+                    self.stop_calls = 0
+                    collectors.append(self)
+
+                def start(self):
+                    start_entered.set()
+                    assert release_start.wait(2.0)
+                    return True
+
+                def stop(self):
+                    self.stop_calls += 1
+
+                def samples(self):
+                    return tagged_samples
+
+            bus, services, manager = _make_current_start_manager(
+                monkeypatch,
+                Collector,
+            )
+            config = services.config_service.load_config.return_value
+            config["allow_incomplete_recording_analysis"] = True
+            manager._build_chart_payload = lambda *_args, **_kwargs: {}
+            original_pending_lookup = manager._pending_current_for_identity_locked
+
+            def observed_pending_lookup(*args, **kwargs):
+                nonlocal request_count
+                pending = original_pending_lookup(*args, **kwargs)
+                if threading.current_thread() in request_threads:
+                    with request_count_lock:
+                        request_count += 1
+                        if request_count == len(request_threads):
+                            request_gate_entered.set()
+                return pending
+
+            manager._pending_current_for_identity_locked = observed_pending_lookup
+            start_thread = threading.Thread(
+                target=lambda: start_results.append(
+                    manager.start({"config_id": 1, "sn": f"SN{round_index}"})
+                )
+            )
+            start_thread.start()
+            assert start_entered.wait(2.0)
+            session = manager._sessions[1]
+            session._captured_frame_count = 44100
+            session._run_judgment = MagicMock(return_value=_successful_judgment())
+
+            def request_completion():
+                request_barrier.wait()
+                session._on_session_done_cb(1)
+
+            def request_stop():
+                request_barrier.wait()
+                stop_results.append(manager.stop_active_run(config_id=1))
+
+            request_threads.extend(
+                [
+                    threading.Thread(target=request_completion),
+                    threading.Thread(target=request_completion),
+                    threading.Thread(target=request_stop),
+                    threading.Thread(target=request_stop),
+                ]
+            )
+            for request_thread in request_threads:
+                request_thread.start()
+            request_barrier.wait()
+            assert request_gate_entered.wait(2.0)
+            with manager._lifecycle_lock:
+                pending = manager._pending_current_collections[1]
+                assert pending.completion_continuation is not None
+                assert pending.stop_continuation is not None
+            release_start.set()
+
+            start_thread.join(2.0)
+            for request_thread in request_threads:
+                request_thread.join(2.0)
+
+            assert not start_thread.is_alive()
+            assert all(not thread.is_alive() for thread in request_threads)
+            assert start_results == [True]
+            assert sorted(stop_results) == [True, True]
+            assert collectors[0].stop_calls == 1
+            assert bus.factory_runtime_auto_analysis_succeeded.emit.call_count == 1
+            assert bus.factory_runtime_aborted.emit.call_count == 0
+            assert manager._pending_current_collections == {}
+            assert manager._current_collectors == {}
+            assert manager._current_collection_generations == {}
+            assert manager._current_collector_generations == {}
+            completed_session = manager._completed_sessions[1]
+            trace = manager._current_trace_payload(
+                1,
+                current_meter=config["current_meter"],
+                session=completed_session,
+            )
+            assert trace is not None
+            assert trace["values_a"] == [20.0 + round_index]
+
     def test_concurrent_repeated_stop_claims_pending_collector_exactly_once(
         self,
         monkeypatch,
     ):
         start_entered = threading.Event()
         release_start = threading.Event()
-        stop_claimed = threading.Event()
+        stop_gate_entered = threading.Event()
         collectors = []
 
         class Collector:
@@ -504,14 +924,16 @@ class TestGenerationRetirement:
         )
         start_thread.start()
         assert start_entered.wait(2.0)
-        session = manager._sessions[1]
-        original_freeze = session.freeze_capture
+        original_pending_lookup = manager._pending_current_for_identity_locked
+        stop_thread = None
 
-        def observed_freeze():
-            stop_claimed.set()
-            return original_freeze()
+        def observed_pending_lookup(*args, **kwargs):
+            pending = original_pending_lookup(*args, **kwargs)
+            if threading.current_thread() is stop_thread and pending is not None:
+                stop_gate_entered.set()
+            return pending
 
-        session.freeze_capture = observed_freeze
+        manager._pending_current_for_identity_locked = observed_pending_lookup
         stop_thread = threading.Thread(
             target=lambda: (
                 manager.stop(config_id=1, silent=True),
@@ -519,7 +941,7 @@ class TestGenerationRetirement:
             )
         )
         stop_thread.start()
-        assert stop_claimed.wait(2.0)
+        assert stop_gate_entered.wait(2.0)
 
         release_start.set()
         start_thread.join(2.0)
@@ -771,7 +1193,7 @@ class TestGenerationRetirement:
         assert generation is not session
         assert generation is not recorder
 
-    def test_collector_start_false_retires_unregistered_collection_generation(
+    def test_collector_start_false_fails_start_and_retires_unregistered_generation(
         self,
         monkeypatch,
     ):
@@ -793,14 +1215,12 @@ class TestGenerationRetirement:
 
         _, _, manager = _make_current_start_manager(monkeypatch, Collector)
 
-        try:
-            assert manager.start({"config_id": 1, "sn": "SN1"}) is True
-            assert 1 in manager._session_generations
-            assert 1 not in manager._current_collection_generations
-            assert 1 not in manager._current_collector_generations
-            assert collectors[0].stop_calls == 1
-        finally:
-            manager.stop(config_id=1, silent=True)
+        assert manager.start({"config_id": 1, "sn": "SN1"}) is False
+        assert collectors[0].stop_calls == 1
+        assert manager._pending_current_collections == {}
+        assert manager._current_collectors == {}
+        assert manager._current_samples_by_config_id == {}
+        _assert_no_generation_state(manager)
 
     def test_collector_start_failure_retires_failed_run_generation_state(
         self,

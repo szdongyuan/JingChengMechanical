@@ -10,7 +10,7 @@ import inspect
 import os
 import threading
 import uuid
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from numbers import Integral
 
 import numpy as np
@@ -182,6 +182,8 @@ class _CurrentCollectionClaim:
         "pending_start",
         "_cleanup_lock",
         "_cleanup_started",
+        "_cleanup_owner_thread_id",
+        "_cleanup_result",
         "_cleanup_complete",
     )
 
@@ -203,11 +205,125 @@ class _CurrentCollectionClaim:
         self.pending_start = pending_start
         self._cleanup_lock = threading.RLock()
         self._cleanup_started = False
+        self._cleanup_owner_thread_id = None
+        self._cleanup_result = None
         self._cleanup_complete = threading.Event()
 
 
+@dataclass(frozen=True)
+class _CurrentCollectionCleanupResult:
+    samples: object
+    stop_error: BaseException | None
+    samples_error: BaseException | None
+
+    @property
+    def error(self) -> BaseException | None:
+        return self.stop_error if self.stop_error is not None else self.samples_error
+
+
+class _PendingCurrentContinuation:
+    """Typed, identity-complete continuation waiting on one terminal snapshot."""
+
+    __slots__ = (
+        "config_id",
+        "session",
+        "generation",
+        "request_id",
+        "requester_thread_id",
+        "claimed",
+        "consumer_thread_id",
+        "done",
+        "result",
+        "error",
+    )
+
+    kind = "base"
+
+    def __init__(self, *, config_id, session, generation):
+        self.config_id = config_id
+        self.session = session
+        self.generation = generation
+        self.request_id = object()
+        self.requester_thread_id = threading.get_ident()
+        self.claimed = False
+        self.consumer_thread_id = None
+        self.done = threading.Event()
+        self.result = None
+        self.error = None
+
+
+class _PendingCompletionContinuation(_PendingCurrentContinuation):
+    kind = "completion"
+
+
+class _PendingFactoryStopContinuation(_PendingCurrentContinuation):
+    kind = "factory_stop"
+
+
+class _PendingManualStopContinuation(_PendingCurrentContinuation):
+    __slots__ = ("silent", "notify_factory_runtime_abort", "expected_error_route")
+    kind = "manual_stop"
+
+    def __init__(
+        self,
+        *,
+        config_id,
+        session,
+        generation,
+        silent,
+        notify_factory_runtime_abort,
+        expected_error_route,
+    ):
+        super().__init__(
+            config_id=config_id,
+            session=session,
+            generation=generation,
+        )
+        self.silent = silent
+        self.notify_factory_runtime_abort = notify_factory_runtime_abort
+        self.expected_error_route = expected_error_route
+
+
+class _PendingErrorContinuation(_PendingCurrentContinuation):
+    __slots__ = ("error_route", "message")
+    kind = "error"
+
+    def __init__(self, *, error_route, message):
+        super().__init__(
+            config_id=error_route.config_id,
+            session=error_route.session,
+            generation=error_route.generation,
+        )
+        self.error_route = error_route
+        self.message = str(message)
+
+
+@dataclass(frozen=True)
+class _PendingCurrentTerminalSnapshot:
+    """Immutable release value for all work owned by a pending collector."""
+
+    config_id: int
+    session: object
+    generation: object
+    terminal_kind: str
+    start_succeeded: bool
+    collector_registered: bool
+    cleanup_claim: _CurrentCollectionClaim | None
+    cleanup_result: _CurrentCollectionCleanupResult | None
+    start_error: BaseException | None
+    cleanup_error: BaseException | None
+    owner_thread_id: int
+    cleanup_owner_thread_id: int | None
+    continuation_kind: str | None
+    continuation_request_id: object | None
+
+    @property
+    def error(self) -> BaseException | None:
+        return self.start_error if self.start_error is not None else self.cleanup_error
+
+
 class _PendingCurrentCollection:
-    """Exact collector ownership while its external start call is in flight."""
+    """Exact collector ownership until one complete terminal snapshot is published."""
 
     __slots__ = (
         "config_id",
@@ -215,14 +331,14 @@ class _PendingCurrentCollection:
         "generation",
         "collector",
         "start_owner_thread_id",
-        "start_returned",
         "settled",
-        "start_succeeded",
-        "start_error",
-        "completion_requested",
-        "deferred_completion",
+        "terminal_snapshot",
+        "terminalizing",
+        "cleanup_owner_thread_id",
         "cleanup_claim",
-        "deferred_cleanup",
+        "completion_continuation",
+        "stop_continuation",
+        "error_continuation",
     )
 
     def __init__(self, *, config_id, session, generation, collector):
@@ -231,14 +347,41 @@ class _PendingCurrentCollection:
         self.generation = generation
         self.collector = collector
         self.start_owner_thread_id = threading.get_ident()
-        self.start_returned = threading.Event()
         self.settled = threading.Event()
-        self.start_succeeded = None
-        self.start_error = None
-        self.completion_requested = False
-        self.deferred_completion = False
+        self.terminal_snapshot = None
+        self.terminalizing = False
+        self.cleanup_owner_thread_id = None
         self.cleanup_claim = None
-        self.deferred_cleanup = False
+        self.completion_continuation = None
+        self.stop_continuation = None
+        self.error_continuation = None
+
+    def owned_by_current_thread(self) -> bool:
+        thread_id = threading.get_ident()
+        return thread_id in {
+            self.start_owner_thread_id,
+            self.cleanup_owner_thread_id,
+        }
+
+    def stage_terminal(self, snapshot: _PendingCurrentTerminalSnapshot) -> None:
+        """Install the immutable value while the manager lifecycle lock is held."""
+
+        if self.terminal_snapshot is not None or self.settled.is_set():
+            raise RuntimeError("pending current collection already published")
+        if snapshot.config_id != self.config_id:
+            raise RuntimeError("pending current terminal config identity mismatch")
+        if snapshot.session is not self.session or snapshot.generation is not self.generation:
+            raise RuntimeError("pending current terminal run identity mismatch")
+        self.terminal_snapshot = snapshot
+
+    def publish_terminal(self, snapshot: _PendingCurrentTerminalSnapshot) -> None:
+        """Release one fully staged snapshot; Event.set is the final operation."""
+
+        if self.terminal_snapshot is not snapshot:
+            raise RuntimeError("pending current terminal snapshot was not staged")
+        if self.settled.is_set():
+            raise RuntimeError("pending current collection already released")
+        self.settled.set()
 
 
 class _CaptureFinalizationState:
@@ -1027,7 +1170,61 @@ class TestManager(QObject):
     def _stop_factory_run(self, config_id: int) -> bool:
         with self._lifecycle_lock:
             session = self._sessions.get(config_id)
+            generation = self._run_generation_token(
+                session,
+                self._session_error_routes.get(config_id),
+            )
+            pending = self._pending_current_for_identity_locked(
+                config_id,
+                session=session,
+                generation=generation,
+            )
+            if pending is None:
+                continuation = None
+                defer_to_owner = False
+                settled = None
+            else:
+                continuation = pending.stop_continuation
+                if continuation is None:
+                    if pending.terminal_snapshot is not None:
+                        return False
+                    continuation = _PendingFactoryStopContinuation(
+                        config_id=config_id,
+                        session=session,
+                        generation=generation,
+                    )
+                    pending.stop_continuation = continuation
+                defer_to_owner = (
+                    pending.terminal_snapshot is None
+                    and pending.owned_by_current_thread()
+                )
+                settled = pending.settled
+
+        if continuation is not None:
+            if defer_to_owner:
+                return True
+            settled.wait()
+            return bool(
+                self._consume_pending_current_continuation(
+                    pending,
+                    continuation,
+                )
+            )
+        return self._continue_factory_stop(config_id)
+
+    def _continue_factory_stop(
+        self,
+        config_id: int,
+        *,
+        expected_session=None,
+        expected_generation=None,
+        preclaimed_current_collection=None,
+    ) -> bool:
+        with self._lifecycle_lock:
+            session = self._sessions.get(config_id)
             if session is None:
+                return False
+            if expected_session is not None and session is not expected_session:
                 return False
             if config_id in self._accepted_factory_stops:
                 return True
@@ -1038,12 +1235,25 @@ class TestManager(QObject):
             mon = self._monitors.get(config_id)
             error_route = self._session_error_routes.pop(config_id, None)
             generation = self._run_generation_token(session, error_route)
+            if (
+                expected_generation is not None
+                and generation is not expected_generation
+            ):
+                self._accepted_factory_stops.discard(config_id)
+                if error_route is not None:
+                    self._session_error_routes[config_id] = error_route
+                return False
             self._retire_session_generation_locked(config_id, generation)
-            current_collection_claim = self._detach_current_collection_locked(
+            detached_current_collection = self._detach_current_collection_locked(
                 config_id,
                 session=session,
                 generation=generation,
                 retain_samples=True,
+            )
+            current_collection_claim = (
+                preclaimed_current_collection
+                if preclaimed_current_collection is not None
+                else detached_current_collection
             )
 
         self._invalidate_error_route(error_route)
@@ -1071,11 +1281,103 @@ class TestManager(QObject):
         *,
         notify_factory_runtime_abort: bool = False,
         expected_error_route=None,
+        expected_session=None,
+        expected_generation=None,
+        preclaimed_current_collection=None,
+    ):
+        if preclaimed_current_collection is not None:
+            return self._continue_stop_one(
+                config_id,
+                silent,
+                notify_factory_runtime_abort=notify_factory_runtime_abort,
+                expected_error_route=expected_error_route,
+                expected_session=expected_session,
+                expected_generation=expected_generation,
+                preclaimed_current_collection=preclaimed_current_collection,
+            )
+        with self._lifecycle_lock:
+            session = self._sessions.get(config_id)
+            error_route = self._session_error_routes.get(config_id)
+            generation = self._run_generation_token(session, error_route)
+            pending = self._pending_current_for_identity_locked(
+                config_id,
+                session=session,
+                generation=generation,
+            )
+            if pending is None:
+                continuation = None
+                defer_to_owner = False
+                settled = None
+            else:
+                continuation = pending.stop_continuation
+                if continuation is None:
+                    if pending.terminal_snapshot is not None:
+                        return False
+                    continuation = _PendingManualStopContinuation(
+                        config_id=config_id,
+                        session=session,
+                        generation=generation,
+                        silent=silent,
+                        notify_factory_runtime_abort=notify_factory_runtime_abort,
+                        expected_error_route=expected_error_route,
+                    )
+                    pending.stop_continuation = continuation
+                defer_to_owner = (
+                    pending.terminal_snapshot is None
+                    and pending.owned_by_current_thread()
+                )
+                settled = pending.settled
+
+        if continuation is not None:
+            if defer_to_owner:
+                return True
+            settled.wait()
+            return bool(
+                self._consume_pending_current_continuation(
+                    pending,
+                    continuation,
+                )
+            )
+        return self._continue_stop_one(
+            config_id,
+            silent,
+            notify_factory_runtime_abort=notify_factory_runtime_abort,
+            expected_error_route=expected_error_route,
+            expected_session=expected_session,
+            expected_generation=expected_generation,
+        )
+
+    def _continue_stop_one(
+        self,
+        config_id: int,
+        silent: bool = False,
+        *,
+        notify_factory_runtime_abort: bool = False,
+        expected_error_route=None,
+        expected_session=None,
+        expected_generation=None,
+        preclaimed_current_collection=None,
     ):
         with self._lifecycle_lock:
             if (
                 expected_error_route is not None
                 and not self._error_route_is_current_locked(expected_error_route)
+            ):
+                return False
+            current_session = self._sessions.get(config_id)
+            if (
+                expected_session is not None
+                and current_session is not expected_session
+            ):
+                return False
+            current_error_route = self._session_error_routes.get(config_id)
+            current_generation = self._run_generation_token(
+                current_session,
+                current_error_route,
+            )
+            if (
+                expected_generation is not None
+                and current_generation is not expected_generation
             ):
                 return False
             session = self._sessions.pop(config_id, None)
@@ -1084,11 +1386,16 @@ class TestManager(QObject):
             error_route = self._session_error_routes.pop(config_id, None)
             generation = self._run_generation_token(session, error_route)
             self._retire_session_generation_locked(config_id, generation)
-            current_collection_claim = self._detach_current_collection_locked(
+            detached_current_collection = self._detach_current_collection_locked(
                 config_id,
                 session=session,
                 generation=generation,
                 retain_samples=False,
+            )
+            current_collection_claim = (
+                preclaimed_current_collection
+                if preclaimed_current_collection is not None
+                else detached_current_collection
             )
             self._retire_current_samples_locked(config_id, generation)
             self._analyzing_sessions.discard(config_id)
@@ -1774,12 +2081,26 @@ class TestManager(QObject):
         expected_session,
         expected_generation,
     ):
-        if not self._await_pending_current_collection_for_completion(
+        if self._route_pending_current_completion(
             config_id,
             session=expected_session,
             generation=expected_generation,
         ):
             return
+        return self._continue_session_done(
+            config_id,
+            expected_session=expected_session,
+            expected_generation=expected_generation,
+        )
+
+    def _continue_session_done(
+        self,
+        config_id: int,
+        *,
+        expected_session,
+        expected_generation,
+        preclaimed_current_collection=None,
+    ):
         error_route = None
         current_collection_claim = None
         with self._lifecycle_lock:
@@ -1804,11 +2125,16 @@ class TestManager(QObject):
                     error_route = None
                 else:
                     self._session_error_routes.pop(config_id, None)
-                current_collection_claim = self._detach_current_collection_locked(
+                detached_current_collection = self._detach_current_collection_locked(
                     config_id,
                     session=session,
                     generation=expected_generation,
                     retain_samples=True,
+                )
+                current_collection_claim = (
+                    preclaimed_current_collection
+                    if preclaimed_current_collection is not None
+                    else detached_current_collection
                 )
 
         self._invalidate_error_route(error_route)
@@ -1935,16 +2261,66 @@ class TestManager(QObject):
     def _on_error(self, error_route, message: str) -> bool:
         if not isinstance(error_route, _SessionErrorRoute):
             return False
+        with self._lifecycle_lock:
+            pending = self._pending_current_for_identity_locked(
+                error_route.config_id,
+                session=error_route.session,
+                generation=error_route.generation,
+            )
+            if pending is None:
+                continuation = None
+                defer_to_owner = False
+                settled = None
+            else:
+                continuation = pending.error_continuation
+                if continuation is None:
+                    if pending.terminal_snapshot is not None:
+                        return False
+                    continuation = _PendingErrorContinuation(
+                        error_route=error_route,
+                        message=message,
+                    )
+                    pending.error_continuation = continuation
+                defer_to_owner = (
+                    pending.terminal_snapshot is None
+                    and pending.owned_by_current_thread()
+                )
+                settled = pending.settled
+
+        if continuation is not None:
+            if defer_to_owner:
+                return True
+            settled.wait()
+            return bool(
+                self._consume_pending_current_continuation(
+                    pending,
+                    continuation,
+                )
+            )
+        return self._continue_error(error_route, message)
+
+    def _continue_error(
+        self,
+        error_route,
+        message: str,
+        *,
+        preclaimed_current_collection=None,
+    ) -> bool:
+        if not isinstance(error_route, _SessionErrorRoute):
+            return False
         config_id = error_route.config_id
         abort_payload = self._make_factory_runtime_abort_payload(
             config_id,
             error_route.session,
             error_message=message,
         )
-        stopped = self._stop_one(
+        stopped = self._continue_stop_one(
             config_id,
             silent=True,
             expected_error_route=error_route,
+            expected_session=error_route.session,
+            expected_generation=error_route.generation,
+            preclaimed_current_collection=preclaimed_current_collection,
         )
         if not stopped:
             return False
@@ -3063,68 +3439,141 @@ class TestManager(QObject):
             collector_started = False
             start_error = exc
 
+        if not collector_started and start_error is None:
+            start_error = RuntimeError("current collector did not start")
+
+        cleanup_claim = None
+        cleanup_result = None
+        cleanup_error = None
+        selected_continuation = None
         with self._lifecycle_lock:
-            pending.start_succeeded = collector_started
-            pending.start_error = start_error
-            pending.start_returned.set()
-            generation_is_current = (
-                self._current_collection_generations.get(config_id)
-                is generation
-                and self._session_generations.get(config_id) is generation
-            )
-            session_is_current = self._sessions.get(config_id) is session
             pending_is_current = (
                 self._pending_current_collections.get(config_id) is pending
             )
-            cleanup_claim = pending.cleanup_claim
-            if (
+            generation_is_current = (
+                self._current_collection_generations.get(config_id) is generation
+                and self._session_generations.get(config_id) is generation
+            )
+            session_is_current = self._sessions.get(config_id) is session
+            selected_continuation = self._select_pending_current_continuation_locked(
+                pending,
+                start_error=start_error,
+                cleanup_error=None,
+            )
+            can_register = (
                 start_error is None
                 and collector_started
-                and cleanup_claim is None
+                and selected_continuation is None
                 and pending_is_current
                 and generation_is_current
                 and session_is_current
-            ):
+            )
+            if can_register:
                 self._pending_current_collections.pop(config_id, None)
                 self._current_collectors[config_id] = collector
                 self._current_collector_generations[config_id] = generation
+                snapshot = _PendingCurrentTerminalSnapshot(
+                    config_id=config_id,
+                    session=session,
+                    generation=generation,
+                    terminal_kind="running",
+                    start_succeeded=True,
+                    collector_registered=True,
+                    cleanup_claim=None,
+                    cleanup_result=None,
+                    start_error=None,
+                    cleanup_error=None,
+                    owner_thread_id=pending.start_owner_thread_id,
+                    cleanup_owner_thread_id=None,
+                    continuation_kind=None,
+                    continuation_request_id=None,
+                )
+                pending.stage_terminal(snapshot)
                 collector_registered = True
             else:
                 collector_registered = False
+                pending.terminalizing = True
+                pending.cleanup_owner_thread_id = threading.get_ident()
+                if (
+                    self._current_collection_generations.get(config_id)
+                    is generation
+                ):
+                    self._current_collection_generations.pop(config_id, None)
+                retain_samples = (
+                    start_error is None
+                    and selected_continuation is not None
+                    and selected_continuation.kind
+                    in {"completion", "factory_stop"}
+                )
+                cleanup_claim = pending.cleanup_claim
                 if cleanup_claim is None:
                     cleanup_claim = _CurrentCollectionClaim(
                         config_id=config_id,
                         session=session,
                         generation=generation,
                         collector=collector,
-                        retain_samples=(
-                            pending.completion_requested and start_error is None
-                        ),
+                        retain_samples=retain_samples,
                         pending_start=pending,
                     )
                     pending.cleanup_claim = cleanup_claim
-                    cleanup_claim_created_here = True
-                else:
-                    cleanup_claim_created_here = False
-            deferred_completion = pending.deferred_completion
 
-        cleanup_error = None
-        if cleanup_claim is not None:
-            try:
-                if cleanup_claim_created_here or pending.deferred_cleanup:
-                    self._stop_current_collection_claim(cleanup_claim)
-            except BaseException as exc:
-                cleanup_error = exc
-            finally:
-                with self._lifecycle_lock:
-                    if self._pending_current_collections.get(config_id) is pending:
-                        self._pending_current_collections.pop(config_id, None)
-                    if (
-                        self._current_collection_generations.get(config_id)
-                        is generation
-                    ):
-                        self._current_collection_generations.pop(config_id, None)
-        pending.settled.set()
+        if collector_registered:
+            pending.publish_terminal(snapshot)
+            self._bus.log.emit(f"[CurrentMeter] started for config={config_id}")
+            return
+
+        try:
+            cleanup_result = self._stop_current_collection_claim(cleanup_claim)
+        except BaseException as exc:
+            cleanup_error = exc
+            cleanup_result = cleanup_claim._cleanup_result
+
+        with self._lifecycle_lock:
+            selected_continuation = self._select_pending_current_continuation_locked(
+                pending,
+                start_error=start_error,
+                cleanup_error=cleanup_error,
+            )
+            terminal_kind = self._pending_current_terminal_kind(
+                start_error=start_error,
+                cleanup_error=cleanup_error,
+                continuation=selected_continuation,
+                pending_is_current=(
+                    self._pending_current_collections.get(config_id) is pending
+                ),
+            )
+            snapshot = _PendingCurrentTerminalSnapshot(
+                config_id=config_id,
+                session=session,
+                generation=generation,
+                terminal_kind=terminal_kind,
+                start_succeeded=bool(collector_started),
+                collector_registered=False,
+                cleanup_claim=cleanup_claim,
+                cleanup_result=cleanup_result,
+                start_error=start_error,
+                cleanup_error=cleanup_error,
+                owner_thread_id=pending.start_owner_thread_id,
+                cleanup_owner_thread_id=pending.cleanup_owner_thread_id,
+                continuation_kind=(
+                    selected_continuation.kind
+                    if selected_continuation is not None
+                    else None
+                ),
+                continuation_request_id=(
+                    selected_continuation.request_id
+                    if selected_continuation is not None
+                    else None
+                ),
+            )
+            pending.stage_terminal(snapshot)
+
+        pending.publish_terminal(snapshot)
+        if selected_continuation is not None:
+            self._consume_pending_current_continuation(
+                pending,
+                selected_continuation,
+            )
 
         if start_error is not None:
             if cleanup_error is not None:
@@ -3132,49 +3581,215 @@ class TestManager(QObject):
             raise start_error
         if cleanup_error is not None:
             raise cleanup_error
-        if collector_registered:
-            self._bus.log.emit(f"[CurrentMeter] started for config={config_id}")
-        if deferred_completion:
-            self._on_session_done(
-                config_id,
-                expected_session=session,
-                expected_generation=generation,
-            )
 
-    def _await_pending_current_collection_for_completion(
+    @staticmethod
+    def _pending_current_terminal_kind(
+        *,
+        start_error,
+        cleanup_error,
+        continuation,
+        pending_is_current,
+    ) -> str:
+        if start_error is not None:
+            return "failed_start"
+        if cleanup_error is not None and continuation is None:
+            return "cleanup_error"
+        if continuation is not None:
+            if cleanup_error is not None:
+                return f"{continuation.kind}_cleanup_error"
+            return continuation.kind
+        if not pending_is_current:
+            return "superseded"
+        return "stopped"
+
+    @staticmethod
+    def _select_pending_current_continuation_locked(
+        pending: _PendingCurrentCollection,
+        *,
+        start_error,
+        cleanup_error,
+    ):
+        # Failed startup is terminal without a run continuation.  Runtime
+        # errors outrank accepted stops, and stops outrank successful
+        # completion.  A collector cleanup error suppresses completion, while
+        # stop/error continuations still run so they can publish one abort.
+        if start_error is not None:
+            return None
+        if pending.error_continuation is not None:
+            return pending.error_continuation
+        if pending.stop_continuation is not None:
+            return pending.stop_continuation
+        if cleanup_error is not None:
+            return None
+        return pending.completion_continuation
+
+    def _pending_current_for_identity_locked(
+        self,
+        config_id: int,
+        *,
+        session,
+        generation,
+    ) -> _PendingCurrentCollection | None:
+        pending = self._pending_current_collections.get(config_id)
+        if (
+            pending is None
+            or pending.session is not session
+            or pending.generation is not generation
+        ):
+            return None
+        return pending
+
+    def _route_pending_current_completion(
         self,
         config_id: int,
         *,
         session,
         generation,
     ) -> bool:
-        while True:
-            with self._lifecycle_lock:
-                if not self._completion_ingress_is_current_locked(
-                    config_id,
+        with self._lifecycle_lock:
+            if not self._completion_ingress_is_current_locked(
+                config_id,
+                session=session,
+                generation=generation,
+            ):
+                return False
+            pending = self._pending_current_for_identity_locked(
+                config_id,
+                session=session,
+                generation=generation,
+            )
+            if pending is None:
+                return False
+            continuation = pending.completion_continuation
+            if continuation is None:
+                if pending.terminal_snapshot is not None:
+                    return True
+                continuation = _PendingCompletionContinuation(
+                    config_id=config_id,
                     session=session,
                     generation=generation,
-                ):
-                    return False
-                pending = self._pending_current_collections.get(config_id)
-                if (
-                    pending is None
-                    or pending.session is not session
-                    or pending.generation is not generation
-                ):
-                    return True
-                pending.completion_requested = True
-                if (
-                    not pending.start_returned.is_set()
-                    and pending.start_owner_thread_id == threading.get_ident()
-                ):
-                    pending.deferred_completion = True
-                    return False
-                settled = pending.settled
+                )
+                pending.completion_continuation = continuation
+            defer_to_owner = (
+                pending.terminal_snapshot is None
+                and pending.owned_by_current_thread()
+            )
+            settled = pending.settled
 
-            settled.wait()
-            if pending.start_error is not None:
-                return False
+        if defer_to_owner:
+            return True
+        settled.wait()
+        self._consume_pending_current_continuation(pending, continuation)
+        return True
+
+    def _consume_pending_current_continuation(
+        self,
+        pending: _PendingCurrentCollection,
+        continuation: _PendingCurrentContinuation,
+    ):
+        pending.settled.wait()
+        release_suppressed = False
+        with self._lifecycle_lock:
+            snapshot = pending.terminal_snapshot
+            if snapshot is None:
+                raise RuntimeError("pending collector released without terminal snapshot")
+            exact_identity = (
+                snapshot.config_id == continuation.config_id
+                and snapshot.session is continuation.session
+                and snapshot.generation is continuation.generation
+            )
+            selected = (
+                exact_identity
+                and snapshot.continuation_kind == continuation.kind
+                and snapshot.continuation_request_id is continuation.request_id
+            )
+            if not selected:
+                if not continuation.done.is_set():
+                    continuation.result = False if continuation.kind != "completion" else None
+                    release_suppressed = True
+                suppressed_result = continuation.result
+                wait_for_consumer = False
+            elif continuation.claimed:
+                if continuation.consumer_thread_id == threading.get_ident():
+                    return continuation.result
+                wait_for_consumer = True
+            else:
+                continuation.claimed = True
+                continuation.consumer_thread_id = threading.get_ident()
+                wait_for_consumer = False
+
+        if not selected:
+            if release_suppressed:
+                continuation.done.set()
+            return suppressed_result
+        if wait_for_consumer:
+            continuation.done.wait()
+            if continuation.error is not None:
+                raise continuation.error
+            return continuation.result
+
+        result = None
+        error = None
+        try:
+            result = self._execute_pending_current_continuation(
+                snapshot,
+                continuation,
+            )
+        except BaseException as exc:
+            error = exc
+        finally:
+            with self._lifecycle_lock:
+                continuation.result = result
+                continuation.error = error
+                if self._pending_current_collections.get(pending.config_id) is pending:
+                    self._pending_current_collections.pop(pending.config_id, None)
+            continuation.done.set()
+
+        if error is not None:
+            raise error
+        return result
+
+    def _execute_pending_current_continuation(
+        self,
+        snapshot: _PendingCurrentTerminalSnapshot,
+        continuation: _PendingCurrentContinuation,
+    ):
+        claim = snapshot.cleanup_claim
+        if continuation.kind == "completion":
+            return self._continue_session_done(
+                continuation.config_id,
+                expected_session=continuation.session,
+                expected_generation=continuation.generation,
+                preclaimed_current_collection=claim,
+            )
+        if continuation.kind == "factory_stop":
+            return self._continue_factory_stop(
+                continuation.config_id,
+                expected_session=continuation.session,
+                expected_generation=continuation.generation,
+                preclaimed_current_collection=claim,
+            )
+        if continuation.kind == "manual_stop":
+            return self._continue_stop_one(
+                continuation.config_id,
+                continuation.silent,
+                notify_factory_runtime_abort=(
+                    continuation.notify_factory_runtime_abort
+                ),
+                expected_error_route=continuation.expected_error_route,
+                expected_session=continuation.session,
+                expected_generation=continuation.generation,
+                preclaimed_current_collection=claim,
+            )
+        if continuation.kind == "error":
+            return self._continue_error(
+                continuation.error_route,
+                continuation.message,
+                preclaimed_current_collection=claim,
+            )
+        raise RuntimeError(
+            f"unsupported pending current continuation: {continuation.kind}"
+        )
 
     def _detach_current_collection_locked(
         self,
@@ -3228,77 +3843,110 @@ class TestManager(QObject):
     def _stop_current_collection_claim(
         self,
         claim: _CurrentCollectionClaim | None,
-    ) -> None:
+    ) -> _CurrentCollectionCleanupResult | None:
         if claim is None:
-            return
-        pending = claim.pending_start
-        if pending is not None and not pending.start_returned.is_set():
-            if pending.start_owner_thread_id == threading.get_ident():
-                pending.deferred_cleanup = True
-                return
-            pending.start_returned.wait()
+            return None
 
         with claim._cleanup_lock:
             if claim._cleanup_started:
                 cleanup_complete = claim._cleanup_complete
+                cleanup_owner_thread_id = claim._cleanup_owner_thread_id
                 perform_cleanup = False
             else:
                 claim._cleanup_started = True
+                claim._cleanup_owner_thread_id = threading.get_ident()
                 cleanup_complete = None
+                cleanup_owner_thread_id = None
                 perform_cleanup = True
         if not perform_cleanup:
+            if (
+                cleanup_owner_thread_id == threading.get_ident()
+                and not cleanup_complete.is_set()
+            ):
+                raise RuntimeError("collector cleanup owner cannot wait on itself")
             cleanup_complete.wait()
-            return
+            result = claim._cleanup_result
+            if result is None:
+                raise RuntimeError("collector cleanup completed without a result")
+            if result.error is not None:
+                raise result.error
+            return result
 
+        stop_error = None
+        samples_error = None
+        samples = []
         try:
             try:
                 claim.collector.stop()
-            finally:
+            except BaseException as exc:
+                stop_error = exc
+            try:
                 samples = claim.collector.samples()
-                with self._lifecycle_lock:
-                    still_owned = (
-                        self._sessions.get(claim.config_id) is claim.session
-                        and getattr(
-                            claim.session,
-                            "_manager_generation_token",
-                            None,
-                        )
-                        is claim.generation
+            except BaseException as exc:
+                samples_error = exc
+
+            result = _CurrentCollectionCleanupResult(
+                samples=samples,
+                stop_error=stop_error,
+                samples_error=samples_error,
+            )
+            with self._lifecycle_lock:
+                still_owned = (
+                    self._sessions.get(claim.config_id) is claim.session
+                    and getattr(
+                        claim.session,
+                        "_manager_generation_token",
+                        None,
                     )
-                    if claim.retain_samples and still_owned:
-                        prior_completed_session = self._completed_sessions.get(
+                    is claim.generation
+                )
+                if claim.retain_samples and still_owned and result.error is None:
+                    prior_completed_session = self._completed_sessions.get(
+                        claim.config_id
+                    )
+                    if (
+                        prior_completed_session is not None
+                        and prior_completed_session is not claim.session
+                    ):
+                        self._staged_current_samples_by_generation[
+                            claim.generation
+                        ] = samples
+                    elif samples:
+                        self._current_samples_by_config_id[
                             claim.config_id
+                        ] = samples
+                        self._current_sample_generations[claim.config_id] = (
+                            claim.generation
                         )
-                        if (
-                            prior_completed_session is not None
-                            and prior_completed_session is not claim.session
-                        ):
-                            self._staged_current_samples_by_generation[
-                                claim.generation
-                            ] = samples
-                        elif samples:
-                            self._current_samples_by_config_id[
-                                claim.config_id
-                            ] = samples
-                            self._current_sample_generations[claim.config_id] = (
-                                claim.generation
-                            )
-                        else:
-                            self._retire_current_samples_locked(
-                                claim.config_id,
-                                claim.generation,
-                            )
                     else:
                         self._retire_current_samples_locked(
                             claim.config_id,
                             claim.generation,
                         )
+                else:
+                    self._retire_current_samples_locked(
+                        claim.config_id,
+                        claim.generation,
+                    )
+            if result.error is None:
                 self._bus.log.emit(
                     f"[CurrentMeter] stopped for config={claim.config_id}, "
                     f"samples={len(samples)}"
                 )
         finally:
+            if "result" not in locals():
+                result = _CurrentCollectionCleanupResult(
+                    samples=samples,
+                    stop_error=stop_error,
+                    samples_error=samples_error,
+                )
+            with claim._cleanup_lock:
+                claim._cleanup_result = result
             claim._cleanup_complete.set()
+
+        if result.error is not None:
+            raise result.error
+        return result
 
     def _current_trace_payload(
         self,
