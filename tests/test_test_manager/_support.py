@@ -51,6 +51,12 @@ class _CaptureRecorderDoubleMixin:
 
     def release_capture(self, attachment):
         self.__dict__.setdefault("release_capture_calls", []).append(attachment)
+        owners = self.__dict__.setdefault("capture_owners", [])
+        if attachment in owners:
+            owners.remove(attachment)
+
+    def has_capture_owners(self):
+        return bool(self.__dict__.setdefault("capture_owners", []))
 
 
 class _FakeSession:
@@ -197,6 +203,7 @@ def _make_running_factory_manager(
             self.request_capture_calls = []
             self.get_capture_buffer_calls = []
             self.release_capture_calls = []
+            self.capture_owners = []
             FakeRecorder.instances.append(self)
 
         def isRunning(self):
@@ -215,7 +222,9 @@ def _make_running_factory_manager(
 
         def request_capture(self, *, record_duration):
             self.request_capture_calls.append(record_duration)
-            return object()
+            owner = object()
+            self.capture_owners.append(owner)
+            return owner
 
         def get_capture_buffer(self, attachment, *, retained_frames):
             self.get_capture_buffer_calls.append((attachment, retained_frames))
@@ -223,6 +232,11 @@ def _make_running_factory_manager(
 
         def release_capture(self, attachment):
             self.release_capture_calls.append(attachment)
+            if attachment in self.capture_owners:
+                self.capture_owners.remove(attachment)
+
+        def has_capture_owners(self):
+            return bool(self.capture_owners)
 
     class FakeMonitor:
         instances = []

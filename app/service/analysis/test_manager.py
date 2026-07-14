@@ -8,6 +8,7 @@ from __future__ import annotations
 import copy
 import inspect
 import os
+import threading
 import uuid
 from dataclasses import asdict, is_dataclass
 from numbers import Integral
@@ -42,6 +43,74 @@ from app.service.factory_review_payloads import FactoryReviewPayload, FactoryRev
 from consts.running_consts import base_dir
 
 
+class _StartupRecorderErrorLatch:
+    """Bridge recorder errors across startup registration without a signal gap."""
+
+    def __init__(self, route_registered_error):
+        self._lock = threading.RLock()
+        self._route_registered_error = route_registered_error
+        self._source_token = None
+        self._registered = False
+        self._latched_error: str | None = None
+
+    def begin_generation(self, source_token) -> None:
+        with self._lock:
+            self._source_token = source_token
+            self._registered = False
+            self._latched_error = None
+
+    def handle(self, source_token, message) -> None:
+        normalized_message = str(message)
+        route_registered_error = None
+        with self._lock:
+            if source_token is not self._source_token:
+                return
+            if not self._registered:
+                if self._latched_error is None:
+                    self._latched_error = normalized_message
+                return
+            route_registered_error = self._route_registered_error
+        route_registered_error(normalized_message)
+
+    def register(self, source_token, register_runtime) -> None:
+        """Atomically reject a latched error or enable normal error routing."""
+
+        with self._lock:
+            if source_token is not self._source_token:
+                raise RuntimeError("stale recorder startup generation")
+            self._raise_latched_error_locked()
+            register_runtime()
+            # A synchronous signal emitted re-entrantly by registration can
+            # acquire this RLock and latch an error.  Check again before the
+            # generation becomes normally routed.
+            self._raise_latched_error_locked()
+            self._registered = True
+
+    def _raise_latched_error_locked(self) -> None:
+        if self._latched_error is not None:
+            raise RuntimeError(self._latched_error)
+
+
+class _CaptureFinalizationState:
+    __slots__ = ("owner_thread_id", "complete", "buffer", "error")
+
+    def __init__(self):
+        self.owner_thread_id = threading.get_ident()
+        self.complete = False
+        self.buffer = None
+        self.error: BaseException | None = None
+
+
+class _CaptureReleaseState:
+    __slots__ = ("attachment", "owner_thread_id", "complete", "error")
+
+    def __init__(self, attachment):
+        self.attachment = attachment
+        self.owner_thread_id = threading.get_ident()
+        self.complete = False
+        self.error: BaseException | None = None
+
+
 class TestManager(QObject):
     """Manages TestSession instances and shared AudioRecorders."""
 
@@ -70,6 +139,9 @@ class TestManager(QObject):
         self._current_samples_by_config_id: dict[int, list] = {}
         self._replay_player = OneShotReplayPlayer()
         self._replay_config_id: int | None = None
+        self._lifecycle_lock = threading.RLock()
+        self._lifecycle_changed = threading.Condition(self._lifecycle_lock)
+        self._completion_claims: set[int] = set()
 
         display_channel_signal = getattr(self._bus, "factory_display_channel_changed", None)
         connect = getattr(display_channel_signal, "connect", None)
@@ -230,6 +302,9 @@ class TestManager(QObject):
         recorder = None
         monitor = None
         requested_capture = None
+        startup_error_latch = _StartupRecorderErrorLatch(
+            lambda message, cid=config_id: self._on_error(cid, message)
+        )
 
         try:
             session = TestSession(
@@ -276,12 +351,12 @@ class TestManager(QObject):
                 )
 
             session.set_monitor_feed(monitor.feed if monitor is not None else None)
-            session._error_lambda = lambda msg, cid=config_id: self._on_error(cid, msg)
             if monitor is not None:
                 monitor.error_occurred.connect(session._monitor_error_lambda)
 
             for capture_attempt in range(2):
                 source_token = object()
+                startup_error_latch.begin_generation(source_token)
                 session.prepare_for_attach(source_token)
                 captured_block_conn = (
                     lambda block, s=session, token=source_token: s._on_captured_block(
@@ -290,7 +365,19 @@ class TestManager(QObject):
                     )
                 )
                 session._captured_block_conn = captured_block_conn
+                def recorder_error_conn(
+                    message,
+                    latch=startup_error_latch,
+                    token=source_token,
+                ):
+                    latch.handle(
+                        token,
+                        message,
+                    )
+
+                session._error_lambda = recorder_error_conn
                 recorder.captured_block_ready.connect(captured_block_conn)
+                recorder.error_occurred.connect(recorder_error_conn)
                 try:
                     requested_capture = recorder.request_capture(
                         record_duration=record_duration,
@@ -299,6 +386,10 @@ class TestManager(QObject):
                     self._disconnect(
                         recorder.captured_block_ready,
                         captured_block_conn,
+                    )
+                    self._disconnect(
+                        recorder.error_occurred,
+                        recorder_error_conn,
                     )
                     self._discard_shared_recorder(recorder)
                     if capture_attempt:
@@ -323,17 +414,23 @@ class TestManager(QObject):
                         source_token=source_token,
                     )
                 except Exception:
-                    recorder.release_capture(requested_capture)
+                    self._release_session_capture(
+                        session,
+                        recorder,
+                        attachment=requested_capture,
+                    )
                     requested_capture = None
                     raise
                 break
 
-            recorder.error_occurred.connect(session._error_lambda)
+            def register_runtime():
+                with self._lifecycle_lock:
+                    self._sessions[config_id] = session
+                    self._recorders[config_id] = recorder
+                    if monitor is not None:
+                        self._monitors[config_id] = monitor
 
-            self._sessions[config_id] = session
-            self._recorders[config_id] = recorder
-            if monitor is not None:
-                self._monitors[config_id] = monitor
+            startup_error_latch.register(source_token, register_runtime)
             self._start_current_collection(config_id, session)
             self._bus.recording_progress.emit(config_id, 0.0)
 
@@ -621,17 +718,31 @@ class TestManager(QObject):
         return self._stop_factory_run(config_id)
 
     def _stop_factory_run(self, config_id: int) -> bool:
-        session = self._sessions.get(config_id)
-        if session is None:
-            return False
-        if config_id in self._accepted_factory_stops:
-            return True
+        with self._lifecycle_lock:
+            session = self._sessions.get(config_id)
+            if session is None:
+                return False
+            if config_id in self._accepted_factory_stops:
+                return True
 
-        self._accepted_factory_stops.add(config_id)
+            self._accepted_factory_stops.add(config_id)
+            session_is_analyzing = self._session_is_analyzing(config_id)
+            rec = self._recorders.get(config_id)
+            mon = self._monitors.get(config_id)
 
-        if self._session_is_analyzing(config_id):
-            return self._stop_to_stopped(config_id, session)
-        return self._stop_recording_with_optional_analysis(config_id, session)
+        if session_is_analyzing:
+            return self._stop_to_stopped(
+                config_id,
+                session,
+                rec=rec,
+                mon=mon,
+            )
+        return self._stop_recording_with_optional_analysis(
+            config_id,
+            session,
+            rec=rec,
+            mon=mon,
+        )
 
     def _stop_one(
         self,
@@ -641,15 +752,16 @@ class TestManager(QObject):
         notify_factory_runtime_abort: bool = False,
     ):
         self._stop_replay_if_config(config_id)
-        session = self._sessions.pop(config_id, None)
-        rec = self._recorders.pop(config_id, None)
-        mon = self._monitors.pop(config_id, None)
+        with self._lifecycle_lock:
+            session = self._sessions.pop(config_id, None)
+            rec = self._recorders.pop(config_id, None)
+            mon = self._monitors.pop(config_id, None)
 
         partial_buf = None
         capture_error = None
         if session is not None:
             try:
-                if rec is not None and not silent:
+                if rec is not None:
                     partial_buf = self._freeze_and_capture_session_buffer(session, rec)
                 else:
                     session.freeze_capture()
@@ -742,10 +854,11 @@ class TestManager(QObject):
         *,
         requested_capture=None,
     ) -> None:
-        registered_session = self._sessions.pop(config_id, None)
+        with self._lifecycle_lock:
+            registered_session = self._sessions.pop(config_id, None)
+            registered_recorder = self._recorders.pop(config_id, None)
+            registered_monitor = self._monitors.pop(config_id, None)
         self._stop_current_collection(config_id)
-        registered_recorder = self._recorders.pop(config_id, None)
-        registered_monitor = self._monitors.pop(config_id, None)
 
         cleanup_session = registered_session or session
         cleanup_recorder = registered_recorder or recorder
@@ -1074,21 +1187,31 @@ class TestManager(QObject):
         )
 
     def _on_session_done(self, config_id: int):
-        session = self._sessions.get(config_id)
-        if session is None or config_id in self._accepted_factory_stops:
+        with self._lifecycle_lock:
+            session = self._sessions.get(config_id)
+            if session is None or config_id in self._accepted_factory_stops:
+                return
+            rec = self._recorders.get(config_id)
+            mon = self._monitors.get(config_id)
+            completion_key = id(session)
+            duplicate_completion = completion_key in self._completion_claims
+            if not duplicate_completion:
+                self._completion_claims.add(completion_key)
+                self._analyzing_sessions.add(config_id)
+
+        if duplicate_completion:
+            # Observe the stable one-shot result before returning.  Calling the
+            # helper also closes the narrow gap where the first completion has
+            # claimed the workflow but has not claimed capture extraction yet.
+            if rec is not None:
+                try:
+                    self._freeze_and_capture_session_buffer(session, rec)
+                except Exception:
+                    pass
             return
 
         cleanup_settled_payload = self._make_cleanup_settled_payload(config_id, session)
-        self._analyzing_sessions.add(config_id)
         try:
-            self._emit_factory_analyzing_entered(
-                config_id,
-                session,
-                log_message=f"[TestManager] recording done for config={config_id}",
-            )
-
-            rec = self._recorders.get(config_id)
-            mon = self._monitors.get(config_id)
             capture_error = None
             if rec is not None:
                 try:
@@ -1114,6 +1237,24 @@ class TestManager(QObject):
             )
             self._stop_current_collection(config_id)
 
+            with self._lifecycle_lock:
+                still_owned = (
+                    self._sessions.get(config_id) is session
+                    and config_id not in self._accepted_factory_stops
+                )
+            if not still_owned:
+                return
+
+            # Canonical capture is frozen, extracted, and released before any
+            # external analyzing notification can re-enter a stop path.
+            self._emit_factory_analyzing_entered(
+                config_id,
+                session,
+                log_message=f"[TestManager] recording done for config={config_id}",
+            )
+            if not self._auto_analysis_review_still_owned(config_id, session):
+                return
+
             if capture_error is not None:
                 if not self._emit_auto_analysis_failure_review(
                     config_id,
@@ -1125,12 +1266,13 @@ class TestManager(QObject):
             elif not self._emit_auto_analysis_review(config_id, session):
                 return
 
-            completed_session = self._sessions.pop(config_id, None)
-            if completed_session is not None:
-                self._completed_sessions[config_id] = completed_session
+            with self._lifecycle_lock:
+                completed_session = self._sessions.pop(config_id, None)
+                if completed_session is not None:
+                    self._completed_sessions[config_id] = completed_session
 
-            self._recorders.pop(config_id, None)
-            mon = self._monitors.pop(config_id, None)
+                self._recorders.pop(config_id, None)
+                mon = self._monitors.pop(config_id, None)
             self._cleanup_monitor_recorder_safely(
                 config_id,
                 mon=mon,
@@ -1143,7 +1285,9 @@ class TestManager(QObject):
                     cleanup_settled_payload,
                 )
         finally:
-            self._analyzing_sessions.discard(config_id)
+            with self._lifecycle_lock:
+                self._analyzing_sessions.discard(config_id)
+                self._completion_claims.discard(completion_key)
 
     def _on_error(self, config_id: int, message: str):
         session = self._sessions.get(config_id)
@@ -1320,10 +1464,14 @@ class TestManager(QObject):
         *,
         allow_accepted_stop: bool = False,
     ) -> bool:
-        return (
-            self._sessions.get(config_id) is session
-            and (allow_accepted_stop or config_id not in self._accepted_factory_stops)
-        )
+        with self._lifecycle_lock:
+            return (
+                self._sessions.get(config_id) is session
+                and (
+                    allow_accepted_stop
+                    or config_id not in self._accepted_factory_stops
+                )
+            )
 
     def _emit_auto_analysis_review(
         self,
@@ -1523,9 +1671,14 @@ class TestManager(QObject):
         self._bus.status.emit("Idle")
         return True
 
-    def _stop_recording_with_optional_analysis(self, config_id: int, session) -> bool:
-        rec = self._recorders.get(config_id)
-        mon = self._monitors.get(config_id)
+    def _stop_recording_with_optional_analysis(
+        self,
+        config_id: int,
+        session,
+        *,
+        rec,
+        mon,
+    ) -> bool:
         capture = self._capture_partial_stop_buffer(config_id, session, rec)
         if rec is not None:
             self._disconnect_session_signals(session, rec, mon)
@@ -1574,11 +1727,19 @@ class TestManager(QObject):
             )
         return self._emit_factory_runtime_stopped(config_id, session)
 
-    def _stop_to_stopped(self, config_id: int, session) -> bool:
-        rec = self._recorders.get(config_id)
-        mon = self._monitors.get(config_id)
+    def _stop_to_stopped(
+        self,
+        config_id: int,
+        session,
+        *,
+        rec,
+        mon,
+    ) -> bool:
         try:
-            session.freeze_capture()
+            if rec is not None:
+                self._freeze_and_capture_session_buffer(session, rec)
+            else:
+                session.freeze_capture()
         finally:
             if rec is not None:
                 self._disconnect_session_signals(session, rec, mon)
@@ -2160,7 +2321,59 @@ class TestManager(QObject):
         return hardware_buffer
 
     def _freeze_and_capture_session_buffer(self, session, recorder) -> np.ndarray:
-        """Freeze one session and extract exactly its retained canonical prefix."""
+        """Return the one stable canonical capture shared by all finalizers."""
+
+        claimant = False
+        with self._lifecycle_changed:
+            state = getattr(
+                session,
+                "_manager_capture_finalization_state",
+                None,
+            )
+            if not isinstance(state, _CaptureFinalizationState):
+                state = _CaptureFinalizationState()
+                session._manager_capture_finalization_state = state
+                claimant = True
+            else:
+                if (
+                    not state.complete
+                    and state.owner_thread_id == threading.get_ident()
+                ):
+                    raise RuntimeError("reentrant session capture finalization")
+                while not state.complete:
+                    self._lifecycle_changed.wait()
+
+            if not claimant:
+                if state.error is not None:
+                    raise state.error
+                return state.buffer
+
+        buffer = None
+        error = None
+        try:
+            buffer = self._freeze_and_capture_session_buffer_once(
+                session,
+                recorder,
+            )
+        except BaseException as exc:
+            error = exc
+
+        with self._lifecycle_changed:
+            state.buffer = buffer
+            state.error = error
+            state.complete = True
+            self._lifecycle_changed.notify_all()
+
+        if error is not None:
+            raise error
+        return buffer
+
+    def _freeze_and_capture_session_buffer_once(
+        self,
+        session,
+        recorder,
+    ) -> np.ndarray:
+        """Freeze and extract exactly one retained canonical prefix."""
 
         retained_frames = int(session.freeze_capture())
         if retained_frames <= 0:
@@ -2203,10 +2416,55 @@ class TestManager(QObject):
             attachment = self._session_capture_attachment(session)
         if attachment is None:
             return
-        if getattr(session, "_released_capture_attachment", None) is attachment:
-            return
-        recorder.release_capture(attachment)
-        session._released_capture_attachment = attachment
+
+        claimant = False
+        with self._lifecycle_changed:
+            release_states = getattr(
+                session,
+                "_manager_capture_release_states",
+                None,
+            )
+            if not isinstance(release_states, dict):
+                release_states = {}
+                session._manager_capture_release_states = release_states
+            release_key = id(attachment)
+            state = release_states.get(release_key)
+            if not (
+                isinstance(state, _CaptureReleaseState)
+                and state.attachment is attachment
+            ):
+                state = _CaptureReleaseState(attachment)
+                release_states[release_key] = state
+                claimant = True
+            else:
+                if (
+                    not state.complete
+                    and state.owner_thread_id == threading.get_ident()
+                ):
+                    return
+                while not state.complete:
+                    self._lifecycle_changed.wait()
+
+            if not claimant:
+                if state.error is not None:
+                    raise state.error
+                return
+
+        release_error = None
+        try:
+            recorder.release_capture(attachment)
+        except BaseException as exc:
+            release_error = exc
+
+        with self._lifecycle_changed:
+            state.error = release_error
+            state.complete = True
+            if release_error is None:
+                session._released_capture_attachment = attachment
+            self._lifecycle_changed.notify_all()
+
+        if release_error is not None:
+            raise release_error
 
     @staticmethod
     def _session_capture_attachment(session):
@@ -2763,10 +3021,21 @@ class TestManager(QObject):
         *,
         excluding_config_id: int | None = None,
     ) -> bool:
-        return any(
-            cid != excluding_config_id and active_recorder is recorder
-            for cid, active_recorder in self._recorders.items()
-        )
+        with self._lifecycle_lock:
+            manager_has_owner = any(
+                cid != excluding_config_id and active_recorder is recorder
+                for cid, active_recorder in self._recorders.items()
+            )
+        if manager_has_owner:
+            return True
+
+        has_capture_owners = getattr(recorder, "has_capture_owners", None)
+        if not callable(has_capture_owners):
+            return False
+        recorder_has_owner = has_capture_owners()
+        if isinstance(recorder_has_owner, (bool, np.bool_)):
+            return bool(recorder_has_owner)
+        return False
 
     def _stop_recorder_if_unused(self, recorder, *, excluding_config_id: int | None = None):
         if not self._recorder_has_live_owner(

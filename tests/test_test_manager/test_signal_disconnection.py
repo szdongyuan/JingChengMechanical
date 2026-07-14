@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+from threading import Event, RLock, Thread
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -59,12 +60,14 @@ class TestSignalDisconnection:
                 self.captured_block_ready = _DummySignal()
                 self.error_occurred = _DummySignal()
                 self.saved_callback = None
+                self.saved_error_callback = None
                 self.request_calls = 0
 
             def request_capture(self, *, record_duration):
                 self.request_calls += 1
                 events.append("rejected.request")
                 self.saved_callback = self.captured_block_ready._callbacks[0]
+                self.saved_error_callback = self.error_occurred._callbacks[0]
                 self.captured_block_ready.emit(
                     CapturedAudioBlock(
                         np.ones((1, 2), dtype=np.float32),
@@ -143,9 +146,235 @@ class TestSignalDisconnection:
         assert session._pending_capture_blocks == []
 
         rejecting.saved_callback(object())
+        rejecting.saved_error_callback("stale rejected-recorder error")
 
         assert session._pending_capture_blocks == []
+        assert mgr.is_running(config_id=1) is True
+        bus.factory_runtime_aborted.emit.assert_not_called()
         mgr.stop(config_id=1, silent=True)
+
+    @pytest.mark.parametrize("error_phase", ["request", "bind", "registration"])
+    def test_startup_recorder_error_is_latched_and_releases_accepted_owner(
+        self,
+        monkeypatch,
+        error_phase,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        config = _factory_runtime_config()
+        config["output_device_name"] = None
+        services.config_service.load_config.return_value = config
+        error_message = f"device lost during {error_phase}"
+
+        class StartupErrorRecorder:
+            instances = []
+
+            def __init__(
+                self,
+                *,
+                device_name,
+                hostapi,
+                sample_rate,
+                n_channels,
+                record_duration,
+            ):
+                self._sample_rate = float(sample_rate)
+                self._n_channels = int(n_channels)
+                self.captured_block_ready = _DummySignal()
+                self.error_occurred = _DummySignal()
+                self._running = False
+                self.capture_owners = []
+                self.release_calls = []
+                self.stop_calls = 0
+                StartupErrorRecorder.instances.append(self)
+
+            def request_capture(self, *, record_duration):
+                owner = RecorderAttachment(
+                    request_monotonic=1.0,
+                    warmup_samples=frames_for_duration(self._sample_rate, 0.05),
+                    target_samples=frames_for_duration(
+                        self._sample_rate,
+                        record_duration,
+                    ),
+                )
+                self.capture_owners.append(owner)
+                if error_phase == "request":
+                    self.error_occurred.emit(error_message)
+                return owner
+
+            def release_capture(self, owner):
+                self.release_calls.append(owner)
+                if owner in self.capture_owners:
+                    self.capture_owners.remove(owner)
+                owner._mark_released()
+
+            def has_capture_owners(self):
+                return bool(self.capture_owners)
+
+            def isRunning(self):
+                return self._running
+
+            def start(self):
+                self._running = True
+
+            def stop(self):
+                self.stop_calls += 1
+                self._running = False
+
+            def wait(self, timeout):
+                return True
+
+        class StartupErrorSession(_FakeSession):
+            def attach_to_recorder(self, attachment, *, source_token):
+                super().attach_to_recorder(
+                    attachment,
+                    source_token=source_token,
+                )
+                if error_phase == "bind":
+                    StartupErrorRecorder.instances[-1].error_occurred.emit(
+                        error_message
+                    )
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.AudioRecorder",
+            StartupErrorRecorder,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.TestSession",
+            StartupErrorSession,
+        )
+
+        mgr = TestManager(bus, services)
+
+        if error_phase == "registration":
+            class ErrorEmittingSessions(dict):
+                emitted = False
+
+                def __setitem__(self, key, value):
+                    super().__setitem__(key, value)
+                    if not self.emitted:
+                        self.emitted = True
+                        StartupErrorRecorder.instances[-1].error_occurred.emit(
+                            error_message
+                        )
+
+            mgr._sessions = ErrorEmittingSessions()
+
+        assert mgr.start({"config_id": 1, "sn": "SN1"}) is False
+
+        recorder = StartupErrorRecorder.instances[0]
+        assert len(recorder.release_calls) == 1
+        assert recorder.release_calls[0].released is True
+        assert recorder.capture_owners == []
+        assert mgr._sessions == {}
+        assert mgr._recorders == {}
+        assert mgr.is_running(config_id=1) is False
+        assert error_message in mgr.last_start_error()
+        bus.test_started.emit.assert_not_called()
+
+    def test_pending_owner_protects_shared_recorder_during_other_session_cleanup(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        config = _factory_runtime_config(config_id=2)
+        config["output_device_name"] = None
+        services.config_service.load_config.return_value = config
+        attach_entered = Event()
+        allow_attach = Event()
+
+        class SharedRecorder:
+            def __init__(self):
+                self._sample_rate = 44100.0
+                self._n_channels = 2
+                self.captured_block_ready = _DummySignal()
+                self.error_occurred = _DummySignal()
+                self._owner_lock = RLock()
+                self.capture_owners = []
+                self._running = True
+                self.stop_calls = 0
+                self.start_calls = 0
+
+            def request_capture(self, *, record_duration):
+                owner = object()
+                with self._owner_lock:
+                    self.capture_owners.append(owner)
+                return owner
+
+            def release_capture(self, owner):
+                with self._owner_lock:
+                    if owner in self.capture_owners:
+                        self.capture_owners.remove(owner)
+
+            def has_capture_owners(self):
+                with self._owner_lock:
+                    return bool(self.capture_owners)
+
+            def get_capture_buffer(self, owner, *, retained_frames):
+                return np.empty((0, self._n_channels), dtype=np.float32)
+
+            def isRunning(self):
+                return self._running
+
+            def start(self):
+                self.start_calls += 1
+                self._running = True
+
+            def stop(self):
+                self.stop_calls += 1
+                self._running = False
+
+            def wait(self, timeout):
+                return True
+
+        recorder = SharedRecorder()
+        first_owner = recorder.request_capture(record_duration=2.0)
+
+        class BlockingAttachSession(_FakeSession):
+            def attach_to_recorder(self, attachment, *, source_token):
+                attach_entered.set()
+                assert allow_attach.wait(timeout=2)
+                super().attach_to_recorder(
+                    attachment,
+                    source_token=source_token,
+                )
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.TestSession",
+            BlockingAttachSession,
+        )
+
+        mgr = TestManager(bus, services)
+        device_key = mgr._device_key(config)
+        mgr._shared_recorders[device_key] = recorder
+        first_session = MagicMock()
+        first_session.capture_attachment = first_owner
+        first_session.freeze_capture.return_value = 0
+        mgr._sessions[1] = first_session
+        mgr._recorders[1] = recorder
+
+        start_results = []
+        starter = Thread(
+            target=lambda: start_results.append(
+                mgr.start({"config_id": 2, "sn": "SN2"})
+            )
+        )
+        starter.start()
+        assert attach_entered.wait(timeout=2)
+
+        mgr._stop_one(1, silent=True)
+
+        assert recorder.stop_calls == 0
+        assert recorder.has_capture_owners() is True
+
+        allow_attach.set()
+        starter.join(timeout=2)
+        assert not starter.is_alive()
+        assert start_results == [True]
+        assert mgr._recorders[2] is recorder
+
+        mgr._stop_one(2, silent=True)
 
     @pytest.mark.parametrize(
         "message",

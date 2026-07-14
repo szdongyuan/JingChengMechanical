@@ -634,6 +634,34 @@ class TestCaptureAttachments:
 
 
 class TestCaptureCapacityOwnership:
+    def test_owner_query_tracks_pending_resolved_and_released_captures(self):
+        clock_values = iter([0.0, 0.1])
+        rec = _recorder(
+            sample_rate=100.0,
+            record_duration=0.1,
+            monotonic_func=lambda: next(clock_values),
+        )
+
+        assert rec.has_capture_owners() is False
+
+        handle = rec.request_capture(record_duration=0.1)
+
+        assert rec.has_capture_owners() is True
+
+        rec._sd_callback(
+            np.zeros((10, 1), dtype=np.float32),
+            10,
+            _portaudio_time(0.0, 0.1),
+            None,
+        )
+
+        assert handle.resolution is not None
+        assert rec.has_capture_owners() is True
+
+        rec.release_capture(handle)
+
+        assert rec.has_capture_owners() is False
+
     def test_pending_owner_blocks_legacy_completion_at_old_capacity(self):
         rec = _recorder(
             sample_rate=100.0,

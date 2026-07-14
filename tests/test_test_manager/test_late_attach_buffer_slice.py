@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -180,6 +180,107 @@ class TestLateAttachBufferSlice:
         assert session._sample_rate == 100.0
         session._run_judgment.assert_called_once_with()
         session.stop_live_display.assert_called_once()
+
+    def test_completion_captures_before_reentrant_stop_from_analyzing_notification(
+        self,
+        monkeypatch,
+    ):
+        post_attach = np.arange(20, dtype=np.float32).reshape(20, 1)
+        bus, _, mgr, session, rec, _, _ = _make_running_factory_manager(
+            monkeypatch,
+            partial_buf=post_attach,
+            sample_rate=100.0,
+        )
+        attachment = session.capture_attachment
+        original_get_capture_buffer = rec.get_capture_buffer
+        observed = {}
+
+        def get_unless_released(owner, *, retained_frames):
+            if owner in rec.release_capture_calls:
+                return np.empty((0, rec._n_channels), dtype=np.float32)
+            return original_get_capture_buffer(
+                owner,
+                retained_frames=retained_frames,
+            )
+
+        rec.get_capture_buffer = get_unless_released
+        session._run_judgment = MagicMock(
+            side_effect=AssertionError("reentrant stop must suppress analysis")
+        )
+
+        def stop_from_analyzing(_payload):
+            observed["buffer"] = session._buffer.copy()
+            observed["get_calls"] = list(rec.get_capture_buffer_calls)
+            observed["released"] = list(rec.release_capture_calls)
+            observed["stop_result"] = mgr.stop_active_run(config_id=1)
+
+        bus.factory_runtime_analyzing_entered.emit.side_effect = stop_from_analyzing
+
+        mgr._on_session_done(1)
+
+        np.testing.assert_array_equal(observed["buffer"], post_attach)
+        assert observed["get_calls"] == [(attachment, post_attach.shape[0])]
+        assert observed["released"] == [attachment]
+        assert observed["stop_result"] is True
+        assert rec.get_capture_buffer_calls == [(attachment, post_attach.shape[0])]
+        assert rec.release_capture_calls == [attachment]
+        session._run_judgment.assert_not_called()
+
+    def test_duplicate_completion_callers_share_one_capture_finalization(
+        self,
+        monkeypatch,
+    ):
+        post_attach = np.arange(20, dtype=np.float32).reshape(20, 1)
+        _bus, _, mgr, session, rec, _, _ = _make_running_factory_manager(
+            monkeypatch,
+            partial_buf=post_attach,
+            sample_rate=100.0,
+        )
+        attachment = session.capture_attachment
+        session.freeze_capture = MagicMock(return_value=post_attach.shape[0])
+        mgr._emit_auto_analysis_review = MagicMock(return_value=False)
+        get_entered = Event()
+        allow_get = Event()
+        second_finalizer_entered = Event()
+        invocation_lock = Lock()
+        helper_invocations = 0
+        original_get_capture_buffer = rec.get_capture_buffer
+        original_finalize = mgr._freeze_and_capture_session_buffer
+
+        def blocking_get(owner, *, retained_frames):
+            get_entered.set()
+            assert allow_get.wait(timeout=2)
+            return original_get_capture_buffer(
+                owner,
+                retained_frames=retained_frames,
+            )
+
+        def observed_finalize(running_session, recorder):
+            nonlocal helper_invocations
+            with invocation_lock:
+                helper_invocations += 1
+                if helper_invocations == 2:
+                    second_finalizer_entered.set()
+            return original_finalize(running_session, recorder)
+
+        rec.get_capture_buffer = blocking_get
+        mgr._freeze_and_capture_session_buffer = observed_finalize
+        workers = [Thread(target=mgr._on_session_done, args=(1,)) for _ in range(2)]
+
+        workers[0].start()
+        assert get_entered.wait(timeout=2)
+        workers[1].start()
+        assert second_finalizer_entered.wait(timeout=2)
+        allow_get.set()
+
+        for worker in workers:
+            worker.join(timeout=2)
+            assert not worker.is_alive()
+
+        assert helper_invocations == 2
+        session.freeze_capture.assert_called_once_with()
+        assert rec.get_capture_buffer_calls == [(attachment, post_attach.shape[0])]
+        assert rec.release_capture_calls == [attachment]
 
     def test_on_session_done_projects_selected_channels_before_final_judgment(self):
         bus = _mock_bus()

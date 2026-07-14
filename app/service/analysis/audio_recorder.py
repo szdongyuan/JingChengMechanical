@@ -179,6 +179,12 @@ class AudioRecorder(QThread):
             self._active_capture_owners.pop(owner, None)
             owner._mark_released()
 
+    def has_capture_owners(self) -> bool:
+        """Return whether any pending or resolved capture still owns capacity."""
+
+        with self._state_lock:
+            return bool(self._pending_capture_owners or self._active_capture_owners)
+
     def get_capture_buffer(
         self,
         owner: RecorderAttachment,
