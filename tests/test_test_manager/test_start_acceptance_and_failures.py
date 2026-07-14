@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from app.service.analysis.frames import JudgmentResult
+from app.service.analysis.session_capture import CapturedAudioBlock
 from app.service.analysis.test_manager import TestManager
 
 from ._support import (
@@ -220,7 +221,6 @@ class TestTestManagerStartStop:
                         (int(sample_rate * record_duration), n_channels),
                         dtype=np.float32,
                     )
-                    self.chunk_ready = _DummySignal()
                     self.recording_done = _DummySignal()
                     self.error_occurred = _DummySignal()
                     self._running = False
@@ -237,12 +237,6 @@ class TestTestManagerStartStop:
 
                 def wait(self, timeout):
                     return True
-
-                def attach_session(self, *, record_duration):
-                    return MagicMock(chunk_index=0, sample_index=0)
-
-                def get_buffer_from(self, snapshot):
-                    return self._buffer
 
             monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
             monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
@@ -351,7 +345,6 @@ class TestTestManagerStartStop:
                         (int(sample_rate * record_duration), n_channels),
                         dtype=np.float32,
                     )
-                    self.chunk_ready = _DummySignal()
                     self.recording_done = _DummySignal()
                     self.error_occurred = _DummySignal()
                     self._running = False
@@ -370,18 +363,6 @@ class TestTestManagerStartStop:
 
                 def wait(self, timeout):
                     return True
-
-                def attach_session(self, *, record_duration):
-                    if record_duration > self._record_duration:
-                        self._record_duration = record_duration
-                        self._buffer = np.zeros(
-                            (int(self._sample_rate * record_duration), self._n_channels),
-                            dtype=np.float32,
-                        )
-                    return MagicMock(chunk_index=0, sample_index=0)
-
-                def get_buffer_from(self, snapshot):
-                    return self._buffer
 
             class FakeMonitor:
                 instances = []
@@ -455,7 +436,6 @@ class TestTestManagerStartStop:
                         (int(sample_rate * record_duration), n_channels),
                         dtype=np.float32,
                     )
-                    self.chunk_ready = _DummySignal()
                     self.recording_done = _DummySignal()
                     self.error_occurred = _DummySignal()
                     self._running = False
@@ -474,12 +454,6 @@ class TestTestManagerStartStop:
 
                 def wait(self, timeout):
                     return True
-
-                def attach_session(self, *, record_duration):
-                    return MagicMock(chunk_index=0, sample_index=0)
-
-                def get_buffer_from(self, snapshot):
-                    return self._buffer
 
             monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
             monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
@@ -550,7 +524,6 @@ class TestTestManagerStartStop:
                         (int(sample_rate * record_duration), n_channels),
                         dtype=np.float32,
                     )
-                    self.chunk_ready = _DummySignal()
                     self.recording_done = _DummySignal()
                     self.error_occurred = _DummySignal()
                     self._running = False
@@ -568,18 +541,6 @@ class TestTestManagerStartStop:
 
                 def wait(self, timeout):
                     return True
-
-                def attach_session(self, *, record_duration):
-                    if record_duration > self._record_duration:
-                        self._record_duration = record_duration
-                        self._buffer = np.zeros(
-                            (int(self._sample_rate * record_duration), self._n_channels),
-                            dtype=np.float32,
-                        )
-                    return MagicMock(chunk_index=0, sample_index=0)
-
-                def get_buffer_from(self, snapshot):
-                    return self._buffer
 
             monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
             monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
@@ -645,7 +606,6 @@ class TestTestManagerStartStop:
                         (int(sample_rate * record_duration), n_channels),
                         dtype=np.float32,
                     )
-                    self.chunk_ready = _DummySignal()
                     self.recording_done = _DummySignal()
                     self.error_occurred = _DummySignal()
                     self._running = False
@@ -662,12 +622,6 @@ class TestTestManagerStartStop:
 
                 def wait(self, timeout):
                     return True
-
-                def attach_session(self, *, record_duration):
-                    return MagicMock(chunk_index=0, sample_index=0)
-
-                def get_buffer_from(self, snapshot):
-                    return self._buffer
 
             monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
             monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
@@ -827,7 +781,6 @@ class TestTestManagerStartStop:
                         (int(sample_rate * record_duration), n_channels),
                         dtype=np.float32,
                     )
-                    self.chunk_ready = _DummySignal()
                     self.recording_done = _DummySignal()
                     self.error_occurred = _DummySignal()
                     self._running = False
@@ -847,18 +800,6 @@ class TestTestManagerStartStop:
 
                 def wait(self, timeout):
                     return True
-
-                def attach_session(self, *, record_duration):
-                    if record_duration > self._record_duration:
-                        self._record_duration = record_duration
-                        self._buffer = np.zeros(
-                            (int(self._sample_rate * record_duration), self._n_channels),
-                            dtype=np.float32,
-                        )
-                    return MagicMock(chunk_index=0, sample_index=0)
-
-                def get_buffer_from(self, snapshot):
-                    return self._buffer
 
             monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
             monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
@@ -937,7 +878,6 @@ class TestTestManagerStartStop:
                         (int(sample_rate * record_duration), n_channels),
                         dtype=np.float32,
                     )
-                    self.chunk_ready = _DummySignal()
                     self.recording_done = _DummySignal()
                     self.error_occurred = _DummySignal()
                     self._running = False
@@ -957,18 +897,6 @@ class TestTestManagerStartStop:
 
                 def wait(self, timeout):
                     return True
-
-                def attach_session(self, *, record_duration):
-                    if record_duration > self._record_duration:
-                        self._record_duration = record_duration
-                        self._buffer = np.zeros(
-                            (int(self._sample_rate * record_duration), self._n_channels),
-                            dtype=np.float32,
-                        )
-                    return MagicMock(chunk_index=0, sample_index=0)
-
-                def get_buffer_from(self, snapshot):
-                    return self._buffer
 
             monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
             monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
@@ -1066,7 +994,6 @@ class TestTestManagerStartStop:
                         (int(self._sample_rate * self._record_duration), n_channels),
                         dtype=np.float32,
                     )
-                    self.chunk_ready = _DummySignal()
                     self.recording_done = _DummySignal()
                     self.error_occurred = _DummySignal()
                     self._running = False
@@ -1080,19 +1007,21 @@ class TestTestManagerStartStop:
                     self.start_calls += 1
                     self._running = True
                     if completion_phase == "recorder_start":
-                        self.captured_block_ready.emit(object())
+                        self.captured_block_ready.emit(
+                            CapturedAudioBlock(
+                                data=np.ones((1, self._n_channels), dtype=np.float32),
+                                sample_start=0,
+                                sample_end=1,
+                                monotonic_start=0.0,
+                                monotonic_end=1.0 / self._sample_rate,
+                            )
+                        )
 
                 def stop(self):
                     self._running = False
 
                 def wait(self, timeout):
                     return True
-
-                def attach_session(self, *, record_duration):
-                    return MagicMock(chunk_index=0, sample_index=0)
-
-                def get_buffer_from(self, snapshot):
-                    return self._buffer
 
             class FastSession(_FakeSession):
                 def __init__(self, config, bus, ai_service, mic_cal, workorder, audio_dir):
@@ -1202,7 +1131,6 @@ class TestTestManagerStartStop:
                         (int(self._sample_rate * self._record_duration), n_channels),
                         dtype=np.float32,
                     )
-                    self.chunk_ready = _DummySignal()
                     self.recording_done = _DummySignal()
                     self.error_occurred = _DummySignal()
                     self._running = False
@@ -1220,12 +1148,6 @@ class TestTestManagerStartStop:
 
                 def wait(self, timeout):
                     return True
-
-                def attach_session(self, *, record_duration):
-                    return MagicMock(chunk_index=0, sample_index=0)
-
-                def get_buffer_from(self, snapshot):
-                    return self._buffer
 
             monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", ErrorRecorder)
             monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)

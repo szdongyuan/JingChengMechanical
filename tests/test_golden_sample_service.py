@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from scipy.io import wavfile
 
+from app.service import golden_sample_service as golden_sample_module
 from app.service.golden_sample_service import (
     GoldenSampleService,
     StagedGoldenSample,
@@ -87,6 +88,30 @@ def test_create_staged_sample_extracts_mono_clip_and_normalizes_metadata(tmp_pat
         staged_data[:32],
         source_data[24_000 : 24_000 + 144_000, 1][:32],
     )
+
+
+def test_create_staged_sample_at_zero_keeps_original_frame_zero(tmp_path):
+    svc = GoldenSampleService(root_dir=str(tmp_path / "managed"))
+    source_path, source_data = _write_temp_wav(
+        tmp_path / "source-from-zero.wav",
+        sample_rate=100,
+        samples=20,
+        channels=1,
+    )
+
+    staged = svc.create_staged_sample(
+        source_path=str(source_path),
+        source_channel=0,
+        start_sample=0,
+        num_samples=10,
+        sample_rate=100.0,
+    )
+    saved_sample_rate, staged_data = wavfile.read(staged.staged_path)
+
+    assert saved_sample_rate == 100
+    np.testing.assert_array_equal(staged_data, source_data[:10])
+    assert staged_data[0] == source_data[0]
+    assert not hasattr(golden_sample_module, "SESSION_WARMUP_SECONDS")
 
 
 def test_promote_staged_samples_allocates_unique_committed_paths_per_binding(tmp_path):

@@ -551,6 +551,36 @@ def test_imported_analysis_uses_wav_sample_rate_and_skips_ai(monkeypatch):
     assert engine.calls[0]["channel_column_map"] == {0: 0}
 
 
+def test_imported_analysis_keeps_original_source_frame_zero(monkeypatch):
+    source_tags = np.arange(10, dtype=np.float64).reshape(-1, 1)
+    wav = ImportedWav(
+        path="import.wav",
+        sample_rate=100.0,
+        buffer=source_tags,
+    )
+    config = _single_channel_config(
+        config_id=101,
+        selected_channels=[0],
+        analysis_duration=0.1,
+    )
+    request = ImportedAudioAnalysisRequest(
+        config_id=101,
+        wav_path="import.wav",
+        assignments=(ImportedChannelAssignment(0, "config", 0),),
+    )
+    captured = _run_import_with_captured_configs(
+        monkeypatch,
+        wav,
+        config,
+        request,
+    )
+
+    judgment_buffer = captured["judgment"]["buffer"]
+    np.testing.assert_array_equal(judgment_buffer[:, 0], source_tags[:, 0])
+    assert judgment_buffer[0, 0] == source_tags[0, 0]
+    assert not hasattr(imported_audio, "SESSION_WARMUP_SECONDS")
+
+
 def test_imported_analysis_disables_manual_reanalysis_for_too_short_wav(monkeypatch):
     wav = ImportedWav(
         path="import.wav",

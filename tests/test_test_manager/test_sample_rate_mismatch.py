@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import numpy as np
 
 from app.service.analysis.session_capture import RecorderAttachment, frames_for_duration
@@ -137,7 +135,6 @@ class TestSampleRateMismatch:
                 self._n_channels = n_channels
                 self._record_duration = record_duration
                 self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
-                self.chunk_ready = _DummySignal()
                 self.recording_done = _DummySignal()
                 self.error_occurred = _DummySignal()
                 self._running = False
@@ -153,15 +150,6 @@ class TestSampleRateMismatch:
 
             def wait(self, timeout):
                 return True
-
-            def attach_session(self, *, record_duration):
-                if record_duration > self._record_duration:
-                    self._record_duration = record_duration
-                    self._buffer = np.zeros((int(self._sample_rate * record_duration), self._n_channels), dtype=np.float32)
-                return MagicMock(chunk_index=0, sample_index=0)
-
-            def get_buffer_from(self, snapshot):
-                return self._buffer
 
         monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
 
@@ -270,7 +258,6 @@ class TestSampleRateMismatch:
                 self._n_channels = n_channels
                 self._record_duration = record_duration
                 self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
-                self.chunk_ready = _DummySignal()
                 self.recording_done = _DummySignal()
                 self.error_occurred = _DummySignal()
                 self._running = False
@@ -286,15 +273,6 @@ class TestSampleRateMismatch:
 
             def wait(self, timeout):
                 return True
-
-            def attach_session(self, *, record_duration):
-                if record_duration > self._record_duration:
-                    self._record_duration = record_duration
-                    self._buffer = np.zeros((int(self._sample_rate * record_duration), self._n_channels), dtype=np.float32)
-                return MagicMock(chunk_index=0, sample_index=0)
-
-            def get_buffer_from(self, snapshot):
-                return self._buffer
 
         monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
 

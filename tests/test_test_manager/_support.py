@@ -238,7 +238,6 @@ def _make_running_factory_manager(
             self._buffer = partial_buf
             self._n_channels = n_channels
             self.captured_block_ready = _DummySignal()
-            self.chunk_ready = _DummySignal()
             self.recording_done = _DummySignal()
             self.error_occurred = _DummySignal()
             self._running = False

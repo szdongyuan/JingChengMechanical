@@ -139,6 +139,35 @@ def test_replay_selection_maps_display_channel_slices_segment_and_passes_gain():
     services.config_service.save_config.assert_not_called()
 
 
+def test_replay_from_zero_starts_at_canonical_frame_zero_without_capture_window(
+    monkeypatch,
+):
+    _, _, mgr, player = _manager_with_player()
+    canonical_tags = np.arange(7, 17, dtype=np.float32).reshape(-1, 1)
+    session = _ReplaySession(
+        buffer=canonical_tags,
+        sample_rate=100.0,
+        real_to_logical_channel={0: 0},
+    )
+    session._audio_file_path = "already-canonical.wav"
+    mgr._completed_sessions[1] = session
+    capture_window = MagicMock(
+        side_effect=AssertionError("replay must not trim canonical audio again")
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.test_session.SessionCaptureWindow",
+        capture_window,
+    )
+
+    assert mgr.replay_selection(1, "run-1", 0, 0.0, 0.03) is True
+
+    np.testing.assert_array_equal(
+        player.play_calls[0]["segment"],
+        canonical_tags[:3, 0],
+    )
+    capture_window.assert_not_called()
+
+
 def test_can_replay_selection_does_not_log_expected_unavailability():
     bus, _, mgr, player = _manager_with_player()
 

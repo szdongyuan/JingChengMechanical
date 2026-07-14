@@ -101,7 +101,6 @@ def _make_config(**overrides) -> dict:
 class _FakeRecorder:
     def __init__(self, *args, **kwargs):
         self.captured_block_ready = _SignalStub()
-        self.chunk_ready = _SignalStub()
         self.recording_done = _SignalStub()
         self.error_occurred = _SignalStub()
         self._sample_rate = float(kwargs.get("sample_rate", 44100.0))

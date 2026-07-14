@@ -903,7 +903,6 @@ class TestSignalDisconnection:
                 self._n_channels = n_channels
                 self._record_duration = record_duration
                 self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
-                self.chunk_ready = _DummySignal()
                 self.recording_done = _DummySignal()
                 self.error_occurred = _DummySignal()
                 self._running = False
@@ -920,15 +919,6 @@ class TestSignalDisconnection:
 
             def wait(self, timeout):
                 return True
-
-            def attach_session(self, *, record_duration):
-                if record_duration > self._record_duration:
-                    self._record_duration = record_duration
-                    self._buffer = np.zeros((int(self._sample_rate * record_duration), self._n_channels), dtype=np.float32)
-                return MagicMock(chunk_index=0, sample_index=0)
-
-            def get_buffer_from(self, snapshot):
-                return self._buffer
 
         class FakeMonitor:
             instances = []
@@ -964,7 +954,6 @@ class TestSignalDisconnection:
         monitor_error_lambda = getattr(session, "_monitor_error_lambda", None)
 
         assert recorder.captured_block_ready._callbacks == [captured_block_conn]
-        assert recorder.chunk_ready._callbacks == []
         assert recorder.recording_done._callbacks == []
         assert error_lambda in recorder.error_occurred._callbacks
         assert (
@@ -981,7 +970,6 @@ class TestSignalDisconnection:
         mgr.stop(config_id=1)
 
         assert captured_block_conn not in recorder.captured_block_ready._callbacks
-        assert recorder.chunk_ready._callbacks == []
         assert recorder.recording_done._callbacks == []
         assert error_lambda not in recorder.error_occurred._callbacks
         assert monitor_error_lambda not in monitor.error_occurred._callbacks
@@ -1024,7 +1012,6 @@ class TestSignalDisconnection:
             def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
                 self._sample_rate = sample_rate
                 self._n_channels = n_channels
-                self.chunk_ready = _DummySignal()
                 self.recording_done = _DummySignal()
                 self.error_occurred = _DummySignal()
                 self._running = False
@@ -1035,9 +1022,6 @@ class TestSignalDisconnection:
 
             def start(self):
                 self._running = True
-
-            def attach_session(self, *, record_duration):
-                return MagicMock(chunk_index=0, sample_index=0)
 
         class FakeMonitor:
             instances = []
@@ -1129,7 +1113,6 @@ class TestSignalDisconnection:
                 self._n_channels = n_channels
                 self._record_duration = record_duration
                 self._buffer = np.zeros((4, n_channels), dtype=np.float32)
-                self.chunk_ready = _DummySignal()
                 self.recording_done = _DummySignal()
                 self.error_occurred = _DummySignal()
                 self._running = False
@@ -1150,12 +1133,6 @@ class TestSignalDisconnection:
             def wait(self, timeout):
                 self.wait_calls.append(timeout)
                 return True
-
-            def attach_session(self, *, record_duration):
-                return MagicMock(chunk_index=0, sample_index=0)
-
-            def get_buffer_from(self, snapshot):
-                return self._buffer
 
         class FakeMonitor:
             instances = []

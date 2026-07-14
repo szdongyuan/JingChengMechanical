@@ -12,7 +12,6 @@ import os
 import queue
 import threading
 import time
-from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
@@ -48,12 +47,6 @@ def _resolve_device_index(device_name: str, hostapi: str) -> int:
     raise ValueError(f"Device not found: {device_name} ({hostapi})")
 
 
-@dataclass(frozen=True)
-class RecorderAttachSnapshot:
-    chunk_index: int
-    sample_index: int
-
-
 class AudioRecorder(QThread):
     """Record multi-channel audio into a pre-allocated ring buffer.
 
@@ -61,15 +54,12 @@ class AudioRecorder(QThread):
     -------
     captured_block_ready(CapturedAudioBlock)
         Emitted with the exact callback-owned sample and monotonic span.
-    chunk_ready(ndarray, int)
-        Temporary legacy emission of (chunk_data, chunk_index).
     recording_done()
         Emitted once the buffer is full.
     error_occurred(str)
         Emitted on device errors.
     """
 
-    chunk_ready = pyqtSignal(object, int)
     captured_block_ready = pyqtSignal(object)
     recording_done = pyqtSignal()
     error_occurred = pyqtSignal(str)
@@ -99,9 +89,6 @@ class AudioRecorder(QThread):
         self._write_pos = 0
         self._capture_sample_cursor = 0
         self._chunk_samples = int(sample_rate * self.CHUNK_DURATION)
-        self._chunk_index = 0
-        self._emitted_chunk_index = 0
-        self._emitted_sample_index = 0
         self._state_lock = threading.Lock()
 
         self._queue: queue.Queue[CapturedAudioBlock] = queue.Queue()
@@ -119,18 +106,6 @@ class AudioRecorder(QThread):
         """Grow the backing buffer to a longer duration if needed."""
         with self._state_lock:
             self._ensure_duration_locked(record_duration)
-
-    def attach_session(self, *, record_duration: float) -> RecorderAttachSnapshot:
-        """Atomically capture a late-attach boundary and ensure sufficient capacity."""
-        with self._state_lock:
-            sample_index = self._emitted_sample_index
-            chunk_index = self._emitted_chunk_index
-            total_duration = (sample_index / self._sample_rate) + float(record_duration)
-            self._ensure_duration_locked(total_duration)
-            return RecorderAttachSnapshot(
-                chunk_index=chunk_index,
-                sample_index=sample_index,
-            )
 
     def request_capture(self, record_duration: float) -> RecorderAttachment:
         """Atomically register a pending sample-exact capture owner.
@@ -242,14 +217,6 @@ class AudioRecorder(QThread):
             if available_end <= bounds.retained_start:
                 return empty
             return self._buffer[bounds.retained_start : available_end].copy()
-
-    def get_buffer_from(self, snapshot: RecorderAttachSnapshot | None) -> np.ndarray:
-        """Return audio written at or after a recorder-owned attach snapshot."""
-        with self._state_lock:
-            start_index = 0 if snapshot is None else int(snapshot.sample_index)
-            legacy_end = min(self._write_pos, self._legacy_target_samples)
-            start = max(0, min(start_index, legacy_end))
-            return self._buffer[start:legacy_end].copy()
 
     def _ensure_duration_locked(self, record_duration: float):
         if record_duration <= self._record_duration:
@@ -464,18 +431,11 @@ class AudioRecorder(QThread):
             self._write_pos = block.sample_end
 
     def _emit_captured_block(self, block: CapturedAudioBlock):
-        """Emit the same exact captured block plus the temporary legacy signal."""
+        """Emit one exact callback-owned block to capture consumers."""
 
         if not isinstance(block, CapturedAudioBlock):
             raise TypeError("block must be CapturedAudioBlock")
-        with self._state_lock:
-            chunk_index = self._chunk_index
-            self._chunk_index += 1
-            self._emitted_chunk_index = self._chunk_index
-            self._emitted_sample_index = block.sample_end
-        legacy_data = block.data.copy()
         self.captured_block_ready.emit(block)
-        self.chunk_ready.emit(legacy_data, chunk_index)
 
     def _feed_chunk(self, data: np.ndarray):
         """Write chunk to ring buffer."""
@@ -487,18 +447,6 @@ class AudioRecorder(QThread):
             n_write = min(n_samples, space)
             self._buffer[self._write_pos : self._write_pos + n_write] = data[:n_write]
             self._write_pos += n_write
-
-    def _emit_chunk(self):
-        """Emit the latest chunk via signal."""
-        with self._state_lock:
-            start = max(0, self._write_pos - self._chunk_samples)
-            end = self._write_pos
-            chunk = self._buffer[start:end].copy()
-            chunk_index = self._chunk_index
-            self._chunk_index += 1
-            self._emitted_chunk_index = self._chunk_index
-            self._emitted_sample_index = end
-        self.chunk_ready.emit(chunk, chunk_index)
 
     def _is_buffer_full(self) -> bool:
         return self._capture_complete()
