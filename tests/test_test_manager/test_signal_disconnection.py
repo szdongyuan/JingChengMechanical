@@ -42,6 +42,89 @@ def _process_qt_events_until(predicate, *, timeout: float = 1.0):
 
 
 class TestSignalDisconnection:
+    def test_delayed_recorder_error_from_stopped_same_config_run_cannot_abort_replacement(
+        self,
+        monkeypatch,
+    ):
+        (
+            bus,
+            _services,
+            mgr,
+            first_session,
+            _first_recorder,
+            _first_monitor,
+            _partial_buf,
+        ) = _make_running_factory_manager(monkeypatch)
+        delayed_error_callback = first_session._error_lambda
+
+        mgr.stop(config_id=1, silent=True)
+        assert mgr.start({"config_id": 1, "sn": "SN2"}) is True
+        replacement_session = mgr._sessions[1]
+        replacement_recorder = mgr._recorders[1]
+        bus.factory_runtime_aborted.emit.reset_mock()
+
+        delayed_error_callback("delayed error from stopped run")
+
+        assert mgr._sessions.get(1) is replacement_session
+        assert mgr._recorders.get(1) is replacement_recorder
+        assert mgr.is_running(config_id=1) is True
+        bus.factory_runtime_aborted.emit.assert_not_called()
+        mgr.stop(config_id=1, silent=True)
+
+    def test_current_recorder_generation_error_still_aborts_current_run(
+        self,
+        monkeypatch,
+    ):
+        (
+            bus,
+            _services,
+            mgr,
+            _session,
+            recorder,
+            _monitor,
+            _partial_buf,
+        ) = _make_running_factory_manager(monkeypatch)
+        bus.factory_runtime_aborted.emit.reset_mock()
+
+        recorder.error_occurred.emit("current recorder failed")
+
+        assert mgr.is_running(config_id=1) is False
+        bus.factory_runtime_aborted.emit.assert_called_once()
+
+    def test_queued_monitor_error_from_stopped_same_config_run_cannot_abort_replacement(
+        self,
+        monkeypatch,
+    ):
+        app = QCoreApplication.instance()
+        if app is None:
+            app = QCoreApplication([])
+        (
+            bus,
+            _services,
+            mgr,
+            _first_session,
+            _first_recorder,
+            first_monitor,
+            _partial_buf,
+        ) = _make_running_factory_manager(monkeypatch)
+
+        first_monitor.error_occurred.emit("queued error from stopped run")
+        mgr.stop(config_id=1, silent=True)
+        assert mgr.start({"config_id": 1, "sn": "SN2"}) is True
+        replacement_session = mgr._sessions[1]
+        replacement_recorder = mgr._recorders[1]
+        replacement_monitor = mgr._monitors[1]
+        bus.factory_runtime_aborted.emit.reset_mock()
+
+        app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents)
+
+        assert mgr._sessions.get(1) is replacement_session
+        assert mgr._recorders.get(1) is replacement_recorder
+        assert mgr._monitors.get(1) is replacement_monitor
+        assert mgr.is_running(config_id=1) is True
+        bus.factory_runtime_aborted.emit.assert_not_called()
+        mgr.stop(config_id=1, silent=True)
+
     def test_rejected_shared_candidate_rotates_token_disconnects_and_retries_once(
         self,
         monkeypatch,

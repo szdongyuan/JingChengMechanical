@@ -966,19 +966,23 @@ class TestLateAttachBufferSlice:
         assert 1 not in mgr._completed_sessions
         assert mgr.is_running(config_id=1) is False
 
-    def test_on_error_emits_factory_runtime_aborted_for_active_factory_run(self):
-        bus = _mock_bus()
-        services = _mock_services(bus)
-        mgr = TestManager(bus, services)
-        rec = MagicMock()
-        session = MagicMock()
-        session.config_id = 1
-        session._workorder = {
-            "trigger_source": "plc",
-            "factory_run_id": "run-1",
-        }
-        mgr._sessions[1] = session
-        mgr._recorders[1] = rec
+    def test_on_error_emits_factory_runtime_aborted_for_active_factory_run(
+        self,
+        monkeypatch,
+    ):
+        (
+            bus,
+            _services,
+            mgr,
+            session,
+            rec,
+            _monitor,
+            _partial_buf,
+        ) = _make_running_factory_manager(
+            monkeypatch,
+            trigger_source="plc",
+        )
+        run_id = session._workorder["factory_run_id"]
 
         state_at_abort = {}
 
@@ -990,14 +994,14 @@ class TestLateAttachBufferSlice:
 
         bus.factory_runtime_aborted.emit.side_effect = capture_state_at_abort
 
-        mgr._on_error(1, "monitor disconnected")
+        rec.error_occurred.emit("monitor disconnected")
 
         abort_payload = state_at_abort["payload"]
         assert state_at_abort["running"] is False
         assert state_at_abort["sessions"] == {}
         assert state_at_abort["recorders"] == {}
         assert abort_payload.config_id == 1
-        assert abort_payload.run_id == "run-1"
+        assert abort_payload.run_id == run_id
         assert abort_payload.trigger_source == "plc"
         assert abort_payload.error_message == "monitor disconnected"
         assert mgr.is_running(config_id=1) is False

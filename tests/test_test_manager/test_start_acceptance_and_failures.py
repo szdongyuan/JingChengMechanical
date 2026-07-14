@@ -25,6 +25,56 @@ def _start_config(**overrides):
     return config
 
 
+def _install_start_boundary_doubles(monkeypatch):
+    class BoundaryRecorder(_CaptureRecorderDoubleMixin):
+        instances = []
+
+        def __init__(
+            self,
+            *,
+            device_name,
+            hostapi,
+            sample_rate,
+            n_channels,
+            record_duration,
+        ):
+            self._sample_rate = float(sample_rate)
+            self._n_channels = int(n_channels)
+            self._buffer = np.zeros(
+                (int(self._sample_rate * record_duration), self._n_channels),
+                dtype=np.float32,
+            )
+            self.error_occurred = _DummySignal()
+            self._running = False
+            self.start_calls = 0
+            self.stop_calls = 0
+            BoundaryRecorder.instances.append(self)
+
+        def isRunning(self):
+            return self._running
+
+        def start(self):
+            self.start_calls += 1
+            self._running = True
+
+        def stop(self):
+            self.stop_calls += 1
+            self._running = False
+
+        def wait(self, timeout):
+            return True
+
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.AudioRecorder",
+        BoundaryRecorder,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.TestSession",
+        _FakeSession,
+    )
+    return BoundaryRecorder
+
+
 class TestTestManagerStartStop:
     def test_start_with_config_id_creates_session(self):
             bus = _mock_bus()
@@ -637,6 +687,102 @@ class TestTestManagerStartStop:
             assert mgr.is_running(config_id=1) is False
             bus.test_started.emit.assert_not_called()
 
+    def test_recorder_error_during_current_collection_setup_fails_before_acceptance(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        services.config_service.load_config.return_value = _start_config()
+        recorder_type = _install_start_boundary_doubles(monkeypatch)
+        mgr = TestManager(bus, services)
+        accepted_run_ids = []
+
+        def fail_at_current_collection_entry(config_id, session):
+            assert mgr._sessions.get(config_id) is session
+            recorder_type.instances[0].error_occurred.emit(
+                "current collection setup failed"
+            )
+
+        monkeypatch.setattr(
+            mgr,
+            "_start_current_collection",
+            fail_at_current_collection_entry,
+        )
+
+        accepted = mgr.start(
+            {"config_id": 1, "sn": "SN1"},
+            on_start_accepted=accepted_run_ids.append,
+        )
+
+        assert accepted is False
+        assert accepted_run_ids == []
+        assert mgr.is_running(config_id=1) is False
+        assert recorder_type.instances[0].start_calls == 0
+        bus.test_started.emit.assert_not_called()
+
+    def test_recorder_error_inside_acceptance_callback_aborts_at_startup_boundary(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        services.config_service.load_config.return_value = _start_config()
+        recorder_type = _install_start_boundary_doubles(monkeypatch)
+        mgr = TestManager(bus, services)
+        accepted_run_ids = []
+
+        def on_start_accepted(run_id):
+            accepted_run_ids.append(run_id)
+            recorder_type.instances[0].error_occurred.emit(
+                "acceptance boundary failed"
+            )
+
+        accepted = mgr.start(
+            {"config_id": 1, "sn": "SN1"},
+            on_start_accepted=on_start_accepted,
+        )
+
+        assert accepted is False
+        assert len(accepted_run_ids) == 1
+        assert mgr.is_running(config_id=1) is False
+        assert recorder_type.instances[0].start_calls == 0
+        assert recorder_type.instances[0].stop_calls == 1
+        bus.factory_runtime_aborted.emit.assert_called_once()
+        bus.test_started.emit.assert_not_called()
+
+    def test_acceptance_callback_can_stop_reentrantly_without_starting_recorder(
+        self,
+        monkeypatch,
+    ):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        services.config_service.load_config.return_value = _start_config()
+        recorder_type = _install_start_boundary_doubles(monkeypatch)
+        mgr = TestManager(bus, services)
+        accepted_run_ids = []
+
+        def on_start_accepted(run_id):
+            accepted_run_ids.append(run_id)
+            mgr.stop(config_id=1, silent=True)
+
+        accepted = mgr.start(
+            {"config_id": 1, "sn": "SN1"},
+            on_start_accepted=on_start_accepted,
+        )
+
+        assert accepted is False
+        assert len(accepted_run_ids) == 1
+        assert mgr.is_running(config_id=1) is False
+        assert recorder_type.instances[0].start_calls == 0
+        assert recorder_type.instances[0].stop_calls == 1
+        bus.factory_runtime_aborted.emit.assert_called_once()
+        assert (
+            bus.factory_runtime_aborted.emit.call_args.args[0].error_message
+            is None
+        )
+        bus.test_started.emit.assert_not_called()
+
     def test_start_can_be_canceled_by_request_id_after_backend_session_exists_but_before_recorder_start(
             self,
             monkeypatch,
@@ -874,9 +1020,11 @@ class TestTestManagerStartStop:
             assert FakeRecorder.instances[0].stop_calls == 1
             bus.test_started.emit.assert_not_called()
 
+    @pytest.mark.parametrize("completion_phase", ["acceptance", "recorder_start"])
     def test_start_keeps_newly_completed_session_when_recorder_finishes_before_start_returns(
             self,
             monkeypatch,
+            completion_phase,
         ):
             bus = _mock_bus()
             services = _mock_services(bus)
@@ -922,14 +1070,17 @@ class TestTestManagerStartStop:
                     self.recording_done = _DummySignal()
                     self.error_occurred = _DummySignal()
                     self._running = False
+                    self.start_calls = 0
                     FastRecorder.instances.append(self)
 
                 def isRunning(self):
                     return self._running
 
                 def start(self):
+                    self.start_calls += 1
                     self._running = True
-                    self.captured_block_ready.emit(object())
+                    if completion_phase == "recorder_start":
+                        self.captured_block_ready.emit(object())
 
                 def stop(self):
                     self._running = False
@@ -980,7 +1131,14 @@ class TestTestManagerStartStop:
             bus.status.emit.side_effect = lambda message: events.append(f"status:{message}")
             bus.log.emit.side_effect = lambda message: events.append(f"log:{message}")
 
-            accepted = mgr.start({"config_id": 1, "sn": "SN1", "trigger_source": "manual"})
+            def on_start_accepted(_run_id):
+                if completion_phase == "acceptance":
+                    FastRecorder.instances[0].captured_block_ready.emit(object())
+
+            accepted = mgr.start(
+                {"config_id": 1, "sn": "SN1", "trigger_source": "manual"},
+                on_start_accepted=on_start_accepted,
+            )
 
             assert accepted is True
             assert mgr.is_running(config_id=1) is False
@@ -994,6 +1152,9 @@ class TestTestManagerStartStop:
             assert not any(
                 event.startswith("log:[TestManager] started config=1")
                 for event in events
+            )
+            assert FastRecorder.instances[0].start_calls == (
+                0 if completion_phase == "acceptance" else 1
             )
             bus.factory_runtime_auto_analysis_succeeded.emit.assert_called_once()
 

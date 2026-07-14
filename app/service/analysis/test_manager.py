@@ -44,51 +44,118 @@ from consts.running_consts import base_dir
 
 
 class _StartupRecorderErrorLatch:
-    """Bridge recorder errors across startup registration without a signal gap."""
+    """Bridge one recorder generation from setup through runtime routing."""
 
-    def __init__(self, route_registered_error):
+    _STARTUP = "startup"
+    _ACCEPTING = "accepting"
+    _RUNTIME = "runtime"
+    _INVALID = "invalid"
+
+    def __init__(self, source_token, route_runtime_error):
         self._lock = threading.RLock()
-        self._route_registered_error = route_registered_error
-        self._source_token = None
-        self._registered = False
+        self._route_runtime_error = route_runtime_error
+        self._source_token = source_token
+        self._phase = self._STARTUP
         self._latched_error: str | None = None
-
-    def begin_generation(self, source_token) -> None:
-        with self._lock:
-            self._source_token = source_token
-            self._registered = False
-            self._latched_error = None
 
     def handle(self, source_token, message) -> None:
         normalized_message = str(message)
-        route_registered_error = None
+        route_runtime_error = None
+        with self._lock:
+            if (
+                source_token is not self._source_token
+                or self._phase == self._INVALID
+            ):
+                return
+            if self._latched_error is None:
+                self._latched_error = normalized_message
+            if self._phase != self._RUNTIME:
+                return
+            route_runtime_error = self._route_runtime_error
+        route_runtime_error(normalized_message)
+
+    def checkpoint(self, source_token) -> bool:
+        """Raise the first setup error and report whether this generation is live."""
+
+        with self._lock:
+            if (
+                source_token is not self._source_token
+                or self._phase == self._INVALID
+            ):
+                return False
+            self._raise_latched_error_locked()
+            return True
+
+    def begin_acceptance(self, source_token) -> bool:
+        """Linearize a clean startup immediately before publishing acceptance."""
+
+        with self._lock:
+            if (
+                source_token is not self._source_token
+                or self._phase == self._INVALID
+            ):
+                return False
+            if self._phase != self._STARTUP:
+                raise RuntimeError("recorder startup acceptance already began")
+            self._raise_latched_error_locked()
+            self._phase = self._ACCEPTING
+            return True
+
+    def complete_startup(self, source_token) -> tuple[bool, str | None]:
+        """Transition acceptance to runtime, or return its boundary error."""
+
+        with self._lock:
+            if (
+                source_token is not self._source_token
+                or self._phase == self._INVALID
+            ):
+                return False, self._latched_error
+            if self._phase != self._ACCEPTING:
+                raise RuntimeError("recorder startup acceptance is not active")
+            if self._latched_error is not None:
+                return True, self._latched_error
+            self._phase = self._RUNTIME
+            return True, None
+
+    def invalidate(self, source_token) -> None:
         with self._lock:
             if source_token is not self._source_token:
                 return
-            if not self._registered:
-                if self._latched_error is None:
-                    self._latched_error = normalized_message
-                return
-            route_registered_error = self._route_registered_error
-        route_registered_error(normalized_message)
-
-    def register(self, source_token, register_runtime) -> None:
-        """Atomically reject a latched error or enable normal error routing."""
-
-        with self._lock:
-            if source_token is not self._source_token:
-                raise RuntimeError("stale recorder startup generation")
-            self._raise_latched_error_locked()
-            register_runtime()
-            # A synchronous signal emitted re-entrantly by registration can
-            # acquire this RLock and latch an error.  Check again before the
-            # generation becomes normally routed.
-            self._raise_latched_error_locked()
-            self._registered = True
+            self._phase = self._INVALID
+            self._source_token = None
 
     def _raise_latched_error_locked(self) -> None:
         if self._latched_error is not None:
             raise RuntimeError(self._latched_error)
+
+
+class _SessionErrorRoute:
+    """Identity-complete route for one manager-owned capture generation."""
+
+    __slots__ = (
+        "config_id",
+        "session",
+        "recorder",
+        "monitor",
+        "source_token",
+        "error_latch",
+    )
+
+    def __init__(
+        self,
+        *,
+        config_id,
+        session,
+        recorder,
+        monitor,
+        source_token,
+    ):
+        self.config_id = config_id
+        self.session = session
+        self.recorder = recorder
+        self.monitor = monitor
+        self.source_token = source_token
+        self.error_latch = None
 
 
 class _CaptureFinalizationState:
@@ -117,7 +184,7 @@ class TestManager(QObject):
     __test__ = False
     _MIN_MANUAL_REANALYSIS_DURATION_SEC = 0.1
 
-    _deferred_monitor_error_occurred = pyqtSignal(int, str)
+    _deferred_monitor_error_occurred = pyqtSignal(object, str)
 
     def __init__(self, bus, services):
         super().__init__()
@@ -128,6 +195,7 @@ class TestManager(QObject):
         self._completed_sessions: dict[int, TestSession] = {}
         self._recorders: dict[int, AudioRecorder] = {}
         self._monitors: dict[int, AudioMonitor] = {}
+        self._session_error_routes: dict[int, _SessionErrorRoute] = {}
         self._shared_recorders: dict[str, AudioRecorder] = {}
         self._pending_factory_starts: dict[str, int] = {}
         self._canceled_factory_start_requests: set[str] = set()
@@ -302,9 +370,9 @@ class TestManager(QObject):
         recorder = None
         monitor = None
         requested_capture = None
-        startup_error_latch = _StartupRecorderErrorLatch(
-            lambda message, cid=config_id: self._on_error(cid, message)
-        )
+        source_token = None
+        startup_error_latch = None
+        error_route = None
 
         try:
             session = TestSession(
@@ -343,20 +411,27 @@ class TestManager(QObject):
                     monitor_channel=resolved_monitor_channel,
                     gain_db=resolved_monitor_gain_db,
                 )
-                session._monitor_error_lambda = (
-                    lambda msg, cid=config_id: self._deferred_monitor_error_occurred.emit(
-                        cid,
-                        msg,
-                    )
-                )
 
             session.set_monitor_feed(monitor.feed if monitor is not None else None)
-            if monitor is not None:
-                monitor.error_occurred.connect(session._monitor_error_lambda)
 
             for capture_attempt in range(2):
                 source_token = object()
-                startup_error_latch.begin_generation(source_token)
+                error_route = _SessionErrorRoute(
+                    config_id=config_id,
+                    session=session,
+                    recorder=recorder,
+                    monitor=monitor,
+                    source_token=source_token,
+                )
+                startup_error_latch = _StartupRecorderErrorLatch(
+                    source_token,
+                    lambda message, route=error_route: self._on_error(
+                        route,
+                        message,
+                    ),
+                )
+                error_route.error_latch = startup_error_latch
+                session._manager_error_route = error_route
                 session.prepare_for_attach(source_token)
                 captured_block_conn = (
                     lambda block, s=session, token=source_token: s._on_captured_block(
@@ -391,6 +466,7 @@ class TestManager(QObject):
                         recorder.error_occurred,
                         recorder_error_conn,
                     )
+                    startup_error_latch.invalidate(source_token)
                     self._discard_shared_recorder(recorder)
                     if capture_attempt:
                         raise
@@ -421,29 +497,107 @@ class TestManager(QObject):
                     )
                     requested_capture = None
                     raise
+                startup_error_latch.checkpoint(source_token)
                 break
 
-            def register_runtime():
-                with self._lifecycle_lock:
-                    self._sessions[config_id] = session
-                    self._recorders[config_id] = recorder
-                    if monitor is not None:
-                        self._monitors[config_id] = monitor
+            if monitor is not None:
+                session._monitor_error_lambda = (
+                    lambda msg, route=error_route: self._deferred_monitor_error_occurred.emit(
+                        route,
+                        str(msg),
+                    )
+                )
+                monitor.error_occurred.connect(session._monitor_error_lambda)
 
-            startup_error_latch.register(source_token, register_runtime)
-            self._start_current_collection(config_id, session)
-            self._bus.recording_progress.emit(config_id, 0.0)
+            with self._lifecycle_lock:
+                self._sessions[config_id] = session
+                self._recorders[config_id] = recorder
+                if monitor is not None:
+                    self._monitors[config_id] = monitor
+                self._session_error_routes[config_id] = error_route
 
-            if mon := self._monitors.get(config_id):
-                mon.start()
+            def checked_startup_state():
+                latch_live = startup_error_latch.checkpoint(source_token)
+                state = self._startup_error_route_state(error_route)
+                if state == "active" and not latch_live:
+                    return "missing"
+                return state
 
-            if self._factory_start_canceled(request_id):
-                self._cleanup_failed_start_setup(config_id, session, recorder, monitor)
+            def finish_inactive_before_acceptance(state):
+                if state in {"completed", "completing"}:
+                    if callable(on_start_accepted):
+                        on_start_accepted(session_workorder["factory_run_id"])
+                    self._clear_pending_factory_start(request_id)
+                    self._clear_last_start_error()
+                    return True
                 self._clear_pending_factory_start(request_id)
                 return False
 
+            state = checked_startup_state()
+            if state != "active":
+                return finish_inactive_before_acceptance(state)
+            self._start_current_collection(config_id, session)
+            state = checked_startup_state()
+            if state != "active":
+                return finish_inactive_before_acceptance(state)
+
+            self._bus.recording_progress.emit(config_id, 0.0)
+            state = checked_startup_state()
+            if state != "active":
+                return finish_inactive_before_acceptance(state)
+
+            if monitor is not None:
+                monitor.start()
+                state = checked_startup_state()
+                if state != "active":
+                    return finish_inactive_before_acceptance(state)
+
+            if self._factory_start_canceled(request_id):
+                self._cleanup_failed_start_setup(
+                    config_id,
+                    session,
+                    recorder,
+                    monitor,
+                    requested_capture=requested_capture,
+                    error_route=error_route,
+                )
+                self._clear_pending_factory_start(request_id)
+                return False
+
+            if not startup_error_latch.begin_acceptance(source_token):
+                return finish_inactive_before_acceptance(
+                    self._startup_error_route_state(error_route)
+                )
             if callable(on_start_accepted):
                 on_start_accepted(session_workorder["factory_run_id"])
+
+            if self._factory_start_canceled(request_id):
+                self._cleanup_failed_start_setup(
+                    config_id,
+                    session,
+                    recorder,
+                    monitor,
+                    requested_capture=requested_capture,
+                    error_route=error_route,
+                )
+                self._clear_pending_factory_start(request_id)
+                return False
+
+            latch_live, acceptance_error = startup_error_latch.complete_startup(
+                source_token
+            )
+            if acceptance_error is not None:
+                self._on_error(error_route, acceptance_error)
+                self._clear_pending_factory_start(request_id)
+                self._clear_last_start_error()
+                return False
+            if not latch_live:
+                state = self._startup_error_route_state(error_route)
+                self._clear_pending_factory_start(request_id)
+                self._clear_last_start_error()
+                if state in {"completed", "completing"}:
+                    return True
+                return False
         except Exception as exc:
             self._bus.log.emit(f"[TestManager] ERROR starting config {config_id}: {exc}")
             self._cleanup_failed_start_setup(
@@ -452,18 +606,34 @@ class TestManager(QObject):
                 recorder,
                 monitor,
                 requested_capture=requested_capture,
+                error_route=error_route,
             )
             return self._fail_start_before_acceptance(
                 request_id,
                 f"启动失败：{exc}",
             )
 
-        if self._factory_start_canceled(request_id):
-            self._stop_one(config_id, silent=True)
+        state = self._startup_error_route_state(error_route)
+        if state != "active":
             self._clear_pending_factory_start(request_id)
-            return False
+            self._clear_last_start_error()
+            return True
 
-        prior_completed_session = self._completed_sessions.pop(config_id, None)
+        with self._lifecycle_lock:
+            if self._completed_sessions.get(config_id) is session:
+                prior_completed_session = None
+            else:
+                prior_completed_session = self._completed_sessions.pop(
+                    config_id,
+                    None,
+                )
+
+        def restore_prior_completed_session():
+            if prior_completed_session is None:
+                return
+            with self._lifecycle_lock:
+                if config_id not in self._completed_sessions:
+                    self._completed_sessions[config_id] = prior_completed_session
 
         # A running shared recorder can deliver enough queued retained audio
         # while attach_to_recorder() drains its pending handoff.  The session
@@ -472,39 +642,43 @@ class TestManager(QObject):
         # completion before deciding whether this recorder needs starting.
         if getattr(session, "_finished", False):
             self._on_session_done(config_id)
-            if self._sessions.get(config_id) is not session:
-                if (
-                    prior_completed_session is not None
-                    and config_id not in self._completed_sessions
-                ):
-                    self._completed_sessions[config_id] = prior_completed_session
+            if self._startup_error_route_state(error_route) != "active":
+                restore_prior_completed_session()
                 self._clear_pending_factory_start(request_id)
                 self._clear_last_start_error()
                 return True
 
         try:
-            if not recorder.isRunning():
+            recorder_running = recorder.isRunning()
+            if self._startup_error_route_state(error_route) != "active":
+                restore_prior_completed_session()
+                self._clear_pending_factory_start(request_id)
+                self._clear_last_start_error()
+                return True
+            if not recorder_running:
                 recorder.start()
         except Exception as exc:
             self._bus.log.emit(f"[TestManager] ERROR starting config {config_id}: {exc}")
-            self._emit_optional_signal(
-                "factory_runtime_aborted",
-                self._make_factory_runtime_abort_payload(
-                    config_id,
-                    session,
-                    error_message=str(exc),
-                ),
+            stopped = self._stop_one(
+                config_id,
+                silent=True,
+                expected_error_route=error_route,
             )
-            self._stop_one(config_id, silent=True)
-            if prior_completed_session is not None and config_id not in self._completed_sessions:
-                self._completed_sessions[config_id] = prior_completed_session
+            if stopped:
+                self._emit_optional_signal(
+                    "factory_runtime_aborted",
+                    self._make_factory_runtime_abort_payload(
+                        config_id,
+                        session,
+                        error_message=str(exc),
+                    ),
+                )
+            restore_prior_completed_session()
             self._clear_pending_factory_start(request_id)
-            return False
+            return not stopped
 
-        active_session = self._sessions.get(config_id)
-        if active_session is not session:
-            if prior_completed_session is not None and config_id not in self._completed_sessions:
-                self._completed_sessions[config_id] = prior_completed_session
+        if self._startup_error_route_state(error_route) != "active":
+            restore_prior_completed_session()
             self._clear_pending_factory_start(request_id)
             self._clear_last_start_error()
             return True
@@ -512,7 +686,11 @@ class TestManager(QObject):
         self._clear_pending_factory_start(request_id)
         self._clear_last_start_error()
         self._bus.test_started.emit(config_id)
+        if self._startup_error_route_state(error_route) != "active":
+            return True
         self._bus.status.emit("Recording...")
+        if self._startup_error_route_state(error_route) != "active":
+            return True
         self._bus.log.emit(
             f"[TestManager] started config={config_id}, workorder={session_workorder}"
         )
@@ -729,6 +907,9 @@ class TestManager(QObject):
             session_is_analyzing = self._session_is_analyzing(config_id)
             rec = self._recorders.get(config_id)
             mon = self._monitors.get(config_id)
+            error_route = self._session_error_routes.pop(config_id, None)
+
+        self._invalidate_error_route(error_route)
 
         if session_is_analyzing:
             return self._stop_to_stopped(
@@ -750,12 +931,21 @@ class TestManager(QObject):
         silent: bool = False,
         *,
         notify_factory_runtime_abort: bool = False,
+        expected_error_route=None,
     ):
-        self._stop_replay_if_config(config_id)
         with self._lifecycle_lock:
+            if (
+                expected_error_route is not None
+                and not self._error_route_is_current_locked(expected_error_route)
+            ):
+                return False
             session = self._sessions.pop(config_id, None)
             rec = self._recorders.pop(config_id, None)
             mon = self._monitors.pop(config_id, None)
+            error_route = self._session_error_routes.pop(config_id, None)
+
+        self._invalidate_error_route(error_route)
+        self._stop_replay_if_config(config_id)
 
         partial_buf = None
         capture_error = None
@@ -844,6 +1034,7 @@ class TestManager(QObject):
             if not silent:
                 self._bus.log.emit(f"[TestManager] stopped config={config_id}")
                 self._bus.status.emit("Stopped")
+        return session is not None
 
     def _cleanup_failed_start_setup(
         self,
@@ -853,16 +1044,46 @@ class TestManager(QObject):
         monitor=None,
         *,
         requested_capture=None,
+        error_route=None,
     ) -> None:
         with self._lifecycle_lock:
-            registered_session = self._sessions.pop(config_id, None)
-            registered_recorder = self._recorders.pop(config_id, None)
-            registered_monitor = self._monitors.pop(config_id, None)
-        self._stop_current_collection(config_id)
+            current_session = self._sessions.get(config_id)
+            replacement_active = (
+                current_session is not None and current_session is not session
+            )
+            if session is not None and current_session is session:
+                registered_session = self._sessions.pop(config_id, None)
+                registered_recorder = None
+                if self._recorders.get(config_id) is recorder:
+                    registered_recorder = self._recorders.pop(config_id, None)
+                registered_monitor = None
+                if monitor is not None and self._monitors.get(config_id) is monitor:
+                    registered_monitor = self._monitors.pop(config_id, None)
+                registered_error_route = self._session_error_routes.get(config_id)
+                if (
+                    registered_error_route is error_route
+                    or getattr(registered_error_route, "session", None) is session
+                ):
+                    self._session_error_routes.pop(config_id, None)
+            else:
+                registered_session = None
+                registered_recorder = None
+                registered_monitor = None
+                registered_error_route = None
 
-        cleanup_session = registered_session or session
-        cleanup_recorder = registered_recorder or recorder
-        cleanup_monitor = registered_monitor or monitor
+        self._invalidate_error_route(registered_error_route)
+        if error_route is not registered_error_route:
+            self._invalidate_error_route(error_route)
+        if not replacement_active:
+            self._stop_current_collection(config_id)
+
+        cleanup_session = registered_session if registered_session is not None else session
+        cleanup_recorder = (
+            registered_recorder if registered_recorder is not None else recorder
+        )
+        cleanup_monitor = (
+            registered_monitor if registered_monitor is not None else monitor
+        )
 
         if cleanup_session is not None:
             try:
@@ -1004,6 +1225,51 @@ class TestManager(QObject):
             return
         self._pending_factory_starts.pop(request_id, None)
         self._canceled_factory_start_requests.discard(request_id)
+
+    def _error_route_is_current_locked(self, error_route) -> bool:
+        if not isinstance(error_route, _SessionErrorRoute):
+            return False
+        config_id = error_route.config_id
+        if self._session_error_routes.get(config_id) is not error_route:
+            return False
+        if self._sessions.get(config_id) is not error_route.session:
+            return False
+        if self._recorders.get(config_id) is not error_route.recorder:
+            return False
+        if error_route.monitor is None:
+            if config_id in self._monitors:
+                return False
+        elif self._monitors.get(config_id) is not error_route.monitor:
+            return False
+        return (
+            getattr(error_route.session, "_manager_error_route", None)
+            is error_route
+        )
+
+    def _startup_error_route_state(self, error_route) -> str:
+        if not isinstance(error_route, _SessionErrorRoute):
+            return "missing"
+        config_id = error_route.config_id
+        session = error_route.session
+        with self._lifecycle_lock:
+            if (
+                self._sessions.get(config_id) is session
+                and id(session) in self._completion_claims
+            ):
+                return "completing"
+            if self._error_route_is_current_locked(error_route):
+                return "active"
+            if self._completed_sessions.get(config_id) is session:
+                return "completed"
+            return "missing"
+
+    @staticmethod
+    def _invalidate_error_route(error_route) -> None:
+        if not isinstance(error_route, _SessionErrorRoute):
+            return
+        latch = error_route.error_latch
+        if isinstance(latch, _StartupRecorderErrorLatch):
+            latch.invalidate(error_route.source_token)
 
     def is_running(self, config_id: int | None = None) -> bool:
         if config_id is not None:
@@ -1187,6 +1453,7 @@ class TestManager(QObject):
         )
 
     def _on_session_done(self, config_id: int):
+        error_route = None
         with self._lifecycle_lock:
             session = self._sessions.get(config_id)
             if session is None or config_id in self._accepted_factory_stops:
@@ -1198,6 +1465,13 @@ class TestManager(QObject):
             if not duplicate_completion:
                 self._completion_claims.add(completion_key)
                 self._analyzing_sessions.add(config_id)
+                error_route = self._session_error_routes.get(config_id)
+                if getattr(error_route, "session", None) is session:
+                    self._session_error_routes.pop(config_id, None)
+                else:
+                    error_route = None
+
+        self._invalidate_error_route(error_route)
 
         if duplicate_completion:
             # Observe the stable one-shot result before returning.  Calling the
@@ -1273,6 +1547,11 @@ class TestManager(QObject):
 
                 self._recorders.pop(config_id, None)
                 mon = self._monitors.pop(config_id, None)
+                final_error_route = self._session_error_routes.pop(
+                    config_id,
+                    None,
+                )
+            self._invalidate_error_route(final_error_route)
             self._cleanup_monitor_recorder_safely(
                 config_id,
                 mon=mon,
@@ -1289,28 +1568,42 @@ class TestManager(QObject):
                 self._analyzing_sessions.discard(config_id)
                 self._completion_claims.discard(completion_key)
 
-    def _on_error(self, config_id: int, message: str):
-        session = self._sessions.get(config_id)
+    def _on_error(self, error_route, message: str) -> bool:
+        if not isinstance(error_route, _SessionErrorRoute):
+            return False
+        config_id = error_route.config_id
+        abort_payload = self._make_factory_runtime_abort_payload(
+            config_id,
+            error_route.session,
+            error_message=message,
+        )
+        stopped = self._stop_one(
+            config_id,
+            silent=True,
+            expected_error_route=error_route,
+        )
+        if not stopped:
+            return False
+
         self._bus.log.emit(f"[TestManager] ERROR config={config_id}: {message}")
         self._bus.status.emit(f"Error: {message}")
-        abort_payload = None
-        if session is not None:
-            abort_payload = self._make_factory_runtime_abort_payload(
-                config_id,
-                session,
-                error_message=message,
-            )
-        self._stop_one(config_id, silent=True)
-        if abort_payload is not None:
-            self._emit_optional_signal("factory_runtime_aborted", abort_payload)
+        self._emit_optional_signal("factory_runtime_aborted", abort_payload)
+        return True
 
-    def _on_monitor_error(self, config_id: int, message: str):
+    def _on_monitor_error(self, error_route, message: str):
+        if not isinstance(error_route, _SessionErrorRoute):
+            return
+        config_id = error_route.config_id
         if self._is_nonfatal_monitor_diagnostic(message):
+            with self._lifecycle_lock:
+                route_is_current = self._error_route_is_current_locked(error_route)
+            if not route_is_current:
+                return
             self._bus.log.emit(
                 f"[TestManager] monitor diagnostic config={config_id}: {message}"
             )
             return
-        self._on_error(config_id, message)
+        self._on_error(error_route, message)
 
     @staticmethod
     def _is_nonfatal_monitor_diagnostic(message: str) -> bool:
