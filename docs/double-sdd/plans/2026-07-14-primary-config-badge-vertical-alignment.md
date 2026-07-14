@@ -44,7 +44,7 @@ Extend `test_factory_config_list_primary_badge_has_non_clipping_height` after ob
 Run:
 
 ```powershell
-$env:QT_QPA_PLATFORM='offscreen'; python -m pytest tests/test_factory_config_list.py::test_factory_config_list_primary_badge_has_non_clipping_height -v
+$env:QT_QPA_PLATFORM='offscreen'; $env:PYTEST_QT_API='pyqt6'; python -m pytest tests/test_factory_config_list.py::test_factory_config_list_primary_badge_has_non_clipping_height -v
 ```
 
 Expected: FAIL on `abs(badge_center_y - row_center_y) <= 1`, with the current center delta measuring 3 px. The existing 32 px item-height assertion should pass.
@@ -99,7 +99,7 @@ When rebuilding each list item, preserve room for the outer decoration:
 Run:
 
 ```powershell
-$env:QT_QPA_PLATFORM='offscreen'; python -m pytest tests/test_factory_config_list.py::test_factory_config_list_primary_badge_has_non_clipping_height -v
+$env:QT_QPA_PLATFORM='offscreen'; $env:PYTEST_QT_API='pyqt6'; python -m pytest tests/test_factory_config_list.py::test_factory_config_list_primary_badge_has_non_clipping_height -v
 ```
 
 Expected: PASS; the badge-to-row center delta is no more than 1 px and the item height remains 32 px.
@@ -119,7 +119,7 @@ Expected: PASS.
 Run:
 
 ```powershell
-$env:QT_QPA_PLATFORM='offscreen'; python -m pytest tests/test_factory_config_list.py -v
+$env:QT_QPA_PLATFORM='offscreen'; $env:PYTEST_QT_API='pyqt6'; python -m pytest tests/test_factory_config_list.py -v
 ```
 
 Expected: all tests pass, covering primary selection, checkbox behavior, drag previews, and drag/drop ordering.
