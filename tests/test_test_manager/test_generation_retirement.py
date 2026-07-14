@@ -2029,6 +2029,496 @@ class TestGenerationRetirement:
         assert monitor_ref() is None
         _assert_no_generation_state(manager)
 
+    def test_completed_session_keeps_canonical_replay_without_runtime_resources(
+        self,
+        monkeypatch,
+    ):
+        (
+            _bus,
+            _services,
+            manager,
+            session,
+            recorder,
+            monitor,
+            partial_buf,
+        ) = _make_running_factory_manager(monkeypatch)
+        session._run_judgment = MagicMock(return_value=_successful_judgment())
+        manager._build_chart_payload = lambda *_args, **_kwargs: {}
+        recorder_ref = weakref.ref(recorder)
+        monitor_ref = weakref.ref(monitor)
+
+        session._on_session_done_cb(1)
+
+        completed_session = manager._completed_sessions[1]
+        assert completed_session is session
+        assert completed_session._manager_completed_runtime_refs_detached is True
+        np.testing.assert_array_equal(completed_session._buffer, partial_buf)
+        replay = manager._prepare_replay_selection(
+            1,
+            completed_session._workorder["factory_run_id"],
+            0,
+            0.0,
+            1.0 / completed_session._sample_rate,
+        )
+        assert replay is not None
+        np.testing.assert_array_equal(replay["segment"], partial_buf[:1, 0])
+
+        type(session).instances.clear()
+        type(recorder).instances.clear()
+        type(monitor).instances.clear()
+        del recorder, monitor
+        gc.collect()
+
+        assert manager._completed_sessions[1] is completed_session
+        assert recorder_ref() is None
+        assert monitor_ref() is None
+
+    def test_factory_partial_completion_keeps_replay_without_runtime_resources(
+        self,
+        monkeypatch,
+    ):
+        (
+            _bus,
+            _services,
+            manager,
+            session,
+            recorder,
+            monitor,
+            partial_buf,
+        ) = _make_running_factory_manager(monkeypatch)
+        session.apply_manual_label = MagicMock()
+        recorder_ref = weakref.ref(recorder)
+        monitor_ref = weakref.ref(monitor)
+
+        assert manager.stop_active_run(config_id=1) is True
+
+        completed_session = manager._completed_sessions[1]
+        assert completed_session is session
+        assert completed_session._manager_completed_runtime_refs_detached is True
+        np.testing.assert_array_equal(completed_session._buffer, partial_buf)
+        replay = manager._prepare_replay_selection(
+            1,
+            completed_session._workorder["factory_run_id"],
+            0,
+            0.0,
+            1.0 / completed_session._sample_rate,
+        )
+        assert replay is not None
+        np.testing.assert_array_equal(replay["segment"], partial_buf[:1, 0])
+
+        type(session).instances.clear()
+        type(recorder).instances.clear()
+        type(monitor).instances.clear()
+        del recorder, monitor
+        gc.collect()
+
+        assert manager._completed_sessions[1] is completed_session
+        assert recorder_ref() is None
+        assert monitor_ref() is None
+
+    def test_factory_stop_analysis_completion_releases_runtime_resources(
+        self,
+        monkeypatch,
+    ):
+        (
+            _bus,
+            _services,
+            manager,
+            session,
+            recorder,
+            monitor,
+            _partial_buf,
+        ) = _make_running_factory_manager(
+            monkeypatch,
+            allow_incomplete_recording_analysis=True,
+        )
+        session._run_judgment = MagicMock(return_value=_successful_judgment())
+        manager._build_chart_payload = lambda *_args, **_kwargs: {}
+        manager._stop_is_analysis_eligible = lambda *_args, **_kwargs: True
+        recorder_ref = weakref.ref(recorder)
+        monitor_ref = weakref.ref(monitor)
+
+        assert manager.stop_active_run(config_id=1) is True
+
+        completed_session = manager._completed_sessions[1]
+        assert completed_session is session
+        assert completed_session._manager_completed_runtime_refs_detached is True
+        type(session).instances.clear()
+        type(recorder).instances.clear()
+        type(monitor).instances.clear()
+        del recorder, monitor
+        gc.collect()
+
+        assert manager._completed_sessions[1] is completed_session
+        assert recorder_ref() is None
+        assert monitor_ref() is None
+
+    def test_factory_capture_failure_completion_releases_runtime_resources(
+        self,
+        monkeypatch,
+    ):
+        (
+            _bus,
+            _services,
+            manager,
+            session,
+            recorder,
+            monitor,
+            _partial_buf,
+        ) = _make_running_factory_manager(monkeypatch)
+        capture_error = RuntimeError("capture failed")
+        try:
+            raise RuntimeError("capture cause")
+        except RuntimeError as cause_error:
+            capture_cause = cause_error
+            BaseException.__dict__["__cause__"].__set__(
+                capture_error,
+                capture_cause,
+            )
+        recorder.get_capture_buffer = MagicMock(side_effect=capture_error)
+        recorder_ref = weakref.ref(recorder)
+        monitor_ref = weakref.ref(monitor)
+
+        assert manager.stop_active_run(config_id=1) is True
+
+        completed_session = manager._completed_sessions[1]
+        assert completed_session is session
+        assert completed_session._manager_completed_runtime_refs_detached is True
+        finalization = completed_session._manager_capture_finalization_state
+        assert finalization.error is capture_error
+        assert finalization.failure.error is capture_error
+        assert finalization.failure.classification == "diagnostic"
+        assert (
+            BaseException.__dict__["__traceback__"].__get__(
+                capture_error,
+                BaseException,
+            )
+            is None
+        )
+        assert (
+            BaseException.__dict__["__cause__"].__get__(
+                capture_error,
+                BaseException,
+            )
+            is capture_cause
+        )
+        assert (
+            BaseException.__dict__["__traceback__"].__get__(
+                capture_cause,
+                BaseException,
+            )
+            is None
+        )
+        type(session).instances.clear()
+        type(recorder).instances.clear()
+        type(monitor).instances.clear()
+        del recorder, monitor
+        gc.collect()
+
+        assert manager._completed_sessions[1] is completed_session
+        assert recorder_ref() is None
+        assert monitor_ref() is None
+
+    def test_completed_detach_failure_does_not_undo_committed_owner(
+        self,
+        monkeypatch,
+    ):
+        class DetachFormatFatal(BaseException):
+            pass
+
+        detach_format_fatal = DetachFormatFatal("detach formatting failed")
+
+        class DetachFatal(BaseException):
+            def __str__(self):
+                raise detach_format_fatal
+
+        (
+            _bus,
+            _services,
+            manager,
+            session,
+            _recorder,
+            _monitor,
+            partial_buf,
+        ) = _make_running_factory_manager(monkeypatch)
+        session._run_judgment = MagicMock(return_value=_successful_judgment())
+        manager._build_chart_payload = lambda *_args, **_kwargs: {}
+        completion = session._on_session_done_cb
+        detach_fatal = DetachFatal("monitor ref detach failed")
+        session_type = type(session)
+        original_setattr = session_type.__setattr__
+
+        def fail_one_runtime_ref(target, name, value):
+            if target is session and name == "_monitor_feed" and value is None:
+                raise detach_fatal
+            return original_setattr(target, name, value)
+
+        monkeypatch.setattr(session_type, "__setattr__", fail_one_runtime_ref)
+
+        completion(1)
+
+        assert manager._completed_sessions[1] is session
+        np.testing.assert_array_equal(session._buffer, partial_buf)
+        assert session._manager_cleanup_actions_sealed is True
+        assert session._manager_cleanup_action_states == {}
+        assert session._manager_completed_runtime_refs_detached is True
+        assert session._manager_completed_runtime_detach_failures == (
+            (
+                "detach _monitor_feed",
+                "DetachFatal",
+                "<unprintable>",
+            ),
+        )
+        assert (
+            BaseException.__dict__["__traceback__"].__get__(
+                detach_fatal,
+                BaseException,
+            )
+            is None
+        )
+        assert (
+            BaseException.__dict__["__traceback__"].__get__(
+                detach_format_fatal,
+                BaseException,
+            )
+            is None
+        )
+        assert session._manager_error_route is None
+        assert session._on_session_done_cb is None
+        assert session._captured_block_conn is None
+        assert session._error_lambda is None
+        assert session._monitor_error_lambda is None
+
+    def test_completed_seal_bypasses_hostile_exception_traceback_attributes(
+        self,
+        monkeypatch,
+    ):
+        class AttributeAccessFatal(BaseException):
+            pass
+
+        class HostileCaptureError(RuntimeError):
+            @property
+            def __traceback__(self):
+                raise AttributeAccessFatal("traceback getter called")
+
+            @__traceback__.setter
+            def __traceback__(self, _value):
+                raise AttributeAccessFatal("traceback setter called")
+
+            @property
+            def __cause__(self):
+                raise AttributeAccessFatal("cause getter called")
+
+            @__cause__.setter
+            def __cause__(self, _value):
+                raise AttributeAccessFatal("cause setter called")
+
+            @property
+            def __context__(self):
+                raise AttributeAccessFatal("context getter called")
+
+            @__context__.setter
+            def __context__(self, _value):
+                raise AttributeAccessFatal("context setter called")
+
+            @property
+            def error(self):
+                raise AttributeAccessFatal("generic error getter called")
+
+        (
+            _bus,
+            _services,
+            manager,
+            session,
+            recorder,
+            monitor,
+            _partial_buf,
+        ) = _make_running_factory_manager(monkeypatch)
+        capture_error = HostileCaptureError("hostile capture failed")
+        recorder.get_capture_buffer = MagicMock(side_effect=capture_error)
+        recorder_ref = weakref.ref(recorder)
+        monitor_ref = weakref.ref(monitor)
+
+        assert manager.stop_active_run(config_id=1) is True
+
+        completed_session = manager._completed_sessions[1]
+        finalization = completed_session._manager_capture_finalization_state
+        assert finalization.error is capture_error
+        assert finalization.failure.error is capture_error
+        assert finalization.failure.classification == "diagnostic"
+        assert (
+            BaseException.__dict__["__traceback__"].__get__(
+                capture_error,
+                BaseException,
+            )
+            is None
+        )
+        assert completed_session._manager_cleanup_actions_sealed is True
+
+        type(session).instances.clear()
+        type(recorder).instances.clear()
+        type(monitor).instances.clear()
+        del recorder, monitor
+        gc.collect()
+
+        assert manager._completed_sessions[1] is completed_session
+        assert recorder_ref() is None
+        assert monitor_ref() is None
+
+    def test_completed_runtime_seal_preserves_inflight_waiter_and_blocks_late_cleanup(
+        self,
+        monkeypatch,
+    ):
+        (
+            _bus,
+            _services,
+            manager,
+            session,
+            recorder,
+            monitor,
+            _partial_buf,
+        ) = _make_running_factory_manager(monkeypatch)
+        session._run_judgment = MagicMock(return_value=_successful_judgment())
+        manager._build_chart_payload = lambda *_args, **_kwargs: {}
+        stop_entered = threading.Event()
+        release_stop = threading.Event()
+        waiter_waiting = threading.Event()
+        completion_errors = []
+        waiter_results = []
+
+        class TrackingEvent:
+            def __init__(self):
+                self._event = threading.Event()
+
+            def is_set(self):
+                return self._event.is_set()
+
+            def set(self):
+                self._event.set()
+
+            def wait(self, timeout=None):
+                waiter_waiting.set()
+                return self._event.wait(timeout)
+
+        def blocking_stop():
+            monitor.stop_calls += 1
+            stop_entered.set()
+            assert release_stop.wait(2.0)
+
+        monitor.stop = blocking_stop
+        completion = session._on_session_done_cb
+
+        def complete():
+            try:
+                completion(1)
+            except BaseException as exc:  # pragma: no cover - asserted below
+                completion_errors.append(exc)
+
+        owner = threading.Thread(target=complete)
+        owner.start()
+        assert stop_entered.wait(2.0)
+        monitor_stop_state = next(
+            state
+            for key, state in session._manager_cleanup_action_states.items()
+            if key[0] == "monitor stop"
+        )
+        monitor_stop_state.complete = TrackingEvent()
+
+        waiter = threading.Thread(
+            target=lambda: waiter_results.append(
+                manager._cleanup_monitor_recorder_safely(
+                    1,
+                    session=session,
+                    mon=monitor,
+                    rec=recorder,
+                    context="duplicate completion cleanup",
+                    excluding_config_id=1,
+                )
+            )
+        )
+        waiter.start()
+        assert waiter_waiting.wait(2.0)
+        release_stop.set()
+        owner.join(2.0)
+        waiter.join(2.0)
+
+        assert not owner.is_alive()
+        assert not waiter.is_alive()
+        assert completion_errors == []
+        assert len(waiter_results) == 1
+        assert manager._completed_sessions[1] is session
+        assert session._manager_cleanup_actions_sealed is True
+        assert session._manager_cleanup_action_states == {}
+        assert session._monitor_feed is None
+        assert session._on_session_done_cb is None
+        assert session._captured_block_conn is None
+        assert session._error_lambda is None
+        assert session._monitor_error_lambda is None
+        assert session._manager_error_route is None
+        assert monitor.stop_calls == 1
+        assert monitor.wait_calls == [1000]
+        assert recorder.stop_calls == 1
+        assert recorder.wait_calls == [3000]
+
+        assert manager._cleanup_monitor_recorder_safely(
+            1,
+            session=session,
+            mon=monitor,
+            rec=recorder,
+            context="late duplicate completion cleanup",
+            excluding_config_id=1,
+        ) == []
+        assert manager._disconnect_session_signals(session, recorder, monitor) == []
+        assert session._manager_cleanup_action_states == {}
+        assert monitor.stop_calls == 1
+        assert monitor.wait_calls == [1000]
+        assert recorder.stop_calls == 1
+        assert recorder.wait_calls == [3000]
+
+    def test_fatal_completion_cleanup_is_not_sealed_or_replayed(self, monkeypatch):
+        class Fatal(BaseException):
+            pass
+
+        (
+            _bus,
+            _services,
+            manager,
+            session,
+            recorder,
+            monitor,
+            _partial_buf,
+        ) = _make_running_factory_manager(monkeypatch)
+        fatal = Fatal("monitor fatal")
+        monitor.stop = MagicMock(side_effect=fatal)
+        completion = session._on_session_done_cb
+
+        with pytest.raises(Fatal) as raised:
+            completion(1)
+
+        assert raised.value is fatal
+        assert 1 not in manager._completed_sessions
+        assert getattr(session, "_manager_cleanup_actions_sealed", False) is False
+        fatal_states = [
+            state
+            for state in session._manager_cleanup_action_states.values()
+            if any(failure.error is fatal for failure in state.failures)
+        ]
+        assert len(fatal_states) == 1
+        assert fatal_states[0].complete.is_set()
+
+        late_failures = manager._cleanup_monitor_recorder_safely(
+            1,
+            session=session,
+            mon=monitor,
+            rec=recorder,
+            context="late fatal duplicate",
+            excluding_config_id=1,
+        )
+        assert [failure.error for failure in late_failures if failure.is_fatal] == [
+            fatal
+        ]
+        monitor.stop.assert_called_once_with()
+
     def test_completion_route_pop_then_reentrant_stop_retires_exact_run_tokens(
         self,
         monkeypatch,

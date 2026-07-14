@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import gc
+import weakref
 from threading import Event, Lock, Thread
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -246,6 +248,8 @@ class TestLateAttachBufferSlice:
             record_duration=0.1,
             monotonic_func=lambda: next(clock_values),
         )
+        recorder._buffer = np.zeros((3_840_000, 1), dtype=np.float32)
+        assert recorder._buffer.nbytes == 15_360_000
         recorder_factory_calls = []
 
         def recorder_factory(**kwargs):
@@ -453,6 +457,19 @@ class TestLateAttachBufferSlice:
         mgr._replay_player = player
         assert mgr.replay_selection(1, None, 0, 0.0, 0.03) is True
         np.testing.assert_array_equal(player.segment, expected_tags[:3])
+
+        monitor = TaggedMonitor.instances[0]
+        recorder_ref = weakref.ref(recorder)
+        monitor_ref = weakref.ref(monitor)
+        TaggedMonitor.instances.clear()
+        monkeypatch.undo()
+        del emit_tagged_range, get_capture_buffer, recorder_factory
+        del recorder, monitor
+        gc.collect()
+
+        assert mgr._completed_sessions[1] is completed
+        assert recorder_ref() is None
+        assert monitor_ref() is None
 
     def test_on_session_done_uses_recorder_owned_post_attach_buffer_slice(self):
         bus = _mock_bus()

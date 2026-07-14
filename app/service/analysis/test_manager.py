@@ -2455,13 +2455,196 @@ class TestManager(QObject):
             None,
         )
         self._completed_sessions[config_id] = session
-        if not staged_present or not staged_ready:
+        if staged_present and staged_ready:
+            if staged_samples:
+                self._current_samples_by_config_id[config_id] = staged_samples
+                self._current_sample_generations[config_id] = generation
+            else:
+                self._retire_current_samples_locked(config_id, generation)
+        self._seal_completed_cleanup_actions_locked(session)
+
+    def _seal_completed_cleanup_actions_locked(self, session) -> None:
+        """Seal physical cleanup before detaching refs outside lifecycle lock.
+
+        Completion reaches this barrier only after physical capture, signal,
+        current, monitor, recorder, and live-display cleanup has settled.
+        """
+
+        if session is None:
             return
-        if staged_samples:
-            self._current_samples_by_config_id[config_id] = staged_samples
-            self._current_sample_generations[config_id] = generation
-        else:
-            self._retire_current_samples_locked(config_id, generation)
+        with self._cleanup_action_lock:
+            session._manager_cleanup_actions_sealed = True
+            states = getattr(session, "_manager_cleanup_action_states", None)
+            if isinstance(states, dict):
+                states.clear()
+            session._manager_completed_runtime_detach_pending = True
+
+    def _detach_completed_runtime_refs(self, session) -> None:
+        """Best-effort runtime ref detach after completed ownership commits."""
+
+        if session is None:
+            return
+        detach_failures = []
+
+        def record_detach_failure(phase: str, error: BaseException) -> None:
+            detach_failures.append(
+                self._lightweight_detach_failure(phase, error)
+            )
+            self._clear_exception_traceback_chain(error, seen=set())
+
+        try:
+            with self._cleanup_action_lock:
+                if (
+                    getattr(
+                        session,
+                        "_manager_cleanup_actions_sealed",
+                        False,
+                    )
+                    is not True
+                ):
+                    return
+                if (
+                    getattr(
+                        session,
+                        "_manager_completed_runtime_refs_detached",
+                        False,
+                    )
+                    is True
+                    or getattr(
+                        session,
+                        "_manager_completed_runtime_refs_detaching",
+                        False,
+                    )
+                    is True
+                ):
+                    return
+                try:
+                    session._manager_completed_runtime_refs_detaching = True
+                except BaseException as exc:
+                    record_detach_failure("mark detaching", exc)
+
+                try:
+                    self._clear_completed_capture_error_tracebacks(session)
+                except BaseException as exc:
+                    record_detach_failure("capture traceback detach", exc)
+
+                for attribute, value in (
+                    ("_manager_error_route", None),
+                    ("_monitor_feed", None),
+                    ("_on_session_done_cb", None),
+                    ("_captured_block_conn", None),
+                    ("_error_lambda", None),
+                    ("_monitor_error_lambda", None),
+                    ("_capture_source_token", None),
+                    ("_pending_capture_blocks", []),
+                    ("_live_display_dispatcher", None),
+                    ("_pipelines", []),
+                ):
+                    try:
+                        setattr(session, attribute, value)
+                    except BaseException as exc:
+                        record_detach_failure(f"detach {attribute}", exc)
+
+                for attribute, value in (
+                    ("_manager_completed_runtime_detach_pending", False),
+                    ("_manager_completed_runtime_refs_detaching", False),
+                    ("_manager_completed_runtime_refs_detached", True),
+                    (
+                        "_manager_completed_runtime_detach_failures",
+                        tuple(detach_failures),
+                    ),
+                ):
+                    try:
+                        setattr(session, attribute, value)
+                    except BaseException:
+                        pass
+        except BaseException:
+            # Completion ownership is already committed.  Ref compaction must
+            # never roll that terminal result back or replace its outcome.
+            return
+
+    @classmethod
+    def _lightweight_detach_failure(
+        cls,
+        phase: str,
+        error: BaseException,
+    ) -> tuple[str, str, str]:
+        """Return a traceback-free diagnostic without retaining ``error``."""
+
+        try:
+            error_type = type(error).__name__
+        except BaseException:
+            error_type = "BaseException"
+        try:
+            error_text = str(error)
+        except BaseException as formatting_error:
+            cls._clear_exception_traceback_chain(
+                formatting_error,
+                seen=set(),
+            )
+            error_text = "<unprintable>"
+        return str(phase), str(error_type), error_text[:500]
+
+    @classmethod
+    def _clear_completed_capture_error_tracebacks(cls, session) -> None:
+        """Drop consumed traceback frames without replacing frozen outcomes."""
+
+        errors = []
+        finalization = getattr(
+            session,
+            "_manager_capture_finalization_state",
+            None,
+        )
+        if isinstance(finalization, _CaptureFinalizationState):
+            errors.extend((finalization.error, finalization.failure))
+
+        release_states = getattr(
+            session,
+            "_manager_capture_release_states",
+            None,
+        )
+        if isinstance(release_states, dict):
+            for release_state in release_states.values():
+                if isinstance(release_state, _CaptureReleaseState):
+                    errors.extend((release_state.error, release_state.failure))
+
+        seen = set()
+        for error_or_record in errors:
+            error = (
+                error_or_record.error
+                if isinstance(error_or_record, _CleanupFailureRecord)
+                else error_or_record
+            )
+            cls._clear_exception_traceback_chain(error, seen=seen)
+
+    @staticmethod
+    def _clear_exception_traceback_chain(error, *, seen: set[int]) -> None:
+        """Best-effort traceback compaction that bypasses hostile overrides."""
+
+        pending = [error]
+        traceback_descriptor = BaseException.__dict__["__traceback__"]
+        cause_descriptor = BaseException.__dict__["__cause__"]
+        context_descriptor = BaseException.__dict__["__context__"]
+        while pending:
+            current = pending.pop()
+            if not isinstance(current, BaseException):
+                continue
+            identity = id(current)
+            if identity in seen:
+                continue
+            seen.add(identity)
+
+            for descriptor in (cause_descriptor, context_descriptor):
+                try:
+                    linked = descriptor.__get__(current, BaseException)
+                except BaseException:
+                    continue
+                if isinstance(linked, BaseException):
+                    pending.append(linked)
+            try:
+                traceback_descriptor.__set__(current, None)
+            except BaseException:
+                pass
 
     def _completion_ingress_is_current_locked(
         self,
@@ -3042,6 +3225,7 @@ class TestManager(QObject):
             if not final_commit_won:
                 return
             self._invalidate_error_route(final_error_route)
+            self._detach_completed_runtime_refs(session)
             if cleanup_settled_payload is not None:
                 self._emit_optional_signal(
                     "factory_runtime_auto_analysis_cleanup_settled",
@@ -3924,6 +4108,8 @@ class TestManager(QObject):
                     self._accepted_factory_stops.discard(config_id)
                     final_commit_won = True
 
+            if final_commit_won:
+                self._detach_completed_runtime_refs(session)
             if final_commit_won and cleanup_settled_payload is not None:
                 self._emit_optional_signal(
                     "factory_runtime_auto_analysis_cleanup_settled",
@@ -3989,6 +4175,8 @@ class TestManager(QObject):
                     self._accepted_factory_stops.discard(config_id)
                     final_commit_won = True
 
+            if final_commit_won:
+                self._detach_completed_runtime_refs(session)
             if final_commit_won and cleanup_settled_payload is not None:
                 self._emit_optional_signal(
                     "factory_runtime_auto_analysis_cleanup_settled",
@@ -4035,6 +4223,7 @@ class TestManager(QObject):
         return cleanup_errors
 
     def _emit_factory_runtime_stopped(self, config_id: int, session) -> bool:
+        completed_owner_committed = False
         with self._lifecycle_lock:
             if self._sessions.get(config_id) is not session:
                 transition_won = False
@@ -4055,6 +4244,7 @@ class TestManager(QObject):
                         completed_session,
                         self._run_generation_token(completed_session),
                     )
+                    completed_owner_committed = True
                 else:
                     self._retire_current_samples_locked(
                         config_id,
@@ -4063,6 +4253,8 @@ class TestManager(QObject):
                 transition_won = True
         if not transition_won:
             return True
+        if completed_owner_committed:
+            self._detach_completed_runtime_refs(completed_session)
         stopped_payload = self._make_factory_runtime_stopped_payload(config_id, session)
         if stopped_payload is not None:
             self._emit_optional_signal(
@@ -6217,6 +6409,16 @@ class TestManager(QObject):
         )
         claimant = False
         with self._cleanup_action_lock:
+            if (
+                session is not None
+                and getattr(
+                    session,
+                    "_manager_cleanup_actions_sealed",
+                    False,
+                )
+                is True
+            ):
+                return None, ()
             if session is None:
                 states = self._cleanup_action_states
             else:
