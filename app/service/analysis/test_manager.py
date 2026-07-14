@@ -213,12 +213,22 @@ class _CurrentCollectionClaim:
 @dataclass(frozen=True)
 class _CurrentCollectionCleanupResult:
     samples: object
-    stop_error: BaseException | None
-    samples_error: BaseException | None
+    stop_diagnostic_error: Exception | None
+    samples_diagnostic_error: Exception | None
+    stop_fatal_error: BaseException | None
+    samples_fatal_error: BaseException | None
 
     @property
-    def error(self) -> BaseException | None:
-        return self.stop_error if self.stop_error is not None else self.samples_error
+    def diagnostic_error(self) -> Exception | None:
+        if self.stop_diagnostic_error is not None:
+            return self.stop_diagnostic_error
+        return self.samples_diagnostic_error
+
+    @property
+    def fatal_error(self) -> BaseException | None:
+        if self.stop_fatal_error is not None:
+            return self.stop_fatal_error
+        return self.samples_fatal_error
 
 
 class _PendingCurrentContinuation:
@@ -311,7 +321,8 @@ class _PendingCurrentTerminalSnapshot:
     cleanup_claim: _CurrentCollectionClaim | None
     cleanup_result: _CurrentCollectionCleanupResult | None
     start_error: BaseException | None
-    cleanup_error: BaseException | None
+    cleanup_diagnostic_error: Exception | None
+    fatal_error: BaseException | None
     owner_thread_id: int
     cleanup_owner_thread_id: int | None
     continuation_kind: str | None
@@ -497,9 +508,6 @@ class TestManager(QObject):
                 "无法解析启动配置，请重新选择配置。",
             )
 
-        if request_id is not None:
-            self._pending_factory_starts[request_id] = config_id
-
         if config_id in self._sessions:
             self._bus.log.emit(f"[TestManager] config {config_id} already running, stopping first")
             self.stop(config_id=config_id)
@@ -598,6 +606,9 @@ class TestManager(QObject):
         session_workorder = dict(workorder)
         session_workorder["factory_run_id"] = self._new_factory_run_id()
 
+        if request_id is not None:
+            self._pending_factory_starts[request_id] = config_id
+
         session = None
         recorder = None
         monitor = None
@@ -606,6 +617,7 @@ class TestManager(QObject):
         run_generation = None
         startup_error_latch = None
         error_route = None
+        failed_start_cleanup_errors = None
 
         try:
             session = TestSession(
@@ -818,13 +830,17 @@ class TestManager(QObject):
                     return finish_inactive_before_acceptance(state)
 
             if self._factory_start_canceled(request_id):
-                self._cleanup_failed_start_setup(
+                failed_start_cleanup_errors = self._cleanup_failed_start_setup(
                     config_id,
                     session,
                     recorder,
                     monitor,
                     requested_capture=requested_capture,
                     error_route=error_route,
+                )
+                self._raise_first_fatal(
+                    failed_start_cleanup_errors,
+                    context="canceled start rollback",
                 )
                 self._clear_pending_factory_start(request_id)
                 return False
@@ -837,13 +853,17 @@ class TestManager(QObject):
                 on_start_accepted(session_workorder["factory_run_id"])
 
             if self._factory_start_canceled(request_id):
-                self._cleanup_failed_start_setup(
+                failed_start_cleanup_errors = self._cleanup_failed_start_setup(
                     config_id,
                     session,
                     recorder,
                     monitor,
                     requested_capture=requested_capture,
                     error_route=error_route,
+                )
+                self._raise_first_fatal(
+                    failed_start_cleanup_errors,
+                    context="canceled accepted-start rollback",
                 )
                 self._clear_pending_factory_start(request_id)
                 return False
@@ -864,9 +884,15 @@ class TestManager(QObject):
                     return True
                 return False
         except BaseException as exc:
-            self._bus.log.emit(f"[TestManager] ERROR starting config {config_id}: {exc}")
+            rollback_logging_errors = []
             try:
-                self._cleanup_failed_start_setup(
+                self._bus.log.emit(
+                    f"[TestManager] ERROR starting config {config_id}: {exc}"
+                )
+            except BaseException as cleanup_exc:
+                rollback_logging_errors.append(cleanup_exc)
+            if failed_start_cleanup_errors is None:
+                failed_start_cleanup_errors = self._cleanup_failed_start_setup(
                     config_id,
                     session,
                     recorder,
@@ -874,40 +900,60 @@ class TestManager(QObject):
                     requested_capture=requested_capture,
                     error_route=error_route,
                 )
-            except BaseException as cleanup_exc:
-                self._bus.log.emit(
-                    f"[TestManager] ERROR failed start rollback for "
-                    f"config={config_id}: {cleanup_exc}"
-                )
+            failed_start_cleanup_errors = (
+                rollback_logging_errors + failed_start_cleanup_errors
+            )
             self._clear_pending_factory_start(request_id)
             if not isinstance(exc, Exception):
+                for cleanup_exc in failed_start_cleanup_errors:
+                    if isinstance(cleanup_exc, Exception) or cleanup_exc is exc:
+                        continue
+                    self._note_secondary_fatal(
+                        exc,
+                        cleanup_exc,
+                        context="failed start rollback",
+                    )
                 raise
+            cleanup_fatal = self._first_fatal(failed_start_cleanup_errors)
+            if cleanup_fatal is not None:
+                self._raise_first_fatal(
+                    failed_start_cleanup_errors,
+                    context="failed start rollback",
+                )
             return self._fail_start_before_acceptance(
                 request_id,
                 f"启动失败：{exc}",
             )
 
-        state = self._startup_error_route_state(error_route)
-        if state != "active":
-            self._clear_pending_factory_start(request_id)
-            self._clear_last_start_error()
-            return True
-
-        # A running shared recorder can deliver enough queued retained audio
-        # while attach_to_recorder() drains its pending handoff.  The session
-        # marks itself finished even though its manager dictionaries are not
-        # registered until the bind completes, so settle that deferred
-        # completion before deciding whether this recorder needs starting.
-        if getattr(session, "_finished", False):
-            self._on_session_done(
-                config_id,
-                expected_session=session,
-                expected_generation=run_generation,
-            )
-            if self._startup_error_route_state(error_route) != "active":
+        try:
+            state = self._startup_error_route_state(error_route)
+            if state != "active":
                 self._clear_pending_factory_start(request_id)
                 self._clear_last_start_error()
                 return True
+
+            # A running shared recorder can deliver enough queued retained
+            # audio while attach_to_recorder() drains its pending handoff.  The
+            # session marks itself finished before manager dictionaries are
+            # registered, so settle that completion before starting recorder.
+            if getattr(session, "_finished", False):
+                self._on_session_done(
+                    config_id,
+                    expected_session=session,
+                    expected_generation=run_generation,
+                )
+                if self._startup_error_route_state(error_route) != "active":
+                    self._clear_pending_factory_start(request_id)
+                    self._clear_last_start_error()
+                    return True
+        except BaseException as exc:
+            return self._rollback_accepted_start_failure(
+                config_id=config_id,
+                session=session,
+                error_route=error_route,
+                request_id=request_id,
+                error=exc,
+            )
 
         try:
             recorder_running = recorder.isRunning()
@@ -923,54 +969,108 @@ class TestManager(QObject):
                 self._clear_pending_factory_start(request_id)
                 self._clear_last_start_error()
                 return True
-        except Exception as exc:
-            self._bus.log.emit(f"[TestManager] ERROR starting config {config_id}: {exc}")
+        except BaseException as exc:
+            return self._rollback_accepted_start_failure(
+                config_id=config_id,
+                session=session,
+                error_route=error_route,
+                request_id=request_id,
+                error=exc,
+            )
+
+        try:
+            if self._startup_error_route_state(error_route) != "active":
+                self._clear_pending_factory_start(request_id)
+                self._clear_last_start_error()
+                return True
+
+            with self._lifecycle_lock:
+                if self._error_route_is_current_locked(error_route):
+                    prior_completed_session = self._completed_sessions.get(config_id)
+                    if (
+                        prior_completed_session is not None
+                        and prior_completed_session is not session
+                    ):
+                        self._retire_completed_owner_locked(
+                            config_id,
+                            prior_completed_session,
+                        )
+
+            self._clear_pending_factory_start(request_id)
+            self._clear_last_start_error()
+            self._bus.test_started.emit(config_id)
+            if self._startup_error_route_state(error_route) != "active":
+                return True
+            self._bus.status.emit("Recording...")
+            if self._startup_error_route_state(error_route) != "active":
+                return True
+            self._bus.log.emit(
+                f"[TestManager] started config={config_id}, workorder={session_workorder}"
+            )
+            return True
+        except BaseException as exc:
+            return self._rollback_accepted_start_failure(
+                config_id=config_id,
+                session=session,
+                error_route=error_route,
+                request_id=request_id,
+                error=exc,
+            )
+
+    def _rollback_accepted_start_failure(
+        self,
+        *,
+        config_id: int,
+        session,
+        error_route,
+        request_id: str | None,
+        error: BaseException,
+    ) -> bool:
+        cleanup_errors = []
+        try:
+            self._bus.log.emit(
+                f"[TestManager] ERROR starting config {config_id}: {error}"
+            )
+        except BaseException as cleanup_exc:
+            cleanup_errors.append(cleanup_exc)
+        try:
             stopped = self._stop_one(
                 config_id,
                 silent=True,
                 expected_error_route=error_route,
             )
-            if stopped:
+        except BaseException as cleanup_exc:
+            cleanup_errors.append(cleanup_exc)
+            with self._lifecycle_lock:
+                stopped = self._sessions.get(config_id) is not session
+        if stopped:
+            try:
                 self._emit_optional_signal(
                     "factory_runtime_aborted",
                     self._make_factory_runtime_abort_payload(
                         config_id,
                         session,
-                        error_message=str(exc),
+                        error_message=str(error),
                     ),
                 )
-            self._clear_pending_factory_start(request_id)
-            return not stopped
-
-        if self._startup_error_route_state(error_route) != "active":
-            self._clear_pending_factory_start(request_id)
-            self._clear_last_start_error()
-            return True
-
-        with self._lifecycle_lock:
-            if self._error_route_is_current_locked(error_route):
-                prior_completed_session = self._completed_sessions.get(config_id)
-                if (
-                    prior_completed_session is not None
-                    and prior_completed_session is not session
-                ):
-                    self._retire_completed_owner_locked(
-                        config_id,
-                        prior_completed_session,
-                    )
-
+            except BaseException as cleanup_exc:
+                cleanup_errors.append(cleanup_exc)
         self._clear_pending_factory_start(request_id)
-        self._clear_last_start_error()
-        self._bus.test_started.emit(config_id)
-        if self._startup_error_route_state(error_route) != "active":
-            return True
-        self._bus.status.emit("Recording...")
-        if self._startup_error_route_state(error_route) != "active":
-            return True
-        self._bus.log.emit(
-            f"[TestManager] started config={config_id}, workorder={session_workorder}"
+        if not isinstance(error, Exception):
+            for cleanup_exc in cleanup_errors:
+                if isinstance(cleanup_exc, Exception):
+                    continue
+                self._note_secondary_fatal(
+                    error,
+                    cleanup_exc,
+                    context="accepted start rollback",
+                )
+            raise error
+        self._raise_first_fatal(
+            cleanup_errors,
+            context="accepted start rollback",
         )
-        return True
+        return not stopped
 
     def _on_factory_display_channel_changed(self, config_id, channel_index) -> None:
         normalized_config_id = self._as_non_bool_int(config_id)
@@ -1156,17 +1256,37 @@ class TestManager(QObject):
         if config_id is not None:
             self._stop_one(config_id, silent, notify_factory_runtime_abort=True)
         else:
-            self._stop_replay()
+            stop_errors = []
+            try:
+                self._stop_replay()
+            except BaseException as exc:
+                stop_errors.append(exc)
             for cid in list(self._sessions.keys()):
-                self._stop_one(cid, silent, notify_factory_runtime_abort=True)
+                try:
+                    self._stop_one(cid, silent, notify_factory_runtime_abort=True)
+                except BaseException as exc:
+                    stop_errors.append(exc)
+            self._raise_first_fatal(stop_errors, context="stop-all cleanup")
+            if stop_errors:
+                raise stop_errors[0]
 
     def stop_active_run(self, config_id: int | None = None) -> bool:
         """Factory-mode hook for stopping an active session."""
         if config_id is None:
             if not self._sessions:
                 return False
+            stop_errors = []
             for cid in list(self._sessions.keys()):
-                self._stop_factory_run(cid)
+                try:
+                    self._stop_factory_run(cid)
+                except BaseException as exc:
+                    stop_errors.append(exc)
+            self._raise_first_fatal(
+                stop_errors,
+                context="factory stop-all cleanup",
+            )
+            if stop_errors:
+                raise stop_errors[0]
             return True
 
         return self._stop_factory_run(config_id)
@@ -1410,34 +1530,63 @@ class TestManager(QObject):
 
         partial_buf = None
         capture_error = None
+        cleanup_errors: list[BaseException] = []
         if session is not None:
             try:
                 if rec is not None:
                     partial_buf = self._freeze_and_capture_session_buffer(session, rec)
                 else:
                     session.freeze_capture()
-            except Exception as exc:
-                capture_error = exc
-            finally:
-                if rec is not None:
+            except BaseException as exc:
+                if isinstance(exc, Exception):
+                    capture_error = exc
+                else:
+                    cleanup_errors.append(exc)
+                    self._bus.log.emit(
+                        f"[TestManager] ERROR fatal capture while stopping "
+                        f"config={config_id}: {exc}"
+                    )
+            if rec is not None:
+                try:
                     self._disconnect_session_signals(session, rec, mon)
-                    try:
-                        self._release_session_capture(session, rec)
-                    except Exception as exc:
-                        self._bus.log.emit(
-                            f"[TestManager] ERROR releasing capture while stopping "
-                            f"config={config_id}: {exc}"
-                        )
-                        if capture_error is None:
-                            capture_error = exc
+                except BaseException as exc:
+                    if isinstance(exc, Exception) and capture_error is None:
+                        capture_error = exc
+                    else:
+                        cleanup_errors.append(exc)
+                    self._bus.log.emit(
+                        f"[TestManager] ERROR disconnecting capture while stopping "
+                        f"config={config_id}: {exc}"
+                    )
+                try:
+                    self._release_session_capture(session, rec)
+                except BaseException as exc:
+                    if isinstance(exc, Exception) and capture_error is None:
+                        capture_error = exc
+                    else:
+                        cleanup_errors.append(exc)
+                    self._bus.log.emit(
+                        f"[TestManager] ERROR releasing capture while stopping "
+                        f"config={config_id}: {exc}"
+                    )
 
-        self._stop_current_collection_claim(current_collection_claim)
+        try:
+            self._stop_current_collection_claim(current_collection_claim)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
         if session is not None:
-            self._stop_session_live_display_safely(
-                config_id,
-                session,
-                context="stopping",
-            )
+            try:
+                self._stop_session_live_display_safely(
+                    config_id,
+                    session,
+                    context="stopping",
+                )
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                self._bus.log.emit(
+                    f"[TestManager] ERROR fatal live display cleanup while stopping "
+                    f"config={config_id}: {exc}"
+                )
 
         should_notify_factory_abort = (
             notify_factory_runtime_abort
@@ -1446,7 +1595,6 @@ class TestManager(QObject):
         )
         factory_abort_error_message = None
 
-        cleanup_errors = []
         try:
             if session is not None and rec is not None and not silent:
                 if capture_error is not None:
@@ -1458,7 +1606,9 @@ class TestManager(QObject):
                 elif isinstance(partial_buf, np.ndarray) and partial_buf.shape[0] > 0:
                     try:
                         session._save_wav(partial_buf, rec._sample_rate)
-                    except Exception as exc:
+                    except BaseException as exc:
+                        if not isinstance(exc, Exception):
+                            cleanup_errors.append(exc)
                         self._bus.log.emit(
                             f"[TestManager] ERROR saving partial recording for "
                             f"config={config_id}: {exc}"
@@ -1468,11 +1618,13 @@ class TestManager(QObject):
                             f"[TestManager] saved partial recording for config={config_id}"
                         )
         finally:
-            cleanup_errors = self._cleanup_monitor_recorder_safely(
-                config_id,
-                mon=mon,
-                rec=rec,
-                context="stopping",
+            cleanup_errors.extend(
+                self._cleanup_monitor_recorder_safely(
+                    config_id,
+                    mon=mon,
+                    rec=rec,
+                    context="stopping",
+                )
             )
 
             if should_notify_factory_abort:
@@ -1492,6 +1644,10 @@ class TestManager(QObject):
             if not silent:
                 self._bus.log.emit(f"[TestManager] stopped config={config_id}")
                 self._bus.status.emit("Stopped")
+        self._raise_first_fatal(
+            cleanup_errors,
+            context="manual stop cleanup",
+        )
         return session is not None
 
     def _cleanup_failed_start_setup(
@@ -1503,7 +1659,7 @@ class TestManager(QObject):
         *,
         requested_capture=None,
         error_route=None,
-    ) -> None:
+    ) -> list[BaseException]:
         with self._lifecycle_lock:
             current_session = self._sessions.get(config_id)
             if session is not None and current_session is session:
@@ -1543,10 +1699,18 @@ class TestManager(QObject):
             )
             self._retire_current_samples_locked(config_id, generation)
 
+        cleanup_errors: list[BaseException] = []
         self._invalidate_error_route(registered_error_route)
         if error_route is not registered_error_route:
             self._invalidate_error_route(error_route)
-        self._stop_current_collection_claim(current_collection_claim)
+        try:
+            self._stop_current_collection_claim(current_collection_claim)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+            self._bus.log.emit(
+                f"[TestManager] ERROR cleaning failed start current collector for "
+                f"config={config_id}: {exc}"
+            )
 
         cleanup_session = registered_session if registered_session is not None else session
         cleanup_recorder = (
@@ -1559,7 +1723,8 @@ class TestManager(QObject):
         if cleanup_session is not None:
             try:
                 cleanup_session.freeze_capture()
-            except Exception as exc:
+            except BaseException as exc:
+                cleanup_errors.append(exc)
                 self._bus.log.emit(
                     f"[TestManager] ERROR freezing failed start capture for "
                     f"config={config_id}: {exc}"
@@ -1572,7 +1737,8 @@ class TestManager(QObject):
                     cleanup_recorder,
                     cleanup_monitor,
                 )
-            except Exception as exc:
+            except BaseException as exc:
+                cleanup_errors.append(exc)
                 self._bus.log.emit(
                     f"[TestManager] ERROR cleaning failed start signals for "
                     f"config={config_id}: {exc}"
@@ -1584,38 +1750,36 @@ class TestManager(QObject):
                     cleanup_recorder,
                     attachment=requested_capture,
                 )
-            except Exception as exc:
+            except BaseException as exc:
+                cleanup_errors.append(exc)
                 self._bus.log.emit(
                     f"[TestManager] ERROR releasing failed start capture for "
                     f"config={config_id}: {exc}"
                 )
 
         if cleanup_session is not None:
-            self._stop_session_live_display_safely(
+            try:
+                self._stop_session_live_display_safely(
+                    config_id,
+                    cleanup_session,
+                    context="failed start",
+                )
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                self._bus.log.emit(
+                    f"[TestManager] ERROR cleaning failed start live display for "
+                    f"config={config_id}: {exc}"
+                )
+
+        cleanup_errors.extend(
+            self._cleanup_monitor_recorder_safely(
                 config_id,
-                cleanup_session,
+                mon=cleanup_monitor,
+                rec=cleanup_recorder,
                 context="failed start",
             )
-
-        if cleanup_monitor is not None:
-            try:
-                cleanup_monitor.stop()
-                self._wait_thread_if_not_current(cleanup_monitor, 1000)
-            except Exception as exc:
-                self._bus.log.emit(
-                    f"[TestManager] ERROR cleaning failed start monitor for "
-                    f"config={config_id}: {exc}"
-                )
-
-        if cleanup_recorder is not None:
-            try:
-                self._stop_recorder_if_unused(cleanup_recorder)
-            except Exception as exc:
-                self._bus.log.emit(
-                    f"[TestManager] ERROR cleaning failed start recorder for "
-                    f"config={config_id}: {exc}"
-                )
-                self._discard_shared_recorder(cleanup_recorder)
+        )
+        return cleanup_errors
 
     @staticmethod
     def _get_factory_start_request_id(workorder: dict) -> str | None:
@@ -2157,29 +2321,89 @@ class TestManager(QObject):
         cleanup_settled_payload = self._make_cleanup_settled_payload(config_id, session)
         try:
             capture_error = None
+            cleanup_errors: list[BaseException] = []
             if rec is not None:
                 try:
                     self._freeze_and_capture_session_buffer(session, rec)
-                except Exception as exc:
-                    capture_error = exc
-                finally:
+                except BaseException as exc:
+                    if isinstance(exc, Exception):
+                        capture_error = exc
+                    else:
+                        cleanup_errors.append(exc)
+                try:
                     self._disconnect_session_signals(session, rec, mon)
-                    try:
-                        self._release_session_capture(session, rec)
-                    except Exception as exc:
-                        self._bus.log.emit(
-                            f"[TestManager] ERROR releasing completed capture "
-                            f"for config={config_id}: {exc}"
-                        )
-                        if capture_error is None:
-                            capture_error = exc
+                except BaseException as exc:
+                    if isinstance(exc, Exception) and capture_error is None:
+                        capture_error = exc
+                    else:
+                        cleanup_errors.append(exc)
+                    self._bus.log.emit(
+                        f"[TestManager] ERROR disconnecting completed capture "
+                        f"for config={config_id}: {exc}"
+                    )
+                try:
+                    self._release_session_capture(session, rec)
+                except BaseException as exc:
+                    if isinstance(exc, Exception) and capture_error is None:
+                        capture_error = exc
+                    else:
+                        cleanup_errors.append(exc)
+                    self._bus.log.emit(
+                        f"[TestManager] ERROR releasing completed capture "
+                        f"for config={config_id}: {exc}"
+                    )
 
-            self._stop_session_live_display_safely(
-                config_id,
-                session,
-                context="recording completion",
+            try:
+                self._stop_session_live_display_safely(
+                    config_id,
+                    session,
+                    context="recording completion",
+                )
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            try:
+                self._stop_current_collection_claim(current_collection_claim)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+
+            cleanup_errors.extend(
+                self._cleanup_monitor_recorder_safely(
+                    config_id,
+                    mon=mon,
+                    rec=rec,
+                    context="recording completion",
+                    excluding_config_id=config_id,
+                )
             )
-            self._stop_current_collection_claim(current_collection_claim)
+
+            fatal_error = self._first_fatal(cleanup_errors)
+            if fatal_error is not None:
+                with self._lifecycle_lock:
+                    if self._sessions.get(config_id) is session:
+                        self._sessions.pop(config_id, None)
+                        if self._recorders.get(config_id) is rec:
+                            self._recorders.pop(config_id, None)
+                        if self._monitors.get(config_id) is mon:
+                            self._monitors.pop(config_id, None)
+                        final_error_route = self._session_error_routes.pop(
+                            config_id,
+                            None,
+                        )
+                        self._retire_session_generation_locked(
+                            config_id,
+                            expected_generation,
+                        )
+                        self._retire_current_samples_locked(
+                            config_id,
+                            expected_generation,
+                        )
+                    else:
+                        final_error_route = None
+                self._invalidate_error_route(final_error_route)
+                self._raise_first_fatal(
+                    cleanup_errors,
+                    context="recording completion cleanup",
+                )
 
             with self._lifecycle_lock:
                 still_owned = (
@@ -2244,12 +2468,6 @@ class TestManager(QObject):
             if not final_commit_won:
                 return
             self._invalidate_error_route(final_error_route)
-            self._cleanup_monitor_recorder_safely(
-                config_id,
-                mon=mon,
-                rec=rec,
-                context="recording completion",
-            )
             if cleanup_settled_payload is not None:
                 self._emit_optional_signal(
                     "factory_runtime_auto_analysis_cleanup_settled",
@@ -2318,20 +2536,32 @@ class TestManager(QObject):
             error_route.session,
             error_message=message,
         )
-        stopped = self._continue_stop_one(
-            config_id,
-            silent=True,
-            expected_error_route=error_route,
-            expected_session=error_route.session,
-            expected_generation=error_route.generation,
-            preclaimed_current_collection=preclaimed_current_collection,
-        )
+        cleanup_fatal = None
+        try:
+            stopped = self._continue_stop_one(
+                config_id,
+                silent=True,
+                expected_error_route=error_route,
+                expected_session=error_route.session,
+                expected_generation=error_route.generation,
+                preclaimed_current_collection=preclaimed_current_collection,
+            )
+        except BaseException as exc:
+            if isinstance(exc, Exception):
+                raise
+            cleanup_fatal = exc
+            with self._lifecycle_lock:
+                stopped = self._sessions.get(config_id) is not error_route.session
         if not stopped:
+            if cleanup_fatal is not None:
+                raise cleanup_fatal
             return False
 
         self._bus.log.emit(f"[TestManager] ERROR config={config_id}: {message}")
         self._bus.status.emit(f"Error: {message}")
         self._emit_optional_signal("factory_runtime_aborted", abort_payload)
+        if cleanup_fatal is not None:
+            raise cleanup_fatal
         return True
 
     def _on_monitor_error(self, error_route, message: str):
@@ -2717,23 +2947,46 @@ class TestManager(QObject):
         mon,
         current_collection_claim,
     ) -> bool:
-        capture = self._capture_partial_stop_buffer(config_id, session, rec)
+        cleanup_errors: list[BaseException] = []
+        try:
+            capture = self._capture_partial_stop_buffer(config_id, session, rec)
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+            capture = {
+                "partial_buf": None,
+                "partial_wav_ok": False,
+                "captured_duration_sec": None,
+                "capture_error": None,
+            }
         if rec is not None:
-            self._disconnect_session_signals(session, rec, mon)
+            try:
+                self._disconnect_session_signals(session, rec, mon)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                self._bus.log.emit(
+                    f"[TestManager] ERROR disconnecting stopped capture for "
+                    f"config={config_id}: {exc}"
+                )
+                if isinstance(exc, Exception) and capture.get("capture_error") is None:
+                    capture["capture_error"] = exc
             try:
                 self._release_session_capture(session, rec)
-            except Exception as exc:
+            except BaseException as exc:
+                cleanup_errors.append(exc)
                 self._bus.log.emit(
                     f"[TestManager] ERROR releasing stopped capture for "
                     f"config={config_id}: {exc}"
                 )
-                if capture.get("capture_error") is None:
+                if isinstance(exc, Exception) and capture.get("capture_error") is None:
                     capture["capture_error"] = exc
-        self._stop_session_live_display_safely(
-            config_id,
-            session,
-            context="factory stop",
-        )
+        try:
+            self._stop_session_live_display_safely(
+                config_id,
+                session,
+                context="factory stop",
+            )
+        except BaseException as exc:
+            cleanup_errors.append(exc)
 
         try:
             self._stop_factory_runtime_io(
@@ -2743,11 +2996,31 @@ class TestManager(QObject):
                 mon=mon,
                 current_collection_claim=current_collection_claim,
             )
-        except Exception as exc:
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+
+        fatal_error = self._first_fatal(cleanup_errors)
+        if fatal_error is not None:
+            self._emit_factory_stop_abort(
+                config_id,
+                session,
+                fatal_error,
+                rec=rec,
+                mon=mon,
+            )
+            self._raise_first_fatal(
+                cleanup_errors,
+                context="factory stop cleanup",
+            )
+        ordinary_cleanup_error = next(
+            (error for error in cleanup_errors if isinstance(error, Exception)),
+            None,
+        )
+        if ordinary_cleanup_error is not None:
             return self._emit_factory_stop_abort(
                 config_id,
                 session,
-                exc,
+                ordinary_cleanup_error,
                 rec=rec,
                 mon=mon,
             )
@@ -2780,26 +3053,35 @@ class TestManager(QObject):
         mon,
         current_collection_claim,
     ) -> bool:
+        cleanup_errors: list[BaseException] = []
         try:
             if rec is not None:
                 self._freeze_and_capture_session_buffer(session, rec)
             else:
                 session.freeze_capture()
-        finally:
-            if rec is not None:
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+        if rec is not None:
+            try:
                 self._disconnect_session_signals(session, rec, mon)
-                try:
-                    self._release_session_capture(session, rec)
-                except Exception as exc:
-                    self._bus.log.emit(
-                        f"[TestManager] ERROR releasing stopped capture for "
-                        f"config={config_id}: {exc}"
-                    )
-        self._stop_session_live_display_safely(
-            config_id,
-            session,
-            context="factory stop",
-        )
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+            try:
+                self._release_session_capture(session, rec)
+            except BaseException as exc:
+                cleanup_errors.append(exc)
+                self._bus.log.emit(
+                    f"[TestManager] ERROR releasing stopped capture for "
+                    f"config={config_id}: {exc}"
+                )
+        try:
+            self._stop_session_live_display_safely(
+                config_id,
+                session,
+                context="factory stop",
+            )
+        except BaseException as exc:
+            cleanup_errors.append(exc)
 
         try:
             self._stop_factory_runtime_io(
@@ -2809,11 +3091,31 @@ class TestManager(QObject):
                 mon=mon,
                 current_collection_claim=current_collection_claim,
             )
-        except Exception as exc:
+        except BaseException as exc:
+            cleanup_errors.append(exc)
+
+        fatal_error = self._first_fatal(cleanup_errors)
+        if fatal_error is not None:
+            self._emit_factory_stop_abort(
+                config_id,
+                session,
+                fatal_error,
+                rec=rec,
+                mon=mon,
+            )
+            self._raise_first_fatal(
+                cleanup_errors,
+                context="factory stop cleanup",
+            )
+        ordinary_cleanup_error = next(
+            (error for error in cleanup_errors if isinstance(error, Exception)),
+            None,
+        )
+        if ordinary_cleanup_error is not None:
             return self._emit_factory_stop_abort(
                 config_id,
                 session,
-                exc,
+                ordinary_cleanup_error,
                 rec=rec,
                 mon=mon,
             )
@@ -2994,37 +3296,35 @@ class TestManager(QObject):
         mon,
         current_collection_claim,
     ) -> None:
-        cleanup_error = None
-
-        try:
-            if mon is not None:
-                mon.stop()
-                self._wait_thread_if_not_current(mon, 1000)
-        except Exception as exc:
-            cleanup_error = exc
-
-        try:
-            if rec is not None:
-                self._stop_recorder_if_unused(rec, excluding_config_id=config_id)
-        except Exception as exc:
-            if cleanup_error is None:
-                cleanup_error = exc
-        finally:
-            with self._lifecycle_lock:
-                if self._sessions.get(config_id) is session:
-                    if self._recorders.get(config_id) is rec:
-                        self._recorders.pop(config_id, None)
-                    if self._monitors.get(config_id) is mon:
-                        self._monitors.pop(config_id, None)
+        cleanup_errors = self._cleanup_monitor_recorder_safely(
+            config_id,
+            mon=mon,
+            rec=rec,
+            context="factory stop",
+            excluding_config_id=config_id,
+        )
+        with self._lifecycle_lock:
+            if self._sessions.get(config_id) is session:
+                if self._recorders.get(config_id) is rec:
+                    self._recorders.pop(config_id, None)
+                if self._monitors.get(config_id) is mon:
+                    self._monitors.pop(config_id, None)
 
         try:
             self._stop_current_collection_claim(current_collection_claim)
-        except Exception as exc:
-            if cleanup_error is None:
-                cleanup_error = exc
+        except BaseException as exc:
+            cleanup_errors.append(exc)
 
-        if cleanup_error is not None:
-            raise cleanup_error
+        self._raise_first_fatal(
+            cleanup_errors,
+            context="factory runtime I/O cleanup",
+        )
+        ordinary_cleanup_error = next(
+            (error for error in cleanup_errors if isinstance(error, Exception)),
+            None,
+        )
+        if ordinary_cleanup_error is not None:
+            raise ordinary_cleanup_error
 
     def _emit_factory_runtime_stopped(self, config_id: int, session) -> bool:
         with self._lifecycle_lock:
@@ -3065,7 +3365,15 @@ class TestManager(QObject):
         self._bus.status.emit("Stopped")
         return True
 
-    def _emit_factory_stop_abort(self, config_id: int, session, error: Exception, *, rec, mon) -> bool:
+    def _emit_factory_stop_abort(
+        self,
+        config_id: int,
+        session,
+        error: BaseException,
+        *,
+        rec,
+        mon,
+    ) -> bool:
         with self._lifecycle_lock:
             if self._sessions.get(config_id) is not session:
                 transition_won = False
@@ -3082,6 +3390,7 @@ class TestManager(QObject):
                 if self._monitors.get(config_id) is mon:
                     self._monitors.pop(config_id, None)
                 transition_won = True
+        cleanup_errors = []
         recorder_is_shared = rec is not None and any(
             shared_recorder is rec
             for shared_recorder in self._shared_recorders.values()
@@ -3098,6 +3407,12 @@ class TestManager(QObject):
                     f"config={config_id}: {cleanup_error}"
                 )
         if not transition_won:
+            if not isinstance(error, Exception):
+                raise error
+            self._raise_first_fatal(
+                cleanup_errors,
+                context="factory stop abort cleanup",
+            )
             return False
         self._bus.log.emit(f"[TestManager] ERROR stopping config={config_id}: {error}")
         self._emit_optional_signal(
@@ -3109,6 +3424,20 @@ class TestManager(QObject):
             ),
         )
         self._bus.status.emit(f"Error: {error}")
+        if not isinstance(error, Exception):
+            for cleanup_error in cleanup_errors:
+                if isinstance(cleanup_error, Exception):
+                    continue
+                self._note_secondary_fatal(
+                    error,
+                    cleanup_error,
+                    context="factory stop abort cleanup",
+                )
+            raise error
+        self._raise_first_fatal(
+            cleanup_errors,
+            context="factory stop abort cleanup",
+        )
         return False
 
     def _session_is_analyzing(self, config_id: int) -> bool:
@@ -3433,7 +3762,15 @@ class TestManager(QObject):
                 self._pending_current_collections[config_id] = pending
                 register_pending = True
         if not register_pending:
-            collector.stop()
+            self._stop_current_collection_claim(
+                _CurrentCollectionClaim(
+                    config_id=config_id,
+                    session=session,
+                    generation=generation,
+                    collector=collector,
+                    retain_samples=False,
+                )
+            )
             return
 
         start_error = None
@@ -3483,7 +3820,8 @@ class TestManager(QObject):
                     cleanup_claim=None,
                     cleanup_result=None,
                     start_error=None,
-                    cleanup_error=None,
+                    cleanup_diagnostic_error=None,
+                    fatal_error=None,
                     owner_thread_id=pending.start_owner_thread_id,
                     cleanup_owner_thread_id=None,
                     continuation_kind=None,
@@ -3528,14 +3866,25 @@ class TestManager(QObject):
         except BaseException as exc:
             cleanup_call_error = exc
             cleanup_result = cleanup_claim._cleanup_result
-        cleanup_error = (
+        cleanup_diagnostic_error = (
+            cleanup_result.diagnostic_error
+            if cleanup_result is not None
+            else None
+        )
+        cleanup_fatal_error = (
             cleanup_call_error
             if cleanup_call_error is not None
+            and not isinstance(cleanup_call_error, Exception)
             else (
-                cleanup_result.error
+                cleanup_result.fatal_error
                 if cleanup_result is not None
                 else None
             )
+        )
+        start_fatal_error = (
+            start_error
+            if start_error is not None and not isinstance(start_error, Exception)
+            else None
         )
 
         with self._lifecycle_lock:
@@ -3545,7 +3894,11 @@ class TestManager(QObject):
             )
             terminal_kind = self._pending_current_terminal_kind(
                 start_error=start_error,
-                cleanup_error=cleanup_error,
+                cleanup_error=(
+                    cleanup_fatal_error
+                    if cleanup_fatal_error is not None
+                    else cleanup_diagnostic_error
+                ),
                 continuation=selected_continuation,
                 start_succeeded=bool(collector_started),
                 pending_is_current=(
@@ -3562,7 +3915,12 @@ class TestManager(QObject):
                 cleanup_claim=cleanup_claim,
                 cleanup_result=cleanup_result,
                 start_error=start_error,
-                cleanup_error=cleanup_error,
+                cleanup_diagnostic_error=cleanup_diagnostic_error,
+                fatal_error=(
+                    start_fatal_error
+                    if start_fatal_error is not None
+                    else cleanup_fatal_error
+                ),
                 owner_thread_id=pending.start_owner_thread_id,
                 cleanup_owner_thread_id=pending.cleanup_owner_thread_id,
                 continuation_kind=(
@@ -3590,9 +3948,22 @@ class TestManager(QObject):
                 selected_continuation,
             )
 
+        if start_fatal_error is not None:
+            if cleanup_fatal_error is not None:
+                self._note_secondary_fatal(
+                    start_fatal_error,
+                    cleanup_fatal_error,
+                    context="current collector startup cleanup",
+                )
+                raise start_fatal_error from cleanup_fatal_error
+            raise start_fatal_error
+        if cleanup_fatal_error is not None and selected_continuation is None:
+            if isinstance(start_error, Exception):
+                raise cleanup_fatal_error from start_error
+            raise cleanup_fatal_error
         if start_error is not None:
-            if cleanup_error is not None:
-                raise start_error from cleanup_error
+            if cleanup_diagnostic_error is not None:
+                raise start_error from cleanup_diagnostic_error
             raise start_error
         if cleanup_call_error is not None and selected_continuation is None:
             raise cleanup_call_error
@@ -3883,25 +4254,37 @@ class TestManager(QObject):
             result = claim._cleanup_result
             if result is None:
                 raise RuntimeError("collector cleanup completed without a result")
+            if result.fatal_error is not None:
+                raise result.fatal_error
             return result
 
-        stop_error = None
-        samples_error = None
+        stop_diagnostic_error = None
+        samples_diagnostic_error = None
+        stop_fatal_error = None
+        samples_fatal_error = None
         samples = []
         try:
             try:
                 claim.collector.stop()
             except BaseException as exc:
-                stop_error = exc
+                if isinstance(exc, Exception):
+                    stop_diagnostic_error = exc
+                else:
+                    stop_fatal_error = exc
             try:
                 samples = claim.collector.samples()
             except BaseException as exc:
-                samples_error = exc
+                if isinstance(exc, Exception):
+                    samples_diagnostic_error = exc
+                else:
+                    samples_fatal_error = exc
 
             result = _CurrentCollectionCleanupResult(
                 samples=samples,
-                stop_error=stop_error,
-                samples_error=samples_error,
+                stop_diagnostic_error=stop_diagnostic_error,
+                samples_diagnostic_error=samples_diagnostic_error,
+                stop_fatal_error=stop_fatal_error,
+                samples_fatal_error=samples_fatal_error,
             )
             with self._lifecycle_lock:
                 still_owned = (
@@ -3916,7 +4299,8 @@ class TestManager(QObject):
                 if (
                     claim.retain_samples
                     and still_owned
-                    and result.samples_error is None
+                    and result.samples_diagnostic_error is None
+                    and result.fatal_error is None
                 ):
                     prior_completed_session = self._completed_sessions.get(
                         claim.config_id
@@ -3945,18 +4329,29 @@ class TestManager(QObject):
                         claim.config_id,
                         claim.generation,
                     )
-            if result.stop_error is not None:
+            if result.stop_diagnostic_error is not None:
                 self._bus.log.emit(
                     f"[CurrentMeter] cleanup diagnostic for "
-                    f"config={claim.config_id}: stop failed: {result.stop_error}"
+                    f"config={claim.config_id}: stop failed: "
+                    f"{result.stop_diagnostic_error}"
                 )
-            if result.samples_error is not None:
+            if result.samples_diagnostic_error is not None:
                 self._bus.log.emit(
                     f"[CurrentMeter] cleanup diagnostic for "
                     f"config={claim.config_id}: samples failed: "
-                    f"{result.samples_error}"
+                    f"{result.samples_diagnostic_error}"
                 )
-            if result.error is None:
+            if result.stop_fatal_error is not None:
+                self._bus.log.emit(
+                    f"[CurrentMeter] fatal cleanup for config={claim.config_id}: "
+                    f"stop failed: {result.stop_fatal_error}"
+                )
+            if result.samples_fatal_error is not None:
+                self._bus.log.emit(
+                    f"[CurrentMeter] fatal cleanup for config={claim.config_id}: "
+                    f"samples failed: {result.samples_fatal_error}"
+                )
+            if result.diagnostic_error is None and result.fatal_error is None:
                 self._bus.log.emit(
                     f"[CurrentMeter] stopped for config={claim.config_id}, "
                     f"samples={len(samples)}"
@@ -3965,13 +4360,17 @@ class TestManager(QObject):
             if "result" not in locals():
                 result = _CurrentCollectionCleanupResult(
                     samples=samples,
-                    stop_error=stop_error,
-                    samples_error=samples_error,
+                    stop_diagnostic_error=stop_diagnostic_error,
+                    samples_diagnostic_error=samples_diagnostic_error,
+                    stop_fatal_error=stop_fatal_error,
+                    samples_fatal_error=samples_fatal_error,
                 )
             with claim._cleanup_lock:
                 claim._cleanup_result = result
             claim._cleanup_complete.set()
 
+        if result.fatal_error is not None:
+            raise result.fatal_error
         return result
 
     def _current_trace_payload(
@@ -4706,13 +5105,38 @@ class TestManager(QObject):
             pass
 
     def _disconnect_session_signals(self, session, recorder, monitor=None):
-        self._disconnect(
-            recorder.captured_block_ready,
-            getattr(session, "_captured_block_conn", None),
-        )
-        self._disconnect(recorder.error_occurred, getattr(session, "_error_lambda", None))
+        errors = []
+        disconnects = [
+            (
+                recorder.captured_block_ready,
+                getattr(session, "_captured_block_conn", None),
+            ),
+            (recorder.error_occurred, getattr(session, "_error_lambda", None)),
+        ]
         if monitor is not None:
-            self._disconnect(monitor.error_occurred, getattr(session, "_monitor_error_lambda", None))
+            disconnects.append(
+                (
+                    monitor.error_occurred,
+                    getattr(session, "_monitor_error_lambda", None),
+                )
+            )
+        for signal, callback in disconnects:
+            try:
+                self._disconnect(signal, callback)
+            except BaseException as exc:
+                errors.append(exc)
+        fatal_error = self._first_fatal(errors)
+        if fatal_error is not None:
+            for secondary in errors:
+                if secondary is not fatal_error and not isinstance(secondary, Exception):
+                    self._note_secondary_fatal(
+                        fatal_error,
+                        secondary,
+                        context="signal disconnection",
+                    )
+            raise fatal_error
+        if errors:
+            raise errors[0]
 
     def _stop_session_live_display_safely(
         self,
@@ -4740,8 +5164,8 @@ class TestManager(QObject):
         rec=None,
         context: str,
         excluding_config_id: int | None = None,
-    ) -> list[Exception]:
-        errors: list[Exception] = []
+    ) -> list[BaseException]:
+        errors: list[BaseException] = []
 
         if mon is not None:
             self._call_cleanup_safely(
@@ -4760,7 +5184,9 @@ class TestManager(QObject):
             )
 
         shutdown_results = []
+        recorder_stop_fatal = False
         if rec is not None:
+            recorder_error_count = len(errors)
             self._call_cleanup_safely(
                 errors,
                 config_id=config_id,
@@ -4773,8 +5199,11 @@ class TestManager(QObject):
                     )
                 ),
             )
+            recorder_stop_fatal = self._first_fatal(
+                errors[recorder_error_count:]
+            ) is not None
 
-        if shutdown_results == [True]:
+        if shutdown_results == [True] or recorder_stop_fatal:
             self._call_cleanup_safely(
                 errors,
                 config_id=config_id,
@@ -4788,7 +5217,7 @@ class TestManager(QObject):
 
     def _call_cleanup_safely(
         self,
-        errors: list[Exception],
+        errors: list[BaseException],
         *,
         config_id: int,
         context: str,
@@ -4797,12 +5226,44 @@ class TestManager(QObject):
     ) -> None:
         try:
             callback()
-        except Exception as exc:
+        except BaseException as exc:
             errors.append(exc)
             self._bus.log.emit(
                 f"[TestManager] ERROR {context} cleanup {action} "
                 f"for config={config_id}: {exc}"
             )
+
+    @staticmethod
+    def _first_fatal(errors) -> BaseException | None:
+        for error in errors:
+            if isinstance(error, BaseException) and not isinstance(error, Exception):
+                return error
+        return None
+
+    @staticmethod
+    def _note_secondary_fatal(
+        primary: BaseException,
+        secondary: BaseException,
+        *,
+        context: str,
+    ) -> None:
+        add_note = getattr(primary, "add_note", None)
+        if callable(add_note):
+            add_note(f"{context}: {type(secondary).__name__}: {secondary}")
+
+    def _raise_first_fatal(self, errors, *, context: str) -> None:
+        fatal_error = self._first_fatal(errors)
+        if fatal_error is None:
+            return
+        for secondary in errors:
+            if secondary is fatal_error or isinstance(secondary, Exception):
+                continue
+            self._note_secondary_fatal(
+                fatal_error,
+                secondary,
+                context=context,
+            )
+        raise fatal_error
 
     def _recorder_has_live_owner(
         self,
