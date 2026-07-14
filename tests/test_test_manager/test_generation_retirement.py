@@ -704,6 +704,181 @@ class TestGenerationRetirement:
         assert manager._session_generations[1] in manager._current_publication_gates
         manager.stop(config_id=1, silent=True)
 
+    def test_live_current_direct_slot_and_cross_thread_replacement_do_not_deadlock(
+        self,
+        monkeypatch,
+    ):
+        collectors = []
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.sample_callback = sample_callback
+                collectors.append(self)
+
+            def start(self):
+                return True
+
+            def stop(self):
+                pass
+
+            def samples(self):
+                return []
+
+        bus, _, manager = _make_current_start_manager(monkeypatch, Collector)
+        assert manager.start({"config_id": 1, "sn": "SN-direct-slot-old"}) is True
+        old_session = manager._sessions[1]
+        old_generation = manager._session_generations[1]
+        old_gate = manager._current_publication_gates[old_generation]
+        slot_entered = threading.Event()
+        slot_acquired_lifecycle = []
+        replacement_generation_hidden_in_slot = []
+
+        def direct_slot(*_args):
+            slot_entered.set()
+            assert old_gate.retirement_requested.wait(2.0)
+            visible_session = manager._sessions.get(1)
+            visible_generation = manager._session_generations.get(1)
+            replacement_generation_hidden_in_slot.append(
+                (visible_session is None or visible_session is old_session)
+                and (
+                    visible_generation is None
+                    or visible_generation is old_generation
+                )
+            )
+            acquired = manager._lifecycle_lock.acquire(timeout=0.5)
+            slot_acquired_lifecycle.append(acquired)
+            if acquired:
+                manager._lifecycle_lock.release()
+
+        bus.current_trace_updated.emit.side_effect = direct_slot
+        callback_errors = []
+        replacement_results = []
+        sample = _raw_current_sample(0.1, 9.0)
+
+        def publish_current():
+            try:
+                collectors[0].sample_callback(sample, (sample,))
+            except BaseException as exc:
+                callback_errors.append(exc)
+
+        callback_thread = threading.Thread(target=publish_current, daemon=True)
+        callback_thread.start()
+        assert slot_entered.wait(2.0)
+
+        replacement_thread = threading.Thread(
+            target=lambda: replacement_results.append(
+                manager.start({"config_id": 1, "sn": "SN-direct-slot-new"})
+            ),
+            daemon=True,
+        )
+        replacement_thread.start()
+        callback_thread.join(3.0)
+        replacement_thread.join(3.0)
+
+        assert not callback_thread.is_alive()
+        assert not replacement_thread.is_alive()
+        assert callback_errors == []
+        assert slot_acquired_lifecycle == [True]
+        assert replacement_generation_hidden_in_slot == [True]
+        assert replacement_results == [True]
+        assert manager._sessions[1] is not old_session
+        assert manager._session_generations[1] is not old_generation
+        assert old_generation not in manager._current_publication_gates
+        manager.stop(config_id=1, silent=True)
+
+    def test_concurrent_start_drains_stranded_config_gate_before_registration(
+        self,
+        monkeypatch,
+    ):
+        collectors = []
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.sample_callback = sample_callback
+                collectors.append(self)
+
+            def start(self):
+                return True
+
+            def stop(self):
+                pass
+
+            def samples(self):
+                return []
+
+        bus, _, manager = _make_current_start_manager(monkeypatch, Collector)
+        assert manager.start({"config_id": 1, "sn": "SN-stranded-old"}) is True
+        old_generation = manager._session_generations[1]
+        old_gate = manager._current_publication_gates[old_generation]
+        slot_entered = threading.Event()
+        start_retirement_argument_seen = threading.Event()
+        start_retirement_arguments = []
+        start_thread_ref = {}
+        original_retire = manager._retire_current_publication_gate
+
+        def observe_retirement_argument(generation):
+            if threading.current_thread() is start_thread_ref.get("thread"):
+                start_retirement_arguments.append(generation)
+                start_retirement_argument_seen.set()
+            return original_retire(generation)
+
+        monkeypatch.setattr(
+            manager,
+            "_retire_current_publication_gate",
+            observe_retirement_argument,
+        )
+
+        def direct_slot(*_args):
+            slot_entered.set()
+            assert old_gate.retirement_requested.wait(2.0)
+            assert start_retirement_argument_seen.wait(2.0)
+
+        bus.current_trace_updated.emit.side_effect = direct_slot
+        callback_errors = []
+        sample = _raw_current_sample(0.1, 9.0)
+
+        def publish_current():
+            try:
+                collectors[0].sample_callback(sample, (sample,))
+            except BaseException as exc:
+                callback_errors.append(exc)
+
+        callback_thread = threading.Thread(target=publish_current, daemon=True)
+        callback_thread.start()
+        assert slot_entered.wait(2.0)
+
+        stop_results = []
+        stop_thread = threading.Thread(
+            target=lambda: stop_results.append(manager.stop(config_id=1, silent=True)),
+            daemon=True,
+        )
+        stop_thread.start()
+        assert old_gate.retirement_requested.wait(2.0)
+
+        start_results = []
+        start_thread = threading.Thread(
+            target=lambda: start_results.append(
+                manager.start({"config_id": 1, "sn": "SN-stranded-new"})
+            ),
+            daemon=True,
+        )
+        start_thread_ref["thread"] = start_thread
+        start_thread.start()
+
+        callback_thread.join(3.0)
+        stop_thread.join(3.0)
+        start_thread.join(3.0)
+        assert not callback_thread.is_alive()
+        assert not stop_thread.is_alive()
+        assert not start_thread.is_alive()
+        assert callback_errors == []
+        assert stop_results == [None]
+        assert start_results == [True]
+        assert start_retirement_arguments == [old_generation]
+        assert manager._session_generations[1] is not old_generation
+        assert old_generation not in manager._current_publication_gates
+        manager.stop(config_id=1, silent=True)
+
     def test_collector_stop_reentrant_completion_never_waits_on_its_owner_thread(
         self,
         monkeypatch,

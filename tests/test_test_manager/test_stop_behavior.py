@@ -69,6 +69,7 @@ class TestTestManagerStartStop:
                 generation=generation,
                 retain_samples=True,
             )
+        mgr._retire_current_publication_gate(generation)
         cleanup = mgr._stop_current_collection_claim(claim)
         mgr._settle_current_samples_for_capture(claim, retained_frames=0)
 

@@ -295,6 +295,7 @@ def test_stop_current_collection_stores_the_same_rebased_set_used_by_review(monk
             generation=generation,
             retain_samples=True,
         )
+    manager._retire_current_publication_gate(generation)
     cleanup = manager._stop_current_collection_claim(claim)
     manager._settle_current_samples_for_capture(claim, retained_frames=1)
 
@@ -397,6 +398,8 @@ def test_live_current_retirement_cancels_callback_blocked_in_epoch(monkeypatch):
     def replace_generation():
         with manager._lifecycle_lock:
             manager._retire_session_generation_locked(7, old_generation)
+        manager._retire_current_publication_gate(old_generation)
+        with manager._lifecycle_lock:
             manager._sessions[7] = new_session
             manager._session_generations[7] = new_generation
         replacement_done.set()
@@ -414,6 +417,7 @@ def test_live_current_retirement_cancels_callback_blocked_in_epoch(monkeypatch):
     bus.current_trace_updated.emit.assert_not_called()
     assert manager._sessions[7] is new_session
     assert manager._session_generations[7] is new_generation
+    assert old_generation not in manager._current_publication_gates
 
 
 def test_live_current_publication_keeps_shared_sessions_on_their_own_epochs(monkeypatch):
@@ -475,6 +479,118 @@ def test_live_current_publication_keeps_shared_sessions_on_their_own_epochs(monk
     assert first_payload["values_a"] == [1.0]
     assert second_payload["times_sec"] == [0.2]
     assert second_payload["values_a"] == [2.0]
+
+
+def test_current_retirement_drains_all_callbacks_without_blocking_other_config(
+    monkeypatch,
+):
+    bus = _mock_bus()
+    bus.current_trace_updated = MagicMock()
+    bus.current_trace_updated.emit = MagicMock()
+
+    class FakeCollector:
+        instances = []
+
+        def __init__(self, _config, *, sample_callback=None, log_callback=None):
+            self.sample_callback = sample_callback
+            FakeCollector.instances.append(self)
+
+        def start(self):
+            return True
+
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.CurrentMeterCollector",
+        FakeCollector,
+    )
+    manager = TestManager(bus, _mock_services(bus))
+    generations = {}
+    for config_id, run_id, epoch in (
+        (7, "draining", 10.0),
+        (8, "independent", 20.0),
+    ):
+        session = SimpleNamespace(
+            _config={
+                "config_id": config_id,
+                "current_meter": {"enabled": True, "host": "127.0.0.1"},
+            },
+            _workorder={"factory_run_id": run_id},
+            current_epoch=lambda value=epoch: value,
+        )
+        manager._sessions[config_id] = session
+        generations[config_id] = _bind_manager_run_generation(
+            manager,
+            config_id,
+            session,
+        )
+        manager._start_current_collection(config_id, session)
+
+    first_emit_entered = Event()
+    allow_first_emit = Event()
+
+    def block_first_config(config_id, *_args):
+        if config_id == 7:
+            first_emit_entered.set()
+            assert allow_first_emit.wait(2.0)
+
+    bus.current_trace_updated.emit.side_effect = block_first_config
+    callback_errors = []
+    second_callback_entered = Event()
+
+    def invoke(callback, sample, *, entered=None):
+        try:
+            if entered is not None:
+                entered.set()
+            callback(sample, (sample,))
+        except BaseException as exc:
+            callback_errors.append(exc)
+
+    first = CurrentSample(0.1, 1.0, 10.1)
+    second = CurrentSample(0.2, 2.0, 10.2)
+    first_thread = Thread(
+        target=invoke,
+        args=(FakeCollector.instances[0].sample_callback, first),
+    )
+    first_thread.start()
+    assert first_emit_entered.wait(2.0)
+
+    second_thread = Thread(
+        target=invoke,
+        args=(FakeCollector.instances[0].sample_callback, second),
+        kwargs={"entered": second_callback_entered},
+    )
+    second_thread.start()
+    assert second_callback_entered.wait(2.0)
+
+    retirement_done = Event()
+    retirement_thread = Thread(
+        target=lambda: (
+            manager._retire_current_publication_gate(generations[7]),
+            retirement_done.set(),
+        )
+    )
+    retirement_thread.start()
+    gate = manager._current_publication_gates[generations[7]]
+    assert gate.retirement_requested.wait(2.0)
+
+    independent = CurrentSample(0.1, 8.0, 20.1)
+    FakeCollector.instances[1].sample_callback(independent, (independent,))
+    assert not retirement_done.is_set()
+    allow_first_emit.set()
+
+    first_thread.join(2.0)
+    second_thread.join(2.0)
+    retirement_thread.join(2.0)
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert not retirement_thread.is_alive()
+    assert callback_errors == []
+    assert retirement_done.is_set()
+    assert [item.args[0] for item in bus.current_trace_updated.emit.call_args_list] == [
+        7,
+        8,
+    ]
+    assert generations[7] not in manager._current_publication_gates
+    assert manager._current_publication_gates.get(generations[8]) is not None
 
 
 class TestReviewPayloadEmission:

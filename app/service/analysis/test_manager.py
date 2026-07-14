@@ -218,6 +218,7 @@ class _CurrentPublicationGate:
     """Linearize one run's current callback publication with retirement."""
 
     __slots__ = (
+        "config_id",
         "session",
         "generation",
         "lock",
@@ -225,7 +226,8 @@ class _CurrentPublicationGate:
         "active",
     )
 
-    def __init__(self, *, session, generation):
+    def __init__(self, *, config_id, session, generation):
+        self.config_id = config_id
         self.session = session
         self.generation = generation
         self.lock = threading.RLock()
@@ -240,13 +242,15 @@ class _CurrentPublicationGate:
             and self.generation is generation
         )
 
-    def deactivate(self) -> None:
-        # Set the cancellation marker before waiting for a callback that may be
-        # blocked while reading the session epoch.  Its final gate check will
-        # then decline publication and release ``lock`` for retirement.
+    def request_retirement(self) -> None:
+        """Cancel future publication without waiting for an active callback."""
+
         self.retirement_requested.set()
-        with self.lock:
-            self.active = False
+
+    def deactivate_locked(self) -> None:
+        """Deactivate after the caller has linearized on ``lock``."""
+
+        self.active = False
 
 
 @dataclass(frozen=True)
@@ -932,20 +936,54 @@ class TestManager(QObject):
                     Qt.ConnectionType.DirectConnection,
                 )
 
-            with self._lifecycle_lock:
-                # A same-config replacement begins with fresh lifecycle flags;
-                # cleanup from the displaced generation must not own them.
-                prior_generation = self._session_generations.get(config_id)
-                if prior_generation is not run_generation:
-                    self._retire_current_publication_gate_locked(prior_generation)
-                self._analyzing_sessions.discard(config_id)
-                self._accepted_factory_stops.discard(config_id)
-                self._sessions[config_id] = session
-                self._recorders[config_id] = recorder
-                if monitor is not None:
-                    self._monitors[config_id] = monitor
-                self._session_error_routes[config_id] = error_route
-                self._session_generations[config_id] = run_generation
+            while True:
+                with self._lifecycle_lock:
+                    prior_generation = self._session_generations.get(config_id)
+                    displaced_publication_generation = (
+                        self._current_publication_generation_for_config_locked(
+                            config_id,
+                            excluding_generation=run_generation,
+                        )
+                    )
+                generation_to_retire = (
+                    displaced_publication_generation
+                    if displaced_publication_generation is not None
+                    else prior_generation
+                )
+                if generation_to_retire is not run_generation:
+                    self._retire_current_publication_gate(generation_to_retire)
+
+                with self._lifecycle_lock:
+                    # If another start won while retirement waited, retry its
+                    # exact gate.  Likewise, a late gate for the prior
+                    # generation must be drained before the new generation is
+                    # made visible.
+                    if (
+                        self._session_generations.get(config_id)
+                        is not prior_generation
+                    ):
+                        continue
+                    if (
+                        self._current_publication_generation_for_config_locked(
+                            config_id,
+                            excluding_generation=run_generation,
+                        )
+                        is not None
+                    ):
+                        continue
+
+                    # A same-config replacement begins with fresh lifecycle
+                    # flags; cleanup from the displaced generation must not
+                    # own them.
+                    self._analyzing_sessions.discard(config_id)
+                    self._accepted_factory_stops.discard(config_id)
+                    self._sessions[config_id] = session
+                    self._recorders[config_id] = recorder
+                    if monitor is not None:
+                        self._monitors[config_id] = monitor
+                    self._session_error_routes[config_id] = error_route
+                    self._session_generations[config_id] = run_generation
+                    break
 
             def checked_startup_state():
                 latch_live = startup_error_latch.checkpoint(source_token)
@@ -1538,6 +1576,7 @@ class TestManager(QObject):
                 else detached_current_collection
             )
 
+        self._retire_current_publication_gate(generation)
         route_cleanup_errors = self._invalidate_error_route(
             error_route,
             context="factory stop",
@@ -1688,6 +1727,7 @@ class TestManager(QObject):
             self._analyzing_sessions.discard(config_id)
             self._accepted_factory_stops.discard(config_id)
 
+        self._retire_current_publication_gate(generation)
         cleanup_errors = self._invalidate_error_route(
             error_route,
             context="manual stop",
@@ -1949,6 +1989,7 @@ class TestManager(QObject):
             )
             self._retire_current_samples_locked(config_id, generation)
 
+        self._retire_current_publication_gate(generation)
         cleanup_errors: list[_CleanupFailureRecord] = []
         self._extend_cleanup_failures(
             cleanup_errors,
@@ -2208,22 +2249,73 @@ class TestManager(QObject):
         )
 
     def _retire_session_generation_locked(self, config_id: int, generation) -> None:
-        self._retire_current_publication_gate_locked(generation)
+        self._request_current_publication_gate_retirement_locked(generation)
         if (
             generation is not None
             and self._session_generations.get(config_id) is generation
         ):
             self._session_generations.pop(config_id, None)
 
-    def _retire_current_publication_gate_locked(self, generation) -> None:
+    def _request_current_publication_gate_retirement_locked(self, generation):
+        """Cancel a generation's publications without waiting on its gate."""
+
         if generation is None:
-            return
+            return None
         gate = self._current_publication_gates.get(generation)
         if gate is None:
+            return None
+        gate.request_retirement()
+        return gate
+
+    def _retire_current_publication_gate(self, generation) -> None:
+        """Wait for and retire one publication gate without lock inversion."""
+
+        if generation is None:
             return
-        gate.deactivate()
-        if self._current_publication_gates.get(generation) is gate:
-            self._current_publication_gates.pop(generation, None)
+        is_owned = getattr(self._lifecycle_lock, "_is_owned", None)
+        if callable(is_owned) and is_owned():
+            raise RuntimeError(
+                "current publication retirement cannot wait while holding "
+                "the lifecycle lock"
+            )
+
+        while True:
+            # Read the exact gate under lifecycle ownership, then release that
+            # lock before cancellation or any wait.  A callback may call a
+            # direct external slot which itself needs the lifecycle lock.
+            with self._lifecycle_lock:
+                gate = self._current_publication_gates.get(generation)
+            if gate is None:
+                return
+            gate.request_retirement()
+
+            # Gate -> lifecycle is the sole blocking lock order for retirement.
+            # Re-check identity because a stale gate must never remove a newer
+            # gate registered for the same generation.
+            retry = False
+            with gate.lock:
+                with self._lifecycle_lock:
+                    gate.deactivate_locked()
+                    if self._current_publication_gates.get(generation) is gate:
+                        self._current_publication_gates.pop(generation, None)
+                    else:
+                        retry = True
+            if not retry:
+                return
+
+    def _current_publication_generation_for_config_locked(
+        self,
+        config_id: int,
+        *,
+        excluding_generation=None,
+    ):
+        for generation, gate in self._current_publication_gates.items():
+            if (
+                gate.config_id == config_id
+                and generation is not excluding_generation
+            ):
+                return generation
+        return None
 
     def _retire_current_samples_locked(self, config_id: int, generation) -> None:
         if generation is not None:
@@ -2639,6 +2731,7 @@ class TestManager(QObject):
                     else detached_current_collection
                 )
 
+        self._retire_current_publication_gate(expected_generation)
         route_cleanup_errors = self._invalidate_error_route(
             error_route,
             context="recording completion",
@@ -4252,6 +4345,7 @@ class TestManager(QObject):
             publication_gate = self._current_publication_gates.get(generation)
             if publication_gate is None:
                 publication_gate = _CurrentPublicationGate(
+                    config_id=config_id,
                     session=session,
                     generation=generation,
                 )
@@ -4288,7 +4382,8 @@ class TestManager(QObject):
             )
         except BaseException:
             with self._lifecycle_lock:
-                self._retire_current_publication_gate_locked(generation)
+                self._request_current_publication_gate_retirement_locked(generation)
+            self._retire_current_publication_gate(generation)
             raise
         pending = _PendingCurrentCollection(
             config_id=config_id,
@@ -4304,12 +4399,13 @@ class TestManager(QObject):
                 is not generation
             ):
                 register_pending = False
-                self._retire_current_publication_gate_locked(generation)
+                self._request_current_publication_gate_retirement_locked(generation)
             else:
                 self._current_collection_generations[config_id] = generation
                 self._pending_current_collections[config_id] = pending
                 register_pending = True
         if not register_pending:
+            self._retire_current_publication_gate(generation)
             self._stop_current_collection_claim(
                 _CurrentCollectionClaim(
                     config_id=config_id,
@@ -4386,7 +4482,7 @@ class TestManager(QObject):
                     is generation
                 ):
                     self._current_collection_generations.pop(config_id, None)
-                self._retire_current_publication_gate_locked(generation)
+                self._request_current_publication_gate_retirement_locked(generation)
                 retain_samples = (
                     start_error is None
                     and selected_continuation is not None
@@ -4410,6 +4506,7 @@ class TestManager(QObject):
             self._bus.log.emit(f"[CurrentMeter] started for config={config_id}")
             return
 
+        self._retire_current_publication_gate(generation)
         try:
             cleanup_result = self._stop_current_collection_claim(cleanup_claim)
         except BaseException as exc:
@@ -4743,7 +4840,7 @@ class TestManager(QObject):
     ) -> _CurrentCollectionClaim | None:
         if generation is None:
             return None
-        self._retire_current_publication_gate_locked(generation)
+        self._request_current_publication_gate_retirement_locked(generation)
         if self._current_collection_generations.get(config_id) is generation:
             self._current_collection_generations.pop(config_id, None)
 

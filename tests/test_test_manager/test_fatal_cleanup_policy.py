@@ -719,6 +719,7 @@ def test_collector_cleanup_owner_and_waiter_consume_one_frozen_reporting_result(
             generation=generation,
             retain_samples=False,
         )
+    manager._retire_current_publication_gate(generation)
     assert claim is not None
 
     bus.log.emit.side_effect = reporting_error
