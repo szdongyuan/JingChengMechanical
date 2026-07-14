@@ -258,6 +258,14 @@ class AudioRecorder(QThread):
             self._close_capture_acceptance()
             self.error_occurred.emit(str(exc))
             return
+        except sd.PortAudioError as exc:
+            self._close_capture_acceptance()
+            self.error_occurred.emit(f"Audio device error: {exc}")
+            return
+        except Exception as exc:
+            self._close_capture_acceptance()
+            self.error_occurred.emit(f"Recording error: {exc}")
+            return
 
         completed = False
         try:

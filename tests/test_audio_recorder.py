@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import sounddevice as sd
 
 from app.service.analysis.audio_recorder import AudioRecorder, _resolve_device_index
 from app.service.analysis.session_capture import CaptureNotAcceptedError
@@ -262,6 +263,53 @@ class TestAudioRecorderErrors:
         rec.run()
 
         assert errors == ["Host API not found: TestAPI"]
+        with pytest.raises(CaptureNotAcceptedError):
+            rec.request_capture(record_duration=0.1)
+        assert not rec._pending_capture_owners
+
+    @pytest.mark.parametrize(
+        ("discovery_error", "expected_message"),
+        [
+            (
+                sd.PortAudioError("backend query failed"),
+                "Audio device error: backend query failed",
+            ),
+            (
+                RuntimeError("backend discovery crashed"),
+                "Recording error: backend discovery crashed",
+            ),
+        ],
+    )
+    def test_terminal_device_discovery_errors_close_capture_acceptance(
+        self,
+        monkeypatch,
+        discovery_error,
+        expected_message,
+    ):
+        def fail_device_discovery(*_):
+            raise discovery_error
+
+        monkeypatch.setattr(
+            "app.service.analysis.audio_recorder._resolve_device_index",
+            fail_device_discovery,
+        )
+        rec = AudioRecorder(
+            device_name="TestMic",
+            hostapi="TestAPI",
+            sample_rate=44100.0,
+            n_channels=1,
+            record_duration=1.0,
+        )
+        errors = []
+        rec.error_occurred.connect(errors.append)
+
+        rec.run()
+
+        assert errors == [expected_message]
+        with pytest.raises(CaptureNotAcceptedError):
+            rec.request_capture(record_duration=0.1)
+        assert not rec._pending_capture_owners
+        assert not rec._active_capture_owners
 
 
 @pytest.mark.skipif(not HAS_PYTEST_QT, reason="pytest-qt not installed")
