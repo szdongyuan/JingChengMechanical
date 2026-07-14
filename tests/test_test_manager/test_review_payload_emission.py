@@ -12,6 +12,8 @@ from app.service.analysis.test_manager import TestManager
 from app.service.current_meter_service import CurrentSample, build_current_trace_payload
 
 from ._support import (
+    _bind_manager_run_generation,
+    _complete_current_session,
     _expected_chart_payload,
     _expected_summary_payload,
     _make_running_factory_manager,
@@ -65,6 +67,8 @@ def test_start_current_collection_emits_live_current_trace_update_with_run_id(mo
         },
         _workorder={"factory_run_id": "run-live"},
     )
+    manager._sessions[7] = session
+    _bind_manager_run_generation(manager, 7, session)
 
     manager._start_current_collection(7, session)
     FakeCollector.instances[0].sample_callback(
@@ -135,6 +139,8 @@ def test_start_current_collection_emits_live_current_trace_with_raw_meter_unit(m
         },
         _workorder={"factory_run_id": "run-live"},
     )
+    manager._sessions[7] = session
+    _bind_manager_run_generation(manager, 7, session)
 
     manager._start_current_collection(7, session)
     FakeCollector.instances[0].sample_callback(samples[-1], samples)
@@ -370,7 +376,7 @@ class TestReviewPayloadEmission:
 
         monkeypatch.setattr(mgr, "_build_summary_payload", _stop_before_first_review_emit)
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         assert stop_results == [True]
         bus.factory_runtime_stopped.emit.assert_called_once()
@@ -404,7 +410,7 @@ class TestReviewPayloadEmission:
             lambda *args: stop_results.append(mgr.stop_active_run(config_id=1))
         )
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         assert stop_results == [True]
         bus.factory_runtime_stopped.emit.assert_called_once()
@@ -436,7 +442,7 @@ class TestReviewPayloadEmission:
             lambda *args: stop_results.append(mgr.stop_active_run(config_id=1))
         )
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         assert stop_results == [True]
         bus.factory_runtime_stopped.emit.assert_called_once()
@@ -535,7 +541,7 @@ class TestReviewPayloadEmission:
             CurrentSample(time_sec=2.5, current_a=3.0),
         ]
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         assert calls["summary"]["config"] == session._config
         assert calls["summary"]["ai_review"] == session.last_ai_review
@@ -734,7 +740,7 @@ class TestReviewPayloadEmission:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
         assert payload.summary_payload["overall_status"] == "no_result"
@@ -812,7 +818,7 @@ class TestReviewPayloadEmission:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
         assert payload.summary_payload == expected_summary
@@ -884,7 +890,7 @@ class TestReviewPayloadEmission:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         assert build_summary_calls == [
             {
@@ -961,7 +967,7 @@ class TestReviewPayloadEmission:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         assert build_summary_calls == [
             {
@@ -1516,7 +1522,7 @@ class TestReviewPayloadEmission:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
         assert payload.summary_payload == expected_summary

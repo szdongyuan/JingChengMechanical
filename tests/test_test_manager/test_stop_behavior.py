@@ -88,12 +88,15 @@ class TestTestManagerStartStop:
         )
         replacement_recorder = object()
         replacement_monitor = MagicMock()
+        replacement_generation = object()
+        replacement_session._manager_generation_token = replacement_generation
         replacement_route = type(old_route)(
             config_id=1,
             session=replacement_session,
             recorder=replacement_recorder,
             monitor=replacement_monitor,
             source_token=object(),
+            generation=replacement_generation,
         )
         replacement_session._manager_error_route = replacement_route
         with mgr._lifecycle_lock:
@@ -101,7 +104,7 @@ class TestTestManagerStartStop:
             mgr._recorders[1] = replacement_recorder
             mgr._monitors[1] = replacement_monitor
             mgr._session_error_routes[1] = replacement_route
-            mgr._session_generations[1] = replacement_route
+            mgr._session_generations[1] = replacement_generation
 
         mgr._start_current_collection(1, replacement_session)
         replacement_collector = collector_instances[1]
@@ -124,7 +127,7 @@ class TestTestManagerStartStop:
         assert mgr._recorders.get(1) is replacement_recorder
         assert mgr._monitors.get(1) is replacement_monitor
         assert mgr._session_error_routes.get(1) is replacement_route
-        assert mgr._session_generations.get(1) is replacement_route
+        assert mgr._session_generations.get(1) is replacement_generation
         assert 1 in mgr._analyzing_sessions
         assert 1 in mgr._accepted_factory_stops
 
@@ -171,7 +174,10 @@ class TestTestManagerStartStop:
             assert mgr._recorders.get(1) is replacement["recorder"]
             assert mgr._monitors.get(1) is replacement["monitor"]
             assert mgr._session_error_routes.get(1) is replacement["route"]
-            assert mgr._session_generations.get(1) is replacement["route"]
+            assert (
+                mgr._session_generations.get(1)
+                is replacement["route"].generation
+            )
             assert mgr._completed_sessions.get(1) is not replacement["session"]
             assert mgr.is_running(config_id=1) is True
         finally:

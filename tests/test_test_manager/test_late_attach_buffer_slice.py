@@ -19,6 +19,7 @@ from app.service.analysis.test_manager import TestManager
 
 from ._support import (
     _DummySignal,
+    _complete_current_session,
     _expected_no_result_payload,
     _make_running_factory_manager,
     _mock_bus,
@@ -170,7 +171,7 @@ class TestLateAttachBufferSlice:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         rec.get_capture_buffer.assert_called_once_with(
             attachment,
@@ -217,7 +218,7 @@ class TestLateAttachBufferSlice:
 
         bus.factory_runtime_analyzing_entered.emit.side_effect = stop_from_analyzing
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         np.testing.assert_array_equal(observed["buffer"], post_attach)
         assert observed["get_calls"] == [(attachment, post_attach.shape[0])]
@@ -261,14 +262,17 @@ class TestLateAttachBufferSlice:
         bus.status.emit.side_effect = start_replacement_on_idle
 
         try:
-            mgr._on_session_done(1)
+            _complete_current_session(mgr, 1)
 
             assert replacement["accepted"] is True
             assert mgr._sessions.get(1) is replacement["session"]
             assert mgr._recorders.get(1) is replacement["recorder"]
             assert mgr._monitors.get(1) is replacement["monitor"]
             assert mgr._session_error_routes.get(1) is replacement["route"]
-            assert mgr._session_generations.get(1) is replacement["route"]
+            assert (
+                mgr._session_generations.get(1)
+                is replacement["route"].generation
+            )
             assert mgr._completed_sessions.get(1) is not replacement["session"]
             assert replacement["monitor"].stop_calls == 0
             assert mgr.is_running(config_id=1) is True
@@ -315,7 +319,10 @@ class TestLateAttachBufferSlice:
 
         rec.get_capture_buffer = blocking_get
         mgr._freeze_and_capture_session_buffer = observed_finalize
-        workers = [Thread(target=mgr._on_session_done, args=(1,)) for _ in range(2)]
+        workers = [
+            Thread(target=_complete_current_session, args=(mgr, 1))
+            for _ in range(2)
+        ]
 
         workers[0].start()
         assert get_entered.wait(timeout=2)
@@ -388,7 +395,7 @@ class TestLateAttachBufferSlice:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         rec.get_capture_buffer.assert_called_once_with(
             attachment,
@@ -454,7 +461,7 @@ class TestLateAttachBufferSlice:
         mgr._recorders[1] = rec
         mgr._monitors[1] = mon
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         rec.get_capture_buffer.assert_called_once_with(
             attachment,
@@ -551,7 +558,7 @@ class TestLateAttachBufferSlice:
         mgr._recorders[1] = rec
         mgr._monitors[1] = mon
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         rec.get_capture_buffer.assert_called_once_with(
             attachment,
@@ -617,7 +624,7 @@ class TestLateAttachBufferSlice:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         phase_payload = bus.factory_runtime_analyzing_entered.emit.call_args.args[0]
         review_payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
@@ -703,7 +710,7 @@ class TestLateAttachBufferSlice:
             lambda payload: _capture_emission("cleanup", payload)
         )
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         assert [entry[0] for entry in emission_order] == ["review", "cleanup"]
         assert emission_order[0][1:3] == (True, True)
@@ -806,7 +813,7 @@ class TestLateAttachBufferSlice:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         payload = _expected_no_result_payload("analysis window not fully captured")
         rec.get_capture_buffer.assert_called_once_with(
@@ -858,7 +865,7 @@ class TestLateAttachBufferSlice:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         payload = _expected_no_result_payload("analysis crashed")
         rec.get_capture_buffer.assert_called_once_with(
@@ -912,7 +919,7 @@ class TestLateAttachBufferSlice:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         bus.factory_runtime_analyzing_entered.emit.assert_called_once()
         bus.test_finished.emit.assert_not_called()
@@ -946,7 +953,7 @@ class TestLateAttachBufferSlice:
             raise RuntimeError("late analysis should be suppressed")
 
         session._run_judgment = _blocking_judgment
-        worker = Thread(target=mgr._on_session_done, args=(1,))
+        worker = Thread(target=_complete_current_session, args=(mgr, 1))
         worker.start()
         assert entered_analysis.wait(timeout=1)
 
@@ -997,7 +1004,7 @@ class TestLateAttachBufferSlice:
         worker.start()
         assert stop_window_entered.wait(timeout=1)
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         release_stop_window.set()
         worker.join(timeout=1)

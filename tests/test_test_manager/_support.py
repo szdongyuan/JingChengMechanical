@@ -144,6 +144,27 @@ class _FakeSession:
         self._audio_data_id = "audio-123"
         return self._audio_file_path
 
+
+def _bind_manager_run_generation(manager, config_id: int, session):
+    """Give direct white-box manager setups the same explicit run identity as start()."""
+
+    generation = getattr(session, "__dict__", {}).get("_manager_generation_token")
+    if generation is None:
+        generation = object()
+        session._manager_generation_token = generation
+        manager._session_generations[config_id] = generation
+    return generation
+
+
+def _complete_current_session(manager, config_id: int):
+    session = manager._sessions[config_id]
+    generation = _bind_manager_run_generation(manager, config_id, session)
+    return manager._on_session_done(
+        config_id,
+        expected_session=session,
+        expected_generation=generation,
+    )
+
 def _factory_runtime_config(
     config_id: int = 1,
     *,

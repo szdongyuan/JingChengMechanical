@@ -5,7 +5,11 @@ from unittest.mock import MagicMock
 import numpy as np
 
 from app.service.analysis.test_manager import TestManager
-from tests.test_test_manager._support import _mock_bus, _mock_services
+from tests.test_test_manager._support import (
+    _complete_current_session,
+    _mock_bus,
+    _mock_services,
+)
 
 
 class _SessionStub:
@@ -162,7 +166,7 @@ def test_no_result_after_saved_audio_row_can_be_manually_judged():
     session._run_judgment = MagicMock(side_effect=ValueError("analysis result unavailable"))
     mgr._sessions[101] = session
 
-    mgr._on_session_done(101)
+    _complete_current_session(mgr, 101)
 
     assert mgr._completed_sessions[101] is session
 
