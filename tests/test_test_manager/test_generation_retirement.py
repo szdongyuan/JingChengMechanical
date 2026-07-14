@@ -55,6 +55,7 @@ def _successful_judgment() -> JudgmentResult:
 
 def _assert_no_generation_state(manager: TestManager, config_id: int = 1) -> None:
     assert config_id not in manager._start_reservations
+    assert dict(manager._pending_shared_recorder_users) == {}
     assert config_id not in manager._session_generations
     assert config_id not in manager._current_collection_generations
     assert config_id not in manager._current_collector_generations

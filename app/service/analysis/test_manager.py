@@ -10,6 +10,7 @@ import inspect
 import os
 import threading
 import uuid
+import weakref
 from dataclasses import asdict, dataclass, is_dataclass
 from numbers import Integral
 
@@ -251,6 +252,25 @@ class _CurrentPublicationGate:
         """Deactivate after the caller has linearized on ``lock``."""
 
         self.active = False
+
+
+class _RecorderStartGate:
+    """Publish one exact recorder start attempt to concurrent sessions."""
+
+    __slots__ = (
+        "lock",
+        "starting",
+        "started",
+        "owner_thread_id",
+        "completion",
+    )
+
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.starting = False
+        self.started = False
+        self.owner_thread_id = None
+        self.completion = None
 
 
 @dataclass(frozen=True)
@@ -555,6 +575,10 @@ class TestManager(QObject):
         self._session_error_routes: dict[int, _SessionErrorRoute] = {}
         self._session_generations: dict[int, object] = {}
         self._shared_recorders: dict[str, AudioRecorder] = {}
+        self._shared_recorder_locks: dict[str, threading.RLock] = {}
+        self._shared_recorder_device_keys = weakref.WeakKeyDictionary()
+        self._pending_shared_recorder_users = weakref.WeakKeyDictionary()
+        self._recorder_start_gates = weakref.WeakKeyDictionary()
         self._start_reservations: dict[int, object] = {}
         self._pending_factory_starts: dict[str, int] = {}
         self._canceled_factory_start_requests: set[str] = set()
@@ -793,6 +817,7 @@ class TestManager(QObject):
         startup_error_latch = None
         error_route = None
         failed_start_cleanup_errors = None
+        shared_recorder_claimed = False
 
         try:
             session = TestSession(
@@ -815,17 +840,14 @@ class TestManager(QObject):
                 )
             )
 
-            if device_key in self._shared_recorders:
-                recorder = self._shared_recorders[device_key]
-            else:
-                recorder = AudioRecorder(
-                    device_name=config.get("input_device_name", ""),
-                    hostapi=config.get("input_device_hostapi", ""),
-                    sample_rate=sample_rate,
-                    n_channels=n_channels,
-                    record_duration=record_duration,
-                )
-                self._shared_recorders[device_key] = recorder
+            recorder = self._get_or_create_shared_recorder(
+                device_key,
+                config=config,
+                sample_rate=sample_rate,
+                n_channels=n_channels,
+                record_duration=record_duration,
+            )
+            shared_recorder_claimed = True
 
             session._sample_rate = recorder._sample_rate
             session._setup_pipelines()
@@ -892,6 +914,11 @@ class TestManager(QObject):
                         record_duration=record_duration,
                     )
                 except CaptureNotAcceptedError:
+                    self._release_shared_recorder_selection(
+                        device_key,
+                        recorder,
+                    )
+                    shared_recorder_claimed = False
                     rejection_cleanup_failures = self._disconnect_session_signals(
                         session,
                         recorder,
@@ -903,26 +930,40 @@ class TestManager(QObject):
                             context="rejected recorder",
                         ),
                     )
-                    self._discard_shared_recorder(recorder)
                     self._raise_first_fatal(
                         rejection_cleanup_failures,
                         context="rejected recorder cleanup",
                     )
                     if capture_attempt:
+                        self._discard_shared_recorder(recorder)
                         raise
-                    recorder = AudioRecorder(
-                        device_name=config.get("input_device_name", ""),
-                        hostapi=config.get("input_device_hostapi", ""),
+                    recorder = self._replace_rejected_shared_recorder(
+                        device_key,
+                        recorder,
+                        config=config,
                         sample_rate=sample_rate,
                         n_channels=n_channels,
                         record_duration=record_duration,
                     )
-                    self._shared_recorders[device_key] = recorder
+                    shared_recorder_claimed = True
                     if session._sample_rate != recorder._sample_rate:
                         session._sample_rate = recorder._sample_rate
                         session._setup_pipelines()
                         self._apply_stored_live_loudness_channel(session, config)
                     continue
+                except BaseException:
+                    self._release_shared_recorder_selection(
+                        device_key,
+                        recorder,
+                    )
+                    shared_recorder_claimed = False
+                    raise
+                else:
+                    self._release_shared_recorder_selection(
+                        device_key,
+                        recorder,
+                    )
+                    shared_recorder_claimed = False
 
                 try:
                     session.attach_to_recorder(
@@ -1101,6 +1142,12 @@ class TestManager(QObject):
                     return True
                 return False
         except BaseException as exc:
+            if shared_recorder_claimed and recorder is not None:
+                self._release_shared_recorder_selection(
+                    device_key,
+                    recorder,
+                )
+                shared_recorder_claimed = False
             rollback_logging_errors = []
             root_error_text = self._report_cleanup_safely(
                 rollback_logging_errors,
@@ -1161,13 +1208,15 @@ class TestManager(QObject):
             )
 
         try:
-            recorder_running = recorder.isRunning()
             if self._startup_error_route_state(error_route) != "active":
                 self._clear_pending_factory_start(request_id)
                 self._clear_last_start_error()
                 return True
-            if not recorder_running:
-                recorder.start()
+            self._start_recorder_once(recorder)
+            if self._startup_error_route_state(error_route) != "active":
+                self._clear_pending_factory_start(request_id)
+                self._clear_last_start_error()
+                return True
             runtime_error = startup_error_latch.error_snapshot(source_token)
             if runtime_error is not None:
                 self._on_error(error_route, runtime_error)
@@ -4050,10 +4099,7 @@ class TestManager(QObject):
                 if self._monitors.get(config_id) is mon:
                     self._monitors.pop(config_id, None)
                 transition_won = True
-        recorder_is_shared = rec is not None and any(
-            shared_recorder is rec
-            for shared_recorder in self._shared_recorders.values()
-        )
+        recorder_is_shared = rec is not None and self._is_shared_recorder(rec)
         if recorder_is_shared:
             self._extend_cleanup_failures(
                 cleanup_errors,
@@ -6352,7 +6398,19 @@ class TestManager(QObject):
                 for failure in failures
             )
 
-        if rec is not None and (shutdown_won or recorder_stop_fatal):
+        fatal_retirement_won = False
+        if rec is not None and recorder_stop_fatal:
+            # A failed stop does not prove that capture acceptance closed.  A
+            # new start may therefore select this exact recorder before
+            # cleanup reaches wait/discard.  Claim retirement first so we
+            # neither wait for nor unpublish a recorder that gained a user.
+            fatal_retirement_won = self._discard_shared_recorder(
+                rec,
+                only_if_unused=True,
+                excluding_config_id=excluding_config_id,
+            )
+
+        if rec is not None and (shutdown_won or fatal_retirement_won):
             _, failures = self._run_cleanup_action_once(
                 action="recorder wait",
                 session=session,
@@ -6365,7 +6423,8 @@ class TestManager(QObject):
                 ),
             )
             self._extend_cleanup_failures(errors, failures)
-            self._discard_shared_recorder(rec)
+            if not fatal_retirement_won:
+                self._discard_shared_recorder(rec)
 
         return errors
 
@@ -6506,6 +6565,211 @@ class TestManager(QObject):
         if fatal_error is not None:
             raise fatal_error
 
+    def _shared_recorder_lock_for(self, device_key: str):
+        """Return the manager-lifetime lock for one stable device key."""
+
+        with self._lifecycle_lock:
+            device_lock = self._shared_recorder_locks.get(device_key)
+            if device_lock is None:
+                device_lock = threading.RLock()
+                self._shared_recorder_locks[device_key] = device_lock
+            return device_lock
+
+    @staticmethod
+    def _new_audio_recorder(
+        *,
+        config,
+        sample_rate,
+        n_channels,
+        record_duration,
+    ):
+        return AudioRecorder(
+            device_name=config.get("input_device_name", ""),
+            hostapi=config.get("input_device_hostapi", ""),
+            sample_rate=sample_rate,
+            n_channels=n_channels,
+            record_duration=record_duration,
+        )
+
+    def _claim_shared_recorder_selection_locked(
+        self,
+        device_key: str,
+        recorder,
+    ) -> None:
+        self._shared_recorder_device_keys[recorder] = device_key
+        pending = int(self._pending_shared_recorder_users.get(recorder, 0))
+        self._pending_shared_recorder_users[recorder] = pending + 1
+
+    def _release_shared_recorder_selection(
+        self,
+        device_key: str,
+        recorder,
+    ) -> None:
+        device_lock = self._shared_recorder_lock_for(device_key)
+        with device_lock:
+            with self._lifecycle_lock:
+                pending = int(
+                    self._pending_shared_recorder_users.get(recorder, 0)
+                )
+                if pending <= 1:
+                    self._pending_shared_recorder_users.pop(recorder, None)
+                else:
+                    self._pending_shared_recorder_users[recorder] = pending - 1
+
+    def _select_shared_recorder(
+        self,
+        device_key: str,
+        *,
+        rejected_recorder=None,
+        config,
+        sample_rate,
+        n_channels,
+        record_duration,
+    ):
+        """Get/create one recorder while serializing only the exact device."""
+
+        device_lock = self._shared_recorder_lock_for(device_key)
+        # Locks are never removed during this manager's lifetime, so a waiter
+        # cannot acquire a new lock for the same key after an ABA replacement.
+        # The lifecycle lock is acquired only in the short map sections below.
+        with device_lock:
+            with self._lifecycle_lock:
+                current = self._shared_recorders.get(device_key)
+                if current is not None and current is not rejected_recorder:
+                    self._claim_shared_recorder_selection_locked(
+                        device_key,
+                        current,
+                    )
+                    return current
+                if current is rejected_recorder:
+                    self._shared_recorders.pop(device_key, None)
+
+            recorder = self._new_audio_recorder(
+                config=config,
+                sample_rate=sample_rate,
+                n_channels=n_channels,
+                record_duration=record_duration,
+            )
+
+            with self._lifecycle_lock:
+                current = self._shared_recorders.get(device_key)
+                if current is None:
+                    self._shared_recorders[device_key] = recorder
+                    self._claim_shared_recorder_selection_locked(
+                        device_key,
+                        recorder,
+                    )
+                    return recorder
+                self._claim_shared_recorder_selection_locked(
+                    device_key,
+                    current,
+                )
+                return current
+
+    def _get_or_create_shared_recorder(
+        self,
+        device_key: str,
+        *,
+        config,
+        sample_rate,
+        n_channels,
+        record_duration,
+    ):
+        return self._select_shared_recorder(
+            device_key,
+            config=config,
+            sample_rate=sample_rate,
+            n_channels=n_channels,
+            record_duration=record_duration,
+        )
+
+    def _replace_rejected_shared_recorder(
+        self,
+        device_key: str,
+        rejected_recorder,
+        *,
+        config,
+        sample_rate,
+        n_channels,
+        record_duration,
+    ):
+        return self._select_shared_recorder(
+            device_key,
+            rejected_recorder=rejected_recorder,
+            config=config,
+            sample_rate=sample_rate,
+            n_channels=n_channels,
+            record_duration=record_duration,
+        )
+
+    def _recorder_start_gate_for(self, recorder) -> _RecorderStartGate:
+        with self._lifecycle_lock:
+            gate = self._recorder_start_gates.get(recorder)
+            if gate is None:
+                gate = _RecorderStartGate()
+                self._recorder_start_gates[recorder] = gate
+            return gate
+
+    def _start_recorder_once(self, recorder) -> None:
+        """Start a shared recorder once without holding manager locks externally."""
+
+        gate = self._recorder_start_gate_for(recorder)
+        thread_id = threading.get_ident()
+        while True:
+            owns_start = False
+            with gate.lock:
+                if gate.started:
+                    return
+                if gate.starting:
+                    if gate.owner_thread_id == thread_id:
+                        return
+                    completion = gate.completion
+                else:
+                    gate.starting = True
+                    gate.owner_thread_id = thread_id
+                    gate.completion = threading.Event()
+                    completion = gate.completion
+                    owns_start = True
+            if owns_start:
+                break
+            completion.wait()
+
+        try:
+            if not recorder.isRunning():
+                recorder.start()
+        except BaseException:
+            with gate.lock:
+                gate.starting = False
+                gate.owner_thread_id = None
+                gate.completion = None
+                completion.set()
+            raise
+        else:
+            with gate.lock:
+                gate.started = True
+                gate.starting = False
+                gate.owner_thread_id = None
+                gate.completion = None
+                completion.set()
+
+    def _is_shared_recorder(self, recorder) -> bool:
+        with self._lifecycle_lock:
+            return any(
+                shared_recorder is recorder
+                for shared_recorder in self._shared_recorders.values()
+            )
+
+    def _shared_recorder_device_key(self, recorder) -> str | None:
+        with self._lifecycle_lock:
+            device_key = self._shared_recorder_device_keys.get(recorder)
+            if device_key is not None:
+                return device_key
+            for key, shared_recorder in self._shared_recorders.items():
+                if shared_recorder is recorder:
+                    self._shared_recorder_device_keys[recorder] = key
+                    return key
+            return None
+
     def _recorder_has_live_owner(
         self,
         recorder,
@@ -6513,10 +6777,14 @@ class TestManager(QObject):
         excluding_config_id: int | None = None,
     ) -> bool:
         with self._lifecycle_lock:
-            return any(
+            has_registered_owner = any(
                 cid != excluding_config_id and active_recorder is recorder
                 for cid, active_recorder in self._recorders.items()
             )
+            has_pending_selection = (
+                int(self._pending_shared_recorder_users.get(recorder, 0)) > 0
+            )
+            return has_registered_owner or has_pending_selection
 
     def _claim_unused_recorder_shutdown(
         self,
@@ -6524,14 +6792,29 @@ class TestManager(QObject):
         *,
         excluding_config_id: int | None = None,
     ) -> bool:
-        """Linearize unowned shutdown without nesting manager/recorder locks."""
+        """Linearize pending selection with shutdown of one exact recorder."""
 
-        if self._recorder_has_live_owner(
-            recorder,
-            excluding_config_id=excluding_config_id,
-        ):
-            return False
+        device_key = self._shared_recorder_device_key(recorder)
+        if device_key is None:
+            if self._recorder_has_live_owner(
+                recorder,
+                excluding_config_id=excluding_config_id,
+            ):
+                return False
+            return self._stop_recorder_if_ownerless(recorder)
 
+        device_lock = self._shared_recorder_lock_for(device_key)
+        with device_lock:
+            if self._recorder_has_live_owner(
+                recorder,
+                excluding_config_id=excluding_config_id,
+            ):
+                return False
+
+            return self._stop_recorder_if_ownerless(recorder)
+
+    @staticmethod
+    def _stop_recorder_if_ownerless(recorder) -> bool:
         shutdown_won = recorder.stop_if_no_capture_owners()
         if not isinstance(shutdown_won, (bool, np.bool_)):
             raise TypeError(
@@ -6572,10 +6855,78 @@ class TestManager(QObject):
         except Exception:
             return False
 
-    def _discard_shared_recorder(self, recorder) -> None:
-        for key, shared_rec in list(self._shared_recorders.items()):
-            if shared_rec is recorder:
-                del self._shared_recorders[key]
+    @staticmethod
+    def _recorder_has_capture_owner(recorder) -> bool:
+        has_capture_owners = getattr(recorder, "has_capture_owners", None)
+        if not callable(has_capture_owners):
+            return False
+        try:
+            result = has_capture_owners()
+        except BaseException:
+            # Failure to prove ownerlessness must never authorize retirement.
+            return True
+        if not isinstance(result, (bool, np.bool_)):
+            return True
+        return bool(result)
+
+    def _discard_shared_recorder(
+        self,
+        recorder,
+        *,
+        only_if_unused: bool = False,
+        excluding_config_id: int | None = None,
+    ) -> bool:
+        with self._lifecycle_lock:
+            device_keys = {
+                key
+                for key, shared_recorder in self._shared_recorders.items()
+                if shared_recorder is recorder
+            }
+            known_device_key = self._shared_recorder_device_keys.get(recorder)
+            if known_device_key is not None:
+                device_keys.add(known_device_key)
+
+        safe_to_retire = True
+        removed = False
+        if not device_keys and only_if_unused:
+            if self._recorder_has_live_owner(
+                recorder,
+                excluding_config_id=excluding_config_id,
+            ):
+                return False
+            return not self._recorder_has_capture_owner(recorder)
+
+        for device_key in device_keys:
+            device_lock = self._shared_recorder_lock_for(device_key)
+            with device_lock:
+                if only_if_unused:
+                    if self._recorder_has_live_owner(
+                        recorder,
+                        excluding_config_id=excluding_config_id,
+                    ):
+                        safe_to_retire = False
+                        continue
+                    if self._recorder_has_capture_owner(recorder):
+                        safe_to_retire = False
+                        continue
+                    # A prior selection cannot release its pending claim while
+                    # this device lock is held, but a registered owner can be
+                    # published independently.  Recheck immediately before
+                    # the identity-guarded removal.
+                    if self._recorder_has_live_owner(
+                        recorder,
+                        excluding_config_id=excluding_config_id,
+                    ):
+                        safe_to_retire = False
+                        continue
+                with self._lifecycle_lock:
+                    if self._shared_recorders.get(device_key) is recorder:
+                        self._shared_recorders.pop(device_key, None)
+                        removed = True
+
+        if only_if_unused:
+            return safe_to_retire
+        return removed
 
     @staticmethod
     def _device_key(config: dict) -> str:
