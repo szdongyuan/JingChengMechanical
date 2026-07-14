@@ -117,6 +117,15 @@ class _StartupRecorderErrorLatch:
             self._phase = self._RUNTIME
             return True, None
 
+    def error_snapshot(self, source_token) -> str | None:
+        with self._lock:
+            if (
+                source_token is not self._source_token
+                or self._phase == self._INVALID
+            ):
+                return None
+            return self._latched_error
+
     def invalidate(self, source_token) -> None:
         with self._lock:
             if source_token is not self._source_token:
@@ -158,6 +167,27 @@ class _SessionErrorRoute:
         self.error_latch = None
 
 
+class _CurrentCollectionClaim:
+    """Collector detached from one exact session generation for safe cleanup."""
+
+    __slots__ = ("config_id", "session", "error_route", "generation", "collector")
+
+    def __init__(
+        self,
+        *,
+        config_id,
+        session,
+        error_route,
+        generation,
+        collector,
+    ):
+        self.config_id = config_id
+        self.session = session
+        self.error_route = error_route
+        self.generation = generation
+        self.collector = collector
+
+
 class _CaptureFinalizationState:
     __slots__ = ("owner_thread_id", "complete", "buffer", "error")
 
@@ -184,6 +214,7 @@ class TestManager(QObject):
     __test__ = False
     _MIN_MANUAL_REANALYSIS_DURATION_SEC = 0.1
 
+    _deferred_runtime_error_occurred = pyqtSignal(object, str)
     _deferred_monitor_error_occurred = pyqtSignal(object, str)
 
     def __init__(self, bus, services):
@@ -196,6 +227,7 @@ class TestManager(QObject):
         self._recorders: dict[int, AudioRecorder] = {}
         self._monitors: dict[int, AudioMonitor] = {}
         self._session_error_routes: dict[int, _SessionErrorRoute] = {}
+        self._session_generations: dict[int, _SessionErrorRoute] = {}
         self._shared_recorders: dict[str, AudioRecorder] = {}
         self._pending_factory_starts: dict[str, int] = {}
         self._canceled_factory_start_requests: set[str] = set()
@@ -204,6 +236,9 @@ class TestManager(QObject):
         self._accepted_factory_stops: set[int] = set()
         self._live_loudness_channel_by_config_id: dict[int, int] = {}
         self._current_collectors: dict[int, CurrentMeterCollector] = {}
+        self._current_collector_generations: dict[int, object] = {}
+        self._current_collection_generations: dict[int, object] = {}
+        self._current_sample_generations: dict[int, object] = {}
         self._current_samples_by_config_id: dict[int, list] = {}
         self._replay_player = OneShotReplayPlayer()
         self._replay_config_id: int | None = None
@@ -215,6 +250,10 @@ class TestManager(QObject):
         connect = getattr(display_channel_signal, "connect", None)
         if callable(connect):
             connect(self._on_factory_display_channel_changed)
+        self._deferred_runtime_error_occurred.connect(
+            self._on_error,
+            Qt.ConnectionType.QueuedConnection,
+        )
         self._deferred_monitor_error_occurred.connect(
             self._on_monitor_error,
             Qt.ConnectionType.QueuedConnection,
@@ -425,7 +464,7 @@ class TestManager(QObject):
                 )
                 startup_error_latch = _StartupRecorderErrorLatch(
                     source_token,
-                    lambda message, route=error_route: self._on_error(
+                    lambda message, route=error_route: self._deferred_runtime_error_occurred.emit(
                         route,
                         message,
                     ),
@@ -452,7 +491,10 @@ class TestManager(QObject):
 
                 session._error_lambda = recorder_error_conn
                 recorder.captured_block_ready.connect(captured_block_conn)
-                recorder.error_occurred.connect(recorder_error_conn)
+                recorder.error_occurred.connect(
+                    recorder_error_conn,
+                    Qt.ConnectionType.DirectConnection,
+                )
                 try:
                     requested_capture = recorder.request_capture(
                         record_duration=record_duration,
@@ -501,20 +543,38 @@ class TestManager(QObject):
                 break
 
             if monitor is not None:
-                session._monitor_error_lambda = (
-                    lambda msg, route=error_route: self._deferred_monitor_error_occurred.emit(
-                        route,
-                        str(msg),
-                    )
+                def monitor_error_conn(
+                    message,
+                    route=error_route,
+                    latch=startup_error_latch,
+                    token=source_token,
+                ):
+                    normalized_message = str(message)
+                    if self._is_nonfatal_monitor_diagnostic(normalized_message):
+                        self._deferred_monitor_error_occurred.emit(
+                            route,
+                            normalized_message,
+                        )
+                        return
+                    latch.handle(token, normalized_message)
+
+                session._monitor_error_lambda = monitor_error_conn
+                monitor.error_occurred.connect(
+                    monitor_error_conn,
+                    Qt.ConnectionType.DirectConnection,
                 )
-                monitor.error_occurred.connect(session._monitor_error_lambda)
 
             with self._lifecycle_lock:
+                # A same-config replacement begins with fresh lifecycle flags;
+                # cleanup from the displaced generation must not own them.
+                self._analyzing_sessions.discard(config_id)
+                self._accepted_factory_stops.discard(config_id)
                 self._sessions[config_id] = session
                 self._recorders[config_id] = recorder
                 if monitor is not None:
                     self._monitors[config_id] = monitor
                 self._session_error_routes[config_id] = error_route
+                self._session_generations[config_id] = error_route
 
             def checked_startup_state():
                 latch_live = startup_error_latch.checkpoint(source_token)
@@ -657,6 +717,13 @@ class TestManager(QObject):
                 return True
             if not recorder_running:
                 recorder.start()
+            runtime_error = startup_error_latch.error_snapshot(source_token)
+            if runtime_error is not None:
+                self._on_error(error_route, runtime_error)
+                restore_prior_completed_session()
+                self._clear_pending_factory_start(request_id)
+                self._clear_last_start_error()
+                return True
         except Exception as exc:
             self._bus.log.emit(f"[TestManager] ERROR starting config {config_id}: {exc}")
             stopped = self._stop_one(
@@ -908,6 +975,13 @@ class TestManager(QObject):
             rec = self._recorders.get(config_id)
             mon = self._monitors.get(config_id)
             error_route = self._session_error_routes.pop(config_id, None)
+            if self._session_generations.get(config_id) is error_route:
+                self._session_generations.pop(config_id, None)
+            current_collection_claim = self._detach_current_collection_locked(
+                config_id,
+                session=session,
+                error_route=error_route,
+            )
 
         self._invalidate_error_route(error_route)
 
@@ -917,12 +991,14 @@ class TestManager(QObject):
                 session,
                 rec=rec,
                 mon=mon,
+                current_collection_claim=current_collection_claim,
             )
         return self._stop_recording_with_optional_analysis(
             config_id,
             session,
             rec=rec,
             mon=mon,
+            current_collection_claim=current_collection_claim,
         )
 
     def _stop_one(
@@ -943,6 +1019,16 @@ class TestManager(QObject):
             rec = self._recorders.pop(config_id, None)
             mon = self._monitors.pop(config_id, None)
             error_route = self._session_error_routes.pop(config_id, None)
+            current_generation = self._session_generations.get(config_id)
+            if current_generation is error_route or current_generation is session:
+                self._session_generations.pop(config_id, None)
+            current_collection_claim = self._detach_current_collection_locked(
+                config_id,
+                session=session,
+                error_route=error_route,
+            )
+            self._analyzing_sessions.discard(config_id)
+            self._accepted_factory_stops.discard(config_id)
 
         self._invalidate_error_route(error_route)
         self._stop_replay_if_config(config_id)
@@ -970,7 +1056,7 @@ class TestManager(QObject):
                         if capture_error is None:
                             capture_error = exc
 
-        self._stop_current_collection(config_id)
+        self._stop_current_collection_claim(current_collection_claim)
         if session is not None:
             self._stop_session_live_display_safely(
                 config_id,
@@ -1014,9 +1100,6 @@ class TestManager(QObject):
                 context="stopping",
             )
 
-            self._analyzing_sessions.discard(config_id)
-            self._accepted_factory_stops.discard(config_id)
-
             if should_notify_factory_abort:
                 if factory_abort_error_message is None and cleanup_errors:
                     factory_abort_error_message = "; ".join(
@@ -1048,9 +1131,6 @@ class TestManager(QObject):
     ) -> None:
         with self._lifecycle_lock:
             current_session = self._sessions.get(config_id)
-            replacement_active = (
-                current_session is not None and current_session is not session
-            )
             if session is not None and current_session is session:
                 registered_session = self._sessions.pop(config_id, None)
                 registered_recorder = None
@@ -1065,17 +1145,32 @@ class TestManager(QObject):
                     or getattr(registered_error_route, "session", None) is session
                 ):
                     self._session_error_routes.pop(config_id, None)
+                current_generation = self._session_generations.get(config_id)
+                if (
+                    current_generation is registered_error_route
+                    or current_generation is error_route
+                    or current_generation is session
+                ):
+                    self._session_generations.pop(config_id, None)
             else:
                 registered_session = None
                 registered_recorder = None
                 registered_monitor = None
                 registered_error_route = None
+            current_collection_claim = self._detach_current_collection_locked(
+                config_id,
+                session=session,
+                error_route=(
+                    registered_error_route
+                    if registered_error_route is not None
+                    else error_route
+                ),
+            )
 
         self._invalidate_error_route(registered_error_route)
         if error_route is not registered_error_route:
             self._invalidate_error_route(error_route)
-        if not replacement_active:
-            self._stop_current_collection(config_id)
+        self._stop_current_collection_claim(current_collection_claim)
 
         cleanup_session = registered_session if registered_session is not None else session
         cleanup_recorder = (
@@ -1232,6 +1327,8 @@ class TestManager(QObject):
         config_id = error_route.config_id
         if self._session_error_routes.get(config_id) is not error_route:
             return False
+        if self._session_generations.get(config_id) is not error_route:
+            return False
         if self._sessions.get(config_id) is not error_route.session:
             return False
         if self._recorders.get(config_id) is not error_route.recorder:
@@ -1244,6 +1341,45 @@ class TestManager(QObject):
         return (
             getattr(error_route.session, "_manager_error_route", None)
             is error_route
+        )
+
+    def _run_resources_are_current_locked(
+        self,
+        config_id: int,
+        *,
+        session,
+        recorder,
+        monitor,
+        error_route,
+    ) -> bool:
+        if self._sessions.get(config_id) is not session:
+            return False
+        if recorder is None:
+            if config_id in self._recorders:
+                return False
+        elif self._recorders.get(config_id) is not recorder:
+            return False
+        if monitor is None:
+            if config_id in self._monitors:
+                return False
+        elif self._monitors.get(config_id) is not monitor:
+            return False
+        if error_route is None:
+            return (
+                config_id not in self._session_error_routes
+                and config_id not in self._session_generations
+            )
+        if self._session_generations.get(config_id) is not error_route:
+            return False
+        current_error_route = self._session_error_routes.get(config_id)
+        if current_error_route is not None and current_error_route is not error_route:
+            return False
+        return (
+            error_route.config_id == config_id
+            and error_route.session is session
+            and error_route.recorder is recorder
+            and error_route.monitor is monitor
+            and getattr(session, "_manager_error_route", None) is error_route
         )
 
     def _startup_error_route_state(self, error_route) -> str:
@@ -1454,6 +1590,7 @@ class TestManager(QObject):
 
     def _on_session_done(self, config_id: int):
         error_route = None
+        current_collection_claim = None
         with self._lifecycle_lock:
             session = self._sessions.get(config_id)
             if session is None or config_id in self._accepted_factory_stops:
@@ -1466,10 +1603,15 @@ class TestManager(QObject):
                 self._completion_claims.add(completion_key)
                 self._analyzing_sessions.add(config_id)
                 error_route = self._session_error_routes.get(config_id)
-                if getattr(error_route, "session", None) is session:
-                    self._session_error_routes.pop(config_id, None)
-                else:
+                if getattr(error_route, "session", None) is not session:
                     error_route = None
+                else:
+                    self._session_error_routes.pop(config_id, None)
+                current_collection_claim = self._detach_current_collection_locked(
+                    config_id,
+                    session=session,
+                    error_route=error_route,
+                )
 
         self._invalidate_error_route(error_route)
 
@@ -1509,7 +1651,7 @@ class TestManager(QObject):
                 session,
                 context="recording completion",
             )
-            self._stop_current_collection(config_id)
+            self._stop_current_collection_claim(current_collection_claim)
 
             with self._lifecycle_lock:
                 still_owned = (
@@ -1541,16 +1683,31 @@ class TestManager(QObject):
                 return
 
             with self._lifecycle_lock:
-                completed_session = self._sessions.pop(config_id, None)
-                if completed_session is not None:
-                    self._completed_sessions[config_id] = completed_session
-
-                self._recorders.pop(config_id, None)
-                mon = self._monitors.pop(config_id, None)
-                final_error_route = self._session_error_routes.pop(
+                if not self._run_resources_are_current_locked(
                     config_id,
-                    None,
-                )
+                    session=session,
+                    recorder=rec,
+                    monitor=mon,
+                    error_route=error_route,
+                ):
+                    final_commit_won = False
+                    final_error_route = None
+                else:
+                    self._sessions.pop(config_id, None)
+                    self._completed_sessions[config_id] = session
+                    if rec is not None:
+                        self._recorders.pop(config_id, None)
+                    if mon is not None:
+                        self._monitors.pop(config_id, None)
+                    final_error_route = self._session_error_routes.pop(
+                        config_id,
+                        None,
+                    )
+                    if self._session_generations.get(config_id) is error_route:
+                        self._session_generations.pop(config_id, None)
+                    final_commit_won = True
+            if not final_commit_won:
+                return
             self._invalidate_error_route(final_error_route)
             self._cleanup_monitor_recorder_safely(
                 config_id,
@@ -1565,7 +1722,9 @@ class TestManager(QObject):
                 )
         finally:
             with self._lifecycle_lock:
-                self._analyzing_sessions.discard(config_id)
+                current_session = self._sessions.get(config_id)
+                if current_session is None or current_session is session:
+                    self._analyzing_sessions.discard(config_id)
                 self._completion_claims.discard(completion_key)
 
     def _on_error(self, error_route, message: str) -> bool:
@@ -1971,6 +2130,7 @@ class TestManager(QObject):
         *,
         rec,
         mon,
+        current_collection_claim,
     ) -> bool:
         capture = self._capture_partial_stop_buffer(config_id, session, rec)
         if rec is not None:
@@ -1991,7 +2151,13 @@ class TestManager(QObject):
         )
 
         try:
-            self._stop_factory_runtime_io(config_id, rec=rec, mon=mon)
+            self._stop_factory_runtime_io(
+                config_id,
+                session=session,
+                rec=rec,
+                mon=mon,
+                current_collection_claim=current_collection_claim,
+            )
         except Exception as exc:
             return self._emit_factory_stop_abort(
                 config_id,
@@ -2027,6 +2193,7 @@ class TestManager(QObject):
         *,
         rec,
         mon,
+        current_collection_claim,
     ) -> bool:
         try:
             if rec is not None:
@@ -2050,7 +2217,13 @@ class TestManager(QObject):
         )
 
         try:
-            self._stop_factory_runtime_io(config_id, rec=rec, mon=mon)
+            self._stop_factory_runtime_io(
+                config_id,
+                session=session,
+                rec=rec,
+                mon=mon,
+                current_collection_claim=current_collection_claim,
+            )
         except Exception as exc:
             return self._emit_factory_stop_abort(
                 config_id,
@@ -2132,7 +2305,9 @@ class TestManager(QObject):
 
     def _run_stop_triggered_auto_analysis(self, config_id: int, session) -> bool:
         cleanup_settled_payload = self._make_cleanup_settled_payload(config_id, session)
-        self._analyzing_sessions.add(config_id)
+        with self._lifecycle_lock:
+            if self._sessions.get(config_id) is session:
+                self._analyzing_sessions.add(config_id)
         self._emit_factory_analyzing_entered(
             config_id,
             session,
@@ -2146,19 +2321,28 @@ class TestManager(QObject):
             ):
                 return True
 
-            completed_session = self._sessions.pop(config_id, None)
-            if completed_session is not None:
-                self._completed_sessions[config_id] = completed_session
+            with self._lifecycle_lock:
+                if self._sessions.get(config_id) is not session:
+                    final_commit_won = False
+                else:
+                    self._sessions.pop(config_id, None)
+                    self._completed_sessions[config_id] = session
+                    self._analyzing_sessions.discard(config_id)
+                    self._accepted_factory_stops.discard(config_id)
+                    final_commit_won = True
 
-            if cleanup_settled_payload is not None:
+            if final_commit_won and cleanup_settled_payload is not None:
                 self._emit_optional_signal(
                     "factory_runtime_auto_analysis_cleanup_settled",
                     cleanup_settled_payload,
                 )
             return True
         finally:
-            self._analyzing_sessions.discard(config_id)
-            self._accepted_factory_stops.discard(config_id)
+            with self._lifecycle_lock:
+                current_session = self._sessions.get(config_id)
+                if current_session is None or current_session is session:
+                    self._analyzing_sessions.discard(config_id)
+                    self._accepted_factory_stops.discard(config_id)
 
     def _run_stop_triggered_capture_failure(
         self,
@@ -2167,7 +2351,9 @@ class TestManager(QObject):
         error: Exception,
     ) -> bool:
         cleanup_settled_payload = self._make_cleanup_settled_payload(config_id, session)
-        self._analyzing_sessions.add(config_id)
+        with self._lifecycle_lock:
+            if self._sessions.get(config_id) is session:
+                self._analyzing_sessions.add(config_id)
         self._emit_factory_analyzing_entered(
             config_id,
             session,
@@ -2183,21 +2369,38 @@ class TestManager(QObject):
             ):
                 return True
 
-            completed_session = self._sessions.pop(config_id, None)
-            if completed_session is not None:
-                self._completed_sessions[config_id] = completed_session
+            with self._lifecycle_lock:
+                if self._sessions.get(config_id) is not session:
+                    final_commit_won = False
+                else:
+                    self._sessions.pop(config_id, None)
+                    self._completed_sessions[config_id] = session
+                    self._analyzing_sessions.discard(config_id)
+                    self._accepted_factory_stops.discard(config_id)
+                    final_commit_won = True
 
-            if cleanup_settled_payload is not None:
+            if final_commit_won and cleanup_settled_payload is not None:
                 self._emit_optional_signal(
                     "factory_runtime_auto_analysis_cleanup_settled",
                     cleanup_settled_payload,
                 )
             return True
         finally:
-            self._analyzing_sessions.discard(config_id)
-            self._accepted_factory_stops.discard(config_id)
+            with self._lifecycle_lock:
+                current_session = self._sessions.get(config_id)
+                if current_session is None or current_session is session:
+                    self._analyzing_sessions.discard(config_id)
+                    self._accepted_factory_stops.discard(config_id)
 
-    def _stop_factory_runtime_io(self, config_id: int, *, rec, mon) -> None:
+    def _stop_factory_runtime_io(
+        self,
+        config_id: int,
+        *,
+        session,
+        rec,
+        mon,
+        current_collection_claim,
+    ) -> None:
         cleanup_error = None
 
         try:
@@ -2214,23 +2417,42 @@ class TestManager(QObject):
             if cleanup_error is None:
                 cleanup_error = exc
         finally:
-            self._recorders.pop(config_id, None)
-            self._monitors.pop(config_id, None)
-            self._stop_current_collection(config_id)
+            with self._lifecycle_lock:
+                if self._sessions.get(config_id) is session:
+                    if self._recorders.get(config_id) is rec:
+                        self._recorders.pop(config_id, None)
+                    if self._monitors.get(config_id) is mon:
+                        self._monitors.pop(config_id, None)
+
+        try:
+            self._stop_current_collection_claim(current_collection_claim)
+        except Exception as exc:
+            if cleanup_error is None:
+                cleanup_error = exc
 
         if cleanup_error is not None:
             raise cleanup_error
 
     def _emit_factory_runtime_stopped(self, config_id: int, session) -> bool:
-        self._analyzing_sessions.discard(config_id)
-        self._accepted_factory_stops.discard(config_id)
-        completed_session = self._sessions.pop(config_id, None)
-        if (
-            completed_session is not None
-            and getattr(completed_session, "_audio_data_id", None)
-            and callable(getattr(completed_session, "apply_manual_label", None))
-        ):
-            self._completed_sessions[config_id] = completed_session
+        with self._lifecycle_lock:
+            if self._sessions.get(config_id) is not session:
+                transition_won = False
+                completed_session = None
+            else:
+                self._analyzing_sessions.discard(config_id)
+                self._accepted_factory_stops.discard(config_id)
+                completed_session = self._sessions.pop(config_id, None)
+                if (
+                    completed_session is not None
+                    and getattr(completed_session, "_audio_data_id", None)
+                    and callable(
+                        getattr(completed_session, "apply_manual_label", None)
+                    )
+                ):
+                    self._completed_sessions[config_id] = completed_session
+                transition_won = True
+        if not transition_won:
+            return True
         stopped_payload = self._make_factory_runtime_stopped_payload(config_id, session)
         if stopped_payload is not None:
             self._emit_optional_signal(
@@ -2242,11 +2464,18 @@ class TestManager(QObject):
         return True
 
     def _emit_factory_stop_abort(self, config_id: int, session, error: Exception, *, rec, mon) -> bool:
-        self._analyzing_sessions.discard(config_id)
-        self._accepted_factory_stops.discard(config_id)
-        self._sessions.pop(config_id, None)
-        self._recorders.pop(config_id, None)
-        self._monitors.pop(config_id, None)
+        with self._lifecycle_lock:
+            if self._sessions.get(config_id) is not session:
+                transition_won = False
+            else:
+                self._analyzing_sessions.discard(config_id)
+                self._accepted_factory_stops.discard(config_id)
+                self._sessions.pop(config_id, None)
+                if self._recorders.get(config_id) is rec:
+                    self._recorders.pop(config_id, None)
+                if self._monitors.get(config_id) is mon:
+                    self._monitors.pop(config_id, None)
+                transition_won = True
         recorder_is_shared = rec is not None and any(
             shared_recorder is rec
             for shared_recorder in self._shared_recorders.values()
@@ -2262,6 +2491,8 @@ class TestManager(QObject):
                     f"[TestManager] ERROR factory stop abort cleanup for "
                     f"config={config_id}: {cleanup_error}"
                 )
+        if not transition_won:
+            return False
         self._bus.log.emit(f"[TestManager] ERROR stopping config={config_id}: {error}")
         self._emit_optional_signal(
             "factory_runtime_aborted",
@@ -2542,15 +2773,33 @@ class TestManager(QObject):
         config = self._session_config(session)
         current_meter_config = config.get("current_meter")
         current_config = normalize_current_meter_config(current_meter_config)
-        self._current_samples_by_config_id.pop(config_id, None)
+        with self._lifecycle_lock:
+            current_session = self._sessions.get(config_id)
+            if current_session is not None and current_session is not session:
+                return
+            error_route = self._session_error_routes.get(config_id)
+            if getattr(error_route, "session", None) is session:
+                generation = error_route
+            else:
+                generation = session
+            self._current_collection_generations[config_id] = generation
+            self._current_samples_by_config_id.pop(config_id, None)
+            self._current_sample_generations.pop(config_id, None)
         if not current_config["enabled"]:
             return
         run_id = self._factory_run_id(session)
         sample_callback = None
         if isinstance(run_id, str) and run_id:
             sample_callback = (
-                lambda _sample, samples_snapshot, cid=config_id, rid=run_id, cfg=current_meter_config:
-                self._emit_current_trace_update(cid, rid, samples_snapshot, cfg)
+                lambda _sample, samples_snapshot, cid=config_id, rid=run_id,
+                cfg=current_meter_config, expected_generation=generation:
+                self._emit_current_trace_update(
+                    cid,
+                    rid,
+                    samples_snapshot,
+                    cfg,
+                    expected_generation=expected_generation,
+                )
             )
         collector = CurrentMeterCollector(
             current_config,
@@ -2560,21 +2809,80 @@ class TestManager(QObject):
             sample_callback=sample_callback,
         )
         if collector.start():
-            self._current_collectors[config_id] = collector
-            self._bus.log.emit(f"[CurrentMeter] started for config={config_id}")
+            with self._lifecycle_lock:
+                current_session = self._sessions.get(config_id)
+                generation_is_current = (
+                    self._current_collection_generations.get(config_id)
+                    is generation
+                )
+                session_is_current = (
+                    current_session is None or current_session is session
+                )
+                if generation_is_current and session_is_current:
+                    self._current_collectors[config_id] = collector
+                    self._current_collector_generations[config_id] = generation
+                    collector_registered = True
+                else:
+                    collector_registered = False
+            if collector_registered:
+                self._bus.log.emit(f"[CurrentMeter] started for config={config_id}")
+            else:
+                collector.stop()
 
-    def _stop_current_collection(self, config_id: int) -> None:
-        collector = self._current_collectors.pop(config_id, None)
+    def _detach_current_collection_locked(
+        self,
+        config_id: int,
+        *,
+        session,
+        error_route=None,
+    ) -> _CurrentCollectionClaim | None:
+        collector = self._current_collectors.get(config_id)
+        generation = self._current_collector_generations.get(config_id)
         if collector is None:
+            return None
+        if generation is not session and generation is not error_route:
+            return None
+        if self._current_collectors.get(config_id) is not collector:
+            return None
+        self._current_collectors.pop(config_id, None)
+        self._current_collector_generations.pop(config_id, None)
+        return _CurrentCollectionClaim(
+            config_id=config_id,
+            session=session,
+            error_route=error_route,
+            generation=generation,
+            collector=collector,
+        )
+
+    def _stop_current_collection_claim(
+        self,
+        claim: _CurrentCollectionClaim | None,
+    ) -> None:
+        if claim is None:
             return
         try:
-            collector.stop()
+            claim.collector.stop()
         finally:
-            samples = collector.samples()
-            if samples:
-                self._current_samples_by_config_id[config_id] = samples
+            samples = claim.collector.samples()
+            with self._lifecycle_lock:
+                if (
+                    self._current_collection_generations.get(claim.config_id)
+                    is claim.generation
+                ):
+                    if samples:
+                        self._current_samples_by_config_id[claim.config_id] = samples
+                        self._current_sample_generations[claim.config_id] = (
+                            claim.generation
+                        )
+                    elif (
+                        self._current_sample_generations.get(claim.config_id)
+                        is claim.generation
+                    ):
+                        self._current_samples_by_config_id.pop(claim.config_id, None)
+                        self._current_sample_generations.pop(claim.config_id, None)
             self._bus.log.emit(
-                f"[CurrentMeter] stopped for config={config_id}, samples={len(samples)}"
+                f"[CurrentMeter] stopped for config={claim.config_id}, "
+                f"samples={len(samples)}"
             )
 
     def _current_trace_payload(
@@ -2600,9 +2908,18 @@ class TestManager(QObject):
         run_id: str | None,
         samples,
         current_meter: dict | None,
+        *,
+        expected_generation=None,
     ) -> None:
         if not isinstance(run_id, str) or not run_id:
             return
+        if expected_generation is not None:
+            with self._lifecycle_lock:
+                if (
+                    self._current_collection_generations.get(config_id)
+                    is not expected_generation
+                ):
+                    return
         payload = build_current_trace_payload(samples, config=current_meter)
         if payload is None:
             return

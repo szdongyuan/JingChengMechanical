@@ -13,12 +13,15 @@ from app.service.analysis.test_manager import TestManager
 class _DummySignal:
     def __init__(self):
         self._callbacks = []
+        self._connection_types = {}
 
-    def connect(self, callback):
+    def connect(self, callback, connection_type=None):
         self._callbacks.append(callback)
+        self._connection_types[callback] = connection_type
 
     def disconnect(self, callback):
         self._callbacks.remove(callback)
+        self._connection_types.pop(callback, None)
 
     def emit(self, *args, **kwargs):
         for callback in list(self._callbacks):

@@ -5,6 +5,7 @@ from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
+from PyQt6.QtCore import QCoreApplication, QEventLoop
 
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.selected_channels import project_selected_channels
@@ -225,6 +226,55 @@ class TestLateAttachBufferSlice:
         assert rec.get_capture_buffer_calls == [(attachment, post_attach.shape[0])]
         assert rec.release_capture_calls == [attachment]
         session._run_judgment.assert_not_called()
+
+    def test_completion_final_commit_preserves_replacement_started_by_idle_callback(
+        self,
+        monkeypatch,
+    ):
+        bus, _, mgr, old_session, _old_recorder, _old_monitor, _ = (
+            _make_running_factory_manager(
+                monkeypatch,
+                partial_buf=np.arange(20, dtype=np.float32).reshape(20, 1),
+                sample_rate=100.0,
+            )
+        )
+        old_session._run_judgment = MagicMock(
+            return_value=JudgmentResult(
+                overall="合格",
+                limit_pass=True,
+                ai_pass=None,
+                ai_score=None,
+                analysis_window=(0.0, 0.1),
+            )
+        )
+        replacement = {}
+
+        def start_replacement_on_idle(message):
+            if message != "Idle" or replacement:
+                return
+            replacement["accepted"] = mgr.start({"config_id": 1, "sn": "SN2"})
+            replacement["session"] = mgr._sessions.get(1)
+            replacement["recorder"] = mgr._recorders.get(1)
+            replacement["monitor"] = mgr._monitors.get(1)
+            replacement["route"] = mgr._session_error_routes.get(1)
+
+        bus.status.emit.side_effect = start_replacement_on_idle
+
+        try:
+            mgr._on_session_done(1)
+
+            assert replacement["accepted"] is True
+            assert mgr._sessions.get(1) is replacement["session"]
+            assert mgr._recorders.get(1) is replacement["recorder"]
+            assert mgr._monitors.get(1) is replacement["monitor"]
+            assert mgr._session_error_routes.get(1) is replacement["route"]
+            assert mgr._session_generations.get(1) is replacement["route"]
+            assert mgr._completed_sessions.get(1) is not replacement["session"]
+            assert replacement["monitor"].stop_calls == 0
+            assert mgr.is_running(config_id=1) is True
+        finally:
+            if mgr.is_running(config_id=1):
+                mgr.stop(config_id=1, silent=True)
 
     def test_duplicate_completion_callers_share_one_capture_finalization(
         self,
@@ -995,6 +1045,10 @@ class TestLateAttachBufferSlice:
         bus.factory_runtime_aborted.emit.side_effect = capture_state_at_abort
 
         rec.error_occurred.emit("monitor disconnected")
+        app = QCoreApplication.instance()
+        if app is None:
+            app = QCoreApplication([])
+        app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents)
 
         abort_payload = state_at_abort["payload"]
         assert state_at_abort["running"] is False

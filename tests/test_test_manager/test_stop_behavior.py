@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from threading import Event, Thread
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -16,6 +17,167 @@ from ._support import (
 
 
 class TestTestManagerStartStop:
+    def test_stop_one_detaches_only_old_generation_current_state_before_cleanup(
+        self,
+        monkeypatch,
+    ):
+        bus, services, mgr, old_session, old_recorder, _old_monitor, _ = (
+            _make_running_factory_manager(monkeypatch)
+        )
+        old_route = mgr._session_error_routes[1]
+        old_session._config["current_meter"] = {"enabled": True}
+        collector_instances = []
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.stop_calls = 0
+                self._samples = [f"collector-{len(collector_instances)}"]
+                collector_instances.append(self)
+
+            def start(self):
+                return True
+
+            def stop(self):
+                self.stop_calls += 1
+
+            def samples(self):
+                return list(self._samples)
+
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.CurrentMeterCollector",
+            Collector,
+        )
+        mgr._start_current_collection(1, old_session)
+        old_collector = collector_instances[0]
+        mgr._current_samples_by_config_id[1] = ["old-sample"]
+
+        old_cleanup_claimed = Event()
+        allow_old_cleanup = Event()
+        original_freeze_capture = old_session.freeze_capture
+
+        def blocking_freeze_capture():
+            old_cleanup_claimed.set()
+            assert allow_old_cleanup.wait(1.0)
+            return original_freeze_capture()
+
+        old_session.freeze_capture = blocking_freeze_capture
+        stop_result = {}
+
+        def stop_old_generation():
+            try:
+                stop_result["value"] = mgr._stop_one(
+                    1,
+                    silent=True,
+                    expected_error_route=old_route,
+                )
+            except BaseException as exc:  # surfaced on the asserting thread
+                stop_result["error"] = exc
+
+        cleanup_thread = Thread(target=stop_old_generation)
+        cleanup_thread.start()
+        assert old_cleanup_claimed.wait(1.0)
+
+        replacement_config = dict(old_session._config)
+        replacement_session = type(old_session)(
+            config=replacement_config,
+            bus=bus,
+            ai_service=services.ai_service,
+            mic_cal={},
+            workorder={"factory_run_id": "replacement-run"},
+            audio_dir="",
+        )
+        replacement_recorder = object()
+        replacement_monitor = MagicMock()
+        replacement_route = type(old_route)(
+            config_id=1,
+            session=replacement_session,
+            recorder=replacement_recorder,
+            monitor=replacement_monitor,
+            source_token=object(),
+        )
+        replacement_session._manager_error_route = replacement_route
+        with mgr._lifecycle_lock:
+            mgr._sessions[1] = replacement_session
+            mgr._recorders[1] = replacement_recorder
+            mgr._monitors[1] = replacement_monitor
+            mgr._session_error_routes[1] = replacement_route
+            mgr._session_generations[1] = replacement_route
+
+        mgr._start_current_collection(1, replacement_session)
+        replacement_collector = collector_instances[1]
+        replacement_samples = ["replacement-sample"]
+        mgr._current_samples_by_config_id[1] = replacement_samples
+        mgr._analyzing_sessions.add(1)
+        mgr._accepted_factory_stops.add(1)
+
+        allow_old_cleanup.set()
+        cleanup_thread.join(2.0)
+
+        assert cleanup_thread.is_alive() is False
+        assert "error" not in stop_result
+        assert stop_result["value"] is True
+        assert old_collector.stop_calls == 1
+        assert replacement_collector.stop_calls == 0
+        assert mgr._current_collectors.get(1) is replacement_collector
+        assert mgr._current_samples_by_config_id.get(1) is replacement_samples
+        assert mgr._sessions.get(1) is replacement_session
+        assert mgr._recorders.get(1) is replacement_recorder
+        assert mgr._monitors.get(1) is replacement_monitor
+        assert mgr._session_error_routes.get(1) is replacement_route
+        assert mgr._session_generations.get(1) is replacement_route
+        assert 1 in mgr._analyzing_sessions
+        assert 1 in mgr._accepted_factory_stops
+
+    def test_stop_triggered_analysis_commit_preserves_idle_callback_replacement(
+        self,
+        monkeypatch,
+    ):
+        partial = np.arange(200, dtype=np.float32).reshape(200, 1)
+        bus, _, mgr, old_session, _old_recorder, _old_monitor, _ = (
+            _make_running_factory_manager(
+                monkeypatch,
+                allow_incomplete_recording_analysis=True,
+                analysis_duration=1.0,
+                partial_buf=partial,
+                sample_rate=100.0,
+            )
+        )
+        old_session._run_judgment = MagicMock(
+            return_value=JudgmentResult(
+                overall="合格",
+                limit_pass=True,
+                ai_pass=None,
+                ai_score=None,
+                analysis_window=(0.0, 1.0),
+            )
+        )
+        replacement = {}
+
+        def start_replacement_on_idle(message):
+            if message != "Idle" or replacement:
+                return
+            replacement["accepted"] = mgr.start({"config_id": 1, "sn": "SN2"})
+            replacement["session"] = mgr._sessions.get(1)
+            replacement["recorder"] = mgr._recorders.get(1)
+            replacement["monitor"] = mgr._monitors.get(1)
+            replacement["route"] = mgr._session_error_routes.get(1)
+
+        bus.status.emit.side_effect = start_replacement_on_idle
+
+        try:
+            assert mgr.stop_active_run(config_id=1) is True
+            assert replacement["accepted"] is True
+            assert mgr._sessions.get(1) is replacement["session"]
+            assert mgr._recorders.get(1) is replacement["recorder"]
+            assert mgr._monitors.get(1) is replacement["monitor"]
+            assert mgr._session_error_routes.get(1) is replacement["route"]
+            assert mgr._session_generations.get(1) is replacement["route"]
+            assert mgr._completed_sessions.get(1) is not replacement["session"]
+            assert mgr.is_running(config_id=1) is True
+        finally:
+            if mgr.is_running(config_id=1):
+                mgr.stop(config_id=1, silent=True)
+
     def test_stop_active_run_before_warmup_saves_and_analyzes_nothing(
         self,
         monkeypatch,

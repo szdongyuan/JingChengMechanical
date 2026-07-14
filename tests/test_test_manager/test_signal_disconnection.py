@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import time
-from threading import Event, RLock, Thread
+from threading import Event, RLock, Thread, get_ident
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
-from PyQt6.QtCore import QCoreApplication, QEventLoop
+from PyQt6.QtCore import (
+    QCoreApplication,
+    QEventLoop,
+    QObject,
+    QThread,
+    QTimer,
+    Qt,
+    pyqtSignal,
+)
 
 from app.service.analysis.session_capture import (
     CaptureNotAcceptedError,
@@ -36,12 +44,312 @@ def _process_qt_events_until(predicate, *, timeout: float = 1.0):
         app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 20)
         if predicate():
             return
-        time.sleep(0.01)
     app.processEvents(QEventLoop.ProcessEventsFlag.AllEvents, 20)
     assert predicate()
 
 
+class _WorkerSignalEmitter(QThread):
+    def __init__(self, signal, message: str):
+        super().__init__()
+        self._signal = signal
+        self._message = message
+        self.emission_returned = Event()
+        self.worker_thread_id = None
+
+    def run(self):
+        self.worker_thread_id = get_ident()
+        self._signal.emit(self._message)
+        self.emission_returned.set()
+
+
+class _QtRecorderDouble(QObject):
+    captured_block_ready = pyqtSignal(object)
+    error_occurred = pyqtSignal(str)
+    request_error = None
+    instances = []
+
+    def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+        super().__init__()
+        self._sample_rate = sample_rate
+        self._n_channels = n_channels
+        self._buffer = np.empty((0, n_channels), dtype=np.float32)
+        self._running = False
+        self.start_calls = 0
+        self.stop_thread_ids = []
+        self.capture_owners = []
+        self.emitter = None
+        type(self).instances.append(self)
+
+    def request_capture(self, *, record_duration):
+        owner = object()
+        self.capture_owners.append(owner)
+        if self.request_error is not None:
+            self.emitter = self.emit_error_from_worker(self.request_error)
+            assert self.emitter.emission_returned.wait(1.0)
+            assert self.emitter.wait(1000)
+        return owner
+
+    def emit_error_from_worker(self, message: str):
+        emitter = _WorkerSignalEmitter(self.error_occurred, message)
+        emitter.start()
+        return emitter
+
+    def get_capture_buffer(self, attachment, *, retained_frames):
+        return self._buffer[:retained_frames].copy()
+
+    def release_capture(self, attachment):
+        if attachment in self.capture_owners:
+            self.capture_owners.remove(attachment)
+
+    def stop_if_no_capture_owners(self):
+        if self.capture_owners:
+            return False
+        self.stop()
+        return True
+
+    def isRunning(self):
+        return self._running
+
+    def start(self):
+        self.start_calls += 1
+        self._running = True
+
+    def stop(self):
+        self.stop_thread_ids.append(get_ident())
+        self._running = False
+
+    def wait(self, _timeout):
+        return True
+
+
+class _QtMonitorDouble(QObject):
+    error_occurred = pyqtSignal(str)
+    start_error = None
+    instances = []
+
+    def __init__(
+        self,
+        *,
+        device_name,
+        hostapi,
+        sample_rate,
+        monitor_channel,
+        gain_db=0.0,
+    ):
+        super().__init__()
+        self.stop_thread_ids = []
+        self.start_calls = 0
+        self.emitter = None
+        type(self).instances.append(self)
+
+    def feed(self, _chunk):
+        return True
+
+    def start(self):
+        self.start_calls += 1
+        if self.start_error is not None:
+            self.emitter = self.emit_error_from_worker(self.start_error)
+            assert self.emitter.emission_returned.wait(1.0)
+            assert self.emitter.wait(1000)
+
+    def emit_error_from_worker(self, message: str):
+        emitter = _WorkerSignalEmitter(self.error_occurred, message)
+        emitter.start()
+        return emitter
+
+    def stop(self):
+        self.stop_thread_ids.append(get_ident())
+
+    def wait(self, _timeout):
+        return True
+
+
+class _ThreadTrackingSession(_FakeSession):
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.freeze_thread_ids = []
+        self.live_display_stop_thread_ids = []
+        type(self).instances.append(self)
+
+    def freeze_capture(self):
+        self.freeze_thread_ids.append(get_ident())
+        return super().freeze_capture()
+
+    def stop_live_display(self):
+        self.live_display_stop_thread_ids.append(get_ident())
+
+
+class _AbortSignal(QObject):
+    emitted = pyqtSignal(object)
+
+
+def _make_real_qt_error_manager(
+    monkeypatch,
+    *,
+    recorder_request_error=None,
+    monitor_start_error=None,
+):
+    app = QCoreApplication.instance()
+    if app is None:
+        app = QCoreApplication([])
+
+    class Recorder(_QtRecorderDouble):
+        request_error = recorder_request_error
+        instances = []
+
+    class Monitor(_QtMonitorDouble):
+        start_error = monitor_start_error
+        instances = []
+
+    class Session(_ThreadTrackingSession):
+        instances = []
+
+    bus = _mock_bus()
+    abort_signal = _AbortSignal()
+    bus.factory_runtime_aborted = abort_signal.emitted
+    services = _mock_services(bus)
+    config = _factory_runtime_config()
+    if monitor_start_error is None and recorder_request_error is not None:
+        config["output_device_name"] = None
+    services.config_service.load_config.return_value = config
+
+    monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", Recorder)
+    monkeypatch.setattr("app.service.analysis.test_manager.AudioMonitor", Monitor)
+    monkeypatch.setattr("app.service.analysis.test_manager.TestSession", Session)
+
+    manager = TestManager(bus, services)
+    return app, abort_signal, bus, manager, Recorder, Monitor, Session
+
+
+def _run_qt_until(signal, action):
+    loop = QEventLoop()
+    timer = QTimer()
+    timer.setSingleShot(True)
+    observed = []
+
+    def complete(*args):
+        observed.append(args)
+        loop.quit()
+
+    signal.connect(complete)
+    timer.timeout.connect(loop.quit)
+    timer.start(1000)
+    action()
+    if not observed:
+        loop.exec()
+    timer.stop()
+    signal.disconnect(complete)
+    assert observed
+    return observed
+
+
 class TestSignalDisconnection:
+    def test_real_qthread_recorder_error_before_request_returns_rejects_startup(
+        self,
+        monkeypatch,
+    ):
+        (
+            _app,
+            _abort_signal,
+            bus,
+            mgr,
+            recorder_type,
+            _monitor_type,
+            _session_type,
+        ) = _make_real_qt_error_manager(
+            monkeypatch,
+            recorder_request_error="request worker failed",
+        )
+
+        accepted = mgr.start({"config_id": 1, "sn": "SN1"})
+        recorder = recorder_type.instances[0]
+
+        try:
+            assert recorder.emitter.emission_returned.is_set()
+            assert recorder.emitter.worker_thread_id != get_ident()
+            assert accepted is False
+            assert recorder.start_calls == 0
+            assert mgr.is_running(config_id=1) is False
+            bus.test_started.emit.assert_not_called()
+        finally:
+            if mgr.is_running(config_id=1):
+                mgr.stop(config_id=1, silent=True)
+
+    def test_real_qthread_fatal_monitor_error_before_start_returns_rejects_startup(
+        self,
+        monkeypatch,
+    ):
+        (
+            _app,
+            _abort_signal,
+            bus,
+            mgr,
+            recorder_type,
+            monitor_type,
+            _session_type,
+        ) = _make_real_qt_error_manager(
+            monkeypatch,
+            monitor_start_error="monitor worker failed",
+        )
+
+        accepted = mgr.start({"config_id": 1, "sn": "SN1"})
+        recorder = recorder_type.instances[0]
+        monitor = monitor_type.instances[0]
+
+        try:
+            assert monitor.emitter.emission_returned.is_set()
+            assert monitor.emitter.worker_thread_id != get_ident()
+            assert accepted is False
+            assert recorder.start_calls == 0
+            assert mgr.is_running(config_id=1) is False
+            bus.test_started.emit.assert_not_called()
+        finally:
+            if mgr.is_running(config_id=1):
+                mgr.stop(config_id=1, silent=True)
+
+    @pytest.mark.parametrize("error_source", ["recorder", "monitor"])
+    def test_real_qthread_runtime_error_aborts_with_cleanup_on_manager_thread(
+        self,
+        monkeypatch,
+        error_source,
+    ):
+        (
+            _app,
+            abort_signal,
+            _bus,
+            mgr,
+            recorder_type,
+            monitor_type,
+            session_type,
+        ) = _make_real_qt_error_manager(monkeypatch)
+        manager_thread_id = get_ident()
+
+        assert mgr.start({"config_id": 1, "sn": "SN1"}) is True
+        recorder = recorder_type.instances[0]
+        monitor = monitor_type.instances[0]
+        session = session_type.instances[0]
+        source = recorder if error_source == "recorder" else monitor
+        emitted = {}
+
+        def emit_from_worker():
+            emitted["thread"] = source.emit_error_from_worker(
+                f"{error_source} runtime failure"
+            )
+
+        _run_qt_until(abort_signal.emitted, emit_from_worker)
+        emitter = emitted["thread"]
+        assert emitter.emission_returned.wait(1.0)
+        assert emitter.wait(1000)
+
+        assert emitter.worker_thread_id != manager_thread_id
+        assert mgr.is_running(config_id=1) is False
+        assert session.freeze_thread_ids == [manager_thread_id]
+        assert session.live_display_stop_thread_ids == [manager_thread_id]
+        assert recorder.stop_thread_ids == [manager_thread_id]
+        assert monitor.stop_thread_ids == [manager_thread_id]
+
     def test_delayed_recorder_error_from_stopped_same_config_run_cannot_abort_replacement(
         self,
         monkeypatch,
@@ -87,6 +395,7 @@ class TestSignalDisconnection:
         bus.factory_runtime_aborted.emit.reset_mock()
 
         recorder.error_occurred.emit("current recorder failed")
+        _process_qt_events_until(lambda: not mgr.is_running(config_id=1))
 
         assert mgr.is_running(config_id=1) is False
         bus.factory_runtime_aborted.emit.assert_called_once()
@@ -658,8 +967,16 @@ class TestSignalDisconnection:
         assert recorder.chunk_ready._callbacks == []
         assert recorder.recording_done._callbacks == []
         assert error_lambda in recorder.error_occurred._callbacks
+        assert (
+            recorder.error_occurred._connection_types[error_lambda]
+            == Qt.ConnectionType.DirectConnection
+        )
         assert session._monitor_feed == monitor.feed
         assert monitor_error_lambda in monitor.error_occurred._callbacks
+        assert (
+            monitor.error_occurred._connection_types[monitor_error_lambda]
+            == Qt.ConnectionType.DirectConnection
+        )
 
         mgr.stop(config_id=1)
 

@@ -33,7 +33,7 @@ class _SignalStub:
     def __init__(self):
         self._callbacks = []
 
-    def connect(self, callback):
+    def connect(self, callback, connection_type=None):
         self._callbacks.append(callback)
 
     def emit(self, *args, **kwargs):
