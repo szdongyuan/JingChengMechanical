@@ -358,6 +358,7 @@ class TestLateAttachBufferSlice:
         )
         rec = MagicMock()
         rec._sample_rate = 100.0
+        rec.stop_if_no_capture_owners.return_value = True
         mon = MagicMock()
         expected_error = "selected channel 3 is outside hardware channel range 0..1"
 
@@ -436,7 +437,8 @@ class TestLateAttachBufferSlice:
         assert mgr._completed_sessions[1] is session
         mon.stop.assert_called_once_with()
         mon.wait.assert_called_once_with(1000)
-        rec.stop.assert_called_once_with()
+        rec.stop_if_no_capture_owners.assert_called_once_with()
+        rec.stop.assert_not_called()
         rec.wait.assert_called_once_with(3000)
 
     def test_on_session_done_projection_failure_attempts_all_cleanup_when_cleanup_raises(self):
@@ -448,7 +450,9 @@ class TestLateAttachBufferSlice:
         )
         rec = MagicMock()
         rec._sample_rate = 100.0
-        rec.stop.side_effect = RuntimeError("recorder stop exploded")
+        rec.stop_if_no_capture_owners.side_effect = RuntimeError(
+            "recorder stop exploded"
+        )
         rec.wait.side_effect = RuntimeError("recorder wait exploded")
         mon = MagicMock()
         mon.stop.side_effect = RuntimeError("monitor stop exploded")
@@ -523,14 +527,15 @@ class TestLateAttachBufferSlice:
         assert mgr._completed_sessions[1] is session
         mon.stop.assert_called_once_with()
         mon.wait.assert_called_once_with(1000)
-        rec.stop.assert_called_once_with()
-        rec.wait.assert_called_once_with(3000)
+        rec.stop_if_no_capture_owners.assert_called_once_with()
+        rec.stop.assert_not_called()
+        rec.wait.assert_not_called()
         log_lines = [call.args[0] for call in bus.log.emit.call_args_list]
         assert any(expected_error in line for line in log_lines)
         assert any("monitor stop exploded" in line for line in log_lines)
         assert any("monitor wait exploded" in line for line in log_lines)
         assert any("recorder stop exploded" in line for line in log_lines)
-        assert any("recorder wait exploded" in line for line in log_lines)
+        assert not any("recorder wait exploded" in line for line in log_lines)
 
     def test_on_session_done_emits_factory_run_id_on_runtime_payloads(self):
         bus = _mock_bus()

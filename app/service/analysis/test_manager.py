@@ -1954,8 +1954,21 @@ class TestManager(QObject):
         self._sessions.pop(config_id, None)
         self._recorders.pop(config_id, None)
         self._monitors.pop(config_id, None)
-        if rec is not None and not self._recorder_has_live_owner(rec):
-            self._discard_shared_recorder(rec)
+        recorder_is_shared = rec is not None and any(
+            shared_recorder is rec
+            for shared_recorder in self._shared_recorders.values()
+        )
+        if recorder_is_shared:
+            cleanup_errors = self._cleanup_monitor_recorder_safely(
+                config_id,
+                rec=rec,
+                context="factory stop abort",
+            )
+            for cleanup_error in cleanup_errors:
+                self._bus.log.emit(
+                    f"[TestManager] ERROR factory stop abort cleanup for "
+                    f"config={config_id}: {cleanup_error}"
+                )
         self._bus.log.emit(f"[TestManager] ERROR stopping config={config_id}: {error}")
         self._emit_optional_signal(
             "factory_runtime_aborted",
@@ -2975,17 +2988,22 @@ class TestManager(QObject):
                 callback=lambda: self._wait_thread_if_not_current(mon, 1000),
             )
 
-        if rec is not None and not self._recorder_has_live_owner(
-            rec,
-            excluding_config_id=excluding_config_id,
-        ):
+        shutdown_results = []
+        if rec is not None:
             self._call_cleanup_safely(
                 errors,
                 config_id=config_id,
                 context=context,
                 action="recorder stop",
-                callback=rec.stop,
+                callback=lambda: shutdown_results.append(
+                    self._claim_unused_recorder_shutdown(
+                        rec,
+                        excluding_config_id=excluding_config_id,
+                    )
+                ),
             )
+
+        if shutdown_results == [True]:
             self._call_cleanup_safely(
                 errors,
                 config_id=config_id,
@@ -3022,27 +3040,37 @@ class TestManager(QObject):
         excluding_config_id: int | None = None,
     ) -> bool:
         with self._lifecycle_lock:
-            manager_has_owner = any(
+            return any(
                 cid != excluding_config_id and active_recorder is recorder
                 for cid, active_recorder in self._recorders.items()
             )
-        if manager_has_owner:
-            return True
 
-        has_capture_owners = getattr(recorder, "has_capture_owners", None)
-        if not callable(has_capture_owners):
-            return False
-        recorder_has_owner = has_capture_owners()
-        if isinstance(recorder_has_owner, (bool, np.bool_)):
-            return bool(recorder_has_owner)
-        return False
+    def _claim_unused_recorder_shutdown(
+        self,
+        recorder,
+        *,
+        excluding_config_id: int | None = None,
+    ) -> bool:
+        """Linearize unowned shutdown without nesting manager/recorder locks."""
 
-    def _stop_recorder_if_unused(self, recorder, *, excluding_config_id: int | None = None):
-        if not self._recorder_has_live_owner(
+        if self._recorder_has_live_owner(
             recorder,
             excluding_config_id=excluding_config_id,
         ):
-            recorder.stop()
+            return False
+
+        shutdown_won = recorder.stop_if_no_capture_owners()
+        if not isinstance(shutdown_won, (bool, np.bool_)):
+            raise TypeError(
+                "recorder stop_if_no_capture_owners() must return bool"
+            )
+        return bool(shutdown_won)
+
+    def _stop_recorder_if_unused(self, recorder, *, excluding_config_id: int | None = None):
+        if self._claim_unused_recorder_shutdown(
+            recorder,
+            excluding_config_id=excluding_config_id,
+        ):
             self._wait_thread_if_not_current(recorder, 3000)
             self._discard_shared_recorder(recorder)
 

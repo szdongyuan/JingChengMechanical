@@ -294,11 +294,15 @@ class TestSignalDisconnection:
                 self.capture_owners = []
                 self._running = True
                 self.stop_calls = 0
+                self.stop_if_no_owner_calls = 0
                 self.start_calls = 0
+                self._accepting_captures = True
 
             def request_capture(self, *, record_duration):
                 owner = object()
                 with self._owner_lock:
+                    if not self._accepting_captures:
+                        raise CaptureNotAcceptedError("recorder stopped")
                     self.capture_owners.append(owner)
                 return owner
 
@@ -310,6 +314,16 @@ class TestSignalDisconnection:
             def has_capture_owners(self):
                 with self._owner_lock:
                     return bool(self.capture_owners)
+
+            def stop_if_no_capture_owners(self):
+                with self._owner_lock:
+                    self.stop_if_no_owner_calls += 1
+                    if self.capture_owners:
+                        return False
+                    self._accepting_captures = False
+                    self._running = False
+                    self.stop_calls += 1
+                    return True
 
             def get_capture_buffer(self, owner, *, retained_frames):
                 return np.empty((0, self._n_channels), dtype=np.float32)
@@ -366,6 +380,7 @@ class TestSignalDisconnection:
         mgr._stop_one(1, silent=True)
 
         assert recorder.stop_calls == 0
+        assert recorder.stop_if_no_owner_calls == 1
         assert recorder.has_capture_owners() is True
 
         allow_attach.set()
@@ -831,11 +846,12 @@ class TestSignalDisconnection:
 
         class CurrentThreadRecorder:
             def __init__(self):
-                self.stop_calls = 0
+                self.stop_if_no_owner_calls = 0
                 self.wait_calls = []
 
-            def stop(self):
-                self.stop_calls += 1
+            def stop_if_no_capture_owners(self):
+                self.stop_if_no_owner_calls += 1
+                return True
 
             def wait(self, timeout):
                 self.wait_calls.append(timeout)
@@ -852,5 +868,37 @@ class TestSignalDisconnection:
             context="recorder error",
         )
 
-        assert recorder.stop_calls == 1
+        assert recorder.stop_if_no_owner_calls == 1
         assert recorder.wait_calls == []
+
+    def test_recorder_cleanup_keeps_shared_mapping_when_atomic_shutdown_loses(self):
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        mgr = TestManager(bus, services)
+
+        class OwnedRecorder:
+            def __init__(self):
+                self.stop_if_no_owner_calls = 0
+                self.wait_calls = []
+
+            def stop_if_no_capture_owners(self):
+                self.stop_if_no_owner_calls += 1
+                return False
+
+            def wait(self, timeout):
+                self.wait_calls.append(timeout)
+                return True
+
+        recorder = OwnedRecorder()
+        mgr._shared_recorders["device"] = recorder
+
+        errors = mgr._cleanup_monitor_recorder_safely(
+            1,
+            rec=recorder,
+            context="pending owner",
+        )
+
+        assert errors == []
+        assert recorder.stop_if_no_owner_calls == 1
+        assert recorder.wait_calls == []
+        assert mgr._shared_recorders == {"device": recorder}

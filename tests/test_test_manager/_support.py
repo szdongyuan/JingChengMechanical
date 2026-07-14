@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from threading import RLock
 from unittest.mock import MagicMock
 
 import numpy as np
 
 from app.service.analysis.selected_channels import project_selected_channels
+from app.service.analysis.session_capture import CaptureNotAcceptedError
 from app.service.analysis.test_manager import TestManager
 
 
@@ -34,10 +36,15 @@ class _CaptureRecorderDoubleMixin:
         raise AttributeError(name)
 
     def request_capture(self, *, record_duration):
-        owner = object()
-        self.__dict__.setdefault("request_capture_calls", []).append(record_duration)
-        self.__dict__.setdefault("capture_owners", []).append(owner)
-        return owner
+        with self._capture_owner_lock():
+            if not self.__dict__.setdefault("_accepting_captures", True):
+                raise CaptureNotAcceptedError("recorder stopped")
+            owner = object()
+            self.__dict__.setdefault("request_capture_calls", []).append(
+                record_duration
+            )
+            self.__dict__.setdefault("capture_owners", []).append(owner)
+            return owner
 
     def get_capture_buffer(self, attachment, *, retained_frames):
         self.__dict__.setdefault("get_capture_buffer_calls", []).append(
@@ -50,13 +57,26 @@ class _CaptureRecorderDoubleMixin:
         return buffer[:retained_frames].copy()
 
     def release_capture(self, attachment):
-        self.__dict__.setdefault("release_capture_calls", []).append(attachment)
-        owners = self.__dict__.setdefault("capture_owners", [])
-        if attachment in owners:
-            owners.remove(attachment)
+        with self._capture_owner_lock():
+            self.__dict__.setdefault("release_capture_calls", []).append(attachment)
+            owners = self.__dict__.setdefault("capture_owners", [])
+            if attachment in owners:
+                owners.remove(attachment)
 
     def has_capture_owners(self):
-        return bool(self.__dict__.setdefault("capture_owners", []))
+        with self._capture_owner_lock():
+            return bool(self.__dict__.setdefault("capture_owners", []))
+
+    def stop_if_no_capture_owners(self):
+        with self._capture_owner_lock():
+            if self.__dict__.setdefault("capture_owners", []):
+                return False
+            self.__dict__["_accepting_captures"] = False
+            self.stop()
+            return True
+
+    def _capture_owner_lock(self):
+        return self.__dict__.setdefault("_capture_owners_lock", RLock())
 
 
 class _FakeSession:
@@ -204,6 +224,8 @@ def _make_running_factory_manager(
             self.get_capture_buffer_calls = []
             self.release_capture_calls = []
             self.capture_owners = []
+            self._capture_owners_lock = RLock()
+            self._accepting_captures = True
             FakeRecorder.instances.append(self)
 
         def isRunning(self):
@@ -221,22 +243,35 @@ def _make_running_factory_manager(
             return True
 
         def request_capture(self, *, record_duration):
-            self.request_capture_calls.append(record_duration)
-            owner = object()
-            self.capture_owners.append(owner)
-            return owner
+            with self._capture_owners_lock:
+                if not self._accepting_captures:
+                    raise CaptureNotAcceptedError("recorder stopped")
+                self.request_capture_calls.append(record_duration)
+                owner = object()
+                self.capture_owners.append(owner)
+                return owner
 
         def get_capture_buffer(self, attachment, *, retained_frames):
             self.get_capture_buffer_calls.append((attachment, retained_frames))
             return self._buffer[:retained_frames].copy()
 
         def release_capture(self, attachment):
-            self.release_capture_calls.append(attachment)
-            if attachment in self.capture_owners:
-                self.capture_owners.remove(attachment)
+            with self._capture_owners_lock:
+                self.release_capture_calls.append(attachment)
+                if attachment in self.capture_owners:
+                    self.capture_owners.remove(attachment)
 
         def has_capture_owners(self):
-            return bool(self.capture_owners)
+            with self._capture_owners_lock:
+                return bool(self.capture_owners)
+
+        def stop_if_no_capture_owners(self):
+            with self._capture_owners_lock:
+                if self.capture_owners:
+                    return False
+                self._accepting_captures = False
+                self.stop()
+                return True
 
     class FakeMonitor:
         instances = []

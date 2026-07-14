@@ -18,6 +18,7 @@ class TestSharedRecorderTeardown:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         shared_rec = MagicMock()
+        shared_rec.stop_if_no_capture_owners.return_value = True
         mock_s1 = MagicMock()
         mock_s1._buffer = None
         mock_s2 = MagicMock()
@@ -26,9 +27,11 @@ class TestSharedRecorderTeardown:
         mgr._recorders = {1: shared_rec, 2: shared_rec}
         mgr._shared_recorders = {"dev|MME|44100": shared_rec}
         mgr._stop_one(1)
+        shared_rec.stop_if_no_capture_owners.assert_not_called()
         shared_rec.stop.assert_not_called()
         mgr._stop_one(2)
-        shared_rec.stop.assert_called_once()
+        shared_rec.stop_if_no_capture_owners.assert_called_once_with()
+        shared_rec.stop.assert_not_called()
 
     def test_failed_factory_stop_does_not_reuse_stale_shared_recorder_on_next_start(
         self,

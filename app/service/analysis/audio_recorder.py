@@ -183,7 +183,20 @@ class AudioRecorder(QThread):
         """Return whether any pending or resolved capture still owns capacity."""
 
         with self._state_lock:
-            return bool(self._pending_capture_owners or self._active_capture_owners)
+            return self._has_capture_owners_locked()
+
+    def stop_if_no_capture_owners(self) -> bool:
+        """Atomically stop only when no exact capture still owns the recorder."""
+
+        with self._state_lock:
+            if self._has_capture_owners_locked():
+                return False
+            self._accepting_captures = False
+            self._stop_flag = True
+            return True
+
+    def _has_capture_owners_locked(self) -> bool:
+        return bool(self._pending_capture_owners or self._active_capture_owners)
 
     def get_capture_buffer(
         self,

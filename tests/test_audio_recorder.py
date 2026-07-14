@@ -928,6 +928,109 @@ class TestCaptureCapacityOwnership:
 
 
 class TestCaptureTerminalRaces:
+    def test_request_wins_atomic_unused_shutdown_and_owner_remains_serviceable(self):
+        request_entered = threading.Event()
+        allow_request = threading.Event()
+        clock_values = iter([10.0, 10.1])
+
+        def clock():
+            value = next(clock_values)
+            if value == 10.0:
+                request_entered.set()
+                assert allow_request.wait(timeout=2)
+            return value
+
+        rec = _recorder(
+            sample_rate=100.0,
+            record_duration=0.1,
+            monotonic_func=clock,
+        )
+        handles = []
+        shutdown_results = []
+        requester = threading.Thread(
+            target=lambda: handles.append(
+                rec.request_capture(record_duration=0.1)
+            )
+        )
+        requester.start()
+        assert request_entered.wait(timeout=2)
+        shutdown = threading.Thread(
+            target=lambda: shutdown_results.append(
+                rec.stop_if_no_capture_owners()
+            )
+        )
+        shutdown.start()
+
+        allow_request.set()
+        requester.join(timeout=2)
+        shutdown.join(timeout=2)
+
+        assert not requester.is_alive()
+        assert not shutdown.is_alive()
+        assert shutdown_results == [False]
+        assert rec._stop_flag is False
+        assert rec._accepting_captures is True
+        assert len(handles) == 1
+
+        rec._sd_callback(
+            np.zeros((10, 1), dtype=np.float32),
+            10,
+            _portaudio_time(0.0, 0.1),
+            None,
+        )
+
+        assert handles[0].resolution is not None
+
+    def test_atomic_unused_shutdown_wins_and_later_request_is_rejected(
+        self,
+        monkeypatch,
+    ):
+        shutdown_entered = threading.Event()
+        allow_shutdown = threading.Event()
+        rec = _recorder(monotonic_func=lambda: 10.0)
+
+        def blocked_owner_check():
+            shutdown_entered.set()
+            assert allow_shutdown.wait(timeout=2)
+            return False
+
+        monkeypatch.setattr(
+            rec,
+            "_has_capture_owners_locked",
+            blocked_owner_check,
+            raising=False,
+        )
+        shutdown_results = []
+        request_errors = []
+        shutdown = threading.Thread(
+            target=lambda: shutdown_results.append(
+                rec.stop_if_no_capture_owners()
+            )
+        )
+        shutdown.start()
+        assert shutdown_entered.wait(timeout=2)
+
+        def request_after_shutdown():
+            try:
+                rec.request_capture(record_duration=0.1)
+            except CaptureNotAcceptedError as exc:
+                request_errors.append(exc)
+
+        requester = threading.Thread(target=request_after_shutdown)
+        requester.start()
+        allow_shutdown.set()
+        shutdown.join(timeout=2)
+        requester.join(timeout=2)
+
+        assert not shutdown.is_alive()
+        assert not requester.is_alive()
+        assert shutdown_results == [True]
+        assert len(request_errors) == 1
+        assert rec._stop_flag is True
+        assert rec._accepting_captures is False
+        assert not rec._pending_capture_owners
+        assert not rec._active_capture_owners
+
     def test_request_registration_wins_shared_lock_and_prevents_completion(self):
         clock_entered = threading.Event()
         allow_clock = threading.Event()
