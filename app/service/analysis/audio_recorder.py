@@ -386,6 +386,10 @@ class AudioRecorder(QThread):
 
         for owner_key, owner in list(self._pending_capture_owners.items()):
             if block.monotonic_start is None or block.monotonic_end is None:
+                # This callback may have begun before the owner was registered.
+                # Without an ADC span, only a later callback is a safe boundary.
+                if owner.request_monotonic >= callback_monotonic:
+                    continue
                 attach_sample = block.sample_end
                 attach_monotonic = max(
                     owner.request_monotonic,

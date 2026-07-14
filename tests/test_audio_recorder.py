@@ -510,6 +510,64 @@ class TestCaptureAttachments:
         ]
         assert len(degradation_logs) == 1
 
+    @pytest.mark.parametrize(
+        "request_monotonic",
+        [100.0, 100.01],
+        ids=["equal-to-callback", "after-callback"],
+    )
+    def test_unusable_time_keeps_request_at_or_after_callback_entry_pending(
+        self, monkeypatch, request_monotonic
+    ):
+        callback_timing_captured = threading.Event()
+        allow_callback_state_lock = threading.Event()
+        clock_values = iter([100.0, request_monotonic, 100.02])
+        rec = _recorder(
+            sample_rate=1000.0,
+            monotonic_func=lambda: next(clock_values),
+        )
+        mapping_calls = 0
+
+        def pause_first_unusable_mapping(**_kwargs):
+            nonlocal mapping_calls
+            mapping_calls += 1
+            if mapping_calls == 1:
+                callback_timing_captured.set()
+                if not allow_callback_state_lock.wait(timeout=2):
+                    raise RuntimeError("test did not release the callback")
+            return None
+
+        monkeypatch.setattr(rec, "_map_callback_time", pause_first_unusable_mapping)
+        callback = threading.Thread(
+            target=lambda: rec._sd_callback(
+                np.arange(20, dtype=np.float32).reshape(-1, 1),
+                20,
+                None,
+                None,
+            )
+        )
+
+        callback.start()
+        assert callback_timing_captured.wait(timeout=2)
+        handle = rec.request_capture(record_duration=0.01)
+        assert handle.request_monotonic >= 100.0
+        allow_callback_state_lock.set()
+        callback.join(timeout=2)
+
+        assert not callback.is_alive()
+        assert handle.resolution is None
+        assert list(rec._pending_capture_owners.values()) == [handle]
+
+        rec._sd_callback(
+            np.arange(20, 40, dtype=np.float32).reshape(-1, 1),
+            20,
+            None,
+            None,
+        )
+
+        assert handle.resolution is not None
+        assert handle.resolution.attach_sample == 40
+        assert handle.resolution.attach_monotonic == pytest.approx(100.02)
+
     def test_callback_waiting_for_request_lock_resolves_handle_once_from_same_block(
         self
     ):
