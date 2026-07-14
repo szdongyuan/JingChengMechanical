@@ -11,10 +11,14 @@ from app.service.analysis.session_capture import (
     SESSION_WARMUP_SECONDS,
     CapturedAudioBlock,
     RecorderAttachment,
+    RetainedAudioBlock,
     ResolvedCaptureBounds,
     SessionCaptureWindow,
     frames_for_duration,
 )
+
+
+INVALID_SAMPLE_INDICES = [0.5, True, np.bool_(True)]
 
 
 @pytest.mark.parametrize(
@@ -90,6 +94,31 @@ def test_captured_audio_block_rejects_invalid_spans(
         )
 
 
+@pytest.mark.parametrize("invalid_value", INVALID_SAMPLE_INDICES)
+@pytest.mark.parametrize("field", ["sample_start", "sample_end"])
+def test_captured_audio_block_rejects_fractional_and_boolean_sample_indices(
+    field: str,
+    invalid_value: object,
+):
+    bool_like = isinstance(invalid_value, (bool, np.bool_))
+    kwargs = {
+        "sample_start": invalid_value if field == "sample_start" else 0,
+        "sample_end": (
+            (2 if bool_like else 1.5)
+            if field == "sample_start"
+            else invalid_value
+        ),
+    }
+
+    with pytest.raises(TypeError, match=field):
+        CapturedAudioBlock(
+            data=np.zeros((1, 1), dtype=np.float32),
+            monotonic_start=None,
+            monotonic_end=None,
+            **kwargs,
+        )
+
+
 def test_resolved_capture_bounds_exposes_exact_retained_range():
     bounds = ResolvedCaptureBounds(
         attach_sample=100,
@@ -100,6 +129,121 @@ def test_resolved_capture_bounds_exposes_exact_retained_range():
 
     assert bounds.retained_start == 105
     assert bounds.retained_end == 125
+
+
+@pytest.mark.parametrize("invalid_value", INVALID_SAMPLE_INDICES)
+@pytest.mark.parametrize(
+    "field", ["attach_sample", "warmup_samples", "target_samples"]
+)
+def test_resolved_bounds_rejects_fractional_and_boolean_frame_fields(
+    field: str,
+    invalid_value: object,
+):
+    kwargs = {
+        "attach_sample": 100,
+        "attach_monotonic": 10.0,
+        "warmup_samples": 5,
+        "target_samples": 20,
+    }
+    kwargs[field] = invalid_value
+
+    with pytest.raises(TypeError, match=field):
+        ResolvedCaptureBounds(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "field", ["attach_sample", "warmup_samples", "target_samples"]
+)
+def test_resolved_bounds_rejects_negative_frame_fields(field: str):
+    kwargs = {
+        "attach_sample": 100,
+        "attach_monotonic": 10.0,
+        "warmup_samples": 5,
+        "target_samples": 20,
+    }
+    kwargs[field] = -1
+
+    with pytest.raises(ValueError, match=field):
+        ResolvedCaptureBounds(**kwargs)
+
+
+@pytest.mark.parametrize("invalid_value", INVALID_SAMPLE_INDICES)
+@pytest.mark.parametrize("field", ["warmup_samples", "target_samples"])
+def test_recorder_attachment_rejects_fractional_and_boolean_frame_fields(
+    field: str,
+    invalid_value: object,
+):
+    kwargs = {
+        "request_monotonic": 9.5,
+        "warmup_samples": 5,
+        "target_samples": 20,
+    }
+    kwargs[field] = invalid_value
+
+    with pytest.raises(TypeError, match=field):
+        RecorderAttachment(**kwargs)
+
+
+@pytest.mark.parametrize("invalid_value", INVALID_SAMPLE_INDICES)
+@pytest.mark.parametrize("field", ["sample_start", "sample_end"])
+def test_retained_audio_block_rejects_fractional_and_boolean_sample_indices(
+    field: str,
+    invalid_value: object,
+):
+    bool_like = isinstance(invalid_value, (bool, np.bool_))
+    kwargs = {
+        "sample_start": invalid_value if field == "sample_start" else 0,
+        "sample_end": (
+            (2 if bool_like else 1.5)
+            if field == "sample_start"
+            else invalid_value
+        ),
+    }
+
+    with pytest.raises(TypeError, match=field):
+        RetainedAudioBlock(
+            data=np.zeros((1, 1), dtype=np.float32),
+            **kwargs,
+        )
+
+
+def test_all_public_sample_fields_normalize_numpy_integers_to_builtin_ints():
+    captured = CapturedAudioBlock(
+        data=np.zeros((2, 1), dtype=np.float32),
+        sample_start=np.int64(3),
+        sample_end=np.int32(5),
+        monotonic_start=None,
+        monotonic_end=None,
+    )
+    bounds = ResolvedCaptureBounds(
+        attach_sample=np.int64(100),
+        attach_monotonic=10.0,
+        warmup_samples=np.int32(5),
+        target_samples=np.int64(20),
+    )
+    attachment = RecorderAttachment(
+        request_monotonic=9.5,
+        warmup_samples=np.int64(5),
+        target_samples=np.int32(20),
+    )
+    retained = RetainedAudioBlock(
+        data=np.zeros((2, 1), dtype=np.float32),
+        sample_start=np.int32(0),
+        sample_end=np.int64(2),
+    )
+
+    values = [
+        captured.sample_start,
+        captured.sample_end,
+        bounds.attach_sample,
+        bounds.warmup_samples,
+        bounds.target_samples,
+        attachment.warmup_samples,
+        attachment.target_samples,
+        retained.sample_start,
+        retained.sample_end,
+    ]
+    assert all(type(value) is int for value in values)
 
 
 def test_recorder_attachment_publishes_resolution_once_and_releases_idempotently():

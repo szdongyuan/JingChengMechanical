@@ -8,6 +8,7 @@ has no Qt or DSP dependencies so its state transitions can be tested directly.
 from __future__ import annotations
 
 import math
+import operator
 import threading
 from dataclasses import dataclass
 
@@ -15,6 +16,18 @@ import numpy as np
 
 
 SESSION_WARMUP_SECONDS = 0.05
+
+
+def _sample_index(value: object, field_name: str) -> int:
+    """Normalize one non-boolean index-compatible sample value."""
+
+    if isinstance(value, (bool, np.bool_)):
+        raise TypeError(f"{field_name} must be a non-boolean integer")
+    try:
+        normalized = operator.index(value)
+    except TypeError as exc:
+        raise TypeError(f"{field_name} must be a non-boolean integer") from exc
+    return int(normalized)
 
 
 def frames_for_duration(sample_rate: float, duration_sec: float) -> int:
@@ -46,9 +59,13 @@ class CapturedAudioBlock:
             raise TypeError("data must be a numpy array")
         if self.data.ndim < 1:
             raise ValueError("data must be at least one-dimensional")
-        if self.sample_start < 0 or self.sample_end < self.sample_start:
+        sample_start = _sample_index(self.sample_start, "sample_start")
+        sample_end = _sample_index(self.sample_end, "sample_end")
+        object.__setattr__(self, "sample_start", sample_start)
+        object.__setattr__(self, "sample_end", sample_end)
+        if sample_start < 0 or sample_end < sample_start:
             raise ValueError("sample span must be non-negative")
-        if self.data.shape[0] != self.sample_end - self.sample_start:
+        if self.data.shape[0] != sample_end - sample_start:
             raise ValueError("data frame count must match the sample span")
 
 
@@ -60,6 +77,13 @@ class ResolvedCaptureBounds:
     attach_monotonic: float
     warmup_samples: int
     target_samples: int
+
+    def __post_init__(self):
+        for field_name in ("attach_sample", "warmup_samples", "target_samples"):
+            value = _sample_index(getattr(self, field_name), field_name)
+            if value < 0:
+                raise ValueError(f"{field_name} must be non-negative")
+            object.__setattr__(self, field_name, value)
 
     @property
     def retained_start(self) -> int:
@@ -77,6 +101,20 @@ class RetainedAudioBlock:
     data: np.ndarray
     sample_start: int
     sample_end: int
+
+    def __post_init__(self):
+        if not isinstance(self.data, np.ndarray):
+            raise TypeError("data must be a numpy array")
+        if self.data.ndim < 1:
+            raise ValueError("data must be at least one-dimensional")
+        sample_start = _sample_index(self.sample_start, "sample_start")
+        sample_end = _sample_index(self.sample_end, "sample_end")
+        object.__setattr__(self, "sample_start", sample_start)
+        object.__setattr__(self, "sample_end", sample_end)
+        if sample_start < 0 or sample_end < sample_start:
+            raise ValueError("sample span must be non-negative")
+        if self.data.shape[0] != sample_end - sample_start:
+            raise ValueError("data frame count must match the sample span")
 
 
 class RecorderAttachment:
@@ -96,6 +134,8 @@ class RecorderAttachment:
     ):
         if not math.isfinite(request_monotonic):
             raise ValueError("request_monotonic must be finite")
+        warmup_samples = _sample_index(warmup_samples, "warmup_samples")
+        target_samples = _sample_index(target_samples, "target_samples")
         if warmup_samples < 0:
             raise ValueError("warmup_samples must be non-negative")
         if target_samples < 0:
