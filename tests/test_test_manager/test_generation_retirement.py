@@ -9,7 +9,15 @@ import numpy as np
 import pytest
 
 from app.service.analysis.frames import JudgmentResult
+from app.service.analysis.session_capture import (
+    SESSION_WARMUP_SECONDS,
+    CapturedAudioBlock,
+    RecorderAttachment,
+    ResolvedCaptureBounds,
+    frames_for_duration,
+)
 from app.service.analysis.test_manager import TestManager
+from app.service.analysis.test_session import TestSession
 from app.service.current_meter_service import CurrentMeterCollector, CurrentSample
 
 from ._support import (
@@ -703,6 +711,147 @@ class TestGenerationRetirement:
         assert old_generation not in manager._current_publication_gates
         assert manager._session_generations[1] in manager._current_publication_gates
         manager.stop(config_id=1, silent=True)
+
+    def test_capture_progress_reentrant_stop_does_not_deadlock_current_epoch_read(
+        self,
+        monkeypatch,
+    ):
+        current_epoch_read_entered = threading.Event()
+        progress_emit_entered = threading.Event()
+        progress_stop_completed = threading.Event()
+        collectors = []
+
+        class CaptureSession(TestSession):
+            def _setup_pipelines(self):
+                return None
+
+            @property
+            def current_epoch(self):
+                current_epoch_read_entered.set()
+                assert progress_emit_entered.wait(2.0)
+                return super().current_epoch
+
+        class CaptureRecorder(_StartRecorder):
+            def request_capture(self, *, record_duration):
+                warmup_samples = frames_for_duration(
+                    self._sample_rate,
+                    SESSION_WARMUP_SECONDS,
+                )
+                target_samples = frames_for_duration(
+                    self._sample_rate,
+                    record_duration,
+                )
+                attachment = RecorderAttachment(
+                    request_monotonic=_TEST_CURRENT_EPOCH - SESSION_WARMUP_SECONDS,
+                    warmup_samples=warmup_samples,
+                    target_samples=target_samples,
+                )
+                attachment._resolve_once(
+                    ResolvedCaptureBounds(
+                        attach_sample=0,
+                        attach_monotonic=(
+                            _TEST_CURRENT_EPOCH - SESSION_WARMUP_SECONDS
+                        ),
+                        warmup_samples=warmup_samples,
+                        target_samples=target_samples,
+                    )
+                )
+                with self._capture_owner_lock():
+                    self.__dict__.setdefault("capture_owners", []).append(attachment)
+                return attachment
+
+        class Collector:
+            def __init__(self, _config, *, log_callback, sample_callback):
+                self.sample_callback = sample_callback
+                collectors.append(self)
+
+            def start(self):
+                return True
+
+            def stop(self):
+                return None
+
+            def samples(self):
+                return []
+
+        bus = _mock_bus()
+        services = _mock_services(bus)
+        config = _factory_runtime_config()
+        config["output_device_name"] = None
+        config["current_meter"] = {"enabled": True}
+        services.config_service.load_config.return_value = config
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.AudioRecorder",
+            CaptureRecorder,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.TestSession",
+            CaptureSession,
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.test_manager.CurrentMeterCollector",
+            Collector,
+        )
+        manager = TestManager(bus, services)
+        assert manager.start({"config_id": 1, "sn": "SN-lock-order"}) is True
+
+        def stop_from_progress(*_args):
+            progress_emit_entered.set()
+            manager.stop(config_id=1, silent=True)
+            progress_stop_completed.set()
+
+        bus.recording_progress.emit.reset_mock()
+        bus.recording_progress.emit.side_effect = stop_from_progress
+        sample = _raw_current_sample(0.1, 9.0)
+        current_errors = []
+        capture_errors = []
+        current_done = threading.Event()
+        capture_done = threading.Event()
+
+        def publish_current():
+            try:
+                collectors[0].sample_callback(sample, (sample,))
+            except BaseException as exc:
+                current_errors.append(exc)
+            finally:
+                current_done.set()
+
+        def publish_capture():
+            try:
+                manager._recorders[1].captured_block_ready.emit(
+                    CapturedAudioBlock(
+                        data=np.zeros((1, 2), dtype=np.float32),
+                        sample_start=0,
+                        sample_end=1,
+                        monotonic_start=None,
+                        monotonic_end=None,
+                    )
+                )
+            except BaseException as exc:
+                capture_errors.append(exc)
+            finally:
+                capture_done.set()
+
+        current_thread = threading.Thread(target=publish_current, daemon=True)
+        current_thread.start()
+        assert current_epoch_read_entered.wait(2.0)
+
+        capture_thread = threading.Thread(target=publish_capture, daemon=True)
+        capture_thread.start()
+        assert progress_emit_entered.wait(2.0)
+
+        assert current_done.wait(2.0), "current callback deadlocked on capture lock"
+        assert capture_done.wait(2.0), "capture progress stop deadlocked on current gate"
+        current_thread.join(2.0)
+        capture_thread.join(2.0)
+
+        assert not current_thread.is_alive()
+        assert not capture_thread.is_alive()
+        assert current_errors == []
+        assert capture_errors == []
+        assert progress_stop_completed.is_set()
+        assert manager.is_running(config_id=1) is False
+        bus.current_trace_updated.emit.assert_not_called()
 
     def test_live_current_direct_slot_and_cross_thread_replacement_do_not_deadlock(
         self,

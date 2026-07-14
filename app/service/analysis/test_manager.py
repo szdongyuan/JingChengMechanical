@@ -5259,30 +5259,28 @@ class TestManager(QObject):
             or not isinstance(publication_gate, _CurrentPublicationGate)
         ):
             return
+        effective_samples = self._effective_current_samples(
+            config_id,
+            samples,
+            session=session,
+        )
+        payload = build_current_trace_payload(
+            effective_samples,
+            config=current_meter,
+        )
+        if payload is None:
+            return
+        signal = getattr(self._bus, "current_trace_updated", None)
+        emit = getattr(signal, "emit", None)
+        if not callable(emit):
+            return
         with publication_gate.lock:
             if not publication_gate.can_publish(
                 session=session,
                 generation=expected_generation,
             ):
                 return
-            effective_samples = self._effective_current_samples(
-                config_id,
-                samples,
-                session=session,
-            )
-            payload = build_current_trace_payload(
-                effective_samples,
-                config=current_meter,
-            )
-            if payload is None or not publication_gate.can_publish(
-                session=session,
-                generation=expected_generation,
-            ):
-                return
-            signal = getattr(self._bus, "current_trace_updated", None)
-            emit = getattr(signal, "emit", None)
-            if callable(emit):
-                emit(config_id, run_id, payload)
+            emit(config_id, run_id, payload)
 
     @staticmethod
     def _capture_session_recorder_buffer(
