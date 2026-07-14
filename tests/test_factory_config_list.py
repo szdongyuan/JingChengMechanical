@@ -158,11 +158,17 @@ def test_factory_config_list_primary_badge_has_non_clipping_height(qapp):
         enabled_config_ids=(101, 202),
     )
     _show_widget(widget, qapp)
-    row_widget = widget.itemWidget(widget.item(0))
+    item = widget.item(0)
+    row_widget = widget.itemWidget(item)
 
+    row_center_y = row_widget.rect().center().y()
+    badge_center_y = row_widget.lbl_primary.geometry().center().y()
+
+    assert abs(badge_center_y - row_center_y) <= 1
+    assert item.sizeHint().height() == 32
     assert row_widget.lbl_primary.minimumHeight() >= 20
     assert row_widget.lbl_primary.height() >= row_widget.lbl_primary.minimumHeight()
-    assert widget.item(0).sizeHint().height() >= row_widget.sizeHint().height()
+    assert item.sizeHint().height() >= row_widget.sizeHint().height()
 
 
 def test_factory_config_list_drag_preview_matches_current_row_widget_size(qapp):
