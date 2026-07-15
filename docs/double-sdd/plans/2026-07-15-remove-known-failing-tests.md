@@ -121,9 +121,10 @@ The axis-label and STFT geometry deletions do not make any imports or helpers un
 
 In `tests/test_main_window.py`, remove exactly this now-dead MainWindow scaffolding:
 
-- imports: `dataclasses`, `sys`, `ModuleType`, `SimpleNamespace`, `MagicMock`, `numpy`, `QCloseEvent`, `QLabel`, `StftFrame`, `DEFAULT_RESULT_DASHBOARD_LAYOUT`, `FactoryControllerState`, `FactoryReviewPayload`, `FactoryReviewWindow`, and `app.main_window as main_window_mod`;
-- the `cv2` and `snap7` module-stubbing block;
-- definitions: `_SignalStub`, `_BusStub`, `_StubModule`, `_make_guarded_module`, `_make_guarded_ai_tool_management_module`, `_ChannelProbeModule`, `_RefreshProbeResultModule`, `_FakeLoginWindow`, `_patch_non_target_modules`, `_make_services`, `_make_window`, and `_show`.
+- import bindings: `MagicMock`, `QCloseEvent`, `DEFAULT_RESULT_DASHBOARD_LAYOUT`, and `main_window_mod` from `import app.main_window as main_window_mod`;
+- definitions: `_BusStub`, `_make_guarded_module`, `_make_guarded_ai_tool_management_module`, `_make_services`, `_make_window`, `_patch_non_target_modules`, and `_show`.
+
+This is an exact cleanup allowlist, not permission to perform a fresh unused-code sweep. Preserve the `cv2`/`snap7` module-stubbing block and preserve these existing imports: `dataclasses`, `sys`, `ModuleType`, `SimpleNamespace`, `numpy as np`, `QLabel`, `StftFrame`, `FactoryControllerState`, `FactoryReviewPayload`, and `FactoryReviewWindow`. Preserve `_SignalStub`, `_StubModule`, `_ChannelProbeModule`, `_RefreshProbeResultModule`, `_FakeLoginWindow`, `_reviewing_state`, and every other pre-existing helper not named in the seven-definition allowlist above. Some are legacy scaffolding that was already unreachable before the approved test deletion; that pre-existing state is outside this task.
 
 Keep the existing `qapp` and `_close_top_level_widgets` fixtures and their helpers. Keep imports required by those fixtures and the five protected Card tests: `gc`, `os`, `pytest`, `sip`, `QCoreApplication`, `QEvent`, `Qt`, `QApplication`, `QWidget`, `GraphicsView`, `APP_QSS`, and `Card`.
 
@@ -149,10 +150,9 @@ Verify the exact dead symbols are absent:
 
 ```powershell
 $deadSymbols = @(
-    '_SignalStub', '_BusStub', '_StubModule', '_make_guarded_module',
-    '_make_guarded_ai_tool_management_module', '_ChannelProbeModule',
-    '_RefreshProbeResultModule', '_FakeLoginWindow',
-    '_patch_non_target_modules', '_make_services', '_make_window', '_show'
+    '_BusStub', '_make_guarded_module',
+    '_make_guarded_ai_tool_management_module', '_make_services',
+    '_make_window', '_patch_non_target_modules', '_show'
 )
 foreach ($symbol in $deadSymbols) {
     $matches = @(rg -n "^(class|def) $([regex]::Escape($symbol))\b" tests/test_main_window.py)
@@ -160,24 +160,160 @@ foreach ($symbol in $deadSymbols) {
 }
 
 $deadImportPatterns = @(
-    '^import dataclasses$', '^import sys$',
-    '^from types import ModuleType, SimpleNamespace$',
-    '^from unittest.mock import MagicMock$', '^import numpy as np$',
+    '^from unittest.mock import MagicMock$',
     '^from PyQt6\.QtGui import QCloseEvent$',
-    '^from PyQt6\.QtWidgets import .*QLabel',
-    '^from app\.service\.analysis\.frames import StftFrame$',
     '^from app\.service\.result_dashboard_layout import DEFAULT_RESULT_DASHBOARD_LAYOUT$',
-    '^from app\.services_container import \($',
     '^import app\.main_window as main_window_mod$'
 )
 foreach ($pattern in $deadImportPatterns) {
     $matches = @(rg -n $pattern tests/test_main_window.py)
     if ($matches.Count -ne 0) { throw "Dead import remains for pattern: $pattern" }
 }
-$stubBlockMatches = @(
-    rg -n 'sys\.modules\.setdefault\("cv2"|if "snap7" not in sys\.modules' tests/test_main_window.py
+
+$retainedSymbols = @(
+    '_SignalStub', '_StubModule', '_ChannelProbeModule',
+    '_RefreshProbeResultModule', '_FakeLoginWindow',
+    '_armed_state', '_running_state', '_reviewing_state', '_stopped_state',
+    '_review_payload', '_chart_payload_for_channels',
+    '_review_payload_with_chart_payload', '_review_payload_with_vibration',
+    '_summary_payload', '_partial_no_result_review_payload',
+    '_select_toolbar_channel', '_toolbar_channel_options',
+    '_assert_run_specific_cards_cleared', '_assert_chart_cards_visible',
+    '_emit_runtime_started', '_emit_chart_frames',
+    '_emit_stft_frames_for_review_channels', '_emit_review_ready',
+    '_assert_committed_chart_channel', '_result_table_value', '_card_title',
+    '_test_page', '_test_page_left_slot_card', '_test_page_grid_card',
+    '_test_page_card_titles', '_make_stft_frame'
 )
-if ($stubBlockMatches.Count -ne 0) { throw 'cv2/snap7 test stubbing block remains' }
+if ($retainedSymbols.Count -ne 31) {
+    throw "Expected the retained helper/scaffolding allowlist to contain 31 definitions, got $($retainedSymbols.Count)"
+}
+foreach ($symbol in $retainedSymbols) {
+    $matches = @(rg -n "^(class|def) $([regex]::Escape($symbol))\b" tests/test_main_window.py)
+    if ($matches.Count -ne 1) { throw "Retained symbol changed or missing: $symbol" }
+}
+
+$retainedImportPatterns = @(
+    '^import dataclasses$', '^import sys$',
+    '^from types import ModuleType, SimpleNamespace$', '^import numpy as np$',
+    '^from PyQt6\.QtWidgets import QApplication, QLabel, QWidget$',
+    '^from app\.service\.analysis\.frames import StftFrame$',
+    '^    FactoryControllerState,$', '^    FactoryReviewPayload,$',
+    '^    FactoryReviewWindow,$'
+)
+foreach ($pattern in $retainedImportPatterns) {
+    $matches = @(rg -n $pattern tests/test_main_window.py)
+    if ($matches.Count -ne 1) { throw "Retained import changed or missing: $pattern" }
+}
+$requiredStubBlockPatterns = @(
+    'sys\.modules\.setdefault\("cv2"',
+    '^if "snap7" not in sys\.modules:$'
+)
+foreach ($pattern in $requiredStubBlockPatterns) {
+    $matches = @(rg -n $pattern tests/test_main_window.py)
+    if ($matches.Count -ne 1) { throw "Required cv2/snap7 stubbing changed or missing: $pattern" }
+}
+```
+
+Mechanically prove that the only removed or rewritten top-level statements are the 24 approved MainWindow test functions, the exact seven helper definitions, and the exact four single-binding imports. This comparison reads `tests/test_main_window.py` directly from the fixed implementation base `dc19e9f6137ab21d48f16c61ca74b414ffc51927` with `git show`, checks that command succeeds, and rejects additions, reordering, or edits to every retained top-level statement, including the existing module-stubbing blocks and legacy helpers:
+
+```powershell
+$implementationBase = 'dc19e9f6137ab21d48f16c61ca74b414ffc51927'
+
+@'
+import ast
+import pathlib
+import subprocess
+import sys
+
+implementation_base = sys.argv[1]
+current_path = pathlib.Path(sys.argv[2])
+allowed_definitions = {
+    "_BusStub", "_make_guarded_module",
+    "_make_guarded_ai_tool_management_module", "_patch_non_target_modules",
+    "_make_services", "_make_window", "_show",
+    "test_show_change_password_window_when_logged_out_updates_visible_status_via_log",
+    "test_main_window_includes_ai_tool_management_tab_in_topbar",
+    "test_engineer_role_can_access_ai_tool_management_tab",
+    "test_admin_role_can_access_ai_tool_management_tab",
+    "test_operator_role_cannot_access_ai_tool_management_tab",
+    "test_no_role_programmatic_page_reentry_remains_allowed",
+    "test_operator_cannot_activate_ai_tool_management_via_programmatic_tab_change",
+    "test_switching_away_from_ai_tool_management_is_blocked_when_confirm_leave_rejects",
+    "test_programmatic_tab_change_reverts_when_ai_tool_management_rejects_leave",
+    "test_switching_away_from_config_is_blocked_when_confirm_leave_rejects",
+    "test_switching_away_from_config_is_allowed_when_confirm_leave_accepts",
+    "test_role_switch_from_admin_to_operator_stays_consistent_when_ai_leave_is_rejected",
+    "test_closing_main_window_is_blocked_when_ai_tool_management_rejects_leave",
+    "test_closing_main_window_is_blocked_when_config_rejects_leave",
+    "test_admin_and_engineer_roles_can_use_plc_settings_card",
+    "test_closing_main_window_stops_plc_cleanup_before_shared_shutdown_and_camera",
+    "test_closing_main_window_uses_shared_shutdown_boundary_and_stops_camera",
+    "test_closing_main_window_still_uses_shared_shutdown_and_camera_when_plc_cleanup_raises",
+    "test_closing_main_window_swallows_camera_cleanup_errors_after_shared_shutdown",
+    "test_closing_main_window_still_stops_camera_when_shared_shutdown_raises",
+    "test_main_window_uses_result_dashboard_module_for_right_side",
+    "test_vibration_panel_titles_use_parentheses",
+    "test_main_window_keeps_fixed_left_column_modules_unchanged",
+    "test_main_window_routes_latest_log_line_to_status_bar",
+}
+allowed_imports = {"MagicMock", "QCloseEvent", "DEFAULT_RESULT_DASHBOARD_LAYOUT", "main_window_mod"}
+
+def read_current(path):
+    return path.read_text(encoding="utf-8")
+
+def read_baseline(revision):
+    result = subprocess.run(
+        ["git", "show", f"{revision}:tests/test_main_window.py"],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="replace")
+        raise SystemExit(f"git show baseline failed ({result.returncode}): {stderr}")
+    return result.stdout.decode("utf-8").replace("\r\n", "\n")
+
+def segment(source, node):
+    lines = source.splitlines(keepends=True)
+    start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])])
+    return "".join(lines[start - 1:node.end_lineno])
+
+def bindings(node):
+    if isinstance(node, ast.Import):
+        return {alias.asname or alias.name.split(".")[0] for alias in node.names}
+    if isinstance(node, ast.ImportFrom):
+        return {alias.asname or alias.name for alias in node.names}
+    return set()
+
+def removable_label(node):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        if node.name in allowed_definitions:
+            return f"definition:{node.name}"
+    node_bindings = bindings(node)
+    if len(node_bindings) == 1 and node_bindings <= allowed_imports:
+        return f"import:{next(iter(node_bindings))}"
+    return None
+
+baseline = read_baseline(implementation_base)
+current = read_current(current_path)
+baseline_nodes = ast.parse(baseline).body
+current_nodes = ast.parse(current).body
+removed_labels = [label for node in baseline_nodes if (label := removable_label(node))]
+expected_labels = {f"definition:{name}" for name in allowed_definitions} | {
+    f"import:{name}" for name in allowed_imports
+}
+if len(removed_labels) != len(expected_labels) or set(removed_labels) != expected_labels:
+    raise SystemExit(f"Baseline allowlist mismatch: {removed_labels!r}")
+expected_segments = [segment(baseline, node) for node in baseline_nodes if not removable_label(node)]
+current_segments = [segment(current, node) for node in current_nodes]
+if current_segments != expected_segments:
+    raise SystemExit(
+        "MainWindow top-level preservation failed: a non-allowlisted statement was "
+        "deleted, added, reordered, or rewritten"
+    )
+print("MainWindow top-level preservation check passed")
+'@ | python - $implementationBase 'tests/test_main_window.py'
+if ($LASTEXITCODE -ne 0) { throw 'MainWindow top-level preservation check failed' }
 ```
 
 - [ ] **Step 4: Prove the collection delta is exactly the approved 35 cases**
@@ -404,23 +540,19 @@ foreach ($name in $approvedFunctionNames) {
 }
 ```
 
-- [ ] **Step 8: Commit the deletion**
+- [ ] **Step 8: Commit the final implementation correction**
 
-Stage only the four approved test paths:
+Stage only the pending final correction in `tests/test_main_window.py`. The seed-test-file deletion and the edits to the axis-label and STFT geometry test files were completed by earlier commits; do not restage missing paths, squash, rewrite, or broaden that history. Steps 4–7 and the subsequent full-range reviews still verify all four approved paths and the complete implementation range:
 
 ```powershell
-git add -- `
-    tests/test_main_window.py `
-    tests/test_seed_historical_normal_report_data.py `
-    tests/test_analysis_chart_modules/test_committed_chart_modules.py `
-    tests/test_stft_module/test_selection_box_geometry.py
+git add -- tests/test_main_window.py
 git diff --cached --check
 git diff --cached --name-status
-git commit -m "test: remove known failing cases"
+git commit -m "test: preserve existing main window scaffolding"
 git status --short
 ```
 
-Expected: one focused commit containing only the approved test deletions and mechanical same-file cleanup, followed by an empty `git status --short` result.
+Expected: one focused final correction commit containing only the still-pending `tests/test_main_window.py` changes, followed by an empty `git status --short` result. The other three approved paths remain covered by their earlier commits and by the complete-range checks. Across the complete implementation range, the only behavior-changing removals remain the approved tests plus the exact seven helpers and four import bindings allowed by Step 3.
 
 ## Review and Completion Gates
 
