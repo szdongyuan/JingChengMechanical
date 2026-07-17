@@ -844,10 +844,11 @@ class PlcSettingsModule(QWidget):
         if self.combo_plc.currentData() == row.id:
             self.set_connect_label("连接中...")
             self.btn_connect.setEnabled(False)
+        self.services.plc_services[row.id] = plc_service
         self.services.plc_threads[row.id] = connect_thread
 
         def on_connect_finished(success, message):
-            self._on_connect_finished(row.id, plc_service, connect_thread, success, message)
+            self._on_connect_finished(row.id, plc_service, success)
 
         def on_connect_thread_stopped():
             self._on_connect_thread_stopped(row.id)
@@ -865,22 +866,12 @@ class PlcSettingsModule(QWidget):
         # 启动后台连接线程，避免界面卡住。
         connect_thread.start()
 
-    def _on_connect_finished(self, plc_id, plc_service, connect_thread, success, message):
+    def _on_connect_finished(self, plc_id, plc_service, success):
         row = self.get_current_row()
-
-        # 连接成功后记录 service；具体状态由 PlcService 的状态信号回传。
+        # 连接成功后保留最近一次成功连接的服务；具体状态由 PlcService 的状态信号回传。
         if success and plc_service is not None:
-            self.services.plc_services[plc_id] = plc_service
-            # 保留最近一次成功连接的服务，兼容原来单实例用法。
             self.services.plc = plc_service
             self.services.bus.log.emit(f"连接成功: {plc_id}")
-        elif plc_service is not None:
-            connect_thread.quit()
-            connect_thread.wait(2000)
-
-        if row is not None and row.id == plc_id:
-            if not success:
-                self.set_connect_label(f"连接失败: {message}" if message else "连接失败")
 
     def _on_connect_thread_stopped(self, plc_id):
         self.logger.info(f"plc {plc_id} 线程已停止")
