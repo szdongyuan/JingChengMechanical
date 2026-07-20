@@ -8,6 +8,7 @@ import inspect
 import json
 import math
 import os
+import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -22,6 +23,11 @@ from app.service.analysis.judgment import JudgmentEngine, _runtime_channel_defau
 from app.service.analysis.live_display_dispatcher import LiveDisplayDispatcher
 from app.service.analysis.pipeline import AnalysisPipeline
 from app.service.analysis.selected_channels import project_selected_channels
+from app.service.analysis.session_capture import (
+    CapturedAudioBlock,
+    RecorderAttachment,
+    SessionCaptureWindow,
+)
 from app.service.result_dashboard_layout import (
     CHANNEL_PRIMARY_ACOUSTIC,
     PANEL_FAMILY_ACOUSTIC,
@@ -78,20 +84,19 @@ class TestSession:
         self._audio_data_id: str | None = None
         self._test_run_id: str | None = None
         self._finished: bool = False
-        self._attach_chunk_index: int = 0
-        self._attach_snapshot: Any | None = None
-        self._processed_samples_since_attach: int = 0
-        self._recorder_chunk_window_samples: int = 0
-        self._attach_pending: bool = False
-        self._pending_attach_chunks: list[tuple[np.ndarray, int]] = []
+        self._capture_lock = threading.RLock()
+        self._capture_source_token: object | None = None
+        self._capture_attachment: RecorderAttachment | None = None
+        self._capture_window: SessionCaptureWindow | None = None
+        self._pending_capture_blocks: list[CapturedAudioBlock] = []
+        self._capture_closed = False
+        self._monitor_feed: Callable[[np.ndarray], Any] | None = None
         self._on_session_done_cb: Callable[[int], Any] | None = None
         self._live_loudness_channel_index: int | None = None
 
         # Connection refs set by TestManager for signal disconnection
-        self._chunk_conn: Callable | None = None
-        self._done_lambda: Callable | None = None
+        self._captured_block_conn: Callable | None = None
         self._error_lambda: Callable | None = None
-        self._monitor_lambda: Callable | None = None
         self._monitor_error_lambda: Callable | None = None
 
     def _setup_pipelines(self):
@@ -138,77 +143,174 @@ class TestSession:
         if normalized_channel in selected_channels:
             self._live_loudness_channel_index = normalized_channel
 
-    def prepare_for_attach(self):
-        """Buffer chunks until the recorder-owned attach boundary is known."""
-        self._attach_pending = True
-        self._pending_attach_chunks = []
+    def set_monitor_feed(self, callback: Callable[[np.ndarray], Any] | None) -> None:
+        """Set the retained-audio monitor sink used by this session."""
 
-    def attach_to_recorder(self, *, chunk_index: int, snapshot: Any | None = None):
-        """Record the chunk boundary where this session becomes live."""
-        self._attach_chunk_index = max(0, int(chunk_index))
-        self._attach_snapshot = snapshot
-        self._processed_samples_since_attach = 0
-        self._recorder_chunk_window_samples = 0
-        pending_chunks = self._pending_attach_chunks
-        self._pending_attach_chunks = []
-        self._attach_pending = False
-        for pending_chunk, pending_index in pending_chunks:
-            self._process_chunk(pending_chunk, pending_index)
+        if callback is not None and not callable(callback):
+            raise TypeError("monitor feed must be callable or None")
+        with self._capture_lock:
+            self._monitor_feed = callback
 
-    def _on_chunk(self, chunk: np.ndarray, chunk_index: int):
-        """Process one audio chunk through all pipelines and emit results."""
-        if self._attach_pending:
-            self._pending_attach_chunks.append((chunk.copy(), chunk_index))
-            return
-        self._process_chunk(chunk, chunk_index)
+    def prepare_for_attach(self, source_token: object) -> None:
+        """Start one recorder-source generation and buffer until handle binding."""
 
-    def _processed_sample_boundary_since_attach(self, *, chunk_index: int, chunk_samples: int) -> int:
-        chunk_window_samples = max(0, int(chunk_samples))
-        if chunk_window_samples > self._recorder_chunk_window_samples:
-            self._recorder_chunk_window_samples = chunk_window_samples
+        if source_token is None:
+            raise ValueError("source_token must be unique and non-None")
+        with self._capture_lock:
+            self._capture_source_token = source_token
+            self._capture_attachment = None
+            self._capture_window = None
+            self._pending_capture_blocks = []
+            self._capture_closed = False
+            self._finished = False
 
-        if self._recorder_chunk_window_samples <= 0:
-            return 0
+    def attach_to_recorder(
+        self,
+        attachment: RecorderAttachment,
+        *,
+        source_token: object,
+    ) -> None:
+        """Bind the exact capture handle and drain this generation in order."""
 
-        relative_chunk_count = max(0, int(chunk_index) - self._attach_chunk_index + 1)
-        processed_samples = relative_chunk_count * self._recorder_chunk_window_samples
-        target_samples = max(0, int(self._sample_rate * self._record_duration))
-        if target_samples > 0:
-            return min(processed_samples, target_samples)
-        return processed_samples
+        should_complete = False
+        with self._capture_lock:
+            if source_token is not self._capture_source_token:
+                raise ValueError("capture source generation is no longer active")
+            if self._capture_closed:
+                raise RuntimeError("capture session is already frozen")
+            if not isinstance(attachment, RecorderAttachment):
+                raise TypeError("attachment must be RecorderAttachment")
 
-    def _process_chunk(self, chunk: np.ndarray, chunk_index: int):
-        if chunk_index < self._attach_chunk_index:
-            return
+            self._capture_attachment = attachment
+            self._capture_window = SessionCaptureWindow(
+                attachment=attachment,
+                sample_rate=self._sample_rate,
+                record_duration=self._record_duration,
+            )
+            pending_blocks = self._pending_capture_blocks
+            self._pending_capture_blocks = []
+            for block in pending_blocks:
+                should_complete = (
+                    self._process_captured_block_locked(block) or should_complete
+                )
 
-        chunk_samples = int(chunk.shape[0]) if chunk.ndim > 0 else 0
-        self._processed_samples_since_attach = self._processed_sample_boundary_since_attach(
-            chunk_index=chunk_index,
-            chunk_samples=chunk_samples,
-        )
+        if should_complete:
+            self._notify_session_done()
+
+    def _on_captured_block(
+        self,
+        block: CapturedAudioBlock,
+        *,
+        source_token: object,
+    ) -> None:
+        """Route one exact recorder block through this session's retained window."""
+
+        should_complete = False
+        with self._capture_lock:
+            if (
+                source_token is not self._capture_source_token
+                or self._capture_closed
+                or self._finished
+            ):
+                return
+            if not isinstance(block, CapturedAudioBlock):
+                raise TypeError("block must be CapturedAudioBlock")
+
+            if self._capture_window is None:
+                self._pending_capture_blocks.append(
+                    CapturedAudioBlock(
+                        data=block.data.copy(),
+                        sample_start=block.sample_start,
+                        sample_end=block.sample_end,
+                        monotonic_start=block.monotonic_start,
+                        monotonic_end=block.monotonic_end,
+                    )
+                )
+                self._bus.recording_progress.emit(self.config_id, 0.0)
+                return
+
+            should_complete = self._process_captured_block_locked(block)
+
+        if should_complete:
+            self._notify_session_done()
+
+    def _process_captured_block_locked(self, block: CapturedAudioBlock) -> bool:
+        window = self._capture_window
+        if window is None or self._capture_closed or self._finished:
+            return False
+
+        retained = window.accept(block)
+        if retained is None:
+            elapsed = (
+                window.retained_frames / self._sample_rate
+                if self._sample_rate > 0
+                else 0.0
+            )
+            self._bus.recording_progress.emit(self.config_id, elapsed)
+            return False
+
+        monitor_feed = self._monitor_feed
+        if monitor_feed is not None:
+            try:
+                monitor_feed(retained.data)
+            except Exception as exc:
+                self._bus.log.emit(
+                    f"[TestSession] WARNING: monitor feed failed "
+                    f"for config={self.config_id}: {exc}"
+                )
+
         elapsed = (
-            self._processed_samples_since_attach / self._sample_rate
+            retained.sample_end / self._sample_rate
             if self._sample_rate > 0
             else 0.0
         )
-        frame_run_id = self._runtime_frame_run_id()
-        sample_end = self._processed_samples_since_attach
-        sample_start = max(0, sample_end - chunk_samples)
-
         self._submit_live_display_chunk(
-            chunk,
+            retained.data,
             elapsed,
-            frame_run_id,
-            sample_start=sample_start,
-            sample_end=sample_end,
+            self._runtime_frame_run_id(),
+            sample_start=retained.sample_start,
+            sample_end=retained.sample_end,
         )
-
         self._bus.recording_progress.emit(self.config_id, elapsed)
 
-        if not self._finished and elapsed >= self._record_duration:
+        if window.complete and not self._finished:
             self._finished = True
-            if self._on_session_done_cb is not None:
-                self._on_session_done_cb(self.config_id)
+            return True
+        return False
+
+    def _notify_session_done(self) -> None:
+        callback = self._on_session_done_cb
+        if callback is not None:
+            callback(self.config_id)
+
+    @property
+    def capture_attachment(self) -> RecorderAttachment | None:
+        with self._capture_lock:
+            return self._capture_attachment
+
+    @property
+    def captured_frame_count(self) -> int:
+        with self._capture_lock:
+            if self._capture_window is None:
+                return 0
+            return self._capture_window.retained_frames
+
+    @property
+    def current_epoch(self) -> float | None:
+        with self._capture_lock:
+            if self._capture_attachment is None:
+                return None
+            return self._capture_attachment.current_epoch()
+
+    def freeze_capture(self) -> int:
+        """Atomically close capture fan-out and return the retained prefix size."""
+
+        with self._capture_lock:
+            self._capture_closed = True
+            self._pending_capture_blocks = []
+            if self._capture_window is None:
+                return 0
+            return self._capture_window.freeze()
 
     def _submit_live_display_chunk(
         self,

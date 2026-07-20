@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.service.golden_sample_service import GoldenSampleService
+from ui.popups import golden_sample_import_dialog as golden_dialog_module
 from ui.popups.golden_sample_import_dialog import GoldenSampleImportDialog
 
 
@@ -250,6 +251,30 @@ def test_dialog_returns_normalized_multichannel_staged_metadata_on_confirm(qapp,
         staged_data[:32],
         data[12_000 : 12_000 + 72_000, 2][:32],
     )
+
+
+def test_dialog_confirm_from_zero_keeps_original_frame_zero(qapp, tmp_path):
+    wav_path, data = _write_temp_wav(
+        tmp_path / "source-from-zero.wav",
+        duration_sec=0.2,
+        channels=1,
+    )
+    dialog = _dialog(
+        tmp_path,
+        wav_path=wav_path,
+        analysis_duration=0.1,
+        config_sample_rate=48_000.0,
+    )
+
+    assert dialog.findChild(QSpinBox, "start_ms_spin").value() == 0
+    dialog._on_confirm()
+    metadata = dialog.staged_metadata()
+    _, staged_data = wavfile.read(metadata["staged_path"])
+
+    assert metadata["start_sample"] == 0
+    np.testing.assert_array_equal(staged_data, data[:4_800])
+    assert staged_data[0] == data[0]
+    assert not hasattr(golden_dialog_module, "SESSION_WARMUP_SECONDS")
 
 
 def test_dialog_keeps_open_and_surfaces_error_when_staging_fails(

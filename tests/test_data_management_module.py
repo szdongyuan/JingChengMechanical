@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import os
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
+from scipy.io import wavfile
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -135,6 +138,48 @@ def test_data_management_shows_statistics_report_button(qapp):
     module = DataManagementModule(services)
 
     assert module.btn_statistics_report.text() == "统计报告"
+
+
+def test_play_saved_wav_keeps_file_frame_zero_and_full_length(
+    qapp,
+    monkeypatch,
+    tmp_path,
+):
+    source = np.asarray(
+        [123.25, -8.0, -7.0, -6.0, -5.0, -4.0, -3.0, -2.0, -1.0, 0.0, 1.0, 2.0],
+        dtype=np.float32,
+    )
+    wav_path = tmp_path / "canonical-session.wav"
+    wavfile.write(wav_path, 100, source)
+    services = SimpleNamespace(audio_data_service=_AudioDataServiceStub())
+    module = DataManagementModule(services)
+    played = []
+    stopped = MagicMock()
+    capture_window = MagicMock(
+        side_effect=AssertionError("saved WAV playback must not trim again")
+    )
+    monkeypatch.setattr("ui.modules.data_management.sd.stop", stopped)
+    monkeypatch.setattr(
+        "ui.modules.data_management.sd.play",
+        lambda data, sample_rate: played.append(
+            (np.asarray(data).copy(), sample_rate)
+        ),
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.test_session.SessionCaptureWindow",
+        capture_window,
+    )
+
+    module._play_file(str(wav_path))
+
+    stopped.assert_called_once_with()
+    assert len(played) == 1
+    played_data, played_sample_rate = played[0]
+    assert played_sample_rate == 100
+    assert played_data.shape == source.shape
+    np.testing.assert_array_equal(played_data, source)
+    assert played_data[0] == source[0]
+    capture_window.assert_not_called()
 
 
 def test_statistics_report_opens_without_selected_rows(qapp, monkeypatch):

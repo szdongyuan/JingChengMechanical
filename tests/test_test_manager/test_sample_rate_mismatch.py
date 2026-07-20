@@ -1,16 +1,32 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import numpy as np
 
+from app.service.analysis.session_capture import RecorderAttachment, frames_for_duration
 from app.service.analysis.test_manager import TestManager
 
 from ._support import (
+    _CaptureRecorderDoubleMixin,
     _DummySignal,
     _mock_bus,
     _mock_services,
 )
+
+
+class _SampleRateRecorderDoubleMixin(_CaptureRecorderDoubleMixin):
+    def request_capture(self, *, record_duration):
+        owner = RecorderAttachment(
+            request_monotonic=0.0,
+            warmup_samples=frames_for_duration(self._sample_rate, 0.05),
+            target_samples=frames_for_duration(self._sample_rate, record_duration),
+        )
+        self.__dict__.setdefault("request_capture_calls", []).append(record_duration)
+        self.__dict__.setdefault("capture_owners", []).append(owner)
+        return owner
+
+    def release_capture(self, owner):
+        super().release_capture(owner)
+        owner._mark_released()
 
 
 class TestSampleRateMismatch:
@@ -113,13 +129,12 @@ class TestSampleRateMismatch:
             "output_device_name": None,
         }
 
-        class FakeRecorder:
+        class FakeRecorder(_SampleRateRecorderDoubleMixin):
             def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
                 self._sample_rate = sample_rate
                 self._n_channels = n_channels
                 self._record_duration = record_duration
                 self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
-                self.chunk_ready = _DummySignal()
                 self.recording_done = _DummySignal()
                 self.error_occurred = _DummySignal()
                 self._running = False
@@ -135,15 +150,6 @@ class TestSampleRateMismatch:
 
             def wait(self, timeout):
                 return True
-
-            def attach_session(self, *, record_duration):
-                if record_duration > self._record_duration:
-                    self._record_duration = record_duration
-                    self._buffer = np.zeros((int(self._sample_rate * record_duration), self._n_channels), dtype=np.float32)
-                return MagicMock(chunk_index=0, sample_index=0)
-
-            def get_buffer_from(self, snapshot):
-                return self._buffer
 
         monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
 
@@ -246,13 +252,12 @@ class TestSampleRateMismatch:
             },
         ]
 
-        class FakeRecorder:
+        class FakeRecorder(_SampleRateRecorderDoubleMixin):
             def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
                 self._sample_rate = sample_rate
                 self._n_channels = n_channels
                 self._record_duration = record_duration
                 self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
-                self.chunk_ready = _DummySignal()
                 self.recording_done = _DummySignal()
                 self.error_occurred = _DummySignal()
                 self._running = False
@@ -268,15 +273,6 @@ class TestSampleRateMismatch:
 
             def wait(self, timeout):
                 return True
-
-            def attach_session(self, *, record_duration):
-                if record_duration > self._record_duration:
-                    self._record_duration = record_duration
-                    self._buffer = np.zeros((int(self._sample_rate * record_duration), self._n_channels), dtype=np.float32)
-                return MagicMock(chunk_index=0, sample_index=0)
-
-            def get_buffer_from(self, snapshot):
-                return self._buffer
 
         monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
 

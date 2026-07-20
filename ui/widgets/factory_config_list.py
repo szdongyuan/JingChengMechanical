@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
 from PyQt6.QtGui import QCursor, QDrag, QDropEvent, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -11,6 +11,13 @@ from PyQt6.QtWidgets import (
     QListWidgetItem,
     QVBoxLayout,
     QWidget,
+)
+
+
+_ITEM_VERTICAL_MARGIN = 2
+_ITEM_BORDER_WIDTH = 1
+_ITEM_VERTICAL_DECORATION = 2 * (
+    _ITEM_VERTICAL_MARGIN + _ITEM_BORDER_WIDTH
 )
 
 
@@ -30,7 +37,7 @@ class _FactoryConfigRowWidget(QWidget):
         self._locked = locked
 
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 6, 8, 6)
+        layout.setContentsMargins(8, 3, 8, 3)
         layout.setSpacing(8)
 
         self.checkbox = QCheckBox()
@@ -116,8 +123,8 @@ class FactoryConfigListWidget(QListWidget):
         self.setStyleSheet(
             "QListWidget { background: #f8fafc; border: 1px solid #e2e8f0; "
             "border-radius: 8px; padding: 4px; }"
-            "QListWidget::item { border: 1px solid transparent; margin: 2px 0; "
-            "padding: 0; }"
+            f"QListWidget::item {{ border: {_ITEM_BORDER_WIDTH}px solid transparent; "
+            f"margin: {_ITEM_VERTICAL_MARGIN}px 0; padding: 0; }}"
             "QListWidget::item:selected { background: #e2e8f0; }"
         )
 
@@ -315,7 +322,9 @@ class FactoryConfigListWidget(QListWidget):
                     emit_signal=True,
                 ),
             )
-            item.setSizeHint(widget.sizeHint())
+            item.setSizeHint(
+                widget.sizeHint() + QSize(0, _ITEM_VERTICAL_DECORATION)
+            )
             self.setItemWidget(item, widget)
 
     def _item_flags(self, config_id: int) -> Qt.ItemFlag:

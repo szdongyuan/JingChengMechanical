@@ -11,6 +11,11 @@ import app.services_container as services_mod
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.test_manager import TestManager
 from app.services_container import EventBus
+from tests.test_test_manager._support import (
+    _CaptureRecorderDoubleMixin,
+    _FakeSession as _ExactCaptureSessionDouble,
+    _complete_current_session,
+)
 
 from ._support import (
     _DummySignal,
@@ -319,7 +324,7 @@ def test_factory_mode_controller_real_manager_auto_completion_gates_start_readin
 
     state_count_before_completion = len(states)
 
-    services.test._on_session_done(101)
+    _complete_current_session(services.test, 101)
 
     completion_states = states[state_count_before_completion:]
     assert [state.run_phase for state in completion_states] == [
@@ -591,7 +596,7 @@ def test_factory_mode_controller_marks_start_ready_after_terminal_auto_analysis_
 def test_factory_mode_controller_consumes_real_test_manager_lifecycle_signals(monkeypatch):
     controller_mod = _load_factory_mode_controller_module()
 
-    class FakeRecorder:
+    class FakeRecorder(_CaptureRecorderDoubleMixin):
         def __init__(
             self,
             *,
@@ -609,7 +614,6 @@ def test_factory_mode_controller_consumes_real_test_manager_lifecycle_signals(mo
                 dtype=np.float32,
             )
             self._running = False
-            self.chunk_ready = _DummySignal()
             self.recording_done = _DummySignal()
             self.error_occurred = _DummySignal()
 
@@ -625,35 +629,15 @@ def test_factory_mode_controller_consumes_real_test_manager_lifecycle_signals(mo
         def wait(self, timeout):
             return True
 
-        def attach_session(self, *, record_duration):
-            return MagicMock(chunk_index=0, sample_index=0)
-
-        def get_buffer_from(self, snapshot):
-            return self._buffer
-
-    class FakeSession:
+    class FakeSession(_ExactCaptureSessionDouble):
         def __init__(self, config, bus, ai_service, mic_cal, workorder, audio_dir):
-            self.config_id = config["config_id"]
-            self._config = dict(config)
-            self._workorder = dict(workorder)
-            self._buffer = None
-            self._sample_rate = None
-            self._finished = False
-            self._attach_snapshot = None
+            super().__init__(config, bus, ai_service, mic_cal, workorder, audio_dir)
+            self._captured_frame_count = int(
+                float(config["input_device_samplerate"])
+                * float(config["record_duration"])
+            )
             self._audio_file_path = "captured.wav"
             self._audio_data_id = "audio-123"
-
-        def _setup_pipelines(self):
-            return None
-
-        def prepare_for_attach(self):
-            return None
-
-        def attach_to_recorder(self, *, chunk_index, snapshot=None):
-            self._attach_snapshot = snapshot
-
-        def _on_chunk(self, *args, **kwargs):
-            return None
 
         def _save_wav(self, *args, **kwargs):
             return "captured.wav"
@@ -723,7 +707,7 @@ def test_factory_mode_controller_consumes_real_test_manager_lifecycle_signals(mo
 
     assert started is True
     assert controller.state.run_phase == "running"
-    services.test._on_session_done(101)
+    _complete_current_session(services.test, 101)
 
     assert controller.state.run_phase == "reviewing"
     assert controller.review_payload.displayed_config_id == 101

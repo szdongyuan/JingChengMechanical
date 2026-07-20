@@ -1,23 +1,37 @@
 from __future__ import annotations
 
+from threading import Event, Thread
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import ANY, MagicMock, call
 
 import numpy as np
 import pytest
 
 from app.service.analysis import dsp, stft_score
 from app.service.analysis.frames import ChannelJudgment, JudgmentResult
+from app.service.analysis.session_capture import RecorderAttachment, ResolvedCaptureBounds
 from app.service.analysis.test_manager import TestManager
 from app.service.current_meter_service import CurrentSample, build_current_trace_payload
 
 from ._support import (
+    _bind_manager_run_generation,
+    _complete_current_session,
     _expected_chart_payload,
     _expected_summary_payload,
     _make_running_factory_manager,
     _mock_bus,
     _mock_services,
 )
+
+
+def _install_completed_capture(session, recorder, buffer: np.ndarray):
+    attachment = object()
+    session.capture_attachment = attachment
+    session.captured_frame_count = int(buffer.shape[0])
+    session.freeze_capture = MagicMock(return_value=int(buffer.shape[0]))
+    recorder._n_channels = int(buffer.shape[1])
+    recorder.get_capture_buffer.return_value = buffer
+    return attachment
 
 
 def test_start_current_collection_emits_live_current_trace_update_with_run_id(monkeypatch):
@@ -44,6 +58,11 @@ def test_start_current_collection_emits_live_current_trace_update_with_run_id(mo
     )
 
     manager = TestManager(bus, services)
+    attachment = RecorderAttachment(
+        request_monotonic=10.0,
+        warmup_samples=5,
+        target_samples=100,
+    )
     session = SimpleNamespace(
         _config={
             "config_id": 7,
@@ -54,14 +73,36 @@ def test_start_current_collection_emits_live_current_trace_update_with_run_id(mo
             },
         },
         _workorder={"factory_run_id": "run-live"},
+        current_epoch=attachment.current_epoch,
     )
+    manager._sessions[7] = session
+    _bind_manager_run_generation(manager, 7, session)
 
     manager._start_current_collection(7, session)
     FakeCollector.instances[0].sample_callback(
-        CurrentSample(time_sec=0.0, current_a=1.642),
+        CurrentSample(time_sec=0.01, current_a=1.0, monotonic_time=10.049),
         (
-            CurrentSample(time_sec=0.0, current_a=1.642),
-            CurrentSample(time_sec=0.2, current_a=1.7),
+            CurrentSample(time_sec=0.01, current_a=1.0, monotonic_time=10.049),
+            CurrentSample(time_sec=0.02, current_a=1.642, monotonic_time=10.075),
+        ),
+    )
+
+    bus.current_trace_updated.emit.assert_not_called()
+
+    attachment._resolve_once(
+        ResolvedCaptureBounds(
+            attach_sample=20,
+            attach_monotonic=10.0,
+            warmup_samples=5,
+            target_samples=100,
+        )
+    )
+    FakeCollector.instances[0].sample_callback(
+        CurrentSample(time_sec=0.03, current_a=1.7, monotonic_time=10.125),
+        (
+            CurrentSample(time_sec=0.01, current_a=1.0, monotonic_time=10.049),
+            CurrentSample(time_sec=0.02, current_a=1.642, monotonic_time=10.075),
+            CurrentSample(time_sec=0.03, current_a=1.7, monotonic_time=10.125),
         ),
     )
 
@@ -69,7 +110,7 @@ def test_start_current_collection_emits_live_current_trace_update_with_run_id(mo
         7,
         "run-live",
         {
-            "times_sec": [0.0, 0.2],
+            "times_sec": [0.025, 0.075],
             "values_a": [1.642, 1.7],
             "average_a": 1.671,
             "max_a": 1.7,
@@ -112,8 +153,8 @@ def test_start_current_collection_emits_live_current_trace_with_raw_meter_unit(m
         "scale": 1.0,
     }
     samples = (
-        CurrentSample(time_sec=0.0, current_a=1.642),
-        CurrentSample(time_sec=0.2, current_a=1.7),
+        CurrentSample(time_sec=99.0, current_a=1.642, monotonic_time=10.0),
+        CurrentSample(time_sec=99.2, current_a=1.7, monotonic_time=10.2),
     )
 
     manager = TestManager(bus, services)
@@ -124,12 +165,21 @@ def test_start_current_collection_emits_live_current_trace_with_raw_meter_unit(m
             "current_meter": raw_current_meter,
         },
         _workorder={"factory_run_id": "run-live"},
+        current_epoch=lambda: 10.0,
     )
+    manager._sessions[7] = session
+    _bind_manager_run_generation(manager, 7, session)
 
     manager._start_current_collection(7, session)
     FakeCollector.instances[0].sample_callback(samples[-1], samples)
 
-    expected_payload = build_current_trace_payload(samples, config=raw_current_meter)
+    expected_payload = build_current_trace_payload(
+        (
+            CurrentSample(0.0, 1.642, 10.0),
+            CurrentSample(0.2, 1.7, 10.2),
+        ),
+        config=raw_current_meter,
+    )
     assert expected_payload["unit"] == "A"
     bus.current_trace_updated.emit.assert_called_once_with(
         7,
@@ -190,6 +240,357 @@ def test_start_current_collection_does_not_emit_live_current_when_meter_disabled
 
     assert FakeCollector.instances == []
     bus.current_trace_updated.emit.assert_not_called()
+
+
+def test_stop_current_collection_stores_the_same_rebased_set_used_by_review(monkeypatch):
+    bus = _mock_bus()
+    services = _mock_services(bus)
+    raw_samples = [
+        CurrentSample(0.01, 1.0, 10.049),
+        CurrentSample(0.02, 2.0, 10.050),
+        CurrentSample(0.08, 3.0, 10.125),
+    ]
+
+    class FakeCollector:
+        def __init__(self, _config, *, sample_callback=None, log_callback=None):
+            self.sample_callback = sample_callback
+
+        def start(self):
+            return True
+
+        def stop(self):
+            return None
+
+        def samples(self):
+            return list(raw_samples)
+
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.CurrentMeterCollector",
+        FakeCollector,
+    )
+    manager = TestManager(bus, services)
+    session = SimpleNamespace(
+        _config={
+            "config_id": 7,
+            "current_meter": {"enabled": True, "host": "127.0.0.1"},
+        },
+        _workorder={"factory_run_id": "run-current-stop"},
+        current_epoch=lambda: 10.050,
+        captured_frame_count=1,
+    )
+    manager._sessions[7] = session
+    generation = _bind_manager_run_generation(manager, 7, session)
+    manager._start_current_collection(7, session)
+
+    active_payload = manager._current_trace_payload(
+        7,
+        current_meter=session._config["current_meter"],
+        session=session,
+    )
+
+    with manager._lifecycle_lock:
+        claim = manager._detach_current_collection_locked(
+            7,
+            session=session,
+            generation=generation,
+            retain_samples=True,
+        )
+    manager._retire_current_publication_gate(generation)
+    cleanup = manager._stop_current_collection_claim(claim)
+    manager._settle_current_samples_for_capture(claim, retained_frames=1)
+
+    assert [
+        (sample.time_sec, sample.current_a, sample.monotonic_time)
+        for sample in cleanup.samples
+    ] == [
+        (pytest.approx(0.0), 2.0, 10.050),
+        (pytest.approx(0.075), 3.0, 10.125),
+    ]
+    assert manager._current_samples_by_config_id[7] == cleanup.samples
+    stored_payload = manager._current_trace_payload(
+        7,
+        current_meter=session._config["current_meter"],
+        session=session,
+    )
+    assert active_payload == build_current_trace_payload(
+        cleanup.samples,
+        config=session._config["current_meter"],
+    )
+    assert stored_payload == active_payload
+
+
+def test_effective_current_samples_keep_each_session_epoch_isolated():
+    bus = _mock_bus()
+    manager = TestManager(bus, _mock_services(bus))
+    first = SimpleNamespace(current_epoch=lambda: 10.05)
+    second = SimpleNamespace(current_epoch=lambda: 20.05)
+    manager._sessions[1] = first
+    manager._sessions[2] = second
+    raw = [
+        CurrentSample(0.0, 1.0, 10.10),
+        CurrentSample(0.0, 2.0, 20.10),
+    ]
+
+    assert [sample.current_a for sample in manager._effective_current_samples(1, raw)] == [
+        1.0,
+        2.0,
+    ]
+    manager._completed_sessions[1] = manager._sessions.pop(1)
+    assert [sample.current_a for sample in manager._effective_current_samples(2, raw)] == [
+        2.0,
+    ]
+
+
+def test_live_current_retirement_cancels_callback_blocked_in_epoch(monkeypatch):
+    bus = _mock_bus()
+    bus.current_trace_updated = MagicMock()
+    bus.current_trace_updated.emit = MagicMock()
+    epoch_entered = Event()
+    allow_epoch = Event()
+
+    class FakeCollector:
+        instances = []
+
+        def __init__(self, _config, *, sample_callback=None, log_callback=None):
+            self.sample_callback = sample_callback
+            FakeCollector.instances.append(self)
+
+        def start(self):
+            return True
+
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.CurrentMeterCollector",
+        FakeCollector,
+    )
+
+    def blocking_epoch():
+        epoch_entered.set()
+        assert allow_epoch.wait(2.0)
+        return 10.0
+
+    manager = TestManager(bus, _mock_services(bus))
+    old_session = SimpleNamespace(
+        _config={
+            "config_id": 7,
+            "current_meter": {"enabled": True, "host": "127.0.0.1"},
+        },
+        _workorder={"factory_run_id": "old-run"},
+        current_epoch=blocking_epoch,
+    )
+    manager._sessions[7] = old_session
+    old_generation = _bind_manager_run_generation(manager, 7, old_session)
+    manager._start_current_collection(7, old_session)
+    publication_gate = manager._current_publication_gates[old_generation]
+    sample = CurrentSample(0.1, 1.5, 10.1)
+    callback_thread = Thread(
+        target=lambda: FakeCollector.instances[0].sample_callback(sample, (sample,))
+    )
+    callback_thread.start()
+    assert epoch_entered.wait(2.0)
+
+    new_generation = object()
+    new_session = SimpleNamespace(
+        _manager_generation_token=new_generation,
+        current_epoch=lambda: 20.0,
+    )
+    replacement_done = Event()
+
+    def replace_generation():
+        with manager._lifecycle_lock:
+            manager._retire_session_generation_locked(7, old_generation)
+        manager._retire_current_publication_gate(old_generation)
+        with manager._lifecycle_lock:
+            manager._sessions[7] = new_session
+            manager._session_generations[7] = new_generation
+        replacement_done.set()
+
+    replacement_thread = Thread(target=replace_generation)
+    replacement_thread.start()
+    assert publication_gate.retirement_requested.wait(2.0)
+    allow_epoch.set()
+    callback_thread.join(2.0)
+    replacement_thread.join(2.0)
+
+    assert not callback_thread.is_alive()
+    assert not replacement_thread.is_alive()
+    assert replacement_done.is_set()
+    bus.current_trace_updated.emit.assert_not_called()
+    assert manager._sessions[7] is new_session
+    assert manager._session_generations[7] is new_generation
+    assert old_generation not in manager._current_publication_gates
+
+
+def test_live_current_publication_keeps_shared_sessions_on_their_own_epochs(monkeypatch):
+    bus = _mock_bus()
+    bus.current_trace_updated = MagicMock()
+    bus.current_trace_updated.emit = MagicMock()
+
+    class FakeCollector:
+        instances = []
+
+        def __init__(self, _config, *, sample_callback=None, log_callback=None):
+            self.sample_callback = sample_callback
+            FakeCollector.instances.append(self)
+
+        def start(self):
+            return True
+
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.CurrentMeterCollector",
+        FakeCollector,
+    )
+    manager = TestManager(bus, _mock_services(bus))
+    for config_id, run_id, epoch in (
+        (7, "shared-a", 10.0),
+        (8, "shared-b", 20.0),
+    ):
+        session = SimpleNamespace(
+            _config={
+                "config_id": config_id,
+                "current_meter": {"enabled": True, "host": "127.0.0.1"},
+            },
+            _workorder={"factory_run_id": run_id},
+            current_epoch=lambda value=epoch: value,
+        )
+        manager._sessions[config_id] = session
+        _bind_manager_run_generation(manager, config_id, session)
+        manager._start_current_collection(config_id, session)
+
+    first = CurrentSample(99.0, 1.0, 10.1)
+    second = CurrentSample(99.0, 2.0, 20.2)
+    FakeCollector.instances[0].sample_callback(first, (first,))
+    FakeCollector.instances[1].sample_callback(second, (second,))
+
+    assert bus.current_trace_updated.emit.call_args_list == [
+        call(
+            7,
+            "shared-a",
+            ANY,
+        ),
+        call(
+            8,
+            "shared-b",
+            ANY,
+        ),
+    ]
+    first_payload = bus.current_trace_updated.emit.call_args_list[0].args[2]
+    second_payload = bus.current_trace_updated.emit.call_args_list[1].args[2]
+    assert first_payload["times_sec"] == [0.1]
+    assert first_payload["values_a"] == [1.0]
+    assert second_payload["times_sec"] == [0.2]
+    assert second_payload["values_a"] == [2.0]
+
+
+def test_current_retirement_drains_all_callbacks_without_blocking_other_config(
+    monkeypatch,
+):
+    bus = _mock_bus()
+    bus.current_trace_updated = MagicMock()
+    bus.current_trace_updated.emit = MagicMock()
+
+    class FakeCollector:
+        instances = []
+
+        def __init__(self, _config, *, sample_callback=None, log_callback=None):
+            self.sample_callback = sample_callback
+            FakeCollector.instances.append(self)
+
+        def start(self):
+            return True
+
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.CurrentMeterCollector",
+        FakeCollector,
+    )
+    manager = TestManager(bus, _mock_services(bus))
+    generations = {}
+    for config_id, run_id, epoch in (
+        (7, "draining", 10.0),
+        (8, "independent", 20.0),
+    ):
+        session = SimpleNamespace(
+            _config={
+                "config_id": config_id,
+                "current_meter": {"enabled": True, "host": "127.0.0.1"},
+            },
+            _workorder={"factory_run_id": run_id},
+            current_epoch=lambda value=epoch: value,
+        )
+        manager._sessions[config_id] = session
+        generations[config_id] = _bind_manager_run_generation(
+            manager,
+            config_id,
+            session,
+        )
+        manager._start_current_collection(config_id, session)
+
+    first_emit_entered = Event()
+    allow_first_emit = Event()
+
+    def block_first_config(config_id, *_args):
+        if config_id == 7:
+            first_emit_entered.set()
+            assert allow_first_emit.wait(2.0)
+
+    bus.current_trace_updated.emit.side_effect = block_first_config
+    callback_errors = []
+    second_callback_entered = Event()
+
+    def invoke(callback, sample, *, entered=None):
+        try:
+            if entered is not None:
+                entered.set()
+            callback(sample, (sample,))
+        except BaseException as exc:
+            callback_errors.append(exc)
+
+    first = CurrentSample(0.1, 1.0, 10.1)
+    second = CurrentSample(0.2, 2.0, 10.2)
+    first_thread = Thread(
+        target=invoke,
+        args=(FakeCollector.instances[0].sample_callback, first),
+    )
+    first_thread.start()
+    assert first_emit_entered.wait(2.0)
+
+    second_thread = Thread(
+        target=invoke,
+        args=(FakeCollector.instances[0].sample_callback, second),
+        kwargs={"entered": second_callback_entered},
+    )
+    second_thread.start()
+    assert second_callback_entered.wait(2.0)
+
+    retirement_done = Event()
+    retirement_thread = Thread(
+        target=lambda: (
+            manager._retire_current_publication_gate(generations[7]),
+            retirement_done.set(),
+        )
+    )
+    retirement_thread.start()
+    gate = manager._current_publication_gates[generations[7]]
+    assert gate.retirement_requested.wait(2.0)
+
+    independent = CurrentSample(0.1, 8.0, 20.1)
+    FakeCollector.instances[1].sample_callback(independent, (independent,))
+    assert not retirement_done.is_set()
+    allow_first_emit.set()
+
+    first_thread.join(2.0)
+    second_thread.join(2.0)
+    retirement_thread.join(2.0)
+    assert not first_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert not retirement_thread.is_alive()
+    assert callback_errors == []
+    assert retirement_done.is_set()
+    assert [item.args[0] for item in bus.current_trace_updated.emit.call_args_list] == [
+        7,
+        8,
+    ]
+    assert generations[7] not in manager._current_publication_gates
+    assert manager._current_publication_gates.get(generations[8]) is not None
 
 
 class TestReviewPayloadEmission:
@@ -360,7 +761,7 @@ class TestReviewPayloadEmission:
 
         monkeypatch.setattr(mgr, "_build_summary_payload", _stop_before_first_review_emit)
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         assert stop_results == [True]
         bus.factory_runtime_stopped.emit.assert_called_once()
@@ -394,7 +795,7 @@ class TestReviewPayloadEmission:
             lambda *args: stop_results.append(mgr.stop_active_run(config_id=1))
         )
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         assert stop_results == [True]
         bus.factory_runtime_stopped.emit.assert_called_once()
@@ -426,7 +827,7 @@ class TestReviewPayloadEmission:
             lambda *args: stop_results.append(mgr.stop_active_run(config_id=1))
         )
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         assert stop_results == [True]
         bus.factory_runtime_stopped.emit.assert_called_once()
@@ -444,14 +845,12 @@ class TestReviewPayloadEmission:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(500, dtype=np.float32).reshape(500, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
+        _install_completed_capture(session, rec, post_attach)
         session._config = {
             "config_id": 1,
             "analysis_duration": 2.0,
@@ -521,13 +920,15 @@ class TestReviewPayloadEmission:
         )
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
+        generation = _bind_manager_run_generation(mgr, 1, session)
         mgr._current_samples_by_config_id[1] = [
             CurrentSample(time_sec=0.5, current_a=1.0),
             CurrentSample(time_sec=1.5, current_a=2.0),
             CurrentSample(time_sec=2.5, current_a=3.0),
         ]
+        mgr._current_sample_generations[1] = generation
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         assert calls["summary"]["config"] == session._config
         assert calls["summary"]["ai_review"] == session.last_ai_review
@@ -679,14 +1080,12 @@ class TestReviewPayloadEmission:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(500, dtype=np.float32).reshape(500, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
+        _install_completed_capture(session, rec, post_attach)
         session._config = {
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 0,
@@ -728,7 +1127,7 @@ class TestReviewPayloadEmission:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
         assert payload.summary_payload["overall_status"] == "no_result"
@@ -746,14 +1145,12 @@ class TestReviewPayloadEmission:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(500, dtype=np.float32).reshape(500, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
+        _install_completed_capture(session, rec, post_attach)
         session._config = {
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 0,
@@ -808,7 +1205,7 @@ class TestReviewPayloadEmission:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
         assert payload.summary_payload == expected_summary
@@ -824,14 +1221,12 @@ class TestReviewPayloadEmission:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(10, 20, dtype=np.float32).reshape(10, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
+        _install_completed_capture(session, rec, post_attach)
         session._audio_file_path = None
         session._audio_data_id = None
         session._workorder = {"factory_run_id": "run-1"}
@@ -882,7 +1277,7 @@ class TestReviewPayloadEmission:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         assert build_summary_calls == [
             {
@@ -908,14 +1303,12 @@ class TestReviewPayloadEmission:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(10, 20, dtype=np.float32).reshape(10, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
+        _install_completed_capture(session, rec, post_attach)
         session._audio_file_path = "captured.wav"
         session._audio_data_id = "audio-123"
         session._workorder = {"factory_run_id": "run-1"}
@@ -961,7 +1354,7 @@ class TestReviewPayloadEmission:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         assert build_summary_calls == [
             {
@@ -1165,11 +1558,14 @@ class TestReviewPayloadEmission:
             raising=False,
         )
         mgr._completed_sessions[1] = mock_session
+        generation = object()
+        mock_session._manager_generation_token = generation
         mgr._current_samples_by_config_id[1] = [
             CurrentSample(time_sec=0.5, current_a=1.0),
             CurrentSample(time_sec=1.5, current_a=2.0),
             CurrentSample(time_sec=2.5, current_a=3.0),
         ]
+        mgr._current_sample_generations[1] = generation
 
         mgr.rejudge(config_id=1, start_sec=1.0, end_sec=3.0)
 
@@ -1463,14 +1859,12 @@ class TestReviewPayloadEmission:
         services = _mock_services(bus)
         mgr = TestManager(bus, services)
         post_attach = np.arange(500, dtype=np.float32).reshape(500, 1)
-        attach_snapshot = object()
         rec = MagicMock()
-        rec.get_buffer_from.return_value = post_attach
         rec._sample_rate = 100.0
         session = MagicMock()
         session.config_id = 1
         session._buffer = None
-        session._attach_snapshot = attach_snapshot
+        _install_completed_capture(session, rec, post_attach)
         session._config = {
             "analysis_duration": 2.0,
             "analysis_window_offset_ms": 0,
@@ -1518,7 +1912,7 @@ class TestReviewPayloadEmission:
         mgr._sessions[1] = session
         mgr._recorders[1] = rec
 
-        mgr._on_session_done(1)
+        _complete_current_session(mgr, 1)
 
         payload = bus.factory_runtime_auto_analysis_succeeded.emit.call_args.args[0]
         assert payload.summary_payload == expected_summary

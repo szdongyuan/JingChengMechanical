@@ -23,6 +23,41 @@ _WORD_ORDERS = {"big", "little"}
 class CurrentSample:
     time_sec: float
     current_a: float
+    monotonic_time: float | None = None
+
+
+def rebase_current_samples(
+    samples: Iterable[CurrentSample],
+    *,
+    current_epoch: float,
+) -> list[CurrentSample]:
+    """Filter and rebase absolute current readings without changing their order."""
+
+    try:
+        epoch = float(current_epoch)
+    except (TypeError, ValueError):
+        return []
+    if not math.isfinite(epoch):
+        return []
+
+    rebased: list[CurrentSample] = []
+    for sample in samples or ():
+        if not isinstance(sample, CurrentSample):
+            continue
+        try:
+            completed_monotonic = float(sample.monotonic_time)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(completed_monotonic) or completed_monotonic < epoch:
+            continue
+        rebased.append(
+            CurrentSample(
+                time_sec=completed_monotonic - epoch,
+                current_a=sample.current_a,
+                monotonic_time=completed_monotonic,
+            )
+        )
+    return rebased
 
 
 def normalize_current_meter_config(config: dict | None) -> dict:
@@ -334,9 +369,11 @@ class CurrentMeterCollector:
             self._log_once("电流表读取值无效")
             return
 
+        completed_monotonic = self._time()
         sample = CurrentSample(
-            time_sec=max(0.0, self._time() - self._start_time),
+            time_sec=max(0.0, completed_monotonic - self._start_time),
             current_a=float(value),
+            monotonic_time=completed_monotonic,
         )
         has_sample_callback = callable(self._sample_callback)
         with self._samples_lock:

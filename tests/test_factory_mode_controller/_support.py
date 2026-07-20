@@ -10,6 +10,10 @@ from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.review_payloads import build_summary_payload
 from app.service.analysis.test_manager import TestManager
 from app.services_container import EventBus
+from tests.test_test_manager._support import (
+    _CaptureRecorderDoubleMixin,
+    _FakeSession as _ExactCaptureSessionDouble,
+)
 
 _DEFAULT_JUDGMENT_PAYLOAD = object()
 
@@ -229,7 +233,7 @@ class _DummySignal:
     def __init__(self):
         self._callbacks = []
 
-    def connect(self, callback):
+    def connect(self, callback, connection_type=None):
         self._callbacks.append(callback)
 
     def disconnect(self, callback):
@@ -327,7 +331,7 @@ def _make_real_manager_factory_context(
 ):
     controller_mod = _load_factory_mode_controller_module()
 
-    class FakeRecorder:
+    class FakeRecorder(_CaptureRecorderDoubleMixin):
         instances = []
 
         def __init__(
@@ -349,7 +353,6 @@ def _make_real_manager_factory_context(
             self._running = False
             self.stop_calls = 0
             self.wait_calls: list[int] = []
-            self.chunk_ready = _DummySignal()
             self.recording_done = _DummySignal()
             self.error_occurred = _DummySignal()
             FakeRecorder.instances.append(self)
@@ -367,12 +370,6 @@ def _make_real_manager_factory_context(
         def wait(self, timeout):
             self.wait_calls.append(timeout)
             return True
-
-        def attach_session(self, *, record_duration):
-            return MagicMock(chunk_index=0, sample_index=0)
-
-        def get_buffer_from(self, snapshot):
-            return self._buffer
 
     class FakeMonitor:
         instances = []
@@ -410,29 +407,15 @@ def _make_real_manager_factory_context(
             self.wait_calls.append(timeout)
             return True
 
-    class FakeSession:
+    class FakeSession(_ExactCaptureSessionDouble):
         def __init__(self, config, bus, ai_service, mic_cal, workorder, audio_dir):
-            self.config_id = config["config_id"]
-            self._config = dict(config)
-            self._workorder = dict(workorder)
-            self._buffer = None
-            self._sample_rate = None
-            self._finished = False
-            self._attach_snapshot = None
+            super().__init__(config, bus, ai_service, mic_cal, workorder, audio_dir)
+            self._captured_frame_count = int(
+                float(config["input_device_samplerate"])
+                * float(config["record_duration"])
+            )
             self._audio_file_path = None
             self._audio_data_id = "audio-123"
-
-        def _setup_pipelines(self):
-            return None
-
-        def prepare_for_attach(self):
-            return None
-
-        def attach_to_recorder(self, *, chunk_index, snapshot=None):
-            self._attach_snapshot = snapshot
-
-        def _on_chunk(self, *args, **kwargs):
-            return None
 
         def _save_wav(self, *args, **kwargs):
             if save_wav_error is not None:

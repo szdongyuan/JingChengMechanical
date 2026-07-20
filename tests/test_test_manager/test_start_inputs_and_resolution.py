@@ -8,6 +8,7 @@ import pytest
 from app.service.analysis.test_manager import TestManager
 
 from ._support import (
+    _CaptureRecorderDoubleMixin,
     _DummySignal,
     _FakeSession,
     _factory_runtime_config,
@@ -16,7 +17,7 @@ from ._support import (
 )
 
 
-class _CountingRecorder:
+class _CountingRecorder(_CaptureRecorderDoubleMixin):
     instances = []
 
     def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -29,7 +30,6 @@ class _CountingRecorder:
             (int(float(sample_rate) * float(record_duration)), n_channels),
             dtype=np.float32,
         )
-        self.chunk_ready = _DummySignal()
         self.recording_done = _DummySignal()
         self.error_occurred = _DummySignal()
         self._running = False
@@ -46,13 +46,6 @@ class _CountingRecorder:
 
     def wait(self, timeout):
         return True
-
-    def attach_session(self, *, record_duration):
-        return MagicMock(chunk_index=0, sample_index=0)
-
-    def get_buffer_from(self, snapshot):
-        return self._buffer
-
 
 class _CountingMonitor:
     instances = []
@@ -142,7 +135,7 @@ class TestTestManagerStartStop:
                 "output_device_name": None,
             }
 
-            class FakeRecorder:
+            class FakeRecorder(_CaptureRecorderDoubleMixin):
                 instances = []
 
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -152,7 +145,6 @@ class TestTestManagerStartStop:
                     self._n_channels = n_channels
                     self._record_duration = record_duration
                     self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
-                    self.chunk_ready = _DummySignal()
                     self.recording_done = _DummySignal()
                     self.error_occurred = _DummySignal()
                     self._running = False
@@ -169,15 +161,6 @@ class TestTestManagerStartStop:
 
                 def wait(self, timeout):
                     return True
-
-                def attach_session(self, *, record_duration):
-                    if record_duration > self._record_duration:
-                        self._record_duration = record_duration
-                        self._buffer = np.zeros((int(self._sample_rate * record_duration), self._n_channels), dtype=np.float32)
-                    return MagicMock(chunk_index=0, sample_index=0)
-
-                def get_buffer_from(self, snapshot):
-                    return self._buffer
 
             monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
             monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
@@ -290,13 +273,12 @@ class TestTestManagerStartStop:
                 "output_device_samplerate": 48000,
             }
 
-            class FakeRecorder:
+            class FakeRecorder(_CaptureRecorderDoubleMixin):
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
                     self._sample_rate = sample_rate
                     self._n_channels = n_channels
                     self._record_duration = record_duration
                     self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
-                    self.chunk_ready = _DummySignal()
                     self.recording_done = _DummySignal()
                     self.error_occurred = _DummySignal()
                     self._running = False
@@ -312,15 +294,6 @@ class TestTestManagerStartStop:
 
                 def wait(self, timeout):
                     return True
-
-                def attach_session(self, *, record_duration):
-                    if record_duration > self._record_duration:
-                        self._record_duration = record_duration
-                        self._buffer = np.zeros((int(self._sample_rate * record_duration), self._n_channels), dtype=np.float32)
-                    return MagicMock(chunk_index=0, sample_index=0)
-
-                def get_buffer_from(self, snapshot):
-                    return self._buffer
 
             class FakeMonitor:
                 instances = []
@@ -396,13 +369,12 @@ class TestTestManagerStartStop:
                 "output_device_samplerate": 48000,
             }
 
-            class FakeRecorder:
+            class FakeRecorder(_CaptureRecorderDoubleMixin):
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
                     self._sample_rate = sample_rate
                     self._n_channels = n_channels
                     self._record_duration = record_duration
                     self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
-                    self.chunk_ready = _DummySignal()
                     self.recording_done = _DummySignal()
                     self.error_occurred = _DummySignal()
                     self._running = False
@@ -418,15 +390,6 @@ class TestTestManagerStartStop:
 
                 def wait(self, timeout):
                     return True
-
-                def attach_session(self, *, record_duration):
-                    if record_duration > self._record_duration:
-                        self._record_duration = record_duration
-                        self._buffer = np.zeros((int(self._sample_rate * record_duration), self._n_channels), dtype=np.float32)
-                    return MagicMock(chunk_index=0, sample_index=0)
-
-                def get_buffer_from(self, snapshot):
-                    return self._buffer
 
             class FakeMonitor:
                 instances = []

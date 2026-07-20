@@ -41,6 +41,9 @@ def test_test_manager_analyze_imported_wav_returns_payload_without_persistence(
 
     create_audio = MagicMock(side_effect=AssertionError("must not persist"))
     save_wav = MagicMock(side_effect=AssertionError("must not save wav"))
+    capture_window = MagicMock(
+        side_effect=AssertionError("import must not create a session capture window")
+    )
     captured: dict[str, object] = {}
 
     def fake_analyze_imported_wav(**kwargs):
@@ -70,6 +73,10 @@ def test_test_manager_analyze_imported_wav_returns_payload_without_persistence(
         MagicMock(side_effect=AssertionError("must not create session")),
     )
     monkeypatch.setattr(
+        "app.service.analysis.test_session.SessionCaptureWindow",
+        capture_window,
+    )
+    monkeypatch.setattr(
         "app.service.analysis.imported_audio.analyze_imported_wav",
         fake_analyze_imported_wav,
     )
@@ -88,6 +95,7 @@ def test_test_manager_analyze_imported_wav_returns_payload_without_persistence(
     assert judgment_engine._golden_sample_service is golden_sample_service
     create_audio.assert_not_called()
     save_wav.assert_not_called()
+    capture_window.assert_not_called()
     bus.test_started.emit.assert_not_called()
     bus.test_finished.emit.assert_not_called()
     bus.result_changed.emit.assert_not_called()

@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock
-
 import numpy as np
 
 from app.service.analysis.test_manager import TestManager
 
 from ._support import (
+    _CaptureRecorderDoubleMixin,
     _DummySignal,
     _FakeSession,
     _mock_bus,
@@ -70,7 +69,7 @@ class TestSharedRecorderMaxDuration:
             },
         ]
 
-        class FakeRecorder:
+        class FakeRecorder(_CaptureRecorderDoubleMixin):
             instances = []
 
             def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -78,11 +77,9 @@ class TestSharedRecorderMaxDuration:
                 self._n_channels = n_channels
                 self._record_duration = record_duration
                 self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
-                self.chunk_ready = _DummySignal()
                 self.recording_done = _DummySignal()
                 self.error_occurred = _DummySignal()
                 self._running = False
-                self._chunk_index = 0
                 FakeRecorder.instances.append(self)
 
             def extend_duration(self, record_duration):
@@ -103,15 +100,6 @@ class TestSharedRecorderMaxDuration:
             def wait(self, timeout):
                 return True
 
-            def attach_session(self, *, record_duration):
-                if record_duration > self._record_duration:
-                    self._record_duration = record_duration
-                    self._buffer = np.zeros((int(self._sample_rate * record_duration), self._n_channels), dtype=np.float32)
-                return MagicMock(chunk_index=0, sample_index=0)
-
-            def get_buffer_from(self, snapshot):
-                return self._buffer
-
         monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
         monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
 
@@ -121,8 +109,10 @@ class TestSharedRecorderMaxDuration:
 
         assert mgr._recorders[1] is mgr._recorders[2]
         shared_rec = mgr._recorders[1]
-        assert shared_rec._record_duration == 5.0
-        assert shared_rec._buffer.shape[0] == 44100 * 5
+        assert shared_rec.request_capture_calls == [3.0, 5.0]
+        assert len(shared_rec.capture_owners) == 2
+        assert mgr._sessions[1].capture_attachment is shared_rec.capture_owners[0]
+        assert mgr._sessions[2].capture_attachment is shared_rec.capture_owners[1]
 
     def test_shared_recorder_extends_duration_while_running(self, monkeypatch):
         bus = _mock_bus()
@@ -178,7 +168,7 @@ class TestSharedRecorderMaxDuration:
             },
         ]
 
-        class FakeRecorder:
+        class FakeRecorder(_CaptureRecorderDoubleMixin):
             instances = []
 
             def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -186,11 +176,9 @@ class TestSharedRecorderMaxDuration:
                 self._n_channels = n_channels
                 self._record_duration = record_duration
                 self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
-                self.chunk_ready = _DummySignal()
                 self.recording_done = _DummySignal()
                 self.error_occurred = _DummySignal()
                 self._running = False
-                self._chunk_index = 0
                 FakeRecorder.instances.append(self)
 
             def extend_duration(self, record_duration):
@@ -211,15 +199,6 @@ class TestSharedRecorderMaxDuration:
             def wait(self, timeout):
                 return True
 
-            def attach_session(self, *, record_duration):
-                if record_duration > self._record_duration:
-                    self._record_duration = record_duration
-                    self._buffer = np.zeros((int(self._sample_rate * record_duration), self._n_channels), dtype=np.float32)
-                return MagicMock(chunk_index=0, sample_index=0)
-
-            def get_buffer_from(self, snapshot):
-                return self._buffer
-
         monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
         monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
 
@@ -230,8 +209,8 @@ class TestSharedRecorderMaxDuration:
         mgr.start({"config_id": 2, "sn": "SN2"})
 
         assert mgr._recorders[1] is mgr._recorders[2]
-        assert shared_rec._record_duration == 5.0
-        assert shared_rec._buffer.shape == (44100 * 5, 2)
+        assert shared_rec.request_capture_calls == [3.0, 5.0]
+        assert len(shared_rec.capture_owners) == 2
         calls = [call.args[0] for call in bus.log.emit.call_args_list]
         assert not any("WARNING" in msg and "cannot extend buffer" in msg for msg in calls)
 
@@ -289,30 +268,15 @@ class TestSharedRecorderMaxDuration:
             },
         ]
 
-        class FakeAttachSnapshot:
-            def __init__(self, chunk_index, sample_index):
-                self.chunk_index = chunk_index
-                self.sample_index = sample_index
-
-        class FakeRecorder:
+        class FakeRecorder(_CaptureRecorderDoubleMixin):
             def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
                 self._sample_rate = sample_rate
                 self._n_channels = n_channels
                 self._record_duration = record_duration
                 self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
-                self.chunk_ready = _DummySignal()
                 self.recording_done = _DummySignal()
                 self.error_occurred = _DummySignal()
                 self._running = False
-                self.attach_calls = []
-                self._next_chunk_index = 0
-                self._next_sample_index = 0
-
-            def attach_session(self, *, record_duration):
-                self.attach_calls.append(record_duration)
-                self._record_duration = float(record_duration) + (self._next_sample_index / self._sample_rate)
-                self._buffer = np.zeros((int(self._sample_rate * self._record_duration), self._n_channels), dtype=np.float32)
-                return FakeAttachSnapshot(self._next_chunk_index, self._next_sample_index)
 
             def isRunning(self):
                 return self._running
@@ -326,21 +290,15 @@ class TestSharedRecorderMaxDuration:
             def wait(self, timeout):
                 return True
 
-            def get_buffer_from(self, snapshot):
-                raise AssertionError("not used in this test")
-
         monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
         monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
 
         mgr = TestManager(bus, services)
         mgr.start({"config_id": 1, "sn": "SN1"})
         shared_rec = mgr._recorders[1]
-        shared_rec._next_sample_index = int(shared_rec._sample_rate * 2.0)
-        shared_rec._next_chunk_index = 40
-
         mgr.start({"config_id": 2, "sn": "SN2"})
 
         assert mgr._recorders[1] is mgr._recorders[2]
-        assert shared_rec.attach_calls == [3.0, 5.0]
-        assert shared_rec._record_duration == 7.0
-        assert shared_rec._buffer.shape == (44100 * 7, 2)
+        assert shared_rec.request_capture_calls == [3.0, 5.0]
+        assert mgr._sessions[1].capture_attachment is shared_rec.capture_owners[0]
+        assert mgr._sessions[2].capture_attachment is shared_rec.capture_owners[1]

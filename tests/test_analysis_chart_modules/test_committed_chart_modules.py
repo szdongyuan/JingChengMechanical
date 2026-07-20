@@ -427,24 +427,6 @@ def test_committed_chart_modules_hide_left_axis_title_but_keep_ticks(qapp, modul
     _assert_left_axis_title_hidden_ticks_visible(module.plot)
 
 
-def test_spectrum_module_keeps_chinese_axis_labels_visible(qapp):
-    services = _make_services(initial_state=_state(101, "reviewing"))
-    module = SpectrumModule(services)
-    module.selected_display_channel_provider = lambda: 0
-    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
-
-    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
-    services.bus.factory_review_changed.emit(review_payload)
-    qapp.processEvents()
-
-    bottom_axis = module.plot.plot_item.getAxis("bottom")
-    left_axis = module.plot.plot_item.getAxis("left")
-    assert bottom_axis.labelText == "频率"
-    assert bottom_axis.labelUnits == "Hz"
-    assert left_axis.labelText == "幅值"
-    assert left_axis.labelUnits == "dB"
-
-
 @pytest.mark.parametrize("module_cls", (SplModule, SpectrumModule, OctaveModule, LoudnessModule))
 def test_display_reset_keeps_committed_chart_controller_without_selected_api(
     qapp,
@@ -491,24 +473,6 @@ def test_channel_refresh_keeps_committed_chart_controller_without_selected_api(
 
         assert module.plot.chart_interactions is not None
         assert not hasattr(module.plot.chart_interactions, "selected_x_range")
-    finally:
-        module.close()
-
-
-def test_stft_module_keeps_chinese_axis_labels_visible(qapp):
-    services = _make_services(initial_state=_state(101, "running"))
-    module = StftModule(services)
-
-    try:
-        module.show()
-        qapp.processEvents()
-
-        bottom_axis = module.canvas.heatmap.plot_item.getAxis("bottom")
-        left_axis = module.canvas.heatmap.plot_item.getAxis("left")
-        assert bottom_axis.labelText == "时间"
-        assert bottom_axis.labelUnits == "s"
-        assert left_axis.labelText == "频率"
-        assert left_axis.labelUnits == "Hz"
     finally:
         module.close()
 

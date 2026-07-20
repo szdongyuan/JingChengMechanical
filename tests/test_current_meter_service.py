@@ -12,6 +12,7 @@ from app.service.current_meter_service import (
     current_trace_display_at_time,
     decode_current_registers,
     normalize_current_meter_config,
+    rebase_current_samples,
     validate_current_meter_config,
 )
 
@@ -360,6 +361,12 @@ def test_build_current_trace_payload_omits_unit_for_generic_float32_config():
 
 def test_current_meter_collector_poll_once_records_decoded_current():
     client = _ClientStub([0x4148, 0x0000])
+    clock_calls = []
+
+    def completed_clock():
+        clock_calls.append(None)
+        return 1.25
+
     collector = CurrentMeterCollector(
         {
             "enabled": True,
@@ -369,7 +376,7 @@ def test_current_meter_collector_poll_once_records_decoded_current():
             "unit_id": 7,
             "data_type": "float32",
         },
-        time_func=lambda: 1.25,
+        time_func=completed_clock,
     )
     collector._start_time = 1.0
 
@@ -377,7 +384,71 @@ def test_current_meter_collector_poll_once_records_decoded_current():
 
     samples = collector.samples()
     assert client.calls == [(8, 2, 7)]
-    assert samples == [CurrentSample(time_sec=0.25, current_a=pytest.approx(0.0125))]
+    assert clock_calls == [None]
+    assert samples == [
+        CurrentSample(
+            time_sec=0.25,
+            current_a=pytest.approx(0.0125),
+            monotonic_time=1.25,
+        )
+    ]
+
+
+def test_current_meter_collector_failed_decode_does_not_take_completion_clock():
+    client = _ClientStub([])
+    clock_calls = []
+    collector = CurrentMeterCollector(
+        {"enabled": True, "host": "192.168.1.20"},
+        time_func=lambda: clock_calls.append(None),
+    )
+    collector._start_time = 1.0
+
+    collector._poll_once(client)
+
+    assert clock_calls == []
+    assert collector.samples() == []
+
+
+def test_rebase_current_samples_filters_strictly_and_preserves_absolute_time():
+    source = [
+        CurrentSample(0.01, 1.0, 10.049),
+        CurrentSample(0.02, 2.0, 10.050),
+        CurrentSample(0.08, 3.0, 10.125),
+    ]
+
+    rebased = rebase_current_samples(source, current_epoch=10.050)
+
+    assert [(sample.time_sec, sample.current_a) for sample in rebased] == [
+        (pytest.approx(0.0), 2.0),
+        (pytest.approx(0.075), 3.0),
+    ]
+    assert [sample.monotonic_time for sample in rebased] == [10.050, 10.125]
+    assert rebased[0] is not source[1]
+    assert rebased[1] is not source[2]
+
+
+def test_rebase_current_samples_preserves_unsorted_acquisition_order():
+    source = [
+        CurrentSample(0.30, 3.0, 10.30),
+        CurrentSample(0.10, 1.0, 10.10),
+        CurrentSample(0.20, 2.0, 10.20),
+    ]
+
+    rebased = rebase_current_samples(source, current_epoch=10.0)
+
+    assert [sample.current_a for sample in rebased] == [3.0, 1.0, 2.0]
+    assert [sample.time_sec for sample in rebased] == pytest.approx([0.30, 0.10, 0.20])
+
+
+def test_rebase_current_samples_excludes_untimestamped_and_never_fabricates_zero():
+    assert rebase_current_samples(
+        [
+            CurrentSample(0.0, 1.0),
+            CurrentSample(0.1, 2.0, 9.99),
+        ],
+        current_epoch=10.0,
+    ) == []
+    assert rebase_current_samples([], current_epoch=10.0) == []
 
 
 def test_current_meter_collector_sample_callback_receives_snapshot_after_storage():
@@ -398,7 +469,13 @@ def test_current_meter_collector_sample_callback_receives_snapshot_after_storage
     collector._poll_once(client)
 
     samples = collector.samples()
-    assert samples == [CurrentSample(time_sec=0.25, current_a=pytest.approx(1.642))]
+    assert samples == [
+        CurrentSample(
+            time_sec=0.25,
+            current_a=pytest.approx(1.642),
+            monotonic_time=1.25,
+        )
+    ]
     assert len(callback_calls) == 1
     sample, snapshot, samples_seen_inside_callback = callback_calls[0]
     assert sample == samples[0]
@@ -420,7 +497,11 @@ def test_current_meter_collector_without_sample_callback_does_not_snapshot_histo
     collector._poll_once(client)
 
     assert len(samples) == 1
-    assert samples[0] == CurrentSample(time_sec=0.25, current_a=pytest.approx(1.642))
+    assert samples[0] == CurrentSample(
+        time_sec=0.25,
+        current_a=pytest.approx(1.642),
+        monotonic_time=1.25,
+    )
     assert not samples.snapshot_requested
 
 
@@ -448,9 +529,9 @@ def test_current_meter_collector_sample_callback_error_is_logged_once_and_sampli
     collector._poll_once(client)
 
     assert collector.samples() == [
-        CurrentSample(time_sec=0.25, current_a=pytest.approx(1.642)),
-        CurrentSample(time_sec=0.5, current_a=pytest.approx(1.642)),
-        CurrentSample(time_sec=0.75, current_a=pytest.approx(1.642)),
+        CurrentSample(0.25, pytest.approx(1.642), 1.25),
+        CurrentSample(0.5, pytest.approx(1.642), 1.5),
+        CurrentSample(0.75, pytest.approx(1.642), 1.75),
     ]
     assert callback_invocations == 3
     assert logs == ["电流表样本回调失败: callback boom"]
@@ -472,7 +553,9 @@ def test_current_meter_collector_poll_once_uses_input_register_read_by_default()
     assert client.calls == [(0, 1, 1)]
     assert client.input_calls == [(0, 1, 1)]
     assert client.holding_calls == []
-    assert collector.samples() == [CurrentSample(time_sec=0.25, current_a=pytest.approx(1.642))]
+    assert collector.samples() == [
+        CurrentSample(0.25, pytest.approx(1.642), 1.25)
+    ]
 
 
 def test_current_meter_collector_poll_once_records_from_holding_registers_with_keyword_count():
@@ -492,7 +575,9 @@ def test_current_meter_collector_poll_once_records_from_holding_registers_with_k
     assert client.calls == [(0, 1, 1)]
     assert client.holding_calls == [(0, 1, 1)]
     assert client.input_calls == []
-    assert collector.samples() == [CurrentSample(time_sec=0.25, current_a=pytest.approx(1.642))]
+    assert collector.samples() == [
+        CurrentSample(0.25, pytest.approx(1.642), 1.25)
+    ]
 
 
 def test_current_meter_collector_poll_once_falls_back_to_unit_keyword_and_catches_unit_read_error():
@@ -533,7 +618,7 @@ def test_current_meter_collector_poll_once_supports_device_id_kwarg_read():
 
     assert client.calls == [(0, 1, 1)]
     assert collector.samples() == [
-        CurrentSample(time_sec=0.25, current_a=pytest.approx(1.642))
+        CurrentSample(0.25, pytest.approx(1.642), 1.25)
     ]
 
 
