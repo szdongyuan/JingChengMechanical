@@ -3,12 +3,13 @@ from __future__ import annotations
 import json
 import re
 
-from model.device_table import DeviceTable
+from consts.time_consts import now_str
+from model.input_hardware_table import InputHardwareTable
 
 
 class InputCalibrationService:
     """
-    输入校准服务：录音 -> SPL/偏差计算 -> 持久化（DB: device_table.mic_cal）。
+    输入校准服务：录音 -> SPL/偏差计算 -> 持久化到指定输入硬件。
     约定：
     - UI 只负责展示/交互
     - 录音/计算/读写配置放到 service
@@ -16,7 +17,9 @@ class InputCalibrationService:
     def __init__(self, bus=None):
         self.bus = bus
 
-    def save_mic_cal_data(self, selected_channel, deviation_lineedit_text):
+    def save_mic_cal_data(
+        self, hardware_id, selected_channel, deviation_lineedit_text
+    ):
         # 只允许 int/float（可带正负号、小数点），允许可选的 "Pa/V" 后缀
         text = (deviation_lineedit_text or "").strip()
         if text.endswith("Pa/V"):
@@ -25,9 +28,13 @@ class InputCalibrationService:
             return False, "偏差值只能是数字（int/float）"
         deviation_match = text
 
-        row = DeviceTable.select().where(DeviceTable.id == 1).first()
+        row = (
+            InputHardwareTable.select()
+            .where(InputHardwareTable.hardware_id == int(hardware_id))
+            .first()
+        )
         if not row:
-            return False, "device_table 中未找到 id=1 的配置行"
+            return False, "未找到所选输入设备"
 
         mic_cal_dict = json.loads(row.mic_cal or "{}")
         if selected_channel not in mic_cal_dict:
@@ -36,12 +43,15 @@ class InputCalibrationService:
 
         mic_cal_str = json.dumps(mic_cal_dict, ensure_ascii=False, indent=4)
         updated = (
-            DeviceTable.update(mic_cal=mic_cal_str)
-            .where(DeviceTable.id == 1)
+            InputHardwareTable.update(
+                mic_cal=mic_cal_str,
+                updated_time=now_str(),
+            )
+            .where(InputHardwareTable.hardware_id == int(hardware_id))
             .execute()
         )
         if updated == 0:
-            return False, "保存失败：device_table.id=1 未更新"
+            return False, "保存失败：输入设备未更新"
         return True, deviation_match
 
 

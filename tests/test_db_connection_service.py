@@ -19,11 +19,13 @@ EXPECTED_RUNTIME_TABLES = {
     "test_config_ai_binding_table",
     "ai_execution_table",
     "device_table",
+    "input_hardware_table",
     "audio_data_table",
     "users_table",
     "system_info_table",
     "training_model_table",
     "plc_table",
+    "plc_field_offset_table",
     "historical_metric_cache_table",
 }
 
@@ -86,8 +88,29 @@ CHANNEL_CONFIG_COLUMN_SQL = {
 
 
 TEST_CONFIG_COLUMN_SQL = {
+    "input_hardware_device_id": "INTEGER DEFAULT NULL",
     "vibration_view_channel_index": "INTEGER DEFAULT NULL",
     "result_dashboard_layout": "TEXT DEFAULT NULL",
+    "current_meter_enabled": "INTEGER NOT NULL DEFAULT 0",
+    "current_meter_source": "TEXT NOT NULL DEFAULT 'modbus_tcp'",
+    "current_meter_host": "TEXT DEFAULT NULL",
+    "current_meter_port": "INTEGER NOT NULL DEFAULT 502",
+    "current_meter_unit_id": "INTEGER NOT NULL DEFAULT 1",
+    "current_meter_register_type": "TEXT NOT NULL DEFAULT 'input'",
+    "current_meter_register_address": "INTEGER NOT NULL DEFAULT 0",
+    "current_meter_register_count": "INTEGER NOT NULL DEFAULT 1",
+    "current_meter_data_type": "TEXT NOT NULL DEFAULT 'uint16'",
+    "current_meter_byte_order": "TEXT NOT NULL DEFAULT 'big'",
+    "current_meter_word_order": "TEXT NOT NULL DEFAULT 'big'",
+    "current_meter_scale": "REAL NOT NULL DEFAULT 0.001",
+    "current_meter_offset": "REAL NOT NULL DEFAULT 0.0",
+    "current_meter_poll_interval_ms": "INTEGER NOT NULL DEFAULT 200",
+    "current_meter_timeout_ms": "INTEGER NOT NULL DEFAULT 1000",
+}
+
+
+PLC_FIELD_OFFSET_COLUMN_SQL = {
+    "current_value_offset": "TEXT DEFAULT NULL",
 }
 
 
@@ -152,6 +175,23 @@ def _create_historical_metric_cache_indexes(tmp_db: SqliteDatabase) -> None:
 
 
 def _create_table(tmp_db: SqliteDatabase, table_name: str) -> None:
+    if table_name == "input_hardware_table":
+        tmp_db.execute_sql(
+            """
+            CREATE TABLE input_hardware_table (
+                hardware_id INTEGER PRIMARY KEY,
+                alias TEXT NOT NULL,
+                device_name TEXT NOT NULL,
+                hostapi TEXT NOT NULL,
+                samplerate REAL NOT NULL,
+                channel_count INTEGER NOT NULL,
+                mic_cal TEXT NOT NULL,
+                created_time TEXT NOT NULL,
+                updated_time TEXT NOT NULL
+            )
+            """
+        )
+        return
     if table_name == "test_config_table":
         column_sql = ", ".join(
             f"{name} {definition}"
@@ -177,6 +217,15 @@ def _create_table(tmp_db: SqliteDatabase, table_name: str) -> None:
         )
         tmp_db.execute_sql(f"CREATE TABLE {table_name} ({column_sql})")
         _create_historical_metric_cache_indexes(tmp_db)
+        return
+    if table_name == "plc_field_offset_table":
+        column_sql = ", ".join(
+            f"{name} {definition}"
+            for name, definition in PLC_FIELD_OFFSET_COLUMN_SQL.items()
+        )
+        tmp_db.execute_sql(
+            f"CREATE TABLE {table_name} (id INTEGER PRIMARY KEY, {column_sql})"
+        )
         return
     tmp_db.execute_sql(f"CREATE TABLE {table_name} (id INTEGER PRIMARY KEY)")
 
@@ -511,6 +560,83 @@ def test_connect_rejects_missing_vibration_view_column_without_mutating(
         assert check_db.execute_sql(
             "SELECT id FROM test_config_table"
         ).fetchall() == [(1,)]
+    finally:
+        check_db.close()
+
+
+def test_connect_rejects_missing_current_meter_source_without_mutating(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "jingchen.db"
+    tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    tmp_db.connect()
+    for table_name in sorted(EXPECTED_RUNTIME_TABLES - {"test_config_table"}):
+        _create_table(tmp_db, table_name)
+    columns_without_source = {
+        name: definition
+        for name, definition in TEST_CONFIG_COLUMN_SQL.items()
+        if name != "current_meter_source"
+    }
+    column_sql = ", ".join(
+        f"{name} {definition}"
+        for name, definition in columns_without_source.items()
+    )
+    tmp_db.execute_sql(
+        f"CREATE TABLE test_config_table (id INTEGER PRIMARY KEY, {column_sql})"
+    )
+    tmp_db.execute_sql("INSERT INTO test_config_table (id) VALUES (1)")
+    tmp_db.close()
+    monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    with pytest.raises(DatabaseStartupError, match="current_meter_source"):
+        svc_mod.DbConnectionService().connect()
+
+    check_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    check_db.connect()
+    try:
+        assert "current_meter_source" not in _table_column_names(
+            check_db, "test_config_table"
+        )
+        assert check_db.execute_sql(
+            "SELECT id FROM test_config_table"
+        ).fetchall() == [(1,)]
+    finally:
+        check_db.close()
+
+
+def test_connect_rejects_missing_plc_current_value_offset_without_mutating(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "jingchen.db"
+    tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    tmp_db.connect()
+    for table_name in sorted(
+        EXPECTED_RUNTIME_TABLES - {"plc_field_offset_table"}
+    ):
+        _create_table(tmp_db, table_name)
+    tmp_db.execute_sql(
+        "CREATE TABLE plc_field_offset_table (plc_id INTEGER PRIMARY KEY)"
+    )
+    tmp_db.execute_sql("INSERT INTO plc_field_offset_table (plc_id) VALUES (9)")
+    tmp_db.close()
+    monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    with pytest.raises(DatabaseStartupError, match="current_value_offset"):
+        svc_mod.DbConnectionService().connect()
+
+    check_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    check_db.connect()
+    try:
+        assert _table_column_names(check_db, "plc_field_offset_table") == [
+            "plc_id"
+        ]
+        assert check_db.execute_sql(
+            "SELECT plc_id FROM plc_field_offset_table"
+        ).fetchall() == [(9,)]
     finally:
         check_db.close()
 

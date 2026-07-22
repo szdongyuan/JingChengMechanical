@@ -37,6 +37,7 @@ from app.service.analysis.session_capture import CaptureNotAcceptedError
 from app.service.analysis.test_session import ManualLabelUpdateResult, TestSession
 from app.service.current_meter_service import (
     CurrentMeterCollector,
+    PlcCurrentCollector,
     build_current_trace_payload,
     normalize_current_meter_config,
     rebase_current_samples,
@@ -626,7 +627,7 @@ class TestManager(QObject):
         from app.service.analysis import imported_audio
 
         config = self._services.config_service.load_config(request.config_id)
-        device_info = self._services.hss_service.load_io_devices()
+        device_info = self._load_input_device_for_config(config)
         mic_cal = device_info.get("mic_cal", {}) if isinstance(device_info, dict) else {}
         if not isinstance(mic_cal, dict):
             mic_cal = {}
@@ -704,7 +705,7 @@ class TestManager(QObject):
             )
 
         try:
-            device_info = self._services.hss_service.load_io_devices()
+            device_info = self._load_input_device_for_config(config)
         except Exception as exc:
             return self._fail_start_exception_before_acceptance(
                 request_id,
@@ -726,6 +727,14 @@ class TestManager(QObject):
             return self._fail_start_before_acceptance(
                 request_id,
                 "配置未选择输入设备，请先在「配置」页面选择输入设备并保存。",
+            )
+
+        availability_error = self._input_hardware_availability_error(config)
+        if availability_error is not None:
+            self._bus.log.emit(f"[TestManager] ERROR {availability_error}")
+            return self._fail_start_before_acceptance(
+                request_id,
+                availability_error,
             )
 
         mic_cal = device_info.get("mic_cal", {})
@@ -2230,6 +2239,25 @@ class TestManager(QObject):
         self._last_start_error = message
         self._clear_pending_factory_start(request_id)
         return False
+
+    def _load_input_device_for_config(self, config: dict) -> dict:
+        """Resolve the complete managed input device bound to this config."""
+        service = self._services.hss_service
+        # Test doubles from older unit tests expose only load_io_devices; real
+        # runtime services always use the new stable hardware-ID binding.
+        managed_loader = getattr(type(service), "load_input_device_for_config", None)
+        if callable(managed_loader):
+            return service.load_input_device_for_config(config)
+        return service.load_io_devices()
+
+    def _input_hardware_availability_error(self, config: dict) -> str | None:
+        service = self._services.hss_service
+        checker = getattr(
+            type(service), "input_hardware_availability_error", None
+        )
+        if not callable(checker):
+            return None
+        return service.input_hardware_availability_error(config)
 
     @classmethod
     def _config_input_device_fields_missing(cls, config: dict) -> bool:
@@ -4614,6 +4642,15 @@ class TestManager(QObject):
                 return
         if not current_config["enabled"]:
             return
+        plc_id = None
+        if current_config["source"] == "plc":
+            plc_id = self._as_non_bool_int(config.get("plc_id"))
+            if plc_id is None:
+                self._bus.log.emit(
+                    f"[CurrentMeter] config={config_id}: "
+                    "PLC 电流已启用，但测试配置未绑定有效 PLC"
+                )
+                return
         with self._lifecycle_lock:
             if (
                 self._sessions.get(config_id) is not session
@@ -4653,13 +4690,24 @@ class TestManager(QObject):
                 )
             )
         try:
-            collector = CurrentMeterCollector(
-                current_config,
-                log_callback=lambda message, cid=config_id: self._bus.log.emit(
+            collector_kwargs = {
+                "log_callback": lambda message, cid=config_id: self._bus.log.emit(
                     f"[CurrentMeter] config={cid}: {message}"
                 ),
-                sample_callback=sample_callback,
-            )
+                "sample_callback": sample_callback,
+            }
+            if current_config["source"] == "plc":
+                collector = PlcCurrentCollector(
+                    current_config,
+                    bus=self._bus,
+                    plc_id=plc_id,
+                    **collector_kwargs,
+                )
+            else:
+                collector = CurrentMeterCollector(
+                    current_config,
+                    **collector_kwargs,
+                )
         except BaseException:
             with self._lifecycle_lock:
                 self._request_current_publication_gate_retirement_locked(generation)

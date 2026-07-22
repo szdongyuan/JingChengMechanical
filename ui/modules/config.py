@@ -63,6 +63,7 @@ _LEGACY_STFT_SCORE_DEFAULTS = (
 )
 _LEGACY_STFT_SCORE_PROPERTY = "legacy_stft_score_fields"
 _PRESERVE_PLC_SELECTION = object()
+_CURRENT_METER_SOURCES = frozenset({"modbus_tcp", "plc"})
 
 
 class _NoWheelSpinBox(QDoubleSpinBox):
@@ -568,7 +569,7 @@ class ConfigModule(QWidget):
         audio_lay.setVerticalSpacing(8)
 
         self.combo_input_dev = _NoWheelComboBox()
-        audio_lay.addRow("输入设备", self.combo_input_dev)
+        audio_lay.addRow("受管输入硬件", self.combo_input_dev)
 
         self.combo_output_dev = _NoWheelComboBox()
         audio_lay.addRow("监听设备", self.combo_output_dev)
@@ -600,7 +601,7 @@ class ConfigModule(QWidget):
             launcher_layout=top_launcher_layout,
             launcher_index=top_launcher_index,
             section_id="audio_vibration_hardware",
-            title="音频/振动硬件设置",
+            title="输入硬件与监听设置",
             content=audio_form,
             default_position_anchor=top_launcher_panel,
             button_object_name="open_audio_vibration_hardware_card",
@@ -616,6 +617,11 @@ class ConfigModule(QWidget):
 
         self.chk_current_meter_enabled = QCheckBox("启用电流表")
         cm_lay.addRow("电流表", self.chk_current_meter_enabled)
+
+        self.combo_current_meter_source = _NoWheelComboBox()
+        self.combo_current_meter_source.addItem("Modbus TCP", "modbus_tcp")
+        self.combo_current_meter_source.addItem("PLC", "plc")
+        cm_lay.addRow("电流来源", self.combo_current_meter_source)
 
         self.ed_current_meter_host = QLineEdit()
         self.ed_current_meter_host.setPlaceholderText("例如 192.168.1.20")
@@ -690,6 +696,21 @@ class ConfigModule(QWidget):
         self.spin_current_meter_timeout_ms.setSuffix(" ms")
         cm_lay.addRow("电流表超时", self.spin_current_meter_timeout_ms)
 
+        self._current_meter_modbus_controls = (
+            self.ed_current_meter_host,
+            self.spin_current_meter_port,
+            self.spin_current_meter_unit_id,
+            self.combo_current_meter_register_type,
+            self.spin_current_meter_register_address,
+            self.combo_current_meter_data_type,
+            self.combo_current_meter_byte_order,
+            self.combo_current_meter_word_order,
+            self.spin_current_meter_scale,
+            self.spin_current_meter_offset,
+            self.spin_current_meter_poll_interval_ms,
+            self.spin_current_meter_timeout_ms,
+        )
+
         self._register_top_level_config_card(
             launcher_layout=top_launcher_layout,
             launcher_index=top_launcher_index,
@@ -699,7 +720,7 @@ class ConfigModule(QWidget):
             default_position_anchor=top_launcher_panel,
             button_object_name="open_current_meter_card",
             dialog_object_name="top_level_current_meter_card_dialog",
-            preferred_size=(380, 640),
+            preferred_size=(380, 680),
         )
         top_launcher_index += 1
 
@@ -826,6 +847,9 @@ class ConfigModule(QWidget):
         self.chk_ai_enabled.toggled.connect(self._mark_ai_binding_dirty)
         self.combo_ai_toolchain.currentIndexChanged.connect(self._mark_ai_binding_dirty)
         self.spin_ai_timeout.valueChanged.connect(self._mark_ai_binding_dirty)
+        self.combo_current_meter_source.currentIndexChanged.connect(
+            self._refresh_current_meter_source_state
+        )
         self.combo_current_meter_register_type.currentIndexChanged.connect(
             self._refresh_current_meter_offset_label
         )
@@ -854,37 +878,85 @@ class ConfigModule(QWidget):
             plc_changed.connect(self._on_plc_changed)
 
     def _populate_devices(self):
-        """Populate input/output device combos from hss_service."""
-        try:
-            devices, hostapis = self.services.hss_service.query_devices_and_hostapis(refresh=False)
-        except Exception:
-            return
-
-        hostapi_names = {}
-        for i, api in enumerate(hostapis):
-            hostapi_names[i] = api.get("name", "N/A")
-
+        """Populate the input combo from the managed hardware registry."""
         self.combo_input_dev.clear()
         self.combo_input_dev.addItem("（未选择）", None)
         self.combo_output_dev.clear()
-        self.combo_output_dev.addItem("（未选择）", None)
-
-        for dev in devices:
-            hostapi_idx = dev.get("hostapi", 0)
-            hostapi_value = hostapi_names.get(hostapi_idx, "N/A")
-            hostapi_display = "未知" if hostapi_value == "N/A" else hostapi_value
-            label = f"{dev.get('name', '?')} ({hostapi_display})"
-            dev_info = {
-                "name": dev.get("name", ""),
-                "hostapi": hostapi_value,
-                "default_samplerate": dev.get("default_samplerate"),
-                "max_input_channels": dev.get("max_input_channels", 0),
-                "max_output_channels": dev.get("max_output_channels", 0),
+        self.combo_output_dev.addItem("（不使用输出设备）", None)
+        managed_loader = getattr(
+            type(self.services.hss_service), "list_input_hardware", None
+        )
+        if not callable(managed_loader):
+            # Unit-test adapters and external integrations predating the
+            # registry can still provide a sounddevice-shaped transient list.
+            try:
+                devices, hostapis = (
+                    self.services.hss_service.query_devices_and_hostapis(
+                        refresh=False
+                    )
+                )
+            except Exception:
+                return
+            for fallback_id, device in enumerate(devices, start=1):
+                hostapi_index = int(device.get("hostapi", 0) or 0)
+                try:
+                    hostapi = hostapis[hostapi_index].get("name", "N/A")
+                except Exception:
+                    hostapi = "N/A"
+                hostapi_display = "未知" if hostapi == "N/A" else hostapi
+                payload = {
+                    "hardware_id": fallback_id,
+                    "alias": device.get("name", ""),
+                    "name": device.get("name", ""),
+                    "hostapi": hostapi,
+                    "default_samplerate": device.get("default_samplerate"),
+                    "max_input_channels": device.get("max_input_channels", 0),
+                    "max_output_channels": device.get("max_output_channels", 0),
+                }
+                label = f"{device.get('name', '?')} ({hostapi_display})"
+                if int(device.get("max_input_channels", 0) or 0) > 0:
+                    self.combo_input_dev.addItem(label, payload)
+                if int(device.get("max_output_channels", 0) or 0) > 0:
+                    self.combo_output_dev.addItem(label, payload)
+            return
+        try:
+            hardware_items = self.services.hss_service.list_input_hardware()
+        except Exception:
+            return
+        for hardware in hardware_items:
+            label = (
+                f"{hardware['alias']} · {hardware['channel_count']} 通道 "
+                f"({hardware['hostapi']})"
+            )
+            self.combo_input_dev.addItem(label, hardware)
+        try:
+            devices, hostapis = (
+                self.services.hss_service.query_devices_and_hostapis(
+                    refresh=False
+                )
+            )
+        except Exception:
+            devices, hostapis = [], []
+        for device in devices:
+            if int(device.get("max_output_channels", 0) or 0) <= 0:
+                continue
+            hostapi_index = int(device.get("hostapi", 0) or 0)
+            try:
+                hostapi = hostapis[hostapi_index].get("name", "N/A")
+            except Exception:
+                hostapi = "N/A"
+            hostapi_display = "未知" if hostapi == "N/A" else hostapi
+            payload = {
+                "name": device.get("name", ""),
+                "hostapi": hostapi,
+                "default_samplerate": device.get("default_samplerate"),
+                "max_input_channels": device.get("max_input_channels", 0),
+                "max_output_channels": device.get("max_output_channels", 0),
             }
-            if dev.get("max_input_channels", 0) > 0:
-                self.combo_input_dev.addItem(label, dev_info)
-            if dev.get("max_output_channels", 0) > 0:
-                self.combo_output_dev.addItem(label, dev_info)
+            self.combo_output_dev.addItem(
+                f"{device.get('name', '?')} ({hostapi_display})",
+                payload,
+            )
 
     @staticmethod
     def _format_plc_option_label(plc_row: PlcTable) -> str:
@@ -2323,18 +2395,31 @@ class ConfigModule(QWidget):
         self._populate_devices()
         self._refresh_plc_selector(data.get("plc_id"))
 
-        saved_input = data.get("input_device_name")
-        saved_input_api = data.get("input_device_hostapi")
-        saved_input_sr = data.get("input_device_samplerate")
+        saved_hardware_id = data.get("input_hardware_device_id")
+        self.combo_input_dev.setCurrentIndex(0)
+        if saved_hardware_id is not None:
+            for index in range(self.combo_input_dev.count()):
+                item = self.combo_input_dev.itemData(index)
+                if (
+                    isinstance(item, dict)
+                    and item.get("hardware_id") == saved_hardware_id
+                ):
+                    self.combo_input_dev.setCurrentIndex(index)
+                    break
+        elif not callable(
+            getattr(type(self.services.hss_service), "list_input_hardware", None)
+        ):
+            self._match_device_combo(
+                self.combo_input_dev,
+                data.get("input_device_name"),
+                data.get("input_device_hostapi"),
+                data.get("input_device_samplerate"),
+            )
         self._match_device_combo(
-            self.combo_input_dev, saved_input, saved_input_api, saved_input_sr
-        )
-
-        saved_output = data.get("output_device_name")
-        saved_output_api = data.get("output_device_hostapi")
-        saved_output_sr = data.get("output_device_samplerate")
-        self._match_device_combo(
-            self.combo_output_dev, saved_output, saved_output_api, saved_output_sr
+            self.combo_output_dev,
+            data.get("output_device_name"),
+            data.get("output_device_hostapi"),
+            data.get("output_device_samplerate"),
         )
 
         self._rebuild_channel_checkboxes_silent()
@@ -2365,8 +2450,13 @@ class ConfigModule(QWidget):
         self._populate_current_meter(data.get("current_meter"))
 
     def _populate_current_meter(self, current_meter: dict | None) -> None:
-        current_meter = normalize_current_meter_config(current_meter)
+        source_config = current_meter if isinstance(current_meter, dict) else {}
+        source = str(source_config.get("source") or "").strip().lower()
+        if source not in _CURRENT_METER_SOURCES:
+            source = "modbus_tcp"
+        current_meter = normalize_current_meter_config(source_config)
         self.chk_current_meter_enabled.setChecked(bool(current_meter.get("enabled")))
+        self._set_combo_current_data(self.combo_current_meter_source, source)
         self.ed_current_meter_host.setText(str(current_meter.get("host") or ""))
         self.spin_current_meter_port.setValue(int(current_meter.get("port")))
         self.spin_current_meter_unit_id.setValue(int(current_meter.get("unit_id")))
@@ -2396,6 +2486,12 @@ class ConfigModule(QWidget):
             int(current_meter["timeout_ms"])
         )
         self._refresh_current_meter_offset_label()
+        self._refresh_current_meter_source_state()
+
+    def _refresh_current_meter_source_state(self, *_args) -> None:
+        modbus_enabled = self.combo_current_meter_source.currentData() != "plc"
+        for control in self._current_meter_modbus_controls:
+            control.setEnabled(modbus_enabled)
 
     def _set_current_meter_offset_label(self, current_meter: dict | None) -> None:
         unit = current_meter_display_unit(current_meter)
@@ -2678,6 +2774,9 @@ class ConfigModule(QWidget):
 
     def _collect_data(self) -> dict:
         input_dev = self.combo_input_dev.currentData()
+        managed_hardware_mode = callable(
+            getattr(type(self.services.hss_service), "list_input_hardware", None)
+        )
         output_dev = self.combo_output_dev.currentData()
 
         selected_channels = self._selected_channels_from_editor()
@@ -2707,6 +2806,7 @@ class ConfigModule(QWidget):
             "monitor_gain_db": float(self.spin_monitor_gain_db.value()),
             "current_meter": {
                 "enabled": self.chk_current_meter_enabled.isChecked(),
+                "source": self.combo_current_meter_source.currentData() or "modbus_tcp",
                 "host": self.ed_current_meter_host.text().strip(),
                 "port": self.spin_current_meter_port.value(),
                 "unit_id": self.spin_current_meter_unit_id.value(),
@@ -2730,6 +2830,12 @@ class ConfigModule(QWidget):
             "channels": [],
             "golden_editor_state": {},
         }
+        if managed_hardware_mode:
+            data["input_hardware_device_id"] = (
+                input_dev.get("hardware_id")
+                if isinstance(input_dev, dict)
+                else None
+            )
 
         for container in self._channel_containers:
             data["channels"].append(self._collect_channel_data(container))
@@ -3113,7 +3219,7 @@ class ConfigModule(QWidget):
             return False
 
     def _on_hardware_changed(self):
-        """Global hardware changed — refresh device combos, preserve current selection."""
+        """Managed input hardware changed; preserve the stable hardware ID."""
         if self._current_config_id is None:
             return
 
@@ -3129,12 +3235,15 @@ class ConfigModule(QWidget):
 
         # Restore previous selections
         if cur_input and isinstance(cur_input, dict):
-            self._match_device_combo(
-                self.combo_input_dev,
-                cur_input.get("name"),
-                cur_input.get("hostapi"),
-                cur_input.get("default_samplerate"),
-            )
+            hardware_id = cur_input.get("hardware_id")
+            for index in range(self.combo_input_dev.count()):
+                candidate = self.combo_input_dev.itemData(index)
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get("hardware_id") == hardware_id
+                ):
+                    self.combo_input_dev.setCurrentIndex(index)
+                    break
         if cur_output and isinstance(cur_output, dict):
             self._match_device_combo(
                 self.combo_output_dev,

@@ -83,7 +83,7 @@ class HistoricalMetricReportService:
             if cancel_check is not None and cancel_check():
                 raise ReportCanceled()
 
-            mic_cal = self._cache.current_mic_calibration()
+            mic_cal = self._cache.mic_calibration_for_record(record)
             signature = self._cache.source_signature_for_record(
                 record,
                 mic_cal=mic_cal,

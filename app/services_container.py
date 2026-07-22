@@ -171,6 +171,9 @@ class EventBus(QObject):
     result_changed = pyqtSignal(dict)
     # 刷新通道
     refresh_channels = pyqtSignal()
+    # 受管输入硬件资产发生变化 / 当前在硬件页选择的设备
+    input_hardware_changed = pyqtSignal()
+    input_hardware_selected = pyqtSignal(int)
     # 写入plc信号：plc_id, test_result
     write_test_result_sign = pyqtSignal(int, dict)
     # 写入 PLC 限值信号：plc_id, limit_values
@@ -190,6 +193,7 @@ class EventBus(QObject):
     octave_updated = pyqtSignal(int, str, int, object)   # config_id, run_id, channel_idx, OctaveFrame
     fft_updated = pyqtSignal(int, str, int, object)      # config_id, run_id, channel_idx, FftFrame
     current_trace_updated = pyqtSignal(int, str, object)  # config_id, run_id, current_trace payload
+    plc_current_sampled = pyqtSignal(int, float, float)  # plc_id, monotonic_time, current_a
 
     # Session lifecycle
     recording_progress = pyqtSignal(int, float)     # config_id, elapsed_sec

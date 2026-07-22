@@ -81,6 +81,11 @@ class MainWindow(QMainWindow):
         self.display_channel_by_config_id: dict[int, int] = {}
         self._last_selected_display_channel: int | None = None
         self._review_identity_by_config_id: dict[int, tuple] = {}
+        self._selected_plc_bindings: tuple[int, ...] = ()
+        self._selected_config_count = 0
+        self._selected_unbound_plc_count = 0
+        self._selected_config_load_error_count = 0
+        self._selected_plc_tooltip = ""
         self._current_main_tab_index = self._TEST_PAGE_INDEX
         self._pending_guarded_tab_index: int | None = None
         self._reverting_main_tab_change = False
@@ -105,6 +110,8 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.tab, 1)
 
         self._connect_bus_signals()
+        self._reload_selected_plc_bindings()
+        self._refresh_plc_state_labels()
 
         # 页面：测试/数据管理/配置/AI管理/硬件
         self.tab.addWidget(self.build_test_page())
@@ -243,12 +250,10 @@ class MainWindow(QMainWindow):
         plc_state_lay = QHBoxLayout(plc_state_bar)
         plc_state_lay.setContentsMargins(66, 0, 0, 0)
         plc_state_lay.setSpacing(12)
-        self.plc1_state_label = QLabel("PLC1：未连接")
-        self.plc2_state_label = QLabel("PLC2：未连接")
+        self.selected_plc_state_label = QLabel("PLC：未选择配置")
         self.process_plc_state_label = QLabel("工艺：未连接")
         for label in (
-            self.plc1_state_label,
-            self.plc2_state_label,
+            self.selected_plc_state_label,
             self.process_plc_state_label,
         ):
             label.setStyleSheet("color: #475569; font-size: 12px;")
@@ -359,20 +364,100 @@ class MainWindow(QMainWindow):
             plc_states = {}
 
         process_state = getattr(self.services, "process_plc_state", "未连接")
-        plc1_state = plc_states.get(1, "未连接")
-        plc2_state = plc_states.get(2, "未连接")
-        self._set_plc_state_label(self.plc1_state_label, "PLC1", plc1_state)
-        self._set_plc_state_label(self.plc2_state_label, "PLC2", plc2_state)
+        self.selected_plc_state_label.setText(
+            self._selected_plc_status_html(
+                self._selected_plc_bindings,
+                plc_states,
+                selected_config_count=self._selected_config_count,
+                unbound_config_count=self._selected_unbound_plc_count,
+                load_error_count=self._selected_config_load_error_count,
+            )
+        )
+        self.selected_plc_state_label.setToolTip(self._selected_plc_tooltip)
         self._set_plc_state_label(self.process_plc_state_label, "工艺", process_state)
+
+    def _reload_selected_plc_bindings(self) -> None:
+        selected_config_ids = tuple(self._factory_state.selected_config_ids)
+        config_service = getattr(self.services, "config_service", None)
+        load_config = getattr(config_service, "load_config", None)
+
+        plc_ids: list[int] = []
+        seen_plc_ids: set[int] = set()
+        unbound_count = 0
+        load_error_count = 0
+        tooltip_rows: list[str] = []
+        for config_id in selected_config_ids:
+            try:
+                config = load_config(config_id) if callable(load_config) else None
+            except Exception:
+                config = None
+            if not isinstance(config, dict):
+                load_error_count += 1
+                tooltip_rows.append(f"配置 {config_id}：加载失败")
+                continue
+
+            config_name = str(config.get("config_name") or f"配置 {config_id}")
+            plc_id = config.get("plc_id")
+            if not isinstance(plc_id, int) or isinstance(plc_id, bool):
+                unbound_count += 1
+                tooltip_rows.append(f"{config_name}：未绑定 PLC")
+                continue
+
+            tooltip_rows.append(f"{config_name}：PLC {plc_id}")
+            if plc_id not in seen_plc_ids:
+                seen_plc_ids.add(plc_id)
+                plc_ids.append(plc_id)
+
+        self._selected_plc_bindings = tuple(plc_ids)
+        self._selected_config_count = len(selected_config_ids)
+        self._selected_unbound_plc_count = unbound_count
+        self._selected_config_load_error_count = load_error_count
+        self._selected_plc_tooltip = "\n".join(tooltip_rows)
+
+    @classmethod
+    def _selected_plc_status_html(
+        cls,
+        plc_ids: tuple[int, ...],
+        plc_states: dict,
+        *,
+        selected_config_count: int,
+        unbound_config_count: int,
+        load_error_count: int,
+    ) -> str:
+        muted_color = "#64748b"
+        if selected_config_count == 0:
+            return f"PLC：<span style='color: {muted_color};'>未选择配置</span>"
+
+        parts = []
+        for plc_id in plc_ids:
+            state = plc_states.get(plc_id, "未连接")
+            color = cls._plc_state_color(state)
+            parts.append(
+                f"PLC {plc_id}：<span style='color: {color};'>{state}</span>"
+            )
+        if unbound_config_count:
+            parts.append(
+                f"<span style='color: {muted_color};'>"
+                f"{unbound_config_count} 个配置未绑定 PLC</span>"
+            )
+        if load_error_count:
+            parts.append(
+                f"<span style='color: #dc2626;'>"
+                f"{load_error_count} 个配置加载失败</span>"
+            )
+        return "　".join(parts)
+
+    @staticmethod
+    def _plc_state_color(state: str) -> str:
+        if state == "已连接":
+            return "#16a34a"
+        if state in ("连接中", "重连中"):
+            return "#d97706"
+        return "#dc2626"
 
     @staticmethod
     def _set_plc_state_label(label, name, state):
-        if state == "已连接":
-            color = "#16a34a"
-        elif state in ("连接中", "重连中"):
-            color = "#d97706"
-        else:
-            color = "#dc2626"
+        color = MainWindow._plc_state_color(state)
         label.setText(f"{name}：<span style='color: {color};'>{state}</span>")
 
     def build_placeholder_page(self, title: str) -> QWidget:
@@ -435,7 +520,7 @@ class MainWindow(QMainWindow):
         left_lay.setSpacing(12)
 
         hw = HardwareModule(self.services)
-        left_lay.addWidget(Card("设备选择", hw), 1)
+        left_lay.addWidget(Card("输入硬件管理", hw), 1)
         content_lay.addWidget(left, 7)
 
         # 右侧主区域：通道选择 / 输入校准 / PLC 设置作为一个整体垂直排列。
@@ -448,7 +533,7 @@ class MainWindow(QMainWindow):
         cal_card = Card("麦克风输入校准", cal)
 
         channel = ChannelSelectModule(self.services)
-        channel_card = Card("通道选择", channel)
+        channel_card = Card("硬件通道启用", channel)
 
         self.plc_settings_module = PlcSettingsModule(self.services)
         self.services.get_process_param_values = self.plc_settings_module.get_process_param_values
@@ -469,6 +554,14 @@ class MainWindow(QMainWindow):
             self.services.bus.factory_review_changed.connect(self._on_factory_review_changed)
         if hasattr(self.services.bus, "factory_display_reset"):
             self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
+        if hasattr(self.services.bus, "config_changed"):
+            self.services.bus.config_changed.connect(self._on_plc_binding_data_changed)
+        if hasattr(self.services.bus, "plc_changed"):
+            self.services.bus.plc_changed.connect(self._on_plc_binding_data_changed)
+
+    def _on_plc_binding_data_changed(self) -> None:
+        self._reload_selected_plc_bindings()
+        self._refresh_plc_state_labels()
 
     def _show_latest_log_line(self, message) -> None:
         self.statusBar().showMessage(self._latest_non_empty_log_line(message))
@@ -515,6 +608,8 @@ class MainWindow(QMainWindow):
             self._factory_state = state
         else:
             self._factory_state = FactoryControllerState()
+        self._reload_selected_plc_bindings()
+        self._refresh_plc_state_labels()
         self._sync_analysis_toolbar()
 
     def _on_factory_review_changed(self, review) -> None:

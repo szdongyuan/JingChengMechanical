@@ -107,6 +107,38 @@ def _install_counting_runtime(monkeypatch):
 
 
 class TestTestManagerStartStop:
+    def test_start_rejects_unavailable_managed_input_before_session_creation(self):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            config = _factory_runtime_config()
+            config["input_hardware_device_id"] = 9
+            services.config_service.load_config.return_value = config
+
+            class UnavailableHardwareService:
+                def load_input_device_for_config(self, _config):
+                    return {
+                        "input": {
+                            "id": 9,
+                            "name": "Missing Mic",
+                            "type": "ASIO",
+                            "samplerate": "44100",
+                            "channel_count": 2,
+                        },
+                        "mic_cal": {},
+                    }
+
+                def input_hardware_availability_error(self, _config):
+                    return "输入硬件“产线声卡”当前未连接。"
+
+            services.hss_service = UnavailableHardwareService()
+            manager = TestManager(bus, services)
+
+            accepted = manager.start({"config_id": config["config_id"]})
+
+            assert accepted is False
+            assert manager.last_start_error() == "输入硬件“产线声卡”当前未连接。"
+            bus.test_started.emit.assert_not_called()
+
     def test_start_passes_input_device_identity_to_recorder(self, monkeypatch):
             bus = _mock_bus()
             services = _mock_services(bus)

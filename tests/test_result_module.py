@@ -285,9 +285,9 @@ def test_result_module_compact_summary_qss_limits_badge_font_sizes():
 def test_result_module_shows_metric_placeholders_before_config(qapp):
     module = _make_module()
 
-    assert _metric_text(module, "lb_spl_metric_label") == "声压级（峰值）"
+    assert _metric_text(module, "lb_spl_metric_label") == "声压级"
     assert module.lb_spl_metric_value.text() == "--"
-    assert _metric_text(module, "lb_loudness_metric_label") == "响度（峰值）"
+    assert _metric_text(module, "lb_loudness_metric_label") == "响度"
     assert module.lb_loudness_metric_value.text() == "--"
 
 
@@ -322,9 +322,9 @@ def test_result_module_updates_live_metrics_only_for_current_run_and_channel(qap
     module.services.bus.spl_updated.emit(101, "old-run", 1, SimpleNamespace(spl_db=80.0))
     module.services.bus.loudness_updated.emit(101, "run-101", 0, SimpleNamespace(loudness_sone=9.0))
 
-    assert module.lb_spl_metric_label.text() == "声压级（峰值）"
+    assert module.lb_spl_metric_label.text() == "声压级"
     assert module.lb_spl_metric_value.text() == "72.3 dB"
-    assert module.lb_loudness_metric_label.text() == "响度（峰值）"
+    assert module.lb_loudness_metric_label.text() == "响度"
     assert module.lb_loudness_metric_value.text() == "2.35 sone"
 
 

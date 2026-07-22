@@ -748,6 +748,7 @@ def test_save_config_persists_current_meter_config():
     )
     payload["current_meter"] = {
         "enabled": True,
+        "source": "modbus_tcp",
         "host": "192.168.1.20",
         "port": 1502,
         "unit_id": 3,
@@ -769,9 +770,56 @@ def test_save_config_persists_current_meter_config():
     row = ConfigTable.get_by_id(config_id)
     assert loaded["current_meter"] == payload["current_meter"]
     assert row.current_meter_enabled is True
+    assert row.current_meter_source == "modbus_tcp"
     assert row.current_meter_host == "192.168.1.20"
     assert row.current_meter_register_type == "input"
     assert row.current_meter_scale == pytest.approx(0.1)
+
+
+def test_plc_current_source_requires_valid_plc_and_does_not_require_modbus_host():
+    svc = _service()
+    plc = PlcTable.create(plc_name="PLC A")
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    payload = _config_payload(
+        config_id,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    payload["plc_id"] = plc.id
+    payload["current_meter"] = {
+        "enabled": True,
+        "source": "plc",
+        "host": "",
+    }
+
+    assert svc.validate(payload) == []
+    svc.save_config(payload)
+
+    loaded = svc.load_config(config_id)
+    row = ConfigTable.get_by_id(config_id)
+    assert loaded["current_meter"]["enabled"] is True
+    assert loaded["current_meter"]["source"] == "plc"
+    assert loaded["current_meter"]["host"] == ""
+    assert row.current_meter_source == "plc"
+
+    payload["plc_id"] = None
+    assert any("PLC" in error for error in svc.validate(payload))
+
+
+def test_current_meter_source_defaults_to_modbus_tcp_for_legacy_payloads():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    payload = _config_payload(
+        config_id,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    payload["current_meter"] = {"enabled": False}
+
+    svc.save_config(payload)
+
+    assert svc.load_config(config_id)["current_meter"]["source"] == "modbus_tcp"
+    assert ConfigTable.get_by_id(config_id).current_meter_source == "modbus_tcp"
 
 
 def test_save_config_persists_plc_id_and_rejects_missing_plc_rows():
@@ -1494,6 +1542,7 @@ def test_legacy_schema_list_and_load_defaults_monitor_fields_without_columns():
     assert result["selected_channels"] == [2, 0]
     assert result["monitor_channel_index"] == 2
     assert result["monitor_gain_db"] == 0.0
+    assert result["current_meter"]["source"] == "modbus_tcp"
 
 
 def test_legacy_schema_save_and_import_omit_monitor_writes_and_preserve_fields():

@@ -120,6 +120,94 @@ def test_start_current_collection_emits_live_current_trace_update_with_run_id(mo
     )
 
 
+def test_start_current_collection_uses_bound_plc_for_plc_current(monkeypatch):
+    bus = _mock_bus()
+    services = _mock_services(bus)
+
+    class FakePlcCollector:
+        instances = []
+
+        def __init__(
+            self,
+            config,
+            *,
+            bus,
+            plc_id,
+            sample_callback=None,
+            log_callback=None,
+        ):
+            self.config = config
+            self.bus = bus
+            self.plc_id = plc_id
+            self.sample_callback = sample_callback
+            self.log_callback = log_callback
+            FakePlcCollector.instances.append(self)
+
+        def start(self):
+            return True
+
+    def fail_modbus_collector(*_args, **_kwargs):
+        raise AssertionError("PLC current must not start the Modbus collector")
+
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.PlcCurrentCollector",
+        FakePlcCollector,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.CurrentMeterCollector",
+        fail_modbus_collector,
+    )
+
+    manager = TestManager(bus, services)
+    session = SimpleNamespace(
+        _config={
+            "config_id": 7,
+            "plc_id": 23,
+            "current_meter": {"enabled": True, "source": "plc"},
+        },
+        _workorder={"factory_run_id": "run-plc-current"},
+        current_epoch=lambda: 10.0,
+    )
+    manager._sessions[7] = session
+    _bind_manager_run_generation(manager, 7, session)
+
+    manager._start_current_collection(7, session)
+
+    assert len(FakePlcCollector.instances) == 1
+    collector = FakePlcCollector.instances[0]
+    assert collector.config["source"] == "plc"
+    assert collector.bus is bus
+    assert collector.plc_id == 23
+
+
+def test_start_current_collection_skips_plc_current_without_bound_plc(monkeypatch):
+    bus = _mock_bus()
+    services = _mock_services(bus)
+    bus.log.emit = MagicMock()
+    plc_collector = MagicMock()
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.PlcCurrentCollector",
+        plc_collector,
+    )
+
+    manager = TestManager(bus, services)
+    session = SimpleNamespace(
+        _config={
+            "config_id": 7,
+            "plc_id": None,
+            "current_meter": {"enabled": True, "source": "plc"},
+        },
+        _workorder={"factory_run_id": "run-plc-current"},
+    )
+    manager._sessions[7] = session
+    _bind_manager_run_generation(manager, 7, session)
+
+    manager._start_current_collection(7, session)
+
+    plc_collector.assert_not_called()
+    assert "未绑定有效 PLC" in bus.log.emit.call_args.args[0]
+
+
 def test_start_current_collection_emits_live_current_trace_with_raw_meter_unit(monkeypatch):
     bus = _mock_bus()
     bus.current_trace_updated = MagicMock()

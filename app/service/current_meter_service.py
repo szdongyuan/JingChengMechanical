@@ -17,6 +17,7 @@ _REGISTER_TYPES = {"holding", "input"}
 _DATA_TYPES = {"uint16", "int16", "uint32", "int32", "float32"}
 _BYTE_ORDERS = {"big", "little"}
 _WORD_ORDERS = {"big", "little"}
+_CURRENT_SOURCES = {"modbus_tcp", "plc"}
 
 
 @dataclass(frozen=True)
@@ -61,43 +62,48 @@ def rebase_current_samples(
 
 
 def normalize_current_meter_config(config: dict | None) -> dict:
-    source = config if isinstance(config, dict) else {}
-    enabled = bool(source.get("enabled", False))
+    raw_config = config if isinstance(config, dict) else {}
+    enabled = bool(raw_config.get("enabled", False))
     return {
         "enabled": enabled,
-        "host": str(source.get("host") or "").strip(),
-        "port": _int_or_default(source.get("port"), 502, minimum=1, maximum=65535),
-        "unit_id": _int_or_default(source.get("unit_id"), 1, minimum=0, maximum=247),
+        "source": _choice_or_default(
+            raw_config.get("source"),
+            "modbus_tcp",
+            _CURRENT_SOURCES,
+        ),
+        "host": str(raw_config.get("host") or "").strip(),
+        "port": _int_or_default(raw_config.get("port"), 502, minimum=1, maximum=65535),
+        "unit_id": _int_or_default(raw_config.get("unit_id"), 1, minimum=0, maximum=247),
         "register_type": _choice_or_default(
-            source.get("register_type"),
+            raw_config.get("register_type"),
             "input",
             _REGISTER_TYPES,
         ),
         "register_address": _int_or_default(
-            source.get("register_address"),
+            raw_config.get("register_address"),
             0,
             minimum=0,
             maximum=65535,
         ),
         "register_count": _int_or_default(
-            source.get("register_count"),
+            raw_config.get("register_count"),
             1,
             minimum=1,
             maximum=4,
         ),
-        "data_type": _choice_or_default(source.get("data_type"), "uint16", _DATA_TYPES),
-        "byte_order": _choice_or_default(source.get("byte_order"), "big", _BYTE_ORDERS),
-        "word_order": _choice_or_default(source.get("word_order"), "big", _WORD_ORDERS),
-        "scale": _float_or_default(source.get("scale"), 0.001),
-        "offset": _float_or_default(source.get("offset"), 0.0),
+        "data_type": _choice_or_default(raw_config.get("data_type"), "uint16", _DATA_TYPES),
+        "byte_order": _choice_or_default(raw_config.get("byte_order"), "big", _BYTE_ORDERS),
+        "word_order": _choice_or_default(raw_config.get("word_order"), "big", _WORD_ORDERS),
+        "scale": _float_or_default(raw_config.get("scale"), 0.001),
+        "offset": _float_or_default(raw_config.get("offset"), 0.0),
         "poll_interval_ms": _int_or_default(
-            source.get("poll_interval_ms"),
+            raw_config.get("poll_interval_ms"),
             200,
             minimum=20,
             maximum=60000,
         ),
         "timeout_ms": _int_or_default(
-            source.get("timeout_ms"),
+            raw_config.get("timeout_ms"),
             1000,
             minimum=50,
             maximum=60000,
@@ -106,14 +112,17 @@ def normalize_current_meter_config(config: dict | None) -> dict:
 
 
 def current_meter_display_unit(config: dict | None) -> str | None:
-    source = config if isinstance(config, dict) else {}
-    explicit_unit = source.get("unit")
+    raw_config = config if isinstance(config, dict) else {}
+    normalized = normalize_current_meter_config(config)
+    if normalized["source"] == "plc":
+        return "A"
+
+    explicit_unit = raw_config.get("unit")
     if isinstance(explicit_unit, str):
         explicit_unit = explicit_unit.strip()
         if explicit_unit:
             return explicit_unit
 
-    normalized = normalize_current_meter_config(config)
     if (
         normalized["data_type"] in {"uint16", "int16"}
         and normalized["register_type"] == "input"
@@ -132,9 +141,13 @@ def validate_current_meter_config(config: dict | None) -> list[str]:
         return []
 
     errors: list[str] = []
-    if not normalized["host"]:
+    if normalized["source"] == "modbus_tcp" and not normalized["host"]:
         errors.append("电流表 IP/主机不能为空")
-    if normalized["data_type"] in {"uint32", "int32", "float32"} and normalized["register_count"] < 2:
+    if (
+        normalized["source"] == "modbus_tcp"
+        and normalized["data_type"] in {"uint32", "int32", "float32"}
+        and normalized["register_count"] < 2
+    ):
         errors.append("电流表 32 位数据至少需要读取 2 个寄存器")
     return errors
 
@@ -277,6 +290,8 @@ class CurrentMeterCollector:
 
     def start(self) -> bool:
         if not self._config["enabled"]:
+            return False
+        if self._config["source"] != "modbus_tcp":
             return False
         if not self._config["host"]:
             self._log_message("电流表未配置 IP/主机，跳过采集")
@@ -428,6 +443,134 @@ class CurrentMeterCollector:
             return
         self._last_error = message
         self._log_message(message)
+
+    def _log_message(self, message: str) -> None:
+        if callable(self._log):
+            try:
+                self._log(message)
+            except Exception:
+                pass
+
+
+class PlcCurrentCollector:
+    """Collect current samples published by a :class:`PlcService` instance."""
+
+    def __init__(
+        self,
+        config: dict,
+        *,
+        bus,
+        plc_id: int,
+        time_func: Callable[[], float] | None = None,
+        log_callback: Callable[[str], None] | None = None,
+        sample_callback: Callable[[CurrentSample, tuple[CurrentSample, ...]], None] | None = None,
+    ):
+        self._config = normalize_current_meter_config(config)
+        self._bus = bus
+        self._plc_id = int(plc_id)
+        self._time = time_func or time.monotonic
+        self._log = log_callback
+        self._sample_callback = sample_callback
+        self._samples: list[CurrentSample] = []
+        self._samples_lock = threading.Lock()
+        self._state_lock = threading.Lock()
+        self._running = False
+        self._start_time = 0.0
+        self._last_callback_error = ""
+        # Keep one stable callable object so PyQt can reliably disconnect it.
+        self._signal_handler = self._on_plc_current_sampled
+
+    def start(self) -> bool:
+        if not self._config["enabled"] or self._config["source"] != "plc":
+            return False
+        signal = getattr(self._bus, "plc_current_sampled", None)
+        if signal is None or not callable(getattr(signal, "connect", None)):
+            self._log_message("PLC 电流采集信号不可用")
+            return False
+
+        with self._state_lock:
+            if self._running:
+                return True
+            self._start_time = self._time()
+            try:
+                signal.connect(self._signal_handler)
+            except Exception as exc:
+                self._log_message(f"PLC 电流采集启动失败: {exc}")
+                return False
+            self._running = True
+        return True
+
+    def stop(self, timeout: float | None = None) -> None:
+        del timeout  # Kept for API parity with CurrentMeterCollector.
+        with self._state_lock:
+            if not self._running:
+                return
+            self._running = False
+            signal = getattr(self._bus, "plc_current_sampled", None)
+            if signal is not None and callable(getattr(signal, "disconnect", None)):
+                try:
+                    signal.disconnect(self._signal_handler)
+                except (TypeError, RuntimeError):
+                    pass
+
+    def samples(self) -> list[CurrentSample]:
+        with self._samples_lock:
+            return list(self._samples)
+
+    def trace_payload(self, analysis_window=None) -> dict | None:
+        return build_current_trace_payload(
+            self.samples(),
+            analysis_window=analysis_window,
+            config=self._config,
+        )
+
+    def _on_plc_current_sampled(
+        self,
+        plc_id: int,
+        monotonic_time: float,
+        current_a: float,
+    ) -> None:
+        if plc_id != self._plc_id:
+            return
+        try:
+            completed_monotonic = float(monotonic_time)
+            current_value = float(current_a)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(completed_monotonic) or not math.isfinite(current_value):
+            return
+
+        has_sample_callback = callable(self._sample_callback)
+        with self._state_lock:
+            if not self._running or completed_monotonic < self._start_time:
+                return
+            sample = CurrentSample(
+                time_sec=max(0.0, completed_monotonic - self._start_time),
+                current_a=current_value,
+                monotonic_time=completed_monotonic,
+            )
+            # Serialize storage with stop() so no sample can appear after stop returns.
+            with self._samples_lock:
+                self._samples.append(sample)
+                if has_sample_callback:
+                    samples_snapshot = tuple(self._samples)
+        if has_sample_callback:
+            self._notify_sample_callback(sample, samples_snapshot)
+
+    def _notify_sample_callback(
+        self,
+        sample: CurrentSample,
+        samples_snapshot: tuple[CurrentSample, ...],
+    ) -> None:
+        try:
+            self._sample_callback(sample, samples_snapshot)
+            self._last_callback_error = ""
+        except Exception as exc:
+            message = f"PLC 电流样本回调失败: {exc}"
+            if message == self._last_callback_error:
+                return
+            self._last_callback_error = message
+            self._log_message(message)
 
     def _log_message(self, message: str) -> None:
         if callable(self._log):

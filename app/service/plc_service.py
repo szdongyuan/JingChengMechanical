@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import math
+import time
+
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
 import snap7
 import snap7.util
@@ -51,7 +54,7 @@ class PlcService(QObject):
         self.logger = LogManager.set_log_handler("core")
         self._on_start_requested = on_start_requested
         self._plc_id = plc_id
-        self._field_offsets_dict = field_offsets_dict
+        self._field_offsets_dict = field_offsets_dict or {}
 
         # PLC 连接参数(IP，机架号，槽号）
         self._ip = ip
@@ -75,6 +78,7 @@ class PlcService(QObject):
         self._last_value = None
         self._reconnect_timer_ms = 0  # 重连计时器
         self._last_connect_error = ""
+        self._last_current_read_error = ""
 
     @pyqtSlot()
     def start_plc_service(self):
@@ -196,6 +200,35 @@ class PlcService(QObject):
             self.bus.log.emit(f"PLC{self._plc_id}读取失败: {exc}")
             self.logger.error(f"PLC{self._plc_id}读取失败: {exc}")
             return None
+
+    def _poll_current_value(self) -> None:
+        """Publish the optional Siemens REAL current field without blocking start detection."""
+
+        if self.plc_client is None or "current_value_offset" not in self._field_offsets_dict:
+            return
+        offset = self._field_offsets_dict.get("current_value_offset")
+        if offset is None or str(offset).strip() == "":
+            return
+
+        try:
+            value = self.read_offset_value(offset, "real")
+            current_a = float(value)
+            if not math.isfinite(current_a):
+                return
+            completed_monotonic = time.monotonic()
+            self.bus.plc_current_sampled.emit(
+                int(self._plc_id),
+                completed_monotonic,
+                current_a,
+            )
+            self._last_current_read_error = ""
+        except Exception as exc:
+            message = f"PLC{self._plc_id}读取电流失败: {exc}"
+            if message == self._last_current_read_error:
+                return
+            self._last_current_read_error = message
+            self.bus.log.emit(message)
+            self.logger.error(message)
 
     def write_plc_value(self, offset, type, value):
         if type == "string":
@@ -346,6 +379,7 @@ class PlcService(QObject):
             "res_result_offset",
         }
         real_fields = {
+            "current_value_offset",
             "res_score_offset",
             "res_spl_offset",
             "res_loudness_offset",
@@ -362,7 +396,7 @@ class PlcService(QObject):
 
         for field_name in field_names:
             offset = self._field_offsets_dict.get(field_name)
-            if not offset:
+            if offset is None or str(offset).strip() == "":
                 self.logger.warning(f"PLC {self._plc_id} 未找到偏移配置: {field_name}")
                 continue
 
@@ -417,6 +451,8 @@ class PlcService(QObject):
         v = self._read_start_bit()
         if v is None:
             return
+
+        self._poll_current_value()
 
         if self._last_value is None:
             # 第一次读到值时只记录，不触发“开始”。
