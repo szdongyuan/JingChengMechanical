@@ -13,6 +13,7 @@ from model.test_config_ai_binding_table import TestConfigAiBindingTable
 from model.device_table import DeviceTable
 from model.audio_data_table import AudioDataTable
 from model.historical_metric_cache_table import HistoricalMetricCacheTable
+from model.input_hardware_table import InputHardwareTable
 
 ALL_TABLES = [
     TestConfigTable,
@@ -22,6 +23,7 @@ ALL_TABLES = [
     TestConfigAiBindingTable,
     AiExecutionTable,
     DeviceTable,
+    InputHardwareTable,
     AudioDataTable,
     HistoricalMetricCacheTable,
 ]

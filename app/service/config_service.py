@@ -158,8 +158,10 @@ MONITOR_GAIN_DEFAULT_DB = 0.0
 MONITOR_GAIN_MIN_DB = -60.0
 MONITOR_GAIN_MAX_DB = 24.0
 _MONITOR_CONFIG_FIELDS = ("monitor_channel_index", "monitor_gain_db")
+_CURRENT_METER_SOURCES = frozenset({"modbus_tcp", "plc"})
 _CURRENT_METER_CONFIG_FIELDS = (
     "current_meter_enabled",
+    "current_meter_source",
     "current_meter_host",
     "current_meter_port",
     "current_meter_unit_id",
@@ -183,6 +185,7 @@ _CONFIG_LOAD_FIELD_NAMES = (
     "allow_incomplete_recording_analysis",
     "scan_triggers_test",
     "plc",
+    "input_hardware_device_id",
     "input_device_name",
     "input_device_hostapi",
     "input_device_samplerate",
@@ -204,6 +207,16 @@ class PendingConfigSave:
     old_paths: tuple[str, ...] = ()
     staged_paths: tuple[str, ...] = ()
     golden_bindings_by_channel: tuple[tuple[int, dict], ...] = ()
+
+
+def _normalize_current_meter_with_source(config: dict | None) -> dict:
+    source_config = config if isinstance(config, dict) else {}
+    source = str(source_config.get("source") or "").strip().lower()
+    if source not in _CURRENT_METER_SOURCES:
+        source = "modbus_tcp"
+    normalized = normalize_current_meter_config(source_config)
+    normalized["source"] = source
+    return normalized
 
 
 class ConfigService:
@@ -292,6 +305,10 @@ class ConfigService:
             "current_meter": self._normalize_current_meter_from_row(cfg),
             "channels": [],
         }
+        if cfg.get("input_hardware_device_id") is not None:
+            result["input_hardware_device_id"] = cfg.get(
+                "input_hardware_device_id"
+            )
         ch_rows = (
             ChannelConfigTable.select()
             .where(ChannelConfigTable.config == config_id)
@@ -565,7 +582,7 @@ class ConfigService:
                 }
                 self._add_current_meter_row_values(
                     row_values,
-                    current_meter=normalize_current_meter_config(None),
+                    current_meter=_normalize_current_meter_with_source(None),
                     available_columns=self._config_table_columns(),
                 )
                 config_id = self._insert_config_row_values(row_values)
@@ -724,6 +741,7 @@ class ConfigService:
             ),
             "scan_triggers_test": source.get("scan_triggers_test", False),
             "plc_id": None,
+            "input_hardware_device_id": source.get("input_hardware_device_id"),
             "input_device_name": source.get("input_device_name"),
             "input_device_hostapi": source.get("input_device_hostapi"),
             "input_device_samplerate": source.get("input_device_samplerate"),
@@ -737,7 +755,7 @@ class ConfigService:
             "monitor_channel_index": source.get("monitor_channel_index"),
             "monitor_gain_db": monitor_gain_db,
             "result_dashboard_layout": result_dashboard_layout,
-            "current_meter": normalize_current_meter_config(
+            "current_meter": _normalize_current_meter_with_source(
                 source.get("current_meter")
             ),
             "channels": prepared_channels,
@@ -916,7 +934,12 @@ class ConfigService:
                 errors.append("PLC 不存在或已被删除")
 
         errors.extend(self.validate_factory_runtime(data))
-        errors.extend(validate_current_meter_config(data.get("current_meter")))
+        current_meter = _normalize_current_meter_with_source(data.get("current_meter"))
+        if current_meter["enabled"] and current_meter["source"] == "plc":
+            if plc_id is None:
+                errors.append("PLC 电流源需要绑定有效 PLC")
+        else:
+            errors.extend(validate_current_meter_config(current_meter))
 
         selected_channels_for_layout = self._selected_channels_for_layout_validation(
             data.get("selected_channels", [])
@@ -1703,6 +1726,12 @@ class ConfigService:
             "selected_channels": json.dumps(data.get("selected_channels", [])),
         }
         available_columns = self._config_table_columns()
+        if self._config_field_exists(
+            "input_hardware_device_id", available_columns
+        ):
+            values["input_hardware_device_id"] = data.get(
+                "input_hardware_device_id"
+            )
         if self._config_field_exists("monitor_channel_index", available_columns):
             values["monitor_channel_index"] = data.get("monitor_channel_index")
         if self._config_field_exists("monitor_gain_db", available_columns):
@@ -1720,7 +1749,7 @@ class ConfigService:
             values["result_dashboard_layout"] = serialize_result_dashboard_layout(
                 data.get("result_dashboard_layout")
             )
-        current_meter = normalize_current_meter_config(data.get("current_meter"))
+        current_meter = _normalize_current_meter_with_source(data.get("current_meter"))
         self._add_current_meter_row_values(
             values,
             current_meter=current_meter,
@@ -1737,6 +1766,7 @@ class ConfigService:
     ) -> None:
         field_map = {
             "current_meter_enabled": "enabled",
+            "current_meter_source": "source",
             "current_meter_host": "host",
             "current_meter_port": "port",
             "current_meter_unit_id": "unit_id",
@@ -1756,9 +1786,10 @@ class ConfigService:
                 values[field_name] = current_meter[config_key]
 
     def _normalize_current_meter_from_row(self, row: dict) -> dict:
-        return normalize_current_meter_config(
+        return _normalize_current_meter_with_source(
             {
                 "enabled": row.get("current_meter_enabled", False),
+                "source": row.get("current_meter_source", "modbus_tcp"),
                 "host": row.get("current_meter_host"),
                 "port": row.get("current_meter_port"),
                 "unit_id": row.get("current_meter_unit_id"),

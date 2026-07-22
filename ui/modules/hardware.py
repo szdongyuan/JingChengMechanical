@@ -8,6 +8,7 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMessageBox,
     QPushButton,
     QTableWidget,
@@ -21,259 +22,247 @@ from app.service.log_manager import LogManager
 
 
 class HardwareModule(QWidget):
+    """Manage complete input devices; channels remain children of each device."""
+
     module_id = "hardware"
 
     def __init__(self, services):
         super().__init__()
         self.services = services
-        self._devices = []
-        self._hostapis = []
-        self.device_info = {}
-        self.logger = LogManager.set_log_handler("硬件选择")
-
+        self._devices: list[dict] = []
+        self._hostapis: list[dict] = []
+        self._managed: list[dict] = []
+        self._selected_hardware_id: int | None = None
+        self.logger = LogManager.set_log_handler("输入硬件管理")
         self.init_ui()
         self.init_fun()
         self.refresh_devices()
 
     def init_ui(self):
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(10)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
 
-        bar = QWidget()
-        bar_lay = QHBoxLayout(bar)
-        bar_lay.setContentsMargins(0, 0, 0, 0)
-        bar_lay.setSpacing(8)
+        toolbar = QHBoxLayout()
+        self.lb_summary = QLabel("已管理 0 台输入设备")
+        self.lb_summary.setObjectName("CurrentDevice")
+        toolbar.addWidget(self.lb_summary, 1)
+        self.btn_refresh = QPushButton("刷新系统设备")
+        toolbar.addWidget(self.btn_refresh)
+        layout.addLayout(toolbar)
 
-        self.lb_current = QLabel("当前保存：—")
-        self.lb_current.setObjectName("CurrentDevice")
-        bar_lay.addWidget(self.lb_current, 1)
-
-        self.btn_refresh = QPushButton("刷新设备")
-        self.btn_save = QPushButton("保存选择")
-        self.btn_save.setObjectName("Primary")
-        bar_lay.addWidget(self.btn_refresh)
-        bar_lay.addWidget(self.btn_save)
-        lay.addWidget(bar)
-
-        # 选择区：输入/输出
-        sel = QWidget()
-        sel_lay = QFormLayout(sel)
-        sel_lay.setContentsMargins(0, 0, 0, 0)
-        sel_lay.setHorizontalSpacing(10)
-        sel_lay.setVerticalSpacing(8)
-
+        form_host = QWidget()
+        form = QFormLayout(form_host)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(8)
         self.combobox_input = QComboBox()
-        self.combobox_output = QComboBox()
-        self.combobox_input.setMinimumWidth(520)
-        self.combobox_output.setMinimumWidth(520)
-        sel_lay.addRow("输入设备", self.combobox_input)
-        sel_lay.addRow("监听设备", self.combobox_output)
-        lay.addWidget(sel)
+        self.combobox_input.setMinimumWidth(480)
+        self.ed_alias = QLineEdit()
+        self.ed_alias.setPlaceholderText("例如：产线 A 测试声卡")
+        form.addRow("系统输入设备", self.combobox_input)
+        form.addRow("设备别名", self.ed_alias)
+        layout.addWidget(form_host)
+
+        actions = QHBoxLayout()
+        self.btn_add = QPushButton("添加设备")
+        self.btn_add.setObjectName("Primary")
+        self.btn_rename = QPushButton("保存别名")
+        self.btn_remove = QPushButton("移除设备")
+        actions.addWidget(self.btn_add)
+        actions.addWidget(self.btn_rename)
+        actions.addWidget(self.btn_remove)
+        actions.addStretch(1)
+        layout.addLayout(actions)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(6)
+        self.table.setColumnCount(7)
         self.table.setHorizontalHeaderLabels(
-            ["序号", "名称", "输入通道", "输出通道", "驱动类型", "采样率"]
+            ["ID", "别名", "系统设备", "输入通道", "驱动", "采样率", "状态"]
         )
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
-        # self.table.setSortingEnabled(True)
-        lay.addWidget(self.table, 1)
+        layout.addWidget(self.table, 1)
+        self._apply_table_sizing()
 
     def init_fun(self):
         self.btn_refresh.clicked.connect(self.refresh_devices)
-        self.btn_save.clicked.connect(self.save_selected)
-        self.combobox_input.currentIndexChanged.connect(self._update_save_enabled)
-        self.combobox_output.currentIndexChanged.connect(self._update_save_enabled)
-
-    def get_db_device_info(self):
-        # 从DB读取上次保存的输入/输出设备信息
-        try:
-            self.device_info = self.services.hss_service.load_io_devices()
-        except Exception as e:
-            # 读取失败时不阻塞页面，其它功能仍可用；给用户一个提示，同时写日志方便排查
-            self.lb_current.setText("当前保存：—（数据库未就绪）")
-            self.services.bus.log.emit(f"读取已保存设备失败: {e}")
-            return
-
-    def update_current_label(self):
-        """
-        更新界面上“当前保存/当前设备”的提示文字，并判断这些设备现在有没有被系统检测到
-        """
-        in_dev = self.device_info.get("input")
-        out_dev = self.device_info.get("output")
-        if not (in_dev or out_dev):
-            # DB 里没有保存过任何选择
-            self.lb_current.setText("当前保存：—")
-            return
-
-        def fmt(dev: dict | None) -> str:
-            if not isinstance(dev, dict):
-                return "—"
-            return f"({dev.get('id','-')})：{dev.get('name','-')}"
-
-        if not self._devices:
-            self.services.bus.log.emit(f"USB端口未检测到设备")
-            self.lb_current.setText(f"当前设备：麦克风{fmt(in_dev)}（未检测到）| 扬声器{fmt(out_dev)}（未检测到）")
-            return
-        matched_in = HardwareSelectService.find_matched_device(in_dev, "input", self._devices, self._hostapis)
-        matched_out = HardwareSelectService.find_matched_device(out_dev, "output", self._devices, self._hostapis)
-        input_status = "" if matched_in else "（未检测到）"
-        output_status = "" if matched_out else "（未检测到）"
-
-        if input_status == "（未检测到）" or output_status == "（未检测到）":
-            self.services.bus.log.emit(f"USB端口设备发生变化，请重新检查设备。")
-
-        self.lb_current.setText(
-            f"当前设备：麦克风{fmt(in_dev)}{input_status} | 扬声器{fmt(out_dev)}{output_status}"
-        )
+        self.btn_add.clicked.connect(self.add_selected_device)
+        self.btn_rename.clicked.connect(self.rename_selected_device)
+        self.btn_remove.clicked.connect(self.remove_selected_device)
+        self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
 
     def refresh_devices(self):
         try:
             self.services.hss_service.refresh_available_device()
-        except Exception as e:
-            self.services.bus.log.emit(f"刷新音频系统失败: {e}")
-        self.select_devices()
-        self.logger.info("刷新设备")
-
-    def select_devices(self):
-        self.get_db_device_info()
+        except Exception as exc:
+            self.services.bus.log.emit(f"刷新音频系统失败: {exc}")
         try:
-            self._devices, self._hostapis = self.services.hss_service.query_devices_and_hostapis(refresh=False)
-        except Exception as e:
-            self.services.bus.log.emit(f"读取设备失败: {e}")
-            self.table.setRowCount(0)
-            return
-
-        res = self.services.hss_service.restore_default_device_from_db(self.device_info, self._devices, self._hostapis)
-        if not res:
-            self.services.bus.log.emit("未找到已保存的设备，未恢复默认设备。")
-        default_in, default_out = self.services.hss_service.get_default_device_ids()
-        self.services.bus.log.emit(f"默认设备：out{default_out}, in{default_in}")
-
-        self.combobox_output.clear()
-        self.combobox_input.clear()
-        self.combobox_output.addItem("请选择监听设备", None)
-        self.combobox_input.addItem("请选择输入设备", None)
-        self.combobox_output.model().item(0).setEnabled(False)
-        self.combobox_input.model().item(0).setEnabled(False)
-        # self.table.setSortingEnabled(False)
-        self.table.setRowCount(len(self._devices))
-        for index, device in enumerate(self._devices):
-            hostapi_name = self._hostapis[device.get("hostapi", 0)].get("name") or "N/A"
-            display_name = f"{device.get('name', '')} ({hostapi_name})"
-            display_name_with_channels = (
-                f"{display_name} [OUT: {device.get('max_output_channels', 0)}, "
-                f"IN: {device.get('max_input_channels', 0)}]"
+            self._devices, self._hostapis = (
+                self.services.hss_service.query_devices_and_hostapis(refresh=False)
             )
+        except Exception as exc:
+            self._devices, self._hostapis = [], []
+            self.services.bus.log.emit(f"读取系统输入设备失败: {exc}")
+        self._populate_detected_inputs()
+        self.reload_managed_devices(preferred_id=self._selected_hardware_id)
+        self.services.bus.refresh_channels.emit()
 
-            samplerate = device.get("default_samplerate", "N/A")
-            if isinstance(samplerate, float):
-                samplerate = f"{int(samplerate)} Hz"
-            dev_index = device.get("index", index)
-
-            values = [
-                str(dev_index),
-                display_name,
-                str(device.get("max_input_channels", 0)),
-                str(device.get("max_output_channels", 0)),
-                hostapi_name,
-                str(samplerate),
-            ]
-            # 表格每一行赋值
-            for col, text in enumerate(values):
-                it = QTableWidgetItem(text)
-                it.setTextAlignment(
-                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter
-                )
-                if col in (1, 4):
-                    it.setToolTip(text)
-                self.table.setItem(index, col, it)
-            # 下拉框赋值
-            if device.get("max_output_channels", 0) > 0:
-                self.combobox_output.addItem(
-                    f"{dev_index}: {display_name_with_channels}", dev_index
-                )
-            if device.get("max_input_channels", 0) > 0:
-                self.combobox_input.addItem(
-                    f"{dev_index}: {display_name_with_channels}", dev_index
-                )
-
-        self._apply_table_sizing()
-        # self.table.setSortingEnabled(True)
-
-        self.services.bus.log.emit(f"设备列表刷新完成，共 {len(self._devices)} 个")
-        self.logger.info(f"设备列表刷新完成，共 {len(self._devices)} 个")
-
-        # 不自动选中任何设备：刷新后保持在“请选择…”
+    def _populate_detected_inputs(self):
+        self.combobox_input.clear()
+        self.combobox_input.addItem("请选择要添加的输入设备", None)
+        first = self.combobox_input.model().item(0)
+        if first is not None:
+            first.setEnabled(False)
+        for device in self._devices:
+            if int(device.get("max_input_channels", 0) or 0) <= 0:
+                continue
+            hostapi_index = int(device.get("hostapi", 0) or 0)
+            hostapi = HardwareSelectService._hostapi_name(
+                self._hostapis, hostapi_index
+            )
+            sample_rate = int(float(device.get("default_samplerate", 0) or 0))
+            label = (
+                f"{device.get('name', '')} ({hostapi}) · "
+                f"{device.get('max_input_channels', 0)} 通道 · {sample_rate} Hz"
+            )
+            self.combobox_input.addItem(label, int(device.get("index")))
         self.combobox_input.setCurrentIndex(0)
-        self.combobox_output.setCurrentIndex(0)
 
-        self._update_save_enabled()
-        self.update_current_label()
+    def reload_managed_devices(self, *, preferred_id: int | None = None):
+        try:
+            self._managed = self.services.hss_service.list_input_hardware()
+        except Exception as exc:
+            self._managed = []
+            self.services.bus.log.emit(f"读取受管输入设备失败: {exc}")
+        self.table.setRowCount(len(self._managed))
+        selected_row = None
+        for row_index, hardware in enumerate(self._managed):
+            status = "已连接" if self._is_connected(hardware) else "未连接"
+            values = [
+                hardware["hardware_id"],
+                hardware["alias"],
+                hardware["name"],
+                hardware["channel_count"],
+                hardware["hostapi"],
+                f"{int(hardware['samplerate'])} Hz",
+                status,
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+                )
+                if column in (1, 2):
+                    item.setToolTip(str(value))
+                self.table.setItem(row_index, column, item)
+            if preferred_id == hardware["hardware_id"]:
+                selected_row = row_index
+        self.lb_summary.setText(f"已管理 {len(self._managed)} 台输入设备")
+        if selected_row is not None:
+            self.table.selectRow(selected_row)
+        elif self._managed:
+            self.table.selectRow(0)
+        else:
+            self._selected_hardware_id = None
+            self.ed_alias.clear()
+
+    def _is_connected(self, hardware: dict) -> bool:
+        matched = HardwareSelectService.find_matched_device(
+            {
+                "name": hardware["name"],
+                "type": hardware["hostapi"],
+                "samplerate": str(int(hardware["samplerate"])),
+                "channel_count": hardware["channel_count"],
+            },
+            "input",
+            self._devices,
+            self._hostapis,
+        )
+        return matched is not None
+
+    def _on_table_selection_changed(self):
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self._managed):
+            return
+        hardware = self._managed[row]
+        self._selected_hardware_id = int(hardware["hardware_id"])
+        self.ed_alias.setText(hardware["alias"])
+        signal = getattr(self.services.bus, "input_hardware_selected", None)
+        if signal is not None:
+            signal.emit(self._selected_hardware_id)
+
+    def add_selected_device(self):
+        device_id = self.combobox_input.currentData()
+        if device_id is None:
+            QMessageBox.warning(self, "提示", "请先选择一个系统输入设备。")
+            return
+        try:
+            hardware = self.services.hss_service.add_input_hardware(
+                int(device_id),
+                self.ed_alias.text(),
+                devices=self._devices,
+                hostapis=self._hostapis,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "添加失败", str(exc))
+            return
+        self._selected_hardware_id = int(hardware["hardware_id"])
+        self._notify_changed()
+        self.reload_managed_devices(preferred_id=self._selected_hardware_id)
+        QMessageBox.information(self, "添加成功", "输入设备已加入硬件管理。")
+
+    def rename_selected_device(self):
+        if self._selected_hardware_id is None:
+            QMessageBox.warning(self, "提示", "请先选择一台受管输入设备。")
+            return
+        try:
+            self.services.hss_service.rename_input_hardware(
+                self._selected_hardware_id, self.ed_alias.text()
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
+            return
+        self._notify_changed()
+        self.reload_managed_devices(preferred_id=self._selected_hardware_id)
+
+    def remove_selected_device(self):
+        if self._selected_hardware_id is None:
+            QMessageBox.warning(self, "提示", "请先选择一台受管输入设备。")
+            return
+        answer = QMessageBox.question(
+            self,
+            "确认移除",
+            "确定移除这台输入设备及其全部通道校准值吗？",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.services.hss_service.delete_input_hardware(
+                self._selected_hardware_id
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "移除失败", str(exc))
+            return
+        self._selected_hardware_id = None
+        self._notify_changed()
+        self.reload_managed_devices()
+
+    def _notify_changed(self):
+        signal = getattr(self.services.bus, "input_hardware_changed", None)
+        if signal is not None:
+            signal.emit()
         self.services.bus.refresh_channels.emit()
 
     def _apply_table_sizing(self):
-        """让表格更清爽：名称列自适应，其它列固定宽度"""
         header = self.table.horizontalHeader()
-        header.setStretchLastSection(False)
-
-        # 先设为 Interactive，避免 resizeColumnsToContents 抢占空间
-        for c in range(self.table.columnCount()):
-            header.setSectionResizeMode(c, QHeaderView.ResizeMode.Interactive)
-
-        self.table.setColumnWidth(0, 50)   # 序号
-        self.table.setColumnWidth(2, 70)   # 输入通道
-        self.table.setColumnWidth(3, 70)   # 输出通道
-        self.table.setColumnWidth(5, 90)   # 采样率（避免右侧太宽）
-
-        # 名称 + 驱动类型一起分担剩余空间（更均衡）
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)  # 名称
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)  # 驱动类型
-        self.table.setColumnWidth(1, 520)  # 初始比例
-        self.table.setColumnWidth(4, 220)  # 初始比例
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
-
-    def _update_save_enabled(self):
-        # 按钮保持可点击；未选齐时由 save_selected() 弹窗提示
-        missing = (
-            self.combobox_input.currentData() is None
-            or self.combobox_output.currentData() is None
-        )
-        self.btn_save.setEnabled(True)
-        self.btn_save.setToolTip("请先选择输入设备和监听设备。") if missing else self.btn_save.setToolTip("")
-
-    def save_selected(self):
-        in_id = self.combobox_input.currentData()
-        out_id = self.combobox_output.currentData()
-        if in_id is None or out_id is None:
-            QMessageBox.warning(self, "提示", "请先选择输入设备和监听设备。")
-            return
-
-        try:
-            in_dev, out_dev = self.services.hss_service.save_device_info(
-                int(in_id),
-                int(out_id),
-                devices=self._devices,
-                hostapis=self._hostapis,
-                sync_sounddevice_default=True,
+        for column in range(self.table.columnCount()):
+            header.setSectionResizeMode(
+                column, QHeaderView.ResizeMode.ResizeToContents
             )
-
-            self.get_db_device_info()
-            self.update_current_label()
-
-            self.services.bus.log.emit(
-                f"已保存设备：\n"
-                f"输入设备：{in_dev.get('id')} | {in_dev.get('name')}\n"
-                f"输出设备：{out_dev.get('id')} | {out_dev.get('name')}"
-            )
-            QMessageBox.information(self, "保存成功", "输入/监听设备保存成功！")
-            self.services.bus.refresh_channels.emit()
-        except Exception as e:
-            self.services.bus.log.emit(f"保存失败: {e}")
-            QMessageBox.warning(self, "保存失败", "硬件设备保存失败，请重试！")
-
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)

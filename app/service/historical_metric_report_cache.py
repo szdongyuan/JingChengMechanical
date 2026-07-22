@@ -26,11 +26,32 @@ class HistoricalMetricCacheComputer:
         self._algorithm_version = str(algorithm_version)
 
     def current_mic_calibration(self) -> dict:
+        """Compatibility hook for report-service test doubles."""
         try:
             devices = self._hss_service.load_io_devices()
         except Exception:
             return {}
         mic_cal = devices.get("mic_cal") if isinstance(devices, dict) else None
+        return mic_cal if isinstance(mic_cal, dict) else {}
+
+    def mic_calibration_for_record(self, record: AudioDataTable) -> dict:
+        parsed = _parse_config(record.config_content)
+        if not isinstance(parsed, dict):
+            return {}
+        managed_loader = getattr(
+            type(self._hss_service), "load_input_device_for_config", None
+        )
+        if not callable(managed_loader):
+            return self.current_mic_calibration()
+        try:
+            device_info = self._hss_service.load_input_device_for_config(parsed)
+        except Exception:
+            return {}
+        mic_cal = (
+            device_info.get("mic_cal")
+            if isinstance(device_info, dict)
+            else None
+        )
         return mic_cal if isinstance(mic_cal, dict) else {}
 
     def current_calibration_hash(self, mic_cal: dict | None = None) -> str:
@@ -98,7 +119,7 @@ class HistoricalMetricCacheComputer:
         mic_cal: dict | None = None,
     ) -> list[HistoricalMetricCacheTable]:
         if mic_cal is None:
-            mic_cal = self.current_mic_calibration()
+            mic_cal = self.mic_calibration_for_record(record)
         signature = replace(
             signature,
             calibration_hash=self.current_calibration_hash(mic_cal),

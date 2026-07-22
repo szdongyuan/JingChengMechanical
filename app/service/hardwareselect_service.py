@@ -8,7 +8,10 @@ os.environ.setdefault("SD_ENABLE_ASIO", "1")
 import sounddevice as sd
 
 from app.service.log_manager import LogManager
+from consts.time_consts import now_str
 from model.device_table import DeviceTable
+from model.input_hardware_table import InputHardwareTable
+from model.test_config_table import TestConfigTable
 
 
 class HardwareSelectService:
@@ -18,6 +21,244 @@ class HardwareSelectService:
     - 读取/保存已选输入/监听设备到 DB（device_table.id=1）
     """
     logger = LogManager.set_log_handler("硬件选择")
+
+    @staticmethod
+    def _default_mic_cal(channel_count: int) -> dict:
+        return {
+            f"In{i}": {
+                "deviation_value": "0",
+                "binding_index": i - 1,
+                "is_selected": 1,
+            }
+            for i in range(1, max(0, int(channel_count)) + 1)
+        }
+
+    @classmethod
+    def _managed_row_payload(cls, row: InputHardwareTable) -> dict:
+        try:
+            mic_cal = json.loads(row.mic_cal or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            mic_cal = {}
+        return {
+            "hardware_id": row.hardware_id,
+            "alias": row.alias,
+            "name": row.device_name,
+            "hostapi": row.hostapi,
+            "samplerate": float(row.samplerate),
+            "channel_count": int(row.channel_count),
+            "mic_cal": mic_cal,
+            # ConfigModule consumes sounddevice-shaped keys.
+            "default_samplerate": float(row.samplerate),
+            "max_input_channels": int(row.channel_count),
+        }
+
+    def list_input_hardware(self) -> list[dict]:
+        rows = InputHardwareTable.select().order_by(
+            InputHardwareTable.alias, InputHardwareTable.hardware_id
+        )
+        return [self._managed_row_payload(row) for row in rows]
+
+    def get_input_hardware(self, hardware_id: int) -> dict | None:
+        row = (
+            InputHardwareTable.select()
+            .where(InputHardwareTable.hardware_id == int(hardware_id))
+            .first()
+        )
+        return self._managed_row_payload(row) if row is not None else None
+
+    def add_input_hardware(
+        self,
+        device_id: int,
+        alias: str,
+        *,
+        devices: list[dict] | None = None,
+        hostapis: list[dict] | None = None,
+    ) -> dict:
+        normalized_alias = str(alias or "").strip()
+        if not normalized_alias:
+            raise ValueError("设备别名不能为空")
+        if devices is None or hostapis is None:
+            devices, hostapis = self.query_devices_and_hostapis(refresh=False)
+        saved = self._device_to_saved(
+            int(device_id), devices, hostapis, kind="input"
+        )
+        if not saved.get("name") or int(saved.get("channel_count") or 0) <= 0:
+            raise ValueError("所选设备不是有效的输入设备")
+        if (
+            InputHardwareTable.select()
+            .where(InputHardwareTable.alias == normalized_alias)
+            .exists()
+        ):
+            raise ValueError(f"设备别名“{normalized_alias}”已存在")
+        identity_query = InputHardwareTable.select().where(
+            (InputHardwareTable.device_name == saved["name"])
+            & (InputHardwareTable.hostapi == saved["type"])
+            & (InputHardwareTable.samplerate == float(saved["samplerate"]))
+            & (InputHardwareTable.channel_count == int(saved["channel_count"]))
+        )
+        if identity_query.exists():
+            raise ValueError("该输入设备已经添加到硬件管理")
+        row = InputHardwareTable.create(
+            alias=normalized_alias,
+            device_name=saved["name"],
+            hostapi=saved["type"],
+            samplerate=float(saved["samplerate"]),
+            channel_count=int(saved["channel_count"]),
+            mic_cal=json.dumps(
+                self._default_mic_cal(int(saved["channel_count"])),
+                ensure_ascii=False,
+                indent=4,
+            ),
+        )
+        return self._managed_row_payload(row)
+
+    def rename_input_hardware(self, hardware_id: int, alias: str) -> dict:
+        normalized_alias = str(alias or "").strip()
+        if not normalized_alias:
+            raise ValueError("设备别名不能为空")
+        duplicate = (
+            InputHardwareTable.select()
+            .where(
+                (InputHardwareTable.alias == normalized_alias)
+                & (InputHardwareTable.hardware_id != int(hardware_id))
+            )
+            .exists()
+        )
+        if duplicate:
+            raise ValueError(f"设备别名“{normalized_alias}”已存在")
+        updated = (
+            InputHardwareTable.update(alias=normalized_alias, updated_time=now_str())
+            .where(InputHardwareTable.hardware_id == int(hardware_id))
+            .execute()
+        )
+        if not updated:
+            raise ValueError("输入设备不存在")
+        return self.get_input_hardware(int(hardware_id))
+
+    def delete_input_hardware(self, hardware_id: int) -> None:
+        hardware_id = int(hardware_id)
+        if (
+            TestConfigTable.select()
+            .where(TestConfigTable.input_hardware_device_id == hardware_id)
+            .exists()
+        ):
+            raise ValueError("该输入设备仍被测试配置使用，请先修改相关配置")
+        deleted = (
+            InputHardwareTable.delete()
+            .where(InputHardwareTable.hardware_id == hardware_id)
+            .execute()
+        )
+        if not deleted:
+            raise ValueError("输入设备不存在")
+
+    def save_input_hardware_calibration(
+        self, hardware_id: int, mic_cal: dict
+    ) -> bool:
+        updated = (
+            InputHardwareTable.update(
+                mic_cal=json.dumps(mic_cal, ensure_ascii=False, indent=4),
+                updated_time=now_str(),
+            )
+            .where(InputHardwareTable.hardware_id == int(hardware_id))
+            .execute()
+        )
+        return updated > 0
+
+    def load_input_device_for_config(self, config: dict) -> dict:
+        hardware_id = config.get("input_hardware_device_id")
+        if hardware_id is None:
+            return {}
+        hardware = self.get_input_hardware(int(hardware_id))
+        if hardware is None:
+            return {}
+        return {
+            "input": {
+                "id": hardware["hardware_id"],
+                "name": hardware["name"],
+                "type": hardware["hostapi"],
+                "samplerate": str(int(hardware["samplerate"])),
+                "channel_count": hardware["channel_count"],
+            },
+            "mic_cal": hardware["mic_cal"],
+        }
+
+    def input_hardware_availability_error(
+        self,
+        config: dict,
+        *,
+        devices: list[dict] | None = None,
+        hostapis: list[dict] | None = None,
+        check_stream_settings: bool = True,
+    ) -> str | None:
+        """Return a user-facing reason when the bound input cannot record."""
+        hardware_id = config.get("input_hardware_device_id")
+        if hardware_id is None:
+            return "配置未绑定受管输入硬件，请重新选择输入硬件并保存。"
+        hardware = self.get_input_hardware(int(hardware_id))
+        if hardware is None:
+            return "配置绑定的输入硬件已不存在，请重新选择输入硬件并保存。"
+        if devices is None or hostapis is None:
+            try:
+                devices, hostapis = self.query_devices_and_hostapis(refresh=False)
+            except Exception as exc:
+                return f"无法读取系统音频设备：{exc}"
+        matched = self.find_matched_device(
+            {
+                "name": hardware["name"],
+                "type": hardware["hostapi"],
+                "samplerate": str(int(hardware["samplerate"])),
+                "channel_count": hardware["channel_count"],
+            },
+            "input",
+            devices,
+            hostapis,
+        )
+        if matched is None:
+            return (
+                f"输入硬件“{hardware['alias']}”当前未连接或设备参数已变化，"
+                "请检查连接后刷新硬件列表。"
+            )
+        if check_stream_settings:
+            try:
+                sd.check_input_settings(
+                    device=int(matched["index"]),
+                    channels=int(hardware["channel_count"]),
+                    samplerate=float(hardware["samplerate"]),
+                    dtype="float32",
+                )
+            except Exception as exc:
+                return f"输入硬件“{hardware['alias']}”当前无法录音：{exc}"
+        return None
+
+    def activate_input_hardware(
+        self,
+        hardware_id: int,
+        *,
+        devices: list[dict] | None = None,
+        hostapis: list[dict] | None = None,
+    ) -> int:
+        hardware = self.get_input_hardware(int(hardware_id))
+        if hardware is None:
+            raise ValueError("输入设备不存在")
+        if devices is None or hostapis is None:
+            devices, hostapis = self.query_devices_and_hostapis(refresh=False)
+        matched = self.find_matched_device(
+            {
+                "name": hardware["name"],
+                "type": hardware["hostapi"],
+                "samplerate": str(int(hardware["samplerate"])),
+                "channel_count": hardware["channel_count"],
+            },
+            "input",
+            devices,
+            hostapis,
+        )
+        if matched is None:
+            raise ValueError("该输入设备当前未连接")
+        input_id = int(matched["index"])
+        _, output_id = self.get_default_device_ids()
+        sd.default.device = (input_id, output_id)
+        return input_id
 
     # -------- sounddevice：刷新/查询 --------
     @staticmethod
@@ -38,7 +279,12 @@ class HardwareSelectService:
             {'name': 'xxx', 'index': 4, 'hostapi': 0, 'max_input_channels': 2, 'max_output_channels': 0, 。。'default_samplerate': 44100.0},
         ]
         """
-        return list(sd.query_devices())
+        devices = []
+        for index, raw_device in enumerate(sd.query_devices()):
+            device = dict(raw_device)
+            device.setdefault("index", index)
+            devices.append(device)
+        return devices
 
     @staticmethod
     def query_hostapis():
@@ -270,7 +516,7 @@ class HardwareSelectService:
     def find_matched_device(dev_info, kind, devices, hostapis):
         if not dev_info:
             return None
-        for dev in devices:
+        for fallback_index, dev in enumerate(devices):
             hostapi_name = hostapis[dev["hostapi"]]["name"]
             samplerate = str(int(dev["default_samplerate"]))
             if kind == "input":
@@ -283,6 +529,10 @@ class HardwareSelectService:
                     and samplerate == dev_info["samplerate"]
                     and channel_count == int(dev_info.get("channel_count") or 0)
             ):
-                return dev
+                if "index" in dev:
+                    return dev
+                matched = dict(dev)
+                matched["index"] = fallback_index
+                return matched
         return None
 

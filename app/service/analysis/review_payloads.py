@@ -30,6 +30,7 @@ _SUMMARY_ROW_DEFS = (
 )
 _NO_RESULT_FALLBACK_MESSAGE = "分析结果不可用"
 _NO_RESULT_STATUS = "无结果"
+_UNJUDGED_STATUS = "未判定"
 _REF_PRESSURE = 20e-6
 _SPL_CHUNK_DURATION_SEC = 0.05
 logger = logging.getLogger(__name__)
@@ -482,7 +483,18 @@ def _build_spl_row(
             }
         )
     if not candidates:
-        return _build_unconstrained_row("spl", "SPL"), None
+        return _build_unconstrained_acoustic_measurement_row(
+            item_key="spl",
+            label="SPL",
+            selected_channels=selected_channels,
+            channel_configs=channel_configs,
+            channel_results=channel_results,
+            available_key="spl_trace_available",
+            actual_key="spl_max_db",
+            fallback_actual_key="spl_db",
+            error_key="spl_trace_error_message",
+            unit="dB",
+        )
     return (
         _build_pass_row_from_candidate(
             item_key="spl",
@@ -542,7 +554,17 @@ def _build_spl_average_row(
             }
         )
     if not candidates:
-        return _build_unconstrained_row("spl_average", "平均SPL"), None
+        return _build_unconstrained_acoustic_measurement_row(
+            item_key="spl_average",
+            label="平均SPL",
+            selected_channels=selected_channels,
+            channel_configs=channel_configs,
+            channel_results=channel_results,
+            available_key="spl_average_available",
+            actual_key="spl_average_db",
+            error_key="spl_average_error_message",
+            unit="dB",
+        )
     return (
         _build_pass_row_from_candidate(
             item_key="spl_average",
@@ -696,7 +718,7 @@ def _build_loudness_row(
     channel_results: dict[int, dict],
 ) -> tuple[dict, str | None]:
     if not selected_channels:
-        return _build_unconstrained_row("loudness", "Loudness"), None
+        return _build_unjudged_row("loudness", "Loudness"), None
 
     candidates = []
     for channel_index in selected_channels:
@@ -771,7 +793,17 @@ def _build_loudness_row(
         )
 
     if not candidates:
-        return _build_unconstrained_row("loudness", "Loudness"), None
+        return _build_unconstrained_acoustic_measurement_row(
+            item_key="loudness",
+            label="Loudness",
+            selected_channels=selected_channels,
+            channel_configs=channel_configs,
+            channel_results=channel_results,
+            available_key="loudness_available",
+            actual_key="loudness_max_sone",
+            error_key="loudness_error_message",
+            loudness_value=True,
+        )
 
     candidate = _worst_loudness_candidate(candidates)
     return (
@@ -796,7 +828,7 @@ def _build_loudness_average_row(
     channel_results: dict[int, dict],
 ) -> tuple[dict, str | None]:
     if not selected_channels:
-        return _build_unconstrained_row("loudness_average", "平均Loudness"), None
+        return _build_unjudged_row("loudness_average", "平均Loudness"), None
 
     candidates = []
     for channel_index in selected_channels:
@@ -878,7 +910,17 @@ def _build_loudness_average_row(
         )
 
     if not candidates:
-        return _build_unconstrained_row("loudness_average", "平均Loudness"), None
+        return _build_unconstrained_acoustic_measurement_row(
+            item_key="loudness_average",
+            label="平均Loudness",
+            selected_channels=selected_channels,
+            channel_configs=channel_configs,
+            channel_results=channel_results,
+            available_key="loudness_available",
+            actual_key="loudness_average_sone",
+            error_key="loudness_error_message",
+            loudness_value=True,
+        )
 
     candidate = _worst_loudness_candidate(candidates)
     return (
@@ -1271,6 +1313,101 @@ def _build_unconstrained_row(item_key: str, label: str) -> dict:
         status="OK",
         constrained=False,
         unit=None,
+    )
+
+
+def _build_unjudged_row(
+    item_key: str,
+    label: str,
+    *,
+    actual_value: float | None = None,
+    channel_index: int | None = None,
+    unit: str | None = None,
+) -> dict:
+    return _build_row(
+        item_key=item_key,
+        label=label,
+        deviation_value=None,
+        actual_value=actual_value,
+        channel_index=channel_index,
+        status=_UNJUDGED_STATUS,
+        constrained=False,
+        unit=unit,
+    )
+
+
+def _build_unconstrained_acoustic_measurement_row(
+    *,
+    item_key: str,
+    label: str,
+    selected_channels: tuple[int, ...],
+    channel_configs: dict[int, dict],
+    channel_results: dict[int, dict],
+    available_key: str,
+    actual_key: str,
+    error_key: str,
+    fallback_actual_key: str | None = None,
+    unit: str | None = None,
+    loudness_value: bool = False,
+) -> tuple[dict, str | None]:
+    if not selected_channels:
+        return _build_unjudged_row(item_key, label), None
+
+    channel_index = selected_channels[0]
+    channel_result = channel_results.get(channel_index)
+    if not isinstance(channel_result, dict):
+        return (
+            _build_no_result_row(
+                item_key,
+                label,
+                constrained=False,
+                channel_index=channel_index,
+            ),
+            None,
+        )
+
+    raw_error_message = channel_result.get(error_key)
+    has_error_message = (
+        isinstance(raw_error_message, str)
+        and bool(raw_error_message.strip())
+    )
+    actual_value = _coerce_number(channel_result.get(actual_key))
+    if actual_value is None and fallback_actual_key is not None:
+        actual_value = _coerce_number(channel_result.get(fallback_actual_key))
+    if channel_result.get(available_key) is False or has_error_message:
+        return (
+            _build_no_result_row(
+                item_key,
+                label,
+                constrained=False,
+                channel_index=channel_index,
+            ),
+            _normalize_error_message(raw_error_message),
+        )
+    if actual_value is None:
+        return (
+            _build_unjudged_row(
+                item_key,
+                label,
+                channel_index=channel_index,
+            ),
+            None,
+        )
+
+    if loudness_value:
+        channel_config = _effective_channel_config(channel_configs, channel_index)
+        unit = _normalize_loudness_unit(channel_config.get("loudness_unit"))
+        actual_value = _loudness_value_in_unit(actual_value, unit)
+
+    return (
+        _build_unjudged_row(
+            item_key,
+            label,
+            actual_value=actual_value,
+            channel_index=channel_index,
+            unit=unit,
+        ),
+        None,
     )
 
 

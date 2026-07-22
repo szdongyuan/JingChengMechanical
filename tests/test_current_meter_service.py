@@ -8,13 +8,16 @@ import pytest
 from app.service.current_meter_service import (
     CurrentMeterCollector,
     CurrentSample,
+    PlcCurrentCollector,
     build_current_trace_payload,
+    current_meter_display_unit,
     current_trace_display_at_time,
     decode_current_registers,
     normalize_current_meter_config,
     rebase_current_samples,
     validate_current_meter_config,
 )
+from app.services_container import EventBus
 
 
 class _ReadResult:
@@ -107,6 +110,7 @@ def test_normalize_current_meter_config_defaults_and_validation():
     defaults = normalize_current_meter_config(None)
 
     assert defaults["enabled"] is False
+    assert defaults["source"] == "modbus_tcp"
     assert defaults["host"] == ""
     assert defaults["port"] == 502
     assert defaults["unit_id"] == 1
@@ -122,6 +126,26 @@ def test_normalize_current_meter_config_defaults_and_validation():
     assert validate_current_meter_config({"enabled": True}) == [
         "电流表 IP/主机不能为空"
     ]
+
+
+def test_plc_current_config_does_not_require_modbus_fields_and_uses_ampere_unit():
+    config = normalize_current_meter_config(
+        {
+            "enabled": True,
+            "source": "PLC",
+            "data_type": "float32",
+            "register_count": 1,
+            "unit": "mA",
+        }
+    )
+
+    assert config["source"] == "plc"
+    assert validate_current_meter_config(config) == []
+    assert current_meter_display_unit({"source": "plc", "unit": "mA"}) == "A"
+
+
+def test_invalid_current_source_falls_back_to_modbus_tcp():
+    assert normalize_current_meter_config({"source": "serial"})["source"] == "modbus_tcp"
 
 
 def test_normalize_current_meter_config_preserves_non_default_values():
@@ -672,3 +696,77 @@ def test_current_meter_collector_stop_waits_for_in_flight_read_before_returning(
         client.release_read.set()
         collector.stop(timeout=2.0)
         stopper.join(timeout=2.0)
+
+
+def test_plc_current_collector_filters_plc_id_and_accumulates_zero_value():
+    bus = EventBus()
+    callbacks = []
+    collector = PlcCurrentCollector(
+        {"enabled": True, "source": "plc"},
+        bus=bus,
+        plc_id=7,
+        time_func=lambda: 10.0,
+        sample_callback=lambda sample, snapshot: callbacks.append((sample, snapshot)),
+    )
+
+    assert collector.start() is True
+    assert collector.start() is True
+    bus.plc_current_sampled.emit(8, 10.1, 99.0)
+    bus.plc_current_sampled.emit(7, 9.9, 88.0)
+    bus.plc_current_sampled.emit(7, 10.25, 0.0)
+
+    expected = CurrentSample(time_sec=0.25, current_a=0.0, monotonic_time=10.25)
+    assert collector.samples() == [expected]
+    assert callbacks == [(expected, (expected,))]
+    assert collector.trace_payload() == {
+        "times_sec": [0.25],
+        "values_a": [0.0],
+        "average_a": 0.0,
+        "max_a": 0.0,
+        "latest_a": 0.0,
+        "unit": "A",
+    }
+
+    collector.stop()
+    bus.plc_current_sampled.emit(7, 10.5, 1.0)
+    assert collector.samples() == [expected]
+
+
+def test_plc_current_collector_requires_enabled_plc_source():
+    bus = EventBus()
+
+    assert PlcCurrentCollector(
+        {"enabled": False, "source": "plc"},
+        bus=bus,
+        plc_id=1,
+    ).start() is False
+    assert PlcCurrentCollector(
+        {"enabled": True, "source": "modbus_tcp", "host": "127.0.0.1"},
+        bus=bus,
+        plc_id=1,
+    ).start() is False
+
+
+def test_plc_current_collector_logs_repeated_callback_error_once():
+    bus = EventBus()
+    logs = []
+
+    def failing_callback(_sample, _snapshot):
+        raise RuntimeError("callback boom")
+
+    collector = PlcCurrentCollector(
+        {"enabled": True, "source": "plc"},
+        bus=bus,
+        plc_id=1,
+        time_func=lambda: 10.0,
+        log_callback=logs.append,
+        sample_callback=failing_callback,
+    )
+
+    assert collector.start() is True
+    bus.plc_current_sampled.emit(1, 10.1, 1.0)
+    bus.plc_current_sampled.emit(1, 10.2, 2.0)
+    collector.stop()
+
+    assert [sample.current_a for sample in collector.samples()] == [1.0, 2.0]
+    assert logs == ["PLC 电流样本回调失败: callback boom"]

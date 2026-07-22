@@ -22,6 +22,8 @@ from app.services_container import FactoryControllerState, FactoryReviewPayload
 
 _SPL_PEAK_LABEL = "声压级（峰值）"
 _LOUDNESS_PEAK_LABEL = "响度（峰值）"
+_SPL_LIVE_LABEL = "声压级"
+_LOUDNESS_LIVE_LABEL = "响度"
 
 _DISPLAY_LABEL_MAP = {
     "SPL": _SPL_PEAK_LABEL,
@@ -106,12 +108,12 @@ class ResultModule(QWidget):
         metrics_lay.setContentsMargins(0, 0, 0, 0)
         metrics_lay.setSpacing(4)
 
-        spl_metric = self._create_metric_badge(_SPL_PEAK_LABEL, "--")
+        spl_metric = self._create_metric_badge(_SPL_LIVE_LABEL, "--")
         self.lb_spl_metric_label = spl_metric["label"]
         self.lb_spl_metric_value = spl_metric["value"]
         metrics_lay.addWidget(spl_metric["widget"], 1)
 
-        loudness_metric = self._create_metric_badge(_LOUDNESS_PEAK_LABEL, "--")
+        loudness_metric = self._create_metric_badge(_LOUDNESS_LIVE_LABEL, "--")
         self.lb_loudness_metric_label = loudness_metric["label"]
         self.lb_loudness_metric_value = loudness_metric["value"]
         metrics_lay.addWidget(loudness_metric["widget"], 1)
@@ -506,7 +508,7 @@ class ResultModule(QWidget):
         if phase in self._LIVE_METRIC_PHASES:
             self._render_live_metrics()
             return
-        self._set_metric_values(_SPL_PEAK_LABEL, "--", _LOUDNESS_PEAK_LABEL, "--")
+        self._set_metric_values(_SPL_LIVE_LABEL, "--", _LOUDNESS_LIVE_LABEL, "--")
 
     def _render_live_metrics(self) -> None:
         key = self._current_metric_key()
@@ -519,14 +521,14 @@ class ResultModule(QWidget):
                 self._live_loudness_by_key.get(key),
                 unit,
             )
-        self._set_metric_values(_SPL_PEAK_LABEL, spl_text, _LOUDNESS_PEAK_LABEL, loudness_text)
+        self._set_metric_values(_SPL_LIVE_LABEL, spl_text, _LOUDNESS_LIVE_LABEL, loudness_text)
 
     def _render_live_spl_metric(self) -> None:
         key = self._current_metric_key()
         spl_text = "--"
         if key is not None:
             spl_text = self._format_spl_db(self._live_spl_by_key.get(key))
-        self.lb_spl_metric_label.setText(_SPL_PEAK_LABEL)
+        self.lb_spl_metric_label.setText(_SPL_LIVE_LABEL)
         self.lb_spl_metric_value.setText(spl_text)
 
     def _render_live_loudness_metric(self) -> None:
@@ -538,7 +540,7 @@ class ResultModule(QWidget):
                 self._live_loudness_by_key.get(key),
                 unit,
             )
-        self.lb_loudness_metric_label.setText(_LOUDNESS_PEAK_LABEL)
+        self.lb_loudness_metric_label.setText(_LOUDNESS_LIVE_LABEL)
         self.lb_loudness_metric_value.setText(loudness_text)
 
     def _render_average_metrics(self) -> None:

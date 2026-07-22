@@ -22,7 +22,7 @@ a = Analysis(
     pathex=['.'],
     binaries=binaries,
     datas=[
-        ('data', 'data'),
+        ('assets', 'assets'),
     ],
     hiddenimports=collect_submodules('snap7'),
     hookspath=[],
@@ -43,6 +43,7 @@ exe = EXE(
     a.datas,
     [],
     name='精成电机',
+    icon='assets/logo.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

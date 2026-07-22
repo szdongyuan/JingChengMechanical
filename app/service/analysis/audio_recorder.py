@@ -65,6 +65,7 @@ class AudioRecorder(QThread):
     error_occurred = pyqtSignal(str)
 
     CHUNK_DURATION = 0.05
+    INPUT_DATA_TIMEOUT_SECONDS = 2.0
 
     def __init__(
         self,
@@ -263,6 +264,8 @@ class AudioRecorder(QThread):
                 blocksize=self._chunk_samples,
                 callback=self._sd_callback,
             ):
+                last_block_received_at = time.monotonic()
+                received_any_block = False
                 while True:
                     with self._state_lock:
                         if self._stop_flag:
@@ -272,9 +275,27 @@ class AudioRecorder(QThread):
                             break
                     try:
                         block = self._queue.get(timeout=0.1)
+                        last_block_received_at = time.monotonic()
+                        received_any_block = True
                         self._feed_captured_block(block)
                         self._emit_captured_block(block)
                     except queue.Empty:
+                        if (
+                            time.monotonic() - last_block_received_at
+                            >= self.INPUT_DATA_TIMEOUT_SECONDS
+                        ):
+                            self._close_capture_acceptance()
+                            if received_any_block:
+                                message = (
+                                    "输入硬件已停止返回音频数据，请检查设备连接。"
+                                )
+                            else:
+                                message = (
+                                    "输入硬件未返回音频数据，录音无法开始，"
+                                    "请检查设备连接和占用状态。"
+                                )
+                            self.error_occurred.emit(message)
+                            return
                         continue
         except sd.PortAudioError as exc:
             self._close_capture_acceptance()

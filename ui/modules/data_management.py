@@ -790,28 +790,9 @@ class DataManagementModule(QWidget):
         self.refresh_table()
 
     def _apply_current_output_device(self) -> None:
-        # 播放模块不自己记设备，直接复用硬件页当前保存的输出设备配置。
-        hss_service = getattr(self.services, "hss_service", None)
-        if hss_service is None:
-            return
-        load_io_devices = getattr(hss_service, "load_io_devices", None)
-        query_devices_and_hostapis = getattr(hss_service, "query_devices_and_hostapis", None)
-        restore_default_device_from_db = getattr(
-            hss_service,
-            "restore_default_device_from_db",
-            None,
-        )
-        if not callable(load_io_devices):
-            return
-        if not callable(query_devices_and_hostapis):
-            return
-        if not callable(restore_default_device_from_db):
-            return
-        device_info = load_io_devices()
-        if not device_info:
-            return
-        devices, hostapis = query_devices_and_hostapis(refresh=False)
-        restore_default_device_from_db(device_info, devices, hostapis)
+        # Output hardware is intentionally unmanaged. Playback follows the
+        # operating system's current default output device.
+        return
 
     def _emit_log(self, message: str) -> None:
         # 统一走 bus.log，状态栏和日志面板都能看到。

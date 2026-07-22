@@ -19,7 +19,9 @@ def test_test_config_table_exposes_nullable_plc_id_field():
         "plc",
         "created_time",
         "updated_time",
+        "input_hardware_device_id",
         "current_meter_host",
+        "current_meter_source",
         "current_meter_port",
         "current_meter_unit_id",
         "current_meter_register_type",
@@ -61,6 +63,7 @@ def test_test_config_table_exposes_nullable_plc_id_field():
 
     assert config.plc_id is None
     assert config.input_device_name is None
+    assert config.input_hardware_device_id is None
     assert config.selected_channels == "[]"
     assert config.vibration_view_channel_index is None
     assert config.result_dashboard_layout is None
@@ -82,6 +85,7 @@ def test_model_defines_allow_incomplete_recording_analysis_with_false_default():
 def test_model_defines_default_lingli_current_meter_fields():
     config = ConfigTable(config_name="LingLi Current Meter Defaults")
 
+    assert config.current_meter_source == "modbus_tcp"
     assert config.current_meter_register_type == "input"
     assert config.current_meter_register_address == 0
     assert config.current_meter_register_count == 1

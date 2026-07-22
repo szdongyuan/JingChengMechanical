@@ -6,6 +6,7 @@ from model.base_mode import BaseModel
 class PlcFieldOffsetTable(BaseModel):
     plc_id = IntegerField(primary_key=True)
     start_signal_offset = TextField(null=True)
+    current_value_offset = TextField(null=True)
     sn_code_offset = TextField(null=True)
     product_model_offset = TextField(null=True)
     res_finish_signal_offset = TextField(null=True)

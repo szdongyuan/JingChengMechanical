@@ -1772,7 +1772,44 @@ def test_build_summary_payload_keeps_nearest_bin_fft_band_results_as_normal_row(
     assert summary["rows"][4]["constrained"] is True
 
 
-def test_build_summary_payload_orders_rows_and_marks_unconstrained_average_rows_ok():
+def test_build_summary_payload_displays_unconstrained_acoustic_values_as_unjudged():
+    summary = build_summary_payload(
+        config=_make_single_channel_config(
+            spl_lower_enabled=False,
+            spl_upper_enabled=False,
+            spl_average_lower_enabled=False,
+            spl_average_upper_enabled=False,
+            loudness_lower_enabled=False,
+            loudness_upper_enabled=False,
+            loudness_average_lower_enabled=False,
+            loudness_average_upper_enabled=False,
+            fft_band_limits=[],
+            oct_band_limits=[],
+        ),
+        judgment_payload=_make_single_channel_judgment_payload(),
+        ai_review={"status": "not_enabled"},
+    )
+
+    acoustic_rows = summary["rows"][:4]
+    assert [row["item_key"] for row in acoustic_rows] == [
+        "spl",
+        "spl_average",
+        "loudness",
+        "loudness_average",
+    ]
+    assert [row["actual_display"] for row in acoustic_rows] == [
+        "77.00 dB",
+        "60.00 dB",
+        "7.00 sone",
+        "4.00 sone",
+    ]
+    assert all(row["status"] == "未判定" for row in acoustic_rows)
+    assert all(row["constrained"] is False for row in acoustic_rows)
+    assert all(row["deviation_display"] == "--" for row in acoustic_rows)
+    assert summary["overall_status"] == "pass"
+
+
+def test_build_summary_payload_marks_failed_unconstrained_average_measurements_no_result():
     summary = build_summary_payload(
         config=_make_single_channel_config(
             spl_average_lower_enabled=False,
@@ -1816,14 +1853,14 @@ def test_build_summary_payload_orders_rows_and_marks_unconstrained_average_rows_
         "ai",
     ]
     assert summary["rows"][1]["label"] == "平均SPL"
-    assert summary["rows"][1]["status"] == "OK"
+    assert summary["rows"][1]["status"] == "无结果"
     assert summary["rows"][1]["deviation_display"] == "--"
-    assert summary["rows"][1]["channel_label"] == "--"
+    assert summary["rows"][1]["channel_label"] == "CH1"
     assert summary["rows"][3]["label"] == "平均Loudness"
-    assert summary["rows"][3]["status"] == "OK"
+    assert summary["rows"][3]["status"] == "无结果"
     assert summary["rows"][5]["deviation_display"] == "--"
     assert summary["rows"][5]["channel_label"] == "--"
-    assert summary["overall_status"] == "pass"
+    assert summary["overall_status"] == "no_result"
 
 
 def test_build_summary_payload_marks_first_selected_blocking_average_row_no_result():

@@ -29,11 +29,13 @@ class DbConnectionService:
             "test_config_ai_binding_table",
             "ai_execution_table",
             "device_table",
+            "input_hardware_table",
             "audio_data_table",
             "users_table",
             "system_info_table",
             "training_model_table",
             "plc_table",
+            "plc_field_offset_table",
             "historical_metric_cache_table",
         }
     )
@@ -58,9 +60,39 @@ class DbConnectionService:
     _REQUIRED_TEST_CONFIG_COLUMNS = frozenset(
         {
             "vibration_view_channel_index",
+            "input_hardware_device_id",
             "result_dashboard_layout",
+            "current_meter_enabled",
+            "current_meter_source",
+            "current_meter_host",
+            "current_meter_port",
+            "current_meter_unit_id",
+            "current_meter_register_type",
+            "current_meter_register_address",
+            "current_meter_register_count",
+            "current_meter_data_type",
+            "current_meter_byte_order",
+            "current_meter_word_order",
+            "current_meter_scale",
+            "current_meter_offset",
+            "current_meter_poll_interval_ms",
+            "current_meter_timeout_ms",
         }
     )
+    _REQUIRED_INPUT_HARDWARE_COLUMNS = frozenset(
+        {
+            "hardware_id",
+            "alias",
+            "device_name",
+            "hostapi",
+            "samplerate",
+            "channel_count",
+            "mic_cal",
+            "created_time",
+            "updated_time",
+        }
+    )
+    _REQUIRED_PLC_FIELD_OFFSET_COLUMNS = frozenset({"current_value_offset"})
     _REQUIRED_HISTORICAL_METRIC_CACHE_COLUMNS = frozenset(
         {
             "cache_id",
@@ -190,6 +222,14 @@ class DbConnectionService:
         self._ensure_required_table_columns(
             "test_config_table",
             self._REQUIRED_TEST_CONFIG_COLUMNS,
+        )
+        self._ensure_required_table_columns(
+            "input_hardware_table",
+            self._REQUIRED_INPUT_HARDWARE_COLUMNS,
+        )
+        self._ensure_required_table_columns(
+            "plc_field_offset_table",
+            self._REQUIRED_PLC_FIELD_OFFSET_COLUMNS,
         )
         self._ensure_required_table_columns(
             "historical_metric_cache_table",

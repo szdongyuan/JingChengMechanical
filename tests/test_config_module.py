@@ -303,6 +303,48 @@ class _HardwareServiceStub:
         return (list(self._devices), list(self._hostapis))
 
 
+class _ManagedHardwareServiceStub:
+    def list_input_hardware(self):
+        return [
+            {
+                "hardware_id": 11,
+                "alias": "产线 A 声卡",
+                "name": "Interface A",
+                "hostapi": "ASIO",
+                "default_samplerate": 48000.0,
+                "samplerate": 48000.0,
+                "max_input_channels": 2,
+                "channel_count": 2,
+                "mic_cal": {},
+            },
+            {
+                "hardware_id": 22,
+                "alias": "产线 B 声卡",
+                "name": "Interface B",
+                "hostapi": "ASIO",
+                "default_samplerate": 96000.0,
+                "samplerate": 96000.0,
+                "max_input_channels": 4,
+                "channel_count": 4,
+                "mic_cal": {},
+            },
+        ]
+
+    def query_devices_and_hostapis(self, refresh: bool = False):
+        return (
+            [
+                {
+                    "name": "Line Monitor",
+                    "hostapi": 0,
+                    "default_samplerate": 48000.0,
+                    "max_input_channels": 0,
+                    "max_output_channels": 2,
+                }
+            ],
+            [{"name": "WASAPI"}],
+        )
+
+
 @contextmanager
 def _capture_qt_messages():
     messages: list[str] = []
@@ -728,8 +770,8 @@ def test_top_level_config_launchers_open_cards_and_keep_plc_visible(qapp):
     assert launcher_panel is not None
 
     expected = {
-        "open_audio_vibration_hardware_card": (
-            "音频/振动硬件设置",
+            "open_audio_vibration_hardware_card": (
+                "输入硬件与监听设置",
             "top_level_audio_vibration_hardware_card_dialog",
         ),
         "open_current_meter_card": (
@@ -1354,6 +1396,7 @@ def test_populate_detail_loads_default_current_meter_controls(qapp):
 
     module._populate_detail(_detail_payload([]))
 
+    assert module.combo_current_meter_source.currentData() == "modbus_tcp"
     assert module.spin_current_meter_port.value() == 502
     assert module.spin_current_meter_unit_id.value() == 1
     assert module.combo_current_meter_register_type.currentData() == "input"
@@ -1373,6 +1416,7 @@ def test_populate_detail_preserves_current_meter_unit_id_zero():
     payload = _detail_payload([])
     payload["current_meter"] = {
         "enabled": True,
+        "source": "modbus_tcp",
         "host": "192.168.1.20",
         "unit_id": 0,
     }
@@ -1472,6 +1516,7 @@ def test_populate_detail_preserves_explicit_current_meter_values(qapp):
 
     assert data["current_meter"] == {
         "enabled": True,
+        "source": "modbus_tcp",
         "host": "192.168.1.20",
         "port": 1502,
         "unit_id": 3,
@@ -1486,6 +1531,36 @@ def test_populate_detail_preserves_explicit_current_meter_values(qapp):
         "poll_interval_ms": 250,
         "timeout_ms": 1200,
     }
+
+
+def test_plc_current_source_disables_only_modbus_controls(qapp):
+    module = _make_module()
+    payload = _detail_payload([])
+    payload["current_meter"] = {
+        "enabled": True,
+        "source": "plc",
+        "host": "192.168.1.20",
+    }
+
+    module._populate_detail(payload)
+
+    assert module.combo_current_meter_source.currentData() == "plc"
+    assert module.chk_current_meter_enabled.isEnabled()
+    assert module.combo_current_meter_source.isEnabled()
+    assert all(
+        not control.isEnabled()
+        for control in module._current_meter_modbus_controls
+    )
+    assert module._collect_data()["current_meter"]["source"] == "plc"
+
+    module.combo_current_meter_source.setCurrentIndex(
+        module.combo_current_meter_source.findData("modbus_tcp")
+    )
+
+    assert all(
+        control.isEnabled()
+        for control in module._current_meter_modbus_controls
+    )
 
 
 def test_hardware_card_exposes_monitor_controls_and_channel_options(qapp):
@@ -1535,6 +1610,57 @@ def test_hardware_card_exposes_monitor_controls_and_channel_options(qapp):
     assert module.spin_monitor_gain_db.singleStep() == pytest.approx(1.0)
     assert module.spin_monitor_gain_db.decimals() == 1
     assert module.spin_monitor_gain_db.suffix() == " dB"
+
+
+def test_managed_input_hardware_binding_uses_stable_id_and_no_output(qapp):
+    module = _make_module(hardware_service=_ManagedHardwareServiceStub())
+    payload = _detail_payload([_channel_payload(i) for i in range(4)])
+    payload["input_hardware_device_id"] = 22
+    payload["selected_channels"] = [0, 3]
+    payload["output_device_name"] = None
+    payload["output_device_hostapi"] = None
+    payload["output_device_samplerate"] = None
+
+    module._populate_detail(payload)
+
+    selected = module.combo_input_dev.currentData()
+    assert selected["hardware_id"] == 22
+    assert module.combo_input_dev.currentText().startswith("产线 B 声卡")
+    assert len(module._channel_checkboxes) == 4
+
+    collected = module._collect_data()
+    assert collected["input_hardware_device_id"] == 22
+    assert collected["input_device_name"] == "Interface B"
+    assert collected["output_device_name"] is None
+    assert collected["output_device_hostapi"] is None
+    assert collected["output_device_samplerate"] is None
+
+
+def test_managed_input_hardware_keeps_config_level_monitor_device(qapp):
+    module = _make_module(hardware_service=_ManagedHardwareServiceStub())
+    payload = _detail_payload([_channel_payload(0), _channel_payload(1)])
+    payload.update(
+        {
+            "input_hardware_device_id": 11,
+            "selected_channels": [0],
+            "output_device_name": "Line Monitor",
+            "output_device_hostapi": "WASAPI",
+            "output_device_samplerate": 48000.0,
+            "monitor_channel_index": 0,
+            "monitor_gain_db": -6.0,
+        }
+    )
+
+    module._populate_detail(payload)
+    collected = module._collect_data()
+
+    assert module.combo_output_dev.currentText() == "Line Monitor (WASAPI)"
+    assert collected["output_device_name"] == "Line Monitor"
+    assert collected["output_device_hostapi"] == "WASAPI"
+    assert collected["output_device_samplerate"] == 48000.0
+    assert collected["monitor_channel_index"] == 0
+    assert collected["monitor_gain_db"] == -6.0
+    assert module.combo_monitor_channel.count() == 2
 
 
 def test_hardware_card_exposes_vibration_view_channel_selector(qapp):
@@ -1855,6 +1981,9 @@ def test_collect_data_includes_current_meter_settings(qapp):
     module = _make_module()
     module._current_config_id = 7
     module.chk_current_meter_enabled.setChecked(True)
+    module.combo_current_meter_source.setCurrentIndex(
+        module.combo_current_meter_source.findData("modbus_tcp")
+    )
     module.ed_current_meter_host.setText("192.168.1.20")
     module.spin_current_meter_port.setValue(1502)
     module.spin_current_meter_unit_id.setValue(3)
@@ -1880,6 +2009,7 @@ def test_collect_data_includes_current_meter_settings(qapp):
 
     assert data["current_meter"] == {
         "enabled": True,
+        "source": "modbus_tcp",
         "host": "192.168.1.20",
         "port": 1502,
         "unit_id": 3,
