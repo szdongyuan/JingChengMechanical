@@ -108,6 +108,45 @@ def test_migration_backs_up_adds_only_missing_columns_and_preserves_rows(
     assert _read_new_offsets(database_path) == (None, None)
 
 
+def test_migration_backup_includes_committed_uncheckpointed_wal_data(tmp_path):
+    database_path = tmp_path / "jingchen.db"
+    writer = sqlite3.connect(database_path)
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        writer.execute("PRAGMA wal_autocheckpoint=0")
+        writer.executescript(
+            """
+            CREATE TABLE plc_field_offset_table (
+                plc_id INTEGER PRIMARY KEY,
+                start_signal_offset TEXT,
+                current_value_offset TEXT
+            );
+            INSERT INTO plc_field_offset_table (
+                plc_id, start_signal_offset, current_value_offset
+            ) VALUES (3, '0.0', '2.0');
+            """
+        )
+        writer.commit()
+        wal_path = database_path.with_name(database_path.name + "-wal")
+        assert wal_path.is_file()
+        assert wal_path.stat().st_size > 0
+
+        result = migration.migrate_database(database_path)
+
+        assert _columns(result.backup_path) == {
+            "plc_id",
+            "start_signal_offset",
+            "current_value_offset",
+        }
+        assert _read_existing_offsets(result.backup_path) == (
+            3,
+            "0.0",
+            "2.0",
+        )
+    finally:
+        writer.close()
+
+
 def test_migration_is_idempotent_and_keeps_backing_up(tmp_path):
     database_path = tmp_path / "jingchen.db"
     _create_legacy_database(database_path)

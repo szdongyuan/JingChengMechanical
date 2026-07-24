@@ -10,7 +10,6 @@ import argparse
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-import shutil
 import sqlite3
 from typing import Sequence
 
@@ -51,6 +50,21 @@ def _column_names(connection: sqlite3.Connection, table_name: str) -> set[str]:
     return {str(row[1]) for row in rows}
 
 
+def _backup_database(
+    source: sqlite3.Connection,
+    backup_path: Path,
+) -> None:
+    destination = sqlite3.connect(backup_path)
+    try:
+        source.backup(destination)
+    except Exception:
+        destination.close()
+        backup_path.unlink(missing_ok=True)
+        raise
+    else:
+        destination.close()
+
+
 def migrate_database(database_path: str | Path) -> MigrationResult:
     """Back up a database and add missing optional PLC protocol columns."""
     resolved_path = Path(database_path).expanduser().resolve()
@@ -58,11 +72,11 @@ def migrate_database(database_path: str | Path) -> MigrationResult:
         raise FileNotFoundError(f"Database file does not exist: {resolved_path}")
 
     backup_path = _backup_path_for(resolved_path)
-    shutil.copy2(resolved_path, backup_path)
-
     added_columns: list[str] = []
     connection = sqlite3.connect(resolved_path)
     try:
+        _backup_database(connection, backup_path)
+
         required_tables = {"plc_field_offset_table"}
         missing_tables = sorted(required_tables - _table_names(connection))
         if missing_tables:
