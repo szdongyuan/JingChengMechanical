@@ -17,7 +17,11 @@ from PyQt6.QtWidgets import (
 )
 
 from app.service.log_manager import LogManager
-from app.service.plc_protocol import PLC_FIELD_SPECS, parse_plc_offset
+from app.service.plc_protocol import (
+    PLC_FIELD_SPECS,
+    PLC_NEW_RECORD_DEFAULT_OFFSETS,
+    parse_plc_offset,
+)
 from base.utils import int_or_none, text_or_empty, text_or_none
 from consts.style import APP_QSS
 from app.service.plc_process_param_service import PlcProcessParamService
@@ -539,7 +543,10 @@ class PlcSettingsModule(QWidget):
             database = PlcTable._meta.database
             with database.atomic():
                 row = PlcTable.create(plc_open_state=0)
-                PlcFieldOffsetTable.create(plc_id=row.id)
+                PlcFieldOffsetTable.create(
+                    plc_id=row.id,
+                    **PLC_NEW_RECORD_DEFAULT_OFFSETS,
+                )
         except Exception as exc:
             self.logger.error(f"新增 PLC 配置失败: {exc}")
             self.services.bus.log.emit(f"新增 PLC 配置失败: {exc}")
