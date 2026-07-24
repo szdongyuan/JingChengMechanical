@@ -45,6 +45,8 @@ class _AnalysisWindowSlice:
     samples: np.ndarray
     start_sec: float
     end_sec: float
+    start_sample: int
+    end_sample: int
     has_explicit_window: bool
 
     @property
@@ -242,11 +244,23 @@ def build_chart_payload(
         is_vibration_channel = channel_index == vibration_channel_index
         channel_payload = {}
         if not is_vibration_channel:
+            spl_signal = (
+                calibrated_full if calibrated_full is not None else calibrated
+            )
+            spl_start = (
+                window_slice.start_sample if calibrated_full is not None else 0
+            )
+            spl_end = (
+                window_slice.end_sample
+                if calibrated_full is not None
+                else len(calibrated)
+            )
             spl_payload = _build_spl_chart(
-                signal=calibrated,
+                signal=spl_signal,
                 sample_rate=sample_rate,
                 channel_config=channel_config,
-                window_start_sec=window_start_sec,
+                output_start_sample=spl_start,
+                output_end_sample=spl_end,
             )
             if x_axis_range_sec is not None:
                 spl_payload["x_axis_range_sec"] = list(x_axis_range_sec)
@@ -1815,14 +1829,35 @@ def _slice_analysis_window_with_bounds(
         not isinstance(analysis_window, (list, tuple))
         or len(analysis_window) != 2
     ):
-        return _AnalysisWindowSlice(buffer, 0.0, total_sec, False)
+        return _AnalysisWindowSlice(
+            buffer,
+            0.0,
+            total_sec,
+            0,
+            total_samples,
+            False,
+        )
     try:
         start_sec = float(analysis_window[0])
         end_sec = float(analysis_window[1])
     except (TypeError, ValueError):
-        return _AnalysisWindowSlice(buffer, 0.0, total_sec, False)
+        return _AnalysisWindowSlice(
+            buffer,
+            0.0,
+            total_sec,
+            0,
+            total_samples,
+            False,
+        )
     if not math.isfinite(start_sec) or not math.isfinite(end_sec):
-        return _AnalysisWindowSlice(buffer, 0.0, total_sec, False)
+        return _AnalysisWindowSlice(
+            buffer,
+            0.0,
+            total_sec,
+            0,
+            total_samples,
+            False,
+        )
     start_sec = max(0.0, min(total_sec, start_sec))
     end_sec = max(start_sec, min(total_sec, end_sec))
     start_idx = max(0, min(total_samples, int(start_sec * sample_rate)))
@@ -1836,6 +1871,8 @@ def _slice_analysis_window_with_bounds(
         buffer[start_idx:end_idx],
         start_sec,
         end_sec,
+        start_idx,
+        end_idx,
         has_explicit_window,
     )
 
@@ -1941,7 +1978,8 @@ def _build_spl_chart(
     signal: np.ndarray,
     sample_rate: float,
     channel_config: dict,
-    window_start_sec: float = 0.0,
+    output_start_sample: int,
+    output_end_sample: int,
 ) -> dict:
     weighting = str(channel_config.get("spl_weighting", "Z") or "Z")
     try:
@@ -1955,11 +1993,13 @@ def _build_spl_chart(
         weighting,
         time_constant,
         chunk_duration=_SPL_CHUNK_DURATION_SEC,
+        output_start_sample=output_start_sample,
+        output_end_sample=output_end_sample,
     )
     times_sec = []
     values_db = []
     for end_time, value in zip(raw_times_sec, raw_values_db):
-        normalized_time = _normalize_chart_number(float(end_time) + float(window_start_sec))
+        normalized_time = _normalize_chart_number(end_time)
         normalized_value = _normalize_chart_number(value)
         if normalized_time is None or normalized_value is None:
             continue
