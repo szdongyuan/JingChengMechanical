@@ -5,9 +5,11 @@ import threading
 import time
 
 import numpy as np
+import pytest
 
 from app.service.analysis.frames import LoudnessFrame, SplFrame
 from app.service.analysis.live_display_dispatcher import LiveDisplayDispatcher
+from app.service.analysis.pipeline import AnalysisPipeline
 
 
 class _Signal:
@@ -390,6 +392,63 @@ def test_sample_span_gap_resets_pipelines_before_later_chunk():
         assert pipeline.reset_snapshots == [[1]]
         assert [call[3].spl_db for call in bus.spl_updated.calls] == [1.0, 3.0]
         assert [call[3] for call in bus.stft_updated.calls] == ["stft-1", "stft-3"]
+    finally:
+        dispatcher.stop()
+
+
+def test_sample_span_gap_resets_complete_live_spl_detector_state():
+    sample_rate = 48_000.0
+    channel_config = {
+        "channel_index": 0,
+        "stft_nfft": 4096,
+        "fft_nfft": 4096,
+        "stft_overlap": 0.5,
+        "spl_weighting": "A",
+        "spl_time_constant": 0.125,
+        "oct_weighting": "Z",
+    }
+    pipeline = AnalysisPipeline(0, channel_config, sample_rate)
+    pristine = AnalysisPipeline(0, channel_config, sample_rate)
+    prefix = np.full(2400, 0.5, dtype=np.float64)
+    times = np.arange(2400, dtype=np.float64) / sample_rate
+    probe = 0.1 * np.sin(2.0 * np.pi * 31.5 * times)
+    expected = pristine.process_chunk(
+        probe,
+        elapsed_time=0.15,
+        compute_loudness=False,
+    )["spl"].spl_db
+    bus = _Bus()
+    dispatcher = LiveDisplayDispatcher(
+        pipelines=[pipeline],
+        bus=bus,
+        config_id=7,
+        max_queue_size=4,
+    )
+
+    try:
+        dispatcher.start()
+        assert dispatcher.submit(
+            prefix.reshape(-1, 1),
+            elapsed_time=0.05,
+            frame_run_id="run-1",
+            live_loudness_channel_index=None,
+            sample_start=0,
+            sample_end=2400,
+        ) is True
+        _wait_until(lambda: len(bus.spl_updated.calls) == 1)
+
+        assert dispatcher.submit(
+            probe.reshape(-1, 1),
+            elapsed_time=0.15,
+            frame_run_id="run-1",
+            live_loudness_channel_index=None,
+            sample_start=4800,
+            sample_end=7200,
+        ) is True
+        _wait_until(lambda: len(bus.spl_updated.calls) == 2)
+
+        actual = bus.spl_updated.calls[-1][3].spl_db
+        assert actual == pytest.approx(expected, abs=1e-12)
     finally:
         dispatcher.stop()
 

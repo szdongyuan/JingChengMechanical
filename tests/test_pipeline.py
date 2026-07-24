@@ -4,6 +4,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from app.service.analysis import dsp
 from app.service.analysis.pipeline import (
     _LIVE_LOUDNESS_THROTTLE_SEC,
     _LIVE_LOUDNESS_WINDOW_BACKEND_SAMPLES,
@@ -41,6 +42,98 @@ def _stable_calibrator_signal(
     amplitude = np.sqrt(2.0) * 20e-6 * (10.0 ** (spl_db / 20.0))
     times = np.arange(int(sample_rate * duration_sec), dtype=np.float64) / sample_rate
     return amplitude * np.sin(2.0 * np.pi * freq_hz * times), sample_rate
+
+
+@pytest.mark.parametrize(
+    ("weighting", "frequency_hz"),
+    [("A", 31.5), ("A", 100.0), ("C", 31.5), ("C", 100.0), ("Z", 31.5)],
+)
+def test_live_spl_matches_post_run_trace_at_common_endpoints(
+    weighting,
+    frequency_hz,
+):
+    sample_rate = 48_000.0
+    signal, _ = _stable_calibrator_signal(
+        sample_rate=sample_rate,
+        duration_sec=2.037,
+        freq_hz=frequency_hz,
+    )
+    pipeline = AnalysisPipeline(
+        channel_index=0,
+        channel_config=_make_config(
+            spl_weighting=weighting,
+            spl_time_constant=0.125,
+        ),
+        sample_rate=sample_rate,
+    )
+
+    chunk_samples = int(0.05 * sample_rate)
+    live_times = []
+    live_values = []
+    for start in range(0, signal.size, chunk_samples):
+        end = min(start + chunk_samples, signal.size)
+        frame = pipeline.process_chunk(
+            signal[start:end],
+            elapsed_time=end / sample_rate,
+            compute_loudness=False,
+        )["spl"]
+        live_times.append(frame.time)
+        live_values.append(frame.spl_db)
+
+    post_times, post_values = dsp.compute_spl_trace(
+        signal,
+        sample_rate,
+        weighting,
+        0.125,
+        chunk_duration=0.05,
+    )
+
+    assert live_times == pytest.approx(post_times, abs=1e-12)
+    assert live_times[-1] == pytest.approx(signal.size / sample_rate, abs=1e-12)
+    np.testing.assert_allclose(live_values, post_values, atol=0.1, rtol=0.0)
+
+
+def test_live_multitone_spl_matches_post_run_trace_with_final_partial_block():
+    sample_rate = 48_000.0
+    sample_count = int(sample_rate * 2.0) + 733
+    times = np.arange(sample_count, dtype=np.float64) / sample_rate
+    signal = (
+        0.08 * np.sin(2.0 * np.pi * 31.5 * times)
+        + 0.03 * np.sin(2.0 * np.pi * 100.0 * times + 0.2)
+        + 0.01 * np.sin(2.0 * np.pi * 1000.0 * times + 0.7)
+    )
+    pipeline = AnalysisPipeline(
+        channel_index=0,
+        channel_config=_make_config(
+            spl_weighting="A",
+            spl_time_constant=0.125,
+        ),
+        sample_rate=sample_rate,
+    )
+
+    chunk_samples = 2400
+    live_values = []
+    for start in range(0, signal.size, chunk_samples):
+        end = min(start + chunk_samples, signal.size)
+        live_values.append(
+            pipeline.process_chunk(
+                signal[start:end],
+                elapsed_time=end / sample_rate,
+                compute_loudness=False,
+            )["spl"].spl_db
+        )
+
+    post_times, post_values = dsp.compute_spl_trace(
+        signal,
+        sample_rate,
+        "A",
+        0.125,
+        chunk_duration=0.05,
+    )
+
+    assert post_times[-1] == pytest.approx(signal.size / sample_rate, abs=1e-12)
+    assert len(post_values) == len(live_values)
+    np.testing.assert_allclose(live_values, post_values, atol=0.1, rtol=0.0)
 
 
 class TestAnalysisPipeline:
