@@ -78,6 +78,7 @@ class PlcService(QObject):
         self._last_current_read_error = ""
         self._pending_testing_state: bool | None = None
         self._last_testing_state_write_error = ""
+        self._start_signal_reset_pending = False
 
     @pyqtSlot()
     def start_plc_service(self):
@@ -149,6 +150,7 @@ class PlcService(QObject):
             self.logger.info(f"PLC{self._plc_id}连接成功: {self._ip}")
             self.bus.log.emit(f"PLC{self._plc_id}连接成功: {self._ip}")
             self.connect_result.emit(True, "")
+            self._apply_start_signal_reset()
             self._reconcile_testing_state()
         except Exception as exc:
             self.plc_client = None
@@ -170,6 +172,42 @@ class PlcService(QObject):
             self.state_changed.emit("重连中")
         else:
             self.state_changed.emit("未连接")
+
+    @pyqtSlot(int)
+    def request_start_signal_reset(self, plc_id: int) -> None:
+        if type(plc_id) is not int or plc_id != self._plc_id:
+            return
+        self._start_signal_reset_pending = True
+        self._apply_start_signal_reset()
+
+    def _apply_start_signal_reset(self) -> None:
+        if not self._start_signal_reset_pending or self.plc_client is None:
+            return
+
+        try:
+            if not self.write_field_value("start_signal_offset", False):
+                raise ValueError("start_signal_offset is not configured")
+        except Exception as exc:
+            message = (
+                f"PLC {self._plc_id} 启动信号归位失败 "
+                f"(start_signal_offset): {exc}"
+            )
+            self.bus.plc_start_signal_reset_result.emit(
+                self._plc_id,
+                False,
+                message,
+            )
+            self.bus.log.emit(message)
+            self.logger.error(message)
+            self._disconnect()
+            return
+
+        self._last_value = False
+        self._start_signal_reset_pending = False
+        message = f"PLC {self._plc_id} 启动信号已归位"
+        self.bus.log.emit(message)
+        self.logger.info(message)
+        self.bus.plc_start_signal_reset_result.emit(self._plc_id, True, "")
 
     def _try_reconnect(self):
         self.logger.info(f"{self._plc_id}触发重新连接")

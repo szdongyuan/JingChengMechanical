@@ -183,6 +183,8 @@ class EventBus(QObject):
     # 写入 PLC 限值信号：plc_id, limit_values
     write_limit_sign = pyqtSignal(int, dict)
     write_plc_testing_state_sign = pyqtSignal(int, bool)
+    request_plc_start_signal_reset = pyqtSignal(int)
+    plc_start_signal_reset_result = pyqtSignal(int, bool, str)
 
     # 配置变化（供外部模块监听，如工单模块刷新可选配置列表）
     config_changed = pyqtSignal()
@@ -234,6 +236,10 @@ class ServiceContainer:
 
     def __post_init__(self):
         self.bus.plc_limit_values_dict = {}
+        self.pending_plc_start_signal_reset_ids: set[int] = set()
+        self.bus.plc_start_signal_reset_result.connect(
+            self._on_plc_start_signal_reset_result
+        )
         self.test = TestManager(self.bus, self)
         # 数据库连接服务（长连接）
         self.db = DbConnectionService()
@@ -280,6 +286,65 @@ class ServiceContainer:
                 rotation_speed=snapshot.get("rotation_speed"),
             )
         )
+
+    def request_plc_start_signal_resets_for_configs(
+        self,
+        config_ids: tuple[int, ...] | list[int],
+    ) -> tuple[int, ...]:
+        plc_ids: list[int] = []
+        seen_plc_ids: set[int] = set()
+
+        for config_id in config_ids:
+            try:
+                config = self.config_service.load_config(config_id)
+            except Exception as exc:
+                self.bus.log.emit(
+                    f"配置 {config_id} 加载失败，跳过 PLC 启动信号归位: {exc}"
+                )
+                continue
+
+            plc_id = config.get("plc_id")
+            if plc_id is None:
+                self.bus.log.emit(
+                    f"配置 {config_id} 未绑定 PLC，跳过启动信号归位"
+                )
+                continue
+            if not isinstance(plc_id, int) or isinstance(plc_id, bool):
+                self.bus.log.emit(
+                    f"配置 {config_id} 的 PLC ID 无效，跳过启动信号归位"
+                )
+                continue
+            if plc_id in seen_plc_ids:
+                continue
+
+            seen_plc_ids.add(plc_id)
+            plc_ids.append(plc_id)
+            is_new_request = plc_id not in self.pending_plc_start_signal_reset_ids
+            self.pending_plc_start_signal_reset_ids.add(plc_id)
+            if is_new_request and plc_id in getattr(self, "plc_services", {}):
+                self.bus.request_plc_start_signal_reset.emit(plc_id)
+
+        return tuple(plc_ids)
+
+    def dispatch_pending_plc_start_signal_reset(self, plc_id: int) -> bool:
+        if plc_id not in self.pending_plc_start_signal_reset_ids:
+            return False
+        if plc_id not in getattr(self, "plc_services", {}):
+            return False
+
+        self.bus.request_plc_start_signal_reset.emit(plc_id)
+        return True
+
+    def _on_plc_start_signal_reset_result(
+        self,
+        plc_id: int,
+        success: bool,
+        message: str,
+    ) -> None:
+        if success:
+            self.pending_plc_start_signal_reset_ids.discard(plc_id)
+            return
+        self.bus.log.emit(message or f"PLC {plc_id} 启动信号归位失败")
 
     def shutdown(self) -> None:
         try:

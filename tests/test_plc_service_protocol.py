@@ -38,6 +38,7 @@ class BusStub:
         self.log = SignalStub()
         self.plc_workorder_changed = SignalStub()
         self.plc_current_sampled = SignalStub()
+        self.plc_start_signal_reset_result = SignalStub()
 
 
 class FakeS7Client:
@@ -92,6 +93,155 @@ def _set_plc_string(client, offset, maximum_length, value):
     client.memory[offset] = maximum_length
     client.memory[offset + 1] = len(encoded)
     client.memory[offset + 2:offset + 2 + len(encoded)] = encoded
+
+
+def test_matching_start_signal_reset_writes_false_and_establishes_baseline():
+    service, client, bus = _build_service(
+        offsets={"start_signal_offset": "0.0"}
+    )
+    snap7.util.set_bool(client.memory, 0, 0, True)
+    service._last_value = True
+
+    service.request_start_signal_reset(22)
+
+    assert snap7.util.get_bool(client.memory, 0, 0) is False
+    assert service._last_value is False
+    assert service._start_signal_reset_pending is False
+    assert bus.plc_start_signal_reset_result.calls[-1] == (22, True, "")
+    assert any("启动信号已归位" in call[0] for call in bus.log.calls)
+
+
+@pytest.mark.parametrize("plc_id", [23, True])
+def test_start_signal_reset_ignores_foreign_and_boolean_plc_ids(plc_id):
+    service, client, bus = _build_service(
+        offsets={"start_signal_offset": "0.0"}
+    )
+    snap7.util.set_bool(client.memory, 0, 0, True)
+
+    service.request_start_signal_reset(plc_id)
+
+    assert snap7.util.get_bool(client.memory, 0, 0) is True
+    assert client.reads == []
+    assert client.writes == []
+    assert bus.plc_start_signal_reset_result.calls == []
+    assert not any("启动信号" in call[0] for call in bus.log.calls)
+
+
+def test_disconnected_start_signal_reset_remains_pending_without_acknowledgement():
+    service, client, bus = _build_service(
+        offsets={"start_signal_offset": "0.0"}
+    )
+    service.plc_client = None
+
+    service.request_start_signal_reset(22)
+
+    assert service._start_signal_reset_pending is True
+    assert client.reads == []
+    assert client.writes == []
+    assert bus.plc_start_signal_reset_result.calls == []
+
+
+def test_connect_applies_retained_start_signal_reset(monkeypatch):
+    service, client, bus = _build_service(
+        offsets={"start_signal_offset": "0.0"}
+    )
+    snap7.util.set_bool(client.memory, 0, 0, True)
+    service.plc_client = None
+    monkeypatch.setattr(snap7.client, "Client", lambda: client)
+
+    service.request_start_signal_reset(22)
+    service._connect_once()
+
+    assert snap7.util.get_bool(client.memory, 0, 0) is False
+    assert service._last_value is False
+    assert service._start_signal_reset_pending is False
+    assert bus.plc_start_signal_reset_result.calls == [(22, True, "")]
+
+
+def test_failed_start_signal_reset_disconnects_and_retries_after_reconnect(
+    monkeypatch,
+):
+    service, client, bus = _build_service(
+        offsets={"start_signal_offset": "0.0"}
+    )
+    snap7.util.set_bool(client.memory, 0, 0, True)
+    client.write_failures[(0, 1)] = [RuntimeError("temporary reset failure")]
+
+    service.request_start_signal_reset(22)
+
+    assert service._start_signal_reset_pending is True
+    assert service.plc_client is None
+    assert client.disconnect_calls == 1
+    assert bus.plc_start_signal_reset_result.calls[-1][0:2] == (22, False)
+    assert "temporary reset failure" in bus.plc_start_signal_reset_result.calls[-1][2]
+    assert any(
+        "启动信号归位失败" in call[0] and "temporary reset failure" in call[0]
+        for call in bus.log.calls
+    )
+
+    monkeypatch.setattr(snap7.client, "Client", lambda: client)
+    service._connect_once()
+
+    assert snap7.util.get_bool(client.memory, 0, 0) is False
+    assert service._start_signal_reset_pending is False
+    assert bus.plc_start_signal_reset_result.calls[-1] == (22, True, "")
+
+
+@pytest.mark.parametrize(
+    "offsets",
+    [
+        {},
+        {"start_signal_offset": "invalid"},
+    ],
+)
+def test_missing_or_invalid_start_signal_offset_retains_reset_request(offsets):
+    service, client, bus = _build_service(offsets=offsets)
+
+    service.request_start_signal_reset(22)
+
+    assert service._start_signal_reset_pending is True
+    assert service.plc_client is None
+    assert client.disconnect_calls == 1
+    assert bus.plc_start_signal_reset_result.calls[-1][0:2] == (22, False)
+    assert "start_signal_offset" in bus.plc_start_signal_reset_result.calls[-1][2]
+    assert any(
+        "启动信号归位失败" in call[0] and "start_signal_offset" in call[0]
+        for call in bus.log.calls
+    )
+
+
+def test_successful_start_signal_reset_makes_immediate_high_read_a_rising_edge():
+    service, client, _bus = _build_service(
+        offsets={"start_signal_offset": "0.0"}
+    )
+    starts = []
+    service._on_start_requested = (
+        lambda plc_id, workorder: starts.append((plc_id, workorder))
+    )
+    service._last_value = True
+
+    service.request_start_signal_reset(22)
+    snap7.util.set_bool(client.memory, 0, 0, True)
+    service.poll_once()
+
+    assert starts == [(22, {})]
+
+
+def test_first_high_read_without_reset_still_does_not_trigger_start():
+    service, client, _bus = _build_service(
+        offsets={"start_signal_offset": "0.0"}
+    )
+    starts = []
+    service._on_start_requested = (
+        lambda plc_id, workorder: starts.append((plc_id, workorder))
+    )
+    snap7.util.set_bool(client.memory, 0, 0, True)
+
+    service.poll_once()
+
+    assert service._last_value is True
+    assert starts == []
+    assert client.writes == []
 
 
 def test_int_field_codec_reads_and_writes_signed_values():

@@ -970,10 +970,20 @@ class PlcSettingsModule(QWidget):
         self.services.bus.write_plc_testing_state_sign.connect(
             plc_service.write_testing_state
         )
+        self.services.bus.request_plc_start_signal_reset.connect(
+            plc_service.request_start_signal_reset
+        )
         # 线程彻底结束后，把这条 PLC 对应的线程记录清掉。
         connect_thread.finished.connect(on_connect_thread_stopped)
         # 启动后台连接线程，避免界面卡住。
         connect_thread.start()
+        dispatch_pending_reset = getattr(
+            self.services,
+            "dispatch_pending_plc_start_signal_reset",
+            None,
+        )
+        if callable(dispatch_pending_reset):
+            dispatch_pending_reset(row.id)
 
     def _on_connect_finished(self, plc_id, plc_service, success):
         row = self.get_current_row()

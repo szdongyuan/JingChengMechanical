@@ -102,10 +102,16 @@ class _SharedSettingsStub:
 
 
 class _FactoryModeStub:
-    def __init__(self, initial_state: FactoryControllerState | None = None):
+    def __init__(
+        self,
+        initial_state: FactoryControllerState | None = None,
+        *,
+        operation_order: list[tuple[str, tuple[int, ...]]] | None = None,
+    ):
         self.state = initial_state or FactoryControllerState()
         self.restore_selection_calls: list[tuple[tuple[int, ...], bool]] = []
         self.set_selection_calls: list[tuple[int, ...]] = []
+        self.operation_order = operation_order
 
     def restore_selection(
         self,
@@ -115,6 +121,8 @@ class _FactoryModeStub:
     ):
         selected = tuple(selected_config_ids)
         self.restore_selection_calls.append((selected, had_missing_configs))
+        if self.operation_order is not None:
+            self.operation_order.append(("restore_selection", selected))
         if had_missing_configs:
             self.state = FactoryControllerState(
                 selected_config_ids=selected,
@@ -134,6 +142,8 @@ class _FactoryModeStub:
     def set_selection(self, selected_config_ids: tuple[int, ...] | list[int]):
         selected = tuple(selected_config_ids)
         self.set_selection_calls.append(selected)
+        if self.operation_order is not None:
+            self.operation_order.append(("set_selection", selected))
         self.state = FactoryControllerState(
             selected_config_ids=selected,
             run_phase="armed" if selected else "not_ready",
@@ -186,9 +196,11 @@ def _make_module(
     shared_settings: _SharedSettingsStub | None = None,
     initial_factory_state: FactoryControllerState | None = None,
     configs: list[dict] | None = None,
+    include_reset_coordinator: bool = True,
 ):
     bus = _BusStub()
     settings = shared_settings or _SharedSettingsStub(saved_selected_ids=saved_selected_ids)
+    operation_order: list[tuple[str, tuple[int, ...]]] = []
     services = SimpleNamespace(
         bus=bus,
         config_service=_ConfigServiceStub(
@@ -215,8 +227,19 @@ def _make_module(
             ]
         ),
         factory_selection_settings=settings,
-        factory_mode=_FactoryModeStub(initial_factory_state),
+        factory_mode=_FactoryModeStub(
+            initial_factory_state,
+            operation_order=operation_order,
+        ),
+        operation_order=operation_order,
     )
+    if include_reset_coordinator:
+        def request_plc_start_signal_resets_for_configs(config_ids):
+            operation_order.append(("reset", tuple(config_ids)))
+
+        services.request_plc_start_signal_resets_for_configs = (
+            request_plc_start_signal_resets_for_configs
+        )
     return WorkOrderModule(services), services
 
 
@@ -307,6 +330,51 @@ def test_workorder_module_deduplicates_restored_saved_ids_before_syncing_control
     assert module.value()["selected_config_ids"] == (101, 202)
     assert module.config_selector.visual_config_order() == (101, 202, 303)
     assert services.factory_mode.restore_selection_calls == [((101, 202), False)]
+
+
+def test_workorder_module_requests_reset_after_restoring_validated_startup_selection(qapp):
+    module, services = _make_module(saved_selected_ids=(303, 999, 101, 303))
+
+    assert module.value()["selected_config_ids"] == (303, 101)
+    assert services.operation_order == [
+        ("restore_selection", (303, 101)),
+        ("reset", (303, 101)),
+    ]
+
+
+def test_workorder_module_requests_newly_checked_reset_before_updating_selection(qapp):
+    module, services = _make_module(saved_selected_ids=(101,))
+    services.operation_order.clear()
+
+    module.config_selector.set_checked(202, True)
+
+    assert ("reset", (202,)) in services.operation_order
+    assert services.operation_order.index(("reset", (202,))) < services.operation_order.index(
+        ("set_selection", (101, 202))
+    )
+
+
+def test_workorder_module_does_not_request_reset_for_remove_sync_or_reorder(qapp):
+    module, services = _make_module(saved_selected_ids=(101, 202, 303))
+    services.operation_order.clear()
+
+    module.config_selector.set_checked(202, False)
+    module.config_selector.sync_enabled_config_ids((101, 303))
+    module.config_selector.move_checked_config(303, before_config_id=101)
+
+    assert all(operation != "reset" for operation, _config_ids in services.operation_order)
+
+
+def test_workorder_module_supports_services_without_reset_coordinator(qapp):
+    module, services = _make_module(
+        saved_selected_ids=(101,),
+        include_reset_coordinator=False,
+    )
+
+    module.config_selector.set_checked(202, True)
+
+    assert module.value()["selected_config_ids"] == (101, 202)
+    assert services.factory_mode.set_selection_calls[-1] == (101, 202)
 
 
 def test_workorder_module_only_renders_list_local_persistence_notice_not_controller_blockers(qapp):
