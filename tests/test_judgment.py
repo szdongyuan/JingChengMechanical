@@ -2748,6 +2748,18 @@ class TestRejudge:
                                 start_sec=4.0, end_sec=1.0)
         # end_sec gets clamped to start_sec (empty window), should not crash
         assert isinstance(result, JudgmentResult)
+        channel = result.channel_results[0]
+        assert channel.spl_trace_available is True
+        assert channel.spl_trace_error_message is None
+        assert channel.spl_db == -np.inf
+        assert channel.spl_min_db == -np.inf
+        assert channel.spl_max_db == -np.inf
+        assert channel.spl_pass is False
+        assert channel.spl_average_available is True
+        assert channel.spl_average_error_message is None
+        assert channel.spl_average_db == -np.inf
+        assert channel.spl_average_pass is True
+        assert result.limit_pass is False
 
     def test_out_of_bounds_clamped(self):
         """Window beyond buffer length should be clamped."""

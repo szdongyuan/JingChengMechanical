@@ -273,13 +273,15 @@ class JudgmentEngine:
                     output_end_sample=spl_end_sample,
                 )
                 trace_values = list(spl_trace_db)
-                spl_db = float(trace_values[-1]) if trace_values else None
+                if not trace_values:
+                    trace_values = [-np.inf]
+                spl_db = float(trace_values[-1])
                 spl_min_db, spl_max_db = self._value_bounds(trace_values)
                 spl_trace_available = True
-                spl_pass = (
-                    self._values_pass_limits(trace_values, spl_lower, spl_upper)
-                    if trace_values
-                    else (None if spl_constrained else True)
+                spl_pass = self._values_pass_limits(
+                    trace_values,
+                    spl_lower,
+                    spl_upper,
                 )
             except Exception as exc:
                 spl_trace_error_message = str(exc) or exc.__class__.__name__
