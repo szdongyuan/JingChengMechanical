@@ -214,6 +214,32 @@ PLC_FIELD_SPECS = (
     ),
 )
 
+PLC_NEW_RECORD_DEFAULT_OFFSETS: dict[str, str | None] = {
+    "start_signal_offset": "0.0",
+    "current_value_offset": "2.0",
+    "rotation_speed_offset": "6.0",
+    "res_testing_signal_offset": "8.0",
+    "res_finish_signal_offset": "8.1",
+    "res_error_code_offset": "10.0",
+    "res_result_offset": "12.0",
+    "res_score_offset": "14.0",
+    "res_spl_offset": "18.0",
+    "res_loudness_offset": "22.0",
+    "res_vibrate_data_offset": "26.0",
+    "res_ai_score_offset": "30.0",
+    "res_spl_limit_up_offset": "34.0",
+    "res_spl_limit_down_offset": "38.0",
+    "res_loudness_limit_up_offset": "42.0",
+    "res_loudness_limit_down_offset": "46.0",
+    "res_vibrate_limit_up_offset": "50.0",
+    "res_vibrate_limit_down_offset": "54.0",
+    "res_ai_score_limit_down_offset": "58.0",
+    "sn_code_offset": "62.0",
+    "product_model_offset": "80.0",
+    "res_sn_code_offset": None,
+    "res_product_model_offset": None,
+}
+
 PLC_FIELD_BY_KEY = {spec.key: spec for spec in PLC_FIELD_SPECS}
 PLC_WORKORDER_FIELDS = tuple(
     sorted(

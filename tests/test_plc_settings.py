@@ -9,7 +9,10 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 
-from app.service.plc_protocol import PLC_FIELD_SPECS
+from app.service.plc_protocol import (
+    PLC_FIELD_SPECS,
+    PLC_NEW_RECORD_DEFAULT_OFFSETS,
+)
 from model.plc_field_offset_table import PlcFieldOffsetTable
 from model.plc_process_param_offset_table import PlcProcessParamOffsetTable
 from model.plc_table import PlcTable
@@ -142,7 +145,7 @@ def test_new_protocol_fields_are_present_and_blank_values_return_none(qapp):
     assert dialog.get_values()["res_testing_signal_offset"] is None
 
 
-def test_empty_plc_table_can_create_blank_configuration(
+def test_empty_plc_table_creates_approved_default_offsets(
     qapp,
     plc_tables,
     services,
@@ -160,13 +163,75 @@ def test_empty_plc_table_can_create_blank_configuration(
 
     row = PlcTable.get()
     assert row.plc_open_state == 0
-    assert PlcFieldOffsetTable.get_by_id(row.id).plc_id == row.id
+    offset_row = PlcFieldOffsetTable.get_by_id(row.id)
+    actual_offsets = {
+        spec.key: getattr(offset_row, spec.key)
+        for spec in PLC_FIELD_SPECS
+    }
+    assert actual_offsets == {
+        "start_signal_offset": "0.0",
+        "current_value_offset": "2.0",
+        "rotation_speed_offset": "6.0",
+        "res_testing_signal_offset": "8.0",
+        "res_finish_signal_offset": "8.1",
+        "res_error_code_offset": "10.0",
+        "res_result_offset": "12.0",
+        "res_score_offset": "14.0",
+        "res_spl_offset": "18.0",
+        "res_loudness_offset": "22.0",
+        "res_vibrate_data_offset": "26.0",
+        "res_ai_score_offset": "30.0",
+        "res_spl_limit_up_offset": "34.0",
+        "res_spl_limit_down_offset": "38.0",
+        "res_loudness_limit_up_offset": "42.0",
+        "res_loudness_limit_down_offset": "46.0",
+        "res_vibrate_limit_up_offset": "50.0",
+        "res_vibrate_limit_down_offset": "54.0",
+        "res_ai_score_limit_down_offset": "58.0",
+        "sn_code_offset": "62.0",
+        "product_model_offset": "80.0",
+        "res_sn_code_offset": None,
+        "res_product_model_offset": None,
+    }
+    assert actual_offsets == PLC_NEW_RECORD_DEFAULT_OFFSETS
+    assert set(PLC_NEW_RECORD_DEFAULT_OFFSETS) == {
+        spec.key for spec in PLC_FIELD_SPECS
+    }
     assert module.combo_plc.currentData() == row.id
     assert module.ed_ip.isEnabled()
     assert module.btn_save.isEnabled()
     assert module.btn_field_offset.isEnabled()
     assert module.btn_delete_plc.isEnabled()
     assert services.bus.plc_changed.emissions == [()]
+
+
+def test_add_plc_preserves_existing_row_offsets(
+    qapp,
+    plc_tables,
+    services,
+    monkeypatch,
+):
+    existing = PlcTable.create(plc_name="Existing", plc_open_state=0)
+    PlcFieldOffsetTable.create(plc_id=existing.id)
+    module = _make_module(monkeypatch, services)
+
+    module.add_plc()
+
+    existing_offsets = PlcFieldOffsetTable.get_by_id(existing.id)
+    assert all(
+        getattr(existing_offsets, spec.key) is None
+        for spec in PLC_FIELD_SPECS
+    )
+    new_plc = (
+        PlcTable.select()
+        .where(PlcTable.id != existing.id)
+        .get()
+    )
+    new_offsets = PlcFieldOffsetTable.get_by_id(new_plc.id)
+    assert {
+        spec.key: getattr(new_offsets, spec.key)
+        for spec in PLC_FIELD_SPECS
+    } == PLC_NEW_RECORD_DEFAULT_OFFSETS
 
 
 def test_delete_plc_cleans_related_data_and_notifies_other_modules(
