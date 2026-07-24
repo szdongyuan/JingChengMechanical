@@ -1,16 +1,28 @@
 from __future__ import annotations
 
 import math
+from dataclasses import FrozenInstanceError
 from dataclasses import replace
+from types import MethodType
 from types import SimpleNamespace
 
 import pytest
 import snap7.util
 
+from app.service.factory_mode_controller import FactoryModeController
 from app.service.analysis.test_manager import TestManager
 from app.service.plc_protocol import PLC_FIELD_BY_KEY
 import app.service.plc_service as plc_service_module
 from app.service.plc_service import PlcService
+from app.services_container import EventBus, ServiceContainer
+from tests.test_factory_mode_controller._support import (
+    _accept_start,
+    _make_config,
+    _make_review_payload,
+    _make_runtime_config_payload,
+    _make_services,
+    _run_id_for,
+)
 
 
 class SignalStub:
@@ -305,6 +317,85 @@ def test_absent_workorder_fields_do_not_emit_empty_payload_or_warning():
     assert client.reads == []
     assert bus.plc_workorder_changed.calls == []
     assert bus.log.calls == []
+
+
+def test_plc_rising_edges_deliver_fresh_atomic_workorder_snapshots_to_start():
+    bus = EventBus()
+    ingresses = []
+    bus.factory_plc_event.connect(ingresses.append)
+    bus.plc_workorder_changed.connect(
+        lambda payload: payload.update(
+            sn="UI-STALE",
+            model="UI-STALE",
+            rotation_speed=-1,
+        )
+    )
+    services = _make_services((_make_config(101, plc_id=22),))
+    _accept_start(services)
+    services.bus = bus
+    services._start_from_plc = MethodType(ServiceContainer._start_from_plc, services)
+    controller = FactoryModeController(bus, services)
+    controller.set_selection((101,))
+    client = FakeS7Client()
+    service = PlcService(
+        bus,
+        services._start_from_plc,
+        "127.0.0.1",
+        db_number=1002,
+        field_offsets_dict={
+            "start_signal_offset": "0.0",
+            "sn_code_offset": "62.0",
+            "product_model_offset": "90.0",
+            "rotation_speed_offset": "130.0",
+        },
+        plc_id=22,
+    )
+    service.plc_client = client
+    service._last_value = False
+    _set_plc_string(client, 62, 20, "SN-0001")
+    _set_plc_string(client, 90, 20, "MODEL-A")
+    snap7.util.set_int(client.memory, 130, 1450)
+    snap7.util.set_bool(client.memory, 0, 0, True)
+
+    service.poll_once()
+
+    first_start = services.test.start.call_args_list[0].args[0]
+    assert first_start["sn"] == "SN-0001"
+    assert first_start["model"] == "MODEL-A"
+    assert first_start["rotation_speed"] == 1450
+    assert type(first_start["rotation_speed"]) is int
+    assert ingresses[0].sn == "SN-0001"
+    assert ingresses[0].model == "MODEL-A"
+    assert ingresses[0].rotation_speed == 1450
+    with pytest.raises(FrozenInstanceError):
+        ingresses[0].sn = "STALE"
+
+    bus.factory_runtime_analyzing_entered.emit(
+        _make_runtime_config_payload(config_id=101, run_id=_run_id_for(101))
+    )
+    bus.factory_runtime_auto_analysis_succeeded.emit(
+        _make_review_payload(
+            displayed_config_id=101,
+            run_id=_run_id_for(101),
+            trigger_source="plc",
+        )
+    )
+    controller.clear_for_next_run()
+    service.poll_once()
+    _set_plc_string(client, 62, 20, "   ")
+    client.read_failures[(90, 2)] = RuntimeError("model unavailable")
+    snap7.util.set_int(client.memory, 130, 1500)
+    snap7.util.set_bool(client.memory, 0, 0, True)
+
+    service.poll_once()
+
+    second_start = services.test.start.call_args_list[1].args[0]
+    assert "sn" not in second_start
+    assert "model" not in second_start
+    assert second_start["rotation_speed"] == 1500
+    assert ingresses[1].sn is None
+    assert ingresses[1].model is None
+    assert ingresses[1].rotation_speed == 1500
 
 
 def test_write_testing_state_writes_matching_plc_bool_field():

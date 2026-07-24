@@ -530,8 +530,10 @@ class PlcService(QObject):
             for spec in PLC_WORKORDER_FIELDS
             if values.get(spec.key) not in (None, "")
         }
+        snapshot = dict(payload)
         if payload:
             self.bus.plc_workorder_changed.emit(payload)
+        return snapshot
 
     def poll_once(self):
         """
@@ -563,9 +565,9 @@ class PlcService(QObject):
             return
         self.bus.log.emit(f"PLC {self._plc_id} 检测到开始信号")
         self.logger.info(f"PLC {self._plc_id} 检测到开始信号")
-        self._emit_plc_workorder()
+        workorder = self._emit_plc_workorder()
         try:
-            self._on_start_requested(self._plc_id)
+            self._on_start_requested(self._plc_id, workorder)
         except Exception as exc:
             self.bus.log.emit(f"PLC{self._plc_id}开始回调失败: {exc}")
             self.logger.error(f"PLC{self._plc_id}开始回调失败: {exc}")

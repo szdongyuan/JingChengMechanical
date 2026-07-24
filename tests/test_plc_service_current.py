@@ -40,7 +40,7 @@ def _build_service(*, field_offsets, client, starts):
     bus = _BusStub()
     service = PlcService(
         bus,
-        starts.append,
+        lambda plc_id, workorder: starts.append((plc_id, workorder)),
         "127.0.0.1",
         db_number=3,
         auto_reset_bit=False,
@@ -69,7 +69,7 @@ def test_poll_once_reads_real_current_and_emits_zero_without_blocking_start(monk
 
     assert client.read_calls == [(3, 8, 1), (3, 0, 4)]
     assert bus.plc_current_sampled.calls == [(7, 123.5, 0.0)]
-    assert starts == [7]
+    assert starts == [(7, {})]
 
 
 def test_poll_once_without_optional_current_field_keeps_start_signal_working():
@@ -85,7 +85,7 @@ def test_poll_once_without_optional_current_field_keeps_start_signal_working():
 
     assert client.read_calls == [(3, 8, 1)]
     assert bus.plc_current_sampled.calls == []
-    assert starts == [7]
+    assert starts == [(7, {})]
 
 
 def test_failed_optional_current_read_does_not_block_start_signal():
@@ -102,7 +102,7 @@ def test_failed_optional_current_read_does_not_block_start_signal():
 
     service.poll_once()
 
-    assert starts == [7]
+    assert starts == [(7, {})]
     assert bus.plc_current_sampled.calls == []
     assert len(bus.log.calls) == 2
     assert "PLC 7" in bus.log.calls[0][0]

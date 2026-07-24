@@ -316,7 +316,12 @@ class FactoryModeController(QObject):
                 plc_id=payload.plc_id,
             )
             return False
-        return self._accept_start(config_id, "plc", {"plc_id": payload.plc_id})
+        workorder = {"plc_id": payload.plc_id}
+        for field_name in ("sn", "model", "rotation_speed"):
+            value = getattr(payload, field_name, None)
+            if value is not None:
+                workorder[field_name] = value
+        return self._accept_start(config_id, "plc", workorder)
 
     def handle_scan_event(self, payload: FactoryScanIngressPayload) -> bool:
         self._last_scan_ingress = payload
