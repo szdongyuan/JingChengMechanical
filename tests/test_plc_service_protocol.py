@@ -31,6 +31,15 @@ class FakeS7Client:
         self.reads = []
         self.writes = []
         self.read_failures = {}
+        self.write_failures = {}
+        self.connect_calls = []
+        self.disconnect_calls = 0
+
+    def connect(self, ip, rack, slot):
+        self.connect_calls.append((ip, rack, slot))
+
+    def disconnect(self):
+        self.disconnect_calls += 1
 
     def db_read(self, db_number, start, size):
         self.reads.append((db_number, start, size))
@@ -41,6 +50,9 @@ class FakeS7Client:
 
     def db_write(self, db_number, start, data):
         payload = bytes(data)
+        failures = self.write_failures.get((start, len(payload)))
+        if failures:
+            raise failures.pop(0)
         self.writes.append((db_number, start, payload))
         self.memory[start:start + len(payload)] = payload
 
@@ -338,6 +350,81 @@ def test_write_testing_state_repeated_false_writes_are_safe():
     assert snap7.util.get_bool(client.memory, 8, 2) is False
     assert len(client.writes) == 2
     assert bus.log.calls == []
+
+
+def test_disconnected_testing_false_is_replayed_after_reconnect(monkeypatch):
+    service, client, _bus = _build_service(
+        offsets={"res_testing_signal_offset": "8.2"}
+    )
+    snap7.util.set_bool(client.memory, 8, 2, True)
+    service.plc_client = None
+    monkeypatch.setattr(snap7.client, "Client", lambda: client)
+
+    service.write_testing_state(22, False)
+
+    assert client.writes == []
+
+    service._connect_once()
+
+    assert snap7.util.get_bool(client.memory, 8, 2) is False
+    assert len(client.writes) == 1
+
+
+def test_transient_testing_state_write_failure_retries_on_poll_without_log_spam():
+    service, client, bus = _build_service(
+        offsets={
+            "start_signal_offset": "0.0",
+            "res_testing_signal_offset": "8.2",
+        }
+    )
+    client.write_failures[(8, 1)] = [
+        RuntimeError("temporary write failure"),
+        RuntimeError("temporary write failure"),
+    ]
+
+    service.write_testing_state(22, True)
+    service.poll_once()
+    service.poll_once()
+
+    assert snap7.util.get_bool(client.memory, 8, 2) is True
+    assert len(client.writes) == 1
+    testing_errors = [
+        call[0]
+        for call in bus.log.calls
+        if "res_testing_signal_offset" in call[0]
+    ]
+    assert len(testing_errors) == 1
+    assert "PLC 22" in testing_errors[0]
+    assert "temporary write failure" in testing_errors[0]
+
+
+def test_later_false_supersedes_undelivered_true(monkeypatch):
+    service, client, _bus = _build_service(
+        offsets={"res_testing_signal_offset": "8.2"}
+    )
+    snap7.util.set_bool(client.memory, 8, 2, True)
+    service.plc_client = None
+    monkeypatch.setattr(snap7.client, "Client", lambda: client)
+
+    service.write_testing_state(22, True)
+    service.write_testing_state(22, False)
+    service._connect_once()
+
+    assert snap7.util.get_bool(client.memory, 8, 2) is False
+    assert len(client.writes) == 1
+
+
+def test_testing_state_reconciliation_is_idempotent_after_success():
+    service, client, _bus = _build_service(
+        offsets={"res_testing_signal_offset": "8.2"}
+    )
+
+    service.write_testing_state(22, True)
+    service._reconcile_testing_state()
+    service._reconcile_testing_state()
+
+    assert snap7.util.get_bool(client.memory, 8, 2) is True
+    assert len(client.writes) == 1
 
 
 def test_test_manager_result_payload_writes_int_error_and_later_plc_fields():

@@ -85,6 +85,8 @@ class PlcService(QObject):
         self._reconnect_timer_ms = 0  # 重连计时器
         self._last_connect_error = ""
         self._last_current_read_error = ""
+        self._pending_testing_state: bool | None = None
+        self._last_testing_state_write_error = ""
 
     @pyqtSlot()
     def start_plc_service(self):
@@ -156,6 +158,7 @@ class PlcService(QObject):
             self.logger.info(f"PLC{self._plc_id}连接成功: {self._ip}")
             self.bus.log.emit(f"PLC{self._plc_id}连接成功: {self._ip}")
             self.connect_result.emit(True, "")
+            self._reconcile_testing_state()
         except Exception as exc:
             self.plc_client = None
             self._last_connect_error = str(exc)
@@ -379,18 +382,35 @@ class PlcService(QObject):
 
     @pyqtSlot(int, bool)
     def write_testing_state(self, plc_id: int, testing: bool) -> None:
-        if plc_id != self._plc_id or self.plc_client is None:
+        if plc_id != self._plc_id:
             return
         if self._configured_offset("res_testing_signal_offset") is None:
             return
+        self._pending_testing_state = bool(testing)
+        self._reconcile_testing_state()
+
+    def _reconcile_testing_state(self) -> None:
+        desired_state = self._pending_testing_state
+        if desired_state is None or self.plc_client is None:
+            return
         try:
-            self.write_field_value("res_testing_signal_offset", testing)
+            self.write_field_value(
+                "res_testing_signal_offset",
+                desired_state,
+            )
         except Exception as exc:
-            self._log_field_failure(
+            message = self._field_failure_message(
                 "write",
                 "res_testing_signal_offset",
                 exc,
             )
+            if message != self._last_testing_state_write_error:
+                self._last_testing_state_write_error = message
+                self.bus.log.emit(message)
+                self.logger.error(message)
+            return
+        self._pending_testing_state = None
+        self._last_testing_state_write_error = ""
 
     def last_write_test_result_to_plc(self, plc_id, test_result):
         """
@@ -526,6 +546,7 @@ class PlcService(QObject):
             self._try_reconnect()
             return
 
+        self._reconcile_testing_state()
         v = self._read_start_bit()
         if v is None:
             return
