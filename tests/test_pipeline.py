@@ -139,6 +139,141 @@ class TestAnalysisPipeline:
         stable_values = np.asarray(values[1:], dtype=np.float64)
         assert float(stable_values.max() - stable_values.min()) <= 0.10
 
+    @pytest.mark.parametrize(
+        ("weighting", "expected_db"),
+        [("A", 54.47), ("C", 90.97)],
+    )
+    def test_live_spl_31_5_hz_uses_configured_weighting_numerically(
+        self,
+        weighting,
+        expected_db,
+    ):
+        sample_rate = 48000.0
+        signal, _ = _stable_calibrator_signal(
+            sample_rate=sample_rate,
+            duration_sec=2.0,
+            freq_hz=31.5,
+        )
+        pipeline = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(
+                spl_weighting=weighting,
+                spl_time_constant=0.125,
+            ),
+            sample_rate=sample_rate,
+        )
+
+        values = []
+        for start in range(0, signal.size, 2400):
+            result = pipeline.process_chunk(
+                signal[start : start + 2400],
+                elapsed_time=(start + 2400) / sample_rate,
+                compute_loudness=False,
+            )
+            values.append(result["spl"].spl_db)
+
+        assert float(np.mean(values[-5:])) == pytest.approx(expected_db, abs=1.0)
+
+    def test_live_spl_irregular_chunks_preserve_weighting_state(self):
+        sample_rate = 48000.0
+        signal, _ = _stable_calibrator_signal(
+            sample_rate=sample_rate,
+            duration_sec=2.0,
+            freq_hz=31.5,
+        )
+        cfg = _make_config(spl_weighting="A", spl_time_constant=0.125)
+        regular = AnalysisPipeline(0, cfg, sample_rate)
+        regular_value = -np.inf
+        for start in range(0, signal.size, 2400):
+            regular_value = regular.process_chunk(
+                signal[start : start + 2400],
+                elapsed_time=min(start + 2400, signal.size) / sample_rate,
+                compute_loudness=False,
+            )["spl"].spl_db
+
+        irregular = AnalysisPipeline(0, cfg, sample_rate)
+        irregular_value = -np.inf
+        sizes = (137, 2863, 511, 4099, 1201)
+        start = 0
+        index = 0
+        while start < signal.size:
+            stop = min(signal.size, start + sizes[index % len(sizes)])
+            irregular_value = irregular.process_chunk(
+                signal[start:stop],
+                elapsed_time=stop / sample_rate,
+                compute_loudness=False,
+            )["spl"].spl_db
+            start = stop
+            index += 1
+
+        assert irregular_value == pytest.approx(regular_value, abs=0.1)
+
+    def test_pipeline_reset_replays_frequency_and_time_detector_state(self):
+        sample_rate = 48000.0
+        signal, _ = _stable_calibrator_signal(
+            sample_rate=sample_rate,
+            duration_sec=0.4,
+            freq_hz=63.0,
+        )
+        pipeline = AnalysisPipeline(
+            0,
+            _make_config(spl_weighting="A", spl_time_constant=0.125),
+            sample_rate,
+        )
+        chunks = (signal[:137], signal[137:4000], signal[4000:])
+
+        first = [
+            pipeline.process_chunk(
+                chunk,
+                elapsed_time=(index + 1) * 0.1,
+                compute_loudness=False,
+            )["spl"].spl_db
+            for index, chunk in enumerate(chunks)
+        ]
+        pipeline.reset()
+        second = [
+            pipeline.process_chunk(
+                chunk,
+                elapsed_time=(index + 1) * 0.1,
+                compute_loudness=False,
+            )["spl"].spl_db
+            for index, chunk in enumerate(chunks)
+        ]
+
+        np.testing.assert_allclose(second, first, atol=1e-12, rtol=1e-12)
+
+    def test_simultaneous_channel_pipelines_do_not_share_weighting_state(self):
+        sample_rate = 48000.0
+        signal, _ = _stable_calibrator_signal(
+            sample_rate=sample_rate,
+            duration_sec=0.2,
+            freq_hz=31.5,
+        )
+        cfg = _make_config(spl_weighting="A", spl_time_constant=0.125)
+        first = AnalysisPipeline(0, cfg, sample_rate)
+        second = AnalysisPipeline(1, cfg, sample_rate)
+        pristine = AnalysisPipeline(2, cfg, sample_rate)
+        prefix = np.full(4000, 0.5, dtype=np.float64)
+
+        first.process_chunk(prefix, elapsed_time=0.1, compute_loudness=False)
+        second_value = second.process_chunk(
+            signal,
+            elapsed_time=0.2,
+            compute_loudness=False,
+        )["spl"].spl_db
+        pristine_value = pristine.process_chunk(
+            signal,
+            elapsed_time=0.2,
+            compute_loudness=False,
+        )["spl"].spl_db
+
+        assert first._spl_detector is not second._spl_detector
+        assert (
+            first._spl_detector._frequency_weighting
+            is not second._spl_detector._frequency_weighting
+        )
+        assert second_value == pytest.approx(pristine_value, abs=1e-12)
+
     def test_live_stft_stable_tone_has_no_periodic_broadband_boundary_spikes(self):
         sample_rate = 44100.0
         nfft = 1024
