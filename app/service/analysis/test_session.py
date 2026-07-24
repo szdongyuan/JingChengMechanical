@@ -542,9 +542,11 @@ class TestSession:
             "sample_rate": int(self._sample_rate),
             "metadata": {},
         }]
+        analysis_workorder = dict(self._workorder)
+        analysis_workorder.pop("rotation_speed", None)
         context = {
             "config_id": self.config_id,
-            "workorder": self._workorder,
+            "workorder": analysis_workorder,
         }
         ai_runs_dir = os.path.abspath(os.path.join(self._audio_dir, "..", "ai_runs"))
         test_run_id = self._get_or_create_test_run_id()

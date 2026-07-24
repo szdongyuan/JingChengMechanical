@@ -257,6 +257,7 @@ class TestTestManagerDisplayChannelRouting:
                 self._config = config
                 self.config_id = config["config_id"]
                 self._sample_rate = float(config.get("input_device_samplerate", 44100))
+                self._workorder = workorder
                 self._on_chunk = MagicMock()
                 self._live_loudness_channel_index = None
 
@@ -315,10 +316,12 @@ class TestTestManagerDisplayChannelRouting:
             _FakeRecorder,
         )
 
-        assert manager.start({"config_id": 1}) is True
+        assert manager.start({"config_id": 1, "rotation_speed": 1450}) is True
 
         assert events[:3] == ["setup", ("set_live", 1), "prepare"]
         assert manager._sessions[1]._live_loudness_channel_index == 1
+        assert manager._sessions[1]._workorder["rotation_speed"] == 1450
+        assert type(manager._sessions[1]._workorder["rotation_speed"]) is int
 
     def test_start_ignores_stored_display_channel_outside_selected_channels(
         self,
@@ -1389,7 +1392,8 @@ class TestTestSessionJudgment:
         }
         session = TestSession(
             config=config, bus=bus, ai_service=ai,
-            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            mic_cal={},
+            workorder={"sn": "test", "model": "M", "rotation_speed": 1450},
             audio_dir=str(tmp_path),
         )
         session._buffer = np.random.randn(44100, 1).astype(np.float32)
@@ -1409,7 +1413,13 @@ class TestTestSessionJudgment:
         kwargs = ai.run_ai_analysis.call_args.kwargs
         assert kwargs["config_id"] == session.config_id
         assert re.fullmatch(r"run_1_\d+", kwargs["test_run_id"])
-        assert kwargs["context"] == {"config_id": session.config_id, "workorder": session._workorder}
+        assert session._workorder["rotation_speed"] == 1450
+        assert type(session._workorder["rotation_speed"]) is int
+        assert kwargs["context"] == {
+            "config_id": session.config_id,
+            "workorder": {"sn": "test", "model": "M"},
+        }
+        assert kwargs["context"]["workorder"] is not session._workorder
         assert os.path.normpath(kwargs["ai_runs_dir"]).endswith(os.path.normpath("ai_runs"))
         assert len(kwargs["segments"]) == 1
         segment = kwargs["segments"][0]
