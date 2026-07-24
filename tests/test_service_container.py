@@ -220,6 +220,7 @@ def test_factory_runtime_payload_contract_includes_run_id():
         "config_id",
         "run_id",
         "trigger_source",
+        "plc_id",
     ]
     assert [field.name for field in fields(runtime_payload_cls)] == [
         "config_id",
@@ -249,6 +250,7 @@ def test_factory_runtime_payload_contract_includes_run_id():
     )
 
     assert start_payload.run_id == "run-101-1"
+    assert start_payload.plc_id is None
     assert runtime_payload.run_id == "run-101-1"
     assert abort_payload.run_id == "run-101-1"
 
