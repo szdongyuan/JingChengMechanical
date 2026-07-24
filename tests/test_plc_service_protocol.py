@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import snap7.util
 
+from app.service.analysis.test_manager import TestManager
 from app.service.plc_service import PlcService
 
 
@@ -288,3 +290,47 @@ def test_absent_workorder_fields_do_not_emit_empty_payload_or_warning():
     assert client.reads == []
     assert bus.plc_workorder_changed.calls == []
     assert bus.log.calls == []
+
+
+def test_test_manager_result_payload_writes_int_error_and_later_plc_fields():
+    service, client, _bus = _build_service(
+        offsets={
+            "res_error_code_offset": "10.0",
+            "res_result_offset": "12.0",
+            "res_finish_signal_offset": "12.1",
+            "res_score_offset": "14.0",
+        }
+    )
+    session = SimpleNamespace(_workorder={"sn": "SN-0001"})
+    review_payload = SimpleNamespace(
+        summary_payload={
+            "overall_status": "pass",
+            "rows": [
+                {
+                    "item_key": "stft_score",
+                    "actual_value": 91.5,
+                }
+            ],
+        },
+        judgment_payload={"channel_results": []},
+        chart_payload={},
+    )
+    payload = TestManager._make_plc_test_result_payload(
+        session,
+        review_payload,
+    )
+
+    service.last_write_test_result_to_plc(22, payload)
+
+    assert payload["error_code"] == 0
+    assert type(payload["error_code"]) is int
+    assert snap7.util.get_int(client.memory, 10) == 0
+    assert snap7.util.get_bool(client.memory, 12, 0) is True
+    assert math.isclose(snap7.util.get_real(client.memory, 14), 91.5)
+    assert snap7.util.get_bool(client.memory, 12, 1) is True
+    assert [start for _db, start, _data in client.writes] == [
+        10,
+        12,
+        14,
+        12,
+    ]
