@@ -58,12 +58,12 @@ def test_authoritative_field_types_directions_and_unique_keys():
 
 def test_exact_workorder_field_mapping():
     assert tuple(
-        (spec.key, spec.workorder_key)
+        (spec.key, spec.workorder_key, spec.workorder_order)
         for spec in PLC_WORKORDER_FIELDS
     ) == (
-        ("rotation_speed_offset", "rotation_speed"),
-        ("sn_code_offset", "sn"),
-        ("product_model_offset", "model"),
+        ("sn_code_offset", "sn", 10),
+        ("product_model_offset", "model", 20),
+        ("rotation_speed_offset", "rotation_speed", 30),
     )
 
 

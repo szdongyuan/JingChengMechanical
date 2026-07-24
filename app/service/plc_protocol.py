@@ -26,6 +26,7 @@ class PlcFieldSpec:
     direction: PlcDirection
     required: bool = False
     workorder_key: str | None = None
+    workorder_order: int | None = None
     result_role: str | None = None
     result_payload_key: str | None = None
     result_order: int | None = None
@@ -52,6 +53,7 @@ PLC_FIELD_SPECS = (
         PlcValueType.INT,
         PlcDirection.READ,
         workorder_key="rotation_speed",
+        workorder_order=30,
     ),
     PlcFieldSpec(
         "res_testing_signal_offset",
@@ -184,6 +186,7 @@ PLC_FIELD_SPECS = (
         PlcValueType.STRING,
         PlcDirection.READ,
         workorder_key="sn",
+        workorder_order=10,
     ),
     PlcFieldSpec(
         "product_model_offset",
@@ -191,6 +194,7 @@ PLC_FIELD_SPECS = (
         PlcValueType.STRING,
         PlcDirection.READ,
         workorder_key="model",
+        workorder_order=20,
     ),
     PlcFieldSpec(
         "res_sn_code_offset",
@@ -212,7 +216,10 @@ PLC_FIELD_SPECS = (
 
 PLC_FIELD_BY_KEY = {spec.key: spec for spec in PLC_FIELD_SPECS}
 PLC_WORKORDER_FIELDS = tuple(
-    spec for spec in PLC_FIELD_SPECS if spec.workorder_key is not None
+    sorted(
+        (spec for spec in PLC_FIELD_SPECS if spec.workorder_key is not None),
+        key=lambda spec: spec.workorder_order,
+    )
 )
 PLC_RESULT_FIELDS = tuple(
     sorted(
