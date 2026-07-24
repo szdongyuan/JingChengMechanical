@@ -53,10 +53,25 @@ def services():
         write_test_result_sign=_SignalStub(),
         write_limit_sign=_SignalStub(),
         write_plc_testing_state_sign=_SignalStub(),
+        request_plc_start_signal_reset=_SignalStub(),
         plc_changed=_SignalStub(),
         plc_limit_values_dict={},
     )
-    return SimpleNamespace(bus=bus, _start_from_plc=lambda *_args: None)
+    services = SimpleNamespace(
+        bus=bus,
+        _start_from_plc=lambda *_args: None,
+        dispatch_pending_calls=[],
+        operation_order=[],
+    )
+
+    def dispatch_pending_plc_start_signal_reset(plc_id):
+        services.dispatch_pending_calls.append(plc_id)
+        services.operation_order.append(("dispatch_pending", plc_id))
+
+    services.dispatch_pending_plc_start_signal_reset = (
+        dispatch_pending_plc_start_signal_reset
+    )
+    return services
 
 
 def _make_module(monkeypatch, services):
@@ -322,7 +337,7 @@ def test_process_configuration_opens_when_process_table_is_empty(
     assert PlcProcessParamOffsetTable.select().count() == 1
 
 
-def test_start_connect_wires_testing_state_only_to_ordinary_plc_service(
+def test_start_connect_wires_ordinary_plc_service_and_replays_pending_reset(
     qapp,
     plc_tables,
     services,
@@ -355,13 +370,20 @@ def test_start_connect_wires_testing_state_only_to_ordinary_plc_service(
         def write_testing_state(self, *_args):
             pass
 
+        def request_start_signal_reset(self, *_args):
+            pass
+
     class _ThreadStub:
         def __init__(self, _parent):
             self.started = _SignalStub()
             self.finished = _SignalStub()
+            self.has_started = False
 
         def start(self):
-            pass
+            assert row.id in services.plc_services
+            assert services.plc_threads[row.id] is self
+            self.has_started = True
+            services.operation_order.append(("thread_started", row.id))
 
     monkeypatch.setattr(plc_settings, "PlcService", _ServiceStub)
     monkeypatch.setattr(plc_settings, "QThread", _ThreadStub)
@@ -369,6 +391,22 @@ def test_start_connect_wires_testing_state_only_to_ordinary_plc_service(
     module.start_connect(row)
 
     plc_service = services.plc_services[row.id]
+    plc_thread = services.plc_threads[row.id]
+    assert services.bus.request_plc_start_signal_reset.callbacks == [
+        plc_service.request_start_signal_reset
+    ]
+    assert plc_thread.has_started is True
+    assert services.dispatch_pending_calls == [row.id]
+    assert services.operation_order == [
+        ("thread_started", row.id),
+        ("dispatch_pending", row.id),
+    ]
+    assert services.bus.write_test_result_sign.callbacks == [
+        plc_service.last_write_test_result_to_plc
+    ]
+    assert services.bus.write_limit_sign.callbacks == [
+        plc_service.last_write_limit_to_plc
+    ]
     assert services.bus.write_plc_testing_state_sign.callbacks == [
         plc_service.write_testing_state
     ]
