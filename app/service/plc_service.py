@@ -9,7 +9,9 @@ import snap7.util
 
 from app.service.log_manager import LogManager
 from app.service.plc_protocol import (
+    PLC_CONFIG_RETURN_FIELDS,
     PLC_FIELD_BY_KEY,
+    PLC_RESULT_FIELDS,
     PLC_WORKORDER_FIELDS,
     PlcValueType,
     parse_plc_offset,
@@ -30,17 +32,6 @@ class PlcService(QObject):
     # 连接状态通知界面信号
     state_changed = pyqtSignal(str)
     read_time_ms = 60000
-    limit_field = (
-        "res_product_model_offset",
-        "res_spl_limit_up_offset",
-        "res_spl_limit_down_offset",
-        "res_loudness_limit_up_offset",
-        "res_loudness_limit_down_offset",
-        "res_vibrate_limit_up_offset",
-        "res_vibrate_limit_down_offset",
-        "res_ai_score_limit_down_offset",
-    )
-
     def __init__(self,
         bus,
         on_start_requested,
@@ -380,6 +371,12 @@ class PlcService(QObject):
         self.bus.log.emit(message)
         self.logger.error(message)
 
+    def _write_configured_field(self, field_name: str, value) -> bool:
+        if self._configured_offset(field_name) is None:
+            return True
+        self.write_field_value(field_name, value)
+        return True
+
     @pyqtSlot(int, bool)
     def write_testing_state(self, plc_id: int, testing: bool) -> None:
         if plc_id != self._plc_id:
@@ -413,50 +410,42 @@ class PlcService(QObject):
         self._last_testing_state_write_error = ""
 
     def last_write_test_result_to_plc(self, plc_id, test_result):
-        """
-        最后按照plcid来写入对应的plc
-        test_result = {
-                "finished": True,
-                "error_code": "0",
-                "sn_code": "01010101",
-                "result": True,
-                "score": 86.5,
-                "spl": 65.2,
-                "loudness": 12.3,
-                "vibrate": 0.8,
-                "ai_score": 91.0,
-                }
-        """
+        """Write one typed PLC result payload, with completion written last."""
         if plc_id != self._plc_id:
             return
         if self.plc_client is None:
             return
-        plc_values = [
-            ("res_error_code_offset", test_result.get("error_code")),
-            ("res_sn_code_offset", test_result.get("sn_code")),
-            ("res_result_offset", test_result.get("test_result")),
-            ("res_score_offset", test_result.get("score")),
-            ("res_spl_offset", test_result.get("spl")),
-            ("res_loudness_offset", test_result.get("loudness")),
-            ("res_vibrate_data_offset", test_result.get("vibrate")),
-            ("res_ai_score_offset", test_result.get("ai_score")),
-        ]
-        try:
-            for field_name, value in plc_values:
-                offset = self._field_offsets_dict.get(field_name)
-                if not offset:
-                    self.logger.warning(f"PLC {self._plc_id} 未找到偏移配置: {field_name}")
-                    continue
-                self.write_field_value(field_name, value)
-            # 最后写结束信号
-            if test_result.get("finished", False):
-                finish_offset = self._field_offsets_dict.get("res_finish_signal_offset")
-                if finish_offset:
-                    self.write_field_value("res_finish_signal_offset", True)
-            self.bus.log.emit(f"PLC {self._plc_id} 写入测试结果完成")
-        except Exception as exc:
-            self.bus.log.emit(f"PLC {self._plc_id} 写入测试结果失败: {exc}")
-            self.logger.error(f"PLC 写入测试结果失败: {exc}")
+
+        if self._configured_offset("res_testing_signal_offset") is not None:
+            self.write_testing_state(plc_id, False)
+            if self._pending_testing_state is not None:
+                return
+
+        for spec in PLC_RESULT_FIELDS:
+            if self._configured_offset(spec.key) is None:
+                continue
+            try:
+                value = test_result[spec.result_payload_key]
+                self._write_configured_field(spec.key, value)
+            except Exception as exc:
+                self._log_field_failure("write result", spec.key, exc)
+                return
+
+        if test_result.get("finished", False):
+            try:
+                self._write_configured_field(
+                    "res_finish_signal_offset",
+                    True,
+                )
+            except Exception as exc:
+                self._log_field_failure(
+                    "write result",
+                    "res_finish_signal_offset",
+                    exc,
+                )
+                return
+
+        self.bus.log.emit(f"PLC {self._plc_id} 写入测试结果完成")
 
     def last_write_limit_to_plc(self, plc_id, limit_values):
         """
@@ -477,20 +466,25 @@ class PlcService(QObject):
         if self.plc_client is None:
             return
 
-        try:
-            for field_name in self.limit_field:
-                if field_name not in limit_values:
-                    continue
-                offset = self._field_offsets_dict.get(field_name)
-                if not offset:
-                    self.logger.warning(f"PLC {self._plc_id} 未找到偏移配置: {field_name}")
-                    continue
-                self.write_field_value(field_name, limit_values.get(field_name))
+        for spec in PLC_CONFIG_RETURN_FIELDS:
+            if spec.key not in limit_values:
+                continue
+            if self._configured_offset(spec.key) is None:
+                continue
+            try:
+                self._write_configured_field(
+                    spec.key,
+                    limit_values[spec.key],
+                )
+            except Exception as exc:
+                self._log_field_failure(
+                    "write configuration return",
+                    spec.key,
+                    exc,
+                )
+                return
 
-            self.bus.log.emit(f"PLC {self._plc_id} 写入限值完成")
-        except Exception as exc:
-            self.bus.log.emit(f"PLC {self._plc_id} 写入限值失败: {exc}")
-            self.logger.error(f"PLC 写入限值失败: {exc}")
+        self.bus.log.emit(f"PLC {self._plc_id} 写入限值完成")
 
     def read_plc_values(self, *field_names) -> dict:
         values = {}
@@ -513,7 +507,9 @@ class PlcService(QObject):
 
     def read_plc_limit(self):
         # PLC 连接成功后读取一次机种和各项上下限，后续测试可直接按 plc_id 取用。
-        values = self.read_plc_values(*self.limit_field)
+        values = self.read_plc_values(
+            *(spec.key for spec in PLC_CONFIG_RETURN_FIELDS)
+        )
         self.bus.plc_limit_values_dict[self._plc_id] = values
         self.bus.log.emit(f"PLC {self._plc_id} 读取限值完成: {values}")
 

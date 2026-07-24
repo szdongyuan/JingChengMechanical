@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import snap7.util
 
 from app.service.analysis.test_manager import TestManager
+from app.service.plc_protocol import PLC_FIELD_BY_KEY
+import app.service.plc_service as plc_service_module
 from app.service.plc_service import PlcService
 
 
@@ -469,3 +472,189 @@ def test_test_manager_result_payload_writes_int_error_and_later_plc_fields():
         14,
         12,
     ]
+
+
+def test_result_callback_writes_configured_fields_in_protocol_order():
+    service, client, bus = _build_service(
+        offsets={
+            "res_testing_signal_offset": "8.2",
+            "res_error_code_offset": "10.0",
+            "res_sn_code_offset": "20.0",
+            "res_result_offset": "40.0",
+            "res_score_offset": "44.0",
+            "res_finish_signal_offset": "48.0",
+        }
+    )
+    client.memory[20] = 15
+
+    service.last_write_test_result_to_plc(
+        22,
+        {
+            "finished": True,
+            "error_code": 0,
+            "sn_code": "SN-0001",
+            "test_result": True,
+            "score": 91.5,
+        },
+    )
+
+    assert [start for _db, start, _data in client.writes] == [
+        8,
+        10,
+        20,
+        40,
+        44,
+        48,
+    ]
+    assert snap7.util.get_bool(client.memory, 8, 2) is False
+    assert snap7.util.get_int(client.memory, 10) == 0
+    assert client.memory[20:29] == bytes([15, 7]) + b"SN-0001"
+    assert snap7.util.get_bool(client.memory, 40, 0) is True
+    assert math.isclose(snap7.util.get_real(client.memory, 44), 91.5)
+    assert snap7.util.get_bool(client.memory, 48, 0) is True
+    assert not any("offset" in call[0].lower() for call in bus.log.calls)
+
+
+def test_result_callback_uses_protocol_result_payload_keys(monkeypatch):
+    service, client, bus = _build_service(
+        offsets={
+            "res_score_offset": "44.0",
+            "res_finish_signal_offset": "48.0",
+        }
+    )
+    score_spec = replace(
+        PLC_FIELD_BY_KEY["res_score_offset"],
+        result_payload_key="metadata_score",
+    )
+    monkeypatch.setattr(
+        plc_service_module,
+        "PLC_RESULT_FIELDS",
+        (score_spec,),
+    )
+
+    service.last_write_test_result_to_plc(
+        22,
+        {
+            "finished": True,
+            "metadata_score": 82.25,
+            "score": "must not be used",
+        },
+    )
+
+    assert math.isclose(snap7.util.get_real(client.memory, 44), 82.25)
+    assert snap7.util.get_bool(client.memory, 48, 0) is True
+    assert bus.log.calls
+
+
+def test_result_callback_stops_before_finish_when_configured_write_fails():
+    service, client, bus = _build_service(
+        offsets={
+            "res_testing_signal_offset": "8.2",
+            "res_error_code_offset": "10.0",
+            "res_score_offset": "44.0",
+            "res_finish_signal_offset": "48.0",
+        }
+    )
+    client.write_failures[(44, 4)] = [RuntimeError("score address unavailable")]
+
+    service.last_write_test_result_to_plc(
+        22,
+        {
+            "finished": True,
+            "error_code": 0,
+            "score": 91.5,
+        },
+    )
+
+    assert [start for _db, start, _data in client.writes] == [8, 10]
+    assert snap7.util.get_bool(client.memory, 48, 0) is False
+    message = bus.log.calls[-1][0]
+    assert "PLC 22" in message
+    assert "res_score_offset" in message
+    assert "score address unavailable" in message
+
+
+@pytest.mark.parametrize("error_code", [32768, "0"])
+def test_invalid_error_code_prevents_finish(error_code):
+    service, client, bus = _build_service(
+        offsets={
+            "res_error_code_offset": "10.0",
+            "res_finish_signal_offset": "48.0",
+        }
+    )
+
+    service.last_write_test_result_to_plc(
+        22,
+        {
+            "finished": True,
+            "error_code": error_code,
+        },
+    )
+
+    assert client.writes == []
+    assert snap7.util.get_bool(client.memory, 48, 0) is False
+    assert "res_error_code_offset" in bus.log.calls[-1][0]
+
+
+def test_result_callback_ignores_different_plc_id():
+    service, client, bus = _build_service(
+        offsets={
+            "res_error_code_offset": "10.0",
+            "res_finish_signal_offset": "48.0",
+        }
+    )
+
+    service.last_write_test_result_to_plc(
+        23,
+        {"finished": True, "error_code": 0},
+    )
+
+    assert client.reads == []
+    assert client.writes == []
+    assert bus.log.calls == []
+
+
+def test_config_callback_writes_only_present_configured_metadata_fields():
+    service, client, bus = _build_service(
+        offsets={
+            "res_spl_limit_up_offset": "60.0",
+            "res_product_model_offset": "70.0",
+        }
+    )
+    client.memory[70] = 12
+
+    service.last_write_limit_to_plc(
+        22,
+        {
+            "res_spl_limit_up_offset": 82.5,
+            "res_spl_limit_down_offset": 55.0,
+            "res_product_model_offset": "MODEL-A",
+        },
+    )
+
+    assert [start for _db, start, _data in client.writes] == [60, 70]
+    assert math.isclose(snap7.util.get_real(client.memory, 60), 82.5)
+    assert client.memory[70:79] == bytes([12, 7]) + b"MODEL-A"
+    assert len(client.writes[1][2]) == 14
+    assert any("写入限值完成" in call[0] for call in bus.log.calls)
+    assert not any("offset" in call[0].lower() for call in bus.log.calls)
+
+
+def test_config_callback_failure_names_field_and_has_no_success_log():
+    service, client, bus = _build_service(
+        offsets={"res_spl_limit_up_offset": "60.0"}
+    )
+
+    service.last_write_limit_to_plc(
+        22,
+        {"res_spl_limit_up_offset": "not-a-real"},
+    )
+
+    assert client.writes == []
+    assert any(
+        "PLC 22" in call[0]
+        and "res_spl_limit_up_offset" in call[0]
+        and "not-a-real" in call[0]
+        for call in bus.log.calls
+    )
+    assert not any("写入限值完成" in call[0] for call in bus.log.calls)
