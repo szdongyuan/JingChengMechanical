@@ -56,7 +56,10 @@ def test_poll_once_reads_real_current_and_emits_zero_without_blocking_start(monk
     starts = []
     client = _PlcClientStub(start_byte=8, current_offset=0, current_a=0.0)
     service, bus = _build_service(
-        field_offsets={"start_signal_offset": "8.0", "current_value_offset": 0},
+        field_offsets={
+            "start_signal_offset": "8.0",
+            "current_value_offset": "0.0",
+        },
         client=client,
         starts=starts,
     )
@@ -89,7 +92,10 @@ def test_failed_optional_current_read_does_not_block_start_signal():
     starts = []
     client = _PlcClientStub(start_byte=8, current_offset=None)
     service, bus = _build_service(
-        field_offsets={"start_signal_offset": "8.0", "current_value_offset": "4"},
+        field_offsets={
+            "start_signal_offset": "8.0",
+            "current_value_offset": "4.0",
+        },
         client=client,
         starts=starts,
     )
@@ -99,4 +105,6 @@ def test_failed_optional_current_read_does_not_block_start_signal():
     assert starts == [7]
     assert bus.plc_current_sampled.calls == []
     assert len(bus.log.calls) == 2
-    assert "读取电流失败" in bus.log.calls[0][0]
+    assert "PLC 7" in bus.log.calls[0][0]
+    assert "current_value_offset" in bus.log.calls[0][0]
+    assert "unexpected PLC read" in bus.log.calls[0][0]
