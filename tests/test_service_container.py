@@ -220,6 +220,7 @@ def test_factory_runtime_payload_contract_includes_run_id():
         "config_id",
         "run_id",
         "trigger_source",
+        "plc_id",
     ]
     assert [field.name for field in fields(runtime_payload_cls)] == [
         "config_id",
@@ -249,6 +250,7 @@ def test_factory_runtime_payload_contract_includes_run_id():
     )
 
     assert start_payload.run_id == "run-101-1"
+    assert start_payload.plc_id is None
     assert runtime_payload.run_id == "run-101-1"
     assert abort_payload.run_id == "run-101-1"
 
@@ -410,7 +412,12 @@ def test_factory_review_payload_contract_is_explicit():
         "trigger_source",
         "error_message",
     ]
-    assert [field.name for field in fields(plc_payload_cls)] == ["plc_id"]
+    assert [field.name for field in fields(plc_payload_cls)] == [
+        "plc_id",
+        "sn",
+        "model",
+        "rotation_speed",
+    ]
 
     review_window = review_window_cls(start_sec=1.0, end_sec=3.0)
     payload = review_payload_cls(run_id="run-101-1", default_window=review_window)
@@ -427,6 +434,9 @@ def test_factory_review_payload_contract_is_explicit():
     assert review_payload_cls().import_warnings == ()
     assert review_payload_cls().display_channel_labels == {}
     assert plc_payload.plc_id == 12
+    assert plc_payload.sn is None
+    assert plc_payload.model is None
+    assert plc_payload.rotation_speed is None
     assert abort_payload.config_id == 101
     assert abort_payload.run_id == "run-101-1"
     assert abort_payload.trigger_source == "manual"

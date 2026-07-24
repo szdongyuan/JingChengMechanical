@@ -8,12 +8,154 @@ from ._support import (
     _accept_start,
     _emit_owned_runtime_start,
     _load_factory_mode_controller_module,
+    _make_abort_payload,
     _make_config,
     _make_review_payload,
     _make_runtime_config_payload,
     _make_services,
     _run_id_for,
 )
+
+
+@pytest.mark.parametrize(
+    ("terminal_signal", "payload_kwargs"),
+    [
+        ("factory_runtime_auto_analysis_succeeded", {}),
+        ("factory_runtime_auto_analysis_no_result", {"no_result": True}),
+        (
+            "factory_runtime_auto_analysis_error",
+            {"no_result": True, "error_message": "analysis failed"},
+        ),
+    ],
+)
+def test_plc_testing_state_clears_on_auto_analysis_terminal_paths(
+    terminal_signal,
+    payload_kwargs,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    testing_states: list[tuple[int, bool]] = []
+    bus.write_plc_testing_state_sign.connect(
+        lambda plc_id, testing: testing_states.append((plc_id, testing))
+    )
+    services = _make_services((_make_config(101, plc_id=22),))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101,))
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        trigger_source="plc",
+        plc_id=22,
+    )
+    testing_states.clear()
+    controller.handle_runtime_analyzing(_make_runtime_config_payload(config_id=101))
+
+    getattr(bus, terminal_signal).emit(
+        _make_review_payload(
+            displayed_config_id=101,
+            trigger_source="plc",
+            **payload_kwargs,
+        )
+    )
+
+    assert testing_states == [(22, False)]
+
+
+@pytest.mark.parametrize("terminal_path", ["stopped", "aborted"])
+def test_plc_testing_state_clears_on_stop_and_abort(terminal_path):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    testing_states: list[tuple[int, bool]] = []
+    bus.write_plc_testing_state_sign.connect(
+        lambda plc_id, testing: testing_states.append((plc_id, testing))
+    )
+    services = _make_services((_make_config(101, plc_id=22),))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101,))
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        trigger_source="plc",
+        plc_id=22,
+    )
+    testing_states.clear()
+
+    if terminal_path == "stopped":
+        bus.factory_runtime_stopped.emit(
+            _make_stopped_payload(
+                config_id=101,
+                trigger_source="plc",
+            )
+        )
+    else:
+        bus.factory_runtime_aborted.emit(
+            _make_abort_payload(
+                config_id=101,
+                trigger_source="plc",
+            )
+        )
+
+    assert testing_states == [(22, False)]
+
+
+@pytest.mark.parametrize("trigger_source", ["manual", "scan", "import_audio"])
+def test_plc_testing_state_ignores_non_plc_runtime_transitions(trigger_source):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    testing_states: list[tuple[int, bool]] = []
+    bus.write_plc_testing_state_sign.connect(
+        lambda plc_id, testing: testing_states.append((plc_id, testing))
+    )
+    services = _make_services((_make_config(101),))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101,))
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        trigger_source=trigger_source,
+        plc_id=22,
+    )
+    controller.handle_runtime_analyzing(_make_runtime_config_payload(config_id=101))
+    bus.factory_runtime_auto_analysis_succeeded.emit(
+        _make_review_payload(
+            displayed_config_id=101,
+            trigger_source=trigger_source,
+        )
+    )
+
+    assert testing_states == []
+
+
+def test_plc_testing_state_ignores_reanalysis_transitions():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    testing_states: list[tuple[int, bool]] = []
+    bus.write_plc_testing_state_sign.connect(
+        lambda plc_id, testing: testing_states.append((plc_id, testing))
+    )
+    services = _make_services((_make_config(101),))
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101,))
+    _emit_owned_runtime_start(
+        controller,
+        bus,
+        config_id=101,
+        trigger_source="manual",
+    )
+    controller.handle_runtime_analyzing(_make_runtime_config_payload(config_id=101))
+    bus.factory_runtime_auto_analysis_succeeded.emit(
+        _make_review_payload(displayed_config_id=101, trigger_source="manual")
+    )
+
+    assert controller.begin_reanalysis(1.0, 3.0) is True
+    bus.factory_runtime_reanalysis_completed.emit(
+        _make_review_payload(displayed_config_id=101, trigger_source="manual")
+    )
+
+    assert testing_states == []
 
 
 def _make_stopped_payload(

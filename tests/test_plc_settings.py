@@ -9,6 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 
+from app.service.plc_protocol import PLC_FIELD_SPECS
 from model.plc_field_offset_table import PlcFieldOffsetTable
 from model.plc_process_param_offset_table import PlcProcessParamOffsetTable
 from model.plc_table import PlcTable
@@ -48,6 +49,7 @@ def services():
         log=_SignalStub(),
         write_test_result_sign=_SignalStub(),
         write_limit_sign=_SignalStub(),
+        write_plc_testing_state_sign=_SignalStub(),
         plc_changed=_SignalStub(),
         plc_limit_values_dict={},
     )
@@ -63,16 +65,81 @@ def _make_module(monkeypatch, services):
     return plc_settings.PlcSettingsModule(services)
 
 
-def test_plc_current_offset_is_optional_for_modbus_configs(qapp):
-    values = {
-        field_name: "0.0"
-        for field_name, _label in plc_settings.PLC_FIELD_OFFSETS
-    }
-    values["current_value_offset"] = None
+@pytest.mark.parametrize(
+    "optional_key",
+    [spec.key for spec in PLC_FIELD_SPECS if not spec.required],
+)
+def test_every_non_start_plc_offset_can_be_blank(
+    qapp,
+    monkeypatch,
+    optional_key,
+):
+    values = {spec.key: "0.0" for spec in PLC_FIELD_SPECS}
+    values[optional_key] = None
+    monkeypatch.setattr(QMessageBox, "warning", lambda *_args: None)
 
     dialog = plc_settings.PlcFieldOffsetDialog(1, values)
 
     assert dialog.validate_values() is True
+
+
+def test_blank_start_offset_fails_validation(qapp, monkeypatch):
+    values = {spec.key: "0.0" for spec in PLC_FIELD_SPECS}
+    values["start_signal_offset"] = None
+    monkeypatch.setattr(QMessageBox, "warning", lambda *_args: None)
+
+    dialog = plc_settings.PlcFieldOffsetDialog(1, values)
+
+    assert dialog.validate_values() is False
+    assert dialog.focusWidget() is dialog.edits["start_signal_offset"]
+
+
+def test_bool_bit_eight_fails_validation(qapp, monkeypatch):
+    values = {spec.key: "0.0" for spec in PLC_FIELD_SPECS}
+    values["res_testing_signal_offset"] = "8.8"
+    monkeypatch.setattr(QMessageBox, "warning", lambda *_args: None)
+
+    dialog = plc_settings.PlcFieldOffsetDialog(1, values)
+
+    assert dialog.validate_values() is False
+    assert dialog.focusWidget() is dialog.edits["res_testing_signal_offset"]
+
+
+@pytest.mark.parametrize(
+    "field_key",
+    [
+        "rotation_speed_offset",
+        "current_value_offset",
+        "sn_code_offset",
+    ],
+)
+def test_byte_aligned_fields_reject_nonzero_bit(
+    qapp,
+    monkeypatch,
+    field_key,
+):
+    values = {spec.key: "0.0" for spec in PLC_FIELD_SPECS}
+    values[field_key] = "10.1"
+    monkeypatch.setattr(QMessageBox, "warning", lambda *_args: None)
+
+    dialog = plc_settings.PlcFieldOffsetDialog(1, values)
+
+    assert dialog.validate_values() is False
+    assert dialog.focusWidget() is dialog.edits[field_key]
+
+
+def test_new_protocol_fields_are_present_and_blank_values_return_none(qapp):
+    values = {spec.key: "0.0" for spec in PLC_FIELD_SPECS}
+    values["rotation_speed_offset"] = None
+    values["res_testing_signal_offset"] = None
+
+    dialog = plc_settings.PlcFieldOffsetDialog(1, values)
+
+    assert "rotation_speed_offset" in dialog.edits
+    assert "res_testing_signal_offset" in dialog.edits
+    assert dialog.validate_values() is True
+    assert dialog.get_values()["rotation_speed_offset"] is None
+    assert dialog.get_values()["res_testing_signal_offset"] is None
 
 
 def test_empty_plc_table_can_create_blank_configuration(
@@ -188,3 +255,56 @@ def test_process_configuration_opens_when_process_table_is_empty(
     module.open_process_param_offset_dialog()
 
     assert PlcProcessParamOffsetTable.select().count() == 1
+
+
+def test_start_connect_wires_testing_state_only_to_ordinary_plc_service(
+    qapp,
+    plc_tables,
+    services,
+    monkeypatch,
+):
+    row = PlcTable.create(plc_name="Line A", plc_open_state=0)
+    PlcFieldOffsetTable.create(plc_id=row.id, start_signal_offset="0.0")
+    module = _make_module(monkeypatch, services)
+
+    class _ServiceStub:
+        def __init__(self, **_kwargs):
+            self.connect_result = _SignalStub()
+            self.state_changed = _SignalStub()
+
+        def moveToThread(self, _thread):
+            pass
+
+        def start_plc_service(self):
+            pass
+
+        def deleteLater(self):
+            pass
+
+        def last_write_test_result_to_plc(self, *_args):
+            pass
+
+        def last_write_limit_to_plc(self, *_args):
+            pass
+
+        def write_testing_state(self, *_args):
+            pass
+
+    class _ThreadStub:
+        def __init__(self, _parent):
+            self.started = _SignalStub()
+            self.finished = _SignalStub()
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(plc_settings, "PlcService", _ServiceStub)
+    monkeypatch.setattr(plc_settings, "QThread", _ThreadStub)
+
+    module.start_connect(row)
+
+    plc_service = services.plc_services[row.id]
+    assert services.bus.write_plc_testing_state_sign.callbacks == [
+        plc_service.write_testing_state
+    ]
+    assert services.process_plc_service is None

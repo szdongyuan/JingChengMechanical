@@ -109,6 +109,9 @@ class FactoryControllerState:
 @dataclass(frozen=True)
 class FactoryPlcIngressPayload:
     plc_id: int
+    sn: str | None = None
+    model: str | None = None
+    rotation_speed: int | None = None
 
 
 @dataclass(frozen=True)
@@ -127,6 +130,7 @@ class FactoryRuntimeStartPayload:
     config_id: int
     run_id: str
     trigger_source: str
+    plc_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -178,6 +182,7 @@ class EventBus(QObject):
     write_test_result_sign = pyqtSignal(int, dict)
     # 写入 PLC 限值信号：plc_id, limit_values
     write_limit_sign = pyqtSignal(int, dict)
+    write_plc_testing_state_sign = pyqtSignal(int, bool)
 
     # 配置变化（供外部模块监听，如工单模块刷新可选配置列表）
     config_changed = pyqtSignal()
@@ -265,8 +270,16 @@ class ServiceContainer:
 
         self.factory_mode = FactoryModeController(self.bus, self)
 
-    def _start_from_plc(self, plc_id: int) -> None:
-        self.bus.factory_plc_event.emit(FactoryPlcIngressPayload(plc_id=plc_id))
+    def _start_from_plc(self, plc_id: int, workorder: dict | None = None) -> None:
+        snapshot = dict(workorder or {})
+        self.bus.factory_plc_event.emit(
+            FactoryPlcIngressPayload(
+                plc_id=plc_id,
+                sn=snapshot.get("sn"),
+                model=snapshot.get("model"),
+                rotation_speed=snapshot.get("rotation_speed"),
+            )
+        )
 
     def shutdown(self) -> None:
         try:

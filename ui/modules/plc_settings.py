@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.service.log_manager import LogManager
+from app.service.plc_protocol import PLC_FIELD_SPECS, parse_plc_offset
 from base.utils import int_or_none, text_or_empty, text_or_none
 from consts.style import APP_QSS
 from app.service.plc_process_param_service import PlcProcessParamService
@@ -27,32 +28,10 @@ from model.plc_table import PlcTable
 from model.test_config_table import TestConfigTable
 
 
-PLC_FIELD_OFFSETS = [
-    ("start_signal_offset", "启动型号 StartSignal"),
-    ("current_value_offset", "电流 CurrentValue (REAL/A)"),
-    ("sn_code_offset", "SN码 SnCode"),
-    ("product_model_offset", "产品型号 ProductModel"),
-    ("res_finish_signal_offset", "返回结束信号 ResFinishSignal"),
-    ("res_error_code_offset", "返回异常代码 ResErrorCode"),
-    ("res_sn_code_offset", "返回SN码 ResSnCode"),
-    ("res_result_offset", "返回测试结果 ResResult"),
-    ("res_score_offset", "返回评分 ResScore"),
-    ("res_spl_offset", "返回平均声压级 ResSPL"),
-    ("res_loudness_offset", "返回响度 ResLoudness"),
-    ("res_vibrate_data_offset", "返回中场振动 ResVibrateData"),
-    ("res_ai_score_offset", "返回AI评分 ResAiScore"),
-    ("res_product_model_offset", "返回机种 ResProductModel"),
-    ("res_spl_limit_up_offset", "返回声压值上限 ResSplLimitUp"),
-    ("res_spl_limit_down_offset", "返回声压值下限 ResSplLimitDown"),
-    ("res_loudness_limit_up_offset", "返回响度值上限 ResLoudnessLimitUp"),
-    ("res_loudness_limit_down_offset", "返回响度值下限 ResLoudnessLimitDown"),
-    ("res_vibrate_limit_up_offset", "返回振动值上限 ResVibrateLimitUp"),
-    ("res_vibrate_limit_down_offset", "返回振动值下限 ResVibrateLimitDown"),
-    ("res_ai_score_limit_down_offset", "返回AI评分下限 ResAiScoreLimitDown"),
-]
-
-# 电流可由 Modbus TCP 提供；PLC 电流地址因此是可选项。
-PLC_OPTIONAL_FIELD_OFFSETS = frozenset({"current_value_offset"})
+PLC_FIELD_OFFSETS = tuple(
+    (spec.key, spec.label)
+    for spec in PLC_FIELD_SPECS
+)
 
 PLC_PROCESS_PARAM_OFFSETS = [
     ("load_cw_scan_offset", "加载Cw扫描 LoadCwScan"),
@@ -81,11 +60,11 @@ class PlcFieldOffsetDialog(QDialog):
 
         form = QFormLayout()
         values = values or {}
-        for key, label in PLC_FIELD_OFFSETS:
-            edit = QLineEdit(text_or_empty(values.get(key)))
+        for spec in PLC_FIELD_SPECS:
+            edit = QLineEdit(text_or_empty(values.get(spec.key)))
             edit.setMinimumHeight(34)
-            self.edits[key] = edit
-            form.addRow(f"{label}：", edit)
+            self.edits[spec.key] = edit
+            form.addRow(f"{spec.label}：", edit)
 
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
@@ -105,13 +84,24 @@ class PlcFieldOffsetDialog(QDialog):
         }
 
     def validate_values(self):
-        for key, label in PLC_FIELD_OFFSETS:
-            value = self.edits[key].text().strip()
-            if not value and key in PLC_OPTIONAL_FIELD_OFFSETS:
+        for spec in PLC_FIELD_SPECS:
+            edit = self.edits[spec.key]
+            value = edit.text().strip()
+            if not value and not spec.required:
                 continue
-            if not re.fullmatch(r"\d+\.\d+", value):
-                QMessageBox.warning(self, "提示", f"{label} 偏移格式错误，请输入类似 0.0 的格式")
-                self.edits[key].setFocus()
+            if not value:
+                QMessageBox.warning(self, "提示", f"{spec.label} 为必填项")
+                edit.setFocus()
+                return False
+            try:
+                parse_plc_offset(value, spec.value_type)
+            except ValueError as exc:
+                QMessageBox.warning(
+                    self,
+                    "提示",
+                    f"{spec.label} 偏移无效：{exc}",
+                )
+                edit.setFocus()
                 return False
         return True
 
@@ -646,8 +636,8 @@ class PlcSettingsModule(QWidget):
         offset_row, _created = PlcFieldOffsetTable.get_or_create(plc_id=row.id)
 
         values = {
-            field_name: getattr(offset_row, field_name)
-            for field_name, _label in PLC_FIELD_OFFSETS
+            spec.key: getattr(offset_row, spec.key)
+            for spec in PLC_FIELD_SPECS
         }
 
         dialog = PlcFieldOffsetDialog(row.id, values, self)
@@ -826,8 +816,8 @@ class PlcSettingsModule(QWidget):
             return None
 
         return {
-            field_name: getattr(offset_row, field_name)
-            for field_name, _label in PLC_FIELD_OFFSETS
+            spec.key: getattr(offset_row, spec.key)
+            for spec in PLC_FIELD_SPECS
         }
 
     def save_current(self):
@@ -970,6 +960,9 @@ class PlcSettingsModule(QWidget):
         plc_service.state_changed.connect(on_state_changed)
         self.services.bus.write_test_result_sign.connect(plc_service.last_write_test_result_to_plc)
         self.services.bus.write_limit_sign.connect(plc_service.last_write_limit_to_plc)
+        self.services.bus.write_plc_testing_state_sign.connect(
+            plc_service.write_testing_state
+        )
         # 线程彻底结束后，把这条 PLC 对应的线程记录清掉。
         connect_thread.finished.connect(on_connect_thread_stopped)
         # 启动后台连接线程，避免界面卡住。

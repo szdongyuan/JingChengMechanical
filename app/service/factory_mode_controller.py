@@ -46,6 +46,7 @@ class FactoryModeController(QObject):
         self._dispatching_runtime_start_accepted_payload: FactoryRuntimeStartPayload | None = None
         self._owned_runtime_config_id: int | None = None
         self._owned_runtime_run_id: str | None = None
+        self._owned_runtime_plc_id: int | None = None
         self._owned_reanalysis_config_id: int | None = None
         self._owned_reanalysis_run_id: str | None = None
         self._last_plc_ingress: FactoryPlcIngressPayload | None = None
@@ -315,7 +316,12 @@ class FactoryModeController(QObject):
                 plc_id=payload.plc_id,
             )
             return False
-        return self._accept_start(config_id, "plc", {"plc_id": payload.plc_id})
+        workorder = {"plc_id": payload.plc_id}
+        for field_name in ("sn", "model", "rotation_speed"):
+            value = getattr(payload, field_name, None)
+            if value is not None:
+                workorder[field_name] = value
+        return self._accept_start(config_id, "plc", workorder)
 
     def handle_scan_event(self, payload: FactoryScanIngressPayload) -> bool:
         self._last_scan_ingress = payload
@@ -354,6 +360,14 @@ class FactoryModeController(QObject):
 
         self._owned_runtime_config_id = payload.config_id
         self._owned_runtime_run_id = payload.run_id
+        self._owned_runtime_plc_id = (
+            payload.plc_id if payload.trigger_source == "plc" else None
+        )
+        if self._owned_runtime_plc_id is not None:
+            self.bus.write_plc_testing_state_sign.emit(
+                self._owned_runtime_plc_id,
+                True,
+            )
         self._state = self._state_with_readiness(
             replace(
                 self._state,
@@ -395,6 +409,7 @@ class FactoryModeController(QObject):
         if not self._owns_active_review_payload(payload):
             return
 
+        self._clear_owned_plc_testing_state()
         self._owned_runtime_config_id = None
         self._owned_runtime_run_id = None
         self._apply_review_payload(payload)
@@ -406,6 +421,7 @@ class FactoryModeController(QObject):
         if not self._owns_active_review_payload(payload):
             return
 
+        self._clear_owned_plc_testing_state()
         self._owned_runtime_config_id = None
         self._owned_runtime_run_id = None
         self._apply_review_payload(payload)
@@ -424,6 +440,7 @@ class FactoryModeController(QObject):
         ):
             return
 
+        self._clear_owned_plc_testing_state()
         self._owned_runtime_config_id = None
         self._owned_runtime_run_id = None
         self._stopped_review_payload = replace(
@@ -677,6 +694,9 @@ class FactoryModeController(QObject):
         payload = dict(workorder or {})
         payload["config_id"] = config_id
         payload["trigger_source"] = trigger_source
+        plc_id = payload.get("plc_id") if trigger_source == "plc" else None
+        if type(plc_id) is not int:
+            plc_id = None
         request_id = f"factory-start-{uuid.uuid4().hex}"
         payload["factory_start_request_id"] = request_id
         self._pending_start = (config_id, trigger_source)
@@ -695,6 +715,7 @@ class FactoryModeController(QObject):
                 config_id=config_id,
                 run_id=run_id,
                 trigger_source=trigger_source,
+                plc_id=plc_id,
             )
             self._dispatching_runtime_start_accepted_payload = accepted_payload
             try:
@@ -956,6 +977,7 @@ class FactoryModeController(QObject):
         *,
         state: FactoryControllerState | None = None,
     ) -> None:
+        self._clear_owned_plc_testing_state()
         self._pending_start = None
         self._pending_start_request_id = None
         self._owned_runtime_config_id = None
@@ -979,6 +1001,12 @@ class FactoryModeController(QObject):
         self.bus.factory_display_reset.emit(reason)
         self.bus.factory_review_changed.emit(self._review_payload)
         self._emit_state()
+
+    def _clear_owned_plc_testing_state(self) -> None:
+        plc_id = self._owned_runtime_plc_id
+        self._owned_runtime_plc_id = None
+        if plc_id is not None:
+            self.bus.write_plc_testing_state_sign.emit(plc_id, False)
 
     def _emit_blocked_start(self, trigger_source: str) -> bool:
         reason = self._state.start_ready_reason

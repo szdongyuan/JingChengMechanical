@@ -111,6 +111,8 @@ TEST_CONFIG_COLUMN_SQL = {
 
 PLC_FIELD_OFFSET_COLUMN_SQL = {
     "current_value_offset": "TEXT DEFAULT NULL",
+    "rotation_speed_offset": "TEXT DEFAULT NULL",
+    "res_testing_signal_offset": "TEXT DEFAULT NULL",
 }
 
 
@@ -637,6 +639,53 @@ def test_connect_rejects_missing_plc_current_value_offset_without_mutating(
         assert check_db.execute_sql(
             "SELECT plc_id FROM plc_field_offset_table"
         ).fetchall() == [(9,)]
+    finally:
+        check_db.close()
+
+
+def test_connect_rejects_missing_optional_plc_protocol_columns_without_mutating(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "jingchen.db"
+    tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    tmp_db.connect()
+    _create_runtime_tables(tmp_db)
+    tmp_db.execute_sql("DROP TABLE plc_field_offset_table")
+    tmp_db.execute_sql(
+        """
+        CREATE TABLE plc_field_offset_table (
+            plc_id INTEGER PRIMARY KEY,
+            current_value_offset TEXT DEFAULT NULL
+        )
+        """
+    )
+    tmp_db.execute_sql(
+        """
+        INSERT INTO plc_field_offset_table (plc_id, current_value_offset)
+        VALUES (9, '2.0')
+        """
+    )
+    tmp_db.close()
+    monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    with pytest.raises(DatabaseStartupError, match="rotation_speed_offset"):
+        svc_mod.DbConnectionService().connect()
+
+    check_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    check_db.connect()
+    try:
+        assert _table_column_names(check_db, "plc_field_offset_table") == [
+            "plc_id",
+            "current_value_offset",
+        ]
+        assert check_db.execute_sql(
+            """
+            SELECT plc_id, current_value_offset
+            FROM plc_field_offset_table
+            """
+        ).fetchall() == [(9, "2.0")]
     finally:
         check_db.close()
 

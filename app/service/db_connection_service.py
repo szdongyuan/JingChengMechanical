@@ -92,7 +92,13 @@ class DbConnectionService:
             "updated_time",
         }
     )
-    _REQUIRED_PLC_FIELD_OFFSET_COLUMNS = frozenset({"current_value_offset"})
+    _REQUIRED_PLC_FIELD_OFFSET_COLUMNS = frozenset(
+        {
+            "current_value_offset",
+            "rotation_speed_offset",
+            "res_testing_signal_offset",
+        }
+    )
     _REQUIRED_HISTORICAL_METRIC_CACHE_COLUMNS = frozenset(
         {
             "cache_id",
