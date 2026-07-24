@@ -19,6 +19,29 @@ from app.service.analysis.test_manager import TestManager
 from app.services_container import EventBus
 
 
+class _ConfigServiceStub:
+    def __init__(self, configs, *, failures=()):
+        self._configs = dict(configs)
+        self._failures = set(failures)
+
+    def load_config(self, config_id: int):
+        if config_id in self._failures:
+            raise RuntimeError(f"failed to load config {config_id}")
+        return self._configs[config_id]
+
+
+def _make_lightweight_service_container(config_service):
+    services = object.__new__(mod.ServiceContainer)
+    services.bus = EventBus()
+    services.config_service = config_service
+    services.plc_services = {}
+    services.pending_plc_start_signal_reset_ids = set()
+    services.bus.plc_start_signal_reset_result.connect(
+        services._on_plc_start_signal_reset_result
+    )
+    return services
+
+
 def _load_factory_mode_controller_module():
     spec = importlib.util.find_spec("app.service.factory_mode_controller")
     assert spec is not None, "app.service.factory_mode_controller module is missing"
@@ -145,6 +168,88 @@ def test_event_bus_exposes_plc_changed_signal():
     bus.plc_changed.emit()
 
     assert received == ["fired"]
+
+
+def test_event_bus_exposes_plc_start_signal_reset_contract():
+    assert _normalized_signal_argument_types(
+        EventBus.request_plc_start_signal_reset
+    ) == ("int",)
+    assert _normalized_signal_argument_types(
+        EventBus.plc_start_signal_reset_result
+    ) == ("int", "bool", "QString")
+
+    bus = EventBus()
+    requests = []
+    results = []
+    bus.request_plc_start_signal_reset.connect(requests.append)
+    bus.plc_start_signal_reset_result.connect(
+        lambda plc_id, success, message: results.append(
+            (plc_id, success, message)
+        )
+    )
+
+    bus.request_plc_start_signal_reset.emit(7)
+    bus.plc_start_signal_reset_result.emit(7, False, "reset failed")
+
+    assert requests == [7]
+    assert results == [(7, False, "reset failed")]
+
+
+def test_service_container_coordinates_pending_plc_start_signal_resets():
+    services = _make_lightweight_service_container(
+        _ConfigServiceStub(
+            {
+                101: {"plc_id": 7},
+                202: {"plc_id": 7},
+                303: {"plc_id": 8},
+                404: {"plc_id": None},
+                606: {"plc_id": True},
+            },
+            failures={505},
+        )
+    )
+    requested_plc_ids = []
+    log_messages = []
+    services.bus.request_plc_start_signal_reset.connect(requested_plc_ids.append)
+    services.bus.log.connect(log_messages.append)
+
+    plc_ids = services.request_plc_start_signal_resets_for_configs(
+        (101, 202, 303, 404, 505)
+    )
+
+    assert plc_ids == (7, 8)
+    assert services.pending_plc_start_signal_reset_ids == {7, 8}
+    assert requested_plc_ids == []
+
+    services.plc_services[7] = object()
+    assert services.dispatch_pending_plc_start_signal_reset(7) is True
+    assert requested_plc_ids == [7]
+
+    assert services.request_plc_start_signal_resets_for_configs([202]) == (7,)
+    assert requested_plc_ids == [7]
+
+    services.bus.plc_start_signal_reset_result.emit(7, False, "reset failed")
+    assert services.pending_plc_start_signal_reset_ids == {7, 8}
+    assert any("reset failed" in message for message in log_messages)
+
+    services.bus.plc_start_signal_reset_result.emit(7, True, "")
+    assert services.pending_plc_start_signal_reset_ids == {8}
+
+    assert services.request_plc_start_signal_resets_for_configs([101]) == (7,)
+    assert services.pending_plc_start_signal_reset_ids == {7, 8}
+    assert requested_plc_ids == [7, 7]
+
+    assert services.dispatch_pending_plc_start_signal_reset(8) is False
+    assert requested_plc_ids == [7, 7]
+    services.plc_services[8] = object()
+    assert services.dispatch_pending_plc_start_signal_reset(8) is True
+    assert requested_plc_ids == [7, 7, 8]
+
+    assert services.request_plc_start_signal_resets_for_configs([606]) == ()
+    assert len(log_messages) >= 3
+    assert any("404" in message for message in log_messages)
+    assert any("505" in message for message in log_messages)
+    assert any("606" in message for message in log_messages)
 
 
 def test_analysis_frame_signals_include_run_id_contract():
