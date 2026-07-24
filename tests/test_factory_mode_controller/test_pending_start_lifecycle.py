@@ -36,6 +36,87 @@ def _make_stopped_payload(
     )
 
 
+def test_plc_testing_state_is_true_only_after_backend_accepts_plc_start():
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    testing_states: list[tuple[int, bool]] = []
+    callbacks: list[object] = []
+    bus.write_plc_testing_state_sign.connect(
+        lambda plc_id, testing: testing_states.append((plc_id, testing))
+    )
+    services = _make_services((_make_config(101, plc_id=22),))
+
+    def _capture_start(_payload, *, on_start_accepted=None):
+        callbacks.append(on_start_accepted)
+        return True
+
+    services.test.start.side_effect = _capture_start
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101,))
+
+    assert controller.handle_plc_event(
+        services_mod.FactoryPlcIngressPayload(plc_id=22)
+    ) is True
+    assert testing_states == []
+
+    callbacks[0](_run_id_for(101))
+
+    assert testing_states == [(22, True)]
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ["no_selected_config", "validation", "backend_false", "backend_error"],
+)
+def test_plc_testing_state_is_not_set_for_rejected_plc_start(failure_mode):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    testing_states: list[tuple[int, bool]] = []
+    bus.write_plc_testing_state_sign.connect(
+        lambda plc_id, testing: testing_states.append((plc_id, testing))
+    )
+    services = _make_services(
+        (_make_config(101, plc_id=22),),
+        validation_errors={101: ["invalid"]} if failure_mode == "validation" else None,
+    )
+    if failure_mode == "backend_false":
+        services.test.start.return_value = False
+    elif failure_mode == "backend_error":
+        services.test.start.side_effect = RuntimeError("backend exploded")
+    controller = controller_mod.FactoryModeController(bus, services)
+    if failure_mode != "no_selected_config":
+        controller.set_selection((101,))
+
+    assert controller.handle_plc_event(
+        services_mod.FactoryPlcIngressPayload(plc_id=22)
+    ) is False
+    assert testing_states == []
+
+
+@pytest.mark.parametrize("trigger_source", ["manual", "scan"])
+def test_plc_testing_state_is_not_set_for_accepted_non_plc_start(trigger_source):
+    controller_mod = _load_factory_mode_controller_module()
+    bus = EventBus()
+    testing_states: list[tuple[int, bool]] = []
+    bus.write_plc_testing_state_sign.connect(
+        lambda plc_id, testing: testing_states.append((plc_id, testing))
+    )
+    services = _make_services((_make_config(101, scan_triggers_test=True),))
+    _accept_start(services)
+    controller = controller_mod.FactoryModeController(bus, services)
+    controller.set_selection((101,))
+
+    if trigger_source == "manual":
+        accepted = controller.start_manual()
+    else:
+        accepted = controller.handle_scan_event(
+            services_mod.FactoryScanIngressPayload(scan_text="SN-1")
+        )
+
+    assert accepted is True
+    assert testing_states == []
+
+
 def test_factory_mode_controller_ignores_out_of_band_factory_runtime_start_acceptance():
     controller_mod = _load_factory_mode_controller_module()
     runtime_start_cls = getattr(services_mod, "FactoryRuntimeStartPayload", None)

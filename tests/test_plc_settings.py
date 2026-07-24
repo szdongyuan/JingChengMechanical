@@ -49,6 +49,7 @@ def services():
         log=_SignalStub(),
         write_test_result_sign=_SignalStub(),
         write_limit_sign=_SignalStub(),
+        write_plc_testing_state_sign=_SignalStub(),
         plc_changed=_SignalStub(),
         plc_limit_values_dict={},
     )
@@ -254,3 +255,56 @@ def test_process_configuration_opens_when_process_table_is_empty(
     module.open_process_param_offset_dialog()
 
     assert PlcProcessParamOffsetTable.select().count() == 1
+
+
+def test_start_connect_wires_testing_state_only_to_ordinary_plc_service(
+    qapp,
+    plc_tables,
+    services,
+    monkeypatch,
+):
+    row = PlcTable.create(plc_name="Line A", plc_open_state=0)
+    PlcFieldOffsetTable.create(plc_id=row.id, start_signal_offset="0.0")
+    module = _make_module(monkeypatch, services)
+
+    class _ServiceStub:
+        def __init__(self, **_kwargs):
+            self.connect_result = _SignalStub()
+            self.state_changed = _SignalStub()
+
+        def moveToThread(self, _thread):
+            pass
+
+        def start_plc_service(self):
+            pass
+
+        def deleteLater(self):
+            pass
+
+        def last_write_test_result_to_plc(self, *_args):
+            pass
+
+        def last_write_limit_to_plc(self, *_args):
+            pass
+
+        def write_testing_state(self, *_args):
+            pass
+
+    class _ThreadStub:
+        def __init__(self, _parent):
+            self.started = _SignalStub()
+            self.finished = _SignalStub()
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(plc_settings, "PlcService", _ServiceStub)
+    monkeypatch.setattr(plc_settings, "QThread", _ThreadStub)
+
+    module.start_connect(row)
+
+    plc_service = services.plc_services[row.id]
+    assert services.bus.write_plc_testing_state_sign.callbacks == [
+        plc_service.write_testing_state
+    ]
+    assert services.process_plc_service is None

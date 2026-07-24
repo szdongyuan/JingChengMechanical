@@ -110,6 +110,7 @@ def _emit_owned_runtime_start(
     config_id: int,
     trigger_source: str,
     run_id: str | None = None,
+    plc_id: int | None = None,
 ):
     runtime_start_cls = getattr(services_mod, "FactoryRuntimeStartPayload", None)
 
@@ -123,6 +124,7 @@ def _emit_owned_runtime_start(
             config_id=config_id,
             run_id=active_run_id,
             trigger_source=trigger_source,
+            plc_id=plc_id,
         )
     )
 

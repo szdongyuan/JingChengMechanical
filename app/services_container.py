@@ -127,6 +127,7 @@ class FactoryRuntimeStartPayload:
     config_id: int
     run_id: str
     trigger_source: str
+    plc_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -178,6 +179,7 @@ class EventBus(QObject):
     write_test_result_sign = pyqtSignal(int, dict)
     # 写入 PLC 限值信号：plc_id, limit_values
     write_limit_sign = pyqtSignal(int, dict)
+    write_plc_testing_state_sign = pyqtSignal(int, bool)
 
     # 配置变化（供外部模块监听，如工单模块刷新可选配置列表）
     config_changed = pyqtSignal()

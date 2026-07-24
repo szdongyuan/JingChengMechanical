@@ -377,6 +377,21 @@ class PlcService(QObject):
         self.bus.log.emit(message)
         self.logger.error(message)
 
+    @pyqtSlot(int, bool)
+    def write_testing_state(self, plc_id: int, testing: bool) -> None:
+        if plc_id != self._plc_id or self.plc_client is None:
+            return
+        if self._configured_offset("res_testing_signal_offset") is None:
+            return
+        try:
+            self.write_field_value("res_testing_signal_offset", testing)
+        except Exception as exc:
+            self._log_field_failure(
+                "write",
+                "res_testing_signal_offset",
+                exc,
+            )
+
     def last_write_test_result_to_plc(self, plc_id, test_result):
         """
         最后按照plcid来写入对应的plc

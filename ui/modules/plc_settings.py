@@ -960,6 +960,9 @@ class PlcSettingsModule(QWidget):
         plc_service.state_changed.connect(on_state_changed)
         self.services.bus.write_test_result_sign.connect(plc_service.last_write_test_result_to_plc)
         self.services.bus.write_limit_sign.connect(plc_service.last_write_limit_to_plc)
+        self.services.bus.write_plc_testing_state_sign.connect(
+            plc_service.write_testing_state
+        )
         # 线程彻底结束后，把这条 PLC 对应的线程记录清掉。
         connect_thread.finished.connect(on_connect_thread_stopped)
         # 启动后台连接线程，避免界面卡住。

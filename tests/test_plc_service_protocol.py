@@ -292,6 +292,54 @@ def test_absent_workorder_fields_do_not_emit_empty_payload_or_warning():
     assert bus.log.calls == []
 
 
+def test_write_testing_state_writes_matching_plc_bool_field():
+    service, client, bus = _build_service(
+        offsets={"res_testing_signal_offset": "8.2"}
+    )
+
+    service.write_testing_state(22, True)
+
+    assert snap7.util.get_bool(client.memory, 8, 2) is True
+    assert len(client.writes) == 1
+    assert bus.log.calls == []
+
+
+def test_write_testing_state_ignores_different_plc_id():
+    service, client, bus = _build_service(
+        offsets={"res_testing_signal_offset": "8.2"}
+    )
+
+    service.write_testing_state(23, True)
+
+    assert client.reads == []
+    assert client.writes == []
+    assert bus.log.calls == []
+
+
+def test_write_testing_state_skips_missing_offset_without_warning():
+    service, client, bus = _build_service()
+
+    service.write_testing_state(22, True)
+
+    assert client.reads == []
+    assert client.writes == []
+    assert bus.log.calls == []
+
+
+def test_write_testing_state_repeated_false_writes_are_safe():
+    service, client, bus = _build_service(
+        offsets={"res_testing_signal_offset": "8.2"}
+    )
+    snap7.util.set_bool(client.memory, 8, 2, True)
+
+    service.write_testing_state(22, False)
+    service.write_testing_state(22, False)
+
+    assert snap7.util.get_bool(client.memory, 8, 2) is False
+    assert len(client.writes) == 2
+    assert bus.log.calls == []
+
+
 def test_test_manager_result_payload_writes_int_error_and_later_plc_fields():
     service, client, _bus = _build_service(
         offsets={
