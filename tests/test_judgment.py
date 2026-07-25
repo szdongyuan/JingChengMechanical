@@ -227,6 +227,215 @@ class TestLimitChecks:
         assert channel_result.spl_max_db is not None
         assert channel_result.spl_max_db - channel_result.spl_min_db <= 0.10
 
+    def test_spl_window_uses_full_calibrated_capture_and_shared_trace(
+        self,
+        monkeypatch,
+    ):
+        engine = self._make_engine()
+        sample_rate = 100.0
+        raw_signal = np.linspace(-1.0, 1.0, 300, dtype=np.float64)
+        captured: dict[str, object] = {}
+        config = _make_config(
+            analysis_duration=1.0,
+            analysis_window_offset_ms=1000,
+            channels=[
+                _make_channel_config(
+                    0,
+                    spl_lower_limit=51.0,
+                    spl_upper_limit=80.0,
+                    spl_average_upper_enabled=True,
+                    spl_average_upper_limit=60.0,
+                )
+            ],
+        )
+
+        def forbidden_compute_spl(*args, **kwargs):
+            raise AssertionError("compute_spl must not be a second SPL authority")
+
+        def fake_trace(
+            signal,
+            actual_sample_rate,
+            weighting,
+            time_constant,
+            **kwargs,
+        ):
+            captured["trace_signal"] = np.asarray(signal).copy()
+            captured["trace_args"] = (
+                actual_sample_rate,
+                weighting,
+                time_constant,
+            )
+            captured["trace_kwargs"] = kwargs
+            return [1.05, 1.10, 2.00], [52.0, 83.0, 53.0]
+
+        def fake_leq(signal, actual_sample_rate, weighting, **kwargs):
+            captured["leq_signal"] = np.asarray(signal).copy()
+            captured["leq_args"] = (actual_sample_rate, weighting)
+            captured["leq_kwargs"] = kwargs
+            return 61.0
+
+        monkeypatch.setattr(dsp, "compute_spl", forbidden_compute_spl)
+        monkeypatch.setattr(dsp, "compute_spl_trace", fake_trace)
+        monkeypatch.setattr(dsp, "compute_spl_leq", fake_leq)
+
+        result = engine.judge(
+            config,
+            raw_signal.reshape(-1, 1),
+            sample_rate,
+            mic_cal={"In1": {"deviation_value": "2.5"}},
+            audio_file_path="/tmp/test.wav",
+        )
+
+        expected_calibrated = raw_signal * 2.5
+        np.testing.assert_array_equal(captured["trace_signal"], expected_calibrated)
+        np.testing.assert_array_equal(captured["leq_signal"], expected_calibrated)
+        assert captured["trace_args"] == (sample_rate, "Z", 0.125)
+        assert captured["trace_kwargs"] == {
+            "chunk_duration": 0.05,
+            "output_start_sample": 100,
+            "output_end_sample": 200,
+        }
+        assert captured["leq_args"] == (sample_rate, "Z")
+        assert captured["leq_kwargs"] == {
+            "start_sample": 100,
+            "end_sample": 200,
+        }
+
+        channel = result.channel_results[0]
+        assert channel.spl_db == pytest.approx(53.0)
+        assert channel.spl_min_db == pytest.approx(52.0)
+        assert channel.spl_max_db == pytest.approx(83.0)
+        assert channel.spl_pass is False
+        assert channel.spl_average_db == pytest.approx(61.0)
+        assert channel.spl_average_pass is False
+
+    def test_rejudge_spl_window_passes_full_capture_and_rejudge_bounds(
+        self,
+        monkeypatch,
+    ):
+        engine = self._make_engine()
+        sample_rate = 40.0
+        raw_signal = np.arange(80, dtype=np.float64)
+        captured: dict[str, object] = {}
+
+        def fake_trace(signal, *args, **kwargs):
+            captured["trace_signal"] = np.asarray(signal).copy()
+            captured["trace_kwargs"] = kwargs
+            return [1.25], [55.0]
+
+        def fake_leq(signal, *args, **kwargs):
+            captured["leq_signal"] = np.asarray(signal).copy()
+            captured["leq_kwargs"] = kwargs
+            return 54.0
+
+        monkeypatch.setattr(
+            dsp,
+            "compute_spl",
+            lambda *args, **kwargs: pytest.fail("compute_spl must not be called"),
+        )
+        monkeypatch.setattr(dsp, "compute_spl_trace", fake_trace)
+        monkeypatch.setattr(dsp, "compute_spl_leq", fake_leq)
+
+        result = engine.rejudge(
+            _make_config(),
+            raw_signal.reshape(-1, 1),
+            sample_rate,
+            mic_cal={"In1": {"deviation_value": "0.5"}},
+            audio_file_path="/tmp/test.wav",
+            start_sec=0.75,
+            end_sec=1.25,
+        )
+
+        expected_calibrated = raw_signal * 0.5
+        np.testing.assert_array_equal(captured["trace_signal"], expected_calibrated)
+        np.testing.assert_array_equal(captured["leq_signal"], expected_calibrated)
+        assert captured["trace_kwargs"]["output_start_sample"] == 30
+        assert captured["trace_kwargs"]["output_end_sample"] == 50
+        assert captured["leq_kwargs"] == {
+            "start_sample": 30,
+            "end_sample": 50,
+        }
+        assert result.channel_results[0].spl_db == pytest.approx(55.0)
+
+    def test_spl_window_numerically_uses_prefix_state_but_window_only_limits(self):
+        engine = self._make_engine()
+        sample_rate = 48_000.0
+        duration_sec = 3.0
+        start_sample = int(2.0 * sample_rate)
+        end_sample = int(duration_sec * sample_rate)
+        times = np.arange(end_sample, dtype=np.float64) / sample_rate
+        quiet_amplitude = np.sqrt(2.0) * 20e-6 * (10.0 ** (34.0 / 20.0))
+        loud_amplitude = np.sqrt(2.0) * 20e-6 * (10.0 ** (74.0 / 20.0))
+        amplitudes = np.where(times < 2.0, quiet_amplitude, loud_amplitude)
+        full_signal = amplitudes * np.sin(2.0 * np.pi * 31.5 * times)
+
+        _, expected_trace = dsp.compute_spl_trace(
+            full_signal,
+            sample_rate,
+            "A",
+            0.125,
+            chunk_duration=0.05,
+            output_start_sample=start_sample,
+            output_end_sample=end_sample,
+        )
+        _, sliced_trace = dsp.compute_spl_trace(
+            full_signal[start_sample:end_sample],
+            sample_rate,
+            "A",
+            0.125,
+            chunk_duration=0.05,
+        )
+        full_trace = dsp.compute_spl_trace(
+            full_signal,
+            sample_rate,
+            "A",
+            0.125,
+            chunk_duration=0.05,
+        )[1]
+        expected_leq = dsp.compute_spl_leq(
+            full_signal,
+            sample_rate,
+            "A",
+            start_sample=start_sample,
+            end_sample=end_sample,
+        )
+        full_leq = dsp.compute_spl_leq(full_signal, sample_rate, "A")
+
+        assert min(full_trace) < 20.0 < min(expected_trace)
+        assert full_leq < 32.0 < expected_leq
+        assert min(expected_trace) != pytest.approx(min(sliced_trace), abs=0.5)
+
+        config = _make_config(
+            analysis_duration=1.0,
+            analysis_window_offset_ms=2000,
+            input_device_samplerate=sample_rate,
+            channels=[
+                _make_channel_config(
+                    0,
+                    spl_weighting="A",
+                    spl_lower_limit=20.0,
+                    spl_upper_limit=80.0,
+                    spl_average_lower_enabled=True,
+                    spl_average_lower_limit=32.0,
+                )
+            ],
+        )
+        result = engine.judge(
+            config,
+            full_signal.reshape(-1, 1),
+            sample_rate,
+            mic_cal={},
+            audio_file_path="/tmp/test.wav",
+        )
+
+        channel = result.channel_results[0]
+        assert channel.spl_db == pytest.approx(expected_trace[-1], abs=1e-12)
+        assert channel.spl_min_db == pytest.approx(min(expected_trace), abs=1e-12)
+        assert channel.spl_max_db == pytest.approx(max(expected_trace), abs=1e-12)
+        assert channel.spl_average_db == pytest.approx(expected_leq, abs=1e-12)
+        assert channel.spl_pass is True
+        assert channel.spl_average_pass is True
+
     def test_stable_calibrator_loudness_uses_corrected_zwtv_trace(self, monkeypatch):
         monkeypatch.setattr(dsp, "compute_loudness_trace", _REAL_COMPUTE_LOUDNESS_TRACE)
         engine = self._make_engine()
@@ -2298,15 +2507,19 @@ class TestLimitChecks:
         )
         observed = {}
 
-        def fake_compute_spl(signal, sample_rate, weighting, time_constant):
+        def fake_compute_spl_trace(signal, *args, **kwargs):
             observed["spl_signal"] = np.asarray(signal).copy()
-            return float(np.mean(signal) * 100.0)
+            return [0.05], [float(np.mean(signal) * 100.0)]
 
-        monkeypatch.setattr(dsp, "compute_spl", fake_compute_spl)
+        monkeypatch.setattr(
+            dsp,
+            "compute_spl",
+            lambda *args, **kwargs: pytest.fail("compute_spl must not be called"),
+        )
         monkeypatch.setattr(
             dsp,
             "compute_spl_trace",
-            lambda signal, *args, **kwargs: ([0.05], [float(np.mean(signal) * 100.0)]),
+            fake_compute_spl_trace,
         )
         monkeypatch.setattr(
             dsp,
@@ -2535,6 +2748,18 @@ class TestRejudge:
                                 start_sec=4.0, end_sec=1.0)
         # end_sec gets clamped to start_sec (empty window), should not crash
         assert isinstance(result, JudgmentResult)
+        channel = result.channel_results[0]
+        assert channel.spl_trace_available is True
+        assert channel.spl_trace_error_message is None
+        assert channel.spl_db == -np.inf
+        assert channel.spl_min_db == -np.inf
+        assert channel.spl_max_db == -np.inf
+        assert channel.spl_pass is False
+        assert channel.spl_average_available is True
+        assert channel.spl_average_error_message is None
+        assert channel.spl_average_db == -np.inf
+        assert channel.spl_average_pass is True
+        assert result.limit_pass is False
 
     def test_out_of_bounds_clamped(self):
         """Window beyond buffer length should be clamped."""

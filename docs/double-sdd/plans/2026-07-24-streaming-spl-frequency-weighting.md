@@ -18,6 +18,30 @@ Authoritative design:
 The implementation must preserve the approved compatibility posture and meet
 the frequency-response and chunk-invariance tolerances in that spec.
 
+## Known Baseline Verification
+
+Before implementation, the focused analysis baseline passed:
+
+```text
+488 passed
+```
+
+The complete Windows suite had three unrelated AI failures. The two
+`test_post_response_discard_honors_request_deadline_and_duration` parameter
+cases passed when rerun directly and are treated as load-sensitive baseline
+flakes. This stable pre-existing Windows failure remained:
+
+```text
+tests/test_ai_service_validation.py::TestValidateResponse::test_artifact_absolute_path_rejected
+```
+
+That test concerns POSIX-style absolute-path validation on Windows and is
+outside this SPL plan. Implementers must not modify AI runtime or response
+validation code. Final verification requires the focused analysis suite to
+pass and the complete suite to introduce no failures beyond this recorded
+baseline; any load-sensitive timeout failure must be rerun directly and
+reported.
+
 ## File Structure
 
 - Create `app/service/analysis/spl_weighting.py`
@@ -688,6 +712,12 @@ python -m pytest -q
 ```
 
 Expected: all tests pass with no regressions.
+
+On the current Windows baseline, the previously recorded
+`test_artifact_absolute_path_rejected` failure may remain. If so, rerun that
+exact node and report it as unchanged rather than modifying unrelated AI code.
+Rerun any resident-runtime timeout failure directly. No new or SPL-related
+failure is acceptable.
 
 - [ ] **Step 8: Verify repository scope**
 

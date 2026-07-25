@@ -23,6 +23,7 @@ from app.service.analysis.dsp import (
     phon_to_sone,
     sone_to_phon,
 )
+from app.service.analysis.spl_weighting import SplFrequencyWeightingFilter
 
 
 def _level_for_center(
@@ -309,6 +310,116 @@ class TestComputeSpl:
         assert spl == pytest.approx(expected, abs=0.1)
 
 
+@pytest.mark.parametrize(
+    ("weighting", "frequency_hz"),
+    [
+        ("A", 25.0),
+        ("A", 31.5),
+        ("A", 63.0),
+        ("A", 100.0),
+        ("A", 1000.0),
+        ("C", 25.0),
+        ("C", 31.5),
+        ("C", 63.0),
+        ("C", 100.0),
+        ("C", 1000.0),
+    ],
+)
+def test_spl_detector_streaming_tones_match_reference(weighting, frequency_hz):
+    signal, sample_rate = _stable_calibrator_signal(
+        sample_rate=48000.0,
+        duration_sec=2.0,
+        freq_hz=frequency_hz,
+    )
+    detector = dsp_module.SplDetector(sample_rate, weighting, 0.125)
+
+    values = [
+        detector.process(signal[start : start + 2400])
+        for start in range(0, signal.size, 2400)
+    ]
+
+    reference = a_weighting if weighting == "A" else c_weighting
+    expected_db = 94.0 + float(reference(np.asarray([frequency_hz]))[0])
+    assert float(np.mean(values[-5:])) == pytest.approx(expected_db, abs=1.0)
+
+
+def test_a_weighted_31_5_hz_streaming_detector_matches_reference():
+    signal, sample_rate = _stable_calibrator_signal(
+        sample_rate=48000.0,
+        duration_sec=2.0,
+        freq_hz=31.5,
+    )
+    detector = dsp_module.SplDetector(sample_rate, "A", 0.125)
+
+    values = [
+        detector.process(signal[start : start + 2400])
+        for start in range(0, signal.size, 2400)
+    ]
+
+    assert np.mean(values[-5:]) == pytest.approx(54.47, abs=1.0)
+
+
+@pytest.mark.parametrize("weighting", ["A", "C"])
+def test_spl_detector_irregular_chunks_match_regular_chunks(weighting):
+    signal, sample_rate = _stable_calibrator_signal(
+        sample_rate=48000.0,
+        duration_sec=2.0,
+        freq_hz=31.5,
+    )
+    regular = dsp_module.SplDetector(sample_rate, weighting, 0.125)
+    regular_value = -np.inf
+    for start in range(0, signal.size, 2400):
+        regular_value = regular.process(signal[start : start + 2400])
+
+    irregular = dsp_module.SplDetector(sample_rate, weighting, 0.125)
+    irregular_value = -np.inf
+    chunk_sizes = (137, 2863, 511, 4099, 1201)
+    start = 0
+    chunk_index = 0
+    while start < signal.size:
+        stop = min(signal.size, start + chunk_sizes[chunk_index % len(chunk_sizes)])
+        irregular_value = irregular.process(signal[start:stop])
+        start = stop
+        chunk_index += 1
+
+    assert irregular_value == pytest.approx(regular_value, abs=0.1)
+
+
+def test_spl_detector_reset_replays_frequency_and_time_state():
+    signal, sample_rate = _stable_calibrator_signal(
+        sample_rate=48000.0,
+        duration_sec=0.4,
+        freq_hz=63.0,
+    )
+    chunks = (signal[:137], signal[137:4000], signal[4000:])
+    detector = dsp_module.SplDetector(sample_rate, "A", 0.125)
+
+    first = [detector.process(chunk) for chunk in chunks]
+    detector.reset()
+    second = [detector.process(chunk) for chunk in chunks]
+
+    np.testing.assert_allclose(second, first, atol=1e-12, rtol=1e-12)
+
+
+def test_spl_detector_z_matches_existing_unweighted_contract():
+    signal, sample_rate = _stable_calibrator_signal(
+        sample_rate=48000.0,
+        duration_sec=0.2,
+        freq_hz=1000.0,
+    )
+    detector = dsp_module.SplDetector(sample_rate, "Z", 0.125)
+
+    actual = detector.process(signal)
+
+    squared = signal**2
+    alpha = 1.0 - np.exp(-1.0 / (sample_rate * 0.125))
+    state = float(np.mean(squared))
+    for sample_square in squared:
+        state = float(alpha * sample_square + (1.0 - alpha) * state)
+    expected = 10.0 * np.log10(state / ((20e-6) ** 2))
+    assert actual == pytest.approx(expected, abs=1e-12)
+
+
 @pytest.mark.parametrize("weighting", ["A", "C", "Z"])
 def test_compute_spl_trace_is_stable_for_1khz_calibrator(weighting):
     signal, sample_rate = _stable_calibrator_signal()
@@ -371,6 +482,128 @@ def test_compute_spl_trace_uses_one_continuous_detector(monkeypatch):
     assert len(instances) == 1
     assert len(instances[0].calls) == len(values)
     assert values == pytest.approx([float(i) for i in range(1, len(values) + 1)])
+
+
+def test_compute_spl_trace_bounds_warm_state_and_emit_absolute_endpoints(monkeypatch):
+    instances = []
+
+    class FakeDetector:
+        def __init__(self, sample_rate, weighting, time_constant):
+            self.total = 0.0
+            self.calls = []
+            instances.append(self)
+
+        def process(self, signal):
+            values = np.asarray(signal, dtype=np.float64)
+            self.calls.append(values.copy())
+            self.total += float(np.sum(values))
+            return self.total
+
+    monkeypatch.setattr("app.service.analysis.dsp.SplDetector", FakeDetector)
+    signal = np.arange(1.0, 24.0)
+
+    times, values = compute_spl_trace(
+        signal,
+        sample_rate=10.0,
+        weighting="A",
+        time_constant=0.125,
+        chunk_duration=0.5,
+        output_start_sample=7,
+        output_end_sample=23,
+    )
+
+    assert len(instances) == 1
+    assert [len(chunk) for chunk in instances[0].calls] == [5, 5, 5, 5, 3]
+    assert times == pytest.approx([1.0, 1.5, 2.0, 2.3])
+    assert values == pytest.approx([55.0, 120.0, 210.0, 276.0])
+
+
+def test_compute_spl_trace_default_bounds_include_final_partial_chunk():
+    signal = np.ones(12, dtype=np.float64)
+
+    times, values = compute_spl_trace(
+        signal,
+        sample_rate=10.0,
+        weighting="Z",
+        time_constant=0.125,
+        chunk_duration=0.5,
+    )
+
+    assert times == pytest.approx([0.5, 1.0, 1.2])
+    assert len(values) == 3
+
+
+@pytest.mark.parametrize(
+    ("start_sample", "end_sample", "expected_times"),
+    [
+        (-5, 99, [0.5, 1.0, 1.2]),
+        (9, 3, []),
+        (12, 12, []),
+    ],
+)
+def test_compute_spl_trace_normalizes_invalid_bounds_safely(
+    start_sample,
+    end_sample,
+    expected_times,
+):
+    times, values = compute_spl_trace(
+        np.ones(12, dtype=np.float64),
+        sample_rate=10.0,
+        weighting="Z",
+        time_constant=0.125,
+        chunk_duration=0.5,
+        output_start_sample=start_sample,
+        output_end_sample=end_sample,
+    )
+
+    assert times == pytest.approx(expected_times)
+    assert len(values) == len(expected_times)
+
+
+def test_compute_spl_leq_bounds_use_continuous_weighting_but_window_only_energy():
+    signal, sample_rate = _stable_calibrator_signal(
+        sample_rate=48000.0,
+        duration_sec=0.5,
+        freq_hz=31.5,
+    )
+    start_sample = 7201
+    end_sample = 19_003
+    weighted = SplFrequencyWeightingFilter(sample_rate, "A").process(
+        signal[:end_sample]
+    )
+    selected = weighted[start_sample:end_sample]
+    expected = 10.0 * np.log10(
+        float(np.mean(selected**2)) / ((20e-6) ** 2)
+    )
+
+    actual = compute_spl_leq(
+        signal,
+        sample_rate,
+        "A",
+        start_sample=start_sample,
+        end_sample=end_sample,
+    )
+
+    assert actual == pytest.approx(expected, abs=1e-12)
+
+
+@pytest.mark.parametrize(
+    ("start_sample", "end_sample"),
+    [(8, 2), (5, 5), (99, 100)],
+)
+def test_compute_spl_leq_empty_normalized_bounds_return_negative_infinity(
+    start_sample,
+    end_sample,
+):
+    actual = compute_spl_leq(
+        np.ones(10, dtype=np.float64),
+        10.0,
+        "Z",
+        start_sample=start_sample,
+        end_sample=end_sample,
+    )
+
+    assert actual == -np.inf
 
 
 class TestLoudnessHelpers:

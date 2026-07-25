@@ -795,6 +795,55 @@ class TestTestSessionProcessing:
         assert pipeline._cfg["stft_nfft"] == _CHANNEL_DEFAULTS["stft_nfft"]
         assert pipeline._cfg["spl_weighting"] == _CHANNEL_DEFAULTS["spl_weighting"]
 
+    def test_setup_pipelines_creates_fresh_independent_spl_weighting_state(self):
+        config = _make_config()
+        config["input_device_samplerate"] = 48000
+        config["channels"][0]["spl_weighting"] = "A"
+        first_session = TestSession(
+            config=config,
+            bus=_make_mock_bus(),
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={},
+            audio_dir="/tmp/audio",
+        )
+        second_session = TestSession(
+            config=config,
+            bus=_make_mock_bus(),
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={},
+            audio_dir="/tmp/audio",
+        )
+
+        first_session._setup_pipelines()
+        second_session._setup_pipelines()
+        try:
+            first_detector = first_session._pipelines[0]._spl_detector
+            second_detector = second_session._pipelines[0]._spl_detector
+            prefix = np.full(4000, 0.5, dtype=np.float64)
+            times = np.arange(9600, dtype=np.float64) / 48000.0
+            signal = (
+                np.sqrt(2.0)
+                * 20e-6
+                * (10.0 ** (94.0 / 20.0))
+                * np.sin(2.0 * np.pi * 31.5 * times)
+            )
+
+            first_detector.process(prefix)
+            actual = second_detector.process(signal)
+            pristine = dsp.SplDetector(48000.0, "A", 0.125).process(signal)
+
+            assert first_detector is not second_detector
+            assert (
+                first_detector._frequency_weighting
+                is not second_detector._frequency_weighting
+            )
+            assert actual == pytest.approx(pristine, abs=1e-12)
+        finally:
+            first_session.stop_live_display()
+            second_session.stop_live_display()
+
     def test_setup_pipelines_defaults_live_loudness_channel_to_first_selected_channel(self):
         bus = _make_mock_bus()
         ai = MagicMock()
