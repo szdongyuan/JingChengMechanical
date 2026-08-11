@@ -190,7 +190,7 @@ def test_imported_review_payload_renders_chart_only_stft_channel(qapp):
     np.testing.assert_allclose(module.current_image_payload()["magnitude_db"], [[9.0]])
 
 
-def test_hardware_review_payload_does_not_seed_stft_from_chart_payload(qapp):
+def test_hardware_review_payload_seeds_stft_from_terminal_chart_payload(qapp):
     module, services = _make_module()
     review = _make_review_payload(
         displayed_config_id=101,
@@ -209,8 +209,8 @@ def test_hardware_review_payload_does_not_seed_stft_from_chart_payload(qapp):
     _show(module, qapp)
     _emit_reviewing(module, services, review)
 
-    assert module.current_render_cache_key() is None
-    assert module.current_image_payload() is None
+    assert module.current_render_cache_key() == (101, "run-101", 0)
+    assert module.current_image_payload()["times_sec"] == [0.1]
 
 
 def test_imported_review_payload_removes_stale_stft_cache_channels(qapp):

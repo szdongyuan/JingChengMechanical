@@ -921,6 +921,20 @@ def test_spectrum_module_uses_committed_fft_axis_scale_when_config_load_fails(qa
     services.config_service.load_config.assert_not_called()
 
 
+def test_spectrum_module_keeps_committed_fft_weighting_metadata(qapp):
+    services = _make_services(initial_state=_state(101, "reviewing"))
+    module = SpectrumModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    review_payload = _review_payload_with_chart_payload(101, channels=(0,))
+    review_payload.chart_payload[0]["fft"]["weighting"] = "A"
+
+    services.bus.factory_state_changed.emit(_state(101, "reviewing"))
+    services.bus.factory_review_changed.emit(review_payload)
+    qapp.processEvents()
+
+    assert module.current_plot_payload()["weighting"] == "A"
+
+
 def test_spectrum_module_passes_committed_fft_limit_envelope_to_chart(qapp):
     services = _make_services(initial_state=_state(101, "reviewing"))
     module = SpectrumModule(services)

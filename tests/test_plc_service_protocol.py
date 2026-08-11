@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import math
+import threading
+import time
 from dataclasses import FrozenInstanceError
-from dataclasses import replace
 from types import MethodType
-from types import SimpleNamespace
 
 import pytest
 import snap7.util
 
 from app.service.factory_mode_controller import FactoryModeController
-from app.service.analysis.test_manager import TestManager
-from app.service.plc_protocol import PLC_FIELD_BY_KEY
+from app.service.plc_protocol import (
+    PLC_FIELD_BY_KEY,
+    PLC_NEW_RECORD_DEFAULT_OFFSETS,
+)
+from app.service.plc_result_sequencer import PlcResultBoundaryError
 import app.service.plc_service as plc_service_module
 from app.service.plc_service import PlcService
 from app.services_container import EventBus, ServiceContainer
@@ -73,7 +76,39 @@ class FakeS7Client:
         self.memory[start:start + len(payload)] = payload
 
 
-def _build_service(*, offsets=None, plc_id=22):
+COMPLETE_PLC_RESULT = {
+    "finished": True,
+    "error_code": 3,
+    "sn_code": "SN-0001",
+    "test_result": False,
+    "score": 91.5,
+    "spl": 62.25,
+    "loudness": 4.5,
+    "vibrate": 0.125,
+    "ai_score": 88.75,
+}
+
+
+COMPLETE_PLC_RESULT_OFFSETS = {
+    "res_finish_signal_offset": "8.1",
+    "res_error_code_offset": "10.0",
+    "res_sn_code_offset": "40.0",
+    "res_result_offset": "12.0",
+    "res_score_offset": "14.0",
+    "res_spl_offset": "18.0",
+    "res_loudness_offset": "22.0",
+    "res_vibrate_data_offset": "26.0",
+    "res_ai_score_offset": "30.0",
+}
+
+
+def _build_service(
+    *,
+    offsets=None,
+    plc_id=22,
+    poll_interval_ms=50,
+    auto_reset_bit=True,
+):
     bus = BusStub()
     client = FakeS7Client()
     service = PlcService(
@@ -81,11 +116,257 @@ def _build_service(*, offsets=None, plc_id=22):
         lambda _plc_id: None,
         "127.0.0.1",
         db_number=1002,
+        poll_interval_ms=poll_interval_ms,
+        auto_reset_bit=auto_reset_bit,
         field_offsets_dict=offsets or {},
         plc_id=plc_id,
     )
     service.plc_client = client
     return service, client, bus
+
+
+def test_plc_service_default_poll_interval_is_50_ms():
+    bus = BusStub()
+
+    service = PlcService(bus, lambda *_args: None, "127.0.0.1")
+
+    assert service._poll_interval_ms == 50
+
+
+def test_ingress_polling_stop_preserves_connection_and_full_stop_disconnects_once():
+    service, client, _bus = _build_service()
+
+    class Timer:
+        def __init__(self):
+            self.stop_calls = 0
+            self.delete_calls = 0
+
+        def stop(self):
+            self.stop_calls += 1
+
+        def deleteLater(self):
+            self.delete_calls += 1
+
+    poll_timer = Timer()
+    value_timer = Timer()
+    service.timer = poll_timer
+    service.value_timer = value_timer
+
+    service.stop_ingress_polling()
+
+    assert service.plc_client is client
+    assert client.disconnect_calls == 0
+    assert poll_timer.stop_calls == poll_timer.delete_calls == 1
+    assert value_timer.stop_calls == value_timer.delete_calls == 1
+    assert service.timer is None
+    assert service.value_timer is None
+
+    service.stop_plc_service()
+    service.stop_plc_service()
+
+    assert client.disconnect_calls == 1
+    assert service.plc_client is None
+
+
+def test_isolated_result_dispatch_does_not_block_plc_owner_thread():
+    entered = threading.Event()
+    release = threading.Event()
+    executed_thread_ids = []
+
+    class Boundary:
+        def write_result(self, _plc_id, _payload):
+            executed_thread_ids.append(threading.get_ident())
+            entered.set()
+            assert release.wait(timeout=2)
+
+        def _disconnect(self):
+            return None
+
+    class Command:
+        def execute(self, boundary):
+            boundary.write_result(22, COMPLETE_PLC_RESULT)
+
+        def fail_if_pending(self, _reason):
+            pytest.fail("isolated writer rejected an accepted command")
+
+    service = PlcService(
+        BusStub(),
+        lambda *_args: None,
+        "127.0.0.1",
+        plc_id=22,
+        isolate_result_io=True,
+        output_boundary_factory=Boundary,
+    )
+    service._start_isolated_result_io()
+    owner_thread_id = threading.get_ident()
+
+    started = time.perf_counter()
+    service._execute_plc_dispatch(Command())
+    elapsed = time.perf_counter() - started
+
+    try:
+        assert elapsed < 0.1
+        assert entered.wait(timeout=2)
+        assert executed_thread_ids != [owner_thread_id]
+    finally:
+        release.set()
+        service.disconnect_plc_service()
+
+
+@pytest.mark.parametrize(
+    "poll_interval_ms",
+    [20, 50, 2_147_483_647],
+)
+def test_plc_service_accepts_exact_qtimer_safe_poll_intervals(
+    poll_interval_ms,
+):
+    service, _client, _bus = _build_service(
+        poll_interval_ms=poll_interval_ms,
+    )
+
+    assert service._poll_interval_ms == poll_interval_ms
+
+
+@pytest.mark.parametrize(
+    "poll_interval_ms",
+    [
+        19,
+        2_147_483_648,
+        True,
+        None,
+        "20",
+        20.0,
+        object(),
+    ],
+)
+def test_plc_service_rejects_invalid_poll_interval_before_timer_use(
+    poll_interval_ms,
+    monkeypatch,
+):
+    timer_constructions = []
+    monkeypatch.setattr(
+        plc_service_module,
+        "QTimer",
+        lambda *_args: timer_constructions.append(True),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=r"20.*2[,_]?147[,_]?483[,_]?647",
+    ):
+        PlcService(
+            BusStub(),
+            lambda *_args: None,
+            "127.0.0.1",
+            poll_interval_ms=poll_interval_ms,
+        )
+
+    assert timer_constructions == []
+
+
+@pytest.mark.parametrize(
+    "poll_interval_ms",
+    [20, 50, 2_147_483_647],
+)
+def test_plc_service_forwards_exact_poll_interval_to_single_timer(
+    poll_interval_ms,
+    monkeypatch,
+):
+    class FakeTimeout:
+        def __init__(self):
+            self.callback = None
+
+        def connect(self, callback):
+            self.callback = callback
+
+    class FakeTimer:
+        def __init__(self, _parent):
+            self.intervals = []
+            self.start_calls = 0
+            self.timeout = FakeTimeout()
+
+        def setInterval(self, interval):
+            self.intervals.append(interval)
+
+        def start(self):
+            self.start_calls += 1
+
+    fake_timer = FakeTimer(None)
+    monkeypatch.setattr(
+        plc_service_module,
+        "QTimer",
+        lambda _parent: fake_timer,
+    )
+    service, _client, _bus = _build_service(
+        poll_interval_ms=poll_interval_ms,
+    )
+
+    service.start_plc_service()
+
+    assert fake_timer.intervals == [poll_interval_ms]
+    assert fake_timer.start_calls == 1
+    assert fake_timer.timeout.callback == service.poll_once
+
+
+@pytest.mark.parametrize("poll_interval_ms", [50, 20])
+def test_supported_poll_intervals_trigger_once_only_on_zero_to_one(
+    poll_interval_ms,
+):
+    service, client, _bus = _build_service(
+        offsets={"start_signal_offset": "0.0"},
+        poll_interval_ms=poll_interval_ms,
+        auto_reset_bit=False,
+    )
+    starts = []
+    service._on_start_requested = (
+        lambda plc_id, workorder, timestamp: starts.append(
+            (plc_id, workorder, timestamp)
+        )
+    )
+
+    snap7.util.set_bool(client.memory, 0, 0, False)
+    service.poll_once()
+    snap7.util.set_bool(client.memory, 0, 0, True)
+    service.poll_once()
+    service.poll_once()
+
+    assert len(starts) == 1
+    assert starts[0][:2] == (22, {})
+    assert type(starts[0][2]) is int
+
+
+def test_rising_edge_samples_once_before_workorder_and_forwards_timestamp():
+    events = []
+    samples = iter((987_654_321,))
+
+    def monotonic_ns():
+        events.append("sample")
+        return next(samples)
+
+    service, client, _bus = _build_service(
+        offsets={"start_signal_offset": "0.0"},
+        auto_reset_bit=False,
+    )
+    service._monotonic_ns = monotonic_ns
+    service._emit_plc_workorder = lambda: events.append("workorder") or {
+        "sn": "SN-1"
+    }
+    service._on_start_requested = (
+        lambda plc_id, workorder, trigger_monotonic_ns: events.append(
+            ("callback", plc_id, workorder, trigger_monotonic_ns)
+        )
+    )
+
+    snap7.util.set_bool(client.memory, 0, 0, False)
+    service.poll_once()
+    snap7.util.set_bool(client.memory, 0, 0, True)
+    service.poll_once()
+
+    assert events == [
+        "sample",
+        "workorder",
+        ("callback", 22, {"sn": "SN-1"}, 987_654_321),
+    ]
 
 
 def _set_plc_string(client, offset, maximum_length, value):
@@ -216,7 +497,9 @@ def test_successful_start_signal_reset_makes_immediate_high_read_a_rising_edge()
     )
     starts = []
     service._on_start_requested = (
-        lambda plc_id, workorder: starts.append((plc_id, workorder))
+        lambda plc_id, workorder, timestamp: starts.append(
+            (plc_id, workorder, timestamp)
+        )
     )
     service._last_value = True
 
@@ -224,7 +507,9 @@ def test_successful_start_signal_reset_makes_immediate_high_read_a_rising_edge()
     snap7.util.set_bool(client.memory, 0, 0, True)
     service.poll_once()
 
-    assert starts == [(22, {})]
+    assert len(starts) == 1
+    assert starts[0][:2] == (22, {})
+    assert type(starts[0][2]) is int
 
 
 def test_first_high_read_without_reset_still_does_not_trigger_start():
@@ -469,83 +754,35 @@ def test_absent_workorder_fields_do_not_emit_empty_payload_or_warning():
     assert bus.log.calls == []
 
 
-def test_plc_rising_edges_deliver_fresh_atomic_workorder_snapshots_to_start():
-    bus = EventBus()
-    ingresses = []
-    bus.factory_plc_event.connect(ingresses.append)
-    bus.plc_workorder_changed.connect(
-        lambda payload: payload.update(
-            sn="UI-STALE",
-            model="UI-STALE",
-            rotation_speed=-1,
-        )
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "res_error_code_offset",
+        "res_sn_code_offset",
+        "res_result_offset",
+        "res_score_offset",
+        "res_spl_offset",
+        "res_loudness_offset",
+        "res_vibrate_data_offset",
+        "res_ai_score_offset",
+        "res_finish_signal_offset",
+    ],
+)
+def test_each_field_failure_raises_plc_result_boundary_error(field_name):
+    service, _client, _bus = _build_service(
+        offsets=COMPLETE_PLC_RESULT_OFFSETS
     )
-    services = _make_services((_make_config(101, plc_id=22),))
-    _accept_start(services)
-    services.bus = bus
-    services._start_from_plc = MethodType(ServiceContainer._start_from_plc, services)
-    controller = FactoryModeController(bus, services)
-    controller.set_selection((101,))
-    client = FakeS7Client()
-    service = PlcService(
-        bus,
-        services._start_from_plc,
-        "127.0.0.1",
-        db_number=1002,
-        field_offsets_dict={
-            "start_signal_offset": "0.0",
-            "sn_code_offset": "62.0",
-            "product_model_offset": "90.0",
-            "rotation_speed_offset": "130.0",
-        },
-        plc_id=22,
-    )
-    service.plc_client = client
-    service._last_value = False
-    _set_plc_string(client, 62, 20, "SN-0001")
-    _set_plc_string(client, 90, 20, "MODEL-A")
-    snap7.util.set_int(client.memory, 130, 1450)
-    snap7.util.set_bool(client.memory, 0, 0, True)
+    def fail_selected_field(candidate, value):
+        if candidate == field_name:
+            raise RuntimeError("backend detail must become a boundary error")
+        return True
 
-    service.poll_once()
+    service.write_field_value = fail_selected_field
 
-    first_start = services.test.start.call_args_list[0].args[0]
-    assert first_start["sn"] == "SN-0001"
-    assert first_start["model"] == "MODEL-A"
-    assert first_start["rotation_speed"] == 1450
-    assert type(first_start["rotation_speed"]) is int
-    assert ingresses[0].sn == "SN-0001"
-    assert ingresses[0].model == "MODEL-A"
-    assert ingresses[0].rotation_speed == 1450
-    with pytest.raises(FrozenInstanceError):
-        ingresses[0].sn = "STALE"
+    with pytest.raises(PlcResultBoundaryError) as failure:
+        service.write_result(22, COMPLETE_PLC_RESULT)
 
-    bus.factory_runtime_analyzing_entered.emit(
-        _make_runtime_config_payload(config_id=101, run_id=_run_id_for(101))
-    )
-    bus.factory_runtime_auto_analysis_succeeded.emit(
-        _make_review_payload(
-            displayed_config_id=101,
-            run_id=_run_id_for(101),
-            trigger_source="plc",
-        )
-    )
-    controller.clear_for_next_run()
-    service.poll_once()
-    _set_plc_string(client, 62, 20, "   ")
-    client.read_failures[(90, 2)] = RuntimeError("model unavailable")
-    snap7.util.set_int(client.memory, 130, 1500)
-    snap7.util.set_bool(client.memory, 0, 0, True)
-
-    service.poll_once()
-
-    second_start = services.test.start.call_args_list[1].args[0]
-    assert "sn" not in second_start
-    assert "model" not in second_start
-    assert second_start["rotation_speed"] == 1500
-    assert ingresses[1].sn is None
-    assert ingresses[1].model is None
-    assert ingresses[1].rotation_speed == 1500
+    assert failure.value.field_name == field_name
 
 
 def test_write_testing_state_writes_matching_plc_bool_field():
@@ -560,23 +797,27 @@ def test_write_testing_state_writes_matching_plc_bool_field():
     assert bus.log.calls == []
 
 
-def test_write_testing_state_ignores_different_plc_id():
+def test_write_testing_state_rejects_different_plc_id():
     service, client, bus = _build_service(
         offsets={"res_testing_signal_offset": "8.2"}
     )
 
-    service.write_testing_state(23, True)
+    with pytest.raises(PlcResultBoundaryError) as failure:
+        service.write_testing_state(23, True)
 
+    assert failure.value.field_name == "plc_id"
     assert client.reads == []
     assert client.writes == []
     assert bus.log.calls == []
 
 
-def test_write_testing_state_skips_missing_offset_without_warning():
+def test_write_testing_state_rejects_missing_offset():
     service, client, bus = _build_service()
 
-    service.write_testing_state(22, True)
+    with pytest.raises(PlcResultBoundaryError) as failure:
+        service.write_testing_state(22, True)
 
+    assert failure.value.field_name == "res_testing_signal_offset"
     assert client.reads == []
     assert client.writes == []
     assert bus.log.calls == []
@@ -596,7 +837,7 @@ def test_write_testing_state_repeated_false_writes_are_safe():
     assert bus.log.calls == []
 
 
-def test_disconnected_testing_false_is_replayed_after_reconnect(monkeypatch):
+def test_disconnected_testing_false_is_not_retained_for_reconnect(monkeypatch):
     service, client, _bus = _build_service(
         offsets={"res_testing_signal_offset": "8.2"}
     )
@@ -604,17 +845,19 @@ def test_disconnected_testing_false_is_replayed_after_reconnect(monkeypatch):
     service.plc_client = None
     monkeypatch.setattr(snap7.client, "Client", lambda: client)
 
-    service.write_testing_state(22, False)
+    with pytest.raises(PlcResultBoundaryError) as failure:
+        service.write_testing_state(22, False)
 
+    assert failure.value.field_name == "testing_dispatch"
     assert client.writes == []
 
     service._connect_once()
 
-    assert snap7.util.get_bool(client.memory, 8, 2) is False
-    assert len(client.writes) == 1
+    assert snap7.util.get_bool(client.memory, 8, 2) is True
+    assert client.writes == []
 
 
-def test_transient_testing_state_write_failure_retries_on_poll_without_log_spam():
+def test_transient_testing_state_write_failure_is_not_retried_on_poll():
     service, client, bus = _build_service(
         offsets={
             "start_signal_offset": "0.0",
@@ -626,23 +869,18 @@ def test_transient_testing_state_write_failure_retries_on_poll_without_log_spam(
         RuntimeError("temporary write failure"),
     ]
 
-    service.write_testing_state(22, True)
+    with pytest.raises(PlcResultBoundaryError) as failure:
+        service.write_testing_state(22, True)
     service.poll_once()
     service.poll_once()
 
-    assert snap7.util.get_bool(client.memory, 8, 2) is True
-    assert len(client.writes) == 1
-    testing_errors = [
-        call[0]
-        for call in bus.log.calls
-        if "res_testing_signal_offset" in call[0]
-    ]
-    assert len(testing_errors) == 1
-    assert "PLC 22" in testing_errors[0]
-    assert "temporary write failure" in testing_errors[0]
+    assert failure.value.field_name == "res_testing_signal_offset"
+    assert snap7.util.get_bool(client.memory, 8, 2) is False
+    assert client.writes == []
+    assert bus.log.calls == []
 
 
-def test_later_false_supersedes_undelivered_true(monkeypatch):
+def test_disconnected_testing_attempts_do_not_supersede_or_replay(monkeypatch):
     service, client, _bus = _build_service(
         offsets={"res_testing_signal_offset": "8.2"}
     )
@@ -650,206 +888,170 @@ def test_later_false_supersedes_undelivered_true(monkeypatch):
     service.plc_client = None
     monkeypatch.setattr(snap7.client, "Client", lambda: client)
 
-    service.write_testing_state(22, True)
-    service.write_testing_state(22, False)
+    with pytest.raises(PlcResultBoundaryError):
+        service.write_testing_state(22, True)
+    with pytest.raises(PlcResultBoundaryError):
+        service.write_testing_state(22, False)
     service._connect_once()
 
-    assert snap7.util.get_bool(client.memory, 8, 2) is False
-    assert len(client.writes) == 1
+    assert snap7.util.get_bool(client.memory, 8, 2) is True
+    assert client.writes == []
 
 
-def test_testing_state_reconciliation_is_idempotent_after_success():
+def test_testing_state_has_no_retained_delivery_state():
     service, client, _bus = _build_service(
         offsets={"res_testing_signal_offset": "8.2"}
     )
 
     service.write_testing_state(22, True)
-    service._reconcile_testing_state()
-    service._reconcile_testing_state()
 
     assert snap7.util.get_bool(client.memory, 8, 2) is True
     assert len(client.writes) == 1
+    assert not hasattr(service, "_pending_testing_state")
+    assert not hasattr(service, "_reconcile_testing_state")
 
 
-def test_test_manager_result_payload_writes_int_error_and_later_plc_fields():
+def test_complete_physical_result_writes_exact_types_and_offsets():
     service, client, _bus = _build_service(
-        offsets={
-            "res_error_code_offset": "10.0",
-            "res_result_offset": "12.0",
-            "res_finish_signal_offset": "12.1",
-            "res_score_offset": "14.0",
-        }
+        offsets=COMPLETE_PLC_RESULT_OFFSETS
     )
-    session = SimpleNamespace(_workorder={"sn": "SN-0001"})
-    review_payload = SimpleNamespace(
-        summary_payload={
-            "overall_status": "pass",
-            "rows": [
-                {
-                    "item_key": "stft_score",
-                    "actual_value": 91.5,
-                }
-            ],
-        },
-        judgment_payload={"channel_results": []},
-        chart_payload={},
-    )
-    payload = TestManager._make_plc_test_result_payload(
-        session,
-        review_payload,
-    )
+    client.memory[40] = 20
 
-    service.last_write_test_result_to_plc(22, payload)
+    service.write_result(22, COMPLETE_PLC_RESULT)
 
-    assert payload["error_code"] == 0
-    assert type(payload["error_code"]) is int
-    assert snap7.util.get_int(client.memory, 10) == 0
-    assert snap7.util.get_bool(client.memory, 12, 0) is True
+    assert snap7.util.get_int(client.memory, 10) == 3
+    assert client.memory[40:49] == bytes([20, 7]) + b"SN-0001"
+    assert snap7.util.get_bool(client.memory, 12, 0) is False
     assert math.isclose(snap7.util.get_real(client.memory, 14), 91.5)
-    assert snap7.util.get_bool(client.memory, 12, 1) is True
+    assert math.isclose(snap7.util.get_real(client.memory, 18), 62.25)
+    assert math.isclose(snap7.util.get_real(client.memory, 22), 4.5)
+    assert math.isclose(snap7.util.get_real(client.memory, 26), 0.125)
+    assert math.isclose(snap7.util.get_real(client.memory, 30), 88.75)
+    assert snap7.util.get_bool(client.memory, 8, 1) is True
+    assert [start for _db, start, _data in client.writes] == [
+        10,
+        40,
+        12,
+        14,
+        18,
+        22,
+        26,
+        30,
+        8,
+    ]
+
+
+def test_default_result_offsets_skip_omitted_sn_and_write_finish_last():
+    service, client, bus = _build_service(
+        offsets=PLC_NEW_RECORD_DEFAULT_OFFSETS
+    )
+
+    service.write_result(22, COMPLETE_PLC_RESULT)
+
     assert [start for _db, start, _data in client.writes] == [
         10,
         12,
         14,
-        12,
-    ]
-
-
-def test_result_callback_writes_configured_fields_in_protocol_order():
-    service, client, bus = _build_service(
-        offsets={
-            "res_testing_signal_offset": "8.2",
-            "res_error_code_offset": "10.0",
-            "res_sn_code_offset": "20.0",
-            "res_result_offset": "40.0",
-            "res_score_offset": "44.0",
-            "res_finish_signal_offset": "48.0",
-        }
-    )
-    client.memory[20] = 15
-
-    service.last_write_test_result_to_plc(
+        18,
         22,
-        {
-            "finished": True,
-            "error_code": 0,
-            "sn_code": "SN-0001",
-            "test_result": True,
-            "score": 91.5,
-        },
-    )
-
-    assert [start for _db, start, _data in client.writes] == [
+        26,
+        30,
         8,
-        10,
-        20,
-        40,
-        44,
-        48,
     ]
-    assert snap7.util.get_bool(client.memory, 8, 2) is False
-    assert snap7.util.get_int(client.memory, 10) == 0
-    assert client.memory[20:29] == bytes([15, 7]) + b"SN-0001"
-    assert snap7.util.get_bool(client.memory, 40, 0) is True
-    assert math.isclose(snap7.util.get_real(client.memory, 44), 91.5)
-    assert snap7.util.get_bool(client.memory, 48, 0) is True
-    assert not any("offset" in call[0].lower() for call in bus.log.calls)
+    assert snap7.util.get_bool(client.memory, 8, 1) is True
+    assert bus.log.calls == []
 
 
-def test_result_callback_uses_protocol_result_payload_keys(monkeypatch):
+def test_result_writer_does_not_write_testing_state():
     service, client, bus = _build_service(
         offsets={
-            "res_score_offset": "44.0",
-            "res_finish_signal_offset": "48.0",
-        }
-    )
-    score_spec = replace(
-        PLC_FIELD_BY_KEY["res_score_offset"],
-        result_payload_key="metadata_score",
-    )
-    monkeypatch.setattr(
-        plc_service_module,
-        "PLC_RESULT_FIELDS",
-        (score_spec,),
-    )
-
-    service.last_write_test_result_to_plc(
-        22,
-        {
-            "finished": True,
-            "metadata_score": 82.25,
-            "score": "must not be used",
-        },
-    )
-
-    assert math.isclose(snap7.util.get_real(client.memory, 44), 82.25)
-    assert snap7.util.get_bool(client.memory, 48, 0) is True
-    assert bus.log.calls
-
-
-def test_result_callback_stops_before_finish_when_configured_write_fails():
-    service, client, bus = _build_service(
-        offsets={
+            **COMPLETE_PLC_RESULT_OFFSETS,
             "res_testing_signal_offset": "8.2",
-            "res_error_code_offset": "10.0",
-            "res_score_offset": "44.0",
-            "res_finish_signal_offset": "48.0",
-        }
-    )
-    client.write_failures[(44, 4)] = [RuntimeError("score address unavailable")]
-
-    service.last_write_test_result_to_plc(
-        22,
-        {
-            "finished": True,
-            "error_code": 0,
-            "score": 91.5,
         },
     )
+    client.memory[40] = 20
+    snap7.util.set_bool(client.memory, 8, 2, True)
 
-    assert [start for _db, start, _data in client.writes] == [8, 10]
-    assert snap7.util.get_bool(client.memory, 48, 0) is False
-    message = bus.log.calls[-1][0]
-    assert "PLC 22" in message
-    assert "res_score_offset" in message
-    assert "score address unavailable" in message
+    service.write_result(22, COMPLETE_PLC_RESULT)
+
+    assert snap7.util.get_bool(client.memory, 8, 2) is True
+    assert len([write for write in client.writes if write[1] == 8]) == 1
+    assert bus.log.calls == []
+
+
+@pytest.mark.parametrize(
+    ("field_name", "invalid_value"),
+    [
+        ("finished", 1),
+        ("error_code", True),
+        ("sn_code", 7),
+        ("test_result", 1),
+        ("score", 91),
+        ("spl", float("nan")),
+        ("loudness", float("inf")),
+        ("vibrate", "0.1"),
+        ("ai_score", False),
+    ],
+)
+def test_result_writer_rejects_inexact_scalar_types(field_name, invalid_value):
+    service, client, _bus = _build_service(
+        offsets=COMPLETE_PLC_RESULT_OFFSETS
+    )
+    payload = dict(COMPLETE_PLC_RESULT)
+    payload[field_name] = invalid_value
+
+    with pytest.raises(PlcResultBoundaryError) as failure:
+        service.write_result(22, payload)
+
+    assert failure.value.field_name == field_name
+    assert client.writes == []
+
+
+def test_result_writer_stops_before_finish_when_field_write_fails():
+    service, client, bus = _build_service(
+        offsets=COMPLETE_PLC_RESULT_OFFSETS
+    )
+    client.memory[40] = 20
+    client.write_failures[(14, 4)] = [RuntimeError("score address unavailable")]
+
+    with pytest.raises(PlcResultBoundaryError) as failure:
+        service.write_result(22, COMPLETE_PLC_RESULT)
+
+    assert failure.value.field_name == "res_score_offset"
+    assert [start for _db, start, _data in client.writes] == [10, 40, 12]
+    assert snap7.util.get_bool(client.memory, 8, 1) is False
+    assert bus.log.calls == []
 
 
 @pytest.mark.parametrize("error_code", [32768, "0"])
 def test_invalid_error_code_prevents_finish(error_code):
     service, client, bus = _build_service(
-        offsets={
-            "res_error_code_offset": "10.0",
-            "res_finish_signal_offset": "48.0",
-        }
+        offsets=COMPLETE_PLC_RESULT_OFFSETS
     )
+    payload = dict(COMPLETE_PLC_RESULT)
+    payload["error_code"] = error_code
 
-    service.last_write_test_result_to_plc(
-        22,
-        {
-            "finished": True,
-            "error_code": error_code,
-        },
+    with pytest.raises(PlcResultBoundaryError) as failure:
+        service.write_result(22, payload)
+
+    expected_field = (
+        "error_code" if error_code == "0" else "res_error_code_offset"
     )
-
+    assert failure.value.field_name == expected_field
     assert client.writes == []
-    assert snap7.util.get_bool(client.memory, 48, 0) is False
-    assert "res_error_code_offset" in bus.log.calls[-1][0]
+    assert snap7.util.get_bool(client.memory, 8, 1) is False
+    assert bus.log.calls == []
 
 
-def test_result_callback_ignores_different_plc_id():
+def test_result_writer_rejects_different_plc_id():
     service, client, bus = _build_service(
-        offsets={
-            "res_error_code_offset": "10.0",
-            "res_finish_signal_offset": "48.0",
-        }
+        offsets=COMPLETE_PLC_RESULT_OFFSETS
     )
 
-    service.last_write_test_result_to_plc(
-        23,
-        {"finished": True, "error_code": 0},
-    )
+    with pytest.raises(PlcResultBoundaryError) as failure:
+        service.write_result(23, COMPLETE_PLC_RESULT)
 
+    assert failure.value.field_name == "plc_id"
     assert client.reads == []
     assert client.writes == []
     assert bus.log.calls == []

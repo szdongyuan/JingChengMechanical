@@ -220,6 +220,18 @@ class WorkOrderModule(QWidget):
         return tuple(deduped)
 
     def _persist_selected_config_ids(self, selected_config_ids: tuple[int, ...]) -> None:
+        if tuple(self._factory_state.selected_config_ids) != tuple(
+            selected_config_ids
+        ):
+            return
+        if bool(
+            getattr(
+                getattr(self.services, "factory_mode", None),
+                "selection_restart_required",
+                False,
+            )
+        ):
+            return
         selection_settings = getattr(self.services, "factory_selection_settings", None)
         save_selected_config_ids = getattr(selection_settings, "save_selected_config_ids", None)
         error_message = None

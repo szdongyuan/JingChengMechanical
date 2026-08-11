@@ -18,6 +18,7 @@ from typing import Any
 import numpy as np
 from scipy.io import wavfile
 
+from app.service.analysis import dsp
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.judgment import JudgmentEngine, _runtime_channel_defaults
 from app.service.analysis.live_display_dispatcher import LiveDisplayDispatcher
@@ -123,6 +124,8 @@ class TestSession:
             pipelines=self._pipelines,
             bus=self._bus,
             config_id=self.config_id,
+            coalesce_pending=True,
+            stft_emit_interval_sec=0.05,
         )
 
     def set_live_loudness_channel_index(self, channel_index: int | None):
@@ -816,14 +819,10 @@ class TestSession:
         return self._get_or_create_test_run_id()
 
     def _get_sensitivity(self, channel_index: int) -> float:
-        """Get mic sensitivity (Pa/V) for a channel from mic_cal."""
-        key = f"In{channel_index + 1}"
-        entry = self._mic_cal.get(key, {})
-        raw = entry.get("deviation_value", "0")
-        try:
-            return float(raw)
-        except (ValueError, TypeError):
-            return 0.0
+        return dsp.mic_sensitivity_from_calibration(
+            self._mic_cal,
+            channel_index,
+        )
 
     @property
     def last_result(self) -> JudgmentResult | None:

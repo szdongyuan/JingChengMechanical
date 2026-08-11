@@ -40,7 +40,9 @@ def _build_service(*, field_offsets, client, starts):
     bus = _BusStub()
     service = PlcService(
         bus,
-        lambda plc_id, workorder: starts.append((plc_id, workorder)),
+        lambda plc_id, workorder, _trigger_ns: starts.append(
+            (plc_id, workorder)
+        ),
         "127.0.0.1",
         db_number=3,
         auto_reset_bit=False,

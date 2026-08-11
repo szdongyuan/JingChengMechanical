@@ -99,7 +99,49 @@ class TestAudioMonitorFeed:
 
         np.testing.assert_allclose(
             out[:, 0],
-            [min(0.75 * (10 ** (6 / 20)), 1.0), 1.0],
+            [0.0, 1.0],
+        )
+
+    def test_feed_applies_one_continuous_50ms_fade_across_chunks(self):
+        mon = AudioMonitor(
+            device_name="TestSpeaker",
+            hostapi="TestAPI",
+            sample_rate=100.0,
+            monitor_channel=0,
+            prebuffer_seconds=0.0,
+            buffer_seconds=1.0,
+        )
+
+        assert mon.feed(np.ones((3, 1), dtype=np.float32)) is True
+        assert mon.feed(np.ones((4, 1), dtype=np.float32)) is True
+        out = np.zeros((7, 1), dtype=np.float32)
+
+        mon._output_callback(out, 7, None, None)
+
+        np.testing.assert_allclose(
+            out[:, 0],
+            np.array([0.0, 0.2, 0.4, 0.6, 0.8, 1.0, 1.0], dtype=np.float32),
+        )
+
+    def test_fade_reset_restarts_from_silence(self):
+        mon = AudioMonitor(
+            device_name="TestSpeaker",
+            hostapi="TestAPI",
+            sample_rate=100.0,
+            monitor_channel=0,
+            prebuffer_seconds=0.0,
+            buffer_seconds=1.0,
+        )
+        assert mon.feed(np.ones((5, 1), dtype=np.float32)) is True
+        mon._reset_fade_in()
+
+        assert mon.feed(np.ones((2, 1), dtype=np.float32)) is True
+        out = np.zeros((7, 1), dtype=np.float32)
+        mon._output_callback(out, 7, None, None)
+
+        np.testing.assert_allclose(
+            out[:, 0],
+            np.array([0.0, 0.2, 0.4, 0.6, 0.8, 0.0, 0.2], dtype=np.float32),
         )
 
     def test_callback_emits_silence_until_prebuffer_target_reached(self):
@@ -133,7 +175,7 @@ class TestAudioMonitorFeed:
 
         mon._output_callback(out, 2, None, None)
 
-        np.testing.assert_array_equal(out[:, 0], np.array([0.1, 0.2], dtype=np.float32))
+        np.testing.assert_array_equal(out[:, 0], np.array([0.0, 0.2], dtype=np.float32))
         assert mon._playback_buffer.buffered_frames() == 1
 
     def test_underrun_fills_remaining_frames_and_emits_throttled_error(self):
@@ -153,7 +195,7 @@ class TestAudioMonitorFeed:
         mon._output_callback(out, 3, None, None)
         mon._output_callback(np.zeros((3, 1), dtype=np.float32), 3, None, None)
 
-        np.testing.assert_array_equal(out[:, 0], np.array([0.5, 0.0, 0.0], dtype=np.float32))
+        np.testing.assert_array_equal(out[:, 0], np.array([0.0, 0.0, 0.0], dtype=np.float32))
         assert len(errors) == 1
         assert "underrun" in errors[0].lower()
 

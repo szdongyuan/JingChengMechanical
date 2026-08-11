@@ -1930,14 +1930,10 @@ def _buffer_column_for_channel(
 
 
 def _mic_sensitivity(mic_cal: dict, channel_index: int) -> float:
-    if not isinstance(mic_cal, dict):
-        return 0.0
-    entry = mic_cal.get(f"In{channel_index + 1}", {})
-    raw = entry.get("deviation_value", "0")
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return 0.0
+    return dsp.mic_sensitivity_from_calibration(
+        mic_cal,
+        channel_index,
+    )
 
 
 def _build_golden_bundle_loader(

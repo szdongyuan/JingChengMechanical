@@ -24,11 +24,12 @@ from model.test_config_table import TestConfigTable
 
 if TYPE_CHECKING:
     from app.service.ai_service import AiService
-    from app.service.config_service import ConfigService
+from app.service.config_service import ConfigService
+from app.service.fault_types import normalize_fault_types
 
 
 FORMAT = "jingcheng-config-package"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 MAX_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
 MAX_FILE_COUNT = 50_000
 MAX_NORMALIZED_PATH_LENGTH_WINDOWS = 240
@@ -142,6 +143,12 @@ class ConfigPackageService:
             raise ValueError("include_ai_package requires include_ai_toolchain")
 
         config_payload = self._config_service.load_config(config_id)
+        if "fault_types" not in config_payload:
+            raise ValueError("config payload is missing fault_types")
+        config_payload = dict(config_payload)
+        config_payload["fault_types"] = normalize_fault_types(
+            config_payload["fault_types"]
+        )
         ai_binding = self._serialize_ai_binding(self._ai_service.resolve_binding(config_id))
         package_payload = {
             "config": config_payload,
@@ -976,7 +983,7 @@ class ConfigPackageService:
     ) -> None:
         for entry_name in file_entries:
             if entry_name.startswith("config/") and entry_name != _CONFIG_ENTRY:
-                raise ValueError("Version 1 is a single-config package format")
+                raise ValueError("Version 2 is a single-config package format")
 
         has_golden_files = any(self._is_under(entry_name, _GOLDEN_PREFIX) for entry_name in file_entries)
         if contents["golden_samples"] and not has_golden_files:
@@ -1007,9 +1014,18 @@ class ConfigPackageService:
         contents: dict[str, bool],
         file_entries: dict[str, zipfile.ZipInfo],
     ) -> None:
+        if not isinstance(config_payload, dict):
+            raise ValueError("config/config.json must contain an object")
         config_root = config_payload.get("config")
         if not isinstance(config_root, dict):
             raise ValueError("config/config.json must contain a config object")
+        if "fault_types" not in config_root:
+            raise ValueError("config/config.json config is missing fault_types")
+        if type(config_root["fault_types"]) is not list:
+            raise ValueError("config/config.json fault_types must be a list")
+        config_root["fault_types"] = normalize_fault_types(
+            config_root["fault_types"]
+        )
 
         golden_assets = config_payload.get("golden_sample_assets", {})
         if golden_assets is None:

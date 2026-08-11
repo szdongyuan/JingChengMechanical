@@ -120,6 +120,11 @@ class ChannelSelectModule(QWidget):
             return
         channel["is_selected"] = 1 if checked else 0
         mic_cal[channel_name] = channel
-        self.services.hss_service.save_input_hardware_calibration(
+        saved = self.services.hss_service.save_input_hardware_calibration(
             self._selected_hardware_id, mic_cal
         )
+        if saved:
+            self.services.bus.status.emit(
+                "输入通道设置已保存；新配置立即可见，"
+                "当前已准备的生产配置需重启软件后重新加载。"
+            )

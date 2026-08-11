@@ -254,9 +254,16 @@ class _SelectionSettingsStub:
         save_results: list[str | None] | None = None,
     ):
         self._saved_selected_ids = tuple(saved_selected_ids)
+        self._pending_selected_ids: tuple[int, ...] | None = None
         self._save_results = list(save_results or [])
         self.save_selected_config_ids = MagicMock(side_effect=self._save)
         self.load_selected_config_ids = MagicMock(side_effect=self._load)
+        self.save_pending_selected_config_ids = MagicMock(
+            side_effect=self._save_pending
+        )
+        self.load_pending_selected_config_ids = MagicMock(
+            side_effect=lambda: self._pending_selected_ids
+        )
 
     def _load(self) -> tuple[int, ...]:
         return self._saved_selected_ids
@@ -269,6 +276,10 @@ class _SelectionSettingsStub:
         if result is None:
             self._saved_selected_ids = tuple(config_ids)
         return result
+
+    def _save_pending(self, config_ids: tuple[int, ...]) -> str | None:
+        self._pending_selected_ids = tuple(config_ids)
+        return None
 
 
 def _accept_start(services):

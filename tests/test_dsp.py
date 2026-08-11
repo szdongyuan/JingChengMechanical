@@ -80,9 +80,9 @@ def _reduced_zwtv_reference_fixture(name: str) -> tuple[np.ndarray, float, float
         levels = np.where(times < duration_sec / 2.0, 60.0, 94.0)
         return _tone_with_level_envelope(levels, sample_rate), sample_rate, 0.5
     if name == "30ms-pulse":
-        return _pulse_fixture(sample_rate=sample_rate, duration_sec=duration_sec, pulse_sec=0.030), sample_rate, 1.0
+        return _pulse_fixture(sample_rate=sample_rate, duration_sec=duration_sec, pulse_sec=0.030), sample_rate, 1.25
     if name == "100ms-pulse":
-        return _pulse_fixture(sample_rate=sample_rate, duration_sec=duration_sec, pulse_sec=0.100), sample_rate, 1.0
+        return _pulse_fixture(sample_rate=sample_rate, duration_sec=duration_sec, pulse_sec=0.100), sample_rate, 1.25
     raise AssertionError(f"unknown fixture {name}")
 
 
@@ -613,7 +613,7 @@ class TestLoudnessHelpers:
     def test_phon_to_sone_clamps_negative_inverse_to_zero(self):
         assert phon_to_sone(0.0) == pytest.approx(0.0)
 
-    def test_compute_loudness_trace_returns_reduced_zwtv_internal_150hz(self):
+    def test_compute_loudness_trace_returns_reduced_zwtv_internal_75hz(self):
         signal, sample_rate = _stable_calibrator_signal(
             sample_rate=48000.0,
             duration_sec=1.0,
@@ -623,10 +623,10 @@ class TestLoudnessHelpers:
 
         values = np.asarray(values_sone, dtype=np.float64)
         assert times_sec[0] == pytest.approx(0.0)
-        assert len(times_sec) == 151
-        assert len(values_sone) == 151
+        assert len(times_sec) == 76
+        assert len(values_sone) == 76
         assert times_sec[-1] == pytest.approx(1.0)
-        np.testing.assert_allclose(np.diff(times_sec), 1.0 / 150.0, rtol=0.0, atol=1e-12)
+        np.testing.assert_allclose(np.diff(times_sec), 1.0 / 75.0, rtol=0.0, atol=1e-12)
         assert np.all(np.isfinite(values))
         assert np.all(values >= 0.0)
         assert max_sone == pytest.approx(max(values_sone))
@@ -655,7 +655,7 @@ class TestLoudnessHelpers:
 
         assert times_sec[0] == pytest.approx(0.0)
         assert times_sec[-1] == pytest.approx(0.2)
-        np.testing.assert_allclose(np.diff(times_sec), 1.0 / 150.0, rtol=0.0, atol=1e-12)
+        np.testing.assert_allclose(np.diff(times_sec), 1.0 / 75.0, rtol=0.0, atol=1e-12)
         assert dsp_module.sone_to_phon(values_sone[0]) > 90.0
         assert values_sone[0] > sliced_values_sone[0] * 100.0
         assert max_sone == pytest.approx(max(values_sone))
@@ -702,8 +702,8 @@ class TestLoudnessHelpers:
 
         loudness_times, values_sone, max_sone = compute_loudness_trace(signal, sample_rate)
 
-        assert len(loudness_times) == 151
-        assert len(values_sone) == 151
+        assert len(loudness_times) == 76
+        assert len(values_sone) == 76
         assert loudness_times[0] == pytest.approx(0.0)
         assert loudness_times[-1] == pytest.approx(1.0)
         assert max_sone >= 0.0
@@ -765,16 +765,16 @@ def test_compute_loudness_trace_non_exact_duration_stays_within_signal_end(monke
 
     times_sec, values_sone, max_sone = compute_loudness_trace(signal, 48000.0)
 
-    assert len(times_sec) == 151
-    assert len(values_sone) == 151
+    assert len(times_sec) == 76
+    assert len(values_sone) == 76
     assert times_sec[-1] == pytest.approx(1.0)
     assert times_sec[-1] <= signal.size / 48000.0
     assert max_sone == pytest.approx(1.0)
 
 
-def test_downsample_loudness_trace_for_display_selects_every_sixth_internal_sample():
-    times = (np.arange(151, dtype=np.float64) / 150.0).tolist()
-    values = np.arange(151, dtype=np.float64).tolist()
+def test_downsample_loudness_trace_for_display_selects_every_third_internal_sample():
+    times = (np.arange(76, dtype=np.float64) / 75.0).tolist()
+    values = np.arange(76, dtype=np.float64).tolist()
 
     display_times, display_values = dsp_module.downsample_loudness_trace_for_display(
         times,
@@ -784,8 +784,8 @@ def test_downsample_loudness_trace_for_display_selects_every_sixth_internal_samp
     assert len(display_times) == 26
     assert display_times[0] == pytest.approx(0.0)
     assert display_times[-1] == pytest.approx(1.0)
-    assert display_times == pytest.approx(times[::6])
-    assert display_values == pytest.approx(values[::6])
+    assert display_times == pytest.approx(times[::3])
+    assert display_values == pytest.approx(values[::3])
 
 
 @pytest.mark.parametrize(
@@ -867,16 +867,16 @@ def test_compute_loudness_trace_uses_reduced_zwtv_core(monkeypatch):
 
     times_sec, values_sone, max_sone = compute_loudness_trace(signal, 48000.0)
 
-    assert len(times_sec) == 113
+    assert len(times_sec) == 57
     assert times_sec[0] == pytest.approx(0.0)
-    assert times_sec[-1] == pytest.approx(112 / 150.0)
+    assert times_sec[-1] == pytest.approx(56 / 75.0)
     assert values_sone[0] == pytest.approx(1.0)
-    assert values_sone[-1] == pytest.approx(113.0)
-    assert max_sone == pytest.approx(113.0)
+    assert values_sone[-1] == pytest.approx(57.0)
+    assert max_sone == pytest.approx(57.0)
     assert calls["reduced_zwtv"] == {
         "input_size": 36000,
         "sample_rate": 48000.0,
-        "target_count": 113,
+        "target_count": 57,
     }
 
 
@@ -911,7 +911,7 @@ def test_compute_loudness_trace_passes_through_native_48k_without_resample(monke
     assert calls["reduced_zwtv"] == {
         "input_size": 36000,
         "sample_rate": 48000.0,
-        "target_count": 113,
+        "target_count": 57,
     }
 
 
@@ -948,11 +948,11 @@ def test_compute_loudness_trace_normalizes_non_native_sample_rate_before_backend
     assert calls["reduced_zwtv"] == {
         "input_size": 36000,
         "sample_rate": 48000.0,
-        "target_count": 113,
+        "target_count": 57,
     }
 
 
-def test_compute_loudness_trace_uses_integer_150hz_time_axis(monkeypatch):
+def test_compute_loudness_trace_uses_integer_75hz_time_axis(monkeypatch):
     calls = {}
 
     def fake_reduced_zwtv(_values, _backend_sample_rate, target_times):
@@ -969,13 +969,13 @@ def test_compute_loudness_trace_uses_integer_150hz_time_axis(monkeypatch):
     signal = np.ones(int(48000 * 1.1), dtype=np.float64)
     times_sec, values_sone, _max_sone = compute_loudness_trace(signal, 48000.0)
 
-    assert len(times_sec) == 166
+    assert len(times_sec) == 83
     assert times_sec[0] == pytest.approx(0.0)
-    assert times_sec[-1] == pytest.approx(1.1)
-    np.testing.assert_allclose(np.diff(times_sec), 1.0 / 150.0, rtol=0.0, atol=1e-12)
+    assert times_sec[-1] == pytest.approx(82 / 75.0)
+    np.testing.assert_allclose(np.diff(times_sec), 1.0 / 75.0, rtol=0.0, atol=1e-12)
     np.testing.assert_allclose(calls["target_times"], times_sec, rtol=0.0, atol=0.0)
     assert values_sone[0] == pytest.approx(1.0)
-    assert values_sone[-1] == pytest.approx(166.0)
+    assert values_sone[-1] == pytest.approx(83.0)
 
 
 def test_compute_loudness_trace_rejects_non_finite_backend_output(monkeypatch):
@@ -1140,7 +1140,7 @@ def test_compute_loudness_trace_four_channel_five_second_performance():
     elapsed = time.perf_counter() - start
 
     assert all(trace[1] for trace in traces)
-    assert all(len(trace[0]) == 751 for trace in traces)
+    assert all(len(trace[0]) == 376 for trace in traces)
     assert elapsed >= 0.0
 
 

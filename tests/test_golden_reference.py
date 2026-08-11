@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -9,8 +10,10 @@ from scipy.io import wavfile
 
 from app.service.analysis import golden_reference as golden_reference_module
 from app.service.analysis.golden_reference import (
+    FrozenGoldenArtifact,
     GoldenReferenceCache,
     GoldenReferenceError,
+    freeze_golden_artifact,
 )
 from app.service.golden_sample_service import GoldenSampleService
 
@@ -46,6 +49,29 @@ def _binding(
         "golden_sample_sample_rate": sample_rate,
         "golden_sample_num_samples": num_samples,
     }
+
+
+def _frozen_binding(path: Path, *, sample_rate: int = 8_000) -> dict:
+    return {
+        "golden_sample_path": str(path),
+        "golden_sample_source_channel": 3,
+        "golden_sample_start_sample": 0,
+        "golden_sample_num_samples": sample_rate,
+        "golden_sample_start_ms": 0,
+        "golden_sample_duration_ms": 1000,
+        "golden_sample_sample_rate": float(sample_rate),
+    }
+
+
+def _freeze_one_second_artifact(path: Path) -> FrozenGoldenArtifact:
+    return freeze_golden_artifact(
+        config_id=1,
+        channel_index=0,
+        channel_config=_frozen_binding(path),
+        runtime_sample_rate=8_000.0,
+        analysis_duration=1.0,
+        managed_root=str(path.parent),
+    )
 
 
 def test_bundle_for_channel_loads_managed_mono_wav_and_applies_mic_calibration(
@@ -436,3 +462,134 @@ def test_cache_reuses_loaded_bundles_and_derived_metrics(
         (48_000.0, 8192, "Z"),
     ]
     assert octave_calls == [(48_000.0, "A")]
+
+
+def test_freeze_golden_artifact_rejects_truncated_wav(tmp_path):
+    root = tmp_path / "managed"
+    root.mkdir()
+    path = root / "truncated.wav"
+    wavfile.write(path, 8_000, np.ones(8_000, dtype=np.int16))
+    path.write_bytes(path.read_bytes()[:-2])
+
+    with pytest.raises(GoldenReferenceError):
+        _freeze_one_second_artifact(path)
+
+
+def test_freeze_golden_artifact_rejects_decoder_warning(tmp_path, monkeypatch):
+    root = tmp_path / "managed"
+    root.mkdir()
+    path = root / "warning.wav"
+    wavfile.write(path, 8_000, np.ones(8_000, dtype=np.int16))
+    real_read = golden_reference_module.wavfile.read
+
+    def warning_read(source):
+        warnings.warn("decoder warning", UserWarning)
+        return real_read(source)
+
+    monkeypatch.setattr(
+        golden_reference_module.wavfile,
+        "read",
+        warning_read,
+    )
+
+    with pytest.raises(GoldenReferenceError):
+        _freeze_one_second_artifact(path)
+
+
+@pytest.mark.parametrize(
+    ("decoded_rate", "decoded"),
+    (
+        (16_000, np.ones(8_000, dtype=np.int16)),
+        (8_000, np.ones((8_000, 1), dtype=np.int16)),
+        (8_000, np.ones(8_000, dtype=np.float32)),
+        (8_000, np.ones(8_000, dtype=np.int32)),
+        (8_000, np.ones(7_999, dtype=np.int16)),
+    ),
+    ids=(
+        "sample-rate",
+        "mono-shape",
+        "integer-pcm-dtype",
+        "sample-width-dtype",
+        "sample-count",
+    ),
+)
+def test_freeze_golden_artifact_requires_exact_header_and_decoded_facts(
+    tmp_path,
+    monkeypatch,
+    decoded_rate,
+    decoded,
+):
+    root = tmp_path / "managed"
+    root.mkdir()
+    path = root / "facts.wav"
+    wavfile.write(path, 8_000, np.ones(8_000, dtype=np.int16))
+    monkeypatch.setattr(
+        golden_reference_module.wavfile,
+        "read",
+        lambda _source: (decoded_rate, decoded),
+    )
+
+    with pytest.raises(GoldenReferenceError):
+        _freeze_one_second_artifact(path)
+
+
+def test_freeze_golden_artifact_rejects_decoder_eof(tmp_path, monkeypatch):
+    root = tmp_path / "managed"
+    root.mkdir()
+    path = root / "eof.wav"
+    wavfile.write(path, 8_000, np.ones(8_000, dtype=np.int16))
+    monkeypatch.setattr(
+        golden_reference_module.wavfile,
+        "read",
+        lambda _source: (_ for _ in ()).throw(EOFError("decoder EOF")),
+    )
+
+    with pytest.raises(GoldenReferenceError):
+        _freeze_one_second_artifact(path)
+
+
+def test_frozen_bundle_rehashes_bytes_without_reopening_path(tmp_path, monkeypatch):
+    import numpy as np
+    from scipy.io import wavfile
+
+    from app.service.analysis.golden_reference import (
+        FrozenGoldenArtifact,
+        GoldenReferenceCache,
+        freeze_golden_artifact,
+    )
+
+    root = tmp_path / "managed"
+    root.mkdir()
+    path = root / "committed.wav"
+    wavfile.write(path, 8_000, np.zeros(8_000, dtype=np.int16))
+    artifact = freeze_golden_artifact(
+        config_id=1,
+        channel_index=0,
+        channel_config={
+            "golden_sample_path": str(path),
+            "golden_sample_source_channel": 0,
+            "golden_sample_start_sample": 0,
+            "golden_sample_num_samples": 8_000,
+            "golden_sample_start_ms": 0,
+            "golden_sample_duration_ms": 1000,
+            "golden_sample_sample_rate": 8_000.0,
+        },
+        runtime_sample_rate=8_000.0,
+        analysis_duration=1.0,
+        managed_root=str(root),
+    )
+    assert type(artifact) is FrozenGoldenArtifact
+    monkeypatch.setattr(
+        "app.service.analysis.golden_reference._read_wav",
+        lambda *_: pytest.fail("runtime path reopen"),
+    )
+    bundle = GoldenReferenceCache().bundle_for_channel(
+        channel_index=0,
+        channel_config={"_frozen_golden_artifact": artifact},
+        configured_input_sample_rate=8_000.0,
+        runtime_sample_rate=8_000.0,
+        mic_sensitivity=0.0,
+        allow_runtime_resample=False,
+    )
+    assert bundle.sample_rate == 8_000.0
+    assert artifact.rehash() == artifact.sha256

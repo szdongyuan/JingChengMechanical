@@ -875,7 +875,7 @@ class TestTestSessionProcessing:
         created_dispatchers = []
 
         class FakeLiveDisplayDispatcher(_CapturingLiveDisplayDispatcher):
-            def __init__(self, *, pipelines, bus, config_id):
+            def __init__(self, *, pipelines, bus, config_id, **_kwargs):
                 super().__init__()
                 self.pipelines = pipelines
                 self.bus = bus
@@ -923,7 +923,7 @@ class TestTestSessionProcessing:
         created_dispatchers = []
 
         class FakeLiveDisplayDispatcher(_CapturingLiveDisplayDispatcher):
-            def __init__(self, *, pipelines, bus, config_id):
+            def __init__(self, *, pipelines, bus, config_id, **_kwargs):
                 super().__init__()
                 self.pipelines = pipelines
                 self.bus = bus

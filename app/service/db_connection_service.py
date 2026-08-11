@@ -29,7 +29,7 @@ class DbConnectionService:
             "test_config_ai_binding_table",
             "ai_execution_table",
             "device_table",
-            "input_hardware_table",
+            "managed_audio_input_table",
             "audio_data_table",
             "users_table",
             "system_info_table",
@@ -59,6 +59,7 @@ class DbConnectionService:
     )
     _REQUIRED_TEST_CONFIG_COLUMNS = frozenset(
         {
+            "fault_types_json",
             "vibration_view_channel_index",
             "input_hardware_device_id",
             "result_dashboard_layout",
@@ -79,15 +80,18 @@ class DbConnectionService:
             "current_meter_timeout_ms",
         }
     )
-    _REQUIRED_INPUT_HARDWARE_COLUMNS = frozenset(
+    _REQUIRED_MANAGED_AUDIO_INPUT_COLUMNS = frozenset(
         {
             "hardware_id",
             "alias",
-            "device_name",
-            "hostapi",
-            "samplerate",
-            "channel_count",
-            "mic_cal",
+            "hardware_revision",
+            "stable_backend_uid",
+            "descriptor_device_name",
+            "descriptor_hostapi_name",
+            "descriptor_sample_rate_hz",
+            "descriptor_input_channels",
+            "calibration_revision",
+            "calibration_json",
             "created_time",
             "updated_time",
         }
@@ -229,9 +233,10 @@ class DbConnectionService:
             "test_config_table",
             self._REQUIRED_TEST_CONFIG_COLUMNS,
         )
+        self._ensure_fault_types_column_definition()
         self._ensure_required_table_columns(
-            "input_hardware_table",
-            self._REQUIRED_INPUT_HARDWARE_COLUMNS,
+            "managed_audio_input_table",
+            self._REQUIRED_MANAGED_AUDIO_INPUT_COLUMNS,
         )
         self._ensure_required_table_columns(
             "plc_field_offset_table",
@@ -279,6 +284,24 @@ class DbConnectionService:
                 "Database schema is incomplete: invalid "
                 "historical_metric_cache_table column definitions: "
                 f"{', '.join(invalid_columns)}. "
+                "Copy a prepared database before starting the application."
+            )
+
+    def _ensure_fault_types_column_definition(self) -> None:
+        cursor = db.execute_sql("PRAGMA table_info(test_config_table)")
+        row = next(
+            (candidate for candidate in cursor.fetchall() if candidate[1] == "fault_types_json"),
+            None,
+        )
+        actual = (
+            None
+            if row is None
+            else (row[2].upper(), bool(row[3]), row[4], int(row[5]))
+        )
+        if actual != ("TEXT", True, "'[]'", 0):
+            raise DatabaseStartupError(
+                "Database schema is incomplete: invalid test_config_table "
+                "column definition: fault_types_json. "
                 "Copy a prepared database before starting the application."
             )
 

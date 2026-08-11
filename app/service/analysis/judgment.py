@@ -1008,14 +1008,4 @@ class JudgmentEngine:
 
     @staticmethod
     def _get_sensitivity(mic_cal: dict, channel_index: int) -> float:
-        """Extract mic sensitivity from mic_cal dict.
-
-        mic_cal format: {"In1": {"deviation_value": "0.5", ...}, ...}
-        """
-        key = f"In{channel_index + 1}"
-        entry = mic_cal.get(key, {})
-        raw = entry.get("deviation_value", "0")
-        try:
-            return float(raw)
-        except (ValueError, TypeError):
-            return 0.0
+        return dsp.mic_sensitivity_from_calibration(mic_cal, channel_index)

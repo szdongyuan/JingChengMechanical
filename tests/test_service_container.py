@@ -15,8 +15,48 @@ import pytest
 import app.services_container as mod
 from app.service.factory_selection_settings import FactorySelectionSettings
 from app.service.historical_metric_report_service import HistoricalMetricReportService
-from app.service.analysis.test_manager import TestManager
 from app.services_container import EventBus
+from app.service.run_persistence.database import RunPersistenceDatabase
+from app.service.run_persistence.data_management import RunDataManagementService
+from app.service.run_persistence.export_reader import RunExportReader
+from app.service.run_persistence.prepare_database import (
+    prepare_run_persistence_database,
+)
+from app.service.run_record_export.archive import RunArchiveService
+
+
+class _PreparedOnlyComposition:
+    coordinator = None
+    ingress_open = False
+    streams = (object(),)
+
+    def __init__(self):
+        self.close_calls = 0
+
+    def close(self):
+        self.close_calls += 1
+
+
+class _PreparedOnlyBuilder:
+    def __init__(self):
+        self.prepared = _PreparedOnlyComposition()
+
+    def prepare(self):
+        return self.prepared
+
+
+def _fresh_runtime(tmp_path: Path) -> RunPersistenceDatabase:
+    return RunPersistenceDatabase(
+        prepare_run_persistence_database(tmp_path / "run_v2.db")
+    )
+
+
+def _prepared_only_kwargs(tmp_path: Path) -> dict[str, object]:
+    builder = _PreparedOnlyBuilder()
+    return {
+        "run_persistence_database": _fresh_runtime(tmp_path),
+        "production_composition_builder": builder,
+    }
 
 
 class _ConfigServiceStub:
@@ -75,6 +115,7 @@ def test_services_container_cold_imports_in_subprocess():
 
 def test_service_container_constructs_historical_report_service_without_circular_import(
     monkeypatch,
+    tmp_path,
 ):
     import app.service.factory_mode_controller as factory_mode_controller
 
@@ -104,14 +145,13 @@ def test_service_container_constructs_historical_report_service_without_circular
         lambda *, config_service, ai_service: object(),
     )
     monkeypatch.setattr(mod, "FactorySelectionSettings", lambda: object())
-    monkeypatch.setattr(mod, "TestManager", lambda bus, services: object())
     monkeypatch.setattr(
         factory_mode_controller,
         "FactoryModeController",
-        lambda bus, services: object(),
+        lambda bus, services, **_kwargs: object(),
     )
 
-    services = mod.ServiceContainer()
+    services = mod.ServiceContainer(**_prepared_only_kwargs(tmp_path))
 
     assert isinstance(
         services.historical_metric_report_service,
@@ -133,6 +173,50 @@ def test_service_container_has_config_package_service():
     source = inspect.getsource(mod.ServiceContainer.__post_init__)
     assert "config_package_service" in source
     assert "ConfigPackageService" in source
+
+
+def test_service_container_owns_one_history_store_and_attaches_one_adapter():
+    source = inspect.getsource(mod.ServiceContainer)
+    assert "result_history_store" in source
+    assert "attach_result_dashboard" in source
+    assert "HistoryQtAdapter" in source
+
+
+def test_service_container_wires_one_durable_run_export_reader_and_archive_service(
+    monkeypatch,
+    tmp_path,
+):
+    runtime = RunPersistenceDatabase(
+        prepare_run_persistence_database(tmp_path / "prepared.sqlite3")
+    )
+    monkeypatch.setattr(mod.DbConnectionService, "connect", lambda self: None)
+    monkeypatch.setattr(
+        mod,
+        "HardwareSelectService",
+        MagicMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr(
+        mod,
+        "InputCalibrationService",
+        MagicMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr(
+        mod,
+        "ConfigService",
+        MagicMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr(mod, "AiService", MagicMock(return_value=MagicMock()))
+
+    services = mod.ServiceContainer(run_persistence_database=runtime)
+
+    assert services.run_persistence_database is runtime
+    assert type(services.run_export_reader) is RunExportReader
+    assert services.run_export_reader._runtime is runtime
+    assert type(services.run_archive_service) is RunArchiveService
+    assert services.run_archive_service._reader is services.run_export_reader
+    assert type(services.run_data_management_service) is RunDataManagementService
+    assert services.run_data_management_service._runtime is runtime
+    assert hasattr(EventBus, "run_records_deleted")
 
 
 def test_analysis_signals_exist():
@@ -389,7 +473,6 @@ def test_factory_controller_state_contract_exposes_only_spec_fields():
     assert is_dataclass(state_cls)
     assert [field.name for field in fields(state_cls)] == [
         "selected_config_ids",
-        "active_config_id",
         "displayed_config_id",
         "run_phase",
         "trigger_source",
@@ -519,6 +602,7 @@ def test_factory_review_payload_contract_is_explicit():
     ]
     assert [field.name for field in fields(plc_payload_cls)] == [
         "plc_id",
+        "trigger_monotonic_ns",
         "sn",
         "model",
         "rotation_speed",
@@ -526,7 +610,10 @@ def test_factory_review_payload_contract_is_explicit():
 
     review_window = review_window_cls(start_sec=1.0, end_sec=3.0)
     payload = review_payload_cls(run_id="run-101-1", default_window=review_window)
-    plc_payload = plc_payload_cls(plc_id=12)
+    plc_payload = plc_payload_cls(
+        plc_id=12,
+        trigger_monotonic_ns=123,
+    )
     abort_payload = abort_payload_cls(
         config_id=101,
         run_id="run-101-1",
@@ -539,6 +626,7 @@ def test_factory_review_payload_contract_is_explicit():
     assert review_payload_cls().import_warnings == ()
     assert review_payload_cls().display_channel_labels == {}
     assert plc_payload.plc_id == 12
+    assert plc_payload.trigger_monotonic_ns == 123
     assert plc_payload.sn is None
     assert plc_payload.model is None
     assert plc_payload.rotation_speed is None
@@ -557,21 +645,14 @@ def test_factory_review_payload_exposes_summary_and_chart_payload_fields():
     assert payload.chart_payload is None
 
 
-def test_service_container_uses_test_manager(monkeypatch):
-    monkeypatch.setattr(mod.DbConnectionService, "connect", lambda self: None)
-    monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
-    monkeypatch.setattr(mod, "InputCalibrationService", MagicMock(return_value=MagicMock()))
-    monkeypatch.setattr(mod, "ConfigService", MagicMock(return_value=MagicMock()))
-    monkeypatch.setattr(mod, "AiService", MagicMock(return_value=MagicMock()))
+def test_testmanager_and_self_test_are_absent():
+    source = Path(mod.__file__).read_text(encoding="utf-8")
 
-    services = mod.ServiceContainer()
-
-    assert isinstance(services.test, TestManager)
-    assert services.test._bus is services.bus
-    assert services.test._services is services
+    assert "TestManager" not in source
+    assert "self.test" not in source
 
 
-def test_service_container_owns_factory_mode_controller(monkeypatch):
+def test_service_container_owns_factory_mode_controller(monkeypatch, tmp_path):
     controller_mod = _load_factory_mode_controller_module()
     controller_cls = controller_mod.FactoryModeController
 
@@ -581,7 +662,7 @@ def test_service_container_owns_factory_mode_controller(monkeypatch):
     monkeypatch.setattr(mod, "ConfigService", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(mod, "AiService", MagicMock(return_value=MagicMock()))
 
-    services = mod.ServiceContainer()
+    services = mod.ServiceContainer(**_prepared_only_kwargs(tmp_path))
 
     assert isinstance(services.factory_mode, controller_cls)
     assert services.factory_mode.bus is services.bus
@@ -604,24 +685,85 @@ def test_service_container_exposes_plc_start_hook(monkeypatch):
 
     assert hasattr(services, "_start_from_plc")
 
-    services._start_from_plc(42)
+    services._start_from_plc(42, {}, 123_456)
 
-    assert payloads == [mod.FactoryPlcIngressPayload(plc_id=42)]
+    assert payloads == [
+        mod.FactoryPlcIngressPayload(
+            plc_id=42,
+            trigger_monotonic_ns=123_456,
+        )
+    ]
 
 
-def test_service_container_exposes_factory_selection_settings(monkeypatch):
+def test_submit_scan_is_sole_boundary_and_direct_bus_emit_is_forbidden():
+    samples = []
+    observed = []
+
+    def monotonic_ns():
+        samples.append("sample")
+        return 222_333
+
+    services = object.__new__(mod.ServiceContainer)
+    services.bus = EventBus()
+    services.monotonic_ns = monotonic_ns
+    services.ingress_open = True
+    services.bus.factory_scan_event.connect(observed.append)
+
+    assert services.submit_scan("SN-44") is True
+    assert samples == ["sample"]
+    assert observed == [
+        mod.FactoryScanIngressPayload(
+            scan_text="SN-44",
+            trigger_monotonic_ns=222_333,
+        )
+    ]
+
+    source = Path(mod.__file__).read_text(encoding="utf-8")
+    assert source.count("factory_scan_event.emit(") == 1
+
+
+@pytest.mark.parametrize("invalid_kind", ["missing", "invalid"])
+def test_missing_or_invalid_run_v2_keeps_ingress_closed(
+    monkeypatch,
+    tmp_path,
+    invalid_kind,
+):
+    path = tmp_path / "run_v2.db"
+    if invalid_kind == "invalid":
+        path.write_bytes(b"not sqlite")
+
+    monkeypatch.setattr(mod.DbConnectionService, "connect", lambda self: None)
+    failures = []
+    bus = EventBus()
+    bus.status.connect(failures.append)
+
+    services = mod.ServiceContainer(
+        bus=bus,
+        run_persistence_path=path,
+    )
+
+    assert services.ingress_open is False
+    assert services.startup_failure is not None
+    assert len(failures) == 1
+    assert not path.exists() if invalid_kind == "missing" else path.read_bytes() == b"not sqlite"
+
+
+def test_service_container_exposes_factory_selection_settings(monkeypatch, tmp_path):
     monkeypatch.setattr(mod.DbConnectionService, "connect", lambda self: None)
     monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(mod, "InputCalibrationService", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(mod, "ConfigService", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(mod, "AiService", MagicMock(return_value=MagicMock()))
 
-    services = mod.ServiceContainer()
+    services = mod.ServiceContainer(**_prepared_only_kwargs(tmp_path))
 
     assert isinstance(services.factory_selection_settings, FactorySelectionSettings)
 
 
-def test_service_container_shutdown_stops_ai_before_closing_db(monkeypatch):
+def test_service_container_shutdown_is_cached_and_closes_prepared_graph_before_writers_and_databases(
+    monkeypatch,
+    tmp_path,
+):
     calls = []
     ai_service = MagicMock()
     ai_service.shutdown.side_effect = lambda: calls.append("ai_shutdown")
@@ -633,14 +775,34 @@ def test_service_container_shutdown_stops_ai_before_closing_db(monkeypatch):
     monkeypatch.setattr(mod, "ConfigService", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(mod, "AiService", MagicMock(return_value=ai_service))
 
-    services = mod.ServiceContainer()
+    kwargs = _prepared_only_kwargs(tmp_path)
+    builder = kwargs["production_composition_builder"]
+    builder.prepared.close = lambda: calls.append("prepared_close")
+    runtime = kwargs["run_persistence_database"]
+    original_run_close = runtime.close_after_upstream_stopped
+    runtime.close_after_upstream_stopped = lambda: (
+        calls.append("run_db_close"),
+        original_run_close(),
+    )[-1]
+    services = mod.ServiceContainer(**kwargs)
 
-    services.shutdown()
+    report = services.shutdown()
+    repeated = services.shutdown()
 
-    assert calls == ["ai_shutdown", "db_close"]
+    assert report.clean is True
+    assert repeated is report
+    assert calls == [
+        "prepared_close",
+        "ai_shutdown",
+        "db_close",
+        "run_db_close",
+    ]
 
 
-def test_service_container_shutdown_closes_db_when_ai_shutdown_raises(monkeypatch):
+def test_service_container_shutdown_reports_one_aggregate_notice_when_ai_shutdown_raises(
+    monkeypatch,
+    tmp_path,
+):
     calls = []
     shutdown_error = RuntimeError("resident cleanup failed")
     ai_service = MagicMock()
@@ -658,15 +820,20 @@ def test_service_container_shutdown_closes_db_when_ai_shutdown_raises(monkeypatc
     monkeypatch.setattr(mod, "ConfigService", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(mod, "AiService", MagicMock(return_value=ai_service))
 
-    services = mod.ServiceContainer()
+    services = mod.ServiceContainer(**_prepared_only_kwargs(tmp_path))
 
-    with pytest.raises(RuntimeError, match="resident cleanup failed"):
-        services.shutdown()
+    notices = []
+    services.bus.status.connect(notices.append)
+    report = services.shutdown()
 
+    assert report.clean is False
+    assert report.restart_required is True
     assert calls == ["ai_shutdown", "db_close"]
+    assert len(notices) == 1
+    assert "restart" in notices[0].lower()
 
 
-def test_service_container_wires_config_package_service(monkeypatch):
+def test_service_container_wires_config_package_service(monkeypatch, tmp_path):
     monkeypatch.setattr(mod.DbConnectionService, "connect", lambda self: None)
     monkeypatch.setattr(mod, "HardwareSelectService", MagicMock(return_value=MagicMock()))
     monkeypatch.setattr(mod, "InputCalibrationService", MagicMock(return_value=MagicMock()))
@@ -681,7 +848,7 @@ def test_service_container_wires_config_package_service(monkeypatch):
         MagicMock(return_value=config_package_service),
     )
 
-    services = mod.ServiceContainer()
+    services = mod.ServiceContainer(**_prepared_only_kwargs(tmp_path))
 
     mod.ConfigPackageService.assert_called_once_with(
         config_service=config_service,

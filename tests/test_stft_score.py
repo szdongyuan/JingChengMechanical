@@ -227,7 +227,10 @@ def test_compute_stft_score_payload_always_reports_minimum_summary(
 
 
 def test_stft_score_interpolates_from_internal_loudness_trace_without_display_downsampling(monkeypatch):
-    internal_times = (np.arange(7, dtype=np.float64) / 150.0).tolist()
+    internal_times = (
+        np.arange(7, dtype=np.float64)
+        / stft_score.dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ
+    ).tolist()
     internal_values = [1.0, 10.0, 2.0, 8.0, 3.0, 7.0, 4.0]
     captured = {}
     real_interpolate = stft_score._interpolate_loudness_to_score_times
@@ -236,7 +239,7 @@ def test_stft_score_interpolates_from_internal_loudness_trace_without_display_do
         stft_score.dsp,
         "compute_stft",
         lambda *_args, **_kwargs: (
-            np.array([1.0 / 150.0], dtype=np.float64),
+            np.array([1.0 / stft_score.dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ], dtype=np.float64),
             np.array([60.0], dtype=np.float64),
             np.array([[-120.0]], dtype=np.float64),
         ),
@@ -280,7 +283,10 @@ def test_stft_score_interpolates_from_internal_loudness_trace_without_display_do
 
 
 def test_stft_score_uses_provided_loudness_trace_without_recompute(monkeypatch):
-    internal_times = (np.arange(7, dtype=np.float64) / 150.0).tolist()
+    internal_times = (
+        np.arange(7, dtype=np.float64)
+        / stft_score.dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ
+    ).tolist()
     internal_values = [1.0, 10.0, 2.0, 8.0, 3.0, 7.0, 4.0]
     captured = {}
     real_interpolate = stft_score._interpolate_loudness_to_score_times
@@ -289,7 +295,7 @@ def test_stft_score_uses_provided_loudness_trace_without_recompute(monkeypatch):
         stft_score.dsp,
         "compute_stft",
         lambda *_args, **_kwargs: (
-            np.array([1.0 / 150.0], dtype=np.float64),
+            np.array([1.0 / stft_score.dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ], dtype=np.float64),
             np.array([60.0], dtype=np.float64),
             np.array([[-120.0]], dtype=np.float64),
         ),
@@ -484,8 +490,17 @@ def test_stft_score_accepts_non_grid_aligned_internal_loudness_trace(monkeypatch
     sample_count = int(round(duration_sec * sample_rate))
     assert sample_count / sample_rate == pytest.approx(duration_sec)
     internal_times = (
-        np.arange(int(np.floor(duration_sec * 150.0 + 1e-12)) + 1, dtype=np.float64)
-        / 150.0
+        np.arange(
+            int(
+                np.floor(
+                    duration_sec * stft_score.dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ
+                    + 1e-12
+                )
+            )
+            + 1,
+            dtype=np.float64,
+        )
+        / stft_score.dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ
     )
     internal_values = np.linspace(2.0, 4.0, internal_times.size, dtype=np.float64)
     captured = {}
@@ -533,11 +548,14 @@ def test_stft_score_accepts_non_grid_aligned_internal_loudness_trace(monkeypatch
 
     assert payload is not None
     assert captured["count"] == internal_times.size
-    assert captured["last_time"] == pytest.approx(1.0066666667)
+    assert captured["last_time"] == pytest.approx(1.0)
 
 
 def test_stft_score_rejects_display_loudness_trace_and_falls_back(monkeypatch):
-    fallback_times = (np.arange(7, dtype=np.float64) / 150.0).tolist()
+    fallback_times = (
+        np.arange(7, dtype=np.float64)
+        / stft_score.dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ
+    ).tolist()
     fallback_values = [5.0, 5.5, 6.0, 5.5, 5.0, 4.5, 4.0]
     captured = {}
     real_interpolate = stft_score._interpolate_loudness_to_score_times
@@ -546,7 +564,7 @@ def test_stft_score_rejects_display_loudness_trace_and_falls_back(monkeypatch):
         stft_score.dsp,
         "compute_stft",
         lambda *_args, **_kwargs: (
-            np.array([1.0 / 150.0], dtype=np.float64),
+            np.array([1.0 / stft_score.dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ], dtype=np.float64),
             np.array([60.0], dtype=np.float64),
             np.array([[-120.0]], dtype=np.float64),
         ),
@@ -587,7 +605,10 @@ def test_stft_score_rejects_display_loudness_trace_and_falls_back(monkeypatch):
 def test_stft_score_cached_loudness_trace_matches_recomputed_score(monkeypatch):
     sample_rate = 2000.0
     signal = _tone(sample_rate, 0.5, 60.0, amplitude=0.02)
-    trace_times = np.arange(76, dtype=np.float64) / 150.0
+    trace_times = (
+        np.arange(39, dtype=np.float64)
+        / stft_score.dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ
+    )
     trace_values = 5.0 + 0.5 * np.sin(2.0 * np.pi * 4.0 * trace_times)
     monkeypatch.setattr(
         stft_score.dsp,

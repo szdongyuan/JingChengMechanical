@@ -441,6 +441,84 @@ def test_imported_mapped_stft_channel_uses_configured_fixed_color_scale(qapp):
     assert module.canvas.heatmap.image_levels() == pytest.approx((-70.0, -7.0))
 
 
+def test_terminal_stft_uses_frozen_color_scale_from_review_payload(qapp):
+    module, services = _make_module_with_config(
+        {
+            "config_id": 101,
+            "selected_channels": [0],
+            "channels": [
+                {
+                    "channel_index": 0,
+                    "stft_color_scale_enabled": False,
+                    "stft_color_scale_min_db": -120.0,
+                    "stft_color_scale_max_db": 0.0,
+                }
+            ],
+        }
+    )
+    module.selected_display_channel_provider = lambda: 0
+    review = _make_review_payload(
+        displayed_config_id=101,
+        run_id="run-frozen-levels",
+        chart_payload={
+            0: {
+                "stft": {
+                    "times_sec": [0.25],
+                    "frequencies_hz": [100.0, 200.0],
+                    "magnitude_db": np.asarray([[-30.0], [-20.0]]),
+                    "stft_color_scale_enabled": True,
+                    "stft_color_scale_min_db": -75.0,
+                    "stft_color_scale_max_db": -5.0,
+                }
+            }
+        },
+    )
+
+    _show(module, qapp)
+    _emit_reviewing(module, services, review)
+
+    assert module.canvas.heatmap.image_levels() == pytest.approx((-75.0, -5.0))
+
+
+def test_terminal_stft_frozen_auto_scale_does_not_use_edited_fixed_config(qapp):
+    module, services = _make_module_with_config(
+        {
+            "config_id": 101,
+            "selected_channels": [0],
+            "channels": [
+                {
+                    "channel_index": 0,
+                    "stft_color_scale_enabled": True,
+                    "stft_color_scale_min_db": -90.0,
+                    "stft_color_scale_max_db": -10.0,
+                }
+            ],
+        }
+    )
+    module.selected_display_channel_provider = lambda: 0
+    review = _make_review_payload(
+        displayed_config_id=101,
+        run_id="run-frozen-auto",
+        chart_payload={
+            0: {
+                "stft": {
+                    "times_sec": [0.25],
+                    "frequencies_hz": [100.0, 200.0],
+                    "magnitude_db": np.asarray([[-30.0], [-20.0]]),
+                    "stft_color_scale_enabled": False,
+                    "stft_color_scale_min_db": -120.0,
+                    "stft_color_scale_max_db": 0.0,
+                }
+            }
+        },
+    )
+
+    _show(module, qapp)
+    _emit_reviewing(module, services, review)
+
+    assert module.canvas.heatmap.image_levels() == pytest.approx((-30.0, -20.0))
+
+
 def test_imported_chart_only_stft_channel_uses_auto_color_scale(qapp):
     module, services = _make_module_with_config(
         {

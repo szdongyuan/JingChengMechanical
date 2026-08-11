@@ -1,7 +1,22 @@
 from __future__ import annotations
 
-from PyQt6.QtCore import QTimer
+from datetime import date, datetime, timedelta, timezone
+
+from PyQt6.QtCore import pyqtSlot
 from PyQt6.QtWidgets import QGridLayout, QLabel, QSizePolicy, QWidget
+
+from app.service.multi_run_coordinator_mvp.contracts import (
+    ABSENT,
+    HistoryFactKind,
+    ProjectedHistoryEvent,
+)
+from app.service.run_persistence.contracts import Judgment, RunState
+
+
+_LOCAL_TIMEZONE = timezone(timedelta(hours=8))
+_TERMINAL_STATES = frozenset(
+    state.value for state in RunState if state is not RunState.ACTIVE
+)
 
 
 class TodayStatisticsModule(QWidget):
@@ -32,21 +47,10 @@ class TodayStatisticsModule(QWidget):
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        # 自动分析结果变化 -> 刷新
-        self.services.bus.result_changed.connect(lambda _payload: self.refresh())
-        # 测试完成 -> 刷新
-        self.services.bus.test_finished.connect(
-            lambda _config_id, _payload: self.refresh()
+        self.services.bus.run_records_deleted.connect(
+            self.on_run_records_deleted
         )
-        # 手工 OK/NG 后 -> 刷新
-        self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
         self.refresh()
-
-        # 防止长时间打开页面跨天后数据不刷新。
-        self._timer = QTimer(self)
-        self._timer.setInterval(30_000)
-        self._timer.timeout.connect(self.refresh)
-        self._timer.start()
 
     def _create_value_label(self, color: str = "#2563eb") -> QLabel:
         label = QLabel("0")
@@ -54,19 +58,75 @@ class TodayStatisticsModule(QWidget):
         label.setMinimumWidth(44)
         return label
 
-    def _on_factory_display_reset(self, reason: str) -> None:
-        # 手工判定 OK / NG 会改数据库里的 labels，需要刷新统计。
-        if reason in {"manual_judgment_ok", "manual_judgment_ng"}:
-            self.refresh()
+    def on_committed_history_event(self, event: object) -> None:
+        """Refresh from the post-durable history path's initial terminal event."""
+
+        if (
+            type(event) is not ProjectedHistoryEvent
+            or event.kind is not HistoryFactKind.RUN_TERMINATED
+            or event.expected_revision is ABSENT
+        ):
+            return
+        rows = tuple(self.services.run_export_reader.list_durable())
+        if not any(
+            row.run_id == event.run_id and self._is_terminal_row(row)
+            for row in rows
+        ):
+            return
+        self._refresh_from_rows(rows)
 
     def refresh(self) -> None:
-        # 查询 audio_data_table 中今天的总数、OK 数、NG 数。
-        stats = self.services.audio_data_service.today_statistics()
-        self._set_values(
-            str(stats["total"]),
-            str(stats["ok"]),
-            str(stats["ng"]),
+        self._refresh_from_rows(
+            tuple(self.services.run_export_reader.list_durable())
         )
+
+    @pyqtSlot(object)
+    def on_run_records_deleted(self, report: object) -> None:
+        results = getattr(report, "results", ())
+        if any(
+            getattr(result, "database_committed", False) is True
+            for result in results
+        ):
+            self.refresh()
+
+    def _refresh_from_rows(self, rows: tuple[object, ...]) -> None:
+        today = datetime.now(_LOCAL_TIMEZONE).date()
+        terminal_rows = tuple(
+            row
+            for row in rows
+            if self._is_terminal_row(row)
+            and self._local_terminal_date(row.terminal_at) == today
+        )
+        self._set_values(
+            str(len(terminal_rows)),
+            str(
+                sum(
+                    row.judgment == Judgment.PASS.value
+                    for row in terminal_rows
+                )
+            ),
+            str(
+                sum(
+                    row.judgment == Judgment.FAIL.value
+                    for row in terminal_rows
+                )
+            ),
+        )
+
+    @staticmethod
+    def _is_terminal_row(row: object) -> bool:
+        return (
+            getattr(row, "state", None) in _TERMINAL_STATES
+            and getattr(row, "terminal_at", None) is not None
+        )
+
+    @staticmethod
+    def _local_terminal_date(terminal_at: str) -> date:
+        terminal_utc = datetime.strptime(
+            terminal_at,
+            "%Y-%m-%dT%H:%M:%S.%fZ",
+        ).replace(tzinfo=timezone.utc)
+        return terminal_utc.astimezone(_LOCAL_TIMEZONE).date()
 
     def _set_values(self, total: str, ok: str, ng: str) -> None:
         self.lb_total.setText(total)

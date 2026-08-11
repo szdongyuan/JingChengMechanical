@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import weakref
 from dataclasses import dataclass
 
 from PyQt6.QtCore import QSettings
@@ -29,8 +31,34 @@ class _AuthoritativeSelection:
     commit_slot_key: str | None
 
 
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class _SelectionLease:
+    generation: int
+    config_ids: tuple[int, ...]
+
+
+_SELECTION_LEASE_LOCK = threading.RLock()
+_ACTIVE_SELECTION_LEASE: weakref.ReferenceType[_SelectionLease] | None = None
+PRODUCTION_CONFIG_RESTART_REQUIRED_NOTICE = "配置已变更，请重启软件后生效。"
+PRODUCTION_SELECTION_LEASE_NOTICE = (
+    "当前测试使用的配置选择已固定，暂时无法更改。"
+)
+
+
+def _active_selection_lease() -> _SelectionLease | None:
+    if _ACTIVE_SELECTION_LEASE is None:
+        return None
+    return _ACTIVE_SELECTION_LEASE()
+
+
+def _set_active_selection_lease(lease: _SelectionLease | None) -> None:
+    global _ACTIVE_SELECTION_LEASE
+    _ACTIVE_SELECTION_LEASE = None if lease is None else weakref.ref(lease)
+
+
 class FactorySelectionSettings:
     SETTINGS_KEY = "factory/selected_config_ids"
+    PENDING_SETTINGS_KEY = "factory/pending_selected_config_ids"
     # Alternate data slots keep the prior candidate available during a later write.
     _SLOT_KEYS = (
         "factory/selected_config_ids/slot_a",
@@ -45,6 +73,7 @@ class FactorySelectionSettings:
 
     def __init__(self, settings: QSettings | None = None):
         self._settings = settings
+        self._selection_lease: _SelectionLease | None = None
 
     def _open_settings(self) -> QSettings:
         if self._settings is not None:
@@ -522,7 +551,184 @@ class FactorySelectionSettings:
         settings = self._open_settings()
         return self._load_authoritative_selection(settings).config_ids
 
+    def load_pending_selected_config_ids(self) -> tuple[int, ...] | None:
+        settings = self._open_settings()
+        missing = object()
+        raw_value = settings.value(self.PENDING_SETTINGS_KEY, missing)
+        if raw_value is missing:
+            return None
+
+        try:
+            decoded = json.loads(raw_value)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(decoded, list):
+            return None
+        if any(type(config_id) is not int for config_id in decoded):
+            return None
+        return tuple(decoded)
+
+    def save_pending_selected_config_ids(
+        self,
+        config_ids: tuple[int, ...],
+    ) -> str | None:
+        try:
+            normalized = tuple(config_ids)
+        except TypeError:
+            return "下次启动配置选择无效"
+        if (
+            any(type(config_id) is not int for config_id in normalized)
+            or len(set(normalized)) != len(normalized)
+        ):
+            return "下次启动配置选择无效"
+
+        with _SELECTION_LEASE_LOCK:
+            settings = self._open_settings()
+            verification_settings = self._open_verification_settings()
+            raw_value = json.dumps(list(normalized), separators=(",", ":"))
+            try:
+                settings.setValue(self.PENDING_SETTINGS_KEY, raw_value)
+                settings.sync()
+                status = getattr(settings, "status", None)
+                if (
+                    callable(status)
+                    and status() != QSettings.Status.NoError
+                ):
+                    return "下次启动配置保存失败"
+            except Exception:
+                return "下次启动配置保存失败"
+
+            missing = object()
+            persisted = verification_settings.value(
+                self.PENDING_SETTINGS_KEY,
+                missing,
+            )
+            if persisted is missing:
+                return "下次启动配置保存失败"
+            try:
+                decoded = json.loads(persisted)
+            except (TypeError, ValueError):
+                return "下次启动配置保存失败"
+            if (
+                not isinstance(decoded, list)
+                or any(type(config_id) is not int for config_id in decoded)
+                or tuple(decoded) != normalized
+            ):
+                return "下次启动配置保存失败"
+            return None
+
+    def clear_pending_selected_config_ids(self) -> None:
+        with _SELECTION_LEASE_LOCK:
+            settings = self._open_settings()
+            try:
+                settings.remove(self.PENDING_SETTINGS_KEY)
+                settings.sync()
+            except Exception as exc:
+                raise RuntimeError("下次启动配置清除失败") from exc
+
+    def reconcile_for_startup(
+        self,
+        existing_ids: tuple[int, ...],
+    ) -> tuple[int, ...]:
+        normalized_existing = tuple(existing_ids)
+        if (
+            any(
+                type(config_id) is not int or config_id <= 0
+                for config_id in normalized_existing
+            )
+            or len(set(normalized_existing)) != len(normalized_existing)
+        ):
+            raise ValueError(
+                "existing config IDs must be unique positive integers"
+            )
+
+        with _SELECTION_LEASE_LOCK:
+            authoritative = self.load_selected_config_ids()
+            pending = self.load_pending_selected_config_ids()
+            candidate = authoritative if pending is None else pending
+            existing = set(normalized_existing)
+            seen: set[int] = set()
+            reconciled_ids: list[int] = []
+            for config_id in candidate:
+                if (
+                    type(config_id) is not int
+                    or config_id not in existing
+                    or config_id in seen
+                ):
+                    continue
+                seen.add(config_id)
+                reconciled_ids.append(config_id)
+            reconciled = tuple(reconciled_ids)
+            if not reconciled and normalized_existing:
+                reconciled = (normalized_existing[0],)
+
+            if reconciled != authoritative:
+                error = self._save_selected_config_ids_locked(reconciled)
+                if error is not None:
+                    raise RuntimeError(error)
+
+            self.clear_pending_selected_config_ids()
+            return reconciled
+
+    def load_committed_selection(self) -> tuple[int, tuple[int, ...]]:
+        """Read the committed generation and ordered IDs without bootstrapping."""
+        settings = self._open_settings()
+        committed = self._load_current_committed_selection(settings)
+        if committed is None:
+            raise RuntimeError("No authoritative committed factory selection exists.")
+        return committed.generation, committed.config_ids
+
+    def acquire_selection_lease(
+        self,
+        generation: int,
+        config_ids: tuple[int, ...],
+    ) -> object:
+        with _SELECTION_LEASE_LOCK:
+            submitted = (generation, tuple(config_ids))
+            if submitted != self.load_committed_selection():
+                raise ValueError(
+                    "lease does not match the authoritative selection"
+                )
+            if _active_selection_lease() is not None:
+                raise ValueError("a production selection lease is active")
+            lease = _SelectionLease(*submitted)
+            self._selection_lease = lease
+            _set_active_selection_lease(lease)
+            return lease
+
+    def release_selection_lease(self, lease: object) -> None:
+        with _SELECTION_LEASE_LOCK:
+            if lease is not _active_selection_lease():
+                raise ValueError("selection lease is not active")
+            _set_active_selection_lease(None)
+            if lease is self._selection_lease:
+                self._selection_lease = None
+
     def save_selected_config_ids(self, config_ids: tuple[int, ...]) -> str | None:
+        with _SELECTION_LEASE_LOCK:
+            lease = _active_selection_lease()
+            if lease is not None:
+                normalized = tuple(config_ids)
+                if lease is not self._selection_lease:
+                    return PRODUCTION_SELECTION_LEASE_NOTICE
+                if not normalized:
+                    return "请至少保留一个配置；空选择不会保存。"
+                if (
+                    len(set(normalized)) != len(normalized)
+                    or any(
+                        type(config_id) is not int
+                        or config_id not in lease.config_ids
+                        for config_id in normalized
+                    )
+                ):
+                    return PRODUCTION_SELECTION_LEASE_NOTICE
+                return self._save_selected_config_ids_locked(normalized)
+            return self._save_selected_config_ids_locked(config_ids)
+
+    def _save_selected_config_ids_locked(
+        self,
+        config_ids: tuple[int, ...],
+    ) -> str | None:
         settings = self._open_settings()
         verification_settings = self._open_verification_settings()
         current_selection = self._ensure_authoritative_selection(

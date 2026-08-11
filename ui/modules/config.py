@@ -33,6 +33,10 @@ from PyQt6.QtWidgets import (
 )
 
 from app.service.current_meter_service import current_meter_display_unit, normalize_current_meter_config
+from app.service.fault_types import (
+    parse_fault_types_editor,
+    render_fault_types_editor,
+)
 from app.service.result_dashboard_layout import (
     normalize_result_dashboard_layout,
     normalize_result_dashboard_layout_for_display,
@@ -483,6 +487,11 @@ class ConfigModule(QWidget):
         self.ed_name = QLineEdit()
         gf_lay.addRow("配置名称", self.ed_name)
 
+        self.fault_types_editor = QLineEdit()
+        self.fault_types_editor.setObjectName("fault_types_editor")
+        self.fault_types_editor.setMaxLength(2_147_483_647)
+        gf_lay.addRow("故障类型", self.fault_types_editor)
+
         self.spin_record = _NoWheelSpinBox()
         self.spin_record.setRange(0.1, 3600.0)
         self.spin_record.setSingleStep(0.5)
@@ -591,7 +600,7 @@ class ConfigModule(QWidget):
 
         self.spin_monitor_gain_db = _NoWheelSpinBox()
         self.spin_monitor_gain_db.setObjectName("spin_monitor_gain_db")
-        self.spin_monitor_gain_db.setRange(-60.0, 24.0)
+        self.spin_monitor_gain_db.setRange(-60.0, 35.0)
         self.spin_monitor_gain_db.setSingleStep(1.0)
         self.spin_monitor_gain_db.setDecimals(1)
         self.spin_monitor_gain_db.setSuffix(" dB")
@@ -1351,9 +1360,17 @@ class ConfigModule(QWidget):
     def _capture_editor_snapshot(self) -> dict | None:
         if self._current_config_id is None:
             return None
+        try:
+            config = self._collect_data()
+        except ValueError as exc:
+            config = {
+                "_validation_error": str(exc),
+                "_fault_types_editor_text": self.fault_types_editor.text(),
+            }
         return copy.deepcopy(
             {
-                "config": self._collect_data(),
+                "config": config,
+                "fault_types_editor_text": self.fault_types_editor.text(),
                 "ai_binding": self._capture_ai_binding_editor_state(),
             }
         )
@@ -2784,6 +2801,9 @@ class ConfigModule(QWidget):
         data = {
             "config_id": self._current_config_id,
             "config_name": self.ed_name.text(),
+            "fault_types": parse_fault_types_editor(
+                self.fault_types_editor.text()
+            ),
             "record_duration": self.spin_record.value(),
             "analysis_duration": self.spin_analysis.value(),
             "analysis_window_offset_ms": self.spin_analysis_window_offset.value(),
@@ -2935,6 +2955,9 @@ class ConfigModule(QWidget):
         self._hide_top_level_config_dialogs()
         self._discard_all_staged_bindings()
         self.ed_name.setText(data["config_name"])
+        self.fault_types_editor.setText(
+            render_fault_types_editor(data["fault_types"])
+        )
         self.spin_record.setValue(data["record_duration"])
         self.spin_analysis.setValue(data["analysis_duration"])
         self.spin_analysis_window_offset.setValue(
@@ -3144,7 +3167,14 @@ class ConfigModule(QWidget):
     def _save_current_config(self, *, show_success: bool = True) -> bool:
         if self._current_config_id is None:
             return True
-        data = self._collect_data()
+        try:
+            data = self._collect_data()
+        except ValueError as exc:
+            self._finalize_failed_save(
+                message_title="验证失败",
+                message_text=str(exc),
+            )
+            return False
         errors = self.services.config_service.validate(data)
         if errors:
             self._finalize_failed_save(

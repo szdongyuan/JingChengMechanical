@@ -8,6 +8,11 @@ from typing import Any
 
 import numpy as np
 
+from app.service.analysis.thread_priority import (
+    THREAD_PRIORITY_BELOW_NORMAL,
+    set_current_thread_priority,
+)
+
 
 _SPL_EMIT_THROTTLE_SEC = 0.25
 _SPL_EMIT_EPSILON_SEC = 1e-9
@@ -38,11 +43,22 @@ class _LoudnessWork:
 class LiveDisplayDispatcher:
     """Run live display pipelines on a bounded FIFO background worker."""
 
-    def __init__(self, *, pipelines, bus, config_id: int, max_queue_size: int = 8):
+    def __init__(
+        self,
+        *,
+        pipelines,
+        bus,
+        config_id: int,
+        max_queue_size: int = 8,
+        coalesce_pending: bool = False,
+        stft_emit_interval_sec: float = 0.0,
+    ):
         self._pipelines = list(pipelines)
         self._bus = bus
         self._config_id = config_id
         self._max_queue_size = max(1, int(max_queue_size))
+        self._coalesce_pending = bool(coalesce_pending)
+        self._stft_emit_interval_sec = max(0.0, float(stft_emit_interval_sec))
         self._condition = threading.Condition()
         self._queue: deque[_DisplayWork] = deque()
         self._pending_loudness: _LoudnessWork | None = None
@@ -52,7 +68,9 @@ class LiveDisplayDispatcher:
         self._continuity_generation = 0
         self._last_processed_sample_end: int | None = None
         self._last_spl_emit_time_by_key: dict[tuple[int, str, int, int], float] = {}
+        self._last_stft_emit_time_by_key: dict[tuple[int, str, int, int], float] = {}
         self._overflow_log_active = False
+        self._active_work = False
         self._thread: threading.Thread | None = None
         self._loudness_thread: threading.Thread | None = None
         self._emit_stop_lock = threading.RLock()
@@ -117,9 +135,10 @@ class LiveDisplayDispatcher:
                 generation=self._generation,
             )
             dropped_for_overflow = False
-            while len(self._queue) >= self._max_queue_size:
-                self._queue.popleft()
-                dropped_for_overflow = True
+            if not self._coalesce_pending:
+                while len(self._queue) >= self._max_queue_size:
+                    self._queue.popleft()
+                    dropped_for_overflow = True
             if dropped_for_overflow and not self._overflow_log_active:
                 self._overflow_log_active = True
                 should_log_overflow = True
@@ -140,6 +159,7 @@ class LiveDisplayDispatcher:
                 self._pending_loudness = None
                 self._last_processed_sample_end = None
                 self._last_spl_emit_time_by_key.clear()
+                self._last_stft_emit_time_by_key.clear()
                 self._overflow_log_active = False
                 self._condition.notify_all()
                 thread = self._thread
@@ -161,6 +181,7 @@ class LiveDisplayDispatcher:
             self._log_stop_timeout(timeout)
 
     def _run(self) -> None:
+        set_current_thread_priority(THREAD_PRIORITY_BELOW_NORMAL)
         while True:
             with self._condition:
                 while not self._queue and not self._stopping:
@@ -168,19 +189,94 @@ class LiveDisplayDispatcher:
                 if not self._queue and self._stopping:
                     return
                 work = self._queue.popleft()
+                if self._coalesce_pending:
+                    work = self._coalesce_contiguous_pending_locked(work)
+                self._active_work = True
                 if not self._queue:
                     self._overflow_log_active = False
 
-            if work is None:
-                continue
-            if not self._work_is_current(work):
-                continue
-            if self._work_has_sample_gap(work):
-                self._reset_pipelines_for_gap()
-            self._process_work(work)
-            self._record_processed_sample_end(work)
+            try:
+                if work is None:
+                    continue
+                if not self._work_is_current(work):
+                    continue
+                if self._work_has_sample_gap(work):
+                    self._reset_pipelines_for_gap()
+                self._process_work(work)
+                self._record_processed_sample_end(work)
+            finally:
+                with self._condition:
+                    self._active_work = False
+                    self._condition.notify_all()
+
+    def _coalesce_contiguous_pending_locked(
+        self,
+        work: _DisplayWork,
+    ) -> _DisplayWork:
+        """Merge queued chunks from the same run before doing display DSP.
+
+        This runs only on the display worker.  It preserves every captured
+        sample while avoiding repeated FFT/STFT setup when rendering falls
+        behind capture.
+        """
+        items = [work]
+        last = work
+        while self._queue:
+            candidate = self._queue[0]
+            if not self._work_is_contiguous(last, candidate):
+                break
+            self._queue.popleft()
+            items.append(candidate)
+            last = candidate
+        if len(items) == 1:
+            return work
+        return self._merge_work_items(items)
+
+    @staticmethod
+    def _merge_work_items(items) -> _DisplayWork:
+        items = tuple(items)
+        first = items[0]
+        last = items[-1]
+        return _DisplayWork(
+            chunk=np.concatenate([item.chunk for item in items], axis=0),
+            elapsed_time=last.elapsed_time,
+            frame_run_id=first.frame_run_id,
+            live_loudness_channel_index=first.live_loudness_channel_index,
+            sample_start=first.sample_start,
+            sample_end=last.sample_end,
+            generation=first.generation,
+        )
+
+    def wait_until_idle(self, timeout: float) -> bool:
+        import time
+
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._condition:
+            while self._queue or self._active_work:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return False
+                self._condition.wait(remaining)
+            return True
+
+    @staticmethod
+    def _work_is_contiguous(left: _DisplayWork, right: _DisplayWork) -> bool:
+        return bool(
+            left.generation == right.generation
+            and left.frame_run_id == right.frame_run_id
+            and left.live_loudness_channel_index
+            == right.live_loudness_channel_index
+            and left.sample_end is not None
+            and right.sample_start == left.sample_end
+            and left.chunk.ndim == right.chunk.ndim
+            and (
+                left.chunk.ndim != 2
+                or left.chunk.shape[1] == right.chunk.shape[1]
+            )
+        )
 
     def _run_loudness(self) -> None:
+        set_current_thread_priority(THREAD_PRIORITY_BELOW_NORMAL)
         while True:
             with self._condition:
                 while self._pending_loudness is None and not self._stopping:
@@ -280,6 +376,12 @@ class LiveDisplayDispatcher:
             return
 
         for stft_frame in result.get("stft_frames") or []:
+            if not self._should_emit_stft_for_work(
+                work,
+                channel_index,
+                stft_frame,
+            ):
+                continue
             self._emit_for_work(
                 work,
                 "stft_updated",
@@ -371,6 +473,38 @@ class LiveDisplayDispatcher:
             self._last_spl_emit_time_by_key[key] = frame_time
             return True
 
+    def _should_emit_stft_for_work(
+        self,
+        work: _DisplayWork,
+        channel_index: int,
+        frame: Any,
+    ) -> bool:
+        if self._stft_emit_interval_sec <= 0.0:
+            return True
+        frame_time = self._spl_frame_time(frame, work.elapsed_time)
+        with self._condition:
+            if (
+                self._closed
+                or self._stopping
+                or work.generation != self._generation
+            ):
+                return False
+            key = (
+                self._config_id,
+                work.frame_run_id,
+                channel_index,
+                self._continuity_generation,
+            )
+            last_emit_time = self._last_stft_emit_time_by_key.get(key)
+            if (
+                last_emit_time is not None
+                and frame_time - last_emit_time
+                < self._stft_emit_interval_sec - _SPL_EMIT_EPSILON_SEC
+            ):
+                return False
+            self._last_stft_emit_time_by_key[key] = frame_time
+            return True
+
     @staticmethod
     def _spl_frame_time(frame: Any, fallback: float) -> float:
         raw_time = getattr(frame, "time", fallback)
@@ -427,6 +561,7 @@ class LiveDisplayDispatcher:
                 self._continuity_generation += 1
                 self._pending_loudness = None
                 self._last_spl_emit_time_by_key.clear()
+                self._last_stft_emit_time_by_key.clear()
                 self._condition.notify_all()
             return gap_detected
 

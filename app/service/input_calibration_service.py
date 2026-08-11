@@ -52,6 +52,11 @@ class InputCalibrationService:
         )
         if updated == 0:
             return False, "保存失败：输入设备未更新"
+        status = getattr(self.bus, "status", None)
+        if status is not None:
+            status.emit(
+                "校准值已保存，将从下一次测试开始生效，无需重启软件。"
+            )
         return True, deviation_match
 
 

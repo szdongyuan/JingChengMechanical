@@ -1262,6 +1262,7 @@ class FftLineChartWidget(LineChartWidget):
         show_zero_reference: bool = False,
         x_axis_scale: str = "linear",
         current_trace: dict | None = None,
+        weighting: str = "Z",
     ) -> None:
         normalized_frequencies = _normalize_vector(
             frequencies_hz, name="frequencies_hz"
@@ -1277,6 +1278,9 @@ class FftLineChartWidget(LineChartWidget):
             name="golden_overlay_levels_db",
         )
         scale = _normalize_fft_x_axis_scale(x_axis_scale)
+        normalized_weighting = str(weighting or "Z").strip().upper()
+        if normalized_weighting not in {"A", "C", "Z"}:
+            normalized_weighting = "Z"
         self.plot_item.setLogMode(x=(scale == "log"), y=False)
 
         freq_array = np.asarray(normalized_frequencies, dtype=np.float64)
@@ -1312,6 +1316,7 @@ class FftLineChartWidget(LineChartWidget):
             "display_golden_overlay_levels_db": display_golden_overlay,
             "show_zero_reference": bool(show_zero_reference),
             "x_axis_scale": scale,
+            "weighting": normalized_weighting,
         }
         self._spectrum_payload = spectrum_payload
 

@@ -103,6 +103,19 @@ def _write_temp_wav(
     return path
 
 
+def test_judgment_reads_frozen_channel_calibration_value():
+    calibration = {
+        "hardware_id": 3,
+        "calibration_revision": 4,
+        "channels": [
+            [0, True, 1, 1.25],
+            [1, True, 2, 2.5],
+        ],
+    }
+
+    assert JudgmentEngine._get_sensitivity(calibration, 1) == 2.5
+
+
 def _golden_binding(path: Path | str, *, sample_rate: float = 48_000.0) -> dict:
     return {
         "golden_sample_path": str(path),

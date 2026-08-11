@@ -6,6 +6,7 @@ import pytest
 from app.service.analysis import dsp, stft_score
 from app.service.analysis.golden_reference import GoldenReferenceError
 from app.service.analysis.review_payloads import (
+    _mic_sensitivity,
     attach_stft_score_summary,
     build_chart_payload,
     build_summary_payload,
@@ -58,6 +59,19 @@ def _make_config(*, fft_limits=True, octave_limits=True):
         "selected_channels": [0, 1],
         "channels": [_channel(0), _channel(1)],
     }
+
+
+def test_chart_payload_reads_frozen_channel_calibration_value():
+    calibration = {
+        "hardware_id": 8,
+        "calibration_revision": 1,
+        "channels": [
+            [0, True, 1, 1.5],
+            [2, True, 1, 3.25],
+        ],
+    }
+
+    assert _mic_sensitivity(calibration, 2) == pytest.approx(3.25)
 
 
 def _make_judgment_payload():
@@ -312,7 +326,7 @@ def _valid_loudness_cache_entry(values_sone):
 
 
 def _two_display_point_values(start: float, end: float) -> np.ndarray:
-    return np.linspace(start, end, 7, dtype=np.float64)
+    return np.linspace(start, end, 4, dtype=np.float64)
 
 
 def _patch_basic_chart_backends(
@@ -742,7 +756,7 @@ def test_build_chart_payload_passes_non_grid_aligned_loudness_cache_to_stft_scor
 
     monkeypatch.setattr(stft_score, "compute_stft_score_payload", fake_score)
     cache_entry = _valid_loudness_cache_entry(
-        np.linspace(2.0, 4.0, 152, dtype=np.float64)
+        np.linspace(2.0, 4.0, 77, dtype=np.float64)
     )
 
     payload = build_chart_payload(
@@ -760,7 +774,7 @@ def test_build_chart_payload_passes_non_grid_aligned_loudness_cache_to_stft_scor
 
     assert payload[0]["stft_score"]["summary_score"] == 88.0
     assert captured["loudness_trace"] == cache_entry
-    assert captured["loudness_trace"]["times_sec"][-1] == pytest.approx(1.0066666667)
+    assert captured["loudness_trace"]["times_sec"][-1] == pytest.approx(1.0133333333)
 
 
 def test_build_chart_payload_disabled_stft_score_uses_disabled_payload(monkeypatch):
@@ -5038,10 +5052,10 @@ def test_build_chart_payload_reuses_valid_internal_loudness_trace_cache_as_displ
         config=_make_config(),
         sample_rate=100.0,
         mic_cal={},
-        analysis_window=(0.5, 0.58),
-        loudness_trace_cache={
-            0: _valid_loudness_cache_entry(np.arange(1.0, 14.0, dtype=np.float64)),
-            1: _valid_loudness_cache_entry(np.linspace(24.0, 30.0, 13, dtype=np.float64)),
+            analysis_window=(0.5, 0.58),
+            loudness_trace_cache={
+                0: _valid_loudness_cache_entry(np.linspace(1.0, 13.0, 7, dtype=np.float64)),
+                1: _valid_loudness_cache_entry(np.linspace(24.0, 30.0, 7, dtype=np.float64)),
         },
     )
 
@@ -5078,10 +5092,10 @@ def test_build_chart_payload_reuses_loudness_trace_cache_with_phon_unit(monkeypa
         config=config,
         sample_rate=100.0,
         mic_cal={},
-        analysis_window=(0.5, 0.58),
-        loudness_trace_cache={
-            0: _valid_loudness_cache_entry(np.linspace(42.0, 48.0, 13, dtype=np.float64)),
-            1: _valid_loudness_cache_entry(np.linspace(24.0, 30.0, 13, dtype=np.float64)),
+            analysis_window=(0.5, 0.58),
+            loudness_trace_cache={
+                0: _valid_loudness_cache_entry(np.linspace(42.0, 48.0, 7, dtype=np.float64)),
+                1: _valid_loudness_cache_entry(np.linspace(24.0, 30.0, 7, dtype=np.float64)),
         },
     )
 

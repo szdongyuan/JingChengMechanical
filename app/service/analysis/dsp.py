@@ -26,7 +26,7 @@ from app.service.analysis.spl_weighting import (
 _REF_PRESSURE = 20e-6
 LOUDNESS_BACKEND_SAMPLE_RATE = 48000.0
 LOUDNESS_TRACE_ALGORITHM = "reduced_zwtv"
-LOUDNESS_TRACE_INTERNAL_RATE_HZ = 150.0
+LOUDNESS_TRACE_INTERNAL_RATE_HZ = 75.0
 LOUDNESS_TRACE_DISPLAY_RATE_HZ = 25.0
 _LOUDNESS_REDUCED_ZWTV_NL_ITER = 12
 _LOUDNESS_REDUCED_ZWTV_LP_ITER = 12
@@ -228,6 +228,12 @@ def _load_reduced_zwtv_components():
     except ImportError as exc:
         raise RuntimeError("MoSQITo loudness backend is unavailable") from exc
     return _third_octave_levels, _main_loudness, _calc_slopes
+
+
+def preload_loudness_backend() -> None:
+    """Pay the MoSQITo import cost before the first completed recording."""
+
+    _load_reduced_zwtv_components()
 
 
 def _loudness_trace_internal_times(signal_size: int) -> np.ndarray:
@@ -774,7 +780,11 @@ def downsample_loudness_trace_for_display(
 
     internal_period = 1.0 / LOUDNESS_TRACE_INTERNAL_RATE_HZ
     if np.allclose(np.diff(times), internal_period, rtol=0.0, atol=1e-9):
-        return times[::6].tolist(), values[::6].tolist()
+        display_step = max(
+            1,
+            int(round(LOUDNESS_TRACE_INTERNAL_RATE_HZ / LOUDNESS_TRACE_DISPLAY_RATE_HZ)),
+        )
+        return times[::display_step].tolist(), values[::display_step].tolist()
 
     display_period = 1.0 / LOUDNESS_TRACE_DISPLAY_RATE_HZ
     display_count = max(1, int(np.floor((times[-1] - times[0]) / display_period + 1e-12)) + 1)
@@ -1018,6 +1028,56 @@ def compute_octave_bands(signal: np.ndarray, sample_rate: float,
 # ---------------------------------------------------------------------------
 # Mic calibration
 # ---------------------------------------------------------------------------
+
+
+def mic_sensitivity_from_calibration(
+    calibration: object,
+    channel_index: int,
+) -> float:
+    """Read one channel's calibration value from legacy or frozen payloads."""
+
+    if not isinstance(calibration, dict):
+        return 0.0
+
+    legacy = calibration.get(f"In{channel_index + 1}")
+    if isinstance(legacy, dict):
+        try:
+            value = float(legacy.get("deviation_value", 0.0))
+        except (TypeError, ValueError):
+            pass
+        else:
+            return value if np.isfinite(value) else 0.0
+
+    channels = calibration.get("channels")
+    if not isinstance(channels, (list, tuple)):
+        return 0.0
+    for item in channels:
+        raw_value = None
+        if isinstance(item, dict):
+            if item.get("channel_index") != channel_index:
+                continue
+            if item.get("trusted") is False:
+                return 0.0
+            raw_value = item.get(
+                "deviation_value",
+                item.get("correction_db"),
+            )
+        elif (
+            isinstance(item, (list, tuple))
+            and len(item) >= 4
+            and item[0] == channel_index
+        ):
+            if item[1] is False:
+                return 0.0
+            raw_value = item[3]
+        else:
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            return 0.0
+        return value if np.isfinite(value) else 0.0
+    return 0.0
 
 
 def apply_mic_calibration(signal: np.ndarray,
