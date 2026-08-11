@@ -220,13 +220,13 @@ class JudgmentEngine:
 
             # Apply mic calibration
             sensitivity = self._get_sensitivity(mic_cal, ch_idx)
-            full_loudness_sig = (
+            calibrated_full = (
                 dsp.apply_mic_calibration(full_sig, sensitivity)
                 if full_sig is not None
                 else None
             )
-            if full_loudness_sig is not None:
-                sig = full_loudness_sig[start_idx:end_idx].copy()
+            if calibrated_full is not None:
+                sig = calibrated_full[start_idx:end_idx].copy()
             else:
                 sig = dsp.apply_mic_calibration(sig, sensitivity)
 
@@ -259,29 +259,43 @@ class JudgmentEngine:
             spl_trace_error_message: str | None = None
             spl_average_available = False
             spl_average_error_message: str | None = None
+            spl_signal = calibrated_full if calibrated_full is not None else sig
+            spl_start_sample = start_idx if calibrated_full is not None else 0
+            spl_end_sample = end_idx if calibrated_full is not None else len(sig)
             try:
-                spl_db = float(dsp.compute_spl(
-                    sig,
-                    sample_rate,
-                    spl_weighting,
-                    spl_time_constant,
-                ))
                 _, spl_trace_db = dsp.compute_spl_trace(
-                    sig,
+                    spl_signal,
                     sample_rate,
                     spl_weighting,
                     spl_time_constant,
                     chunk_duration=_SPL_CHUNK_DURATION_SEC,
+                    output_start_sample=spl_start_sample,
+                    output_end_sample=spl_end_sample,
                 )
-                trace_values = spl_trace_db or [spl_db]
+                trace_values = list(spl_trace_db)
+                if not trace_values:
+                    trace_values = [-np.inf]
+                spl_db = float(trace_values[-1])
                 spl_min_db, spl_max_db = self._value_bounds(trace_values)
                 spl_trace_available = True
-                spl_pass = self._values_pass_limits(trace_values, spl_lower, spl_upper)
+                spl_pass = self._values_pass_limits(
+                    trace_values,
+                    spl_lower,
+                    spl_upper,
+                )
             except Exception as exc:
                 spl_trace_error_message = str(exc) or exc.__class__.__name__
                 spl_pass = None if spl_constrained else True
             try:
-                spl_average_db = float(dsp.compute_spl_leq(sig, sample_rate, spl_weighting))
+                spl_average_db = float(
+                    dsp.compute_spl_leq(
+                        spl_signal,
+                        sample_rate,
+                        spl_weighting,
+                        start_sample=spl_start_sample,
+                        end_sample=spl_end_sample,
+                    )
+                )
                 spl_average_available = True
                 spl_average_pass = self._values_pass_limits(
                     [spl_average_db],
@@ -319,10 +333,10 @@ class JudgmentEngine:
                 loudness_average_upper,
             )
             try:
-                if full_loudness_sig is not None and start_sec > 0.0:
+                if calibrated_full is not None and start_sec > 0.0:
                     times_sec, loudness_values_sone, loudness_max_sone = (
                         dsp.compute_loudness_trace_for_window(
-                            full_loudness_sig,
+                            calibrated_full,
                             sample_rate,
                             start_sec,
                             end_sec,
@@ -994,14 +1008,4 @@ class JudgmentEngine:
 
     @staticmethod
     def _get_sensitivity(mic_cal: dict, channel_index: int) -> float:
-        """Extract mic sensitivity from mic_cal dict.
-
-        mic_cal format: {"In1": {"deviation_value": "0.5", ...}, ...}
-        """
-        key = f"In{channel_index + 1}"
-        entry = mic_cal.get(key, {})
-        raw = entry.get("deviation_value", "0")
-        try:
-            return float(raw)
-        except (ValueError, TypeError):
-            return 0.0
+        return dsp.mic_sensitivity_from_calibration(mic_cal, channel_index)

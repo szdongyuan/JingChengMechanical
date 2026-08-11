@@ -8,6 +8,7 @@ from PyQt6.QtCore import QEvent, QPoint, QRect, Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QFrame,
+    QHBoxLayout,
     QLabel,
     QPushButton,
     QVBoxLayout,
@@ -16,8 +17,98 @@ from PyQt6.QtWidgets import (
 
 from app.service.analysis.frames import StftFrame
 from app.service.current_meter_service import current_trace_display_at_time
+from app.service.run_scoped_playback import (
+    PlaybackCode,
+    PlaybackLifecycleCode,
+    PlaybackLifecycleReport,
+    PlaybackLifecycleStatus,
+    PlaybackResult,
+    PlaybackStatus,
+    RunPlaybackRequest,
+)
 from app.services_container import FactoryControllerState, FactoryReviewPayload
 from ui.widgets.analysis_charts import StftImageChartWidget
+
+
+_PLAYBACK_DIAGNOSTICS = {
+    (PlaybackStatus.STARTED, PlaybackCode.STARTED): "Playback started.",
+    (PlaybackStatus.UNAVAILABLE, PlaybackCode.BUSY): "Playback is busy.",
+    (
+        PlaybackStatus.UNAVAILABLE,
+        PlaybackCode.PERSISTED_AUDIO_UNAVAILABLE,
+    ): "播放失败：所选运行记录的音频不存在，可能已被删除",
+    (
+        PlaybackStatus.FAILED,
+        PlaybackCode.PERSISTED_FACT_INVALID,
+    ): "Selected run playback facts are invalid.",
+    (
+        PlaybackStatus.FAILED,
+        PlaybackCode.CONFIG_SNAPSHOT_INVALID,
+    ): "Selected run playback configuration is invalid.",
+    (
+        PlaybackStatus.UNAVAILABLE,
+        PlaybackCode.CHANNEL_UNAVAILABLE,
+    ): "Selected run channel is unavailable.",
+    (
+        PlaybackStatus.UNAVAILABLE,
+        PlaybackCode.WINDOW_UNAVAILABLE,
+    ): "Selected run window is unavailable.",
+    (
+        PlaybackStatus.FAILED,
+        PlaybackCode.AUDIO_LOAD_FAILED,
+    ): "Selected run audio could not be loaded.",
+    (
+        PlaybackStatus.FAILED,
+        PlaybackCode.DEADLINE_CLOCK_FAILED,
+    ): "Playback deadline could not be established.",
+    (
+        PlaybackStatus.FAILED,
+        PlaybackCode.REPLACEMENT_TIMED_OUT,
+    ): "Previous playback replacement timed out.",
+    (
+        PlaybackStatus.FAILED,
+        PlaybackCode.REPLACEMENT_NON_CLEAN,
+    ): "Previous playback ended non-cleanly.",
+    (
+        PlaybackStatus.FAILED,
+        PlaybackCode.BACKEND_START_FAILED,
+    ): "Playback backend could not start.",
+    (
+        PlaybackStatus.FAILED,
+        PlaybackCode.BACKEND_START_TIMED_OUT,
+    ): "Playback backend start timed out.",
+    (
+        PlaybackStatus.CLOSED,
+        PlaybackCode.SERVICE_CLOSED,
+    ): "Playback service is closed.",
+}
+
+_PLAYBACK_LIFECYCLE_DIAGNOSTICS = {
+    (
+        PlaybackLifecycleStatus.CLEAN,
+        PlaybackLifecycleCode.CLEAN,
+    ): "Playback lifecycle is clean.",
+    (
+        PlaybackLifecycleStatus.NON_CLEAN,
+        PlaybackLifecycleCode.BUSY,
+    ): "Playback lifecycle is busy.",
+    (
+        PlaybackLifecycleStatus.NON_CLEAN,
+        PlaybackLifecycleCode.DEADLINE_CLOCK_FAILED,
+    ): "Playback lifecycle deadline could not be established.",
+    (
+        PlaybackLifecycleStatus.TIMED_OUT,
+        PlaybackLifecycleCode.BACKEND_JOIN_TIMED_OUT,
+    ): "Playback lifecycle join timed out.",
+    (
+        PlaybackLifecycleStatus.NON_CLEAN,
+        PlaybackLifecycleCode.BACKEND_STOP_FAILED,
+    ): "Playback lifecycle stop failed.",
+    (
+        PlaybackLifecycleStatus.NON_CLEAN,
+        PlaybackLifecycleCode.BACKEND_NON_CLEAN,
+    ): "Playback lifecycle ended non-cleanly.",
+}
 
 
 @dataclass
@@ -303,7 +394,10 @@ class StftModule(QWidget):
         super().__init__()
         self.services = services
         self.selected_display_channel_provider = None
+        self.selected_run_id_provider = None
+        self.run_scoped_playback = None
         self.strict_selected_display_channel = False
+        self._playback_closed = False
         self._factory_state = getattr(
             services.factory_mode, "state", FactoryControllerState()
         )
@@ -343,16 +437,38 @@ class StftModule(QWidget):
         lay.addWidget(self.canvas, 1)
 
         self.selection_box = _AnalysisSelectionBox(self)
-        self.analysis_select_button = QPushButton("框选分析", self)
+        self.analysis_control_row = QWidget(self)
+        self.analysis_control_row.setObjectName("StftAnalysisControlRow")
+        analysis_control_layout = QHBoxLayout(self.analysis_control_row)
+        analysis_control_layout.setContentsMargins(4, 0, 0, 0)
+        analysis_control_layout.setSpacing(0)
+        self.analysis_select_button = QPushButton(
+            "框选分析",
+            self.analysis_control_row,
+        )
         self.analysis_select_button.setCheckable(True)
+        self.analysis_select_button.setMinimumWidth(144)
         self.analysis_select_button.setStyleSheet("padding: 2px 14px;")
         self.analysis_select_button.clicked.connect(self._on_analysis_select_toggled)
         self.analysis_select_button.hide()
+        analysis_control_layout.addWidget(
+            self.analysis_select_button,
+            0,
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+        )
+        analysis_control_layout.addStretch(1)
+        self.analysis_control_row.setFixedHeight(
+            max(
+                self._ANALYSIS_SELECT_BOTTOM_RESERVE_PX,
+                self.analysis_select_button.sizeHint().height(),
+            )
+        )
+        lay.addWidget(self.analysis_control_row)
         self.analyze_button = QPushButton("分析", self.canvas)
         self.analyze_button.clicked.connect(self._begin_reanalysis)
         self.analyze_button.hide()
         self.replay_button = QPushButton("重放", self.canvas)
-        self.replay_button.clicked.connect(self._replay_selection)
+        self.replay_button.clicked.connect(self._play_selected_run)
         self.replay_button.hide()
 
         self.score_overlay_label = QLabel(self.canvas)
@@ -1014,11 +1130,7 @@ class StftModule(QWidget):
         if self._selected_window is None or not self.is_selection_movable():
             return
 
-        validated = self._validated_window(
-            start_sec=self._selected_window[0],
-            end_sec=self._selected_window[1],
-            captured_duration_sec=self._captured_duration_sec(),
-        )
+        validated = self._exact_action_window(self._selected_window)
         if validated is None:
             return
 
@@ -1031,9 +1143,6 @@ class StftModule(QWidget):
         self,
         review: FactoryReviewPayload,
     ) -> None:
-        if getattr(review, "trigger_source", None) != "import_audio":
-            return
-
         config_id = getattr(review, "displayed_config_id", None)
         run_id = getattr(review, "run_id", None)
         chart_payload = getattr(review, "chart_payload", None)
@@ -1121,19 +1230,61 @@ class StftModule(QWidget):
 
         return times_sec, frequencies_hz, magnitude_db
 
-    def _replay_selection(self):
-        context = self._replay_context()
-        if context is None:
+    def _play_selected_run(self):
+        request = self._playback_request()
+        if request is None:
             return
 
-        test_service = getattr(self.services, "test", None)
-        replay_selection = getattr(test_service, "replay_selection", None)
-        if not callable(replay_selection):
-            self._emit_replay_failure()
+        playback = self.run_scoped_playback
+        play = getattr(playback, "play", None)
+        if not callable(play):
             return
 
-        if not bool(replay_selection(*context)):
-            self._emit_replay_failure()
+        try:
+            result = play(request)
+        except Exception:
+            self._emit_playback_diagnostic("Playback request failed.")
+            return
+
+        self._handle_playback_result(request, result)
+
+    def handle_playback_lifecycle_report(self, report) -> None:
+        if type(report) is not PlaybackLifecycleReport:
+            self._emit_playback_diagnostic("Playback lifecycle report is invalid.")
+            return
+
+        diagnostic = _PLAYBACK_LIFECYCLE_DIAGNOSTICS.get(
+            (report.status, report.code)
+        )
+        if diagnostic is None:
+            self._emit_playback_diagnostic("Playback lifecycle report is invalid.")
+            return
+        self._emit_playback_diagnostic(diagnostic)
+
+    def _handle_playback_result(self, request: RunPlaybackRequest, result) -> None:
+        if type(result) is not PlaybackResult or result.run_id != request.run_id:
+            self._emit_playback_diagnostic("Playback result is invalid.")
+            return
+
+        diagnostic = _PLAYBACK_DIAGNOSTICS.get((result.status, result.code))
+        if diagnostic is None:
+            self._emit_playback_diagnostic("Playback result is invalid.")
+            return
+
+        if (
+            result.status is PlaybackStatus.STARTED
+            and result.code is PlaybackCode.STARTED
+            and result.replaced_run_id is not None
+        ):
+            diagnostic = "Playback replaced the previous run."
+        elif (
+            result.status is PlaybackStatus.CLOSED
+            and result.code is PlaybackCode.SERVICE_CLOSED
+        ):
+            self._playback_closed = True
+            self.replay_button.setEnabled(False)
+
+        self._emit_playback_diagnostic(diagnostic)
 
     def _selected_display_channel(self) -> int | None:
         provider = self.selected_display_channel_provider
@@ -1548,7 +1699,9 @@ class StftModule(QWidget):
     def _widget_rect_in_canvas(self, widget: QWidget) -> QRect:
         if widget.parentWidget() is self.canvas:
             return QRect(widget.geometry())
-        top_left = widget.mapTo(self.canvas, QPoint(0, 0))
+        top_left = self.canvas.mapFromGlobal(
+            widget.mapToGlobal(QPoint(0, 0))
+        )
         return QRect(top_left, widget.size())
 
     def _bounded_score_overlay_rect(
@@ -1576,7 +1729,7 @@ class StftModule(QWidget):
         bounded_y = max(min_y, min(int(y), max_y))
         return QRect(bounded_x, bounded_y, int(width), int(height))
 
-    def _replay_context(self) -> tuple[int, str, int, float, float] | None:
+    def _playback_request(self) -> RunPlaybackRequest | None:
         if (
             self._factory_state.run_phase not in self._REVIEW_PHASES
             or self._selected_window is None
@@ -1584,50 +1737,74 @@ class StftModule(QWidget):
         ):
             return None
 
-        displayed_config_id = self._factory_state.displayed_config_id
-        if isinstance(displayed_config_id, bool):
+        run_provider = self.selected_run_id_provider
+        if not callable(run_provider):
             return None
         try:
-            config_id = int(displayed_config_id)
-        except (TypeError, ValueError):
+            run_id = run_provider()
+        except Exception:
             return None
 
-        run_id = self._display_run_id or self._review_run_id_for_displayed_config()
-        if not isinstance(run_id, str) or not run_id:
-            return None
-
-        display_channel = self._selected_display_channel()
-        if display_channel is None:
-            return None
-
-        validated = self._validated_window(
-            start_sec=self._selected_window[0],
-            end_sec=self._selected_window[1],
-            captured_duration_sec=self._captured_duration_sec(),
+        displayed_run_id = (
+            self._display_run_id or self._review_run_id_for_displayed_config()
         )
+        if type(run_id) is not str or run_id != displayed_run_id:
+            return None
+
+        channel_provider = self.selected_display_channel_provider
+        if not callable(channel_provider):
+            return None
+        try:
+            display_channel = channel_provider()
+        except Exception:
+            return None
+        if type(display_channel) is not int or display_channel < 0:
+            return None
+
+        validated = self._exact_action_window(self._selected_window)
         if validated is None:
             return None
 
-        return (config_id, run_id, display_channel, validated[0], validated[1])
+        try:
+            return RunPlaybackRequest(
+                run_id=run_id,
+                display_channel_index=display_channel,
+                window_start_seconds=validated[0],
+                window_end_seconds=validated[1],
+            )
+        except (TypeError, ValueError):
+            return None
 
-    def _can_replay_selection(self) -> bool:
-        context = self._replay_context()
-        if context is None:
+    def _can_play_selected_run(self) -> bool:
+        if self._playback_closed or self._playback_request() is None:
             return False
 
-        test_service = getattr(self.services, "test", None)
-        can_replay_selection = getattr(test_service, "can_replay_selection", None)
-        if not callable(can_replay_selection):
-            return False
-        return bool(can_replay_selection(*context))
+        return callable(getattr(self.run_scoped_playback, "play", None))
 
-    def _emit_replay_failure(self) -> None:
+    def _emit_playback_diagnostic(self, message: str) -> None:
         bus = getattr(self.services, "bus", None)
         for signal_name in ("status", "log"):
             signal = getattr(bus, signal_name, None)
             emit = getattr(signal, "emit", None)
             if callable(emit):
-                emit("重放失败")
+                emit(message)
+
+    @staticmethod
+    def _exact_action_window(
+        window: tuple[float, float] | None,
+    ) -> tuple[float, float] | None:
+        if (
+            type(window) is not tuple
+            or len(window) != 2
+            or type(window[0]) is not float
+            or type(window[1]) is not float
+            or not np.isfinite(window[0])
+            or not np.isfinite(window[1])
+            or window[0] < 0.0
+            or window[1] <= window[0]
+        ):
+            return None
+        return window
 
     def _selection_from_review(
         self,
@@ -1761,7 +1938,6 @@ class StftModule(QWidget):
         )
         self.analysis_select_button.setVisible(selection_tool_visible)
         self.analysis_select_button.setEnabled(selection_tool_enabled)
-        self._set_analysis_select_bottom_reserve(selection_tool_visible)
         if not selection_tool_visible and self._analysis_selection_mode:
             self._set_analysis_selection_mode(False, refresh_overlay=False)
         else:
@@ -1850,7 +2026,7 @@ class StftModule(QWidget):
             self._layout_score_overlay_label()
             return
 
-        self.replay_button.setEnabled(self._can_replay_selection())
+        self.replay_button.setEnabled(self._can_play_selected_run())
         self._layout_selection_buttons(
             left=left,
             width=width,
@@ -1863,53 +2039,7 @@ class StftModule(QWidget):
     def _layout_analysis_select_button(self) -> None:
         if not self.analysis_select_button.isVisible():
             return
-
-        host = self._ensure_analysis_select_button_host()
-        margin = 4
-        bottom_margin = 0
-        spacing = 6
-        size_hint = self.analysis_select_button.sizeHint()
-        width = max(size_hint.width() + 28, 144)
-        height = max(size_hint.height(), 24)
-        reset_button = getattr(
-            getattr(self.canvas.heatmap, "chart_interactions", None),
-            "reset_button",
-            None,
-        )
-        module_offset_x = 0
-        if host is not self:
-            module_offset_x = self.geometry().x()
-        x = module_offset_x + margin
-        if reset_button is not None and reset_button.isVisible():
-            x = module_offset_x + reset_button.x() + reset_button.width() + spacing
-        if host is self:
-            y = self.height() - height - bottom_margin
-        else:
-            y = host.height() - height - bottom_margin
-        y = max(margin, y)
-        self.analysis_select_button.setGeometry(x, y, width, height)
         self.analysis_select_button.raise_()
-
-    def _set_analysis_select_bottom_reserve(self, enabled: bool) -> None:
-        bottom = self._ANALYSIS_SELECT_BOTTOM_RESERVE_PX if enabled else 0
-        left, top, right, current_bottom = self._content_layout.getContentsMargins()
-        if current_bottom == bottom:
-            return
-        self._content_layout.setContentsMargins(left, top, right, bottom)
-        self._content_layout.activate()
-
-    def _ensure_analysis_select_button_host(self) -> QWidget:
-        host = self.parentWidget()
-        if host is None or host.objectName() != "Card":
-            host = self
-        if self.analysis_select_button.parentWidget() is host:
-            return host
-
-        was_visible = self.analysis_select_button.isVisible()
-        self.analysis_select_button.setParent(host)
-        if was_visible:
-            self.analysis_select_button.show()
-        return host
 
     def _layout_selection_buttons(
         self,
@@ -2096,6 +2226,29 @@ class StftModule(QWidget):
         if channel_index is None:
             return None
 
+        # A completed run must keep using its frozen display configuration.
+        # Loading the current database row here made terminal/history images
+        # silently fall back to auto levels after a config edit.
+        chart_payload = getattr(self._review_payload, "chart_payload", None)
+        if (
+            self._review_payload.displayed_config_id
+            == self._factory_state.displayed_config_id
+            and isinstance(chart_payload, dict)
+        ):
+            channel_payload = chart_payload.get(channel_index)
+            if channel_payload is None:
+                channel_payload = chart_payload.get(str(channel_index))
+            stft_payload = (
+                channel_payload.get("stft")
+                if isinstance(channel_payload, dict)
+                else None
+            )
+            if (
+                isinstance(stft_payload, dict)
+                and "stft_color_scale_enabled" in stft_payload
+            ):
+                return self._fixed_color_levels_from_config(stft_payload)
+
         try:
             config = self._load_displayed_config()
         except Exception:
@@ -2113,17 +2266,25 @@ class StftModule(QWidget):
                 continue
             if channel.get("channel_index") != channel_index:
                 continue
-            if not bool(channel.get("stft_color_scale_enabled", False)):
-                return None
-            try:
-                lower = float(channel.get("stft_color_scale_min_db"))
-                upper = float(channel.get("stft_color_scale_max_db"))
-            except (TypeError, ValueError):
-                return None
-            if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
-                return None
-            return (lower, upper)
+            return self._fixed_color_levels_from_config(channel)
         return None
+
+    @staticmethod
+    def _fixed_color_levels_from_config(
+        config: dict | None,
+    ) -> tuple[float, float] | None:
+        if not isinstance(config, dict) or not bool(
+            config.get("stft_color_scale_enabled", False)
+        ):
+            return None
+        try:
+            lower = float(config.get("stft_color_scale_min_db"))
+            upper = float(config.get("stft_color_scale_max_db"))
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(lower) or not np.isfinite(upper) or lower >= upper:
+            return None
+        return (lower, upper)
 
     def _review_run_id_for_displayed_config(self) -> str | None:
         if (

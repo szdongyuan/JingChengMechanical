@@ -12,10 +12,10 @@ import sounddevice as sd
 from app.service.analysis.audio_recorder import _resolve_device_index
 
 MONITOR_PREBUFFER_SECONDS = 0.15
-MONITOR_BUFFER_SECONDS = 2.0
+MONITOR_BUFFER_SECONDS = 10.0
 MONITOR_OUTPUT_LATENCY_SECONDS = 0.05
 MONITOR_GAIN_MIN_DB = -60.0
-MONITOR_GAIN_MAX_DB = 24.0
+MONITOR_GAIN_MAX_DB = 35.0
 
 
 def apply_monitor_gain(samples: np.ndarray, gain_db: float) -> np.ndarray:

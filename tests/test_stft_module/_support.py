@@ -52,10 +52,6 @@ def _make_module():
     services = SimpleNamespace(
         bus=bus,
         factory_mode=factory_mode,
-        test=SimpleNamespace(
-            can_replay_selection=MagicMock(return_value=True),
-            replay_selection=MagicMock(return_value=True),
-        ),
     )
     return StftModule(services), services
 

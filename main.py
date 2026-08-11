@@ -1,5 +1,17 @@
 import os
+import multiprocessing
 import sys
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+
+# Final-result DSP must leave CPU time for the always-on capture and monitor
+# callbacks.  Production analysis is intentionally single-threaded.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+
 from PyQt6.QtGui import QIcon
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
@@ -11,6 +23,7 @@ from ui.modules.login import LoginWindow
 
 
 DATABASE_STARTUP_ERROR_TITLE = "数据库启动失败"
+APPLICATION_STARTUP_ERROR_TITLE = "应用启动失败"
 
 
 def _database_startup_error_message(error: Exception) -> str:
@@ -38,13 +51,43 @@ def run_app(argv=None) -> int:
         )
         return 1
 
+    startup_failure = getattr(services, "startup_failure", None)
+    if type(startup_failure) is str and startup_failure.strip():
+        QMessageBox.critical(
+            None,
+            APPLICATION_STARTUP_ERROR_TITLE,
+            "应用初始化未完成，无法安全启动。\n\n"
+            f"错误信息：{startup_failure}",
+        )
+        services.shutdown()
+        return 1
+
     # 主窗口在登录成功后才创建；用变量持有引用，避免被 Python 回收导致界面消失。
     main_window = None
+    startup_exit_code = None
 
     def on_login_success(username: str, role: str):
         # 内层函数要修改外层变量时必须声明 nonlocal，否则赋值会变成局部变量。
-        nonlocal main_window
-        main_window = MainWindow(services)
+        nonlocal main_window, startup_exit_code
+        try:
+            main_window = MainWindow(services)
+        except Exception as exc:
+            startup_failure = getattr(services, "startup_failure", None)
+            reason = (
+                startup_failure
+                if type(startup_failure) is str and startup_failure.strip()
+                else f"main window startup: {exc}"
+            )[:512]
+            QMessageBox.critical(
+                None,
+                APPLICATION_STARTUP_ERROR_TITLE,
+                "应用初始化未完成，无法安全启动。\n\n"
+                f"错误信息：{reason}",
+            )
+            services.shutdown()
+            startup_exit_code = 1
+            app.exit(1)
+            return
         main_window.current_user_name = username
         main_window.current_user_role = role
         main_window.set_role()
@@ -52,6 +95,7 @@ def run_app(argv=None) -> int:
 
     def on_login_cancel():
         # 未登录就关闭登录框（点关闭按钮）：结束应用事件循环，进程退出。
+        services.shutdown()
         app.quit()
 
     # 登录框：校验通过后回调 on_login_success；关闭且未成功登录时回调 on_login_cancel。
@@ -62,6 +106,8 @@ def run_app(argv=None) -> int:
     )
     login_window.show()
 
+    if startup_exit_code is not None:
+        return startup_exit_code
     return app.exec()
 
 

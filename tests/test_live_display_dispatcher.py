@@ -5,9 +5,11 @@ import threading
 import time
 
 import numpy as np
+import pytest
 
-from app.service.analysis.frames import LoudnessFrame, SplFrame
+from app.service.analysis.frames import LoudnessFrame, SplFrame, StftFrame
 from app.service.analysis.live_display_dispatcher import LiveDisplayDispatcher
+from app.service.analysis.pipeline import AnalysisPipeline
 
 
 class _Signal:
@@ -189,6 +191,173 @@ class _EveryFramePipeline:
             "octave": f"octave-{value:g}",
             "fft": f"fft-{value:g}",
         }
+
+
+class _CoalescingPipeline:
+    channel_index = 0
+
+    def __init__(self):
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.processed_chunks: list[list[float]] = []
+
+    def process_chunk(self, mono, elapsed_time, *, compute_loudness=True):
+        values = np.asarray(mono).reshape(-1).astype(float).tolist()
+        self.processed_chunks.append(values)
+        if len(self.processed_chunks) == 1:
+            self.started.set()
+            assert self.release.wait(2.0)
+        return {
+            "stft_frames": [],
+            "stft": None,
+            "spl": None,
+            "loudness": None,
+            "octave": None,
+            "fft": None,
+        }
+
+
+class _TimedStftPipeline:
+    channel_index = 0
+
+    def __init__(self):
+        self.processed = 0
+
+    def process_chunk(self, mono, elapsed_time, *, compute_loudness=True):
+        self.processed += 1
+        return {
+            "stft_frames": [
+                StftFrame(
+                    time=float(elapsed_time),
+                    frequencies=np.array([100.0]),
+                    magnitudes=np.array([1.0]),
+                )
+            ],
+            "stft": None,
+            "spl": None,
+            "loudness": None,
+            "octave": None,
+            "fft": None,
+        }
+
+
+def test_optional_pending_coalescing_preserves_contiguous_samples():
+    bus = _Bus()
+    pipeline = _CoalescingPipeline()
+    dispatcher = LiveDisplayDispatcher(
+        pipelines=[pipeline],
+        bus=bus,
+        config_id=7,
+        max_queue_size=8,
+        coalesce_pending=True,
+    )
+
+    try:
+        dispatcher.submit(
+            np.array([[1.0]], dtype=np.float32),
+            elapsed_time=0.01,
+            frame_run_id="run-1",
+            live_loudness_channel_index=None,
+            sample_start=0,
+            sample_end=1,
+        )
+        assert pipeline.started.wait(1.0)
+        dispatcher.submit(
+            np.array([[2.0]], dtype=np.float32),
+            elapsed_time=0.02,
+            frame_run_id="run-1",
+            live_loudness_channel_index=None,
+            sample_start=1,
+            sample_end=2,
+        )
+        dispatcher.submit(
+            np.array([[3.0]], dtype=np.float32),
+            elapsed_time=0.03,
+            frame_run_id="run-1",
+            live_loudness_channel_index=None,
+            sample_start=2,
+            sample_end=3,
+        )
+        pipeline.release.set()
+        _wait_until(lambda: len(pipeline.processed_chunks) == 2)
+        assert pipeline.processed_chunks == [[1.0], [2.0, 3.0]]
+    finally:
+        pipeline.release.set()
+        dispatcher.stop()
+
+
+def test_pending_coalescing_keeps_every_sample_without_submit_thread_merging():
+    bus = _Bus()
+    pipeline = _CoalescingPipeline()
+    dispatcher = LiveDisplayDispatcher(
+        pipelines=[pipeline],
+        bus=bus,
+        config_id=7,
+        max_queue_size=2,
+        coalesce_pending=True,
+    )
+
+    try:
+        dispatcher.submit(
+            np.array([[0.0]], dtype=np.float32),
+            elapsed_time=0.01,
+            frame_run_id="run-1",
+            live_loudness_channel_index=None,
+            sample_start=0,
+            sample_end=1,
+        )
+        assert pipeline.started.wait(1.0)
+        for value in range(1, 7):
+            dispatcher.submit(
+                np.array([[float(value)]], dtype=np.float32),
+                elapsed_time=(value + 1) / 100.0,
+                frame_run_id="run-1",
+                live_loudness_channel_index=None,
+                sample_start=value,
+                sample_end=value + 1,
+            )
+            assert dispatcher.pending_count == value
+
+        pipeline.release.set()
+        assert dispatcher.wait_until_idle(2.0) is True
+        assert pipeline.processed_chunks == [
+            [0.0],
+            [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        ]
+        assert bus.log.calls == []
+    finally:
+        pipeline.release.set()
+        dispatcher.stop()
+
+
+def test_optional_stft_emit_interval_limits_ui_signal_rate():
+    bus = _Bus()
+    pipeline = _TimedStftPipeline()
+    dispatcher = LiveDisplayDispatcher(
+        pipelines=[pipeline],
+        bus=bus,
+        config_id=7,
+        stft_emit_interval_sec=0.05,
+    )
+
+    try:
+        for index, elapsed_time in enumerate((0.01, 0.03, 0.07)):
+            dispatcher.submit(
+                np.array([[float(index)]], dtype=np.float32),
+                elapsed_time=elapsed_time,
+                frame_run_id="run-1",
+                live_loudness_channel_index=None,
+                sample_start=index,
+                sample_end=index + 1,
+            )
+            _wait_until(lambda count=index + 1: pipeline.processed >= count)
+
+        _wait_until(lambda: len(bus.stft_updated.calls) == 2)
+        assert [
+            call[3].time for call in bus.stft_updated.calls
+        ] == pytest.approx([0.01, 0.07])
+    finally:
+        dispatcher.stop()
 
 
 def test_ordered_display_submission_processes_pending_chunks_fifo():
@@ -390,6 +559,63 @@ def test_sample_span_gap_resets_pipelines_before_later_chunk():
         assert pipeline.reset_snapshots == [[1]]
         assert [call[3].spl_db for call in bus.spl_updated.calls] == [1.0, 3.0]
         assert [call[3] for call in bus.stft_updated.calls] == ["stft-1", "stft-3"]
+    finally:
+        dispatcher.stop()
+
+
+def test_sample_span_gap_resets_complete_live_spl_detector_state():
+    sample_rate = 48_000.0
+    channel_config = {
+        "channel_index": 0,
+        "stft_nfft": 4096,
+        "fft_nfft": 4096,
+        "stft_overlap": 0.5,
+        "spl_weighting": "A",
+        "spl_time_constant": 0.125,
+        "oct_weighting": "Z",
+    }
+    pipeline = AnalysisPipeline(0, channel_config, sample_rate)
+    pristine = AnalysisPipeline(0, channel_config, sample_rate)
+    prefix = np.full(2400, 0.5, dtype=np.float64)
+    times = np.arange(2400, dtype=np.float64) / sample_rate
+    probe = 0.1 * np.sin(2.0 * np.pi * 31.5 * times)
+    expected = pristine.process_chunk(
+        probe,
+        elapsed_time=0.15,
+        compute_loudness=False,
+    )["spl"].spl_db
+    bus = _Bus()
+    dispatcher = LiveDisplayDispatcher(
+        pipelines=[pipeline],
+        bus=bus,
+        config_id=7,
+        max_queue_size=4,
+    )
+
+    try:
+        dispatcher.start()
+        assert dispatcher.submit(
+            prefix.reshape(-1, 1),
+            elapsed_time=0.05,
+            frame_run_id="run-1",
+            live_loudness_channel_index=None,
+            sample_start=0,
+            sample_end=2400,
+        ) is True
+        _wait_until(lambda: len(bus.spl_updated.calls) == 1)
+
+        assert dispatcher.submit(
+            probe.reshape(-1, 1),
+            elapsed_time=0.15,
+            frame_run_id="run-1",
+            live_loudness_channel_index=None,
+            sample_start=4800,
+            sample_end=7200,
+        ) is True
+        _wait_until(lambda: len(bus.spl_updated.calls) == 2)
+
+        actual = bus.spl_updated.calls[-1][3].spl_db
+        assert actual == pytest.approx(expected, abs=1e-12)
     finally:
         dispatcher.stop()
 

@@ -257,6 +257,7 @@ class TestTestManagerDisplayChannelRouting:
                 self._config = config
                 self.config_id = config["config_id"]
                 self._sample_rate = float(config.get("input_device_samplerate", 44100))
+                self._workorder = workorder
                 self._on_chunk = MagicMock()
                 self._live_loudness_channel_index = None
 
@@ -315,10 +316,12 @@ class TestTestManagerDisplayChannelRouting:
             _FakeRecorder,
         )
 
-        assert manager.start({"config_id": 1}) is True
+        assert manager.start({"config_id": 1, "rotation_speed": 1450}) is True
 
         assert events[:3] == ["setup", ("set_live", 1), "prepare"]
         assert manager._sessions[1]._live_loudness_channel_index == 1
+        assert manager._sessions[1]._workorder["rotation_speed"] == 1450
+        assert type(manager._sessions[1]._workorder["rotation_speed"]) is int
 
     def test_start_ignores_stored_display_channel_outside_selected_channels(
         self,
@@ -792,6 +795,55 @@ class TestTestSessionProcessing:
         assert pipeline._cfg["stft_nfft"] == _CHANNEL_DEFAULTS["stft_nfft"]
         assert pipeline._cfg["spl_weighting"] == _CHANNEL_DEFAULTS["spl_weighting"]
 
+    def test_setup_pipelines_creates_fresh_independent_spl_weighting_state(self):
+        config = _make_config()
+        config["input_device_samplerate"] = 48000
+        config["channels"][0]["spl_weighting"] = "A"
+        first_session = TestSession(
+            config=config,
+            bus=_make_mock_bus(),
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={},
+            audio_dir="/tmp/audio",
+        )
+        second_session = TestSession(
+            config=config,
+            bus=_make_mock_bus(),
+            ai_service=MagicMock(),
+            mic_cal={},
+            workorder={},
+            audio_dir="/tmp/audio",
+        )
+
+        first_session._setup_pipelines()
+        second_session._setup_pipelines()
+        try:
+            first_detector = first_session._pipelines[0]._spl_detector
+            second_detector = second_session._pipelines[0]._spl_detector
+            prefix = np.full(4000, 0.5, dtype=np.float64)
+            times = np.arange(9600, dtype=np.float64) / 48000.0
+            signal = (
+                np.sqrt(2.0)
+                * 20e-6
+                * (10.0 ** (94.0 / 20.0))
+                * np.sin(2.0 * np.pi * 31.5 * times)
+            )
+
+            first_detector.process(prefix)
+            actual = second_detector.process(signal)
+            pristine = dsp.SplDetector(48000.0, "A", 0.125).process(signal)
+
+            assert first_detector is not second_detector
+            assert (
+                first_detector._frequency_weighting
+                is not second_detector._frequency_weighting
+            )
+            assert actual == pytest.approx(pristine, abs=1e-12)
+        finally:
+            first_session.stop_live_display()
+            second_session.stop_live_display()
+
     def test_setup_pipelines_defaults_live_loudness_channel_to_first_selected_channel(self):
         bus = _make_mock_bus()
         ai = MagicMock()
@@ -823,7 +875,7 @@ class TestTestSessionProcessing:
         created_dispatchers = []
 
         class FakeLiveDisplayDispatcher(_CapturingLiveDisplayDispatcher):
-            def __init__(self, *, pipelines, bus, config_id):
+            def __init__(self, *, pipelines, bus, config_id, **_kwargs):
                 super().__init__()
                 self.pipelines = pipelines
                 self.bus = bus
@@ -871,7 +923,7 @@ class TestTestSessionProcessing:
         created_dispatchers = []
 
         class FakeLiveDisplayDispatcher(_CapturingLiveDisplayDispatcher):
-            def __init__(self, *, pipelines, bus, config_id):
+            def __init__(self, *, pipelines, bus, config_id, **_kwargs):
                 super().__init__()
                 self.pipelines = pipelines
                 self.bus = bus
@@ -1389,7 +1441,8 @@ class TestTestSessionJudgment:
         }
         session = TestSession(
             config=config, bus=bus, ai_service=ai,
-            mic_cal={}, workorder={"sn": "test", "model": "M"},
+            mic_cal={},
+            workorder={"sn": "test", "model": "M", "rotation_speed": 1450},
             audio_dir=str(tmp_path),
         )
         session._buffer = np.random.randn(44100, 1).astype(np.float32)
@@ -1409,7 +1462,13 @@ class TestTestSessionJudgment:
         kwargs = ai.run_ai_analysis.call_args.kwargs
         assert kwargs["config_id"] == session.config_id
         assert re.fullmatch(r"run_1_\d+", kwargs["test_run_id"])
-        assert kwargs["context"] == {"config_id": session.config_id, "workorder": session._workorder}
+        assert session._workorder["rotation_speed"] == 1450
+        assert type(session._workorder["rotation_speed"]) is int
+        assert kwargs["context"] == {
+            "config_id": session.config_id,
+            "workorder": {"sn": "test", "model": "M"},
+        }
+        assert kwargs["context"]["workorder"] is not session._workorder
         assert os.path.normpath(kwargs["ai_runs_dir"]).endswith(os.path.normpath("ai_runs"))
         assert len(kwargs["segments"]) == 1
         segment = kwargs["segments"][0]

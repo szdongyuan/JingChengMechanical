@@ -472,7 +472,7 @@ class TestTestManagerStartStop:
             config = _factory_runtime_config()
             config["selected_channels"] = [1, 3]
             config["monitor_channel_index"] = 2
-            config["monitor_gain_db"] = 6.5
+            config["monitor_gain_db"] = 35.0
             services.config_service.load_config.return_value = config
             _install_counting_runtime(monkeypatch)
             mgr = TestManager(bus, services)
@@ -483,7 +483,7 @@ class TestTestManagerStartStop:
             assert _CountingRecorder.instances[0]._n_channels == 4
             assert _CountingSession.instances[0]._config["selected_channels"] == [1, 3]
             assert _CountingMonitor.instances[0].monitor_channel == 2
-            assert _CountingMonitor.instances[0].gain_db == pytest.approx(6.5)
+            assert _CountingMonitor.instances[0].gain_db == pytest.approx(35.0)
 
             hardware_buffer = np.column_stack(
                 [np.full(5, channel, dtype=np.float32) for channel in range(4)]
@@ -562,7 +562,7 @@ class TestTestManagerStartStop:
             assert _CountingMonitor.instances == []
             bus.test_started.emit.assert_not_called()
 
-    @pytest.mark.parametrize("monitor_gain_db", [float("nan"), float("inf"), -60.1, 24.1, "6"])
+    @pytest.mark.parametrize("monitor_gain_db", [float("nan"), float("inf"), -60.1, 35.1, "6"])
     def test_start_rejects_invalid_monitor_gain_before_runtime_setup(
         self,
         monkeypatch,

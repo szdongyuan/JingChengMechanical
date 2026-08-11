@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QLabel,
     QPushButton,
+    QLineEdit,
     QScrollArea,
     QSpinBox,
     QTableWidget,
@@ -39,6 +40,7 @@ from app.service.config_package_service import (
 )
 from app.service.golden_sample_service import GoldenSampleService
 from model.channel_config_table import ChannelConfigTable
+from model.input_hardware_table import InputHardwareTable
 from model.plc_table import PlcTable
 from model.test_config_table import TestConfigTable as ConfigTable
 from ui.modules.config import ConfigModule
@@ -345,6 +347,17 @@ class _ManagedHardwareServiceStub:
         )
 
 
+def _create_valid_managed_input() -> InputHardwareTable:
+    return InputHardwareTable.create(
+        hardware_id=11,
+        alias="Managed input",
+        device_name="Interface A",
+        hostapi="ASIO",
+        samplerate=48_000,
+        channel_count=2,
+    )
+
+
 @contextmanager
 def _capture_qt_messages():
     messages: list[str] = []
@@ -472,6 +485,7 @@ def _detail_payload(
     config_id: int = 7,
     config_name: str = "Cfg1",
     plc_id: int | None = None,
+    fault_types: list[str] | None = None,
 ) -> dict:
     return {
         "config_id": config_id,
@@ -482,6 +496,7 @@ def _detail_payload(
         "allow_incomplete_recording_analysis": False,
         "scan_triggers_test": False,
         "plc_id": plc_id,
+        "fault_types": list(fault_types or []),
         "input_device_name": "Mic 1",
         "input_device_hostapi": "ASIO",
         "input_device_samplerate": 48000,
@@ -491,6 +506,128 @@ def _detail_payload(
         "selected_channels": [0],
         "channels": channels,
     }
+
+
+def _fault_editor_text_with_length(length: int) -> str:
+    names = [f"n{index}" for index in range(32)]
+    base = ",".join(names)
+    return names[0] + (" " * (length - len(base))) + "," + ",".join(names[1:])
+
+
+def test_fault_types_editor_is_single_global_comma_editor(qapp) -> None:
+    module = _make_module()
+
+    editor = module.findChild(QLineEdit, "fault_types_editor")
+
+    assert editor is module.fault_types_editor
+    assert _field_label_text(module, "fault_types_editor") == "故障类型"
+    assert editor.maxLength() > 4096
+
+
+def test_fault_types_editor_populates_collects_and_marks_dirty(qapp) -> None:
+    module = _make_module()
+    module._current_config_id = 7
+    module._populate_detail(
+        _detail_payload([], fault_types=["异响", "漏装"])
+    )
+
+    assert module.fault_types_editor.text() == "异响, 漏装"
+    assert module._collect_data()["fault_types"] == ["异响", "漏装"]
+    assert module._has_unsaved_changes() is False
+
+    module.fault_types_editor.setText(" 异响 , 划伤 ")
+
+    assert module._collect_data()["fault_types"] == ["异响", "划伤"]
+    assert module._has_unsaved_changes() is True
+
+
+def test_fault_types_editor_uses_python_code_point_bound_without_qt_truncation(
+    qapp,
+) -> None:
+    module = _make_module()
+    module._current_config_id = 7
+    module._populate_detail(_detail_payload([]))
+    valid = _fault_editor_text_with_length(4096)
+    module.fault_types_editor.setText(valid)
+
+    assert module.fault_types_editor.text() == valid
+    assert len(module._collect_data()["fault_types"]) == 32
+
+    invalid = _fault_editor_text_with_length(4097)
+    module.fault_types_editor.setText(invalid)
+    assert module.fault_types_editor.text() == invalid
+    with pytest.raises(ValueError):
+        module._collect_data()
+
+
+def test_fault_types_editor_preserves_text_beyond_qt_default_limit_for_python_validation(
+    qapp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ui.modules.config as config_module
+
+    module = _make_module()
+    module._current_config_id = 7
+    original = (" " * 40_000) + "X"
+    parser_inputs: list[str] = []
+    real_parser = config_module.parse_fault_types_editor
+
+    def _recording_parser(value: str) -> list[str]:
+        parser_inputs.append(value)
+        return real_parser(value)
+
+    monkeypatch.setattr(
+        config_module,
+        "parse_fault_types_editor",
+        _recording_parser,
+    )
+
+    module.fault_types_editor.setText(original)
+    collected = module._collect_data()
+
+    assert module.fault_types_editor.maxLength() > len(original)
+    assert module.fault_types_editor.text() == original
+    assert parser_inputs == [original]
+    assert collected["fault_types"] == ["X"]
+
+
+def test_fault_types_save_uses_authoritative_normalized_reload(
+    qapp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(
+        base_mod,
+        "db",
+        SimpleNamespace(atomic=lambda: nullcontext()),
+    )
+    config_service = _ConfigServiceStub(
+        loaded_configs={
+            7: _detail_payload([], fault_types=["旧类型"]),
+        }
+    )
+    module = _make_module(config_service=config_service)
+    module._current_config_id = 7
+    module._populate_detail(config_service.load_config(7))
+    module.fault_types_editor.setText(" 异响 , 漏装 ")
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.information",
+        lambda *args: None,
+    )
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    saved = module._save_current_config()
+
+    assert saved is True, warnings
+    assert warnings == []
+    assert config_service.saved_configs[0]["fault_types"] == ["异响", "漏装"]
+    assert module.fault_types_editor.text() == "异响, 漏装"
+    assert module._has_unsaved_changes() is False
 
 
 def _package_preview(
@@ -736,8 +873,9 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_id(qapp):
         "output_device_name",
         "output_device_hostapi",
         "output_device_samplerate",
-        "selected_channels",
-        "monitor_channel_index",
+            "selected_channels",
+            "fault_types",
+            "monitor_channel_index",
         "vibration_view_channel_index",
         "monitor_gain_db",
         "current_meter",
@@ -826,18 +964,18 @@ def test_top_level_config_launchers_include_result_dashboard_layout(qapp):
 
 def test_result_dashboard_layout_dialog_confirm_stages_without_saving(qapp):
     layout = {
-        "version": 1,
+        "version": 2,
         "columns": 1,
         "rows": 1,
         "panels": [
             {
-                "id": "summary",
-                "type": "result_summary",
+                "id": "spectrum",
+                "type": "spectrum",
                 "row": 0,
                 "column": 0,
                 "row_span": 1,
                 "column_span": 1,
-                "channel": "none",
+                "channel": "primary_acoustic",
             }
         ],
     }
@@ -865,18 +1003,18 @@ def test_result_dashboard_layout_confirm_marks_config_dirty_for_leave_prompt(
     qapp, monkeypatch
 ):
     layout = {
-        "version": 1,
+        "version": 2,
         "columns": 1,
         "rows": 1,
         "panels": [
             {
-                "id": "summary",
-                "type": "result_summary",
+                "id": "spectrum",
+                "type": "spectrum",
                 "row": 0,
                 "column": 0,
                 "row_span": 1,
                 "column_span": 1,
-                "channel": "none",
+                "channel": "primary_acoustic",
             }
         ],
     }
@@ -909,18 +1047,18 @@ def test_result_dashboard_layout_confirm_marks_config_dirty_for_leave_prompt(
 
 def test_result_dashboard_layout_dialog_x_discards_unconfirmed_edits(qapp):
     layout = {
-        "version": 1,
+        "version": 2,
         "columns": 1,
         "rows": 1,
         "panels": [
             {
-                "id": "summary",
-                "type": "result_summary",
+                "id": "spectrum",
+                "type": "spectrum",
                 "row": 0,
                 "column": 0,
                 "row_span": 1,
                 "column_span": 1,
-                "channel": "none",
+                "channel": "primary_acoustic",
             }
         ],
     }
@@ -945,7 +1083,7 @@ def test_result_dashboard_layout_dialog_x_discards_unconfirmed_edits(qapp):
     data = module._collect_data()
     assert data["result_dashboard_layout"]["rows"] == 1
     assert [panel["id"] for panel in data["result_dashboard_layout"]["panels"]] == [
-        "summary"
+        "spectrum"
     ]
     assert config_service.begin_calls == 0
 
@@ -969,12 +1107,12 @@ def test_malformed_loaded_result_dashboard_layout_stays_invalid_until_dialog_con
     editor = module.findChild(
         ResultDashboardLayoutEditor, "result_dashboard_layout_editor"
     )
-    assert editor.layout_data()["panels"][0]["id"] == "summary"
+    assert editor.layout_data()["panels"][0]["id"] == "stft_acoustic"
     module.findChild(QPushButton, "TopLevelConfigCardConfirmButton").click()
 
     data = module._collect_data()
     assert isinstance(data["result_dashboard_layout"], dict)
-    assert data["result_dashboard_layout"]["panels"][0]["id"] == "summary"
+    assert data["result_dashboard_layout"]["panels"][0]["id"] == "stft_acoustic"
 
 
 def _expected_centered_dialog_pos(dialog: QDialog, owner: QWidget) -> QPoint:
@@ -1606,7 +1744,7 @@ def test_hardware_card_exposes_monitor_controls_and_channel_options(qapp):
     ]
     assert [module.combo_monitor_channel.itemData(i) for i in range(4)] == [0, 1, 2, 3]
     assert module.spin_monitor_gain_db.minimum() == pytest.approx(-60.0)
-    assert module.spin_monitor_gain_db.maximum() == pytest.approx(24.0)
+    assert module.spin_monitor_gain_db.maximum() == pytest.approx(35.0)
     assert module.spin_monitor_gain_db.singleStep() == pytest.approx(1.0)
     assert module.spin_monitor_gain_db.decimals() == 1
     assert module.spin_monitor_gain_db.suffix() == " dB"
@@ -4405,9 +4543,11 @@ def test_outer_transaction_failure_after_begin_save_config_rolls_back_promotions
     )
     golden_service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
     config_service = ConfigService(bus, golden_sample_service=golden_service)
+    managed_input = _create_valid_managed_input()
 
     config_id = ConfigTable.create(
         config_name="Cfg1",
+        input_hardware_device_id=managed_input.hardware_id,
         input_device_name="Mic 1",
         input_device_hostapi="ASIO",
         input_device_samplerate=48_000,
@@ -4441,6 +4581,7 @@ def test_outer_transaction_failure_after_begin_save_config_rolls_back_promotions
         config_id=config_id,
     )
     payload["selected_channels"] = [0]
+    payload["input_hardware_device_id"] = managed_input.hardware_id
     payload["golden_editor_state"] = {
         0: _staged_golden_binding(
             staged_path,
@@ -4569,8 +4710,10 @@ def test_post_commit_failure_reloads_authoritative_config_list_and_detail(
         status=_SignalStub(),
         config_changed=_SignalStub(),
     )
+    managed_input = _create_valid_managed_input()
     config_id = ConfigTable.create(
         config_name="Cfg1",
+        input_hardware_device_id=managed_input.hardware_id,
         input_device_name="Mic 1",
         input_device_hostapi="ASIO",
         input_device_samplerate=48_000,
@@ -4587,7 +4730,7 @@ def test_post_commit_failure_reloads_authoritative_config_list_and_detail(
     module = _make_module(
         config_service=config_service,
         ai_service=_AiServiceStub(),
-        hardware_service=_HardwareServiceStub(),
+        hardware_service=_ManagedHardwareServiceStub(),
         bus=bus,
     )
 
@@ -4636,15 +4779,17 @@ def test_post_commit_commit_pending_save_failure_keeps_new_authoritative_replace
     )
     golden_service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
     config_service = ConfigService(bus, golden_sample_service=golden_service)
+    managed_input = _create_valid_managed_input()
     module = _make_module(
         config_service=config_service,
         ai_service=_AiServiceStub(),
-        hardware_service=_HardwareServiceStub(),
+        hardware_service=_ManagedHardwareServiceStub(),
         bus=bus,
     )
 
     config_id = ConfigTable.create(
         config_name="Cfg1",
+        input_hardware_device_id=managed_input.hardware_id,
         input_device_name="Mic 1",
         input_device_hostapi="ASIO",
         input_device_samplerate=48_000,
@@ -4728,15 +4873,17 @@ def test_post_commit_reload_failure_keeps_new_authoritative_replacement_binding(
     )
     golden_service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
     config_service = ConfigService(bus, golden_sample_service=golden_service)
+    managed_input = _create_valid_managed_input()
     module = _make_module(
         config_service=config_service,
         ai_service=_AiServiceStub(),
-        hardware_service=_HardwareServiceStub(),
+        hardware_service=_ManagedHardwareServiceStub(),
         bus=bus,
     )
 
     config_id = ConfigTable.create(
         config_name="Cfg1",
+        input_hardware_device_id=managed_input.hardware_id,
         input_device_name="Mic 1",
         input_device_hostapi="ASIO",
         input_device_samplerate=48_000,
@@ -4820,15 +4967,17 @@ def test_post_commit_reload_failure_keeps_new_authoritative_cleared_binding(
     )
     golden_service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
     config_service = ConfigService(bus, golden_sample_service=golden_service)
+    managed_input = _create_valid_managed_input()
     module = _make_module(
         config_service=config_service,
         ai_service=_AiServiceStub(),
-        hardware_service=_HardwareServiceStub(),
+        hardware_service=_ManagedHardwareServiceStub(),
         bus=bus,
     )
 
     config_id = ConfigTable.create(
         config_name="Cfg1",
+        input_hardware_device_id=managed_input.hardware_id,
         input_device_name="Mic 1",
         input_device_hostapi="ASIO",
         input_device_samplerate=48_000,

@@ -11,12 +11,14 @@ from app.service.current_meter_service import (
     PlcCurrentCollector,
     build_current_trace_payload,
     current_meter_display_unit,
+    current_samples_to_trace,
     current_trace_display_at_time,
     decode_current_registers,
     normalize_current_meter_config,
     rebase_current_samples,
     validate_current_meter_config,
 )
+from app.service.run_persistence import CurrentTrace
 from app.services_container import EventBus
 
 
@@ -26,6 +28,28 @@ class _ReadResult:
 
     def isError(self) -> bool:
         return False
+
+
+def test_current_samples_to_trace_is_strict_ordered_and_inference_free():
+    assert current_samples_to_trace([]) is None
+    trace = current_samples_to_trace(
+        [
+            CurrentSample(0.0, 1.25),
+            CurrentSample(0.1, 1.5),
+        ]
+    )
+    assert trace == CurrentTrace(samples=((0.0, 1.25), (0.1, 1.5)))
+
+    invalid_values = (
+        (CurrentSample(0.1, 1.0), CurrentSample(0.0, 2.0)),
+        (CurrentSample(0.0, 1.0), CurrentSample(0.0, 2.0)),
+        (CurrentSample(-0.1, 1.0),),
+        (CurrentSample(True, 1.0),),
+        ({"time_sec": 0.0, "current_a": 1.0},),
+    )
+    for samples in invalid_values:
+        with pytest.raises(ValueError):
+            current_samples_to_trace(list(samples))
 
 
 class _ClientStub:
@@ -418,6 +442,18 @@ def test_current_meter_collector_poll_once_records_decoded_current():
     ]
 
 
+def test_current_meter_collector_uses_explicit_audio_time_origin():
+    collector = CurrentMeterCollector(
+        {"enabled": True, "source": "modbus_tcp", "host": "127.0.0.1"},
+        time_func=lambda: 10.4,
+        time_origin=10.0,
+    )
+    collector._start_time = collector._time_origin
+    collector._poll_once(_ClientStub([0x0001]))
+
+    assert collector.samples()[0].time_sec == pytest.approx(0.4)
+
+
 def test_current_meter_collector_failed_decode_does_not_take_completion_clock():
     client = _ClientStub([])
     clock_calls = []
@@ -698,6 +734,36 @@ def test_current_meter_collector_stop_waits_for_in_flight_read_before_returning(
         stopper.join(timeout=2.0)
 
 
+def test_current_meter_collector_stop_timeout_reports_live_worker():
+    client = _BlockingReadClientStub([0x066A])
+    collector = CurrentMeterCollector(
+        {
+            "enabled": True,
+            "host": "192.168.1.20",
+            "poll_interval_ms": 20,
+            "timeout_ms": 2000,
+        },
+        client_factory=lambda *args, **kwargs: client,
+    )
+
+    assert collector.start() is True
+    assert client.read_started.wait(timeout=2.0)
+    try:
+        with pytest.raises(
+            TimeoutError,
+            match="current collector stop timed out",
+        ):
+            collector.stop(timeout=0.01)
+        assert collector._thread is not None
+        assert collector._thread.is_alive()
+    finally:
+        client.release_read.set()
+        collector.stop(timeout=2.0)
+
+    assert collector._thread is not None
+    assert not collector._thread.is_alive()
+
+
 def test_plc_current_collector_filters_plc_id_and_accumulates_zero_value():
     bus = EventBus()
     callbacks = []
@@ -719,8 +785,8 @@ def test_plc_current_collector_filters_plc_id_and_accumulates_zero_value():
     assert collector.samples() == [expected]
     assert callbacks == [(expected, (expected,))]
     assert collector.trace_payload() == {
-        "times_sec": [0.25],
-        "values_a": [0.0],
+        "times_sec": [0.0, 0.25],
+        "values_a": [0.0, 0.0],
         "average_a": 0.0,
         "max_a": 0.0,
         "latest_a": 0.0,
@@ -730,6 +796,25 @@ def test_plc_current_collector_filters_plc_id_and_accumulates_zero_value():
     collector.stop()
     bus.plc_current_sampled.emit(7, 10.5, 1.0)
     assert collector.samples() == [expected]
+
+
+def test_plc_current_collector_uses_explicit_audio_time_origin():
+    bus = EventBus()
+    collector = PlcCurrentCollector(
+        {"enabled": True, "source": "plc"},
+        bus=bus,
+        plc_id=7,
+        time_func=lambda: 10.4,
+        time_origin=10.0,
+    )
+
+    assert collector.start() is True
+    bus.plc_current_sampled.emit(7, 10.5, 2.0)
+    collector.stop()
+
+    assert collector.samples() == [
+        CurrentSample(time_sec=0.5, current_a=2.0, monotonic_time=10.5)
+    ]
 
 
 def test_plc_current_collector_requires_enabled_plc_source():

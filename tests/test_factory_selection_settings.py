@@ -3,6 +3,7 @@ from __future__ import annotations
 import app.service.factory_selection_settings as factory_selection_settings_module
 from app.service.factory_selection_settings import FactorySelectionSettings
 from PyQt6.QtCore import QSettings
+import pytest
 
 
 class _FakeSettings:
@@ -17,6 +18,89 @@ class _FakeSettings:
 
     def sync(self) -> None:
         pass
+
+    def remove(self, key: str) -> None:
+        self._values.pop(key, None)
+
+
+def test_selection_lease_rejects_committed_settings_save() -> None:
+    raw = _FakeSettings()
+    settings = FactorySelectionSettings(raw)
+    assert settings.save_selected_config_ids((101,)) is None
+    generation, ids = settings.load_committed_selection()
+    lease = settings.acquire_selection_lease(generation, ids)
+
+    assert settings.save_selected_config_ids((202,)) == (
+        "当前测试使用的配置选择已固定，暂时无法更改。"
+    )
+    assert settings.load_committed_selection() == (generation, ids)
+    settings.release_selection_lease(lease)
+
+
+def test_selection_lease_allows_nonempty_subset_of_prepared_configs() -> None:
+    raw = _FakeSettings()
+    settings = FactorySelectionSettings(raw)
+    assert settings.save_selected_config_ids((101, 202)) is None
+    generation, ids = settings.load_committed_selection()
+    lease = settings.acquire_selection_lease(generation, ids)
+
+    assert settings.save_selected_config_ids((202,)) is None
+    next_generation, next_ids = settings.load_committed_selection()
+    assert next_generation == generation + 1
+    assert next_ids == (202,)
+    assert settings.save_selected_config_ids(()) == (
+        "请至少保留一个配置；空选择不会保存。"
+    )
+    assert settings.load_committed_selection() == (
+        next_generation,
+        next_ids,
+    )
+    settings.release_selection_lease(lease)
+
+
+def test_selection_lease_generation_and_release_are_exact() -> None:
+    raw = _FakeSettings()
+    settings = FactorySelectionSettings(raw)
+    assert settings.save_selected_config_ids((303, 101)) is None
+    generation, ids = settings.load_committed_selection()
+
+    with pytest.raises(ValueError, match="authoritative selection"):
+        settings.acquire_selection_lease(generation + 1, ids)
+    lease = settings.acquire_selection_lease(generation, ids)
+    with pytest.raises(ValueError, match="active"):
+        settings.acquire_selection_lease(generation, ids)
+    with pytest.raises(ValueError, match="lease"):
+        settings.release_selection_lease(object())
+    settings.release_selection_lease(lease)
+    with pytest.raises(ValueError, match="lease"):
+        settings.release_selection_lease(lease)
+    next_lease = settings.acquire_selection_lease(generation, ids)
+    assert next_lease is not lease
+    settings.release_selection_lease(next_lease)
+
+
+def test_selection_lease_is_process_local_and_exclusive_across_holders() -> None:
+    raw = _FakeSettings()
+    first_holder = FactorySelectionSettings(raw)
+    second_holder = FactorySelectionSettings(raw)
+    assert first_holder.save_selected_config_ids((101, 202)) is None
+    generation, ids = first_holder.load_committed_selection()
+    lease = first_holder.acquire_selection_lease(generation, ids)
+
+    try:
+        with pytest.raises(ValueError, match="active"):
+            second_holder.acquire_selection_lease(generation, ids)
+        assert second_holder.save_selected_config_ids((303,)) == (
+            "当前测试使用的配置选择已固定，暂时无法更改。"
+        )
+        with pytest.raises(ValueError, match="lease"):
+            second_holder.release_selection_lease(object())
+    finally:
+        first_holder.release_selection_lease(lease)
+
+    next_lease = second_holder.acquire_selection_lease(generation, ids)
+    assert next_lease is not lease
+    second_holder.release_selection_lease(next_lease)
 
 
 class _ExplodingSettings:
@@ -380,3 +464,144 @@ def test_factory_selection_settings_default_usage_treats_committed_status_error_
 
     reopened_store = FactorySelectionSettings()
     assert reopened_store.load_selected_config_ids() == (101, 202)
+
+
+def test_pending_selection_distinguishes_missing_from_empty_and_can_be_cleared():
+    raw = _FakeSettings()
+    store = FactorySelectionSettings(raw)
+
+    assert store.load_pending_selected_config_ids() is None
+    assert store.save_pending_selected_config_ids(()) is None
+    assert store.load_pending_selected_config_ids() == ()
+    assert store.save_pending_selected_config_ids((303, 101)) is None
+    assert store.load_pending_selected_config_ids() == (303, 101)
+
+    store.clear_pending_selected_config_ids()
+
+    assert store.load_pending_selected_config_ids() is None
+
+
+@pytest.mark.parametrize(
+    "invalid_ids",
+    [
+        (101, 101),
+        (True,),
+        ("101",),
+    ],
+)
+def test_pending_selection_rejects_duplicates_and_non_exact_integers(
+    invalid_ids,
+):
+    raw = _FakeSettings()
+    store = FactorySelectionSettings(raw)
+    assert store.save_pending_selected_config_ids((303,)) is None
+
+    error = store.save_pending_selected_config_ids(invalid_ids)
+
+    assert error == "下次启动配置选择无效"
+    assert store.load_pending_selected_config_ids() == (303,)
+
+
+def test_pending_selection_reports_write_failure_in_chinese():
+    store = FactorySelectionSettings(settings=_ExplodingSettings())
+
+    assert (
+        store.save_pending_selected_config_ids((101, 202))
+        == "下次启动配置保存失败"
+    )
+
+
+@pytest.mark.parametrize(
+    "sync_outcome",
+    [
+        (QSettings.Status.AccessError, True),
+        (QSettings.Status.NoError, False),
+    ],
+)
+def test_pending_selection_reports_sync_or_readback_failure(sync_outcome):
+    store = FactorySelectionSettings(
+        settings=_SharedBackingSettings(
+            backing={},
+            sync_outcomes=[sync_outcome],
+        )
+    )
+
+    assert (
+        store.save_pending_selected_config_ids((101, 202))
+        == "下次启动配置保存失败"
+    )
+
+
+def test_reconcile_for_startup_prefers_pending_and_prunes_missing_duplicates():
+    raw = _FakeSettings()
+    store = FactorySelectionSettings(raw)
+    assert store.save_selected_config_ids((101, 202)) is None
+    raw.setValue(
+        FactorySelectionSettings.PENDING_SETTINGS_KEY,
+        "[303,303,999,202]",
+    )
+
+    selected = store.reconcile_for_startup((202, 303, 404))
+
+    assert selected == (303, 202)
+    assert store.load_selected_config_ids() == (303, 202)
+    assert store.load_pending_selected_config_ids() is None
+
+
+def test_reconcile_for_startup_falls_back_to_first_existing_config():
+    raw = _FakeSettings()
+    store = FactorySelectionSettings(raw)
+    assert store.save_selected_config_ids((999,)) is None
+
+    selected = store.reconcile_for_startup((404, 303))
+
+    assert selected == (404,)
+    assert store.load_selected_config_ids() == (404,)
+
+
+def test_reconcile_for_startup_keeps_generation_when_selection_is_unchanged():
+    raw = _FakeSettings()
+    store = FactorySelectionSettings(raw)
+    assert store.save_selected_config_ids((303, 101)) is None
+    generation, _ = store.load_committed_selection()
+    assert store.save_pending_selected_config_ids((303, 101)) is None
+
+    selected = store.reconcile_for_startup((101, 303))
+
+    assert selected == (303, 101)
+    assert store.load_committed_selection() == (generation, (303, 101))
+    assert store.load_pending_selected_config_ids() is None
+
+
+@pytest.mark.parametrize(
+    "existing_ids",
+    [
+        (101, 101),
+        (0,),
+        (-1,),
+        (True,),
+        ("101",),
+    ],
+)
+def test_reconcile_for_startup_rejects_invalid_existing_ids(existing_ids):
+    store = FactorySelectionSettings(_FakeSettings())
+
+    with pytest.raises(ValueError, match="existing config IDs"):
+        store.reconcile_for_startup(existing_ids)
+
+
+def test_reconcile_for_startup_keeps_pending_when_commit_fails(monkeypatch):
+    raw = _FakeSettings()
+    store = FactorySelectionSettings(raw)
+    assert store.save_selected_config_ids((101,)) is None
+    assert store.save_pending_selected_config_ids((202,)) is None
+    monkeypatch.setattr(
+        store,
+        "_save_selected_config_ids_locked",
+        lambda config_ids: "配置保存失败",
+    )
+
+    with pytest.raises(RuntimeError, match="配置保存失败"):
+        store.reconcile_for_startup((101, 202))
+
+    assert store.load_pending_selected_config_ids() == (202,)

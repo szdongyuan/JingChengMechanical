@@ -114,7 +114,7 @@ def test_replay_selection_maps_display_channel_slices_segment_and_passes_gain():
         buffer=buffer,
         sample_rate=10.0,
         real_to_logical_channel={3: 0, 1: 1},
-        monitor_gain_db=-9.5,
+        monitor_gain_db=35.0,
     )
     mgr._completed_sessions[1] = session
 
@@ -130,7 +130,7 @@ def test_replay_selection_maps_display_channel_slices_segment_and_passes_gain():
     assert call["sample_rate"] == pytest.approx(10.0)
     assert call["device_name"] == "Speaker"
     assert call["hostapi"] == "MME"
-    assert call["gain_db"] == pytest.approx(-9.5)
+    assert call["gain_db"] == pytest.approx(35.0)
     assert callable(call["error_callback"])
     session.rejudge.assert_not_called()
     session._run_judgment.assert_not_called()

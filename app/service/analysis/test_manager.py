@@ -4470,7 +4470,7 @@ class TestManager(QObject):
 
         return {
             "finished": True,
-            "error_code": "0",
+            "error_code": 0,
             "sn_code": cls._session_sn_code(session),
             "test_result": passed,
             "score": cls._plc_float_value(score),

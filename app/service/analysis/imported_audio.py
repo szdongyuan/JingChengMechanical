@@ -1189,6 +1189,17 @@ def _add_imported_stft_payload(
                     for freq in np.asarray(frequencies_hz, dtype=np.float64)
                 ],
                 "magnitude_db": np.asarray(magnitude_db, dtype=np.float64),
+                "stft_color_scale_enabled": bool(
+                    channel_config.get("stft_color_scale_enabled", False)
+                ),
+                "stft_color_scale_min_db": channel_config.get(
+                    "stft_color_scale_min_db",
+                    -120.0,
+                ),
+                "stft_color_scale_max_db": channel_config.get(
+                    "stft_color_scale_max_db",
+                    0.0,
+                ),
             }
             if "stft_score" not in channel_payload:
                 try:

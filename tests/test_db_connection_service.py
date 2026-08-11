@@ -19,7 +19,7 @@ EXPECTED_RUNTIME_TABLES = {
     "test_config_ai_binding_table",
     "ai_execution_table",
     "device_table",
-    "input_hardware_table",
+    "managed_audio_input_table",
     "audio_data_table",
     "users_table",
     "system_info_table",
@@ -88,6 +88,7 @@ CHANNEL_CONFIG_COLUMN_SQL = {
 
 
 TEST_CONFIG_COLUMN_SQL = {
+    "fault_types_json": "TEXT NOT NULL DEFAULT '[]'",
     "input_hardware_device_id": "INTEGER DEFAULT NULL",
     "vibration_view_channel_index": "INTEGER DEFAULT NULL",
     "result_dashboard_layout": "TEXT DEFAULT NULL",
@@ -109,8 +110,124 @@ TEST_CONFIG_COLUMN_SQL = {
 }
 
 
+def test_runtime_schema_requires_managed_input_without_legacy_hardware_fallback():
+    service = svc_mod.DbConnectionService()
+    assert "managed_audio_input_table" in service.REQUIRED_RUNTIME_TABLES
+    assert "input_hardware_table" not in service.REQUIRED_RUNTIME_TABLES
+    assert service._REQUIRED_MANAGED_AUDIO_INPUT_COLUMNS == {
+        "hardware_id",
+        "alias",
+        "hardware_revision",
+        "stable_backend_uid",
+        "descriptor_device_name",
+        "descriptor_hostapi_name",
+        "descriptor_sample_rate_hz",
+        "descriptor_input_channels",
+        "calibration_revision",
+        "calibration_json",
+        "created_time",
+        "updated_time",
+    }
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        None,
+        "TEXT DEFAULT '[]'",
+        "INTEGER NOT NULL DEFAULT '[]'",
+        "TEXT NOT NULL DEFAULT '{}'",
+        'TEXT NOT NULL DEFAULT "[]"',
+    ],
+)
+def test_connect_requires_exact_fault_types_column_without_mutating(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    definition: str | None,
+) -> None:
+    db_path = tmp_path / "jingchen.db"
+    tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    tmp_db.connect()
+    for table_name in sorted(EXPECTED_RUNTIME_TABLES - {"test_config_table"}):
+        _create_table(tmp_db, table_name)
+    columns = dict(TEST_CONFIG_COLUMN_SQL)
+    if definition is None:
+        columns.pop("fault_types_json")
+    else:
+        columns["fault_types_json"] = definition
+    column_sql = ", ".join(
+        f"{name} {column_definition}"
+        for name, column_definition in columns.items()
+    )
+    tmp_db.execute_sql(
+        f"CREATE TABLE test_config_table (id INTEGER PRIMARY KEY, {column_sql})"
+    )
+    tmp_db.execute_sql("INSERT INTO test_config_table (id) VALUES (1)")
+    before = tmp_db.execute_sql("PRAGMA table_info(test_config_table)").fetchall()
+    tmp_db.close()
+    monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    with pytest.raises(DatabaseStartupError, match="fault_types_json"):
+        svc_mod.DbConnectionService().connect()
+
+    check_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    check_db.connect()
+    try:
+        assert check_db.execute_sql(
+            "PRAGMA table_info(test_config_table)"
+        ).fetchall() == before
+        assert check_db.execute_sql(
+            "SELECT id FROM test_config_table"
+        ).fetchall() == [(1,)]
+    finally:
+        check_db.close()
+
+
+def test_connect_rejects_fault_types_column_in_primary_key_without_mutating(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    db_path = tmp_path / "jingchen.db"
+    tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    tmp_db.connect()
+    for table_name in sorted(EXPECTED_RUNTIME_TABLES - {"test_config_table"}):
+        _create_table(tmp_db, table_name)
+    columns = dict(TEST_CONFIG_COLUMN_SQL)
+    columns["fault_types_json"] = "TEXT NOT NULL DEFAULT '[]' PRIMARY KEY"
+    column_sql = ", ".join(
+        f"{name} {column_definition}"
+        for name, column_definition in columns.items()
+    )
+    tmp_db.execute_sql(
+        f"CREATE TABLE test_config_table (id INTEGER, {column_sql})"
+    )
+    tmp_db.execute_sql("INSERT INTO test_config_table (id) VALUES (1)")
+    before = tmp_db.execute_sql("PRAGMA table_info(test_config_table)").fetchall()
+    tmp_db.close()
+    monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    with pytest.raises(DatabaseStartupError, match="fault_types_json"):
+        svc_mod.DbConnectionService().connect()
+
+    check_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    check_db.connect()
+    try:
+        assert check_db.execute_sql(
+            "PRAGMA table_info(test_config_table)"
+        ).fetchall() == before
+        assert check_db.execute_sql(
+            "SELECT id, fault_types_json FROM test_config_table"
+        ).fetchall() == [(1, "[]")]
+    finally:
+        check_db.close()
+
+
 PLC_FIELD_OFFSET_COLUMN_SQL = {
     "current_value_offset": "TEXT DEFAULT NULL",
+    "rotation_speed_offset": "TEXT DEFAULT NULL",
+    "res_testing_signal_offset": "TEXT DEFAULT NULL",
 }
 
 
@@ -175,17 +292,20 @@ def _create_historical_metric_cache_indexes(tmp_db: SqliteDatabase) -> None:
 
 
 def _create_table(tmp_db: SqliteDatabase, table_name: str) -> None:
-    if table_name == "input_hardware_table":
+    if table_name == "managed_audio_input_table":
         tmp_db.execute_sql(
             """
-            CREATE TABLE input_hardware_table (
+            CREATE TABLE managed_audio_input_table (
                 hardware_id INTEGER PRIMARY KEY,
                 alias TEXT NOT NULL,
-                device_name TEXT NOT NULL,
-                hostapi TEXT NOT NULL,
-                samplerate REAL NOT NULL,
-                channel_count INTEGER NOT NULL,
-                mic_cal TEXT NOT NULL,
+                hardware_revision INTEGER NOT NULL,
+                stable_backend_uid TEXT,
+                descriptor_device_name TEXT NOT NULL,
+                descriptor_hostapi_name TEXT NOT NULL,
+                descriptor_sample_rate_hz REAL NOT NULL,
+                descriptor_input_channels INTEGER NOT NULL,
+                calibration_revision INTEGER NOT NULL,
+                calibration_json TEXT NOT NULL,
                 created_time TEXT NOT NULL,
                 updated_time TEXT NOT NULL
             )
@@ -637,6 +757,53 @@ def test_connect_rejects_missing_plc_current_value_offset_without_mutating(
         assert check_db.execute_sql(
             "SELECT plc_id FROM plc_field_offset_table"
         ).fetchall() == [(9,)]
+    finally:
+        check_db.close()
+
+
+def test_connect_rejects_missing_optional_plc_protocol_columns_without_mutating(
+    monkeypatch,
+    tmp_path,
+):
+    db_path = tmp_path / "jingchen.db"
+    tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    tmp_db.connect()
+    _create_runtime_tables(tmp_db)
+    tmp_db.execute_sql("DROP TABLE plc_field_offset_table")
+    tmp_db.execute_sql(
+        """
+        CREATE TABLE plc_field_offset_table (
+            plc_id INTEGER PRIMARY KEY,
+            current_value_offset TEXT DEFAULT NULL
+        )
+        """
+    )
+    tmp_db.execute_sql(
+        """
+        INSERT INTO plc_field_offset_table (plc_id, current_value_offset)
+        VALUES (9, '2.0')
+        """
+    )
+    tmp_db.close()
+    monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    with pytest.raises(DatabaseStartupError, match="rotation_speed_offset"):
+        svc_mod.DbConnectionService().connect()
+
+    check_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    check_db.connect()
+    try:
+        assert _table_column_names(check_db, "plc_field_offset_table") == [
+            "plc_id",
+            "current_value_offset",
+        ]
+        assert check_db.execute_sql(
+            """
+            SELECT plc_id, current_value_offset
+            FROM plc_field_offset_table
+            """
+        ).fetchall() == [(9, "2.0")]
     finally:
         check_db.close()
 

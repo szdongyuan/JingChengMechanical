@@ -10,3 +10,7 @@ image.png
 data/
 build/
 dist/
+.packaging-venv312/
+packaging/
+release/
+.test-temp-*/

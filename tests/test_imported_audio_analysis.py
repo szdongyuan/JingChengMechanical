@@ -162,7 +162,7 @@ def _patch_imported_chart_backends(monkeypatch):
     ref_db = 20.0 * math.log10(20e-6)
     monkeypatch.setattr(
         "app.service.analysis.review_payloads.dsp.compute_spl_trace",
-        lambda signal, sample_rate, weighting, time_constant, *, chunk_duration: (
+        lambda signal, sample_rate, weighting, time_constant, **kwargs: (
             [0.05],
             [70.0],
         ),
@@ -315,6 +315,61 @@ def test_normalize_float_wav_preserves_values():
     normalized = imported_audio.normalize_wav_samples(raw)
 
     assert normalized[:, 0].tolist() == pytest.approx([0.25, -0.5])
+
+
+def test_repeated_imported_analysis_uses_fresh_spl_weighting_state(monkeypatch):
+    sample_rate = 48_000.0
+    sample_count = int(sample_rate) + 733
+    times = np.arange(sample_count, dtype=np.float64) / sample_rate
+    amplitude = np.sqrt(2.0) * 20e-6 * (10.0 ** (94.0 / 20.0))
+    samples = (
+        amplitude * np.sin(2.0 * np.pi * 31.5 * times)
+    ).reshape(-1, 1)
+    wav = ImportedWav("repeat.wav", sample_rate, samples)
+    config = _single_channel_config(
+        config_id=101,
+        selected_channels=[0],
+        analysis_duration=sample_count / sample_rate,
+        spl_weighting="A",
+        spl_time_constant=0.125,
+        stft_nfft=256,
+        fft_nfft=256,
+    )
+    request = ImportedAudioAnalysisRequest(
+        config_id=config["config_id"],
+        wav_path=wav.path,
+        assignments=(ImportedChannelAssignment(0, "config", 0),),
+    )
+    engine = JudgmentEngine(ai_service=None)
+    monkeypatch.setattr(imported_audio, "load_wav", lambda path: wav)
+
+    first = imported_audio.analyze_imported_wav(
+        request=request,
+        config=config,
+        mic_cal={},
+        judgment_engine=engine,
+    )
+    second = imported_audio.analyze_imported_wav(
+        request=request,
+        config=config,
+        mic_cal={},
+        judgment_engine=engine,
+    )
+
+    assert second.chart_payload[0]["spl"] == first.chart_payload[0]["spl"]
+    first_spl = first.judgment_payload["channel_results"][0]
+    second_spl = second.judgment_payload["channel_results"][0]
+    for key in (
+        "spl_db",
+        "spl_min_db",
+        "spl_max_db",
+        "spl_average_db",
+        "spl_pass",
+        "spl_average_pass",
+        "spl_trace_available",
+        "spl_average_available",
+    ):
+        assert second_spl[key] == first_spl[key]
 
 
 def test_load_wav_rejects_non_wav_extension(tmp_path):

@@ -98,6 +98,20 @@ class WorkOrderModule(QWidget):
         self._publish_workorder(force=True, log=True)
 
     def _on_config_selection_changed(self, selected_config_ids: tuple[int, ...]) -> None:
+        previous_selected = set(self._factory_state.selected_config_ids)
+        added_config_ids = tuple(
+            config_id
+            for config_id in selected_config_ids
+            if config_id not in previous_selected
+        )
+        request_resets = getattr(
+            self.services,
+            "request_plc_start_signal_resets_for_configs",
+            None,
+        )
+        if added_config_ids and callable(request_resets):
+            request_resets(added_config_ids)
+
         next_state = None
         factory_mode = getattr(self.services, "factory_mode", None)
         set_selection = getattr(factory_mode, "set_selection", None)
@@ -170,6 +184,13 @@ class WorkOrderModule(QWidget):
             set_selection = getattr(factory_mode, "set_selection", None)
             if callable(set_selection):
                 next_state = set_selection(restored_selection)
+        request_resets = getattr(
+            self.services,
+            "request_plc_start_signal_resets_for_configs",
+            None,
+        )
+        if callable(request_resets):
+            request_resets(restored_selection)
         if isinstance(next_state, FactoryControllerState):
             self._sync_factory_state(next_state, publish_workorder=False)
         else:
@@ -199,6 +220,18 @@ class WorkOrderModule(QWidget):
         return tuple(deduped)
 
     def _persist_selected_config_ids(self, selected_config_ids: tuple[int, ...]) -> None:
+        if tuple(self._factory_state.selected_config_ids) != tuple(
+            selected_config_ids
+        ):
+            return
+        if bool(
+            getattr(
+                getattr(self.services, "factory_mode", None),
+                "selection_restart_required",
+                False,
+            )
+        ):
+            return
         selection_settings = getattr(self.services, "factory_selection_settings", None)
         save_selected_config_ids = getattr(selection_settings, "save_selected_config_ids", None)
         error_message = None

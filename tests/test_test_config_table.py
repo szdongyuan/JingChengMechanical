@@ -42,6 +42,7 @@ def test_test_config_table_exposes_nullable_plc_id_field():
         "output_device_hostapi",
         "output_device_samplerate",
         "selected_channels",
+        "fault_types_json",
         "vibration_view_channel_index",
         "result_dashboard_layout",
         "plc_device_key",
@@ -65,6 +66,7 @@ def test_test_config_table_exposes_nullable_plc_id_field():
     assert config.input_device_name is None
     assert config.input_hardware_device_id is None
     assert config.selected_channels == "[]"
+    assert config.fault_types_json == "[]"
     assert config.vibration_view_channel_index is None
     assert config.result_dashboard_layout is None
     assert config.plc_device_key is None
@@ -72,6 +74,17 @@ def test_test_config_table_exposes_nullable_plc_id_field():
     assert config.analysis_window_offset_ms == 0
     assert config.monitor_channel_index is None
     assert config.monitor_gain_db is None
+
+    fault_types_column = next(
+        row
+        for row in ConfigTable._meta.database.execute_sql(
+            "PRAGMA table_info(test_config_table)"
+        ).fetchall()
+        if row[1] == "fault_types_json"
+    )
+    assert fault_types_column[2].upper() == "TEXT"
+    assert bool(fault_types_column[3]) is True
+    assert fault_types_column[4] == "'[]'"
 
 
 def test_model_defines_allow_incomplete_recording_analysis_with_false_default():

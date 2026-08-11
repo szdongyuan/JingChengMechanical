@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from datetime import datetime, timedelta
 import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -8,20 +10,38 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication, QDialog
+from PyQt6.QtCore import QPoint, Qt
+from PyQt6.QtTest import QTest
+from PyQt6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QScrollArea,
+    QTableWidget,
+    QWidget,
+)
 
 from app.service.analysis.imported_audio import (
     ImportedAudioAnalysisRequest,
     ImportedChannelAssignment,
 )
+from app.service.multi_run_coordinator_mvp import OperationResult, OperationStatus
+from app.service.result_history import (
+    FrozenConfigSummary,
+    ResultConclusion,
+    ResultHistoryCardSnapshot,
+    ResultHistorySnapshot,
+    ResultPhase,
+)
+from app.service.result_history_contracts import ManualJudgmentTarget
 
 from app.services_container import (
     FactoryControllerState,
-    FactoryRuntimeAbortPayload,
     FactoryStartBlockedPayload,
 )
 from ui.modules.control import ControlModule
+from ui.modules.result_history import ResultHistoryModule
 from ui.modules.workorder import WorkOrderModule
+from ui.widgets.result_history_card import ResultHistoryCard
 
 
 class _SignalStub:
@@ -47,6 +67,7 @@ class _BusStub:
         self.factory_runtime_aborted = _SignalStub()
         self.factory_selection_notice = _SignalStub()
         self.log = _SignalStub()
+        self.status = _SignalStub()
         self.current_workorder_payload = {}
 
 
@@ -63,6 +84,7 @@ class _ConfigServiceStub:
                 "plc_device_label": "PLC A",
                 "scan_triggers_test": False,
                 "selected_channels": [0, 1],
+                "fault_types": ["aa", "bb", "cc"],
             },
             {
                 "config_id": 202,
@@ -218,18 +240,25 @@ def _ready_state() -> FactoryControllerState:
     )
 
 
-def _runtime_abort_payload(error_message: str | None):
-    return FactoryRuntimeAbortPayload(
-        config_id=101,
-        run_id="run-101",
-        trigger_source="manual",
-        error_message=error_message,
+def _manual_target(
+    run_id: str = "run-1",
+    *,
+    revision: int = 1,
+    fault_types: tuple[str, ...] = ("异响", "漏装"),
+    allowed: bool = True,
+) -> ManualJudgmentTarget:
+    return ManualJudgmentTarget(
+        run_id=run_id,
+        revision=revision,
+        fault_types=fault_types,
+        manual_judgment_allowed=allowed,
     )
 
 
 def _make_module(
     *,
     initial_state: FactoryControllerState | None = None,
+    production_unavailable_reason: str | None = None,
 ):
     bus = _BusStub()
     services = SimpleNamespace(
@@ -237,6 +266,7 @@ def _make_module(
         config_service=_ConfigServiceStub(),
         factory_selection_settings=_FactorySelectionSettingsStub(),
         factory_mode=_FactoryModeStub(bus, initial_state),
+        production_unavailable_reason=production_unavailable_reason,
     )
     return ControlModule(services), services
 
@@ -297,15 +327,266 @@ def test_control_panel_renders_three_button_rows_with_updated_spacing_and_button
     assert module.layout().spacing() == 8
     assert module.btn_start.minimumHeight() == 36
     assert module.btn_stop.minimumHeight() == 36
+    assert module.btn_stop.text() == "停止测试"
     assert module.btn_pass.minimumHeight() == 36
     assert module.btn_fail.minimumHeight() == 36
     assert module.btn_import_audio.minimumHeight() == 36
+
+
+def test_manual_actions_are_one_shared_widget_outside_left_control_layout(qapp):
+    module, _services = _make_module()
+
+    actions = module.manual_judgment_widget
+
+    assert isinstance(actions, QWidget)
+    assert actions.objectName() == "manual_judgment_actions"
+    assert module.layout().indexOf(actions) == -1
+    assert actions.isAncestorOf(module.btn_pass)
+    assert actions.isAncestorOf(module.btn_fail)
+    assert all(actions.isAncestorOf(button) for button in module.manual_fault_buttons)
+    assert module.btn_start.parentWidget() is module
+    assert module.btn_stop.parentWidget() is module
+    assert module.btn_import_audio.parentWidget() is module
+
+
+def test_real_five_fault_ng_submission_keeps_history_geometry_and_focus(qapp):
+    bus = _BusStub()
+    config_service = _ConfigServiceStub()
+    fault_types = ("异响", "漏装", "松动", "破损", "电流异常")
+    config_service._details[101]["fault_types"] = list(fault_types)
+    services = SimpleNamespace(
+        bus=bus,
+        config_service=config_service,
+        factory_selection_settings=_FactorySelectionSettingsStub(),
+        factory_mode=_FactoryModeStub(bus, _ready_state()),
+    )
+    control = ControlModule(services)
+    history = ResultHistoryModule(
+        manual_judgment_widget=control.manual_judgment_widget
+    )
+    started_at = datetime(2026, 7, 30, 9, 0)
+    cards = tuple(
+        ResultHistoryCardSnapshot(
+            run_id=f"run-{index}",
+            config=FrozenConfigSummary(
+                config_id=101,
+                name="Config Alpha",
+                fault_types=fault_types,
+            ),
+            sn=f"SN-{index}",
+            trigger_source="manual",
+            started_at=started_at + timedelta(minutes=index),
+            terminated_at=started_at + timedelta(minutes=index, seconds=5),
+            phase=ResultPhase.TERMINAL,
+            conclusion=ResultConclusion.OK,
+            reason=None,
+            is_active_run=False,
+            manual_judgment_allowed=True,
+            manual_reanalysis_allowed=True,
+            revision=1,
+        )
+        for index in range(6)
+    )
+    selected_run_id = "run-4"
+    snapshot = ResultHistorySnapshot(
+        revision=1,
+        follow_latest=False,
+        selected_run_id=selected_run_id,
+        active_cards=(),
+        terminal_cards=cards,
+    )
+    history.render_snapshot(snapshot)
+    control.set_manual_judgment_target(
+        ManualJudgmentTarget(
+            run_id=selected_run_id,
+            revision=1,
+            fault_types=fault_types,
+            manual_judgment_allowed=True,
+        )
+    )
+    history.resize(360, 260)
+    history.show()
+    QTest.qWait(180)
+    qapp.processEvents()
+
+    scroll = history.findChild(QScrollArea, "result_history_scroll")
+    assert scroll is not None
+    scrollbar = scroll.verticalScrollBar()
+    card_widgets = {
+        str(card.property("run_id")): card
+        for card in history.findChildren(ResultHistoryCard)
+    }
+    selected_card = card_widgets[selected_run_id]
+    scroll.ensureWidgetVisible(selected_card, 0, 0)
+    qapp.processEvents()
+    scrollbar.setValue(scrollbar.maximum() // 2)
+    qapp.processEvents()
+
+    def geometry_signature():
+        current_cards = {
+            str(card.property("run_id")): card
+            for card in history.findChildren(ResultHistoryCard)
+            if card.isVisible()
+        }
+        selected = current_cards[selected_run_id]
+        table = selected.findChild(
+            QTableWidget, "result_history_card_summary_table"
+        )
+        assert table is not None
+        return (
+            tuple(
+                (
+                    run_id,
+                    card.height(),
+                    card.mapTo(history._scroll_content, QPoint(0, 0)).y(),
+                )
+                for run_id, card in sorted(current_cards.items())
+            ),
+            table.height(),
+            selected.manual_judgment_slot.height(),
+            history._scroll_content.height(),
+            scrollbar.maximum(),
+            scrollbar.value(),
+        )
+
+    initial_signature = geometry_signature()
+    initial_cards = dict(card_widgets)
+    action_slot = selected_card.manual_judgment_slot
+    actions = control.manual_judgment_widget
+    assert action_slot.height() >= actions.sizeHint().height()
+    assert actions.parentWidget() is action_slot
+    assert not actions.findChildren(QScrollArea)
+    assert all(button.isVisible() for button in control.manual_fault_buttons)
+    assert control.btn_pass.objectName() == "Success"
+    assert all(
+        button.objectName() == "Fail"
+        for button in control.manual_fault_buttons
+    )
+    assert [
+        control.manual_fault_button_layout.getItemPosition(
+            control.manual_fault_button_layout.indexOf(widget)
+        )[:2]
+        for widget in (control.btn_pass, *control.manual_fault_buttons)
+    ] == [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2)]
+
+    signatures_during_submission = []
+
+    def submit_ng(_label, fault_type):
+        nonlocal snapshot
+        signatures_during_submission.append(geometry_signature())
+        updated_cards = tuple(
+            replace(
+                card,
+                conclusion=ResultConclusion.NG,
+                fault_type=fault_type,
+                revision=2,
+                manual_judgment_revision=1,
+            )
+            if card.run_id == selected_run_id
+            else card
+            for card in cards
+        )
+        snapshot = ResultHistorySnapshot(
+            revision=2,
+            follow_latest=False,
+            selected_run_id=selected_run_id,
+            active_cards=(),
+            terminal_cards=updated_cards,
+        )
+        history.render_snapshot(snapshot)
+        qapp.processEvents()
+
+    control.manual_judgment_intent.connect(submit_ng)
+    control.manual_fault_buttons[-1].click()
+    qapp.processEvents()
+
+    final_cards = {
+        str(card.property("run_id")): card
+        for card in history.findChildren(ResultHistoryCard)
+        if card.isVisible()
+    }
+    assert signatures_during_submission == [initial_signature]
+    assert geometry_signature() == initial_signature
+    assert final_cards == initial_cards
+    assert selected_card.manual_judgment_widget is actions
+    assert actions.parentWidget() is action_slot
+    assert control.manual_fault_buttons[-1].isChecked()
+
+
+def test_unchanged_manual_target_setter_is_a_complete_no_op(qapp, monkeypatch):
+    module, _services = _make_module()
+    target = _manual_target()
+    module.set_manual_judgment_target(target)
+    sync_calls = []
+    monkeypatch.setattr(
+        module,
+        "_sync_manual_judgment_controls",
+        lambda: sync_calls.append(True),
+    )
+
+    module.set_manual_judgment_target(target)
+
+    assert sync_calls == []
 
 
 def test_control_module_has_import_audio_button(qapp):
     module, _ = _make_module()
 
     assert module.btn_import_audio.text() == "导入音频分析"
+
+
+def test_restart_control_is_always_available_and_emits_only_one_pending_intent(qapp):
+    module, _ = _make_module(
+        production_unavailable_reason="生产功能不可用，请修复设备或配置后重启软件。"
+    )
+    intents = []
+    module.restart_intent.connect(lambda: intents.append("restart"))
+
+    assert module.btn_restart.text() == "重启软件"
+    assert module.btn_restart.isEnabled() is True
+
+    module.btn_restart.click()
+    module.btn_restart.click()
+
+    assert intents == ["restart"]
+    assert module.btn_restart.isEnabled() is False
+
+    module.set_restart_pending(False)
+
+    assert module.btn_restart.isEnabled() is True
+    module.btn_restart.click()
+    assert intents == ["restart", "restart"]
+
+
+def test_control_connects_start_blocked_without_legacy_runtime_abort(qapp):
+    module, services = _make_module()
+
+    assert module._on_factory_state_changed in (
+        services.bus.factory_state_changed._callbacks
+    )
+    assert module._on_factory_start_blocked in (
+        services.bus.factory_start_blocked._callbacks
+    )
+    assert services.bus.factory_runtime_aborted._callbacks == []
+    assert not hasattr(module, "_on_factory_runtime_aborted")
+
+
+@pytest.mark.parametrize("run_phase", ["running", "analyzing"])
+def test_stop_button_exposes_one_intent_without_legacy_write(qapp, run_phase):
+    module, services = _make_module(
+        initial_state=FactoryControllerState(
+            selected_config_ids=(101,),
+            run_phase=run_phase,
+        )
+    )
+    intents = []
+    module.stop_intent.connect(lambda: intents.append("stop"))
+
+    module.btn_stop.click()
+
+    assert module.btn_stop.text() == "停止测试"
+    assert intents == ["stop"]
+    services.factory_mode.stop_active_run.assert_not_called()
 
 
 @pytest.mark.parametrize("run_phase", ["running", "analyzing", "reanalyzing"])
@@ -479,22 +760,359 @@ def test_import_audio_dialog_controller_rejection_shows_warning(qapp, monkeypatc
     assert warnings == [("导入音频分析", "导入音频分析失败，请查看结果区域或日志")]
 
 
-def test_manual_pass_click_applies_manual_ok(qapp):
+def test_manual_fault_button_click_submits_typed_request_and_manual_ng_retries(qapp):
     module, services = _make_module()
+    run_id = "00000000-0000-4000-8000-000000000001"
+    intents = []
+    module.manual_judgment_intent.connect(
+        lambda label, fault_type: intents.append((label, fault_type))
+    )
+
+    module.set_manual_judgment_target(_manual_target(run_id))
+
+    assert module.manual_fault_button_group.exclusive() is True
+    assert [button.text() for button in module.manual_fault_buttons] == [
+        "异响",
+        "漏装",
+    ]
+    assert all(button.isCheckable() for button in module.manual_fault_buttons)
+    assert module.manual_fault_button_group.checkedButton() is None
+    assert module.btn_fail.isEnabled() is False
+    assert module.btn_fail.isHidden()
+    assert module.btn_pass.text() == "√ 合格"
+    assert module.manual_fault_button_layout.getItemPosition(
+        module.manual_fault_button_layout.indexOf(module.btn_pass)
+    )[:2] == (0, 0)
+    assert [
+        module.manual_fault_button_layout.getItemPosition(
+            module.manual_fault_button_layout.indexOf(button)
+        )[:2]
+        for button in module.manual_fault_buttons
+    ] == [(0, 1), (0, 2)]
+
+    module.manual_fault_buttons[0].click()
+
+    assert module.manual_fault_buttons[0].isChecked() is True
+    assert intents == [("NG", "异响")]
+    services.factory_mode.apply_manual_judgment.assert_not_called()
+    services.factory_mode.start_manual.assert_not_called()
+    services.factory_mode.stop_active_run.assert_not_called()
+    services.factory_mode.analyze_imported_audio.assert_not_called()
+    assert services.bus.log.emissions == []
+
+    module.manual_fault_buttons[1].click()
+
+    assert module.manual_fault_buttons[0].isChecked() is False
+    assert module.manual_fault_buttons[1].isChecked() is True
+    assert intents == [("NG", "异响"), ("NG", "漏装")]
+
+    module.handle_manual_judgment_result(
+        OperationResult(
+            run_id=run_id,
+            status=OperationStatus.PERSISTENCE_REJECTED,
+            attempt_id=None,
+            reason="persistence rejected",
+        )
+    )
+
+    assert module.manual_fault_buttons[1].isChecked() is True
+    assert module.btn_fail.isEnabled() is False
+
+    module.manual_fault_buttons[1].click()
+
+    assert intents == [("NG", "异响"), ("NG", "漏装"), ("NG", "漏装")]
+
+    module.handle_manual_judgment_result(
+        OperationResult(
+            run_id=run_id,
+            status=OperationStatus.COMPLETED,
+            attempt_id=None,
+            reason="",
+        )
+    )
+
+    assert module.manual_fault_button_group.checkedButton() is None
+    services.factory_mode.apply_manual_judgment.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "next_target",
+    (
+        _manual_target("00000000-0000-4000-8000-000000000002"),
+        _manual_target(
+            "00000000-0000-4000-8000-000000000001",
+            revision=2,
+        ),
+    ),
+)
+def test_retired_fault_button_release_never_labels_a_new_target(
+    qapp,
+    next_target,
+):
+    module, _ = _make_module()
+    intents = []
+    module.manual_judgment_intent.connect(
+        lambda label, fault_type: intents.append((label, fault_type))
+    )
+    module.set_manual_judgment_target(
+        _manual_target("00000000-0000-4000-8000-000000000001")
+    )
+    old_button = module.manual_fault_buttons[0]
+    module.show()
+    qapp.processEvents()
+
+    QTest.mousePress(old_button, Qt.MouseButton.LeftButton)
+    module.set_manual_judgment_target(next_target)
+    QTest.mouseRelease(old_button, Qt.MouseButton.LeftButton)
+
+    assert intents == []
+
+
+def test_configured_buttons_stay_prepared_but_hidden_without_terminal_target(qapp):
+    module, services = _make_module(initial_state=_ready_state())
+    intents = []
+    module.manual_judgment_intent.connect(
+        lambda label, fault_type: intents.append((label, fault_type))
+    )
+
+    assert [button.text() for button in module.manual_fault_buttons] == [
+        "aa",
+        "bb",
+        "cc",
+    ]
+    assert all(
+        button.isEnabled() is False for button in module.manual_fault_buttons
+    )
+    assert module.btn_pass.isEnabled() is False
+    assert module.btn_fail.isEnabled() is False
+
+    assert intents == []
+
+    services.config_service._details[101]["fault_types"] = ["new"]
+    next_state = FactoryControllerState(
+        selected_config_ids=(101,),
+        run_phase="running",
+        selection_ready=True,
+        start_ready=True,
+    )
+    services.bus.factory_state_changed.emit(next_state)
+
+    assert [button.text() for button in module.manual_fault_buttons] == ["new"]
+
+
+def test_manual_fault_selection_clears_on_target_change_success_or_shutdown(qapp):
+    module, _ = _make_module()
+    target = _manual_target()
+    run_two = "00000000-0000-4000-8000-000000000002"
+    module.set_manual_judgment_target(target)
+    module.manual_fault_buttons[0].click()
+
+    module.set_manual_judgment_target(target)
+    assert module.manual_fault_buttons[0].isChecked() is True
+
+    module.set_manual_judgment_target(_manual_target(run_two))
+    assert module.manual_fault_button_group.checkedButton() is None
+    module.manual_fault_buttons[0].click()
+
+    module.set_manual_judgment_target(_manual_target(run_two, revision=2))
+    assert module.manual_fault_button_group.checkedButton() is None
+    module.manual_fault_buttons[0].click()
+
+    module.set_manual_judgment_target(
+        _manual_target(run_two, revision=2, fault_types=("松动", "异响"))
+    )
+    assert [button.text() for button in module.manual_fault_buttons] == [
+        "松动",
+        "异响",
+    ]
+    assert module.manual_fault_button_group.checkedButton() is None
+    module.manual_fault_buttons[1].click()
+
+    module.set_manual_judgment_target(
+        _manual_target(
+            run_two,
+            revision=2,
+            fault_types=("松动", "异响"),
+            allowed=False,
+        )
+    )
+    assert module.manual_fault_button_group.checkedButton() is None
+    module.set_manual_judgment_target(
+        _manual_target(
+            run_two,
+            revision=2,
+            fault_types=("松动", "异响"),
+        )
+    )
+    module.manual_fault_buttons[1].click()
+    module.btn_fail.click()
+
+    module.handle_manual_judgment_result(
+        OperationResult(
+            run_id=run_two,
+            status=OperationStatus.PERSISTENCE_REJECTED,
+            attempt_id=None,
+            reason="persistence rejected",
+        )
+    )
+    assert module.manual_fault_buttons[1].isChecked() is True
+
+    module.handle_manual_judgment_result(
+        OperationResult(
+            run_id=run_two,
+            status=OperationStatus.COMPLETED,
+            attempt_id=None,
+            reason="",
+        )
+    )
+    assert module.manual_fault_button_group.checkedButton() is None
+    module.manual_fault_buttons[0].click()
+
+    module.shutdown()
+    module.shutdown()
+
+    assert module.manual_fault_buttons == ()
+    assert module.btn_pass.isEnabled() is False
+    assert module.btn_fail.isEnabled() is False
+
+
+def test_late_success_for_prior_key_never_clears_current_selection(qapp):
+    module, _ = _make_module()
+    first_run = "00000000-0000-4000-8000-000000000001"
+    second_run = "00000000-0000-4000-8000-000000000002"
+    module.set_manual_judgment_target(_manual_target(first_run))
+    module.manual_fault_buttons[0].click()
+    module.btn_fail.click()
+
+    module.set_manual_judgment_target(_manual_target(second_run))
+    module.manual_fault_buttons[1].click()
+    module.handle_manual_judgment_result(
+        OperationResult(
+            run_id=first_run,
+            status=OperationStatus.COMPLETED,
+            attempt_id=None,
+            reason="",
+        )
+    )
+
+    assert module.manual_fault_buttons[1].isChecked() is True
+
+
+def test_manual_not_found_emits_one_chinese_status_and_keeps_different_target(qapp):
+    module, services = _make_module()
+    first_run = "00000000-0000-4000-8000-000000000001"
+    second_run = "00000000-0000-4000-8000-000000000002"
+    module.set_manual_judgment_target(_manual_target(second_run))
+    module.manual_fault_buttons[1].click()
+
+    module.handle_manual_judgment_result(
+        OperationResult(
+            run_id=first_run,
+            status=OperationStatus.NOT_FOUND,
+            attempt_id=None,
+            reason="result-control facts were not found",
+        )
+    )
+
+    assert services.bus.status.emissions == [
+        (("人工判定失败：所选运行记录不存在，可能已被删除",), {})
+    ]
+    assert module.manual_fault_buttons[1].isChecked() is True
+
+
+def test_manual_fault_controls_disable_without_capability_and_emit_nothing(qapp):
+    module, services = _make_module()
+    intents = []
+    module.manual_judgment_intent.connect(
+        lambda label, fault_type: intents.append((label, fault_type))
+    )
+    module.set_manual_judgment_target(_manual_target(allowed=False))
+
+    assert [button.text() for button in module.manual_fault_buttons] == [
+        "异响",
+        "漏装",
+    ]
+    assert all(
+        button.isEnabled() is False for button in module.manual_fault_buttons
+    )
+    assert module.btn_pass.isEnabled() is False
+    assert module.btn_fail.isEnabled() is False
+
+    module.manual_fault_buttons[0].click()
+    module.btn_pass.click()
+    module.btn_fail.click()
+
+    assert intents == []
+    services.factory_mode.apply_manual_judgment.assert_not_called()
+
+
+def test_ok_always_submits_none_without_changing_fault_selection(qapp):
+    module, _ = _make_module()
+    intents = []
+    module.manual_judgment_intent.connect(
+        lambda label, fault_type: intents.append((label, fault_type))
+    )
+    module.set_manual_judgment_target(_manual_target())
+    module.manual_fault_buttons[1].click()
 
     module.btn_pass.click()
 
-    services.factory_mode.apply_manual_judgment.assert_called_once_with("OK")
-    assert services.bus.log.emissions[-1][0][0] == "Manual judgment: PASS"
+    assert intents == [("NG", "漏装"), ("OK", None)]
+    assert module.manual_fault_buttons[1].isChecked() is True
 
 
-def test_manual_fail_click_applies_manual_ng(qapp):
+def test_empty_fault_list_submits_generic_ng_and_ok_always_submits_none(qapp):
     module, services = _make_module()
+    intents = []
+    module.manual_judgment_intent.connect(
+        lambda label, fault_type: intents.append((label, fault_type))
+    )
+    module.set_manual_judgment_target(_manual_target(fault_types=()))
+
+    assert module.manual_fault_buttons == ()
+    assert module.btn_pass.isEnabled() is True
+    assert module.btn_fail.isEnabled() is True
+    assert not module.btn_pass.isHidden()
+    assert not module.btn_fail.isHidden()
+    assert module.btn_pass.text() == "√ 合格"
+    assert module.btn_fail.text() == "× 不合格"
 
     module.btn_fail.click()
+    module.btn_pass.click()
 
-    services.factory_mode.apply_manual_judgment.assert_called_once_with("NG")
-    assert services.bus.log.emissions[-1][0][0] == "Manual judgment: FAIL"
+    assert intents == [("NG", None), ("OK", None)]
+    services.factory_mode.apply_manual_judgment.assert_not_called()
+
+
+def test_target_update_clears_rejection_retention_and_never_preselects_persisted_type(
+    qapp,
+):
+    module, _ = _make_module()
+    module.set_manual_judgment_target(_manual_target(revision=8))
+    module.manual_fault_buttons[0].click()
+
+    module.handle_manual_judgment_result(
+        OperationResult(
+            run_id="00000000-0000-4000-8000-000000000001",
+            status=OperationStatus.INVALID_REQUEST,
+            attempt_id=None,
+            reason="validation rejected",
+        )
+    )
+    assert module.manual_fault_buttons[0].isChecked() is True
+
+    module.set_manual_judgment_target(_manual_target(revision=9))
+
+    assert module.manual_fault_button_group.checkedButton() is None
+    assert [button.isChecked() for button in module.manual_fault_buttons] == [
+        False,
+        False,
+    ]
+
+    module.set_manual_judgment_target(None)
+    assert module.manual_fault_buttons == ()
+    assert module.btn_pass.isEnabled() is False
+    assert module.btn_fail.isEnabled() is False
 
 
 def test_start_uses_live_workorder_payload_from_current_workorder_module(qapp):
@@ -559,6 +1177,55 @@ def test_start_button_is_disabled_only_for_busy_or_pending_states(qapp, state):
 
     assert module.btn_start.isEnabled() is False
     assert hasattr(module, "lbl_start_reason") is False
+
+
+def test_configuration_restart_required_disables_start_and_import(qapp):
+    module, _ = _make_module(
+        initial_state=FactoryControllerState(
+            selected_config_ids=(202,),
+            run_phase="not_ready",
+            selection_ready=True,
+            start_ready=False,
+            start_ready_reason="配置已变更，请重启软件后生效。",
+        )
+    )
+
+    assert module.btn_start.isEnabled() is False
+    assert module.btn_import_audio.isEnabled() is False
+
+
+def test_production_unavailable_reason_is_shown_once_and_disables_only_ingress(
+    qapp,
+):
+    reason = "生产功能不可用，请修复设备或配置后重启软件。"
+    module, services = _make_module(initial_state=_ready_state())
+
+    assert module.btn_start.isEnabled() is True
+    assert module.lbl_production_unavailable_reason.text() == ""
+
+    services.production_unavailable_reason = reason
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            selected_config_ids=(101,),
+            run_phase="not_ready",
+            selection_ready=True,
+            start_ready=False,
+            start_ready_reason=reason,
+        )
+    )
+
+    assert module.btn_start.isEnabled() is False
+    assert module.btn_import_audio.isEnabled() is False
+    assert module.btn_stop.isEnabled() is False
+    assert module.btn_restart.isEnabled() is True
+    assert module.lbl_production_unavailable_reason.text() == reason
+    assert module.lbl_production_unavailable_reason.isVisible() is False
+    module.show()
+    qapp.processEvents()
+    assert module.lbl_production_unavailable_reason.isVisible() is True
+
+    module.btn_start.click()
+    services.factory_mode.start_manual.assert_not_called()
 
 
 def test_start_button_is_disabled_for_review_cleanup_busy_state(qapp):
@@ -785,74 +1452,3 @@ def test_blocked_external_trigger_signal_uses_same_modal_flow(qapp, monkeypatch,
 
     assert recorder.open_count == 1
     assert recorder.latest_text == "配置加载失败"
-
-
-def test_runtime_abort_with_error_opens_start_failure_dialog(qapp, monkeypatch):
-    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
-
-    services.bus.factory_runtime_aborted.emit(
-        FactoryRuntimeAbortPayload(
-            config_id=101,
-            run_id="run-101",
-            trigger_source="manual",
-            error_message="Device not found: Mic (MME)",
-        )
-    )
-
-    assert recorder.open_count == 1
-    assert recorder.latest_text == "启动失败：Device not found: Mic (MME)"
-
-
-def test_runtime_abort_without_error_does_not_open_start_failure_dialog(qapp, monkeypatch):
-    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
-
-    services.bus.factory_runtime_aborted.emit(_runtime_abort_payload(None))
-
-    assert recorder.open_count == 0
-    assert recorder.latest_text == ""
-
-
-def test_runtime_abort_dialog_does_not_close_when_factory_state_becomes_ready(qapp, monkeypatch):
-    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
-
-    services.bus.factory_runtime_aborted.emit(_runtime_abort_payload("Device lost"))
-    services.bus.factory_state_changed.emit(_ready_state())
-
-    assert recorder.open_count == 1
-    assert recorder.latest_text == "启动失败：Device lost"
-    assert recorder.close_count == 0
-    assert recorder.was_closed is False
-
-
-def test_later_blocked_start_dialog_reenables_ready_state_auto_close(qapp, monkeypatch):
-    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
-
-    services.bus.factory_runtime_aborted.emit(_runtime_abort_payload("Device lost"))
-    services.bus.factory_start_blocked.emit(
-        FactoryStartBlockedPayload(reason="配置加载失败", trigger_source="manual")
-    )
-    services.bus.factory_state_changed.emit(_ready_state())
-
-    assert recorder.open_count == 1
-    assert recorder.latest_text == "配置加载失败"
-    assert recorder.close_count == 1
-    assert recorder.was_closed is True
-
-
-def test_runtime_abort_replaces_blocked_start_dialog_and_disables_ready_state_auto_close(
-    qapp,
-    monkeypatch,
-):
-    module, services, recorder = _make_module_with_message_box_spy(monkeypatch)
-
-    services.bus.factory_start_blocked.emit(
-        FactoryStartBlockedPayload(reason="配置加载失败", trigger_source="manual")
-    )
-    module._open_pending_blocked_start_dialog()
-    services.bus.factory_runtime_aborted.emit(_runtime_abort_payload("Device lost"))
-    services.bus.factory_state_changed.emit(_ready_state())
-
-    assert recorder.open_count == 1
-    assert recorder.latest_text == "启动失败：Device lost"
-    assert recorder.close_count == 0
-    assert recorder.was_closed is False
