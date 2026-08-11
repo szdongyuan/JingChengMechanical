@@ -46,8 +46,9 @@ def test_selected_configuration_plcs_are_resolved_in_selection_order():
     ]
 
 
-def test_selected_plc_status_uses_bound_ids_instead_of_fixed_plc_one_and_two():
-    text = MainWindow._selected_plc_status_html(
+def test_plc_status_shows_all_runtime_plcs_when_states_are_available():
+    text = MainWindow._plc_status_html(
+        (1, 2, 7, 9),
         (7, 9),
         {7: "已连接", 9: "重连中", 1: "已连接", 2: "已连接"},
         selected_config_count=3,
@@ -57,15 +58,31 @@ def test_selected_plc_status_uses_bound_ids_instead_of_fixed_plc_one_and_two():
 
     assert "PLC 7" in text
     assert "PLC 9" in text
-    assert "PLC 1：" not in text
-    assert "PLC 2：" not in text
+    assert "PLC 1：" in text
+    assert "PLC 2：" in text
     assert "已连接" in text
     assert "重连中" in text
+    assert "1 个配置未绑定 PLC" not in text
+
+
+def test_plc_status_falls_back_to_bound_ids_before_runtime_states_exist():
+    text = MainWindow._plc_status_html(
+        (),
+        (7, 9),
+        {7: "已连接", 9: "重连中"},
+        selected_config_count=3,
+        unbound_config_count=1,
+        load_error_count=0,
+    )
+
+    assert "PLC 7" in text
+    assert "PLC 9" in text
     assert "1 个配置未绑定 PLC" in text
 
 
 def test_selected_plc_status_explains_when_no_configuration_is_selected():
-    text = MainWindow._selected_plc_status_html(
+    text = MainWindow._plc_status_html(
+        (),
         (),
         {},
         selected_config_count=0,
@@ -74,3 +91,14 @@ def test_selected_plc_status_explains_when_no_configuration_is_selected():
     )
 
     assert "未选择配置" in text
+
+
+def test_visible_plc_ids_prefers_all_runtime_state_ids():
+    assert MainWindow._visible_plc_ids(
+        {2: "未连接", 1: "已连接"},
+        (2,),
+    ) == (1, 2)
+
+
+def test_visible_plc_ids_falls_back_to_selected_bindings():
+    assert MainWindow._visible_plc_ids({}, (2,)) == (2,)

@@ -68,7 +68,7 @@ ROLE_PERMISSIONS = {
     },
     "操作员": {
         "tabs": {"测试"},
-        "actions": {"切换用户", "修改密码"},
+        "actions": {"切换用户"},
     },
 }
 
@@ -498,7 +498,8 @@ class MainWindow(QMainWindow):
 
         process_state = getattr(self.services, "process_plc_state", "未连接")
         self.selected_plc_state_label.setText(
-            self._selected_plc_status_html(
+            self._plc_status_html(
+                self._visible_plc_ids(plc_states, self._selected_plc_bindings),
                 self._selected_plc_bindings,
                 plc_states,
                 selected_config_count=self._selected_config_count,
@@ -548,8 +549,9 @@ class MainWindow(QMainWindow):
         self._selected_plc_tooltip = "\n".join(tooltip_rows)
 
     @classmethod
-    def _selected_plc_status_html(
+    def _plc_status_html(
         cls,
+        visible_plc_ids: tuple[int, ...],
         plc_ids: tuple[int, ...],
         plc_states: dict,
         *,
@@ -558,6 +560,16 @@ class MainWindow(QMainWindow):
         load_error_count: int,
     ) -> str:
         muted_color = "#64748b"
+        if visible_plc_ids:
+            parts = []
+            for plc_id in visible_plc_ids:
+                state = plc_states.get(plc_id, "未连接")
+                color = cls._plc_state_color(state)
+                parts.append(
+                    f"PLC {plc_id}：<span style='color: {color};'>{state}</span>"
+                )
+            return "　".join(parts)
+
         if selected_config_count == 0:
             return f"PLC：<span style='color: {muted_color};'>未选择配置</span>"
 
@@ -579,6 +591,17 @@ class MainWindow(QMainWindow):
                 f"{load_error_count} 个配置加载失败</span>"
             )
         return "　".join(parts)
+
+    @staticmethod
+    def _visible_plc_ids(plc_states: dict, selected_plc_ids: tuple[int, ...]) -> tuple[int, ...]:
+        state_ids = sorted(
+            plc_id
+            for plc_id in plc_states
+            if type(plc_id) is int and plc_id > 0
+        )
+        if state_ids:
+            return tuple(state_ids)
+        return tuple(selected_plc_ids)
 
     @staticmethod
     def _plc_state_color(state: str) -> str:
