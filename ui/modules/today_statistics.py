@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime, timedelta, timezone
 
-from PyQt6.QtCore import pyqtSlot
+from PyQt6.QtCore import QTimer, pyqtSlot
 from PyQt6.QtWidgets import QGridLayout, QLabel, QSizePolicy, QWidget
 
 from app.service.multi_run_coordinator_mvp.contracts import (
@@ -16,6 +16,13 @@ from app.service.run_persistence.contracts import Judgment, RunState
 _LOCAL_TIMEZONE = timezone(timedelta(hours=8))
 _TERMINAL_STATES = frozenset(
     state.value for state in RunState if state is not RunState.ACTIVE
+)
+_JUDGED_STATES = frozenset({Judgment.PASS.value, Judgment.FAIL.value})
+_REFRESH_HISTORY_KINDS = frozenset(
+    {
+        HistoryFactKind.RUN_TERMINATED,
+        HistoryFactKind.TERMINAL_RESULT_REPLACED,
+    }
 )
 
 
@@ -34,10 +41,13 @@ class TodayStatisticsModule(QWidget):
         self.lb_total = self._create_value_label()
         self.lb_ok = self._create_value_label("#16a34a")
         self.lb_ng = self._create_value_label("#dc2626")
+        self.lb_abnormal = self._create_value_label("#eab308")
 
         # 两行显示：第一行总数，第二行 OK / NG 数。
         layout.addWidget(QLabel("今日总测试数："), 0, 0)
         layout.addWidget(self.lb_total, 0, 1)
+        layout.addWidget(QLabel("异常数："), 0, 2)
+        layout.addWidget(self.lb_abnormal, 0, 3)
         layout.addWidget(QLabel("OK数："), 1, 0)
         layout.addWidget(self.lb_ok, 1, 1)
         layout.addWidget(QLabel("NG数："), 1, 2)
@@ -47,10 +57,16 @@ class TodayStatisticsModule(QWidget):
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
+        self.services.bus.test_finished.connect(self._on_test_finished)
         self.services.bus.run_records_deleted.connect(
             self.on_run_records_deleted
         )
         self.refresh()
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(30_000)
+        self._timer.timeout.connect(self.refresh)
+        self._timer.start()
 
     def _create_value_label(self, color: str = "#2563eb") -> QLabel:
         label = QLabel("0")
@@ -59,11 +75,11 @@ class TodayStatisticsModule(QWidget):
         return label
 
     def on_committed_history_event(self, event: object) -> None:
-        """Refresh from the post-durable history path's initial terminal event."""
+        """Refresh after committed terminal writes that can change statistics."""
 
         if (
             type(event) is not ProjectedHistoryEvent
-            or event.kind is not HistoryFactKind.RUN_TERMINATED
+            or event.kind not in _REFRESH_HISTORY_KINDS
             or event.expected_revision is ABSENT
         ):
             return
@@ -79,6 +95,10 @@ class TodayStatisticsModule(QWidget):
         self._refresh_from_rows(
             tuple(self.services.run_export_reader.list_durable())
         )
+
+    @pyqtSlot(int, dict)
+    def _on_test_finished(self, _config_id: int, _payload: dict) -> None:
+        self.refresh()
 
     @pyqtSlot(object)
     def on_run_records_deleted(self, report: object) -> None:
@@ -111,6 +131,12 @@ class TodayStatisticsModule(QWidget):
                     for row in terminal_rows
                 )
             ),
+            str(
+                sum(
+                    row.judgment not in _JUDGED_STATES
+                    for row in terminal_rows
+                )
+            ),
         )
 
     @staticmethod
@@ -128,7 +154,14 @@ class TodayStatisticsModule(QWidget):
         ).replace(tzinfo=timezone.utc)
         return terminal_utc.astimezone(_LOCAL_TIMEZONE).date()
 
-    def _set_values(self, total: str, ok: str, ng: str) -> None:
+    def _set_values(
+        self,
+        total: str,
+        ok: str,
+        ng: str,
+        abnormal: str,
+    ) -> None:
         self.lb_total.setText(total)
         self.lb_ok.setText(ok)
         self.lb_ng.setText(ng)
+        self.lb_abnormal.setText(abnormal)

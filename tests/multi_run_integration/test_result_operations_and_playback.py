@@ -375,6 +375,8 @@ def test_committed_statistics_observer_runs_once_and_never_gates_history():
 
     assert trace == [
         ("dashboard", replacement),
+        ("statistics", replacement),
         ("dashboard", preaccept),
     ]
-    assert diagnostics == []
+    assert len(diagnostics) == 1
+    assert "statistics refresh exploded" in diagnostics[0]

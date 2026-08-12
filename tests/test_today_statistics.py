@@ -193,11 +193,13 @@ def test_today_statistics_reads_durable_run_v2_terminal_rows(qapp):
     assert module.lb_total.text() == "3"
     assert module.lb_ok.text() == "1"
     assert module.lb_ng.text() == "1"
+    assert module.lb_abnormal.text() == "1"
+    assert "#eab308" in module.lb_abnormal.styleSheet()
 
     module.deleteLater()
 
 
-def test_only_committed_run_terminated_history_refreshes_statistics(qapp):
+def test_committed_terminal_history_events_refresh_statistics(qapp):
     reader = _RunExportReaderStub(())
     module = TodayStatisticsModule(
         SimpleNamespace(
@@ -210,7 +212,6 @@ def test_only_committed_run_terminated_history_refreshes_statistics(qapp):
     ignored_events = (
         _history_event(HistoryFactKind.RECORDING),
         _history_event(HistoryFactKind.RUN_TERMINATED, preaccept=True),
-        _history_event(HistoryFactKind.TERMINAL_RESULT_REPLACED),
         _history_event(HistoryFactKind.REANALYSIS_COMPLETED),
         {"kind": "RUN_TERMINATED", "run_id": _RUN_ID},
     )
@@ -236,6 +237,25 @@ def test_only_committed_run_terminated_history_refreshes_statistics(qapp):
     assert module.lb_total.text() == "1"
     assert module.lb_ok.text() == "1"
     assert module.lb_ng.text() == "0"
+    assert module.lb_abnormal.text() == "0"
+
+    reader.rows = (
+        _durable_row(
+            run_id=_RUN_ID,
+            state="SUCCEEDED",
+            judgment="FAIL",
+            terminal_at=_terminal_at(now),
+        ),
+    )
+    module.on_committed_history_event(
+        _history_event(HistoryFactKind.TERMINAL_RESULT_REPLACED)
+    )
+
+    assert reader.calls == 3
+    assert module.lb_total.text() == "1"
+    assert module.lb_ok.text() == "0"
+    assert module.lb_ng.text() == "1"
+    assert module.lb_abnormal.text() == "0"
 
     module.deleteLater()
 
@@ -258,7 +278,7 @@ def test_terminal_trigger_does_not_refresh_when_run_is_not_durably_terminal(qapp
             audio_data_service=_LegacyAudioDataServiceStub(),
         )
     )
-    module._set_values("unchanged", "unchanged", "unchanged")
+    module._set_values("unchanged", "unchanged", "unchanged", "unchanged")
 
     module.on_committed_history_event(
         _history_event(HistoryFactKind.RUN_TERMINATED)
@@ -268,11 +288,12 @@ def test_terminal_trigger_does_not_refresh_when_run_is_not_durably_terminal(qapp
     assert module.lb_total.text() == "unchanged"
     assert module.lb_ok.text() == "unchanged"
     assert module.lb_ng.text() == "unchanged"
+    assert module.lb_abnormal.text() == "unchanged"
 
     module.deleteLater()
 
 
-def test_today_statistics_has_no_legacy_or_periodic_refresh_source(qapp):
+def test_today_statistics_refreshes_on_test_finished_and_timer(qapp):
     bus = _BusStub()
     reader = _RunExportReaderStub(())
     legacy = _LegacyAudioDataServiceStub()
@@ -286,14 +307,20 @@ def test_today_statistics_has_no_legacy_or_periodic_refresh_source(qapp):
     )
 
     assert bus.result_changed.callbacks == []
-    assert bus.test_finished.callbacks == []
+    assert len(bus.test_finished.callbacks) == 1
     assert bus.factory_display_reset.callbacks == []
-    assert not hasattr(module, "_timer")
+    assert module._timer.interval() == 30_000
+    assert module._timer.isActive()
 
     bus.result_changed.emit({})
-    bus.test_finished.emit(1, {})
     bus.factory_display_reset.emit("manual_judgment_ok")
     assert reader.calls == 1
+
+    bus.test_finished.emit(1, {})
+    assert reader.calls == 2
+
+    module._timer.timeout.emit()
+    assert reader.calls == 3
 
     module.deleteLater()
 

@@ -165,8 +165,16 @@ class _CommittedHistoryDelivery(QObject):
             pass
 
 
+_COMMITTED_STATISTICS_HISTORY_KINDS = frozenset(
+    {
+        HistoryFactKind.RUN_TERMINATED,
+        HistoryFactKind.TERMINAL_RESULT_REPLACED,
+    }
+)
+
+
 class _PostDurableHistorySink:
-    """Fan out one committed terminal without allowing statistics to gate it."""
+    """Fan out committed statistics events without allowing it to gate history."""
 
     def __init__(
         self,
@@ -181,7 +189,7 @@ class _PostDurableHistorySink:
         self._primary.publish(event)
         if (
             type(event) is not ProjectedHistoryEvent
-            or event.kind is not HistoryFactKind.RUN_TERMINATED
+            or event.kind not in _COMMITTED_STATISTICS_HISTORY_KINDS
             or event.expected_revision is ABSENT
         ):
             return
