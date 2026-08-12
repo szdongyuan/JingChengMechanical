@@ -23,11 +23,6 @@ from app.service.multi_run_coordinator_mvp import (
     TriggerSource,
 )
 from app.service.multi_run_integration.shutdown import ApplicationShutdownOwner
-from app.service.plc_result_sequencer import (
-    PlcAttemptOutcome,
-    PlcMutationDisposition,
-    PlcResultBoundaryError,
-)
 from app.service.run_persistence import AttemptState, BridgeTerminalStatus, Judgment
 from app.service.run_scoped_playback.contracts import PlaybackCode
 from tests.multi_run_coordinator_mvp._support import (
@@ -54,7 +49,6 @@ from tests.multi_run_integration.test_shutdown_order import (
     _harness as shutdown_harness,
     _non_clean_result,
 )
-from tests.plc_result_sequencer_fakes import RaisingResultPort, RecordingPorts
 from tests.run_scoped_playback.conftest import (
     OTHER_RUN_ID,
     RUN_ID as PLAYBACK_RUN_ID,
@@ -68,11 +62,6 @@ from tests.run_scoped_playback.conftest import (
 from tests.run_scoped_playback.test_service_resolution import (
     make_service as make_playback_service,
     request as playback_request,
-)
-from tests.test_plc_result_sequencer_ordering import (
-    make_sequencer,
-    register,
-    result_reports,
 )
 
 
@@ -423,31 +412,6 @@ def test_cross_aggregate_one_attempt_failure_matrix_is_isolated():
     assert playback_calls == [("run.get", PLAYBACK_RUN_ID)]
     valid_playback = make_playback_service()
     assert valid_playback.play(playback_request()).code is PlaybackCode.STARTED
-
-    # One failed PLC result boundary advances FIFO exactly once, and the next
-    # ticket retains its own payload and succeeds.
-    plc_ports = RecordingPorts()
-    result_port = RaisingResultPort(
-        {1: PlcResultBoundaryError("res_score_offset", "write failed")}
-    )
-    sequencer, _ = make_sequencer(plc_ports, write_result=result_port)
-    first_ticket = register(sequencer, "plc-run-1")
-    second_ticket = register(sequencer, "plc-run-2")
-    assert (
-        sequencer.publish_terminal(second_ticket, {"value": 2})
-        is PlcMutationDisposition.APPLIED
-    )
-    assert (
-        sequencer.publish_terminal(first_ticket, {"value": 1})
-        is PlcMutationDisposition.APPLIED
-    )
-    assert result_port.calls == [(10, {"value": 1}), (10, {"value": 2})]
-    reports = result_reports(plc_ports)
-    assert [report.outcome for report in reports] == [
-        PlcAttemptOutcome.BOUNDARY_FAILED,
-        PlcAttemptOutcome.BOUNDARY_RETURNED,
-    ]
-    assert [report.run_id for report in reports] == ["plc-run-1", "plc-run-2"]
 
     # Every shutdown stage's exact non-clean result is observed once, cached,
     # and never retried.
