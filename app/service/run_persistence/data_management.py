@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from math import ceil
 from pathlib import Path
 
+from app.service.fault_types import normalize_fault_type_name
 from app.service.run_persistence.analysis_result_artifact import (
     AnalysisResultArtifactStore,
 )
@@ -18,6 +20,7 @@ from app.service.run_persistence.contracts import (
 )
 from app.service.run_persistence.database import RunPersistenceDatabase
 from app.service.run_persistence.transactions import run_short_transaction
+from model.malfunction_type_table import GOOD_MALFUNCTION_TYPE_NAME
 
 
 class ManagementJudgment(str, Enum):
@@ -27,6 +30,10 @@ class ManagementJudgment(str, Enum):
 
 
 _PAGE_SIZES = frozenset({20, 50, 100, 200})
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
 def _require_exact_string(value: object, name: str) -> str:
@@ -483,6 +490,69 @@ class RunDataManagementService:
             page_size=request.page_size,
             total_pages=total_pages,
         )
+
+    def update_fault_type(self, run_id: str, fault_type: str) -> bool:
+        validate_uuid4(_require_exact_string(run_id, "run_id"))
+        try:
+            normalized_fault_type = normalize_fault_type_name(fault_type)
+        except ValueError as exc:
+            raise ContractValidationError(f"fault_type is invalid: {exc}") from None
+        is_good = normalized_fault_type == GOOD_MALFUNCTION_TYPE_NAME
+        judgment = "PASS" if is_good else "FAIL"
+        stored_fault_type = None if is_good else normalized_fault_type
+        now = _utc_now()
+
+        def update(database):
+            row = database.execute_sql(
+                """
+                SELECT judgment
+                FROM run
+                WHERE run_id = ? AND state <> 'ACTIVE'
+                """,
+                (run_id,),
+            ).fetchone()
+            if row is None:
+                raise _DeletionRejected(
+                    DeleteRunStatus.NOT_FOUND,
+                    "run not found or active",
+                )
+            cursor = database.execute_sql(
+                """
+                UPDATE run
+                SET judgment = ?,
+                    judgment_source = 'MANUAL',
+                    fault_type = ?,
+                    manual_judgment_revision =
+                        CASE
+                            WHEN manual_judgment_revision IS NULL THEN 1
+                            ELSE manual_judgment_revision + 1
+                        END,
+                    judged_at = ?,
+                    updated_at = ?
+                WHERE run_id = ? AND state <> 'ACTIVE'
+                """,
+                (judgment, stored_fault_type, now, now, run_id),
+            )
+            if cursor.rowcount != 1:
+                raise _DeletionRejected(
+                    DeleteRunStatus.NOT_FOUND,
+                    "run not found or not editable",
+                )
+            return True
+
+        with self._runtime.operation() as database:
+            transaction = run_short_transaction(database, update)
+            if transaction.state is TransactionState.UNKNOWN:
+                self._runtime.quarantine_unknown()
+
+        if transaction.state is TransactionState.UNKNOWN:
+            raise RuntimeError(
+                transaction.reason or "database transaction state unknown"
+            )
+        if transaction.state is TransactionState.ROLLED_BACK:
+            _status, reason = _decode_rejection(transaction.reason)
+            raise RuntimeError(reason)
+        return True
 
     def delete_one(self, run_id: str) -> DeleteRunResult:
         validate_uuid4(_require_exact_string(run_id, "run_id"))

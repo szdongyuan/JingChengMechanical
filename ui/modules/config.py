@@ -3,10 +3,11 @@ from __future__ import annotations
 import copy
 from contextlib import contextmanager
 
-from PyQt6.QtCore import QPoint, Qt, QTimer
-from PyQt6.QtGui import QWheelEvent
+from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
+from PyQt6.QtGui import QStandardItem, QStandardItemModel, QWheelEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -28,12 +29,18 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QStackedWidget,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from app.service.current_meter_service import current_meter_display_unit, normalize_current_meter_config
 from app.service.fault_types import (
+    normalize_fault_type_name,
     parse_fault_types_editor,
     render_fault_types_editor,
 )
@@ -42,6 +49,11 @@ from app.service.result_dashboard_layout import (
     normalize_result_dashboard_layout_for_display,
 )
 from model.plc_table import PlcTable
+from model.malfunction_type_table import (
+    MalfunctionTypeTable,
+    ensure_builtin_malfunction_type,
+    is_builtin_malfunction_type_id,
+)
 from ui.popups import config_package_dialogs
 from ui.popups.golden_sample_import_dialog import GoldenSampleImportDialog
 from ui.widgets.cards import Card
@@ -91,11 +103,371 @@ class _NoWheelComboBox(QComboBox):
         event.ignore()
 
 
+class _FaultTypeCheckDelegate(QStyledItemDelegate):
+    """让下拉列表里的勾选项显示成真正的选择框。"""
+
+    def paint(self, painter, option, index):
+        widget = option.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawPrimitive(
+            QStyle.PrimitiveElement.PE_PanelItemViewItem,
+            option,
+            painter,
+            widget,
+        )
+
+        indicator_width = style.pixelMetric(
+            QStyle.PixelMetric.PM_IndicatorWidth,
+            None,
+            widget,
+        )
+        indicator_height = style.pixelMetric(
+            QStyle.PixelMetric.PM_IndicatorHeight,
+            None,
+            widget,
+        )
+        indicator_rect = QRect(
+            option.rect.left() + 8,
+            option.rect.top() + (option.rect.height() - indicator_height) // 2,
+            indicator_width,
+            indicator_height,
+        )
+
+        check_option = QStyleOptionButton()
+        check_option.rect = indicator_rect
+        check_option.state = QStyle.StateFlag.State_Enabled
+        if index.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked:
+            check_option.state |= QStyle.StateFlag.State_On
+        else:
+            check_option.state |= QStyle.StateFlag.State_Off
+        style.drawControl(
+            QStyle.ControlElement.CE_CheckBox,
+            check_option,
+            painter,
+            widget,
+        )
+
+        text_rect = option.rect.adjusted(indicator_width + 18, 0, -6, 0)
+        style.drawItemText(
+            painter,
+            text_rect,
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            option.palette,
+            True,
+            str(index.data(Qt.ItemDataRole.DisplayRole) or ""),
+        )
+
+
+class _FaultTypeMultiSelectCombo(_NoWheelComboBox):
+    """多选故障类型下拉框，显示值仍保持逗号分隔。"""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._selected_names: list[str] = []
+        self._skip_next_hide = False
+        self._model = QStandardItemModel(self)
+        self.setModel(self._model)
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setPlaceholderText("请选择故障类型")
+        self.view().setItemDelegate(_FaultTypeCheckDelegate(self.view()))
+        self.view().pressed.connect(self._toggle_item)
+        self.refresh_options()
+
+    def text(self) -> str:
+        return ", ".join(self._selected_names)
+
+    def setText(self, value: object):
+        try:
+            self._selected_names = parse_fault_types_editor(str(value or ""))
+        except ValueError:
+            self._selected_names = []
+        self.refresh_options()
+        self._refresh_display()
+
+    def refresh_options(self):
+        ensure_builtin_malfunction_type()
+        checked = list(self._selected_names)
+        self._model.clear()
+        seen: set[str] = set()
+        try:
+            rows = list(
+                MalfunctionTypeTable.select().order_by(MalfunctionTypeTable.id)
+            )
+        except Exception:
+            rows = []
+
+        for row in rows:
+            name = str(row.malfunction_name or "").strip()
+            if not name:
+                continue
+            number = str(row.malfunction_number or "").strip()
+            label = f"{name}（{number}）" if number else name
+            self._add_option(label, name, name in checked)
+            seen.add(name)
+
+        # 兼容已经保存过、但后来从故障类型表里删掉的配置值。
+        for name in checked:
+            if name not in seen:
+                self._add_option(f"{name}（未建档）", name, True)
+
+        self._selected_names = self._checked_names()
+        self._refresh_display()
+
+    def showPopup(self):
+        self.refresh_options()
+        super().showPopup()
+
+    def hidePopup(self):
+        if self._skip_next_hide:
+            self._skip_next_hide = False
+            return
+        self._selected_names = self._checked_names()
+        self._refresh_display()
+        super().hidePopup()
+
+    def _add_option(self, label: str, name: str, checked: bool):
+        item = QStandardItem(label)
+        item.setData(name, Qt.ItemDataRole.UserRole)
+        item.setCheckable(True)
+        item.setCheckState(
+            Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        )
+        item.setFlags(
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsUserCheckable
+        )
+        self._model.appendRow(item)
+
+    def _toggle_item(self, index):
+        item = self._model.itemFromIndex(index)
+        if item is None:
+            return
+        item.setCheckState(
+            Qt.CheckState.Unchecked
+            if item.checkState() == Qt.CheckState.Checked
+            else Qt.CheckState.Checked
+        )
+        self._skip_next_hide = True
+        QTimer.singleShot(0, self._refresh_display)
+
+    def _checked_names(self) -> list[str]:
+        names: list[str] = []
+        for row in range(self._model.rowCount()):
+            item = self._model.item(row)
+            if item.checkState() != Qt.CheckState.Checked:
+                continue
+            name = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if name and name not in names:
+                names.append(name)
+        return names
+
+    def _refresh_display(self):
+        display = ", ".join(self._selected_names)
+        self.lineEdit().setText(display)
+        self.setToolTip(display)
+
+
 class _NoWheelPlainTextEdit(QPlainTextEdit):
     """QPlainTextEdit that ignores mouse wheel events."""
 
     def wheelEvent(self, event: QWheelEvent):
         event.ignore()
+
+
+class _MalfunctionTypeManageDialog(QDialog):
+    """配置页里的故障类型管理弹窗。"""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("故障类型管理")
+        self.resize(680, 460)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["ID", "故障编号", "故障名称", "备注"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setSectionResizeMode(
+            0,
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            1,
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            2,
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            3,
+            QHeaderView.ResizeMode.Stretch,
+        )
+        root.addWidget(self.table, 1)
+
+        form_host = QWidget()
+        form = QFormLayout(form_host)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(8)
+
+        self.ed_number = QLineEdit()
+        self.ed_number.setPlaceholderText("例如：dd")
+        self.ed_name = QLineEdit()
+        self.ed_name.setPlaceholderText("例如：异音")
+        self.ed_notes = QLineEdit()
+        self.ed_notes.setPlaceholderText("可不填")
+
+        form.addRow("故障编号", self.ed_number)
+        form.addRow("故障名称", self.ed_name)
+        form.addRow("备注", self.ed_notes)
+        root.addWidget(form_host)
+
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(8)
+
+        self.btn_add = QPushButton("新增")
+        self.btn_add.setObjectName("Primary")
+        self.btn_delete = QPushButton("删除选中")
+        self.btn_delete.setObjectName("Danger")
+        self.btn_close = QPushButton("关闭")
+
+        actions.addWidget(self.btn_add)
+        actions.addWidget(self.btn_delete)
+        actions.addStretch(1)
+        actions.addWidget(self.btn_close)
+        root.addLayout(actions)
+
+        self.btn_add.clicked.connect(self._add_type)
+        self.btn_delete.clicked.connect(self._delete_selected_type)
+        self.btn_close.clicked.connect(self.accept)
+        self.table.itemSelectionChanged.connect(self._fill_inputs_from_selected)
+
+        self._reload_rows()
+
+    def _reload_rows(self):
+        try:
+            ensure_builtin_malfunction_type()
+            rows = list(
+                MalfunctionTypeTable.select().order_by(MalfunctionTypeTable.id)
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "读取失败", f"无法读取故障类型表：{exc}")
+            rows = []
+
+        self.table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            values = [
+                row.id,
+                row.malfunction_number,
+                row.malfunction_name,
+                row.malfunction_notes or "",
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+                )
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, int(row.id))
+                self.table.setItem(row_index, column, item)
+
+    def _selected_type_id(self) -> int | None:
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        item = self.table.item(row, 0)
+        if item is None:
+            return None
+        value = item.data(Qt.ItemDataRole.UserRole)
+        return int(value) if value is not None else None
+
+    def _selected_type_name(self) -> str:
+        row = self.table.currentRow()
+        if row < 0:
+            return ""
+        item = self.table.item(row, 2)
+        return "" if item is None else item.text().strip()
+
+    def _fill_inputs_from_selected(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        self.ed_number.setText(self.table.item(row, 1).text())
+        self.ed_name.setText(self.table.item(row, 2).text())
+        self.ed_notes.setText(self.table.item(row, 3).text())
+
+    def _add_type(self):
+        number = self.ed_number.text().strip()
+        name = self.ed_name.text().strip()
+        notes = self.ed_notes.text().strip()
+        if not number:
+            QMessageBox.warning(self, "提示", "请填写故障编号。")
+            self.ed_number.setFocus()
+            return
+        try:
+            name = normalize_fault_type_name(name)
+        except ValueError as exc:
+            QMessageBox.warning(self, "提示", f"故障名称不正确：{exc}")
+            self.ed_name.setFocus()
+            return
+
+        if (
+            MalfunctionTypeTable.select()
+            .where(
+                (MalfunctionTypeTable.malfunction_number == number)
+                | (MalfunctionTypeTable.malfunction_name == name)
+            )
+            .exists()
+        ):
+            QMessageBox.warning(self, "提示", "故障编号或故障名称已存在。")
+            return
+
+        try:
+            MalfunctionTypeTable.create(
+                malfunction_number=number,
+                malfunction_name=name,
+                malfunction_notes=notes or None,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "新增失败", str(exc))
+            return
+
+        self.ed_number.clear()
+        self.ed_name.clear()
+        self.ed_notes.clear()
+        self._reload_rows()
+
+    def _delete_selected_type(self):
+        type_id = self._selected_type_id()
+        if type_id is None:
+            QMessageBox.warning(self, "提示", "请先选择一条故障类型。")
+            return
+        if is_builtin_malfunction_type_id(type_id):
+            QMessageBox.warning(self, "提示", "系统默认“良品/不良”类型不能删除。")
+            return
+        if (
+            QMessageBox.question(self, "确认删除", "确定删除选中的故障类型吗？")
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        try:
+            MalfunctionTypeTable.delete().where(
+                MalfunctionTypeTable.id == type_id
+            ).execute()
+        except Exception as exc:
+            QMessageBox.warning(self, "删除失败", str(exc))
+            return
+        self._reload_rows()
 
 
 class _ConfigSectionCardDialog(QDialog):
@@ -487,10 +859,17 @@ class ConfigModule(QWidget):
         self.ed_name = QLineEdit()
         gf_lay.addRow("配置名称", self.ed_name)
 
-        self.fault_types_editor = QLineEdit()
+        self.fault_types_editor = _FaultTypeMultiSelectCombo()
         self.fault_types_editor.setObjectName("fault_types_editor")
-        self.fault_types_editor.setMaxLength(2_147_483_647)
-        gf_lay.addRow("故障类型", self.fault_types_editor)
+        fault_types_row = QWidget()
+        fault_types_lay = QHBoxLayout(fault_types_row)
+        fault_types_lay.setContentsMargins(0, 0, 0, 0)
+        fault_types_lay.setSpacing(6)
+        self.btn_manage_fault_types = QPushButton("故障类型管理")
+        self.btn_manage_fault_types.setFixedWidth(120)
+        fault_types_lay.addWidget(self.fault_types_editor, 1)
+        fault_types_lay.addWidget(self.btn_manage_fault_types)
+        gf_lay.addRow("故障类型", fault_types_row)
 
         self.spin_record = _NoWheelSpinBox()
         self.spin_record.setRange(0.1, 3600.0)
@@ -845,6 +1224,9 @@ class ConfigModule(QWidget):
         self.btn_import.clicked.connect(self._on_import_package)
         self.btn_export.clicked.connect(self._on_export_package)
         self.btn_save.clicked.connect(self._on_save)
+        self.btn_manage_fault_types.clicked.connect(
+            self._open_malfunction_type_dialog
+        )
         self.config_list.currentItemChanged.connect(self._on_item_changed)
         self.combo_input_dev.currentIndexChanged.connect(self._on_input_device_changed)
         self.combo_monitor_channel.currentIndexChanged.connect(
@@ -885,6 +1267,11 @@ class ConfigModule(QWidget):
         plc_changed = getattr(self.services.bus, "plc_changed", None)
         if plc_changed is not None:
             plc_changed.connect(self._on_plc_changed)
+
+    def _open_malfunction_type_dialog(self):
+        dialog = _MalfunctionTypeManageDialog(self)
+        dialog.exec()
+        self.fault_types_editor.refresh_options()
 
     def _populate_devices(self):
         """Populate the input combo from the managed hardware registry."""

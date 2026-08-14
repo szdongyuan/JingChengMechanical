@@ -39,6 +39,12 @@ from app.service.run_scoped_playback import (
     RunPlaybackRequest,
 )
 from consts.running_consts import base_dir
+from model.malfunction_type_table import (
+    BAD_MALFUNCTION_TYPE_NAME,
+    GOOD_MALFUNCTION_TYPE_NAME,
+    MalfunctionTypeTable,
+    ensure_builtin_malfunction_type,
+)
 from ui.popups.historical_metric_report_dialog import HistoricalMetricReportDialog
 from ui.popups.run_audio_replay_dialog import RunAudioReplayDialog
 
@@ -361,11 +367,23 @@ class DataManagementModule(QWidget):
                     start=1,
                 ):
                     value = getattr(record, field_name)
-                    display = (
-                        self._display_run_id(value)
-                        if field_name == "run_id"
-                        else "" if value is None else str(value)
-                    )
+                    if field_name == "fault_type":
+                        item = QTableWidgetItem("")
+                        item.setFlags(
+                            Qt.ItemFlag.ItemIsEnabled
+                            | Qt.ItemFlag.ItemIsSelectable
+                        )
+                        self.table.setItem(row_index, column_index, item)
+                        self.table.setCellWidget(
+                            row_index,
+                            column_index,
+                            self._create_fault_type_combo(record),
+                        )
+                        continue
+                    if field_name == "run_id":
+                        display = self._display_run_id(value)
+                    else:
+                        display = "" if value is None else str(value)
                     item = QTableWidgetItem(
                         display
                     )
@@ -442,11 +460,108 @@ class DataManagementModule(QWidget):
         if self.table.columnCount() > 4:
             header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.table.setColumnWidth(0, max(54, self.table.columnWidth(0)))
+        fault_column = self._fault_type_column_index()
+        if fault_column is not None:
+            self.table.setColumnWidth(
+                fault_column,
+                max(128, self.table.columnWidth(fault_column)),
+            )
         for column in (
             self.table.columnCount() - 2,
             self.table.columnCount() - 1,
         ):
             self.table.setColumnWidth(column, 48)
+
+    def _fault_type_column_index(self) -> int | None:
+        for index, (field_name, _label) in enumerate(self._columns, start=1):
+            if field_name == "fault_type":
+                return index
+        return None
+
+    def _fault_type_options(
+        self,
+        current_value: str | None = None,
+    ) -> list[tuple[str, str | None]]:
+        options: list[tuple[str, str | None]] = [("请选择", None)]
+        seen: set[str] = set()
+        try:
+            ensure_builtin_malfunction_type()
+            rows = list(
+                MalfunctionTypeTable.select().order_by(MalfunctionTypeTable.id)
+            )
+        except Exception:
+            rows = []
+        for row in rows:
+            name = str(row.malfunction_name or "").strip()
+            if not name:
+                continue
+            number = str(row.malfunction_number or "").strip()
+            label = f"{name}（{number}）" if number else name
+            options.append((label, name))
+            seen.add(name)
+        current = str(current_value or "").strip()
+        if current and current not in seen:
+            options.append((f"{current}（当前值）", current))
+        return options
+
+    def _create_fault_type_combo(self, record) -> QComboBox:
+        combo = QComboBox(self.table)
+        combo.setMinimumHeight(26)
+        combo.setEditable(False)
+        for label, value in self._fault_type_options(record.fault_type):
+            combo.addItem(label, value)
+        current = self._record_fault_type_selection(record)
+        target_index = combo.findData(current) if current else 0
+        combo.blockSignals(True)
+        combo.setCurrentIndex(target_index if target_index >= 0 else 0)
+        combo.blockSignals(False)
+        combo.setProperty("last_committed_index", combo.currentIndex())
+        editable = getattr(record, "state", None) != "ACTIVE"
+        combo.setEnabled(editable)
+        if editable:
+            combo.setToolTip("选择后会同步更新判定和数据库")
+            combo.currentIndexChanged.connect(
+                lambda _index, run_id=record.run_id, source=combo: (
+                    self._on_fault_type_changed(run_id, source)
+                )
+            )
+        else:
+            combo.setToolTip("运行中的记录不能修改")
+        return combo
+
+    @staticmethod
+    def _record_fault_type_selection(record) -> str:
+        judgment = getattr(record, "judgment", None)
+        fault_type = str(getattr(record, "fault_type", None) or "").strip()
+        if judgment == "PASS":
+            return GOOD_MALFUNCTION_TYPE_NAME
+        if judgment == "FAIL":
+            return fault_type or BAD_MALFUNCTION_TYPE_NAME
+        return fault_type
+
+    def _on_fault_type_changed(self, run_id: str, combo: QComboBox) -> None:
+        fault_type = combo.currentData()
+        previous_index = combo.property("last_committed_index")
+        if previous_index is None:
+            previous_index = 0
+        if not fault_type:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(int(previous_index))
+            combo.blockSignals(False)
+            return
+        try:
+            self.services.run_data_management_service.update_fault_type(
+                run_id,
+                str(fault_type),
+            )
+        except Exception as exc:
+            combo.blockSignals(True)
+            combo.setCurrentIndex(int(previous_index))
+            combo.blockSignals(False)
+            QMessageBox.warning(self, "修改失败", f"故障类型更新失败：{exc}")
+            return
+        combo.setProperty("last_committed_index", combo.currentIndex())
+        self.refresh_table()
 
     @staticmethod
     def _display_run_id(run_id: object) -> str:
