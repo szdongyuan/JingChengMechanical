@@ -26,19 +26,18 @@ from model.plc_process_param_offset_table import PlcProcessParamOffsetTable
 from model.plc_table import PlcTable
 
 PLC_FIELD_OFFSETS = [
-    ("start_signal_offset", "启动型号 StartSignal"),
-    ("sn_code_offset", "SN码 SnCode"),
-    ("product_model_offset", "产品型号 ProductModel"),
+    ("start_signal_offset", "启动信号 StartSignal"),
+    ("current_value_offset", "电流 CurrentValue (REAL/A)"),
+    ("rotation_speed_offset", "转速值 RotationSpeed"),
+    ("res_testing_signal_offset", "返回测试中 ResTestingSignal"),
     ("res_finish_signal_offset", "返回结束信号 ResFinishSignal"),
     ("res_error_code_offset", "返回异常代码 ResErrorCode"),
-    ("res_sn_code_offset", "返回SN码 ResSnCode"),
     ("res_result_offset", "返回测试结果 ResResult"),
     ("res_score_offset", "返回评分 ResScore"),
     ("res_spl_offset", "返回平均声压级 ResSPL"),
     ("res_loudness_offset", "返回响度 ResLoudness"),
     ("res_vibrate_data_offset", "返回中场振动 ResVibrateData"),
     ("res_ai_score_offset", "返回AI评分 ResAiScore"),
-    ("res_product_model_offset", "返回机种 ResProductModel"),
     ("res_spl_limit_up_offset", "返回声压值上限 ResSplLimitUp"),
     ("res_spl_limit_down_offset", "返回声压值下限 ResSplLimitDown"),
     ("res_loudness_limit_up_offset", "返回响度值上限 ResLoudnessLimitUp"),
@@ -46,6 +45,10 @@ PLC_FIELD_OFFSETS = [
     ("res_vibrate_limit_up_offset", "返回振动值上限 ResVibrateLimitUp"),
     ("res_vibrate_limit_down_offset", "返回振动值下限 ResVibrateLimitDown"),
     ("res_ai_score_limit_down_offset", "返回AI评分下限 ResAiScoreLimitDown"),
+    ("sn_code_offset", "SN码 SnCode"),
+    ("product_model_offset", "产品型号 ProductModel"),
+    ("res_sn_code_offset", "返回SN码 ResSnCode"),
+    ("res_product_model_offset", "返回机种 ResProductModel"),
 ]
 
 PLC_PROCESS_PARAM_OFFSETS = [
@@ -101,6 +104,8 @@ class PlcFieldOffsetDialog(QDialog):
     def validate_values(self):
         for key, label in PLC_FIELD_OFFSETS:
             value = self.edits[key].text().strip()
+            if not value:
+                continue
             if not re.fullmatch(r"\d+\.\d+", value):
                 QMessageBox.warning(self, "提示", f"{label} 偏移格式错误，请输入类似 0.0 的格式")
                 self.edits[key].setFocus()
@@ -267,6 +272,8 @@ class PlcProcessParamOffsetDialog(QDialog):
         )
         for label, edit in validate_items:
             value = edit.text().strip()
+            if not value:
+                continue
             if not re.fullmatch(r"\d+\.\d+", value):
                 QMessageBox.warning(self, "提示", f"{label} 偏移格式错误，请输入类似 0.0 的格式")
                 edit.setFocus()
@@ -319,7 +326,21 @@ class PlcSettingsModule(QWidget):
         # 顶部下拉框只显示 PLC 的 id。
         self.combo_plc = QComboBox()
         self.combo_plc.setMinimumWidth(220)
-        root.addWidget(self.combo_plc, 0)
+        # 新增/删除 PLC：只处理数据库里的 PLC 配置和对应偏移配置。
+        self.btn_add_plc = QPushButton("新增 PLC")
+        self.btn_add_plc.setObjectName("Primary")
+        self.btn_add_plc.setFixedWidth(96)
+        self.btn_delete_plc = QPushButton("删除 PLC")
+        self.btn_delete_plc.setObjectName("Danger")
+        self.btn_delete_plc.setFixedWidth(96)
+
+        plc_row = QHBoxLayout()
+        plc_row.setContentsMargins(0, 0, 0, 0)
+        plc_row.setSpacing(10)
+        plc_row.addWidget(self.combo_plc, 1)
+        plc_row.addWidget(self.btn_add_plc)
+        plc_row.addWidget(self.btn_delete_plc)
+        root.addLayout(plc_row)
 
         form = QFormLayout()
         form.setContentsMargins(0, 0, 0, 0)
@@ -397,6 +418,9 @@ class PlcSettingsModule(QWidget):
 
     def init_fun(self):
         self.combo_plc.currentIndexChanged.connect(self.on_combo_changed)
+        # 顶部新增/删除按钮。
+        self.btn_add_plc.clicked.connect(self.add_plc)
+        self.btn_delete_plc.clicked.connect(self.delete_current_plc)
         self.btn_save.clicked.connect(self.save_current)
         self.btn_toggle.clicked.connect(self.toggle_state)
         self.btn_connect.clicked.connect(self.connect_plc)
@@ -424,7 +448,8 @@ class PlcSettingsModule(QWidget):
             QMessageBox.warning(self, "提示", f"读取 PLC 配置失败: {exc}")
 
         for row in rows:
-            self.services.plc_state[row.id] = "未连接"
+            if row.id not in self.services.plc_state:
+                self.services.plc_state[row.id] = "未连接"
 
         self.combo_plc.blockSignals(True)
         self.combo_plc.clear()
@@ -434,6 +459,8 @@ class PlcSettingsModule(QWidget):
 
         has_rows = bool(rows)
         self.combo_plc.setEnabled(has_rows)
+        self.btn_add_plc.setEnabled(True)
+        self.btn_delete_plc.setEnabled(has_rows)
         self.btn_save.setEnabled(has_rows)
         self.btn_toggle.setEnabled(has_rows)
         self.btn_connect.setEnabled(has_rows)
@@ -518,8 +545,73 @@ class PlcSettingsModule(QWidget):
         self.btn_toggle.setText("开启")
         self.btn_connect.setText("连接")
         self.btn_connect.setEnabled(False)
+        self.btn_delete_plc.setEnabled(False)
         self.btn_field_offset.setEnabled(False)
         self.btn_process_param_offset.setEnabled(False)
+
+    def add_plc(self):
+        try:
+            # 先新增 PLC 基础配置，再给它补一条空的偏移配置。
+            row = PlcTable.create(
+                plc_name=None,
+                plc_ip=None,
+                plc_rack=0,
+                plc_slot=1,
+                plc_db_number=1,
+                plc_poll_interval_ms=100,
+                plc_reconnect_interval_ms=1000,
+                plc_open_state=0,
+            )
+            PlcFieldOffsetTable.create(
+                plc_id=row.id,
+                **{field_name: None for field_name, _label in PLC_FIELD_OFFSETS},
+            )
+            # 重新加载下拉框，并切到刚新增的 PLC。
+            self.reload_rows()
+            index = self.combo_plc.findData(row.id)
+            if index >= 0:
+                self.combo_plc.setCurrentIndex(index)
+            QMessageBox.information(self, "成功", f"PLC {row.id} 新增成功!")
+        except Exception as exc:
+            QMessageBox.warning(self, "提示", f"新增 PLC 失败: {exc}")
+
+    def delete_current_plc(self):
+        row = self.get_current_row()
+        if row is None:
+            QMessageBox.warning(self, "提示", "请先选择 PLC")
+            return
+
+        reply = QMessageBox.question(
+            self,
+            "提示",
+            f"确认删除 PLC {row.id}：{row.plc_name or '-'}？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        row_id = row.id
+        try:
+            # 删除前先断开当前 PLC，避免后台线程还在读写这条配置。
+            self.disconnect_row(row_id)
+            # 先删偏移配置，再删 PLC 主配置。
+            PlcFieldOffsetTable.delete().where(
+                PlcFieldOffsetTable.plc_id == row_id
+            ).execute()
+            deleted = PlcTable.delete().where(PlcTable.id == row_id).execute()
+            if deleted == 0:
+                QMessageBox.warning(self, "提示", f"PLC {row_id} 删除失败")
+                return
+            # 清掉顶部状态栏使用的状态缓存。
+            self.services.plc_state.pop(row_id, None)
+            self.reload_rows()
+            refresh_plc_labels = getattr(self.window(), "_refresh_plc_state_labels", None)
+            if callable(refresh_plc_labels):
+                refresh_plc_labels()
+            QMessageBox.information(self, "成功", f"PLC {row_id} 删除成功!")
+        except Exception as exc:
+            QMessageBox.warning(self, "提示", f"删除 PLC 失败: {exc}")
 
     def open_field_offset_dialog(self):
         row = self.get_current_row()
@@ -982,6 +1074,8 @@ class PlcSettingsModule(QWidget):
                 self.ed_db_number,
                 self.ed_poll_interval,
                 self.ed_reconnect_interval,
+                self.btn_add_plc,
+                self.btn_delete_plc,
                 self.btn_save,
                 self.btn_toggle,
                 self.btn_connect,

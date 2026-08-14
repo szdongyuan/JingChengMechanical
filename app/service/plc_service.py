@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import time
+
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
 import snap7
 import snap7.util
@@ -329,6 +331,11 @@ class PlcService(QObject):
             data = self.plc_client.db_read(self._db_number, byte_index, 4)
             return snap7.util.get_real(data, 0)
 
+        if type == "int":
+            byte_index = int(str(offset).split(".", 1)[0])
+            data = self.plc_client.db_read(self._db_number, byte_index, 2)
+            return snap7.util.get_int(data, 0)
+
         return None
 
     def read_plc_values(self, *field_names) -> dict:
@@ -359,6 +366,9 @@ class PlcService(QObject):
             "res_vibrate_limit_down_offset",
             "res_ai_score_limit_down_offset",
         }
+        int_fields = {
+            "rotation_speed_offset",
+        }
 
         for field_name in field_names:
             offset = self._field_offsets_dict.get(field_name)
@@ -372,6 +382,8 @@ class PlcService(QObject):
                 value = self.read_offset_value(offset, "bool")
             elif field_name in real_fields:
                 value = self.read_offset_value(offset, "real")
+            elif field_name in int_fields:
+                value = self.read_offset_value(offset, "int")
             else:
                 continue
 
@@ -397,13 +409,21 @@ class PlcService(QObject):
 
     def _emit_plc_workorder(self):
         payload = {}
-        values = self.read_plc_values("sn_code_offset", "product_model_offset")
+        values = self.read_plc_values(
+            "sn_code_offset",
+            "product_model_offset",
+            "rotation_speed_offset",
+        )
         if values.get("sn_code_offset"):
             payload["sn"] = values["sn_code_offset"]
         if values.get("product_model_offset"):
             payload["model"] = values["product_model_offset"]
+        if values.get("rotation_speed_offset") is not None:
+            payload["rotation_speed"] = values["rotation_speed_offset"]
         if payload:
+            self.bus.current_workorder_payload = dict(payload)
             self.bus.plc_workorder_changed.emit(payload)
+        return payload
 
     def poll_once(self):
         """
@@ -432,9 +452,15 @@ class PlcService(QObject):
             return
         self.bus.log.emit(f"PLC {self._plc_id} 检测到开始信号")
         self.logger.info(f"PLC {self._plc_id} 检测到开始信号")
-        self._emit_plc_workorder()
+        trigger_monotonic_ns = time.monotonic_ns()
+        workorder = self._emit_plc_workorder()
+        print(workorder)
         try:
-            self._on_start_requested(self._plc_id)
+            self._on_start_requested(
+                self._plc_id,
+                workorder,
+                trigger_monotonic_ns,
+            )
         except Exception as exc:
             self.bus.log.emit(f"PLC{self._plc_id}开始回调失败: {exc}")
             self.logger.error(f"PLC{self._plc_id}开始回调失败: {exc}")
