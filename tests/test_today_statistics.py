@@ -293,7 +293,7 @@ def test_terminal_trigger_does_not_refresh_when_run_is_not_durably_terminal(qapp
     module.deleteLater()
 
 
-def test_today_statistics_refreshes_on_test_finished_and_timer(qapp):
+def test_today_statistics_ignores_precommit_signals_and_uses_timer(qapp):
     bus = _BusStub()
     reader = _RunExportReaderStub(())
     legacy = _LegacyAudioDataServiceStub()
@@ -307,20 +307,18 @@ def test_today_statistics_refreshes_on_test_finished_and_timer(qapp):
     )
 
     assert bus.result_changed.callbacks == []
-    assert len(bus.test_finished.callbacks) == 1
+    assert bus.test_finished.callbacks == []
     assert bus.factory_display_reset.callbacks == []
     assert module._timer.interval() == 30_000
     assert module._timer.isActive()
 
     bus.result_changed.emit({})
+    bus.test_finished.emit(1, {})
     bus.factory_display_reset.emit("manual_judgment_ok")
     assert reader.calls == 1
 
-    bus.test_finished.emit(1, {})
-    assert reader.calls == 2
-
     module._timer.timeout.emit()
-    assert reader.calls == 3
+    assert reader.calls == 2
 
     module.deleteLater()
 

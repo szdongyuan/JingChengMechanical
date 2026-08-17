@@ -57,7 +57,6 @@ class TodayStatisticsModule(QWidget):
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        self.services.bus.test_finished.connect(self._on_test_finished)
         self.services.bus.run_records_deleted.connect(
             self.on_run_records_deleted
         )
@@ -95,10 +94,6 @@ class TodayStatisticsModule(QWidget):
         self._refresh_from_rows(
             tuple(self.services.run_export_reader.list_durable())
         )
-
-    @pyqtSlot(int, dict)
-    def _on_test_finished(self, _config_id: int, _payload: dict) -> None:
-        self.refresh()
 
     @pyqtSlot(object)
     def on_run_records_deleted(self, report: object) -> None:

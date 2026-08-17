@@ -49,6 +49,9 @@ from ui.popups.historical_metric_report_dialog import HistoricalMetricReportDial
 from ui.popups.run_audio_replay_dialog import RunAudioReplayDialog
 
 
+_BEIJING_TIMEZONE = timezone(timedelta(hours=8))
+
+
 class _CachedFaultTypeCombo(QComboBox):
     def __init__(self, refresh_options, parent=None):
         super().__init__(parent)
@@ -397,6 +400,8 @@ class DataManagementModule(QWidget):
                         continue
                     if field_name == "run_id":
                         display = self._display_run_id(value)
+                    elif field_name == "accepted_at":
+                        display = self._display_beijing_time(value)
                     else:
                         display = "" if value is None else str(value)
                     item = QTableWidgetItem(
@@ -634,6 +639,19 @@ class DataManagementModule(QWidget):
         if len(text) <= 12:
             return text
         return f"{text[:6]}…{text[-6:]}"
+
+    @classmethod
+    def _display_beijing_time(cls, value: object) -> str:
+        text = str(value or "").strip()
+        if not text:
+            return ""
+        try:
+            parsed = cls._parse_utc(text)
+        except Exception:
+            return text
+        return parsed.astimezone(_BEIJING_TIMEZONE).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
 
     def _create_table_action_button(
         self,

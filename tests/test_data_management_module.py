@@ -288,6 +288,7 @@ def test_page_projects_sn_model_filters_paging_and_destructive_controls(qapp):
     assert module.table.item(0, 1).text() == "111111…111111"
     assert module.table.item(0, 1).toolTip() == RUN_A
     assert module.table.item(0, 1).data(Qt.ItemDataRole.UserRole) == RUN_A
+    assert module.table.item(0, 2).text() == "2026-07-29 09:02:03"
     assert module.table.item(0, 3).text() == "SN-001"
     assert module.table.item(0, 4).text() == "MODEL-A"
     assert module.edit_model.placeholderText() == "产品型号"
