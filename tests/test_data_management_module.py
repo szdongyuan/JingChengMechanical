@@ -14,6 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtCore import QDateTime, Qt
 from PyQt6.QtWidgets import (
     QApplication,
+    QComboBox,
     QFileDialog,
     QMessageBox,
     QPushButton,
@@ -315,14 +316,20 @@ def test_page_projects_sn_model_filters_paging_and_destructive_controls(qapp):
     )
     play = module.table.cellWidget(0, module.table.columnCount() - 2)
     delete = module.table.cellWidget(0, module.table.columnCount() - 1)
+    fault_type = module.table.cellWidget(0, module.table.columnCount() - 3)
+    assert isinstance(fault_type, QComboBox)
+    assert fault_type.objectName() == "data_management_fault_type_combo"
+    assert fault_type.height() == 24
     assert play.objectName() == "data_management_play_button"
     assert delete.objectName() == "data_management_delete_button"
     assert play.toolTip() == "播放完整音频"
     assert delete.toolTip() == "永久删除此记录"
     assert not play.icon().isNull()
     assert not delete.icon().isNull()
-    assert play.width() <= 30 and play.height() <= 30
-    assert delete.width() <= 30 and delete.height() <= 30
+    assert play.width() == 22 and play.height() == 22
+    assert delete.width() == 22 and delete.height() == 22
+    assert play.iconSize().width() == 13
+    assert delete.iconSize().width() == 13
     for control in (
         module.btn_refresh,
         module.btn_statistics_report,
@@ -330,6 +337,66 @@ def test_page_projects_sn_model_filters_paging_and_destructive_controls(qapp):
         module.btn_export,
     ):
         assert control.isEnabled()
+
+
+def test_fault_type_options_are_cached_on_show_and_reused_by_combos(
+    qapp,
+    monkeypatch,
+):
+    calls = []
+
+    def fake_load_fault_type_options(self):
+        call_index = len(calls)
+        calls.append(call_index)
+        value = "缓存类型-A" if call_index == 0 else "缓存类型-B"
+        return (
+            (
+                ("请选择", None),
+                (f"{value}（FT）", value),
+            ),
+            frozenset({value}),
+        )
+
+    monkeypatch.setattr(
+        DataManagementModule,
+        "_load_fault_type_options_from_database",
+        fake_load_fault_type_options,
+    )
+
+    module, management, _deleted = _module(qapp)
+
+    assert calls == []
+    module.show()
+    qapp.processEvents()
+
+    assert calls == [0]
+    fault_combo = module.table.cellWidget(0, module.table.columnCount() - 3)
+    assert fault_combo.findData("缓存类型-A") >= 0
+
+    management.next_page = _page(
+        tuple(
+            _row(f"33333333-3333-4333-8333-33333333333{index}")
+            for index in range(5)
+        )
+    )
+    module.refresh_table()
+
+    assert calls == [0]
+    fault_combo = module.table.cellWidget(0, module.table.columnCount() - 3)
+    fault_combo.showPopup()
+    fault_combo.hidePopup()
+    assert calls == [0]
+    assert fault_combo.findData("缓存类型-A") >= 0
+
+    module.hide()
+    qapp.processEvents()
+    module.show()
+    qapp.processEvents()
+
+    assert calls == [0, 1]
+    fault_combo = module.table.cellWidget(0, module.table.columnCount() - 3)
+    assert fault_combo.findData("缓存类型-B") >= 0
+    module.close()
 
 
 def test_filters_reset_page_and_convert_local_end_second_to_exclusive_utc(

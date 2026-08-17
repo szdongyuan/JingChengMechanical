@@ -4,7 +4,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import os
 
-from PyQt6.QtCore import QDateTime, QSignalBlocker, Qt, QTimer
+from PyQt6.QtCore import QDateTime, QSize, QSignalBlocker, Qt, QTimer
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -47,6 +47,16 @@ from model.malfunction_type_table import (
 )
 from ui.popups.historical_metric_report_dialog import HistoricalMetricReportDialog
 from ui.popups.run_audio_replay_dialog import RunAudioReplayDialog
+
+
+class _CachedFaultTypeCombo(QComboBox):
+    def __init__(self, refresh_options, parent=None):
+        super().__init__(parent)
+        self._refresh_options = refresh_options
+
+    def showPopup(self) -> None:
+        self._refresh_options(self)
+        super().showPopup()
 
 
 class DataManagementModule(QWidget):
@@ -96,6 +106,11 @@ class DataManagementModule(QWidget):
         self._report_dialog = None
         self._replay_dialogs: dict[str, RunAudioReplayDialog] = {}
         self._initial_column_widths_applied = False
+        self._fault_type_options_cache: tuple[
+            tuple[str, str | None],
+            ...,
+        ] = (("请选择", None),)
+        self._fault_type_option_names: frozenset[str] = frozenset()
 
         self._build_ui()
         self.refresh_table()
@@ -443,6 +458,8 @@ class DataManagementModule(QWidget):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
+        self._refresh_fault_type_options_cache()
+        self._refresh_visible_fault_type_combos()
         if not self._initial_column_widths_applied:
             self._initial_column_widths_applied = True
             QTimer.singleShot(0, self._apply_table_column_widths)
@@ -478,10 +495,9 @@ class DataManagementModule(QWidget):
                 return index
         return None
 
-    def _fault_type_options(
+    def _load_fault_type_options_from_database(
         self,
-        current_value: str | None = None,
-    ) -> list[tuple[str, str | None]]:
+    ) -> tuple[tuple[tuple[str, str | None], ...], frozenset[str]]:
         options: list[tuple[str, str | None]] = [("请选择", None)]
         seen: set[str] = set()
         try:
@@ -499,23 +515,54 @@ class DataManagementModule(QWidget):
             label = f"{name}（{number}）" if number else name
             options.append((label, name))
             seen.add(name)
+        return tuple(options), frozenset(seen)
+
+    def _refresh_fault_type_options_cache(self) -> None:
+        options, seen = self._load_fault_type_options_from_database()
+        self._fault_type_options_cache = options
+        self._fault_type_option_names = seen
+
+    def _refresh_visible_fault_type_combos(self) -> None:
+        fault_column = self._fault_type_column_index()
+        if fault_column is None:
+            return
+        for row_index in range(self.table.rowCount()):
+            combo = self.table.cellWidget(row_index, fault_column)
+            if isinstance(combo, QComboBox):
+                self._reload_fault_type_combo_options(combo)
+
+    def _fault_type_options(
+        self,
+        current_value: str | None = None,
+    ) -> list[tuple[str, str | None]]:
+        result = list(self._fault_type_options_cache)
         current = str(current_value or "").strip()
-        if current and current not in seen:
-            options.append((f"{current}（当前值）", current))
-        return options
+        if current and current not in self._fault_type_option_names:
+            result.append((f"{current}（当前值）", current))
+        return result
 
     def _create_fault_type_combo(self, record) -> QComboBox:
-        combo = QComboBox(self.table)
-        combo.setMinimumHeight(26)
+        combo = _CachedFaultTypeCombo(
+            self._reload_fault_type_combo_options,
+            self.table,
+        )
+        combo.setObjectName("data_management_fault_type_combo")
+        combo.setFixedHeight(24)
+        combo.setStyleSheet(
+            """
+            QComboBox#data_management_fault_type_combo {
+                padding: 2px 22px 2px 8px;
+                border-radius: 6px;
+            }
+            QComboBox#data_management_fault_type_combo::drop-down {
+                width: 22px;
+                border: 0px;
+            }
+            """
+        )
         combo.setEditable(False)
-        for label, value in self._fault_type_options(record.fault_type):
-            combo.addItem(label, value)
         current = self._record_fault_type_selection(record)
-        target_index = combo.findData(current) if current else 0
-        combo.blockSignals(True)
-        combo.setCurrentIndex(target_index if target_index >= 0 else 0)
-        combo.blockSignals(False)
-        combo.setProperty("last_committed_index", combo.currentIndex())
+        self._populate_fault_type_combo(combo, current)
         editable = getattr(record, "state", None) != "ACTIVE"
         combo.setEnabled(editable)
         if editable:
@@ -528,6 +575,24 @@ class DataManagementModule(QWidget):
         else:
             combo.setToolTip("运行中的记录不能修改")
         return combo
+
+    def _reload_fault_type_combo_options(self, combo: QComboBox) -> None:
+        self._populate_fault_type_combo(combo, combo.currentData())
+
+    def _populate_fault_type_combo(
+        self,
+        combo: QComboBox,
+        current_value: str | None,
+    ) -> None:
+        current = str(current_value or "").strip()
+        combo.blockSignals(True)
+        combo.clear()
+        for label, value in self._fault_type_options(current):
+            combo.addItem(label, value)
+        target_index = combo.findData(current) if current else 0
+        combo.setCurrentIndex(target_index if target_index >= 0 else 0)
+        combo.setProperty("last_committed_index", combo.currentIndex())
+        combo.blockSignals(False)
 
     @staticmethod
     def _record_fault_type_selection(record) -> str:
@@ -579,9 +644,10 @@ class DataManagementModule(QWidget):
         button = QPushButton(self.table)
         button.setObjectName(object_name)
         button.setIcon(self.style().standardIcon(standard_pixmap))
+        button.setIconSize(QSize(13, 13))
         button.setToolTip(tooltip)
-        button.setFixedSize(28, 26)
-        button.setStyleSheet("padding: 0; margin: 0;")
+        button.setFixedSize(22, 22)
+        button.setStyleSheet("padding: 0; margin: 0; border-radius: 4px;")
         return button
 
     def _resolve_full_run_playback_request(
