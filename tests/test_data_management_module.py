@@ -408,6 +408,26 @@ def test_fault_type_options_are_cached_on_show_and_reused_by_combos(
     module.close()
 
 
+def test_fault_type_combo_ignores_wheel_to_avoid_accidental_update(qapp):
+    class WheelEventStub:
+        def __init__(self) -> None:
+            self.ignored = False
+
+        def ignore(self) -> None:
+            self.ignored = True
+
+    module, management, _deleted = _module(qapp)
+    fault_combo = module.table.cellWidget(0, module.table.columnCount() - 3)
+    old_index = fault_combo.currentIndex()
+    event = WheelEventStub()
+
+    fault_combo.wheelEvent(event)
+
+    assert event.ignored is True
+    assert fault_combo.currentIndex() == old_index
+    assert management.updated_fault_types == []
+
+
 def test_filters_reset_page_and_convert_local_end_second_to_exclusive_utc(
     qapp,
 ):

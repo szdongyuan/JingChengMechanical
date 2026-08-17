@@ -62,6 +62,9 @@ class _CachedFaultTypeCombo(QComboBox):
         self._refresh_options(self)
         super().showPopup()
 
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
 
 class DataManagementModule(QWidget):
     """Server-paged run-v2 listing, archive export, and irreversible deletion."""
