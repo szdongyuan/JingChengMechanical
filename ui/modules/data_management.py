@@ -13,6 +13,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QHeaderView,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -133,6 +134,7 @@ class DataManagementModule(QWidget):
         self.btn_select_all = QPushButton("全选")
         self.btn_select_all.setCheckable(True)
         self.btn_export = QPushButton("导出")
+        self.btn_batch_fault_type = QPushButton("批量修改故障类型")
         self.btn_batch_delete = QPushButton("批量删除")
         self.lb_selected = QLabel("已选 0 条")
 
@@ -140,6 +142,7 @@ class DataManagementModule(QWidget):
         toolbar_layout.addWidget(self.btn_statistics_report)
         toolbar_layout.addWidget(self.btn_select_all)
         toolbar_layout.addWidget(self.btn_export)
+        toolbar_layout.addWidget(self.btn_batch_fault_type)
         toolbar_layout.addWidget(self.btn_batch_delete)
         toolbar_layout.addStretch(1)
         toolbar_layout.addWidget(self.lb_selected)
@@ -230,6 +233,9 @@ class DataManagementModule(QWidget):
         self.btn_statistics_report.clicked.connect(self._show_statistics_report)
         self.btn_select_all.clicked.connect(self._toggle_select_all)
         self.btn_export.clicked.connect(self._export_selected_rows)
+        self.btn_batch_fault_type.clicked.connect(
+            self._batch_update_fault_type
+        )
         self.btn_batch_delete.clicked.connect(self._delete_selected_rows)
         self.btn_search.clicked.connect(self._apply_filters)
         self.edit_model.returnPressed.connect(self._apply_filters)
@@ -766,8 +772,9 @@ class DataManagementModule(QWidget):
                 QMessageBox.warning(self, "回放", "此记录的音频无法打开")
                 return
             self._replay_dialogs[run_id] = dialog
+            replay_dialogs = self._replay_dialogs
             dialog.destroyed.connect(
-                lambda *_args, rid=run_id: self._replay_dialogs.pop(
+                lambda *_args, rid=run_id, dialogs=replay_dialogs: dialogs.pop(
                     rid,
                     None,
                 )
@@ -987,6 +994,98 @@ class DataManagementModule(QWidget):
                 f"导出失败：{error_message}",
             )
 
+    def _batch_update_fault_type(self) -> None:
+        if self._operation_active:
+            return
+        run_ids = self._selected_run_ids()
+        if not run_ids:
+            QMessageBox.warning(
+                self,
+                "提示",
+                "请先勾选要修改故障类型的运行记录",
+            )
+            return
+
+        self._refresh_fault_type_options_cache()
+        choices = [
+            (label, value)
+            for label, value in self._fault_type_options()
+            if value
+        ]
+        if not choices:
+            QMessageBox.warning(self, "提示", "没有可用的故障类型")
+            return
+
+        labels = [label for label, _value in choices]
+        selected_label, accepted = QInputDialog.getItem(
+            self,
+            "批量修改故障类型",
+            f"将已选 {len(run_ids)} 条记录修改为：",
+            labels,
+            0,
+            False,
+        )
+        if not accepted:
+            return
+
+        fault_type = next(
+            (
+                value
+                for label, value in choices
+                if label == str(selected_label)
+            ),
+            None,
+        )
+        if not fault_type:
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "确认批量修改",
+            f"确定将已选的 {len(run_ids)} 条记录故障类型修改为"
+            f"「{selected_label}」吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer is not QMessageBox.StandardButton.Yes:
+            return
+
+        failures: list[tuple[str, str]] = []
+        self._set_operation_active(True)
+        QApplication.processEvents()
+        try:
+            for run_id in run_ids:
+                try:
+                    updated = (
+                        self.services.run_data_management_service
+                        .update_fault_type(run_id, str(fault_type))
+                    )
+                except Exception as exc:
+                    failures.append((run_id, str(exc)))
+                    continue
+                if updated is False:
+                    failures.append((run_id, "数据库未更新"))
+        finally:
+            self._set_operation_active(False)
+
+        self.refresh_table()
+        success_count = len(run_ids) - len(failures)
+        lines = [
+            f"成功修改 {success_count} 条",
+            f"失败 {len(failures)} 条",
+        ]
+        if failures:
+            lines.append("明细：")
+            lines.extend(
+                f"{run_id}: {reason}"
+                for run_id, reason in failures[:5]
+            )
+            remaining = len(failures) - 5
+            if remaining > 0:
+                lines.append(f"还有 {remaining} 条失败未展示")
+        message = QMessageBox.warning if failures else QMessageBox.information
+        message(self, "批量修改结果", "\n".join(lines))
+
     def _delete_run(self, run_id: str) -> None:
         if self._operation_active:
             return
@@ -1152,6 +1251,7 @@ class DataManagementModule(QWidget):
             self.btn_next,
             self.btn_select_all,
             self.btn_export,
+            self.btn_batch_fault_type,
             self.btn_batch_delete,
         )
 

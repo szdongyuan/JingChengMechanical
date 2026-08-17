@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QHeaderView,
+    QInputDialog,
     QMessageBox,
     QPushButton,
     QTableView,
@@ -115,6 +116,7 @@ class _ManagementStub:
             unattempted_run_ids=(),
             restart_required=False,
         )
+        self.updated_fault_types = []
 
     def query_page(self, request):
         self.queries.append(request)
@@ -129,6 +131,10 @@ class _ManagementStub:
     def delete_many(self, run_ids):
         self.deleted_many = run_ids
         return self.delete_many_report
+
+    def update_fault_type(self, run_id, fault_type):
+        self.updated_fault_types.append((run_id, fault_type))
+        return True
 
 
 @pytest.fixture(scope="session")
@@ -311,6 +317,7 @@ def test_page_projects_sn_model_filters_paging_and_destructive_controls(qapp):
     assert module.btn_previous.text() == "上一页"
     assert module.btn_next.text() == "下一页"
     assert module.lb_page.text() == "第 1/1 页，共 2 条"
+    assert module.btn_batch_fault_type.text() == "批量修改故障类型"
     assert module.btn_batch_delete.text() == "批量删除"
     assert isinstance(
         module.table.cellWidget(0, module.table.columnCount() - 1),
@@ -572,6 +579,61 @@ def test_invalid_time_filter_is_reported_without_replacing_applied_state(
     assert module.check_start.isChecked() is False
     assert module.check_end.isChecked() is False
     assert "查询条件错误" in messages[0][1]
+
+
+def test_batch_update_fault_type_updates_selected_rows_and_refreshes(
+    qapp,
+    monkeypatch,
+):
+    module, management, _deleted = _module(qapp)
+    management.queries.clear()
+    _select_all_rows(module)
+
+    def fake_refresh_fault_types(self):
+        self._fault_type_options_cache = (
+            ("请选择", None),
+            ("良品（OK）", "良品"),
+            ("轴伤（ZS）", "轴伤"),
+        )
+        self._fault_type_option_names = frozenset({"良品", "轴伤"})
+
+    confirmations = []
+    summaries = []
+    monkeypatch.setattr(
+        DataManagementModule,
+        "_refresh_fault_type_options_cache",
+        fake_refresh_fault_types,
+    )
+    monkeypatch.setattr(
+        QInputDialog,
+        "getItem",
+        lambda *args: ("轴伤（ZS）", True),
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args: (
+            confirmations.append(args),
+            QMessageBox.StandardButton.Yes,
+        )[1],
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda *args: summaries.append(args),
+    )
+
+    module._batch_update_fault_type()
+
+    assert management.updated_fault_types == [
+        (RUN_A, "轴伤"),
+        (RUN_B, "轴伤"),
+    ]
+    assert module._operation_active is False
+    assert management.queries[-1].page == 1
+    assert "已选的 2 条" in confirmations[0][2]
+    assert "轴伤（ZS）" in confirmations[0][2]
+    assert "成功修改 2 条" in summaries[0][2]
 
 
 def test_export_uses_shared_operation_gate_and_archive_service(
