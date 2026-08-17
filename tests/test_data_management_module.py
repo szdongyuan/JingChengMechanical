@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
     QFileDialog,
+    QHeaderView,
     QMessageBox,
     QPushButton,
     QTableView,
@@ -285,7 +286,7 @@ def test_page_projects_sn_model_filters_paging_and_destructive_controls(qapp):
         "回放",
         "删除",
     ]
-    assert module.table.item(0, 1).text() == "111111…111111"
+    assert module.table.item(0, 1).text() == RUN_A
     assert module.table.item(0, 1).toolTip() == RUN_A
     assert module.table.item(0, 1).data(Qt.ItemDataRole.UserRole) == RUN_A
     assert module.table.item(0, 2).text() == "2026-07-29 09:02:03"
@@ -441,6 +442,20 @@ def test_first_show_applies_table_widths_without_manual_refresh(qapp):
 
     assert module._initial_column_widths_applied is True
     assert len(management.queries) == query_count
+    assert (
+        module.table.horizontalHeader().sectionResizeMode(4)
+        is QHeaderView.ResizeMode.Interactive
+    )
+    model_width = module.table.columnWidth(4)
+    assert module.table.columnWidth(1) >= 300
+    assert module.table.columnWidth(2) >= 152
+    assert module.table.columnWidth(3) >= 96
+    assert model_width >= 180
+    assert model_width < module.table.viewport().width() // 4
+    assert model_width <= module.table.columnWidth(2) + 40
+    assert module.table.columnWidth(5) >= 70
+    assert module.table.columnWidth(6) >= 92
+    assert module.table.columnWidth(7) >= 150
     assert module.table.columnWidth(module.table.columnCount() - 2) == 48
     assert module.table.columnWidth(module.table.columnCount() - 1) == 48
     calendar = module.edit_start.calendarWidget()

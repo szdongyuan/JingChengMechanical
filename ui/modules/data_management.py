@@ -399,7 +399,7 @@ class DataManagementModule(QWidget):
                         )
                         continue
                     if field_name == "run_id":
-                        display = self._display_run_id(value)
+                        display = "" if value is None else str(value)
                     elif field_name == "accepted_at":
                         display = self._display_beijing_time(value)
                     else:
@@ -472,27 +472,69 @@ class DataManagementModule(QWidget):
     def _apply_table_column_widths(self) -> None:
         if not hasattr(self, "table"):
             return
-        self.table.resizeColumnsToContents()
         header = self.table.horizontalHeader()
         for column in range(self.table.columnCount()):
             header.setSectionResizeMode(
                 column,
                 QHeaderView.ResizeMode.Interactive,
             )
-        if self.table.columnCount() > 4:
-            header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        self.table.setColumnWidth(0, max(54, self.table.columnWidth(0)))
-        fault_column = self._fault_type_column_index()
-        if fault_column is not None:
-            self.table.setColumnWidth(
-                fault_column,
-                max(128, self.table.columnWidth(fault_column)),
-            )
+
+        minimum_widths = {
+            "run_id": 300,
+            "accepted_at": 152,
+            "sn": 96,
+            "model": 180,
+            "judgment": 70,
+            "judgment_source": 92,
+            "fault_type": 150,
+        }
+        growth_weights = {
+            "run_id": 1.25,
+            "accepted_at": 0.80,
+            "sn": 0.60,
+            "model": 0.75,
+            "judgment": 0.35,
+            "judgment_source": 0.50,
+            "fault_type": 0.70,
+        }
+        action_width = 48
+        fixed_width = 54 + (2 * action_width)
+        base_width = fixed_width + sum(minimum_widths.values())
+        available_width = max(self.table.viewport().width() - 2, base_width)
+        extra_width = max(0, available_width - base_width)
+        total_weight = sum(growth_weights.values())
+
+        self.table.setColumnWidth(0, 54)
+        applied_widths: dict[int, int] = {}
+        for column, (field_name, _label) in enumerate(
+            self._columns,
+            start=1,
+        ):
+            width = minimum_widths.get(field_name, 100)
+            if field_name in growth_weights and extra_width:
+                width += int(
+                    extra_width * growth_weights[field_name] / total_weight
+                )
+            applied_widths[column] = width
+            self.table.setColumnWidth(column, width)
         for column in (
             self.table.columnCount() - 2,
             self.table.columnCount() - 1,
         ):
-            self.table.setColumnWidth(column, 48)
+            self.table.setColumnWidth(column, action_width)
+        used_width = 54 + (2 * action_width) + sum(applied_widths.values())
+        remainder = max(0, available_width - used_width)
+        if remainder and applied_widths:
+            fault_column = self._fault_type_column_index()
+            target_column = (
+                fault_column
+                if fault_column is not None
+                else max(applied_widths)
+            )
+            self.table.setColumnWidth(
+                target_column,
+                self.table.columnWidth(target_column) + remainder,
+            )
 
     def _fault_type_column_index(self) -> int | None:
         for index, (field_name, _label) in enumerate(self._columns, start=1):
@@ -632,13 +674,6 @@ class DataManagementModule(QWidget):
             return
         combo.setProperty("last_committed_index", combo.currentIndex())
         self.refresh_table()
-
-    @staticmethod
-    def _display_run_id(run_id: object) -> str:
-        text = str(run_id)
-        if len(text) <= 12:
-            return text
-        return f"{text[:6]}…{text[-6:]}"
 
     @classmethod
     def _display_beijing_time(cls, value: object) -> str:

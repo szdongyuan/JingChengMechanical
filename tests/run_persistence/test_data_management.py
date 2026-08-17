@@ -211,6 +211,66 @@ def test_query_filters_saved_fault_type_across_configurations(
     assert [row.run_id for row in rows] == [bearing]
 
 
+def test_query_fault_type_good_matches_pass_rows_displayed_as_good(
+    prepared_database_path: Path,
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+    fail = _insert_run(
+        runtime,
+        accepted_at="2026-07-27T12:34:58.123456Z",
+        judgment="FAIL",
+    )
+    newest_pass = _insert_run(
+        runtime,
+        accepted_at="2026-07-27T12:34:57.123456Z",
+    )
+    oldest_pass = _insert_run(
+        runtime,
+        accepted_at="2026-07-27T12:34:55.123456Z",
+    )
+
+    rows = RunDataManagementService(runtime).query_page(
+        _query(fault_type_contains="良品")
+    ).rows
+
+    assert [row.run_id for row in rows] == [newest_pass, oldest_pass]
+    assert fail not in {row.run_id for row in rows}
+
+
+def test_query_fault_type_bad_matches_untyped_fail_rows_displayed_as_bad(
+    prepared_database_path: Path,
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+    untyped_fail = _insert_run(
+        runtime,
+        accepted_at="2026-07-27T12:34:58.123456Z",
+        judgment="FAIL",
+    )
+    specific_fail = _insert_run(
+        runtime,
+        accepted_at="2026-07-27T12:34:57.123456Z",
+        judgment="FAIL",
+    )
+    with runtime.operation() as database:
+        database.execute_sql(
+            """
+            UPDATE run
+            SET judgment_source = 'MANUAL',
+                manual_judgment_revision = 1,
+                fault_type = ?
+            WHERE run_id = ?
+            """,
+            ("轴承异响", specific_fail),
+        )
+
+    rows = RunDataManagementService(runtime).query_page(
+        _query(fault_type_contains="不良")
+    ).rows
+
+    assert [row.run_id for row in rows] == [untyped_fail]
+    assert specific_fail not in {row.run_id for row in rows}
+
+
 def test_result_contracts_are_frozen_slotted_and_exact() -> None:
     row = _row()
     page = RunManagementPage(

@@ -20,7 +20,11 @@ from app.service.run_persistence.contracts import (
 )
 from app.service.run_persistence.database import RunPersistenceDatabase
 from app.service.run_persistence.transactions import run_short_transaction
-from model.malfunction_type_table import GOOD_MALFUNCTION_TYPE_NAME
+from model.malfunction_type_table import (
+    BAD_MALFUNCTION_TYPE_NAME,
+    BUILTIN_MALFUNCTION_TYPES,
+    GOOD_MALFUNCTION_TYPE_NAME,
+)
 
 
 class ManagementJudgment(str, Enum):
@@ -286,6 +290,26 @@ def _escape_like_literal(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _matches_builtin_fault_type_filter(
+    query: str,
+    builtin_name: str,
+) -> bool:
+    needle = query.strip().casefold()
+    if not needle:
+        return False
+    for _type_id, number, name in BUILTIN_MALFUNCTION_TYPES:
+        if name != builtin_name:
+            continue
+        labels = (
+            name,
+            number,
+            f"{name}（{number}）",
+            f"{name}({number})",
+        )
+        return any(needle in label.casefold() for label in labels)
+    return needle in builtin_name.casefold()
+
+
 def _query_predicate(
     request: RunManagementQuery,
 ) -> tuple[str, tuple[object, ...]]:
@@ -303,8 +327,24 @@ def _query_predicate(
         parameters.append(f"%{_escape_like_literal(sn_contains)}%")
     fault_type_contains = request.fault_type_contains.strip()
     if fault_type_contains:
-        clauses.append(
+        fault_type_clauses = [
             "coalesce(r.fault_type, '') LIKE ? ESCAPE '\\' COLLATE NOCASE"
+        ]
+        if _matches_builtin_fault_type_filter(
+            fault_type_contains,
+            GOOD_MALFUNCTION_TYPE_NAME,
+        ):
+            fault_type_clauses.append("r.judgment = 'PASS'")
+        if _matches_builtin_fault_type_filter(
+            fault_type_contains,
+            BAD_MALFUNCTION_TYPE_NAME,
+        ):
+            fault_type_clauses.append(
+                "(r.judgment = 'FAIL' AND "
+                "(r.fault_type IS NULL OR trim(r.fault_type) = ''))"
+            )
+        clauses.append(
+            f"({' OR '.join(fault_type_clauses)})"
         )
         parameters.append(
             f"%{_escape_like_literal(fault_type_contains)}%"
