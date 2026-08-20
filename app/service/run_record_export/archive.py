@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from io import BytesIO
 import json
@@ -21,6 +22,9 @@ from app.service.run_record_export.contracts import (
 
 class RunArchiveError(RuntimeError):
     """One run archive request failed without publishing a partial target."""
+
+
+ProgressCallback = Callable[[int, int, str], None]
 
 
 @dataclass(frozen=True)
@@ -438,6 +442,16 @@ def _validate_index_database(
         database.close()
 
 
+def _emit_progress(
+    progress_callback: ProgressCallback | None,
+    completed: int,
+    total: int,
+    message: str,
+) -> None:
+    if progress_callback is not None:
+        progress_callback(completed, total, message)
+
+
 def _write_record(archive: zipfile.ZipFile, prepared: _PreparedRecord) -> None:
     record = prepared.record
     prefix = f"{record.run_id}/"
@@ -451,6 +465,8 @@ def _write_record(archive: zipfile.ZipFile, prepared: _PreparedRecord) -> None:
 def write_run_archive(
     records: tuple[RunExportRecord, ...],
     target_path: str,
+    *,
+    progress_callback: ProgressCallback | None = None,
 ) -> str:
     """Validate, assemble, test, and atomically publish one run archive."""
 
@@ -461,10 +477,35 @@ def write_run_archive(
 
     resolved_target = resolve_export_target(target_path)
     target = Path(resolved_target)
+    total_steps = len(records) * 2 + 4
+    completed_steps = 0
+    _emit_progress(
+        progress_callback,
+        completed_steps,
+        total_steps,
+        f"正在准备导出 {len(records)} 条记录...",
+    )
     try:
         _reject_target_source_aliases(target, records)
-        prepared_records = tuple(_prepare_record(record) for record in records)
+        prepared = []
+        for index, record in enumerate(records, start=1):
+            prepared.append(_prepare_record(record))
+            completed_steps += 1
+            _emit_progress(
+                progress_callback,
+                completed_steps,
+                total_steps,
+                f"正在准备音频 {index}/{len(records)}...",
+            )
+        prepared_records = tuple(prepared)
         index_database = _index_database(prepared_records)
+        completed_steps += 1
+        _emit_progress(
+            progress_callback,
+            completed_steps,
+            total_steps,
+            "正在生成导出索引...",
+        )
     except RunArchiveError:
         raise
     except Exception as exc:
@@ -484,8 +525,22 @@ def write_run_archive(
             temporary, "w", compression=zipfile.ZIP_DEFLATED
         ) as archive:
             archive.writestr("index.sqlite3", index_database)
-            for prepared in prepared_records:
+            completed_steps += 1
+            _emit_progress(
+                progress_callback,
+                completed_steps,
+                total_steps,
+                "正在写入索引文件...",
+            )
+            for index, prepared in enumerate(prepared_records, start=1):
                 _write_record(archive, prepared)
+                completed_steps += 1
+                _emit_progress(
+                    progress_callback,
+                    completed_steps,
+                    total_steps,
+                    f"正在写入压缩包 {index}/{len(prepared_records)}...",
+                )
 
         with zipfile.ZipFile(temporary, "r") as archive:
             bad_member = archive.testzip()
@@ -493,8 +548,21 @@ def write_run_archive(
         if bad_member is not None:
             raise RunArchiveError(f"archive member failed CRC: {bad_member}")
         _validate_index_database(archived_index_database, prepared_records)
+        completed_steps += 1
+        _emit_progress(
+            progress_callback,
+            completed_steps,
+            total_steps,
+            "正在校验导出文件...",
+        )
 
         os.replace(temporary, target)
+        _emit_progress(
+            progress_callback,
+            total_steps,
+            total_steps,
+            "导出完成",
+        )
     except Exception as exc:
         if temporary is not None:
             try:
@@ -518,8 +586,18 @@ class RunArchiveService:
         self,
         run_ids: tuple[str, ...],
         target_path: str,
+        *,
+        progress_callback: ProgressCallback | None = None,
     ) -> str:
+        _emit_progress(
+            progress_callback,
+            0,
+            0,
+            f"正在读取 {len(run_ids)} 条导出数据...",
+        )
+        records = self._reader.read_many(run_ids)
         return write_run_archive(
-            self._reader.read_many(run_ids),
+            records,
             target_path,
+            progress_callback=progress_callback,
         )

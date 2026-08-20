@@ -531,6 +531,35 @@ class RunDataManagementService:
             total_pages=total_pages,
         )
 
+    def query_run_ids(self, request: RunManagementQuery) -> tuple[str, ...]:
+        if type(request) is not RunManagementQuery:
+            raise TypeError("request must be an exact RunManagementQuery")
+        request.__post_init__()
+        predicate, parameters = _query_predicate(request)
+        with self._runtime.operation() as database:
+            database.begin()
+            try:
+                raw_rows = database.execute_sql(
+                    f"""
+                    SELECT r.run_id
+                    FROM run AS r
+                    WHERE {predicate}
+                    ORDER BY r.accepted_at DESC, r.run_id DESC
+                    """,
+                    parameters,
+                ).fetchall()
+                database.commit()
+            except Exception:
+                database.rollback()
+                raise
+
+        run_ids = []
+        for row in raw_rows:
+            run_id = _require_exact_string(row[0], "run_id")
+            validate_uuid4(run_id)
+            run_ids.append(run_id)
+        return tuple(run_ids)
+
     def update_fault_type(self, run_id: str, fault_type: str) -> bool:
         validate_uuid4(_require_exact_string(run_id, "run_id"))
         try:

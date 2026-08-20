@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
+from inspect import Parameter, signature
 import os
 
 from PyQt6.QtCore import QDateTime, QSize, QSignalBlocker, Qt, QTimer
@@ -17,6 +18,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QStyle,
     QTableWidget,
@@ -104,6 +106,8 @@ class DataManagementModule(QWidget):
         self._total_pages = 1
         self._total_count = 0
         self._applied_query: RunManagementQuery | None = None
+        self._selection_scope: tuple[object, ...] | None = None
+        self._selected_run_id_set: set[str] = set()
         self._operation_active = False
         self._operation_control_state: tuple[
             tuple[tuple[QWidget, bool], ...],
@@ -308,6 +312,19 @@ class DataManagementModule(QWidget):
         )
 
     @staticmethod
+    def _selection_scope_from_query(
+        request: RunManagementQuery,
+    ) -> tuple[object, ...]:
+        return (
+            request.model,
+            request.sn_contains,
+            request.accepted_start_utc,
+            request.accepted_end_exclusive_utc,
+            tuple(sorted(judgment.value for judgment in request.judgments)),
+            request.fault_type_contains,
+        )
+
+    @staticmethod
     def _to_utc(value: QDateTime, *, end_exclusive: bool = False) -> str:
         local_value = value.toPyDateTime()
         if local_value.tzinfo is None:
@@ -367,6 +384,10 @@ class DataManagementModule(QWidget):
             )
             return False
 
+        selection_scope = self._selection_scope_from_query(request)
+        if selection_scope != self._selection_scope:
+            self._selected_run_id_set.clear()
+            self._selection_scope = selection_scope
         self._records = list(page.rows)
         self._page = page.page
         self._total_pages = page.total_pages
@@ -387,7 +408,11 @@ class DataManagementModule(QWidget):
                     Qt.ItemFlag.ItemIsEnabled
                     | Qt.ItemFlag.ItemIsUserCheckable
                 )
-                selector.setCheckState(Qt.CheckState.Unchecked)
+                selector.setCheckState(
+                    Qt.CheckState.Checked
+                    if record.run_id in self._selected_run_id_set
+                    else Qt.CheckState.Unchecked
+                )
                 self.table.setItem(row_index, 0, selector)
                 for column_index, (field_name, _label) in enumerate(
                     self._columns,
@@ -910,37 +935,61 @@ class DataManagementModule(QWidget):
     def _toggle_select_all(self, checked: bool) -> None:
         if self._operation_active:
             return
-        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        if checked:
+            if self._applied_query is None:
+                self._update_selected_count()
+                return
+            try:
+                run_ids = (
+                    self.services.run_data_management_service
+                    .query_run_ids(replace(self._applied_query, page=1))
+                )
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "全选失败",
+                    f"读取全部运行记录失败：{exc}",
+                )
+                self._update_selected_count()
+                return
+            self._selected_run_id_set = set(run_ids)
+        else:
+            self._selected_run_id_set.clear()
+        self._sync_visible_selection()
+        self._update_selected_count()
+
+    def _sync_visible_selection(self) -> None:
         self.table.blockSignals(True)
         try:
             for row_index in range(self.table.rowCount()):
                 selector = self.table.item(row_index, 0)
                 if selector is not None:
+                    run_id = str(selector.data(Qt.ItemDataRole.UserRole))
+                    state = (
+                        Qt.CheckState.Checked
+                        if run_id in self._selected_run_id_set
+                        else Qt.CheckState.Unchecked
+                    )
                     selector.setCheckState(state)
         finally:
             self.table.blockSignals(False)
-        self._update_selected_count()
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         if item.column() == 0:
+            run_id = item.data(Qt.ItemDataRole.UserRole)
+            if run_id is not None:
+                if item.checkState() == Qt.CheckState.Checked:
+                    self._selected_run_id_set.add(str(run_id))
+                else:
+                    self._selected_run_id_set.discard(str(run_id))
             self._update_selected_count()
 
     def _selected_run_ids(self) -> tuple[str, ...]:
-        selected = []
-        for row_index in range(self.table.rowCount()):
-            selector = self.table.item(row_index, 0)
-            if (
-                selector is not None
-                and selector.checkState() == Qt.CheckState.Checked
-            ):
-                selected.append(
-                    str(selector.data(Qt.ItemDataRole.UserRole))
-                )
-        return tuple(selected)
+        return tuple(self._selected_run_id_set)
 
     def _update_selected_count(self) -> None:
-        selected_count = len(self._selected_run_ids())
-        total_count = self.table.rowCount()
+        selected_count = len(self._selected_run_id_set)
+        total_count = self._total_count
         all_selected = total_count > 0 and selected_count == total_count
         self.lb_selected.setText(f"已选 {selected_count} 条")
         self.btn_select_all.blockSignals(True)
@@ -970,18 +1019,32 @@ class DataManagementModule(QWidget):
         if not target_path:
             return
 
+        progress = self._export_progress_dialog(len(run_ids))
+
+        def update_progress(completed: int, total: int, message: str) -> None:
+            if total <= 0:
+                progress.setRange(0, 0)
+            else:
+                progress.setRange(0, total)
+                progress.setValue(max(0, min(completed, total)))
+            progress.setLabelText(message)
+            QApplication.processEvents()
+
         self._set_operation_active(True)
+        progress.show()
         QApplication.processEvents()
         resolved_target = None
         error_message = None
         try:
-            resolved_target = self.services.run_archive_service.export(
+            resolved_target = self._export_archive(
                 run_ids,
                 target_path,
+                update_progress,
             )
         except Exception as exc:
             error_message = str(exc)
         finally:
+            progress.close()
             self._set_operation_active(False)
 
         if error_message is None:
@@ -996,6 +1059,53 @@ class DataManagementModule(QWidget):
                 "导出失败",
                 f"导出失败：{error_message}",
             )
+
+    def _export_progress_dialog(self, run_count: int) -> QProgressDialog:
+        progress = QProgressDialog(
+            f"正在准备导出 {run_count} 条记录...",
+            None,
+            0,
+            100,
+            self,
+        )
+        progress.setWindowTitle("导出进度")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setMinimumWidth(380)
+        progress.setValue(0)
+        return progress
+
+    def _export_archive(
+        self,
+        run_ids: tuple[str, ...],
+        target_path: str,
+        progress_callback,
+    ) -> str:
+        export = self.services.run_archive_service.export
+        if self._callable_accepts_progress_callback(export):
+            return export(
+                run_ids,
+                target_path,
+                progress_callback=progress_callback,
+            )
+        progress_callback(0, 0, "正在导出运行记录...")
+        return export(run_ids, target_path)
+
+    @staticmethod
+    def _callable_accepts_progress_callback(function) -> bool:
+        try:
+            parameters = signature(function).parameters.values()
+        except (TypeError, ValueError):
+            return True
+        for parameter in parameters:
+            if parameter.kind is Parameter.VAR_KEYWORD:
+                return True
+            if parameter.name == "progress_callback":
+                return True
+        return False
 
     def _batch_update_fault_type(self) -> None:
         if self._operation_active:
@@ -1071,6 +1181,7 @@ class DataManagementModule(QWidget):
         finally:
             self._set_operation_active(False)
 
+        self._selected_run_id_set.clear()
         self.refresh_table()
         success_count = len(run_ids) - len(failures)
         lines = [
@@ -1162,6 +1273,11 @@ class DataManagementModule(QWidget):
             result.database_committed for result in report.results
         )
         if committed:
+            self._selected_run_id_set.difference_update(
+                result.run_id
+                for result in report.results
+                if result.database_committed
+            )
             signal = getattr(
                 getattr(self.services, "bus", None),
                 "run_records_deleted",
