@@ -40,7 +40,6 @@ from app.service.multi_run_coordinator_mvp.contracts import (
     StartStatus,
     TriggerSource,
 )
-from app.service.multi_run_integration.plc_dispatch import PlcDispatchPorts
 from app.service.multi_run_integration.captured_start_dispatcher import (
     CapturedStartDispatcher,
 )
@@ -570,15 +569,12 @@ class ServiceContainer:
         )
         self.factory_selection_settings = FactorySelectionSettings()
 
-        self.plc_dispatch_ports = PlcDispatchPorts(
-            plc_services=self.plc_services,
-            plc_threads=self.plc_threads,
-        )
+        self.plc_dispatch_ports = None
         report_attempt = self._dispatch_plc_attempt_report
         self._plc_report_attempt = report_attempt
         self.plc_result_sequencer = PlcResultSequencer(
-            write_result=self.plc_dispatch_ports.write_result,
-            write_testing_state=self.plc_dispatch_ports.write_testing_state,
+            write_result=self.bus.write_test_result_sign.emit,
+            write_testing_state=self.bus.write_plc_testing_state_sign.emit,
             report_attempt=report_attempt,
         )
         builder = self.production_composition_builder

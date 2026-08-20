@@ -4435,6 +4435,8 @@ class TestManager(QObject):
     def _emit_plc_test_result_if_needed(self, session, review_payload) -> None:
         if getattr(review_payload, "trigger_source", None) != "plc":
             return
+        if getattr(self._services, "multi_run_coordinator", None) is not None:
+            return
         plc_id = self._plc_id_from_session_workorder(session)
         if plc_id is None:
             self._bus.log.emit("[TestManager] PLC 测试结果未写入：未找到 plc_id")

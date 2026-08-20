@@ -235,6 +235,7 @@ class PlcService(QObject):
                 "ai_score": 91.0,
                 }
         """
+        print(f"id:{plc_id},{self._plc_id}, result:{test_result}")
         if plc_id != self._plc_id:
             return
         if self.plc_client is None:
