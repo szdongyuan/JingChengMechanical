@@ -387,7 +387,6 @@ class EventBus(QObject):
     write_test_result_sign = pyqtSignal(int, dict)
     # 写入 PLC 限值信号：plc_id, limit_values
     write_limit_sign = pyqtSignal(int, dict)
-    write_plc_testing_state_sign = pyqtSignal(int, bool)
     request_plc_start_signal_reset = pyqtSignal(int)
     plc_start_signal_reset_result = pyqtSignal(int, bool, str)
 
@@ -574,7 +573,6 @@ class ServiceContainer:
         self._plc_report_attempt = report_attempt
         self.plc_result_sequencer = PlcResultSequencer(
             write_result=self.bus.write_test_result_sign.emit,
-            write_testing_state=self.bus.write_plc_testing_state_sign.emit,
             report_attempt=report_attempt,
         )
         builder = self.production_composition_builder

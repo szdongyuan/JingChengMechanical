@@ -220,6 +220,17 @@ class PlcService(QObject):
             return True
         return False
 
+    def _write_testing_signal(self, testing):
+        offset = self._field_offsets_dict.get("res_testing_signal_offset")
+        if not offset:
+            self.logger.warning(f"PLC {self._plc_id} 未找到偏移配置: res_testing_signal_offset")
+            return
+        try:
+            self.write_plc_value(offset, "bool", testing)
+        except Exception as exc:
+            self.bus.log.emit(f"PLC {self._plc_id} 写入测试中信号失败: {exc}")
+            self.logger.error(f"PLC 写入测试中信号失败: {exc}")
+
     def last_write_test_result_to_plc(self, plc_id, test_result):
         """
         最后按照plcid来写入对应的plc
@@ -235,9 +246,9 @@ class PlcService(QObject):
                 "ai_score": 91.0,
                 }
         """
-        print(f"id:{plc_id},{self._plc_id}, result:{test_result}")
         if plc_id != self._plc_id:
             return
+        print(f"id:{plc_id},{self._plc_id}, result:{test_result}")
         if self.plc_client is None:
             return
         plc_values = [
@@ -262,6 +273,7 @@ class PlcService(QObject):
                 finish_offset = self._field_offsets_dict.get("res_finish_signal_offset")
                 if finish_offset:
                     self.write_plc_value(finish_offset, "bool", True)
+                self._write_testing_signal(False)
             self.bus.log.emit(f"PLC {self._plc_id} 写入测试结果完成")
         except Exception as exc:
             self.bus.log.emit(f"PLC {self._plc_id} 写入测试结果失败: {exc}")
@@ -451,6 +463,7 @@ class PlcService(QObject):
             return
         self.bus.log.emit(f"PLC {self._plc_id} 检测到开始信号")
         self.logger.info(f"PLC {self._plc_id} 检测到开始信号")
+        self._write_testing_signal(True)
         trigger_monotonic_ns = time.monotonic_ns()
         workorder = self._emit_plc_workorder()
         print(workorder)

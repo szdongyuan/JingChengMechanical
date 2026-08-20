@@ -35,11 +35,6 @@ class PlcAttemptOutcome(str, Enum):
     BOUNDARY_FAILED = "boundary_failed"
 
 
-class PlcTestingStateReason(str, Enum):
-    ACTIVE_COUNT_TRANSITION = "active_count_transition"
-    SHUTDOWN_CLEAR = "shutdown_clear"
-
-
 @dataclass(frozen=True)
 class PlcIngressTicket:
     run_id: str
@@ -60,15 +55,6 @@ class PlcResultAttemptReport:
     plc_sequence: int
     outcome: PlcAttemptOutcome
     field_name: str | None
-    reason: str | None
-
-
-@dataclass(frozen=True)
-class PlcTestingStateAttemptReport:
-    plc_id: int
-    testing: bool
-    reason_kind: PlcTestingStateReason
-    outcome: PlcAttemptOutcome
     reason: str | None
 
 
@@ -129,22 +115,16 @@ class PlcResultSequencer:
         self,
         *,
         write_result: Callable[[int, Mapping[str, PlcScalar]], None],
-        write_testing_state: Callable[[int, bool], None],
-        report_attempt: Callable[
-            [PlcResultAttemptReport | PlcTestingStateAttemptReport],
-            None,
-        ],
+        report_attempt: Callable[[PlcResultAttemptReport], None],
     ) -> None:
         for name, port in (
             ("write_result", write_result),
-            ("write_testing_state", write_testing_state),
             ("report_attempt", report_attempt),
         ):
             if not callable(port):
                 raise ValueError(f"{name} must be callable")
 
         self._write_result = write_result
-        self._write_testing_state = write_testing_state
         self._report_attempt = report_attempt
         self._map_lock = threading.Lock()
         self._lanes: dict[int, _Lane] = {}
@@ -253,11 +233,8 @@ class PlcResultSequencer:
             if slot.accepted:
                 return PlcMutationDisposition.DUPLICATE_OR_STALE
 
-            was_inactive = lane.active_count == 0
             slot.accepted = True
             lane.active_count += 1
-            if was_inactive:
-                self._attempt_testing_state(lane.plc_id, True)
             return PlcMutationDisposition.APPLIED
 
     def publish_rejection(
@@ -321,8 +298,6 @@ class PlcResultSequencer:
             slot.terminal_payload = copied_payload
             if slot.accepted:
                 lane.active_count -= 1
-                if lane.active_count == 0:
-                    self._attempt_testing_state(lane.plc_id, False)
             self._drain_ready_results(lane)
             return PlcMutationDisposition.APPLIED
 
@@ -414,8 +389,6 @@ class PlcResultSequencer:
             lanes = tuple(sorted(self._lanes.items()))
 
         deadline = time.monotonic() + timeout_seconds
-        clear_returned: list[int] = []
-        clear_failures: list[PlcShutdownClearFailure] = []
         skipped_busy: list[int] = []
         dropped_tickets: list[PlcIngressTicket] = []
 
@@ -435,58 +408,20 @@ class PlcResultSequencer:
                     for sequence in sorted(lane.slots)
                 )
                 lane.slots.clear()
-                outcome, reason = self._attempt_testing_state(
-                    plc_id,
-                    False,
-                    PlcTestingStateReason.SHUTDOWN_CLEAR,
-                )
-                if outcome is PlcAttemptOutcome.BOUNDARY_RETURNED:
-                    clear_returned.append(plc_id)
-                else:
-                    assert reason is not None
-                    clear_failures.append(
-                        PlcShutdownClearFailure(plc_id, reason)
-                    )
             finally:
                 lane.lock.release()
 
         return PlcShutdownReport(
-            clean=not clear_failures and not skipped_busy,
-            clear_returned_plc_ids=tuple(clear_returned),
-            clear_failures=tuple(clear_failures),
+            clean=not skipped_busy,
+            clear_returned_plc_ids=(),
+            clear_failures=(),
             skipped_busy_plc_ids=tuple(skipped_busy),
             dropped_tickets=tuple(dropped_tickets),
         )
 
-    def _attempt_testing_state(
-        self,
-        plc_id: int,
-        testing: bool,
-        reason_kind: PlcTestingStateReason = PlcTestingStateReason.ACTIVE_COUNT_TRANSITION,
-    ) -> tuple[PlcAttemptOutcome, str | None]:
-        try:
-            self._write_testing_state(plc_id, testing)
-        except Exception as exc:
-            outcome = PlcAttemptOutcome.BOUNDARY_FAILED
-            reason = _exception_reason(exc)
-        else:
-            outcome = PlcAttemptOutcome.BOUNDARY_RETURNED
-            reason = None
-
-        self._emit_report(
-            PlcTestingStateAttemptReport(
-                plc_id=plc_id,
-                testing=testing,
-                reason_kind=reason_kind,
-                outcome=outcome,
-                reason=reason,
-            )
-        )
-        return outcome, reason
-
     def _emit_report(
         self,
-        report: PlcResultAttemptReport | PlcTestingStateAttemptReport,
+        report: PlcResultAttemptReport,
     ) -> None:
         try:
             self._report_attempt(report)
