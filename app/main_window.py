@@ -337,7 +337,7 @@ class MainWindow(QMainWindow):
         left_lay.setSpacing(5)
 
         self.workorder = WorkOrderModule(self.services)
-        left_lay.addWidget(Card("工单输入", self.workorder), 1)
+        left_lay.addWidget(Card("工单", self.workorder), 1)
 
         self.control = ControlModule(self.services)
         self.control.btn_stop.setText("停止测试")

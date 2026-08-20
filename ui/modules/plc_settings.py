@@ -437,6 +437,12 @@ class PlcSettingsModule(QWidget):
         ):
             edit.textChanged.connect(lambda _text: self.btn_save.setText("保存*"))
 
+    def _emit_plc_changed(self):
+        signal = getattr(self.services.bus, "plc_changed", None)
+        emit = getattr(signal, "emit", None)
+        if callable(emit):
+            emit()
+
     def reload_rows(self):
         # 每次重载都从数据库重新取 PLC 列表，并刷新下拉框。
         try:
@@ -571,6 +577,7 @@ class PlcSettingsModule(QWidget):
             index = self.combo_plc.findData(row.id)
             if index >= 0:
                 self.combo_plc.setCurrentIndex(index)
+            self._emit_plc_changed()
             QMessageBox.information(self, "成功", f"PLC {row.id} 新增成功!")
         except Exception as exc:
             QMessageBox.warning(self, "提示", f"新增 PLC 失败: {exc}")
@@ -606,6 +613,7 @@ class PlcSettingsModule(QWidget):
             # 清掉顶部状态栏使用的状态缓存。
             self.services.plc_state.pop(row_id, None)
             self.reload_rows()
+            self._emit_plc_changed()
             refresh_plc_labels = getattr(self.window(), "_refresh_plc_state_labels", None)
             if callable(refresh_plc_labels):
                 refresh_plc_labels()

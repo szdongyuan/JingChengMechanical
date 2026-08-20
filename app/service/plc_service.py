@@ -411,18 +411,16 @@ class PlcService(QObject):
         payload = {}
         values = self.read_plc_values(
             "sn_code_offset",
-            "product_model_offset",
             "rotation_speed_offset",
         )
         if values.get("sn_code_offset"):
             payload["sn"] = values["sn_code_offset"]
-        if values.get("product_model_offset"):
-            payload["model"] = values["product_model_offset"]
         if values.get("rotation_speed_offset") is not None:
             payload["rotation_speed"] = values["rotation_speed_offset"]
-        if payload:
-            self.bus.current_workorder_payload = dict(payload)
-            self.bus.plc_workorder_changed.emit(payload)
+        if self._plc_id is not None:
+            display_payload = dict(payload)
+            display_payload["plc_id"] = self._plc_id
+            self.bus.plc_workorder_changed.emit(display_payload)
         return payload
 
     def poll_once(self):

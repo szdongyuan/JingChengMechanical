@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from PyQt6.QtWidgets import QFormLayout, QLabel, QLineEdit, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QGridLayout, QHBoxLayout, QLabel, QLineEdit, QVBoxLayout, QWidget
 
 from app.services_container import FactoryControllerState
+from model.plc_table import PlcTable
 from ui.widgets.factory_config_list import FactoryConfigListWidget
 
 
@@ -26,15 +27,21 @@ class WorkOrderModule(QWidget):
         self._factory_state = getattr(services.factory_mode, "state", FactoryControllerState())
         self._config_rows: list[dict] = []
         self._last_workorder_payload: dict | None = None
+        self._plc_sn_values: dict[int, str] = {}
+        self._plc_sn_edits: dict[int, QLineEdit] = {}
+        self._rendered_plc_ids: tuple[int, ...] = ()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
-        self.ed_sn = QLineEdit()
-        self.ed_sn.setPlaceholderText("请输入条码")
-        self.ed_model = QLineEdit()
-        self.ed_model.setPlaceholderText("请输入产品型号")
+        self.plc_sn_widget = QWidget()
+        self.plc_sn_layout = QGridLayout(self.plc_sn_widget)
+        self.plc_sn_layout.setContentsMargins(0, 0, 2, 0)
+        self.plc_sn_layout.setHorizontalSpacing(8)
+        self.plc_sn_layout.setVerticalSpacing(6)
+        self.plc_sn_layout.setColumnStretch(0, 1)
+        self.plc_sn_layout.setColumnStretch(1, 1)
 
         self.config_selector = FactoryConfigListWidget()
         self.config_selector.setMinimumHeight(180)
@@ -50,10 +57,7 @@ class WorkOrderModule(QWidget):
         self.lbl_phase_summary = QLabel()
         self.lbl_phase_summary.setWordWrap(True)
 
-        self.form_layout = QFormLayout()
-        self.form_layout.addRow("条码 SN", self.ed_sn)
-        self.form_layout.addRow("产品型号", self.ed_model)
-        layout.addLayout(self.form_layout)
+        layout.addWidget(self.plc_sn_widget)
 
         self.factory_config_section = QWidget()
         factory_config_layout = QVBoxLayout(self.factory_config_section)
@@ -67,11 +71,11 @@ class WorkOrderModule(QWidget):
         layout.addWidget(self.lbl_selection_status)
         layout.addWidget(self.lbl_phase_summary)
 
-        self.ed_sn.textChanged.connect(lambda _text: self._publish_workorder())
-        self.ed_model.textChanged.connect(lambda _text: self._publish_workorder())
         self.config_selector.enabled_order_changed.connect(self._on_config_selection_changed)
         if hasattr(self.services.bus, "config_changed"):
             self.services.bus.config_changed.connect(self._reload_config_options)
+        if hasattr(self.services.bus, "plc_changed"):
+            self.services.bus.plc_changed.connect(self._refresh_plc_sn_rows)
         if hasattr(self.services.bus, "factory_state_changed"):
             self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
         if hasattr(self.services.bus, "factory_selection_notice"):
@@ -82,6 +86,7 @@ class WorkOrderModule(QWidget):
             self.services.bus.plc_workorder_changed.connect(self._on_plc_workorder_changed)
 
         self._reload_config_options()
+        self._refresh_plc_sn_rows()
         self._restore_startup_selection()
         initial_payload = self.value()
         self._last_workorder_payload = dict(initial_payload)
@@ -89,8 +94,8 @@ class WorkOrderModule(QWidget):
 
     def value(self) -> dict:
         return {
-            "sn": self.ed_sn.text().strip(),
-            "model": self.ed_model.text().strip(),
+            "sn": "",
+            "model": "",
             "selected_config_ids": self.config_selector.enabled_config_ids(),
         }
 
@@ -133,19 +138,20 @@ class WorkOrderModule(QWidget):
     def _on_factory_display_reset(self, reason: str) -> None:
         if reason not in {"manual_judgment_ok", "manual_judgment_ng"}:
             return
-        if self.ed_sn.text() == "":
-            self._publish_workorder(force=True)
-            return
-        self.ed_sn.clear()
         self._publish_workorder(force=True)
 
     def _on_plc_workorder_changed(self, payload: dict) -> None:
         sn = str(payload.get("sn") or "").strip()
-        model = str(payload.get("model") or "").strip()
-        if sn:
-            self.ed_sn.setText(sn)
-        if model:
-            self.ed_model.setText(model)
+        plc_id = self._payload_plc_id(payload)
+        if plc_id is None:
+            return
+        self._plc_sn_values[plc_id] = sn
+        self._refresh_plc_sn_rows()
+        for other_edit in self._plc_sn_edits.values():
+            other_edit.setStyleSheet("")
+        edit = self._plc_sn_edits.get(plc_id)
+        if edit is not None and sn:
+            edit.setStyleSheet("color: #2563eb; font-weight: 600;")
 
     def _sync_factory_state(
         self,
@@ -264,6 +270,97 @@ class WorkOrderModule(QWidget):
             ),
         )
         self._sync_selector_lock_state()
+        self._refresh_plc_sn_rows()
+
+    def _payload_plc_id(self, payload: dict) -> int | None:
+        raw_plc_id = payload.get("plc_id")
+        if isinstance(raw_plc_id, bool):
+            return None
+        if isinstance(raw_plc_id, int) and raw_plc_id > 0:
+            return raw_plc_id
+        try:
+            plc_id = int(str(raw_plc_id).strip())
+        except (TypeError, ValueError):
+            return None
+        return plc_id if plc_id > 0 else None
+
+    def _refresh_plc_sn_rows(self) -> None:
+        plc_ids = self._plc_ids_for_display()
+        if plc_ids != self._rendered_plc_ids:
+            self._rebuild_plc_sn_rows(plc_ids)
+        for plc_id, edit in self._plc_sn_edits.items():
+            edit.setText(self._plc_sn_values.get(plc_id, ""))
+
+    def _plc_ids_for_display(self) -> tuple[int, ...]:
+        plc_ids = self._known_plc_ids()
+        if plc_ids:
+            self._plc_sn_values = {
+                plc_id: sn
+                for plc_id, sn in self._plc_sn_values.items()
+                if plc_id in plc_ids
+            }
+            return tuple(sorted(plc_ids))
+        return tuple(sorted(self._plc_sn_values))
+
+    def _known_plc_ids(self) -> set[int]:
+        plc_ids: set[int] = set()
+        for attr_name in ("plc_services", "plc_threads", "plc_state"):
+            mapping = getattr(self.services, attr_name, None)
+            keys = getattr(mapping, "keys", None)
+            if not callable(keys):
+                continue
+            for raw_id in keys():
+                if isinstance(raw_id, bool):
+                    continue
+                if isinstance(raw_id, int) and raw_id > 0:
+                    plc_ids.add(raw_id)
+
+        try:
+            rows = PlcTable.select(PlcTable.id).order_by(PlcTable.id)
+            for row in rows:
+                plc_id = getattr(row, "id", None)
+                if isinstance(plc_id, int) and plc_id > 0:
+                    plc_ids.add(plc_id)
+        except Exception:
+            pass
+
+        return plc_ids
+
+    def _rebuild_plc_sn_rows(self, plc_ids: tuple[int, ...]) -> None:
+        while self.plc_sn_layout.count():
+            item = self.plc_sn_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        self._plc_sn_edits = {}
+        self._rendered_plc_ids = tuple(plc_ids)
+        if not plc_ids:
+            empty_label = QLabel("未配置 PLC")
+            empty_label.setObjectName("Muted")
+            self.plc_sn_layout.addWidget(empty_label, 0, 0, 1, 2)
+            return
+
+        for index, plc_id in enumerate(plc_ids):
+            row_widget = QWidget()
+            row_layout = QHBoxLayout(row_widget)
+            row_layout.setContentsMargins(0, 1, 2, 1)
+            row_layout.setSpacing(6)
+
+            label = QLabel(f"PLC{plc_id} SN码")
+            label.setFixedWidth(72)
+
+            edit = QLineEdit()
+            edit.setReadOnly(True)
+            edit.setPlaceholderText("未读取")
+            edit.setMinimumWidth(0)
+            edit.setMinimumHeight(28)
+            edit.setMaximumHeight(30)
+
+            row_layout.addWidget(label)
+            row_layout.addWidget(edit, 1)
+            self.plc_sn_layout.addWidget(row_widget, index // 2, index % 2)
+            self._plc_sn_edits[plc_id] = edit
 
     def _available_config_ids(self) -> set[int]:
         return {

@@ -7,10 +7,11 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QLabel
 
 from app.service.factory_mode_controller import FactoryModeController
 from app.services_container import EventBus, FactoryControllerState
+from model.plc_table import PlcTable
 from ui.modules.workorder import WorkOrderModule
 
 
@@ -33,6 +34,8 @@ class _BusStub:
         self.workorder_changed = _SignalStub()
         self.log = _SignalStub()
         self.config_changed = _SignalStub()
+        self.plc_changed = _SignalStub()
+        self.plc_workorder_changed = _SignalStub()
         self.factory_state_changed = _SignalStub()
         self.factory_selection_notice = _SignalStub()
         self.factory_display_reset = _SignalStub()
@@ -231,6 +234,9 @@ def _make_module(
             initial_factory_state,
             operation_order=operation_order,
         ),
+        plc_services={},
+        plc_threads={},
+        plc_state={},
         operation_order=operation_order,
     )
     if include_reset_coordinator:
@@ -280,6 +286,9 @@ def _make_real_controller_module(
         ),
         factory_selection_settings=settings,
         test=_IdleTestManagerStub(),
+        plc_services={},
+        plc_threads={},
+        plc_state={},
     )
     services.factory_mode = FactoryModeController(bus, services)
     return WorkOrderModule(services), services
@@ -301,10 +310,11 @@ def test_workorder_module_uses_full_width_factory_config_section(qapp):
     module, _ = _make_module()
 
     assert module.lbl_factory_configs.text() == "配置选择"
-    assert module.form_layout.labelForField(module.ed_model).text() == "产品型号"
-    assert module.form_layout.labelForField(module.ed_sn).text() == "条码 SN"
+    assert hasattr(module, "ed_sn") is False
+    assert hasattr(module, "ed_model") is False
+    assert hasattr(module, "form_layout") is False
+    assert module.layout().indexOf(module.plc_sn_widget) >= 0
     assert hasattr(module, "ed_cfg") is False
-    assert module.form_layout.labelForField(module.config_selector) is None
     assert module.factory_config_section.layout().indexOf(module.config_selector) >= 0
 
 
@@ -555,7 +565,7 @@ def test_real_controller_config_changed_prune_sync_updates_ui_without_second_per
     assert services.factory_selection_settings.save_calls == [(101, 303)]
 
 
-def test_workorder_restore_keeps_sn_and_model_empty(qapp):
+def test_workorder_restore_keeps_sn_and_model_payload_empty(qapp):
     module, _ = _make_module(saved_selected_ids=(303, 101))
 
     assert module.value() == {
@@ -563,37 +573,63 @@ def test_workorder_restore_keeps_sn_and_model_empty(qapp):
         "model": "",
         "selected_config_ids": (303, 101),
     }
-    assert module.ed_sn.text() == ""
-    assert module.ed_model.text() == ""
 
 
 @pytest.mark.parametrize("reason", ["manual_judgment_ok", "manual_judgment_ng"])
 def test_manual_judgment_reset_clears_sn_and_publishes_blank_payload(qapp, reason):
     module, services = _make_module(saved_selected_ids=(101,))
-    module.ed_sn.setText("SN-OLD")
-    module.ed_model.setText("MODEL-KEEP")
     services.bus.workorder_changed.emissions.clear()
 
     services.bus.factory_display_reset.emit(reason)
 
-    assert module.ed_sn.text() == ""
-    assert module.ed_model.text() == "MODEL-KEEP"
     assert module.value()["selected_config_ids"] == (101,)
     assert services.bus.current_workorder_payload == {
         "sn": "",
-        "model": "MODEL-KEEP",
+        "model": "",
         "selected_config_ids": (101,),
     }
     assert services.bus.workorder_changed.emissions[-1][0][0]["sn"] == ""
 
 
-def test_non_manual_display_reset_preserves_sn(qapp):
+def test_plc_sn_display_follows_plc_add_delete_and_updates_by_plc_id(qapp):
     module, services = _make_module(saved_selected_ids=(101,))
-    module.ed_sn.setText("SN-KEEP")
 
-    services.bus.factory_display_reset.emit("selection_changed")
+    first = PlcTable.create(plc_name="PLC A")
+    second = PlcTable.create(plc_name="PLC B")
+    services.bus.plc_changed.emit()
 
-    assert module.ed_sn.text() == "SN-KEEP"
+    assert tuple(module._plc_sn_edits) == (first.id, second.id)
+
+    services.bus.plc_workorder_changed.emit(
+        {"plc_id": second.id, "sn": "SN-PLC-B"}
+    )
+
+    assert module._plc_sn_edits[first.id].text() == ""
+    assert module._plc_sn_edits[second.id].text() == "SN-PLC-B"
+    assert "#2563eb" in module._plc_sn_edits[second.id].styleSheet()
+
+    services.bus.plc_workorder_changed.emit(
+        {"plc_id": first.id, "sn": "SN-PLC-A"}
+    )
+    assert "#2563eb" in module._plc_sn_edits[first.id].styleSheet()
+    assert module._plc_sn_edits[second.id].styleSheet() == ""
+
+    third = PlcTable.create(plc_name="PLC C")
+    services.bus.plc_changed.emit()
+
+    assert tuple(module._plc_sn_edits) == (first.id, second.id, third.id)
+    assert module.plc_sn_layout.itemAtPosition(0, 0).widget() is not None
+    assert module.plc_sn_layout.itemAtPosition(0, 1).widget() is not None
+    assert module.plc_sn_layout.itemAtPosition(1, 0).widget() is not None
+    assert module.plc_sn_layout.itemAtPosition(1, 1) is None
+    first_row = module.plc_sn_layout.itemAtPosition(0, 0).widget()
+    first_row_labels = first_row.findChildren(QLabel)
+    assert first_row_labels[0].text() == f"PLC{first.id} SN码"
+
+    third.delete_instance()
+    services.bus.plc_changed.emit()
+
+    assert tuple(module._plc_sn_edits) == (first.id, second.id)
 
 
 @pytest.mark.parametrize(

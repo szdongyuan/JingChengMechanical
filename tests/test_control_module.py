@@ -62,6 +62,8 @@ class _BusStub:
     def __init__(self):
         self.workorder_changed = _SignalStub()
         self.config_changed = _SignalStub()
+        self.plc_changed = _SignalStub()
+        self.plc_workorder_changed = _SignalStub()
         self.factory_state_changed = _SignalStub()
         self.factory_start_blocked = _SignalStub()
         self.factory_runtime_aborted = _SignalStub()
@@ -266,6 +268,9 @@ def _make_module(
         config_service=_ConfigServiceStub(),
         factory_selection_settings=_FactorySelectionSettingsStub(),
         factory_mode=_FactoryModeStub(bus, initial_state),
+        plc_services={},
+        plc_threads={},
+        plc_state={},
         production_unavailable_reason=production_unavailable_reason,
     )
     return ControlModule(services), services
@@ -281,6 +286,9 @@ def _make_shared_modules(
         config_service=_ConfigServiceStub(),
         factory_selection_settings=_FactorySelectionSettingsStub(),
         factory_mode=_FactoryModeStub(bus, initial_state),
+        plc_services={},
+        plc_threads={},
+        plc_state={},
     )
     return WorkOrderModule(services), ControlModule(services), services
 
@@ -1120,15 +1128,13 @@ def test_start_uses_live_workorder_payload_from_current_workorder_module(qapp):
 
     workorder_module.config_selector.set_checked(101, True)
     workorder_module.config_selector.set_checked(202, True)
-    workorder_module.ed_sn.setText("SN-LIVE")
-    workorder_module.ed_model.setText("MODEL-LIVE")
 
     control_module.btn_start.click()
 
     services.factory_mode.start_manual.assert_called_once_with(
         {
-            "sn": "SN-LIVE",
-            "model": "MODEL-LIVE",
+            "sn": "",
+            "model": "",
             "selected_config_ids": (101, 202),
         }
     )
