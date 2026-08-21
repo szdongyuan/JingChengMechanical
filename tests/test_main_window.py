@@ -573,6 +573,20 @@ def test_degraded_production_still_builds_configuration_and_hardware_pages(
     assert window.tab.count() == 5
 
 
+def test_operator_can_activate_data_management_but_not_admin_pages():
+    import app.main_window as main_window
+
+    window = main_window.MainWindow.__new__(main_window.MainWindow)
+    window.current_user_role = "操作员"
+    window.tab_names = ["测试", "数据管理", "配置", "AI管理", "硬件"]
+
+    assert window._can_activate_main_tab(0)
+    assert window._can_activate_main_tab(1)
+    assert not window._can_activate_main_tab(2)
+    assert not window._can_activate_main_tab(3)
+    assert not window._can_activate_main_tab(4)
+
+
 def _disable_updates_and_remove_events(widget: QWidget) -> None:
     widget.setUpdatesEnabled(False)
     widgets = [widget]
