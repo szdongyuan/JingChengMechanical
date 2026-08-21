@@ -28,6 +28,18 @@ ProgressCallback = Callable[[int, int, str], None]
 
 
 @dataclass(frozen=True)
+class RunArchiveSkippedRecord:
+    run_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class RunArchiveSelectionInspection:
+    exportable_run_ids: tuple[str, ...]
+    skipped: tuple[RunArchiveSkippedRecord, ...]
+
+
+@dataclass(frozen=True)
 class _PreparedRecord:
     record: RunExportRecord
     channel_wavs: tuple[bytes, ...]
@@ -466,6 +478,7 @@ def write_run_archive(
     records: tuple[RunExportRecord, ...],
     target_path: str,
     *,
+    copy_database: bytes | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> str:
     """Validate, assemble, test, and atomically publish one run archive."""
@@ -474,10 +487,14 @@ def write_run_archive(
         raise RunArchiveError("at least one run export record is required")
     if len({record.run_id for record in records}) != len(records):
         raise RunArchiveError("run export record IDs must be unique")
+    if copy_database is not None and (
+        type(copy_database) is not bytes or not copy_database
+    ):
+        raise RunArchiveError("copy database must be nonempty bytes")
 
     resolved_target = resolve_export_target(target_path)
     target = Path(resolved_target)
-    total_steps = len(records) * 2 + 4
+    total_steps = len(records) * 2 + 2 + (1 if copy_database is not None else 0)
     completed_steps = 0
     _emit_progress(
         progress_callback,
@@ -499,12 +516,13 @@ def write_run_archive(
             )
         prepared_records = tuple(prepared)
         index_database = _index_database(prepared_records)
+        _validate_index_database(index_database, prepared_records)
         completed_steps += 1
         _emit_progress(
             progress_callback,
             completed_steps,
             total_steps,
-            "正在生成导出索引...",
+            "正在校验导出数据...",
         )
     except RunArchiveError:
         raise
@@ -524,14 +542,15 @@ def write_run_archive(
         with zipfile.ZipFile(
             temporary, "w", compression=zipfile.ZIP_DEFLATED
         ) as archive:
-            archive.writestr("index.sqlite3", index_database)
-            completed_steps += 1
-            _emit_progress(
-                progress_callback,
-                completed_steps,
-                total_steps,
-                "正在写入索引文件...",
-            )
+            if copy_database is not None:
+                archive.writestr("copy_data.sqlite3", copy_database)
+                completed_steps += 1
+                _emit_progress(
+                    progress_callback,
+                    completed_steps,
+                    total_steps,
+                    "正在写入数据库副本...",
+                )
             for index, prepared in enumerate(prepared_records, start=1):
                 _write_record(archive, prepared)
                 completed_steps += 1
@@ -544,10 +563,8 @@ def write_run_archive(
 
         with zipfile.ZipFile(temporary, "r") as archive:
             bad_member = archive.testzip()
-            archived_index_database = archive.read("index.sqlite3")
         if bad_member is not None:
             raise RunArchiveError(f"archive member failed CRC: {bad_member}")
-        _validate_index_database(archived_index_database, prepared_records)
         completed_steps += 1
         _emit_progress(
             progress_callback,
@@ -582,6 +599,32 @@ class RunArchiveService:
     def __init__(self, reader: RunExportReaderPort) -> None:
         self._reader = reader
 
+    def inspect_selection(
+        self,
+        run_ids: tuple[str, ...],
+    ) -> RunArchiveSelectionInspection:
+        read_many_report = getattr(self._reader, "read_many_report", None)
+        if callable(read_many_report):
+            report = read_many_report(run_ids)
+            return RunArchiveSelectionInspection(
+                exportable_run_ids=tuple(
+                    record.run_id for record in report.records
+                ),
+                skipped=tuple(
+                    RunArchiveSkippedRecord(
+                        run_id=skipped.run_id,
+                        reason=skipped.reason,
+                    )
+                    for skipped in report.skipped
+                ),
+            )
+
+        records = self._reader.read_many(run_ids)
+        return RunArchiveSelectionInspection(
+            exportable_run_ids=tuple(record.run_id for record in records),
+            skipped=(),
+        )
+
     def export(
         self,
         run_ids: tuple[str, ...],
@@ -596,8 +639,19 @@ class RunArchiveService:
             f"正在读取 {len(run_ids)} 条导出数据...",
         )
         records = self._reader.read_many(run_ids)
+        copy_database = None
+        read_copy_database = getattr(self._reader, "read_copy_database", None)
+        if callable(read_copy_database):
+            _emit_progress(
+                progress_callback,
+                0,
+                0,
+                "正在生成数据库副本...",
+            )
+            copy_database = read_copy_database(run_ids)
         return write_run_archive(
             records,
             target_path,
+            copy_database=copy_database,
             progress_callback=progress_callback,
         )

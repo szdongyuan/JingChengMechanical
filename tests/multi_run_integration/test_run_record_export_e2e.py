@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import sqlite3
 from unittest.mock import MagicMock
 import wave
 from zipfile import ZipFile
@@ -68,6 +69,47 @@ def _read_mono_samples(payload: bytes) -> tuple[int, ...]:
     )
 
 
+def _patch_service_container_dependencies(monkeypatch) -> MagicMock:
+    monkeypatch.setattr(
+        services_module.DbConnectionService,
+        "connect",
+        lambda self: None,
+    )
+    monkeypatch.setattr(
+        services_module,
+        "HardwareSelectService",
+        MagicMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr(
+        services_module,
+        "InputCalibrationService",
+        MagicMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr(
+        services_module,
+        "ConfigService",
+        MagicMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr(
+        services_module,
+        "AiService",
+        MagicMock(return_value=MagicMock()),
+    )
+    legacy_export = MagicMock(
+        side_effect=AssertionError(
+            "legacy SQLite-plus-WAV export must be unreachable"
+        )
+    )
+    monkeypatch.setattr(
+        services_module,
+        "AudioDataService",
+        MagicMock(
+            return_value=MagicMock(export_zip=legacy_export),
+        ),
+    )
+    return legacy_export
+
+
 def test_data_management_exports_selected_terminal_runs_through_service_container(
     monkeypatch,
     prepared_database_path,
@@ -113,43 +155,7 @@ def test_data_management_exports_selected_terminal_runs_through_service_containe
         frame_count=3,
     )
 
-    monkeypatch.setattr(
-        services_module.DbConnectionService,
-        "connect",
-        lambda self: None,
-    )
-    monkeypatch.setattr(
-        services_module,
-        "HardwareSelectService",
-        MagicMock(return_value=MagicMock()),
-    )
-    monkeypatch.setattr(
-        services_module,
-        "InputCalibrationService",
-        MagicMock(return_value=MagicMock()),
-    )
-    monkeypatch.setattr(
-        services_module,
-        "ConfigService",
-        MagicMock(return_value=MagicMock()),
-    )
-    monkeypatch.setattr(
-        services_module,
-        "AiService",
-        MagicMock(return_value=MagicMock()),
-    )
-    legacy_export = MagicMock(
-        side_effect=AssertionError(
-            "legacy SQLite-plus-WAV export must be unreachable"
-        )
-    )
-    monkeypatch.setattr(
-        services_module,
-        "AudioDataService",
-        MagicMock(
-            return_value=MagicMock(export_zip=legacy_export),
-        ),
-    )
+    legacy_export = _patch_service_container_dependencies(monkeypatch)
 
     services = services_module.ServiceContainer(
         run_persistence_database=runtime,
@@ -195,6 +201,7 @@ def test_data_management_exports_selected_terminal_runs_through_service_containe
     legacy_export.assert_not_called()
 
     expected_members = {
+        "copy_data.sqlite3",
         f"{first_id}/manifest.json",
         f"{first_id}/channel-001.wav",
         f"{first_id}/channel-002.wav",
@@ -243,6 +250,20 @@ def test_data_management_exports_selected_terminal_runs_through_service_containe
         assert archive.read(f"{first_id}/current.csv") == (
             b"time_sec,current_a\n0.0,1.25\n0.5,1.75\n"
         )
+        restored = sqlite3.connect(":memory:")
+        try:
+            restored.deserialize(archive.read("copy_data.sqlite3"))
+            assert {
+                row[0] for row in restored.execute("SELECT run_id FROM run")
+            } == {first_id, second_id}
+            assert {
+                row[0] for row in restored.execute("SELECT run_id FROM audio")
+            } == {first_id, second_id}
+            assert restored.execute(
+                "SELECT COUNT(*) FROM analysis_attempt"
+            ).fetchone() == (0,)
+        finally:
+            restored.close()
         assert first_manifest["current"] == {
             "present": True,
             "file": "current.csv",
@@ -251,3 +272,99 @@ def test_data_management_exports_selected_terminal_runs_through_service_containe
             "present": False,
             "file": None,
         }
+
+
+def test_data_management_can_skip_bad_selected_runs_during_export(
+    monkeypatch,
+    prepared_database_path,
+    tmp_path,
+):
+    runtime: RunPersistenceDatabase = _ready_runtime(prepared_database_path)
+    good_source = tmp_path / "good-source.wav"
+    _write_pcm16(good_source, ((11, 12, 13),))
+
+    good_id = _insert_active(runtime, channel_order=(1,), hardware_id=23)
+    _finish(runtime, good_id)
+    _insert_audio(
+        runtime,
+        good_id,
+        good_source,
+        channel_count=1,
+        frame_count=3,
+    )
+    bad_id = _insert_active(runtime)
+    _finish(runtime, bad_id)
+
+    legacy_export = _patch_service_container_dependencies(monkeypatch)
+
+    services = services_module.ServiceContainer(
+        run_persistence_database=runtime,
+    )
+    app = QApplication.instance() or QApplication([])
+    module = DataManagementModule(services)
+    rows_by_id = {
+        module.table.item(row_index, 1).data(
+            Qt.ItemDataRole.UserRole
+        ): row_index
+        for row_index in range(module.table.rowCount())
+    }
+    assert set(rows_by_id) == {good_id, bad_id}
+    for run_id in (good_id, bad_id):
+        module.table.item(rows_by_id[run_id], 0).setCheckState(
+            Qt.CheckState.Checked
+        )
+
+    chosen = tmp_path / "skip-bad"
+    messages: list[tuple[str, tuple[object, ...]]] = []
+    prompts: list[tuple[object, ...]] = []
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (str(chosen), "Zip files (*.zip)"),
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args: (
+            prompts.append(args) or QMessageBox.StandardButton.Yes
+        ),
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda *args: messages.append(("success", args)),
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args: messages.append(("failure", args)),
+    )
+
+    module._export_selected_rows()
+
+    target = chosen.with_suffix(".zip")
+    assert target.is_file()
+    assert len(prompts) == 1
+    assert "跳过" in prompts[0][2]
+    assert bad_id in prompts[0][2]
+    assert [kind for kind, _args in messages] == ["success"]
+    assert "已导出 1 条" in messages[0][1][2]
+    legacy_export.assert_not_called()
+
+    with ZipFile(target, "r") as archive:
+        assert set(archive.namelist()) == {
+            "copy_data.sqlite3",
+            f"{good_id}/manifest.json",
+            f"{good_id}/channel-001.wav",
+        }
+        restored = sqlite3.connect(":memory:")
+        try:
+            restored.deserialize(archive.read("copy_data.sqlite3"))
+            assert restored.execute("SELECT run_id FROM run").fetchall() == [
+                (good_id,)
+            ]
+            assert restored.execute("SELECT run_id FROM audio").fetchall() == [
+                (good_id,)
+            ]
+        finally:
+            restored.close()

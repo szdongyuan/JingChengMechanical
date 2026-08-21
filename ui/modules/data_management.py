@@ -1009,6 +1009,10 @@ class DataManagementModule(QWidget):
             QMessageBox.warning(self, "提示", "请先勾选要导出的运行记录")
             return
 
+        run_ids = self._prepare_export_run_ids(run_ids)
+        if not run_ids:
+            return
+
         os.makedirs(self.data_dir, exist_ok=True)
         target_path, _selected_filter = QFileDialog.getSaveFileName(
             self,
@@ -1059,6 +1063,76 @@ class DataManagementModule(QWidget):
                 "导出失败",
                 f"导出失败：{error_message}",
             )
+
+    def _prepare_export_run_ids(
+        self,
+        run_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        inspect_selection = getattr(
+            self.services.run_archive_service,
+            "inspect_selection",
+            None,
+        )
+        if not callable(inspect_selection):
+            return run_ids
+
+        try:
+            inspection = inspect_selection(run_ids)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "导出检查失败",
+                f"检查导出记录失败：{exc}",
+            )
+            return ()
+
+        skipped = tuple(getattr(inspection, "skipped", ()))
+        exportable_run_ids = tuple(
+            getattr(inspection, "exportable_run_ids", ())
+        )
+        if not skipped:
+            return exportable_run_ids or run_ids
+
+        details = self._format_skipped_export_details(skipped)
+        if not exportable_run_ids:
+            QMessageBox.warning(
+                self,
+                "无法导出",
+                (
+                    f"选中的 {len(run_ids)} 条记录都不能导出。\n\n"
+                    f"{details}"
+                ),
+            )
+            return ()
+
+        answer = QMessageBox.question(
+            self,
+            "跳过不可导出记录",
+            (
+                f"选中 {len(run_ids)} 条，其中 {len(skipped)} 条不能导出。\n"
+                f"是否跳过这些记录，继续导出剩余 "
+                f"{len(exportable_run_ids)} 条？\n\n"
+                f"{details}"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer == QMessageBox.StandardButton.Yes:
+            return exportable_run_ids
+        return ()
+
+    @staticmethod
+    def _format_skipped_export_details(skipped: tuple[object, ...]) -> str:
+        lines = ["不可导出记录："]
+        for item in skipped[:5]:
+            run_id = str(getattr(item, "run_id", ""))
+            reason = str(getattr(item, "reason", ""))
+            if len(reason) > 160:
+                reason = f"{reason[:157]}..."
+            lines.append(f"- {run_id}: {reason}")
+        if len(skipped) > 5:
+            lines.append(f"... 还有 {len(skipped) - 5} 条")
+        return "\n".join(lines)
 
     def _export_progress_dialog(self, run_count: int) -> QProgressDialog:
         progress = QProgressDialog(

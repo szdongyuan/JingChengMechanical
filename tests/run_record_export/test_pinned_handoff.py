@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sqlite3
 import wave
 from zipfile import ZipFile
 
@@ -15,6 +16,7 @@ class _FrozenReader:
     def __init__(self, records: tuple[RunExportRecord, ...]) -> None:
         self._records = records
         self.selections: list[tuple[str, ...]] = []
+        self.copy_selections: list[tuple[str, ...]] = []
 
     def read_many(
         self,
@@ -22,6 +24,16 @@ class _FrozenReader:
     ) -> tuple[RunExportRecord, ...]:
         self.selections.append(run_ids)
         return self._records
+
+    def read_copy_database(self, run_ids: tuple[str, ...]) -> bytes:
+        self.copy_selections.append(run_ids)
+        database = sqlite3.connect(":memory:")
+        try:
+            database.execute("CREATE TABLE run(run_id TEXT PRIMARY KEY)")
+            database.execute("INSERT INTO run(run_id) VALUES (?)", (RUN_ID,))
+            return database.serialize()
+        finally:
+            database.close()
 
 
 def _write_pcm16_wav(path: Path) -> None:
@@ -75,8 +87,17 @@ def test_reader_value_maps_one_based_archive_positions_through_frozen_channel_or
 
     assert service.export((RUN_ID,), str(target)) == str(target)
     assert reader.selections == [(RUN_ID,)]
+    assert reader.copy_selections == [(RUN_ID,)]
 
     with ZipFile(target, "r") as archive:
+        copied = sqlite3.connect(":memory:")
+        try:
+            copied.deserialize(archive.read("copy_data.sqlite3"))
+            assert copied.execute("SELECT run_id FROM run").fetchall() == [
+                (RUN_ID,)
+            ]
+        finally:
+            copied.close()
         manifest = json.loads(archive.read(f"{RUN_ID}/manifest.json"))
 
     rows = manifest["channels"]

@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import sqlite3
 from uuid import uuid4
 
 import pytest
@@ -149,7 +150,8 @@ def _insert_audio(
     channel_count: int = 1,
     frame_count: int = 16,
     source_kind: str = "CAPTURED_AUDIO",
-) -> None:
+) -> str:
+    audio_id = str(uuid4())
     with runtime.operation() as database:
         database.execute_sql(
             """
@@ -161,7 +163,7 @@ def _insert_audio(
             ) VALUES (?, ?, ?, ?, ?, 1, ?, 'WAV_PCM', 8000, ?, ?, 2, 44, ?, ?)
             """,
             (
-                str(uuid4()),
+                audio_id,
                 str(uuid4()),
                 run_id,
                 source_kind,
@@ -177,6 +179,39 @@ def _insert_audio(
                 TERMINAL_AT,
             ),
         )
+    return audio_id
+
+
+def _insert_attempt(
+    runtime: RunPersistenceDatabase,
+    run_id: str,
+    audio_id: str,
+) -> str:
+    attempt_id = str(uuid4())
+    with runtime.operation() as database:
+        database.execute_sql(
+            """
+            INSERT INTO analysis_attempt (
+                attempt_id, run_id, audio_id, attempt_kind, state, judgment,
+                result_payload_json, error_code, error_summary, queued_at,
+                started_at, terminal_at, updated_at
+            ) VALUES (
+                ?, ?, ?, 'INITIAL', 'SUCCEEDED', 'PASS', ?, NULL, NULL,
+                ?, ?, ?, ?
+            )
+            """,
+            (
+                attempt_id,
+                run_id,
+                audio_id,
+                '{"result":{"summary_payload":{"rows":[]}}}',
+                ACCEPTED_AT,
+                ACCEPTED_AT,
+                TERMINAL_AT,
+                TERMINAL_AT,
+            ),
+        )
+    return attempt_id
 
 
 def _replace_config(
@@ -386,6 +421,103 @@ def test_read_many_returns_one_closed_terminal_export_value(
     assert len(database_opens) == 1
     assert database_opens[0].is_closed()
     assert calls == []
+
+
+def test_read_many_report_returns_exportable_records_and_skips_bad_facts(
+    prepared_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+
+    bad_id = _insert_active(runtime)
+    _finish(runtime, bad_id)
+
+    good_id = _insert_active(runtime)
+    _finish(runtime, good_id)
+    _insert_audio(runtime, good_id, tmp_path / "good.wav")
+
+    report = RunExportReader(runtime).read_many_report((bad_id, good_id))
+
+    assert tuple(record.run_id for record in report.records) == (good_id,)
+    assert len(report.skipped) == 1
+    assert report.skipped[0].run_id == bad_id
+    assert (
+        "terminal run has no committed audio value"
+        in report.skipped[0].reason
+    )
+
+
+def test_read_copy_database_exports_selected_run_audio_and_attempt_rows(
+    prepared_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+    selected_id = _insert_active(runtime)
+    _finish(runtime, selected_id)
+    selected_audio = _insert_audio(
+        runtime,
+        selected_id,
+        tmp_path / "selected.wav",
+    )
+    selected_attempt = _insert_attempt(runtime, selected_id, selected_audio)
+
+    other_id = _insert_active(runtime)
+    _finish(runtime, other_id)
+    other_audio = _insert_audio(runtime, other_id, tmp_path / "other.wav")
+    _insert_attempt(runtime, other_id, other_audio)
+
+    payload = RunExportReader(runtime).read_copy_database((selected_id,))
+
+    copied = sqlite3.connect(":memory:")
+    try:
+        copied.deserialize(payload)
+        assert {
+            row[0]
+            for row in copied.execute(
+                "SELECT name FROM sqlite_schema WHERE type = 'table'"
+            )
+        } == {"run", "audio", "analysis_attempt"}
+        assert copied.execute("SELECT run_id FROM run").fetchall() == [
+            (selected_id,)
+        ]
+        assert copied.execute("SELECT run_id, audio_id FROM audio").fetchall() == [
+            (selected_id, selected_audio)
+        ]
+        assert copied.execute(
+            "SELECT attempt_id, run_id, audio_id FROM analysis_attempt"
+        ).fetchall() == [(selected_attempt, selected_id, selected_audio)]
+        assert copied.execute(
+            "SELECT COUNT(*) FROM run WHERE run_id = ?",
+            (other_id,),
+        ).fetchone() == (0,)
+        assert copied.execute(
+            "SELECT COUNT(*) FROM audio WHERE audio_id = ?",
+            (other_audio,),
+        ).fetchone() == (0,)
+    finally:
+        copied.close()
+
+
+def test_read_copy_database_can_be_opened_as_plain_sqlite_file(
+    prepared_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+    selected_id = _insert_active(runtime)
+    _finish(runtime, selected_id)
+    _insert_audio(runtime, selected_id, tmp_path / "selected.wav")
+
+    payload = RunExportReader(runtime).read_copy_database((selected_id,))
+    target = tmp_path / "copy_data.sqlite3"
+    target.write_bytes(payload)
+
+    copied = sqlite3.connect(target)
+    try:
+        assert copied.execute("SELECT run_id FROM run").fetchall() == [
+            (selected_id,)
+        ]
+    finally:
+        copied.close()
 
 
 def test_read_many_uses_empty_identity_when_frozen_workorder_omits_it(

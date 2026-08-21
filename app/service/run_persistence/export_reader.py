@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+import sqlite3
 
 from app.service.fault_types import normalize_fault_types
 from app.service.run_persistence.analysis_envelope import (
@@ -31,6 +32,18 @@ from app.service.run_record_export.contracts import RunExportRecord
 
 class RunExportReadError(RuntimeError):
     """Selected durable facts are not a complete valid export input."""
+
+
+@dataclass(frozen=True)
+class RunExportSkippedRecord:
+    run_id: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class RunExportReadReport:
+    records: tuple[RunExportRecord, ...]
+    skipped: tuple[RunExportSkippedRecord, ...]
 
 
 @dataclass(frozen=True)
@@ -100,6 +113,8 @@ _READ_COLUMNS = (
     "a.byte_size, a.closed_verified_at, a.created_at"
 )
 
+_SOURCE_SQL_TABLES = ("run", "audio", "analysis_attempt")
+
 
 class RunExportReader:
     def __init__(self, runtime: RunPersistenceDatabase) -> None:
@@ -127,6 +142,55 @@ class RunExportReader:
         """Read one ordered, all-or-nothing selection without source-file I/O."""
 
         selected = self._validate_selection(run_ids)
+        grouped = self._read_joined_facts(selected)
+        records: list[RunExportRecord] = []
+        for run_id in selected:
+            matches = grouped[run_id]
+            if len(matches) != 1:
+                raise RunExportReadError(
+                    f"run {run_id} is missing or has duplicate durable facts"
+                )
+            records.append(_to_export_record(matches[0]))
+        return tuple(records)
+
+    def read_many_report(
+        self,
+        run_ids: tuple[str, ...],
+    ) -> RunExportReadReport:
+        """Read exportable records and collect malformed selected runs."""
+
+        selected = self._validate_selection(run_ids)
+        grouped = self._read_joined_facts(selected)
+        records: list[RunExportRecord] = []
+        skipped: list[RunExportSkippedRecord] = []
+        for run_id in selected:
+            matches = grouped[run_id]
+            if len(matches) != 1:
+                skipped.append(
+                    RunExportSkippedRecord(
+                        run_id=run_id,
+                        reason=(
+                            f"run {run_id} is missing or has duplicate "
+                            "durable facts"
+                        ),
+                    )
+                )
+                continue
+            try:
+                records.append(_to_export_record(matches[0]))
+            except RunExportReadError as exc:
+                skipped.append(
+                    RunExportSkippedRecord(
+                        run_id=run_id,
+                        reason=str(exc),
+                    )
+                )
+        return RunExportReadReport(tuple(records), tuple(skipped))
+
+    def _read_joined_facts(
+        self,
+        selected: tuple[str, ...],
+    ) -> dict[str, list[_JoinedFacts]]:
         placeholders = ", ".join("?" for _ in selected)
         with self._runtime.operation() as database:
             with database.atomic():
@@ -147,16 +211,7 @@ class RunExportReader:
             facts = _JoinedFacts(*row)
             if facts.run_id in grouped:
                 grouped[facts.run_id].append(facts)
-
-        records: list[RunExportRecord] = []
-        for run_id in selected:
-            matches = grouped[run_id]
-            if len(matches) != 1:
-                raise RunExportReadError(
-                    f"run {run_id} is missing or has duplicate durable facts"
-                )
-            records.append(_to_export_record(matches[0]))
-        return tuple(records)
+        return grouped
 
     @staticmethod
     def _validate_selection(run_ids: tuple[str, ...]) -> tuple[str, ...]:
@@ -174,6 +229,112 @@ class RunExportReader:
         if len(set(run_ids)) != len(run_ids):
             raise RunExportReadError("run selection contains a duplicate run ID")
         return run_ids
+
+    def read_copy_database(
+        self,
+        run_ids: tuple[str, ...],
+    ) -> bytes:
+        selected = self._validate_selection(run_ids)
+        placeholders = ", ".join("?" for _ in selected)
+        order = {run_id: index for index, run_id in enumerate(selected)}
+        with self._runtime.operation() as database:
+            with database.atomic():
+                schemas = {
+                    table: _source_table_schema(database, table)
+                    for table in _SOURCE_SQL_TABLES
+                }
+                table_columns = {
+                    table: _source_table_columns(database, table)
+                    for table in _SOURCE_SQL_TABLES
+                }
+                table_rows = {}
+                for table, columns in table_columns.items():
+                    rows = list(
+                        database.execute_sql(
+                            f"""
+                            SELECT {_column_list(columns)}
+                            FROM {_quote_identifier(table)}
+                            WHERE run_id IN ({placeholders})
+                            """,
+                            selected,
+                        ).fetchall()
+                    )
+                    run_index = columns.index("run_id")
+                    rows.sort(
+                        key=lambda row: (
+                            order[str(row[run_index])],
+                            tuple(str(value) for value in row),
+                        )
+                    )
+                    table_rows[table] = rows
+
+        return _copy_sqlite_database(
+            schemas,
+            table_columns,
+            table_rows,
+        )
+
+
+def _quote_identifier(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
+
+
+def _column_list(columns: tuple[str, ...]) -> str:
+    return ", ".join(_quote_identifier(column) for column in columns)
+
+
+def _source_table_schema(database, table: str) -> str:
+    row = database.execute_sql(
+        """
+        SELECT sql
+        FROM sqlite_schema
+        WHERE type = 'table' AND name = ?
+        """,
+        (table,),
+    ).fetchone()
+    if row is None or type(row[0]) is not str or not row[0].strip():
+        raise RunExportReadError(f"source table schema is missing: {table}")
+    return row[0].strip()
+
+
+def _source_table_columns(database, table: str) -> tuple[str, ...]:
+    rows = database.execute_sql(
+        f"PRAGMA table_info({_quote_identifier(table)})"
+    ).fetchall()
+    columns = tuple(row[1] for row in rows)
+    if not columns or any(type(column) is not str for column in columns):
+        raise RunExportReadError(f"source table columns are invalid: {table}")
+    if "run_id" not in columns:
+        raise RunExportReadError(f"source table has no run_id column: {table}")
+    return columns
+
+
+def _copy_sqlite_database(
+    schemas: dict[str, str],
+    table_columns: dict[str, tuple[str, ...]],
+    table_rows: dict[str, list[tuple[object, ...]]],
+) -> bytes:
+    database = sqlite3.connect(":memory:")
+    try:
+        database.execute("PRAGMA foreign_keys = OFF")
+        database.execute("PRAGMA application_id = 1245926744")
+        database.execute("PRAGMA user_version = 1")
+        for table in _SOURCE_SQL_TABLES:
+            database.execute(schemas[table])
+            columns = table_columns[table]
+            markers = ", ".join("?" for _ in columns)
+            database.executemany(
+                f"INSERT INTO {_quote_identifier(table)} "
+                f"({_column_list(columns)}) VALUES ({markers})",
+                table_rows[table],
+            )
+        database.commit()
+        payload = database.serialize()
+    finally:
+        database.close()
+    if not payload:
+        raise RunExportReadError("copy_data sqlite database is empty")
+    return payload
 
 
 def _to_export_record(facts: _JoinedFacts) -> RunExportRecord:

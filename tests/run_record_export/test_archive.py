@@ -4,7 +4,6 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
-import sqlite3
 import wave
 from zipfile import ZipFile
 
@@ -127,7 +126,6 @@ def test_write_run_archive_splits_mono_pcm16_and_preserves_rate_and_frames(
     assert result == str(target)
     with ZipFile(target, "r") as archive:
         assert archive.namelist() == [
-            "index.sqlite3",
             f"{RUN_ID}/manifest.json",
             f"{RUN_ID}/channel-001.wav",
             f"{RUN_ID}/channel-002.wav",
@@ -184,47 +182,6 @@ def test_write_run_archive_splits_mono_pcm16_and_preserves_rate_and_frames(
             b"time_sec,current_a\n0.0,1.25\n0.2,1.5\n"
         )
 
-        index = sqlite3.connect(":memory:")
-        try:
-            index.deserialize(archive.read("index.sqlite3"))
-            assert index.execute("PRAGMA application_id").fetchone() == (
-                1245926744,
-            )
-            assert index.execute("PRAGMA user_version").fetchone() == (1,)
-            assert dict(index.execute("SELECT key, value FROM export_metadata")) == {
-                "archive_schema": "jingcheng-run-export/v1",
-                "index_schema": "jingcheng-run-export-index/v1",
-            }
-            assert index.execute(
-                """
-                SELECT run_id, export_order, sn, model, result,
-                       manifest_path, current_csv_path
-                FROM export_run
-                """
-            ).fetchone() == (
-                RUN_ID,
-                1,
-                "SN-EXPORT-001",
-                "型号-甲",
-                "OK",
-                f"{RUN_ID}/manifest.json",
-                f"{RUN_ID}/current.csv",
-            )
-            assert tuple(
-                index.execute(
-                    """
-                    SELECT position, source_channel, wav_path
-                    FROM export_channel
-                    ORDER BY position
-                    """
-                )
-            ) == (
-                (1, 4, f"{RUN_ID}/channel-001.wav"),
-                (2, 9, f"{RUN_ID}/channel-002.wav"),
-            )
-        finally:
-            index.close()
-
 
 def test_manifest_uses_null_hardware_id_for_imported_run(tmp_path):
     from app.service.run_record_export.archive import write_run_archive
@@ -238,7 +195,6 @@ def test_manifest_uses_null_hardware_id_for_imported_run(tmp_path):
 
     with ZipFile(target, "r") as archive:
         assert archive.namelist() == [
-            "index.sqlite3",
             f"{IMPORTED_RUN_ID}/manifest.json",
             f"{IMPORTED_RUN_ID}/channel-001.wav",
             f"{IMPORTED_RUN_ID}/channel-002.wav",
@@ -260,7 +216,7 @@ def test_manifest_uses_null_hardware_id_for_imported_run(tmp_path):
         )
 
 
-def test_index_database_preserves_selected_order_and_unicode_identity(tmp_path):
+def test_archive_preserves_selected_order_and_unicode_identity(tmp_path):
     from app.service.run_record_export.archive import write_run_archive
 
     imported_source = tmp_path / "imported.wav"
@@ -282,31 +238,26 @@ def test_index_database_preserves_selected_order_and_unicode_identity(tmp_path):
     assert write_run_archive(records, str(target)) == str(target)
 
     with ZipFile(target, "r") as archive:
-        index_payload = archive.read("index.sqlite3")
-    index = sqlite3.connect(":memory:")
-    try:
-        index.deserialize(index_payload)
-        assert tuple(
-            index.execute(
-                """
-                SELECT export_order, run_id, sn, model, current_csv_path
-                FROM export_run
-                ORDER BY export_order
-                """
-            )
-        ) == (
-            (1, IMPORTED_RUN_ID, "SN-第二条", "型号-乙", None),
-            (
-                2,
-                RUN_ID,
-                "SN-第一条",
-                "型号-甲",
-                f"{RUN_ID}/current.csv",
-            ),
-        )
-        assert index.execute("PRAGMA integrity_check").fetchone() == ("ok",)
-    finally:
-        index.close()
+        assert archive.namelist() == [
+            f"{IMPORTED_RUN_ID}/manifest.json",
+            f"{IMPORTED_RUN_ID}/channel-001.wav",
+            f"{IMPORTED_RUN_ID}/channel-002.wav",
+            f"{RUN_ID}/manifest.json",
+            f"{RUN_ID}/channel-001.wav",
+            f"{RUN_ID}/channel-002.wav",
+            f"{RUN_ID}/current.csv",
+        ]
+        imported = json.loads(archive.read(f"{IMPORTED_RUN_ID}/manifest.json"))
+        captured = json.loads(archive.read(f"{RUN_ID}/manifest.json"))
+        assert imported["run"]["sn"] == "SN-第二条"
+        assert imported["run"]["model"] == "型号-乙"
+        assert imported["current"] == {"present": False, "file": None}
+        assert captured["run"]["sn"] == "SN-第一条"
+        assert captured["run"]["model"] == "型号-甲"
+        assert captured["current"] == {
+            "present": True,
+            "file": "current.csv",
+        }
 
 
 def test_write_run_archive_publishes_sibling_temp_after_close_testzip_once_replace(
