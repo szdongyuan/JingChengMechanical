@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -1334,6 +1335,35 @@ def test_frozen_run_freezer_prefers_explicit_identity_and_keeps_import_fallback(
     assert ingress["config"] == {"config_id": 11}
     fallback, _ingress = freezer._config(missing)
     assert fallback is config
+
+
+def test_frozen_run_freezer_names_audio_by_station_time_and_sn(
+    monkeypatch,
+    tmp_path,
+):
+    import app.service.multi_run_integration.production_composition as module
+
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 8, 24, 15, 30, 12)
+
+    monkeypatch.setattr(module, "datetime", FixedDatetime)
+    config = SimpleNamespace(config_id=11)
+    freezer = module._FrozenRunFreezer(
+        SimpleNamespace(configs=(config,)),
+        tmp_path,
+    )
+
+    request = freezer._final_path(
+        "12345678-1234-4234-8234-123456789abc",
+        config=config,
+        ingress={"work_order": {"sn": "SN/001"}},
+        values={"config_name": "工位2", "plc_id": 7, "config_id": 11},
+        plc_id=7,
+    )
+
+    assert Path(request.final_path).name == "工位2_20260824_153012_SN_001.wav"
 
 
 def test_run_freezer_loads_latest_calibration_for_each_new_run(tmp_path):

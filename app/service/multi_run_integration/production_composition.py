@@ -133,6 +133,15 @@ from app.service.managed_input_sounddevice_backend import (
 
 
 _PRODUCTION_ANALYSIS_WORKER_COUNT = 2
+_INVALID_AUDIO_FILENAME_CHARS = set('<>:"/\\|?*')
+_WINDOWS_RESERVED_FILENAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *{f"COM{index}" for index in range(1, 10)},
+    *{f"LPT{index}" for index in range(1, 10)},
+}
 
 
 class ProductionCompositionError(RuntimeError):
@@ -165,6 +174,25 @@ def _decode_payload(value: FrozenPayload) -> dict[str, object]:
     if type(decoded) is not dict:
         raise ValueError("frozen ingress payload must be an object")
     return decoded
+
+
+def _safe_audio_filename_part(value: object, fallback: str) -> str:
+    text = "" if value is None else str(value).strip()
+    if not text:
+        text = fallback
+    text = "".join(
+        "_"
+        if character in _INVALID_AUDIO_FILENAME_CHARS
+        or ord(character) < 32
+        else character
+        for character in text
+    )
+    text = "_".join(text.split()).strip(" ._")
+    if not text:
+        text = fallback
+    if text.upper() in _WINDOWS_RESERVED_FILENAMES:
+        text = f"{text}_"
+    return text[:80]
 
 
 def _result_payload_with_judgment(
@@ -1319,10 +1347,91 @@ class _FrozenRunFreezer:
             canonical,
         )
 
-    def _final_path(self, run_id: str) -> FinalPathRequest:
-        return FinalPathRequest(
-            str((self._output_directory / f"{run_id}.wav").resolve())
+    @staticmethod
+    def _work_order_value(
+        ingress: Mapping[str, object],
+        *keys: str,
+    ) -> object:
+        work_order = ingress.get("work_order")
+        if not isinstance(work_order, Mapping):
+            return None
+        for key in keys:
+            value = work_order.get(key)
+            if value is not None and str(value).strip():
+                return value
+        return None
+
+    @staticmethod
+    def _station_value(
+        config,
+        values: Mapping[str, object],
+        plc_id: object,
+    ) -> object:
+        value = values.get("config_name")
+        if value is not None and str(value).strip():
+            return value
+        for key in (
+            "station_no",
+            "station_id",
+            "station",
+            "workstation",
+            "workstation_id",
+            "work_station",
+            "工位号",
+            "工位",
+        ):
+            value = values.get(key)
+            if value is not None and str(value).strip():
+                return value
+        if plc_id is not None:
+            return plc_id
+        value = values.get("plc_id")
+        if value is not None and str(value).strip():
+            return value
+        value = values.get("config_id")
+        if value is not None and str(value).strip():
+            return value
+        return getattr(config, "config_id", None)
+
+    def _unique_audio_path(self, stem: str) -> Path:
+        candidate = self._output_directory / f"{stem}.wav"
+        if not candidate.exists():
+            return candidate
+        for index in range(2, 1000):
+            candidate = self._output_directory / f"{stem}_{index}.wav"
+            if not candidate.exists():
+                return candidate
+        return self._output_directory / f"{stem}_{uuid4().hex}.wav"
+
+    def _final_path(
+        self,
+        run_id: str,
+        *,
+        config,
+        ingress: Mapping[str, object],
+        values: Mapping[str, object],
+        plc_id: object = None,
+    ) -> FinalPathRequest:
+        station = _safe_audio_filename_part(
+            self._station_value(config, values, plc_id),
+            "unknown-station",
         )
+        sn = _safe_audio_filename_part(
+            self._work_order_value(
+                ingress,
+                "sn",
+                "SN",
+                "sn_code",
+                "barcode",
+                "serial",
+                "serial_number",
+                "编号",
+            ),
+            "no-sn",
+        )
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        stem = f"{station}_{timestamp}_{sn}"
+        return FinalPathRequest(str(self._unique_audio_path(stem).resolve()))
 
     @staticmethod
     def _target_frames(config) -> int:
@@ -1384,7 +1493,13 @@ class _FrozenRunFreezer:
                 ingress,
                 semantic_config,
             ),
-            final_path_request=self._final_path(request.run_id),
+            final_path_request=self._final_path(
+                request.run_id,
+                config=config,
+                ingress=ingress,
+                values=semantic_config,
+                plc_id=getattr(request, "plc_id", None),
+            ),
             metadata=AudioMetadataConstraints(
                 expected_sample_rate_hz=int(
                     config.managed_input.descriptor_sample_rate_hz
@@ -1446,7 +1561,12 @@ class _ImportedRunFreezer(_FrozenRunFreezer):
                 ingress,
                 semantic_config,
             ),
-            final_path_request=self._final_path(request.run_id),
+            final_path_request=self._final_path(
+                request.run_id,
+                config=config,
+                ingress=ingress,
+                values=semantic_config,
+            ),
             metadata=metadata,
         )
 
