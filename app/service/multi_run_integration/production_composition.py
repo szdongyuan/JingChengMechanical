@@ -49,6 +49,7 @@ from app.service.fault_types import (
     encode_history_labels_payload,
     encode_run_config_payload,
 )
+from app.service.log_manager import LogManager
 from app.service.managed_input_contracts import (
     BackendScanId,
     HardwareEndpointIdentity,
@@ -396,6 +397,7 @@ class _ProductionLiveDisplayManager:
     def __init__(self, *, bus: object, diagnostic_callback=None) -> None:
         self._bus = bus
         self._diagnostic_callback = diagnostic_callback
+        self.logger = LogManager.set_log_handler("core")
         self._lock = threading.Lock()
         self._runs_by_hardware: dict[str, dict[str, _LiveRun]] = {}
         self._closed = False
@@ -719,7 +721,12 @@ class _ProductionLiveDisplayManager:
             self._block_thread.join(1.0)
         for run in runs:
             run.dispatcher.stop()
-            self._stop_monitor(run.monitor, wait=True)
+            self._stop_monitor(
+                run.monitor,
+                wait=True,
+                run_id=run.run_id,
+                log_stop=True,
+            )
 
     def _create_monitor(
         self,
@@ -768,17 +775,27 @@ class _ProductionLiveDisplayManager:
                 )
             )
             monitor.start()
+            self.logger.info(f"开始播放: run_id={run_id}, 设备={output_name}")
             return monitor
         except Exception as exc:
+            self.logger.error(f"实时播放启动失败: run_id={run_id}, error={exc}")
             self._diagnose(f"monitor setup failed: {exc}")
             return None
 
-    @staticmethod
-    def _stop_monitor(monitor: object | None, *, wait: bool) -> None:
+    def _stop_monitor(
+        self,
+        monitor: object | None,
+        *,
+        wait: bool,
+        run_id: str | None = None,
+        log_stop: bool = False,
+    ) -> None:
         if monitor is None:
             return
         try:
             monitor.stop()
+            if log_stop:
+                self.logger.info(f"结束播放: run_id={run_id}")
         except Exception:
             return
         if wait:
@@ -787,14 +804,18 @@ class _ProductionLiveDisplayManager:
             except Exception:
                 pass
 
-    @classmethod
-    def _drain_and_stop(cls, run: _LiveRun) -> None:
+    def _drain_and_stop(self, run: _LiveRun) -> None:
         def drain() -> None:
             run.dispatcher.wait_until_idle(2.0)
             run.dispatcher.stop()
-            cls._stop_monitor(run.monitor, wait=True)
+            self._stop_monitor(run.monitor, wait=True, run_id=run.run_id)
 
-        cls._stop_monitor(run.monitor, wait=False)
+        self._stop_monitor(
+            run.monitor,
+            wait=False,
+            run_id=run.run_id,
+            log_stop=True,
+        )
         threading.Thread(
             target=drain,
             name="production-live-display-drain",

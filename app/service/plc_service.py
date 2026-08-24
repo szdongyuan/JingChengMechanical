@@ -466,7 +466,10 @@ class PlcService(QObject):
         self._write_testing_signal(True)
         trigger_monotonic_ns = time.monotonic_ns()
         workorder = self._emit_plc_workorder()
-        print(workorder)
+        self.logger.info(
+            f"PLC {self._plc_id} 开始信号详情: "
+            f"触发时间戳={trigger_monotonic_ns}, 读取数据={workorder}"
+        )
         try:
             self._on_start_requested(
                 self._plc_id,

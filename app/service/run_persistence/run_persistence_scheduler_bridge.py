@@ -6,6 +6,7 @@ import base64
 from dataclasses import dataclass
 from enum import Enum
 import json
+import logging
 import math
 from pathlib import Path
 import threading
@@ -1008,6 +1009,7 @@ class AnalysisPersistenceBoundary:
         self._quarantine_claimed = False
         self._scheduler_shutdown_result: BridgeSchedulerShutdownResult | None = None
         self._database_close_result: BridgeDatabaseCloseResult | None = None
+        self.logger = logging.getLogger("core")
 
     @property
     def _context_count(self) -> int:
@@ -1234,6 +1236,10 @@ class AnalysisPersistenceBoundary:
                         "analysis attempt start context is invalid",
                     )
                 active.durable_started = True
+                self.logger.info(
+                    f"开始分析: run_id={job.run_id}, "
+                    f"attempt_id={job.analysis_attempt_id}"
+                )
         finally:
             with self._submit_condition:
                 context.start_in_flight = False
@@ -1300,6 +1306,15 @@ class AnalysisPersistenceBoundary:
             context.terminal_sink(report)
         except Exception:
             pass
+        if context.durable_started:
+            status = (
+                report.attempt_state.value
+                if report.attempt_state is not None
+                else report.status.value
+            )
+            self.logger.info(
+                f"结束分析: run_id={context.job.run_id}, 状态={status}"
+            )
         self._discard_context(context)
         return True
 
