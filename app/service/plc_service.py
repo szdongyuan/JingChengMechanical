@@ -221,7 +221,9 @@ class PlcService(QObject):
         return False
 
     def _write_testing_signal(self, testing):
+        self.logger.info(f"self._field_offsets_dict的值是: {self._field_offsets_dict}")
         offset = self._field_offsets_dict.get("res_testing_signal_offset")
+        self.logger.info(f"offset的值是: {offset}")
         if not offset:
             self.logger.warning(f"PLC {self._plc_id} 未找到偏移配置: res_testing_signal_offset")
             return
@@ -324,10 +326,10 @@ class PlcService(QObject):
             self.bus.log.emit(f"PLC {self._plc_id} 写入限值失败: {exc}")
             self.logger.error(f"PLC 写入限值失败: {exc}")
 
-    def read_offset_value(self, offset, type):
+    def read_offset_value(self, offset, type, string_size=254):
         if type == "string":
             byte_index = int(str(offset).split(".", 1)[0])
-            data = self.plc_client.db_read(self._db_number, byte_index, 256)
+            data = self.plc_client.db_read(self._db_number, byte_index, int(string_size) + 2)
             current_len = data[1]
             if current_len <= 0:
                 return ""
@@ -360,12 +362,19 @@ class PlcService(QObject):
             "res_sn_code_offset",
             "res_product_model_offset",
         }
+        string_sizes = {
+            "sn_code_offset": 15,
+            "product_model_offset": 36,
+            "res_sn_code_offset": 15,
+            "res_product_model_offset": 36,
+        }
         bool_fields = {
             "start_signal_offset",
             "res_finish_signal_offset",
             "res_result_offset",
         }
         real_fields = {
+            "current_value_offset",
             "res_score_offset",
             "res_spl_offset",
             "res_loudness_offset",
@@ -390,15 +399,35 @@ class PlcService(QObject):
                 continue
 
             if field_name in string_fields:
-                value = self.read_offset_value(offset, "string")
+                value_type = "string"
             elif field_name in bool_fields:
-                value = self.read_offset_value(offset, "bool")
+                value_type = "bool"
             elif field_name in real_fields:
-                value = self.read_offset_value(offset, "real")
+                value_type = "real"
             elif field_name in int_fields:
-                value = self.read_offset_value(offset, "int")
+                value_type = "int"
             else:
                 continue
+
+            self.logger.info(
+                f"PLC {self._plc_id} 读取字段开始: {field_name}, "
+                f"offset={offset}, type={value_type}"
+            )
+            try:
+                value = self.read_offset_value(
+                    offset,
+                    value_type,
+                    string_sizes.get(field_name, 254),
+                )
+            except Exception as exc:
+                self.logger.error(
+                    f"PLC {self._plc_id} 读取字段失败: {field_name}, "
+                    f"offset={offset}, type={value_type}, error={exc}"
+                )
+                continue
+            self.logger.info(
+                f"PLC {self._plc_id} 读取字段完成: {field_name}, value={value}"
+            )
 
             # 字符串为空或读取失败时不放进结果；False 和 0.0 是有效值，需要保留。
             if value == "" or value is None:
@@ -424,7 +453,52 @@ class PlcService(QObject):
         payload = {}
         values = self.read_plc_values(
             "sn_code_offset",
+            "product_model_offset",
+            "start_signal_offset",
+            "current_value_offset",
             "rotation_speed_offset",
+            "res_finish_signal_offset",
+            "res_result_offset",
+            "res_score_offset",
+            "res_spl_offset",
+            "res_loudness_offset",
+            "res_vibrate_data_offset",
+            "res_ai_score_offset",
+            "res_spl_limit_up_offset",
+            "res_spl_limit_down_offset",
+            "res_loudness_limit_up_offset",
+            "res_loudness_limit_down_offset",
+            "res_vibrate_limit_up_offset",
+            "res_vibrate_limit_down_offset",
+            "res_ai_score_limit_down_offset",
+            "res_error_code_offset",
+            "res_sn_code_offset",
+            "res_product_model_offset",
+        )
+        self.logger.info(
+            f"PLC {self._plc_id} 读取数据汇总: "
+            f"SN={values.get('sn_code_offset')}, "
+            f"产品型号={values.get('product_model_offset')}, "
+            f"启动信号={values.get('start_signal_offset')}, "
+            f"电流值={values.get('current_value_offset')}, "
+            f"转速值={values.get('rotation_speed_offset')}, "
+            f"返回结束信号={values.get('res_finish_signal_offset')}, "
+            f"返回测试结果={values.get('res_result_offset')}, "
+            f"返回评分={values.get('res_score_offset')}, "
+            f"返回平均声压级={values.get('res_spl_offset')}, "
+            f"返回响度={values.get('res_loudness_offset')}, "
+            f"返回中场振动={values.get('res_vibrate_data_offset')}, "
+            f"返回AI评分={values.get('res_ai_score_offset')}, "
+            f"声压阈值上限={values.get('res_spl_limit_up_offset')}, "
+            f"声压阈值下限={values.get('res_spl_limit_down_offset')}, "
+            f"响度阈值上限={values.get('res_loudness_limit_up_offset')}, "
+            f"响度阈值下限={values.get('res_loudness_limit_down_offset')}, "
+            f"振动阈值上限={values.get('res_vibrate_limit_up_offset')}, "
+            f"振动阈值下限={values.get('res_vibrate_limit_down_offset')}, "
+            f"AI评分下限={values.get('res_ai_score_limit_down_offset')}, "
+            f"返回异常代码={values.get('res_error_code_offset')}, "
+            f"返回SN={values.get('res_sn_code_offset')}, "
+            f"返回机种={values.get('res_product_model_offset')}"
         )
         if values.get("sn_code_offset"):
             payload["sn"] = values["sn_code_offset"]
@@ -463,9 +537,17 @@ class PlcService(QObject):
             return
         self.bus.log.emit(f"PLC {self._plc_id} 检测到开始信号")
         self.logger.info(f"PLC {self._plc_id} 检测到开始信号")
+        self.logger.info(f"PLC {self._plc_id} 写入测试中信号开始")
         self._write_testing_signal(True)
+        self.logger.info(f"PLC {self._plc_id} 写入测试中信号完成")
         trigger_monotonic_ns = time.monotonic_ns()
-        workorder = self._emit_plc_workorder()
+        self.logger.info(f"PLC {self._plc_id} 读取工单数据开始")
+        try:
+            workorder = self._emit_plc_workorder()
+        except Exception as exc:
+            self.logger.error(f"PLC {self._plc_id} 读取工单数据失败，继续启动: {exc}")
+            workorder = {}
+        self.logger.info(f"PLC {self._plc_id} 读取工单数据完成: {workorder}")
         self.logger.info(
             f"PLC {self._plc_id} 开始信号详情: "
             f"触发时间戳={trigger_monotonic_ns}, 读取数据={workorder}"
