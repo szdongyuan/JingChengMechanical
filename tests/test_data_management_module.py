@@ -31,6 +31,7 @@ from app.service.run_persistence.data_management import (
     DeleteRunStatus,
     ManagementJudgment,
     RunManagementPage,
+    RunFaultTypeOptions,
     RunManagementRow,
 )
 from app.service.run_scoped_playback import (
@@ -53,6 +54,7 @@ def _row(
     sn: str = "SN-001",
     model: str = "MODEL-A",
     state: str = "SUCCEEDED",
+    accepted_fault_types: tuple[str, ...] = (),
 ) -> RunManagementRow:
     return RunManagementRow(
         run_id=run_id,
@@ -74,6 +76,7 @@ def _row(
             if state == "SUCCEEDED"
             else None
         ),
+        accepted_fault_types=accepted_fault_types,
     )
 
 
@@ -120,6 +123,7 @@ class _ManagementStub:
             restart_required=False,
         )
         self.updated_fault_types = []
+        self.fault_type_options_by_run_id: dict[str, tuple[str, ...]] = {}
 
     def query_page(self, request):
         self.queries.append(request)
@@ -138,6 +142,18 @@ class _ManagementStub:
     def update_fault_type(self, run_id, fault_type):
         self.updated_fault_types.append((run_id, fault_type))
         return True
+
+    def fault_type_options_for_run_ids(self, run_ids):
+        return tuple(
+            RunFaultTypeOptions(
+                run_id=run_id,
+                accepted_fault_types=self.fault_type_options_by_run_id.get(
+                    run_id,
+                    (),
+                ),
+            )
+            for run_id in run_ids
+        )
 
 
 @pytest.fixture(scope="session")
@@ -441,10 +457,14 @@ def test_fault_type_options_are_cached_on_show_and_reused_by_combos(
     )
 
     module, management, _deleted = _module(qapp)
+    management.next_page = _page(
+        (_row(RUN_A, accepted_fault_types=("缓存类型-A",)),)
+    )
 
     assert calls == []
     module.show()
     qapp.processEvents()
+    module.refresh_table()
 
     assert calls == [0]
     fault_combo = module.table.cellWidget(0, module.table.columnCount() - 3)
@@ -452,7 +472,10 @@ def test_fault_type_options_are_cached_on_show_and_reused_by_combos(
 
     management.next_page = _page(
         tuple(
-            _row(f"33333333-3333-4333-8333-33333333333{index}")
+            _row(
+                f"33333333-3333-4333-8333-33333333333{index}",
+                accepted_fault_types=("缓存类型-A",),
+            )
             for index in range(5)
         )
     )
@@ -471,9 +494,74 @@ def test_fault_type_options_are_cached_on_show_and_reused_by_combos(
     qapp.processEvents()
 
     assert calls == [0, 1]
+    management.next_page = _page(
+        (_row(RUN_B, accepted_fault_types=("缓存类型-B",)),)
+    )
+    module.refresh_table()
     fault_combo = module.table.cellWidget(0, module.table.columnCount() - 3)
     assert fault_combo.findData("缓存类型-B") >= 0
     module.close()
+
+
+def test_fault_type_options_include_virtual_good_without_database_row(
+    qapp,
+    monkeypatch,
+):
+    rows = [
+        SimpleNamespace(malfunction_name="良品", malfunction_number="OK"),
+        SimpleNamespace(malfunction_name="不良", malfunction_number="NG"),
+        SimpleNamespace(malfunction_name="轴伤音", malfunction_number="ZS"),
+    ]
+
+    class Query:
+        def order_by(self, *_args):
+            return rows
+
+    monkeypatch.setattr(
+        "ui.modules.data_management.ensure_builtin_malfunction_type",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "ui.modules.data_management.MalfunctionTypeTable.select",
+        lambda: Query(),
+    )
+
+    module, _management, _deleted = _module(qapp)
+    options, seen = module._load_fault_type_options_from_database()
+
+    assert options[0] == ("请选择", None)
+    assert ("合格（OK）", "良品") in options
+    assert ("不良（NG）", "不良") in options
+    assert ("轴伤音（ZS）", "轴伤音") in options
+    assert "良品" in seen
+    assert sum(1 for _label, value in options if value == "良品") == 1
+
+
+def test_fault_type_combo_filters_options_to_record_frozen_fault_types(
+    qapp,
+):
+    module, management, _deleted = _module(qapp)
+    module._fault_type_options_cache = (
+        ("请选择", None),
+        ("合格（OK）", "良品"),
+        ("不良（NG）", "不良"),
+        ("针响（ZX）", "针响"),
+        ("轴真圆度音（ZZ）", "轴真圆度音"),
+    )
+    module._fault_type_option_names = frozenset(
+        {"良品", "不良", "针响", "轴真圆度音"}
+    )
+    management.next_page = _page(
+        (_row(RUN_A, accepted_fault_types=("不良", "针响")),)
+    )
+
+    module.refresh_table()
+
+    fault_combo = module.table.cellWidget(0, module.table.columnCount() - 3)
+    assert fault_combo.findData("良品") >= 0
+    assert fault_combo.findData("不良") >= 0
+    assert fault_combo.findData("针响") >= 0
+    assert fault_combo.findData("轴真圆度音") < 0
 
 
 def test_fault_type_combo_ignores_wheel_to_avoid_accidental_update(qapp):
@@ -675,15 +763,19 @@ def test_batch_update_fault_type_updates_selected_rows_and_refreshes(
 ):
     module, management, _deleted = _module(qapp)
     management.queries.clear()
+    management.fault_type_options_by_run_id = {
+        RUN_A: ("轴伤音",),
+        RUN_B: ("轴伤音",),
+    }
     _select_all_rows(module)
 
     def fake_refresh_fault_types(self):
         self._fault_type_options_cache = (
             ("请选择", None),
-            ("良品（OK）", "良品"),
-            ("轴伤（ZS）", "轴伤"),
+            ("合格（OK）", "良品"),
+            ("轴伤音（ZS）", "轴伤音"),
         )
-        self._fault_type_option_names = frozenset({"良品", "轴伤"})
+        self._fault_type_option_names = frozenset({"良品", "轴伤音"})
 
     confirmations = []
     summaries = []
@@ -695,7 +787,7 @@ def test_batch_update_fault_type_updates_selected_rows_and_refreshes(
     monkeypatch.setattr(
         QInputDialog,
         "getItem",
-        lambda *args: ("轴伤（ZS）", True),
+        lambda *args: ("轴伤音（ZS）", True),
     )
     monkeypatch.setattr(
         QMessageBox,
@@ -714,14 +806,66 @@ def test_batch_update_fault_type_updates_selected_rows_and_refreshes(
     module._batch_update_fault_type()
 
     assert management.updated_fault_types == [
-        (RUN_A, "轴伤"),
-        (RUN_B, "轴伤"),
+        (RUN_A, "轴伤音"),
+        (RUN_B, "轴伤音"),
     ]
     assert module._operation_active is False
     assert management.queries[-1].page == 1
     assert "已选的 2 条" in confirmations[0][2]
-    assert "轴伤（ZS）" in confirmations[0][2]
+    assert "轴伤音（ZS）" in confirmations[0][2]
     assert "成功修改 2 条" in summaries[0][2]
+
+
+def test_batch_update_fault_type_only_shows_common_frozen_options(
+    qapp,
+    monkeypatch,
+):
+    module, management, _deleted = _module(qapp)
+    management.queries.clear()
+    management.fault_type_options_by_run_id = {
+        RUN_A: ("不良", "针响"),
+        RUN_B: ("不良", "电枢音"),
+    }
+    _select_all_rows(module)
+
+    def fake_refresh_fault_types(self):
+        self._fault_type_options_cache = (
+            ("请选择", None),
+            ("合格（OK）", "良品"),
+            ("不良（NG）", "不良"),
+            ("针响（ZX）", "针响"),
+            ("电枢音（DS）", "电枢音"),
+        )
+        self._fault_type_option_names = frozenset(
+            {"良品", "不良", "针响", "电枢音"}
+        )
+
+    labels_seen = []
+    monkeypatch.setattr(
+        DataManagementModule,
+        "_refresh_fault_type_options_cache",
+        fake_refresh_fault_types,
+    )
+
+    def fake_get_item(_parent, _title, _prompt, labels, *_args):
+        labels_seen.extend(labels)
+        return "不良（NG）", True
+
+    monkeypatch.setattr(QInputDialog, "getItem", fake_get_item)
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: None)
+
+    module._batch_update_fault_type()
+
+    assert labels_seen == ["合格（OK）", "不良（NG）"]
+    assert management.updated_fault_types == [
+        (RUN_A, "不良"),
+        (RUN_B, "不良"),
+    ]
 
 
 def test_export_uses_shared_operation_gate_and_archive_service(

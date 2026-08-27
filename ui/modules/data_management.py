@@ -63,6 +63,7 @@ from ui.popups.run_audio_replay_dialog import RunAudioReplayDialog
 
 
 _BEIJING_TIMEZONE = timezone(timedelta(hours=8))
+_GOOD_MANAGEMENT_OPTION_LABEL = "合格（OK）"
 
 
 class _ExportCanceledError(RuntimeError):
@@ -643,8 +644,11 @@ class DataManagementModule(QWidget):
     def _load_fault_type_options_from_database(
         self,
     ) -> tuple[tuple[tuple[str, str | None], ...], frozenset[str]]:
-        options: list[tuple[str, str | None]] = [("请选择", None)]
-        seen: set[str] = set()
+        options: list[tuple[str, str | None]] = [
+            ("请选择", None),
+            (_GOOD_MANAGEMENT_OPTION_LABEL, GOOD_MALFUNCTION_TYPE_NAME),
+        ]
+        seen: set[str] = {GOOD_MALFUNCTION_TYPE_NAME}
         try:
             ensure_builtin_malfunction_type()
             rows = list(
@@ -655,6 +659,8 @@ class DataManagementModule(QWidget):
         for row in rows:
             name = str(row.malfunction_name or "").strip()
             if not name:
+                continue
+            if name in seen:
                 continue
             number = str(row.malfunction_number or "").strip()
             label = f"{name}（{number}）" if number else name
@@ -679,12 +685,141 @@ class DataManagementModule(QWidget):
     def _fault_type_options(
         self,
         current_value: str | None = None,
+        accepted_fault_types: tuple[str, ...] | None = None,
     ) -> list[tuple[str, str | None]]:
-        result = list(self._fault_type_options_cache)
+        if accepted_fault_types is None:
+            result = list(self._fault_type_options_cache)
+            option_names = set(self._fault_type_option_names)
+        else:
+            result = self._fault_type_options_for_accepted_types(
+                accepted_fault_types
+            )
+            option_names = {value for _label, value in result if value}
         current = str(current_value or "").strip()
-        if current and current not in self._fault_type_option_names:
+        if current and current not in option_names:
             result.append((f"{current}（当前值）", current))
         return result
+
+    def _fault_type_label_by_name(self) -> dict[str, str]:
+        return {
+            value: label
+            for label, value in self._fault_type_options_cache
+            if value
+        }
+
+    def _fault_type_options_for_accepted_types(
+        self,
+        accepted_fault_types: tuple[str, ...],
+    ) -> list[tuple[str, str | None]]:
+        label_by_name = self._fault_type_label_by_name()
+        options: list[tuple[str, str | None]] = [
+            ("请选择", None),
+            (
+                label_by_name.get(
+                    GOOD_MALFUNCTION_TYPE_NAME,
+                    _GOOD_MANAGEMENT_OPTION_LABEL,
+                ),
+                GOOD_MALFUNCTION_TYPE_NAME,
+            ),
+        ]
+        names = self._normalized_fault_type_names(accepted_fault_types)
+        if not names:
+            names = (BAD_MALFUNCTION_TYPE_NAME,)
+        seen = {GOOD_MALFUNCTION_TYPE_NAME}
+        for name in names:
+            if name in seen:
+                continue
+            options.append((label_by_name.get(name, name), name))
+            seen.add(name)
+        return options
+
+    def _fault_type_choices_for_selected_runs(
+        self,
+        run_ids: tuple[str, ...],
+    ) -> list[tuple[str, str]]:
+        accepted_by_run_id = self._accepted_fault_types_by_run_id(run_ids)
+        allowed_sets: list[set[str]] = []
+        for run_id in run_ids:
+            accepted = accepted_by_run_id.get(run_id, ())
+            names = set(self._normalized_fault_type_names(accepted))
+            allowed = {GOOD_MALFUNCTION_TYPE_NAME}
+            if names:
+                allowed.update(names)
+            else:
+                allowed.add(BAD_MALFUNCTION_TYPE_NAME)
+            allowed_sets.append(allowed)
+        common = set.intersection(*allowed_sets) if allowed_sets else set()
+        if GOOD_MALFUNCTION_TYPE_NAME not in common:
+            common.add(GOOD_MALFUNCTION_TYPE_NAME)
+
+        label_by_name = self._fault_type_label_by_name()
+        choices: list[tuple[str, str]] = [
+            (
+                label_by_name.get(
+                    GOOD_MALFUNCTION_TYPE_NAME,
+                    _GOOD_MANAGEMENT_OPTION_LABEL,
+                ),
+                GOOD_MALFUNCTION_TYPE_NAME,
+            )
+        ]
+        ordered_candidates: list[str] = [
+            value
+            for _label, value in self._fault_type_options_cache
+            if value and value != GOOD_MALFUNCTION_TYPE_NAME
+        ]
+        for accepted in accepted_by_run_id.values():
+            ordered_candidates.extend(
+                name
+                for name in self._normalized_fault_type_names(accepted)
+                if name != GOOD_MALFUNCTION_TYPE_NAME
+            )
+        if BAD_MALFUNCTION_TYPE_NAME not in ordered_candidates:
+            ordered_candidates.append(BAD_MALFUNCTION_TYPE_NAME)
+        seen = {GOOD_MALFUNCTION_TYPE_NAME}
+        for name in ordered_candidates:
+            if name in seen or name not in common:
+                continue
+            choices.append((label_by_name.get(name, name), name))
+            seen.add(name)
+        return choices
+
+    def _accepted_fault_types_by_run_id(
+        self,
+        run_ids: tuple[str, ...],
+    ) -> dict[str, tuple[str, ...]]:
+        service = self.services.run_data_management_service
+        loader = getattr(service, "fault_type_options_for_run_ids", None)
+        if callable(loader):
+            accepted_by_run_id = {
+                options.run_id: self._record_accepted_fault_types(options)
+                for options in loader(run_ids)
+            }
+            missing = [
+                run_id for run_id in run_ids if run_id not in accepted_by_run_id
+            ]
+            if missing:
+                raise RuntimeError(f"缺少运行记录 {missing[0]} 的故障类型配置")
+            return accepted_by_run_id
+        selected = set(run_ids)
+        return {
+            str(record.run_id): self._record_accepted_fault_types(record)
+            for record in self._records
+            if str(record.run_id) in selected
+        }
+
+    @staticmethod
+    def _normalized_fault_type_names(
+        values: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        names: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            name = str(value or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+        return tuple(names)
 
     def _create_fault_type_combo(self, record) -> QComboBox:
         combo = _CachedFaultTypeCombo(
@@ -707,7 +842,9 @@ class DataManagementModule(QWidget):
         )
         combo.setEditable(False)
         current = self._record_fault_type_selection(record)
-        self._populate_fault_type_combo(combo, current)
+        accepted_fault_types = self._record_accepted_fault_types(record)
+        combo.setProperty("accepted_fault_types", accepted_fault_types)
+        self._populate_fault_type_combo(combo, current, accepted_fault_types)
         editable = getattr(record, "state", None) != "ACTIVE"
         combo.setEnabled(editable)
         if editable:
@@ -722,22 +859,40 @@ class DataManagementModule(QWidget):
         return combo
 
     def _reload_fault_type_combo_options(self, combo: QComboBox) -> None:
-        self._populate_fault_type_combo(combo, combo.currentData())
+        accepted_fault_types = combo.property("accepted_fault_types")
+        if not isinstance(accepted_fault_types, tuple):
+            accepted_fault_types = ()
+        self._populate_fault_type_combo(
+            combo,
+            combo.currentData(),
+            accepted_fault_types,
+        )
 
     def _populate_fault_type_combo(
         self,
         combo: QComboBox,
         current_value: str | None,
+        accepted_fault_types: tuple[str, ...] | None = None,
     ) -> None:
         current = str(current_value or "").strip()
         combo.blockSignals(True)
         combo.clear()
-        for label, value in self._fault_type_options(current):
+        for label, value in self._fault_type_options(
+            current,
+            accepted_fault_types,
+        ):
             combo.addItem(label, value)
         target_index = combo.findData(current) if current else 0
         combo.setCurrentIndex(target_index if target_index >= 0 else 0)
         combo.setProperty("last_committed_index", combo.currentIndex())
         combo.blockSignals(False)
+
+    @staticmethod
+    def _record_accepted_fault_types(record) -> tuple[str, ...]:
+        values = getattr(record, "accepted_fault_types", ())
+        if not isinstance(values, tuple):
+            return ()
+        return DataManagementModule._normalized_fault_type_names(values)
 
     @staticmethod
     def _record_fault_type_selection(record) -> str:
@@ -1359,11 +1514,15 @@ class DataManagementModule(QWidget):
             return
 
         self._refresh_fault_type_options_cache()
-        choices = [
-            (label, value)
-            for label, value in self._fault_type_options()
-            if value
-        ]
+        try:
+            choices = self._fault_type_choices_for_selected_runs(run_ids)
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                "读取故障类型失败",
+                f"读取已选记录可用故障类型失败：{exc}",
+            )
+            return
         if not choices:
             QMessageBox.warning(self, "提示", "没有可用的故障类型")
             return

@@ -453,7 +453,7 @@ class _MalfunctionTypeManageDialog(QDialog):
             QMessageBox.warning(self, "提示", "请先选择一条故障类型。")
             return
         if is_builtin_malfunction_type_id(type_id):
-            QMessageBox.warning(self, "提示", "系统默认“良品/不良”类型不能删除。")
+            QMessageBox.warning(self, "提示", "系统默认“不良”类型不能删除。")
             return
         if (
             QMessageBox.question(self, "确认删除", "确定删除选中的故障类型吗？")

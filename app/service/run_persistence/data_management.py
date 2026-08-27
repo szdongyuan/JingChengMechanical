@@ -5,12 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+import json
 from math import ceil
 from pathlib import Path
 
-from app.service.fault_types import normalize_fault_type_name
+from app.service.fault_types import normalize_fault_type_name, normalize_fault_types
 from app.service.run_persistence.analysis_result_artifact import (
     AnalysisResultArtifactStore,
+)
+from app.service.run_persistence.analysis_envelope import (
+    AnalysisEnvelopeError,
+    decode_analysis_envelope,
 )
 from app.service.run_persistence.contracts import (
     ContractValidationError,
@@ -125,6 +130,7 @@ class RunManagementRow:
     manual_judgment_revision: int | None
     terminal_code: str | None
     terminal_at: str | None
+    accepted_fault_types: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         validate_uuid4(_require_exact_string(self.run_id, "run_id"))
@@ -155,6 +161,47 @@ class RunManagementRow:
         )
         if self.terminal_at is not None:
             validate_utc_timestamp(self.terminal_at)
+        if type(self.accepted_fault_types) is not tuple:
+            raise ContractValidationError(
+                "accepted_fault_types must be a tuple of exact strings"
+            )
+        try:
+            normalized_fault_types = tuple(
+                normalize_fault_types(self.accepted_fault_types)
+            )
+        except ValueError as exc:
+            raise ContractValidationError(
+                f"accepted_fault_types is invalid: {exc}"
+            ) from None
+        if normalized_fault_types != self.accepted_fault_types:
+            raise ContractValidationError(
+                "accepted_fault_types must be normalized"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class RunFaultTypeOptions:
+    run_id: str
+    accepted_fault_types: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        validate_uuid4(_require_exact_string(self.run_id, "run_id"))
+        if type(self.accepted_fault_types) is not tuple:
+            raise ContractValidationError(
+                "accepted_fault_types must be a tuple of exact strings"
+            )
+        try:
+            normalized_fault_types = tuple(
+                normalize_fault_types(self.accepted_fault_types)
+            )
+        except ValueError as exc:
+            raise ContractValidationError(
+                f"accepted_fault_types is invalid: {exc}"
+            ) from None
+        if normalized_fault_types != self.accepted_fault_types:
+            raise ContractValidationError(
+                "accepted_fault_types must be normalized"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -282,8 +329,52 @@ _ROW_COLUMNS = f"""
     r.fault_type,
     r.manual_judgment_revision,
     r.terminal_code,
-    r.terminal_at
+    r.terminal_at,
+    r.config_snapshot_json
 """
+
+
+def _accepted_fault_types_from_config_snapshot(value: object) -> tuple[str, ...]:
+    if type(value) is not str:
+        return ()
+    try:
+        envelope = decode_analysis_envelope(value)
+    except AnalysisEnvelopeError:
+        pass
+    else:
+        try:
+            return tuple(normalize_fault_types(envelope.config["fault_types"]))
+        except (KeyError, TypeError, ValueError):
+            return ()
+
+    try:
+        root = json.loads(value)
+    except (TypeError, json.JSONDecodeError):
+        return ()
+    if type(root) is not dict:
+        return ()
+    raw_fault_types = None
+    config = root.get("config")
+    if type(config) is dict and "fault_types" in config:
+        raw_fault_types = config["fault_types"]
+    elif "fault_types" in root:
+        raw_fault_types = root["fault_types"]
+    if raw_fault_types is None:
+        return ()
+    try:
+        return tuple(normalize_fault_types(raw_fault_types))
+    except ValueError:
+        return ()
+
+
+def _validate_run_id_selection(run_ids: object) -> tuple[str, ...]:
+    if type(run_ids) is not tuple:
+        raise ContractValidationError("run_ids must be a tuple")
+    selected: list[str] = []
+    for run_id in run_ids:
+        validate_uuid4(_require_exact_string(run_id, "run_id"))
+        selected.append(run_id)
+    return tuple(selected)
 
 
 def _escape_like_literal(value: str) -> str:
@@ -520,7 +611,11 @@ class RunDataManagementService:
         normalized_rows = []
         for row in raw_rows:
             values = list(row)
+            config_snapshot_json = values.pop()
             values[7] = None if values[7] is None else str(values[7])
+            values.append(
+                _accepted_fault_types_from_config_snapshot(config_snapshot_json)
+            )
             normalized_rows.append(RunManagementRow(*values))
         rows = tuple(normalized_rows)
         return RunManagementPage(
@@ -560,21 +655,62 @@ class RunDataManagementService:
             run_ids.append(run_id)
         return tuple(run_ids)
 
+    def fault_type_options_for_run_ids(
+        self,
+        run_ids: tuple[str, ...],
+    ) -> tuple[RunFaultTypeOptions, ...]:
+        selected_run_ids = _validate_run_id_selection(run_ids)
+        if not selected_run_ids:
+            return ()
+        placeholders = ",".join("?" for _run_id in selected_run_ids)
+        with self._runtime.operation() as database:
+            database.begin()
+            try:
+                raw_rows = database.execute_sql(
+                    f"""
+                    SELECT run_id, config_snapshot_json
+                    FROM run
+                    WHERE run_id IN ({placeholders})
+                    """,
+                    selected_run_ids,
+                ).fetchall()
+                database.commit()
+            except Exception:
+                database.rollback()
+                raise
+
+        accepted_by_run_id: dict[str, tuple[str, ...]] = {}
+        for row in raw_rows:
+            row_run_id = _require_exact_string(row[0], "run_id")
+            validate_uuid4(row_run_id)
+            accepted_by_run_id[row_run_id] = (
+                _accepted_fault_types_from_config_snapshot(row[1])
+            )
+        missing = [
+            run_id for run_id in selected_run_ids if run_id not in accepted_by_run_id
+        ]
+        if missing:
+            raise RuntimeError(f"selected run not found: {missing[0]}")
+        return tuple(
+            RunFaultTypeOptions(
+                run_id=run_id,
+                accepted_fault_types=accepted_by_run_id[run_id],
+            )
+            for run_id in selected_run_ids
+        )
+
     def update_fault_type(self, run_id: str, fault_type: str) -> bool:
         validate_uuid4(_require_exact_string(run_id, "run_id"))
         try:
             normalized_fault_type = normalize_fault_type_name(fault_type)
         except ValueError as exc:
             raise ContractValidationError(f"fault_type is invalid: {exc}") from None
-        is_good = normalized_fault_type == GOOD_MALFUNCTION_TYPE_NAME
-        judgment = "PASS" if is_good else "FAIL"
-        stored_fault_type = None if is_good else normalized_fault_type
         now = _utc_now()
 
         def update(database):
             row = database.execute_sql(
                 """
-                SELECT judgment
+                SELECT config_snapshot_json
                 FROM run
                 WHERE run_id = ? AND state <> 'ACTIVE'
                 """,
@@ -585,6 +721,26 @@ class RunDataManagementService:
                     DeleteRunStatus.NOT_FOUND,
                     "run not found or active",
                 )
+            accepted_fault_types = _accepted_fault_types_from_config_snapshot(row[0])
+            if normalized_fault_type == GOOD_MALFUNCTION_TYPE_NAME:
+                judgment = "PASS"
+                stored_fault_type = None
+            else:
+                judgment = "FAIL"
+                if accepted_fault_types:
+                    if normalized_fault_type not in accepted_fault_types:
+                        raise RuntimeError(
+                            f"故障类型「{normalized_fault_type}」"
+                            "不属于该记录冻结配置，不能修改"
+                        )
+                    stored_fault_type = normalized_fault_type
+                else:
+                    if normalized_fault_type != BAD_MALFUNCTION_TYPE_NAME:
+                        raise RuntimeError(
+                            f"故障类型「{normalized_fault_type}」"
+                            "不属于该记录冻结配置，不能修改"
+                        )
+                    stored_fault_type = None
             cursor = database.execute_sql(
                 """
                 UPDATE run

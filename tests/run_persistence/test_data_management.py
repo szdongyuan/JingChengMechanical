@@ -21,6 +21,7 @@ from app.service.run_persistence.data_management import (
     DeleteRunStatus,
     ManagementJudgment,
     RunDataManagementService,
+    RunFaultTypeOptions,
     RunManagementPage,
     RunManagementQuery,
     RunManagementRow,
@@ -66,12 +67,16 @@ def _insert_run(
     judgment_source: str = "AUTOMATIC",
     ingress_kind: str = "CAPTURED",
     imported_source_path: str | None = None,
+    fault_types: tuple[str, ...] = (),
 ) -> str:
     assigned = str(uuid4()) if run_id is None else run_id
     if workorder is None:
         workorder = {}
     config_snapshot_json = json.dumps(
-        {"workorder": workorder},
+        {
+            "workorder": workorder,
+            "config": {"fault_types": list(fault_types)},
+        },
         ensure_ascii=False,
         separators=(",", ":"),
     )
@@ -136,9 +141,28 @@ def _row(**overrides: object) -> RunManagementRow:
         "manual_judgment_revision": None,
         "terminal_code": "DONE",
         "terminal_at": TERMINAL_AT,
+        "accepted_fault_types": (),
     }
     values.update(overrides)
     return RunManagementRow(**values)
+
+
+def _run_judgment(
+    runtime: RunPersistenceDatabase,
+    run_id: str,
+) -> tuple[str | None, str | None, str | None, int | None]:
+    with runtime.operation() as database:
+        row = database.execute_sql(
+            """
+            SELECT judgment, judgment_source, fault_type,
+                   manual_judgment_revision
+            FROM run
+            WHERE run_id = ?
+            """,
+            (run_id,),
+        ).fetchone()
+    assert row is not None
+    return tuple(row)
 
 
 def test_query_contracts_are_frozen_slotted_and_validate_exact_values() -> None:
@@ -348,6 +372,82 @@ def test_query_projects_trimmed_sn_model_fallbacks_and_safe_invalid_json(
     assert projected[fallback] == ("SN-CODE", "MODEL-FALLBACK")
     assert projected[invalid] == ("", "")
     assert projected[scalar] == ("", "")
+
+
+def test_query_exposes_frozen_fault_type_options(
+    prepared_database_path: Path,
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+    run_id = _insert_run(runtime, fault_types=("不良", "针响"))
+    service = RunDataManagementService(runtime)
+
+    page = service.query_page(_query())
+    options = service.fault_type_options_for_run_ids((run_id,))
+
+    assert page.rows[0].accepted_fault_types == ("不良", "针响")
+    assert options == (
+        RunFaultTypeOptions(
+            run_id=run_id,
+            accepted_fault_types=("不良", "针响"),
+        ),
+    )
+
+
+def test_update_fault_type_accepts_only_frozen_values(
+    prepared_database_path: Path,
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+    run_id = _insert_run(
+        runtime,
+        judgment="FAIL",
+        fault_types=("不良", "针响"),
+    )
+    service = RunDataManagementService(runtime)
+
+    service.update_fault_type(run_id, "针响")
+    assert _run_judgment(runtime, run_id) == (
+        "FAIL",
+        "MANUAL",
+        "针响",
+        1,
+    )
+
+    with pytest.raises(RuntimeError, match="冻结配置"):
+        service.update_fault_type(run_id, "轴真圆度音")
+
+    assert _run_judgment(runtime, run_id) == (
+        "FAIL",
+        "MANUAL",
+        "针响",
+        1,
+    )
+
+
+def test_update_fault_type_keeps_good_virtual_and_empty_config_generic_bad(
+    prepared_database_path: Path,
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+    run_id = _insert_run(runtime, judgment="FAIL", fault_types=())
+    service = RunDataManagementService(runtime)
+
+    service.update_fault_type(run_id, "不良")
+    assert _run_judgment(runtime, run_id) == (
+        "FAIL",
+        "MANUAL",
+        None,
+        1,
+    )
+
+    service.update_fault_type(run_id, "良品")
+    assert _run_judgment(runtime, run_id) == (
+        "PASS",
+        "MANUAL",
+        None,
+        2,
+    )
+
+    with pytest.raises(RuntimeError, match="冻结配置"):
+        service.update_fault_type(run_id, "针响")
 
 
 def test_query_treats_sn_wildcards_literally_and_model_as_nocase_exact(

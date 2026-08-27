@@ -3,12 +3,11 @@ from peewee import AutoField, TextField
 from model.base_mode import BaseModel
 
 
+GOOD_MALFUNCTION_TYPE_NAME = "良品"
+BAD_MALFUNCTION_TYPE_NAME = "不良"
 BUILTIN_MALFUNCTION_TYPES = (
-    (1, "OK", "良品"),
-    (2, "NG", "不良"),
+    (2, "NG", BAD_MALFUNCTION_TYPE_NAME),
 )
-GOOD_MALFUNCTION_TYPE_NAME = BUILTIN_MALFUNCTION_TYPES[0][2]
-BAD_MALFUNCTION_TYPE_NAME = BUILTIN_MALFUNCTION_TYPES[1][2]
 BUILTIN_MALFUNCTION_TYPE_IDS = frozenset(
     type_id for type_id, _number, _name in BUILTIN_MALFUNCTION_TYPES
 )
@@ -33,7 +32,7 @@ class MalfunctionTypeTable(BaseModel):
 
 
 def ensure_builtin_malfunction_type() -> None:
-    """保证系统默认“良品/不良”固定在 id=1/2。"""
+    """保证系统默认“不良”固定在故障类型表中。"""
 
     database = MalfunctionTypeTable._meta.database
     with database.atomic():
