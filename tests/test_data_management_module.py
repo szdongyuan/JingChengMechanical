@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import os
+from threading import Event
+import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -42,6 +44,7 @@ from ui.modules.data_management import DataManagementModule
 
 RUN_A = "11111111-1111-4111-8111-111111111111"
 RUN_B = "22222222-2222-4222-8222-222222222222"
+RUN_C = "33333333-3333-4333-8333-333333333333"
 
 
 def _row(
@@ -169,6 +172,31 @@ def _module(qapp, archive_service=MagicMock()):
 def _select_all_rows(module: DataManagementModule) -> None:
     for row_index in range(module.table.rowCount()):
         module.table.item(row_index, 0).setCheckState(Qt.CheckState.Checked)
+
+
+def _visible_checked_run_ids(module: DataManagementModule) -> set[str]:
+    checked = set()
+    for row_index in range(module.table.rowCount()):
+        selector = module.table.item(row_index, 0)
+        if selector.checkState() == Qt.CheckState.Checked:
+            checked.add(str(selector.data(Qt.ItemDataRole.UserRole)))
+    return checked
+
+
+def _wait_for_operation_idle(
+    module: DataManagementModule,
+    *,
+    timeout_seconds: float = 5.0,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while (
+        module._operation_active or module._export_worker is not None
+    ) and time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.01)
+    QApplication.processEvents()
+    assert module._operation_active is False
+    assert module._export_worker is None
 
 
 def test_playback_uses_full_uuid_first_frozen_channel_and_full_duration(qapp):
@@ -317,6 +345,7 @@ def test_page_projects_sn_model_filters_paging_and_destructive_controls(qapp):
     assert module.btn_previous.text() == "上一页"
     assert module.btn_next.text() == "下一页"
     assert module.lb_page.text() == "第 1/1 页，共 2 条"
+    assert module.btn_select_page.text() == "选当前页"
     assert module.btn_batch_fault_type.text() == "批量修改故障类型"
     assert module.btn_batch_delete.text() == "批量删除"
     assert isinstance(
@@ -343,9 +372,48 @@ def test_page_projects_sn_model_filters_paging_and_destructive_controls(qapp):
         module.btn_refresh,
         module.btn_statistics_report,
         module.btn_select_all,
+        module.btn_select_page,
         module.btn_export,
     ):
         assert control.isEnabled()
+
+
+def test_select_current_page_toggles_only_visible_page(qapp):
+    module, management, _deleted = _module(qapp)
+
+    module.btn_select_page.click()
+
+    assert module._selected_run_id_set == {RUN_A, RUN_B}
+    assert _visible_checked_run_ids(module) == {RUN_A, RUN_B}
+    assert module.btn_select_page.text() == "取消当前页"
+
+    management.next_page = _page(
+        (_row(RUN_C, sn="SN-003"),),
+        page=2,
+        total_count=51,
+        total_pages=2,
+    )
+    assert module._request_and_render(2)
+
+    assert module._selected_run_id_set == {RUN_A, RUN_B}
+    assert _visible_checked_run_ids(module) == set()
+    assert module.lb_selected.text() == "已选 2 条"
+    assert module.btn_select_page.text() == "选当前页"
+    assert not module.btn_select_all.isChecked()
+
+    module.btn_select_page.click()
+
+    assert module._selected_run_id_set == {RUN_A, RUN_B, RUN_C}
+    assert _visible_checked_run_ids(module) == {RUN_C}
+    assert module.btn_select_page.text() == "取消当前页"
+    assert not module.btn_select_all.isChecked()
+
+    module.btn_select_page.click()
+
+    assert module._selected_run_id_set == {RUN_A, RUN_B}
+    assert _visible_checked_run_ids(module) == set()
+    assert module.btn_select_page.text() == "选当前页"
+    assert not module.btn_select_all.isChecked()
 
 
 def test_fault_type_options_are_cached_on_show_and_reused_by_combos(
@@ -662,19 +730,14 @@ def test_export_uses_shared_operation_gate_and_archive_service(
     tmp_path,
 ):
     chosen = tmp_path / "operator-choice.zip"
-    holder = {}
+    calls = []
 
     class ArchiveService:
         def export(self, run_ids, target_path):
-            module = holder["module"]
-            assert module._operation_active is True
-            assert all(not control.isEnabled() for control in module._operation_controls())
-            assert run_ids == (RUN_A, RUN_B)
-            assert target_path == str(chosen)
+            calls.append((run_ids, target_path))
             return target_path
 
     module, _management, _deleted = _module(qapp, ArchiveService())
-    holder["module"] = module
     _select_all_rows(module)
     monkeypatch.setattr(
         QFileDialog,
@@ -685,8 +748,71 @@ def test_export_uses_shared_operation_gate_and_archive_service(
 
     module._export_selected_rows()
 
+    assert module._operation_active is True
+    assert all(not control.isEnabled() for control in module._operation_controls())
+    _wait_for_operation_idle(module)
+
+    assert len(calls) == 1
+    assert set(calls[0][0]) == {RUN_A, RUN_B}
+    assert calls[0][1] == str(chosen)
     assert module._operation_active is False
     assert module.btn_refresh.isEnabled()
+    module.services.audio_data_service.export_zip.assert_not_called()
+
+
+def test_export_cancel_restores_controls_and_reports_canceled(
+    qapp,
+    monkeypatch,
+    tmp_path,
+):
+    chosen = tmp_path / "operator-choice.zip"
+    progress_seen = Event()
+    continue_export = Event()
+    calls = []
+    messages = []
+    warnings = []
+
+    class ArchiveService:
+        def export(self, run_ids, target_path, *, progress_callback=None):
+            calls.append((run_ids, target_path))
+            assert progress_callback is not None
+            progress_callback(0, 2, "正在导出运行记录...")
+            progress_seen.set()
+            assert continue_export.wait(2)
+            progress_callback(1, 2, "正在写入压缩包 1/2...")
+            return target_path
+
+    module, _management, _deleted = _module(qapp, ArchiveService())
+    _select_all_rows(module)
+    monkeypatch.setattr(
+        QFileDialog,
+        "getSaveFileName",
+        lambda *args, **kwargs: (str(chosen), "Zip files (*.zip)"),
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda *args: messages.append(args),
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module._export_selected_rows()
+    assert progress_seen.wait(2)
+    QApplication.processEvents()
+
+    module._cancel_export()
+    continue_export.set()
+    _wait_for_operation_idle(module)
+
+    assert len(calls) == 1
+    assert module.btn_refresh.isEnabled()
+    assert warnings == []
+    assert messages
+    assert messages[0][1] == "导出已取消"
     module.services.audio_data_service.export_zip.assert_not_called()
 
 

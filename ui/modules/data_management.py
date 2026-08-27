@@ -1,11 +1,21 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from inspect import Parameter, signature
 import os
+from threading import Event
 
-from PyQt6.QtCore import QDateTime, QSize, QSignalBlocker, Qt, QTimer
+from PyQt6.QtCore import (
+    QDateTime,
+    QSize,
+    QSignalBlocker,
+    Qt,
+    QThread,
+    QTimer,
+    pyqtSignal,
+)
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -53,6 +63,54 @@ from ui.popups.run_audio_replay_dialog import RunAudioReplayDialog
 
 
 _BEIJING_TIMEZONE = timezone(timedelta(hours=8))
+
+
+class _ExportCanceledError(RuntimeError):
+    pass
+
+
+class _ExportWorker(QThread):
+    progress_changed = pyqtSignal(int, int, str)
+    succeeded = pyqtSignal(str)
+    failed = pyqtSignal(str)
+    canceled = pyqtSignal()
+
+    def __init__(
+        self,
+        export_runner: Callable[[Callable[[int, int, str], None]], str],
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._export_runner = export_runner
+        self._cancel_requested = Event()
+
+    def request_cancel(self) -> None:
+        self._cancel_requested.set()
+
+    def run(self) -> None:
+        try:
+            self._raise_if_cancel_requested()
+            resolved_target = self._export_runner(self._emit_progress)
+            self._raise_if_cancel_requested()
+        except _ExportCanceledError:
+            self.canceled.emit()
+            return
+        except Exception as exc:
+            if self._cancel_requested.is_set():
+                self.canceled.emit()
+                return
+            self.failed.emit(str(exc))
+            return
+        self.succeeded.emit(resolved_target)
+
+    def _emit_progress(self, completed: int, total: int, message: str) -> None:
+        self._raise_if_cancel_requested()
+        self.progress_changed.emit(completed, total, message)
+        self._raise_if_cancel_requested()
+
+    def _raise_if_cancel_requested(self) -> None:
+        if self._cancel_requested.is_set():
+            raise _ExportCanceledError("export canceled")
 
 
 class _CachedFaultTypeCombo(QComboBox):
@@ -114,6 +172,8 @@ class DataManagementModule(QWidget):
             tuple[Qt.ItemFlag, ...],
             tuple[bool, ...],
         ] | None = None
+        self._export_worker: _ExportWorker | None = None
+        self._export_progress: QProgressDialog | None = None
         self._report_dialog = None
         self._replay_dialogs: dict[str, RunAudioReplayDialog] = {}
         self._initial_column_widths_applied = False
@@ -140,6 +200,8 @@ class DataManagementModule(QWidget):
         self.btn_statistics_report = QPushButton("统计报告")
         self.btn_select_all = QPushButton("全选")
         self.btn_select_all.setCheckable(True)
+        self.btn_select_page = QPushButton("选当前页")
+        self.btn_select_page.setCheckable(True)
         self.btn_export = QPushButton("导出")
         self.btn_batch_fault_type = QPushButton("批量修改故障类型")
         self.btn_batch_delete = QPushButton("批量删除")
@@ -148,6 +210,7 @@ class DataManagementModule(QWidget):
         toolbar_layout.addWidget(self.btn_refresh)
         toolbar_layout.addWidget(self.btn_statistics_report)
         toolbar_layout.addWidget(self.btn_select_all)
+        toolbar_layout.addWidget(self.btn_select_page)
         toolbar_layout.addWidget(self.btn_export)
         toolbar_layout.addWidget(self.btn_batch_fault_type)
         toolbar_layout.addWidget(self.btn_batch_delete)
@@ -239,6 +302,7 @@ class DataManagementModule(QWidget):
         self.btn_refresh.clicked.connect(self.refresh_table)
         self.btn_statistics_report.clicked.connect(self._show_statistics_report)
         self.btn_select_all.clicked.connect(self._toggle_select_all)
+        self.btn_select_page.clicked.connect(self._toggle_select_current_page)
         self.btn_export.clicked.connect(self._export_selected_rows)
         self.btn_batch_fault_type.clicked.connect(
             self._batch_update_fault_type
@@ -958,6 +1022,20 @@ class DataManagementModule(QWidget):
         self._sync_visible_selection()
         self._update_selected_count()
 
+    def _toggle_select_current_page(self, checked: bool) -> None:
+        if self._operation_active:
+            return
+        run_ids = self._current_page_run_ids()
+        if checked:
+            self._selected_run_id_set.update(run_ids)
+        else:
+            self._selected_run_id_set.difference_update(run_ids)
+        self._sync_visible_selection()
+        self._update_selected_count()
+
+    def _current_page_run_ids(self) -> tuple[str, ...]:
+        return tuple(str(record.run_id) for record in self._records)
+
     def _sync_visible_selection(self) -> None:
         self.table.blockSignals(True)
         try:
@@ -985,21 +1063,48 @@ class DataManagementModule(QWidget):
             self._update_selected_count()
 
     def _selected_run_ids(self) -> tuple[str, ...]:
-        return tuple(self._selected_run_id_set)
+        ordered: list[str] = []
+        seen: set[str] = set()
+        for row_index in range(self.table.rowCount()):
+            item = self.table.item(row_index, 1)
+            if item is None:
+                continue
+            run_id = item.data(Qt.ItemDataRole.UserRole)
+            if run_id is None:
+                run_id = item.text()
+            run_id = str(run_id)
+            if run_id in self._selected_run_id_set and run_id not in seen:
+                ordered.append(run_id)
+                seen.add(run_id)
+
+        for run_id in sorted(self._selected_run_id_set - seen):
+            ordered.append(run_id)
+        return tuple(ordered)
 
     def _update_selected_count(self) -> None:
         selected_count = len(self._selected_run_id_set)
         total_count = self._total_count
         all_selected = total_count > 0 and selected_count == total_count
+        current_page_run_ids = self._current_page_run_ids()
+        page_selected = bool(current_page_run_ids) and all(
+            run_id in self._selected_run_id_set
+            for run_id in current_page_run_ids
+        )
         self.lb_selected.setText(f"已选 {selected_count} 条")
         self.btn_select_all.blockSignals(True)
+        self.btn_select_page.blockSignals(True)
         try:
             self.btn_select_all.setChecked(all_selected)
             self.btn_select_all.setText(
                 "取消全选" if all_selected else "全选"
             )
+            self.btn_select_page.setChecked(page_selected)
+            self.btn_select_page.setText(
+                "取消当前页" if page_selected else "选当前页"
+            )
         finally:
             self.btn_select_all.blockSignals(False)
+            self.btn_select_page.blockSignals(False)
 
     def _export_selected_rows(self) -> None:
         if self._operation_active:
@@ -1037,32 +1142,61 @@ class DataManagementModule(QWidget):
         self._set_operation_active(True)
         progress.show()
         QApplication.processEvents()
-        resolved_target = None
-        error_message = None
-        try:
-            resolved_target = self._export_archive(
-                run_ids,
-                target_path,
-                update_progress,
-            )
-        except Exception as exc:
-            error_message = str(exc)
-        finally:
-            progress.close()
-            self._set_operation_active(False)
 
-        if error_message is None:
-            QMessageBox.information(
-                self,
-                "导出完成",
-                f"已导出 {len(run_ids)} 条运行记录到：\n{resolved_target}",
-            )
-        else:
-            QMessageBox.warning(
-                self,
-                "导出失败",
-                f"导出失败：{error_message}",
-            )
+        export = self.services.run_archive_service.export
+
+        def run_export(progress_callback) -> str:
+            if self._callable_accepts_progress_callback(export):
+                return self.services.run_archive_service.export(
+                    run_ids,
+                    target_path,
+                    progress_callback=progress_callback,
+                )
+            progress_callback(0, 0, "正在导出运行记录...")
+            return export(run_ids, target_path)
+
+        self._export_progress = progress
+        worker = _ExportWorker(run_export, self)
+        self._export_worker = worker
+        progress.canceled.connect(self._cancel_export)
+        worker.progress_changed.connect(
+            update_progress,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        worker.succeeded.connect(
+            lambda resolved_target: self._finish_export(
+                len(run_ids),
+                resolved_target,
+                None,
+            ),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        worker.failed.connect(
+            lambda error_message: self._finish_export(
+                len(run_ids),
+                None,
+                error_message,
+            ),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        worker.canceled.connect(
+            lambda: self._finish_export(
+                len(run_ids),
+                None,
+                None,
+                canceled=True,
+            ),
+            Qt.ConnectionType.QueuedConnection,
+        )
+        worker.finished.connect(
+            self._clear_export_worker,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        worker.finished.connect(
+            worker.deleteLater,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        worker.start()
 
     def _prepare_export_run_ids(
         self,
@@ -1137,14 +1271,13 @@ class DataManagementModule(QWidget):
     def _export_progress_dialog(self, run_count: int) -> QProgressDialog:
         progress = QProgressDialog(
             f"正在准备导出 {run_count} 条记录...",
-            None,
+            "取消",
             0,
             100,
             self,
         )
         progress.setWindowTitle("导出进度")
         progress.setWindowModality(Qt.WindowModality.WindowModal)
-        progress.setCancelButton(None)
         progress.setMinimumDuration(0)
         progress.setAutoClose(False)
         progress.setAutoReset(False)
@@ -1152,21 +1285,53 @@ class DataManagementModule(QWidget):
         progress.setValue(0)
         return progress
 
-    def _export_archive(
+    def _finish_export(
         self,
-        run_ids: tuple[str, ...],
-        target_path: str,
-        progress_callback,
-    ) -> str:
-        export = self.services.run_archive_service.export
-        if self._callable_accepts_progress_callback(export):
-            return export(
-                run_ids,
-                target_path,
-                progress_callback=progress_callback,
+        run_count: int,
+        resolved_target: str | None,
+        error_message: str | None,
+        *,
+        canceled: bool = False,
+    ) -> None:
+        progress = self._export_progress
+        self._export_progress = None
+        if progress is not None:
+            progress.close()
+        self._set_operation_active(False)
+
+        if canceled:
+            QMessageBox.information(
+                self,
+                "导出已取消",
+                f"已取消导出 {run_count} 条运行记录",
             )
-        progress_callback(0, 0, "正在导出运行记录...")
-        return export(run_ids, target_path)
+            return
+
+        if error_message is None:
+            QMessageBox.information(
+                self,
+                "导出完成",
+                f"已导出 {run_count} 条运行记录到：\n{resolved_target}",
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "导出失败",
+                f"导出失败：{error_message}",
+            )
+
+    def _cancel_export(self) -> None:
+        worker = self._export_worker
+        if worker is not None:
+            worker.request_cancel()
+        progress = self._export_progress
+        if progress is not None:
+            progress.setLabelText("正在取消导出...")
+            progress.setRange(0, 0)
+            progress.setCancelButton(None)
+
+    def _clear_export_worker(self) -> None:
+        self._export_worker = None
 
     @staticmethod
     def _callable_accepts_progress_callback(function) -> bool:
@@ -1443,6 +1608,7 @@ class DataManagementModule(QWidget):
             self.btn_previous,
             self.btn_next,
             self.btn_select_all,
+            self.btn_select_page,
             self.btn_export,
             self.btn_batch_fault_type,
             self.btn_batch_delete,

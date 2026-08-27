@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import time
 from unittest.mock import MagicMock
 import wave
 from zipfile import ZipFile
@@ -110,6 +111,22 @@ def _patch_service_container_dependencies(monkeypatch) -> MagicMock:
     return legacy_export
 
 
+def _wait_for_operation_idle(
+    module: DataManagementModule,
+    *,
+    timeout_seconds: float = 5.0,
+) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while (
+        module._operation_active or module._export_worker is not None
+    ) and time.monotonic() < deadline:
+        QApplication.processEvents()
+        time.sleep(0.01)
+    QApplication.processEvents()
+    assert module._operation_active is False
+    assert module._export_worker is None
+
+
 def test_data_management_exports_selected_terminal_runs_through_service_container(
     monkeypatch,
     prepared_database_path,
@@ -193,6 +210,7 @@ def test_data_management_exports_selected_terminal_runs_through_service_containe
     )
 
     module._export_selected_rows()
+    _wait_for_operation_idle(module)
 
     target = chosen.with_suffix(".zip")
     assert target.is_file()
@@ -341,6 +359,7 @@ def test_data_management_can_skip_bad_selected_runs_during_export(
     )
 
     module._export_selected_rows()
+    _wait_for_operation_idle(module)
 
     target = chosen.with_suffix(".zip")
     assert target.is_file()
