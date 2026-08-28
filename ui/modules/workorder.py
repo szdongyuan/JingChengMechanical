@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from PyQt6.QtWidgets import QGridLayout, QHBoxLayout, QLabel, QLineEdit, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QGridLayout, QLabel, QLineEdit, QVBoxLayout, QWidget
 
 from app.services_container import FactoryControllerState
 from model.plc_table import PlcTable
@@ -29,6 +29,8 @@ class WorkOrderModule(QWidget):
         self._last_workorder_payload: dict | None = None
         self._plc_sn_values: dict[int, str] = {}
         self._plc_sn_edits: dict[int, QLineEdit] = {}
+        self._plc_model_values: dict[int, str] = {}
+        self._plc_model_edits: dict[int, QLineEdit] = {}
         self._rendered_plc_ids: tuple[int, ...] = ()
 
         layout = QVBoxLayout(self)
@@ -142,10 +144,12 @@ class WorkOrderModule(QWidget):
 
     def _on_plc_workorder_changed(self, payload: dict) -> None:
         sn = str(payload.get("sn") or "").strip()
+        model = str(payload.get("model") or "").strip()
         plc_id = self._payload_plc_id(payload)
         if plc_id is None:
             return
         self._plc_sn_values[plc_id] = sn
+        self._plc_model_values[plc_id] = model
         self._refresh_plc_sn_rows()
         for other_edit in self._plc_sn_edits.values():
             other_edit.setStyleSheet("")
@@ -290,6 +294,8 @@ class WorkOrderModule(QWidget):
             self._rebuild_plc_sn_rows(plc_ids)
         for plc_id, edit in self._plc_sn_edits.items():
             edit.setText(self._plc_sn_values.get(plc_id, ""))
+        for plc_id, edit in self._plc_model_edits.items():
+            edit.setText(self._plc_model_values.get(plc_id, ""))
 
     def _plc_ids_for_display(self) -> tuple[int, ...]:
         plc_ids = self._known_plc_ids()
@@ -297,6 +303,11 @@ class WorkOrderModule(QWidget):
             self._plc_sn_values = {
                 plc_id: sn
                 for plc_id, sn in self._plc_sn_values.items()
+                if plc_id in plc_ids
+            }
+            self._plc_model_values = {
+                plc_id: model
+                for plc_id, model in self._plc_model_values.items()
                 if plc_id in plc_ids
             }
             return tuple(sorted(plc_ids))
@@ -334,6 +345,7 @@ class WorkOrderModule(QWidget):
                 widget.deleteLater()
 
         self._plc_sn_edits = {}
+        self._plc_model_edits = {}
         self._rendered_plc_ids = tuple(plc_ids)
         if not plc_ids:
             empty_label = QLabel("未配置 PLC")
@@ -343,24 +355,37 @@ class WorkOrderModule(QWidget):
 
         for index, plc_id in enumerate(plc_ids):
             row_widget = QWidget()
-            row_layout = QHBoxLayout(row_widget)
+            row_layout = QGridLayout(row_widget)
             row_layout.setContentsMargins(0, 1, 2, 1)
             row_layout.setSpacing(6)
 
-            label = QLabel(f"PLC{plc_id} SN码")
-            label.setFixedWidth(72)
+            sn_label = QLabel(f"PLC{plc_id} SN码")
+            sn_label.setFixedWidth(72)
+            model_label = QLabel(f"PLC{plc_id} 型号")
+            model_label.setFixedWidth(72)
 
-            edit = QLineEdit()
-            edit.setReadOnly(True)
-            edit.setPlaceholderText("未读取")
-            edit.setMinimumWidth(0)
-            edit.setMinimumHeight(28)
-            edit.setMaximumHeight(30)
+            sn_edit = QLineEdit()
+            sn_edit.setReadOnly(True)
+            sn_edit.setPlaceholderText("未读取")
+            sn_edit.setMinimumWidth(0)
+            sn_edit.setMinimumHeight(28)
+            sn_edit.setMaximumHeight(30)
 
-            row_layout.addWidget(label)
-            row_layout.addWidget(edit, 1)
+            model_edit = QLineEdit()
+            model_edit.setReadOnly(True)
+            model_edit.setPlaceholderText("未读取")
+            model_edit.setMinimumWidth(0)
+            model_edit.setMinimumHeight(28)
+            model_edit.setMaximumHeight(30)
+
+            row_layout.addWidget(sn_label, 0, 0)
+            row_layout.addWidget(sn_edit, 0, 1)
+            row_layout.addWidget(model_label, 1, 0)
+            row_layout.addWidget(model_edit, 1, 1)
+            row_layout.setColumnStretch(1, 1)
             self.plc_sn_layout.addWidget(row_widget, index // 2, index % 2)
-            self._plc_sn_edits[plc_id] = edit
+            self._plc_sn_edits[plc_id] = sn_edit
+            self._plc_model_edits[plc_id] = model_edit
 
     def _available_config_ids(self) -> set[int]:
         return {
