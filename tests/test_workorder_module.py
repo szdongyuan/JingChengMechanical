@@ -591,7 +591,7 @@ def test_manual_judgment_reset_clears_sn_and_publishes_blank_payload(qapp, reaso
     assert services.bus.workorder_changed.emissions[-1][0][0]["sn"] == ""
 
 
-def test_plc_sn_display_follows_plc_add_delete_and_updates_by_plc_id(qapp):
+def test_plc_workorder_display_follows_plc_add_delete_and_updates_by_plc_id(qapp):
     module, services = _make_module(saved_selected_ids=(101,))
 
     first = PlcTable.create(plc_name="PLC A")
@@ -599,18 +599,32 @@ def test_plc_sn_display_follows_plc_add_delete_and_updates_by_plc_id(qapp):
     services.bus.plc_changed.emit()
 
     assert tuple(module._plc_sn_edits) == (first.id, second.id)
+    assert tuple(module._plc_model_edits) == (first.id, second.id)
 
     services.bus.plc_workorder_changed.emit(
-        {"plc_id": second.id, "sn": "SN-PLC-B"}
+        {
+            "plc_id": second.id,
+            "sn": "SN-PLC-B",
+            "model": "MODEL-B",
+        }
     )
 
     assert module._plc_sn_edits[first.id].text() == ""
+    assert module._plc_model_edits[first.id].text() == ""
     assert module._plc_sn_edits[second.id].text() == "SN-PLC-B"
+    assert module._plc_model_edits[second.id].text() == "MODEL-B"
     assert "#2563eb" in module._plc_sn_edits[second.id].styleSheet()
 
     services.bus.plc_workorder_changed.emit(
-        {"plc_id": first.id, "sn": "SN-PLC-A"}
+        {
+            "plc_id": first.id,
+            "sn": "SN-PLC-A",
+            "model": "MODEL-A",
+        }
     )
+    assert module._plc_model_edits[first.id].text() == "MODEL-A"
+    assert module._plc_sn_edits[second.id].text() == "SN-PLC-B"
+    assert module._plc_model_edits[second.id].text() == "MODEL-B"
     assert "#2563eb" in module._plc_sn_edits[first.id].styleSheet()
     assert module._plc_sn_edits[second.id].styleSheet() == ""
 
@@ -618,18 +632,40 @@ def test_plc_sn_display_follows_plc_add_delete_and_updates_by_plc_id(qapp):
     services.bus.plc_changed.emit()
 
     assert tuple(module._plc_sn_edits) == (first.id, second.id, third.id)
+    assert tuple(module._plc_model_edits) == (first.id, second.id, third.id)
     assert module.plc_sn_layout.itemAtPosition(0, 0).widget() is not None
     assert module.plc_sn_layout.itemAtPosition(0, 1).widget() is not None
     assert module.plc_sn_layout.itemAtPosition(1, 0).widget() is not None
     assert module.plc_sn_layout.itemAtPosition(1, 1) is None
-    first_row = module.plc_sn_layout.itemAtPosition(0, 0).widget()
-    first_row_labels = first_row.findChildren(QLabel)
-    assert first_row_labels[0].text() == f"PLC{first.id} SN码"
+    first_card = module.plc_sn_layout.itemAtPosition(0, 0).widget()
+    first_labels = [label.text() for label in first_card.findChildren(QLabel)]
+    assert first_labels == [f"PLC{first.id} SN码", f"PLC{first.id} 型号"]
+    assert first_card.isAncestorOf(module._plc_model_edits[first.id])
+    assert module._plc_model_edits[first.id].isReadOnly() is True
+    assert module._plc_model_edits[first.id].placeholderText() == "未读取"
 
     third.delete_instance()
     services.bus.plc_changed.emit()
 
     assert tuple(module._plc_sn_edits) == (first.id, second.id)
+    assert tuple(module._plc_model_edits) == (first.id, second.id)
+
+    services.bus.plc_workorder_changed.emit(
+        {"plc_id": first.id, "sn": "SN-PLC-A-2"}
+    )
+    assert module._plc_model_edits[first.id].text() == ""
+
+    first.delete_instance()
+    second.delete_instance()
+    services.bus.plc_changed.emit()
+
+    assert tuple(module._plc_sn_edits) == (first.id, second.id)
+    assert tuple(module._plc_model_edits) == (first.id, second.id)
+    assert module._plc_sn_edits[first.id].text() == "SN-PLC-A-2"
+    assert module._plc_model_edits[first.id].text() == ""
+    assert module._plc_sn_edits[second.id].text() == "SN-PLC-B"
+    assert module._plc_model_edits[second.id].text() == "MODEL-B"
+    assert hasattr(module, "ed_model") is False
 
 
 @pytest.mark.parametrize(

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import math
+import struct
 import time
 
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
 import snap7
 import snap7.util
+from snap7.error import S7Error
 
 from app.service.log_manager import LogManager
 
@@ -77,6 +80,7 @@ class PlcService(QObject):
         self._last_value = None
         self._reconnect_timer_ms = 0  # 重连计时器
         self._last_connect_error = ""
+        self._last_current_read_error = ""
 
     @pyqtSlot()
     def start_plc_service(self):
@@ -502,6 +506,8 @@ class PlcService(QObject):
         )
         if values.get("sn_code_offset"):
             payload["sn"] = values["sn_code_offset"]
+        if values.get("product_model_offset"):
+            payload["model"] = values["product_model_offset"]
         if values.get("rotation_speed_offset") is not None:
             payload["rotation_speed"] = values["rotation_speed_offset"]
         if self._plc_id is not None:
@@ -509,6 +515,47 @@ class PlcService(QObject):
             display_payload["plc_id"] = self._plc_id
             self.bus.plc_workorder_changed.emit(display_payload)
         return payload
+
+    def _report_current_read_error(self, exc: BaseException) -> None:
+        message = (
+            f"PLC {self._plc_id} 读取电流失败 "
+            f"(current_value_offset): {exc}"
+        )
+        if message == self._last_current_read_error:
+            return
+        self._last_current_read_error = message
+        self.bus.log.emit(message)
+        self.logger.error(message)
+
+    def _poll_current_value(self) -> None:
+        if self.plc_client is None:
+            return
+        offset = self._field_offsets_dict.get("current_value_offset")
+        if offset is None or not str(offset).strip():
+            return
+
+        sampled_monotonic = time.monotonic()
+        try:
+            raw_value = self.read_offset_value(offset, "real")
+        except (S7Error, struct.error) as exc:
+            self._report_current_read_error(exc)
+            return
+
+        try:
+            current_a = float(raw_value)
+        except (TypeError, ValueError) as exc:
+            self._report_current_read_error(exc)
+            return
+
+        if not math.isfinite(current_a):
+            return
+
+        self.bus.plc_current_sampled.emit(
+            int(self._plc_id),
+            sampled_monotonic,
+            current_a,
+        )
+        self._last_current_read_error = ""
 
     def poll_once(self):
         """
@@ -522,6 +569,8 @@ class PlcService(QObject):
         v = self._read_start_bit()
         if v is None:
             return
+
+        self._poll_current_value()
 
         if self._last_value is None:
             # 第一次读到值时只记录，不触发“开始”。
