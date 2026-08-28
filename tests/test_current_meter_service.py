@@ -4,6 +4,8 @@ import threading
 import time
 
 import pytest
+from PyQt6.QtCore import QCoreApplication
+from PyQt6.QtWidgets import QApplication
 
 from app.service.current_meter_service import (
     CurrentMeterCollector,
@@ -20,6 +22,9 @@ from app.service.current_meter_service import (
 )
 from app.service.run_persistence import CurrentTrace
 from app.services_container import EventBus
+
+
+_QT_APP: QCoreApplication | None = None
 
 
 class _ReadResult:
@@ -796,6 +801,41 @@ def test_plc_current_collector_filters_plc_id_and_accumulates_zero_value():
     collector.stop()
     bus.plc_current_sampled.emit(7, 10.5, 1.0)
     assert collector.samples() == [expected]
+
+
+def test_plc_current_collector_started_from_python_worker_delivers_sample():
+    global _QT_APP
+    app = QCoreApplication.instance()
+    if app is None:
+        _QT_APP = QApplication([])
+        app = _QT_APP
+    bus = EventBus()
+    collector = PlcCurrentCollector(
+        {"enabled": True, "source": "plc"},
+        bus=bus,
+        plc_id=7,
+        time_func=lambda: 10.0,
+    )
+    start_results = []
+    worker = threading.Thread(
+        target=lambda: start_results.append(collector.start()),
+        name="captured-start-dispatch-test",
+    )
+
+    worker.start()
+    worker.join(timeout=2.0)
+    try:
+        assert not worker.is_alive()
+        assert start_results == [True]
+
+        bus.plc_current_sampled.emit(7, 10.25, 1.5)
+        app.processEvents()
+
+        assert collector.samples() == [
+            CurrentSample(time_sec=0.25, current_a=1.5, monotonic_time=10.25)
+        ]
+    finally:
+        collector.stop()
 
 
 def test_plc_current_collector_uses_explicit_audio_time_origin():
