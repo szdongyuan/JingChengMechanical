@@ -213,6 +213,10 @@ def _analysis_process_main(
             pass
     finally:
         try:
+            executor.close()
+        except Exception:
+            pass
+        try:
             connection.close()
         except Exception:
             pass
