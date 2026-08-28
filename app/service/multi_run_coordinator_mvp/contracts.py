@@ -3,12 +3,13 @@ from __future__ import annotations
 import itertools
 import math
 import threading
+import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum, auto
 from pathlib import PurePath, PurePosixPath, PureWindowsPath
-from typing import Final, TypeAlias
+from typing import Callable, Final, TypeAlias
 
 from app.service.plc_result_sequencer import (
     PlcIngressTicket,
@@ -830,6 +831,158 @@ class CaptureReservation:
         _require_nonempty_text(self.reservation_id, "reservation_id")
         require_uuid4(self.run_id, "run_id")
         _require_nonempty_text(self.hardware_id, "hardware_id")
+
+
+@dataclass(frozen=True, slots=True, init=False, eq=False)
+class CaptureReserveClaim:
+    claim_id: str
+    run_id: str
+    hardware_id: str
+    trigger_monotonic_ns: int
+    deadline_monotonic_ns: int
+    _owner_nonce: object = field(repr=False)
+
+    def __new__(cls) -> CaptureReserveClaim:
+        raise TypeError("CaptureReserveClaim is issued only by its Resident port")
+
+
+def _issue_capture_reserve_claim(
+    *,
+    claim_id: str,
+    run_id: str,
+    hardware_id: str,
+    trigger_monotonic_ns: int,
+    deadline_monotonic_ns: int,
+    owner_nonce: object,
+) -> CaptureReserveClaim:
+    _require_nonempty_text(claim_id, "claim_id")
+    require_uuid4(run_id, "run_id")
+    _require_nonempty_text(hardware_id, "hardware_id")
+    if type(trigger_monotonic_ns) is not int or trigger_monotonic_ns <= 0:
+        raise ValueError("trigger_monotonic_ns must be a positive integer")
+    if type(deadline_monotonic_ns) is not int or deadline_monotonic_ns <= 0:
+        raise ValueError("deadline_monotonic_ns must be a positive integer")
+    if owner_nonce is None:
+        raise ValueError("owner_nonce must authenticate a Resident port")
+    claim = object.__new__(CaptureReserveClaim)
+    object.__setattr__(claim, "claim_id", claim_id)
+    object.__setattr__(claim, "run_id", run_id)
+    object.__setattr__(claim, "hardware_id", hardware_id)
+    object.__setattr__(claim, "trigger_monotonic_ns", trigger_monotonic_ns)
+    object.__setattr__(claim, "deadline_monotonic_ns", deadline_monotonic_ns)
+    object.__setattr__(claim, "_owner_nonce", owner_nonce)
+    return claim
+
+
+def _validate_capture_reserve_claim(
+    value: object,
+    *,
+    owner_nonce: object,
+) -> CaptureReserveClaim:
+    if type(value) is not CaptureReserveClaim:
+        raise ValueError("claim must be an exact CaptureReserveClaim")
+    try:
+        claim_id = value.claim_id
+        run_id = value.run_id
+        hardware_id = value.hardware_id
+        trigger_monotonic_ns = value.trigger_monotonic_ns
+        deadline_monotonic_ns = value.deadline_monotonic_ns
+        actual_owner = value._owner_nonce
+    except AttributeError:
+        raise ValueError("capture reserve claim is malformed") from None
+    _require_nonempty_text(claim_id, "claim_id")
+    require_uuid4(run_id, "run_id")
+    _require_nonempty_text(hardware_id, "hardware_id")
+    if type(trigger_monotonic_ns) is not int or trigger_monotonic_ns <= 0:
+        raise ValueError("capture reserve claim trigger is malformed")
+    if type(deadline_monotonic_ns) is not int or deadline_monotonic_ns <= 0:
+        raise ValueError("capture reserve claim deadline is malformed")
+    if actual_owner is not owner_nonce:
+        raise ValueError("capture reserve claim belongs to another Resident port")
+    return value
+
+
+@dataclass(frozen=True, slots=True, init=False, eq=False)
+class CaptureReserveWakeSignal:
+    claim_id: str
+    run_id: str
+    deadline_monotonic_ns: int
+    _owner_nonce: object = field(repr=False)
+    _wait: Callable[[float | None], object] = field(repr=False)
+    _cancelled: threading.Event = field(repr=False)
+
+    def __new__(cls) -> CaptureReserveWakeSignal:
+        raise TypeError(
+            "CaptureReserveWakeSignal is issued only by its Resident port"
+        )
+
+    def wait(self) -> None:
+        while not self._cancelled.is_set():
+            remaining_ns = self.deadline_monotonic_ns - time.monotonic_ns()
+            if remaining_ns <= 0:
+                return
+            outcome = self._wait(
+                min(remaining_ns / 1_000_000_000, 0.05)
+            )
+            if outcome is not None:
+                return
+
+    def _cancel(self) -> None:
+        self._cancelled.set()
+
+
+def _issue_capture_reserve_wake_signal(
+    *,
+    claim: CaptureReserveClaim,
+    owner_nonce: object,
+    wait: Callable[[float | None], object],
+) -> CaptureReserveWakeSignal:
+    if type(claim) is not CaptureReserveClaim:
+        raise ValueError("wake signal requires an exact CaptureReserveClaim")
+    if claim._owner_nonce is not owner_nonce:
+        raise ValueError("wake signal claim belongs to another Resident port")
+    if not callable(wait):
+        raise ValueError("wake signal wait must be callable")
+    signal = object.__new__(CaptureReserveWakeSignal)
+    object.__setattr__(signal, "claim_id", claim.claim_id)
+    object.__setattr__(signal, "run_id", claim.run_id)
+    object.__setattr__(
+        signal, "deadline_monotonic_ns", claim.deadline_monotonic_ns
+    )
+    object.__setattr__(signal, "_owner_nonce", owner_nonce)
+    object.__setattr__(signal, "_wait", wait)
+    object.__setattr__(signal, "_cancelled", threading.Event())
+    return signal
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureReservePending:
+    run_id: str
+    hardware_id: str
+    claim: CaptureReserveClaim
+    wake_signal: CaptureReserveWakeSignal
+
+    def __post_init__(self) -> None:
+        require_uuid4(self.run_id, "run_id")
+        _require_nonempty_text(self.hardware_id, "hardware_id")
+        if type(self.claim) is not CaptureReserveClaim:
+            raise ValueError("claim must be an exact CaptureReserveClaim")
+        if type(self.wake_signal) is not CaptureReserveWakeSignal:
+            raise ValueError(
+                "wake_signal must be an exact CaptureReserveWakeSignal"
+            )
+        if (
+            self.claim.run_id != self.run_id
+            or self.claim.hardware_id != self.hardware_id
+            or self.wake_signal.run_id != self.run_id
+            or self.wake_signal.claim_id != self.claim.claim_id
+            or self.wake_signal.deadline_monotonic_ns
+            != self.claim.deadline_monotonic_ns
+            or self.wake_signal._owner_nonce is not self.claim._owner_nonce
+        ):
+            raise ValueError(
+                "pending claim and wake signal identity must match its result"
+            )
 
 
 @dataclass(frozen=True, slots=True)

@@ -12,6 +12,7 @@ from app.service.analysis.resident_audio_mvp import pool as pool_module
 from app.service.analysis.resident_audio_mvp import ring as ring_module
 from app.service.analysis.resident_audio_mvp import stream as stream_module
 from app.service.analysis.resident_audio_mvp.contracts import (
+    FLOAT32_BYTES,
     MAX_ALLOCATABLE_FRAMES,
     MAX_BOUNDED_TEXT_CHARS,
     MAX_CAPTURE_BUFFER_BYTES,
@@ -921,11 +922,14 @@ def test_exact_ring_byte_boundary_is_accepted_without_real_large_allocation(
     )
     monkeypatch.setattr(stream_module, "_ResidentRing", SizingRing)
     channels = tuple(range(MAX_INPUT_CHANNELS))
+    exact_ring_frames = MAX_RING_BYTES_PER_STREAM // (
+        len(channels) * FLOAT32_BYTES
+    )
     spec = valid_spec(
         sample_rate_hz=1,
         input_channel_count=MAX_INPUT_CHANNELS,
         capture_channel_indices=channels,
-        frames_per_buffer=1_048_574,
+        frames_per_buffer=exact_ring_frames - 10,
     )
     backend = FakeBackend(
         clock=clock,
@@ -1391,7 +1395,7 @@ def test_start_return_without_first_block_does_not_mark_ready(
     assert len(handle.close_deadlines) == 1
 
 
-def test_first_valid_block_is_retained_before_ready(
+def test_first_valid_block_is_owned_by_ingress_at_ready_then_retained(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     clock = ManualMonotonicClock()
@@ -1404,6 +1408,10 @@ def test_first_valid_block_is_retained_before_ready(
     slot = opened.pool._slots["mic-1"]
 
     assert opened.streams[0].status is StreamOpenStatus.READY
+    assert slot.callback_sequence == 1
+    assert slot.callback_heartbeat_monotonic_ns is not None
+    assert slot._first_block_event.is_set()
+    assert slot._first_block_drained_event.wait(1)
     assert slot._ring.write_cursor == 480
     np.testing.assert_array_equal(
         slot._ring.read(0, 1),

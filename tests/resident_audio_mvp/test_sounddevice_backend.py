@@ -17,6 +17,7 @@ from app.service.analysis.resident_audio_mvp.contracts import (
 )
 from app.service.analysis.resident_audio_mvp.sounddevice_backend import (
     SoundDeviceAudioBackend,
+    _NativeLifecycleState,
 )
 
 
@@ -132,6 +133,7 @@ def test_create_is_local_and_start_uses_only_exact_frozen_resolution() -> None:
         "channels": 4,
         "dtype": "float32",
         "blocksize": 2_400,
+        "latency": "high",
     }
     assert module.native.calls == ["start"]
     assert not hasattr(module, "query_devices")
@@ -175,7 +177,12 @@ def test_native_callback_raises_library_stop_for_delegated_ok_stop() -> None:
         )
 
     assert faults == []
-    handle.close(time.monotonic_ns() + 1_000_000_000)
+    assert module.native.closed.wait(1)
+    assert module.native.calls == ["start", "stop", "close"]
+    assert (
+        handle.close(time.monotonic_ns() + 1_000_000_000).status
+        is BackendCloseStatus.CLOSED
+    )
 
 
 def test_native_status_maps_to_fatal_backend_value_and_reports_once() -> None:
@@ -236,7 +243,7 @@ def test_blocked_native_construction_times_out_and_late_open_closes_once() -> No
     assert time.monotonic_ns() < deadline + 100_000_000
     construction_release.set()
     assert module.native.closed.wait(1)
-    assert module.native.calls == ["start", "stop", "close"]
+    assert module.native.calls == ["stop", "close"]
     result = handle.close(time.monotonic_ns() + 1_000_000_000)
     assert result.status is BackendCloseStatus.CLOSED
     assert module.native.calls.count("close") == 1
@@ -518,22 +525,16 @@ def test_restart_native_once_exception_reports_one_fault(
     handle.close(time.monotonic_ns() + 1_000_000_000)
 
 
-def test_restart_native_once_late_request_cannot_complete_later_request() -> None:
+def test_timed_out_restart_rejects_later_request_without_second_command() -> None:
     first_stop_entered = threading.Event()
     first_stop_release = threading.Event()
-    second_stop_entered = threading.Event()
-    second_stop_release = threading.Event()
 
     class SequencedStopStream(NativeStream):
         def stop(self) -> None:
             super().stop()
-            stop_count = self.calls.count("stop")
-            if stop_count == 1:
+            if self.calls.count("stop") == 1:
                 first_stop_entered.set()
                 first_stop_release.wait()
-            elif stop_count == 2:
-                second_stop_entered.set()
-                second_stop_release.wait()
 
     module = FakeSoundDevice()
     module.native = SequencedStopStream()
@@ -555,29 +556,91 @@ def test_restart_native_once_late_request_cannot_complete_later_request() -> Non
     request_a.join(1)
     assert results == {"a": False}
 
-    request_b = threading.Thread(
-        target=lambda: results.__setitem__(
-            "b",
-            handle.restart_native_once(
-                time.monotonic_ns() + 1_000_000_000
-            ),
-        )
-    )
-    request_b.start()
+    assert handle.restart_native_once(
+        time.monotonic_ns() + 1_000_000_000
+    ) is False
+    assert module.native.calls == ["start", "stop"]
     first_stop_release.set()
-    assert second_stop_entered.wait(1)
-    assert request_b.is_alive()
-    second_stop_release.set()
-    request_b.join(1)
+    assert handle.wait_for_lifecycle_settle(1)
 
-    assert results == {"a": False, "b": True}
-    assert module.native.calls == ["start", "stop", "stop", "start"]
+    assert results == {"a": False}
+    assert module.native.calls == ["start", "stop"]
     handle.close(time.monotonic_ns() + 1_000_000_000)
     assert module.native.calls == [
         "start",
         "stop",
-        "stop",
-        "start",
-        "stop",
         "close",
     ]
+
+
+def test_restart_timeout_in_prestart_gap_cannot_issue_late_native_start() -> None:
+    authorization_entered = threading.Event()
+    authorization_release = threading.Event()
+    late_start = threading.Event()
+
+    class StartRecordingStream(NativeStream):
+        def start(self) -> None:
+            super().start()
+            if self.calls.count("start") == 2:
+                late_start.set()
+
+    module = FakeSoundDevice()
+    module.native = StartRecordingStream()
+    handle = SoundDeviceAudioBackend(module).create_input(
+        stream_spec(),
+        lambda *_args: BackendCallbackDirective.CONTINUE,
+        lambda _fault: None,
+    )
+    handle.start(time.monotonic_ns() + 1_000_000_000)
+
+    def pause_before_restart_start() -> None:
+        authorization_entered.set()
+        authorization_release.wait()
+
+    handle._before_native_restart = pause_before_restart_start
+    try:
+        result = handle.restart_native_once(
+            time.monotonic_ns() + 50_000_000
+        )
+        assert authorization_entered.is_set()
+        assert result is False
+        assert handle._retired
+        authorization_release.set()
+
+        assert not late_start.wait(0.1)
+        assert module.native.calls == ["start", "stop"]
+        assert handle._retired
+        assert (
+            handle.lifecycle_state
+            is _NativeLifecycleState.CLOSE_RETRYABLE
+        )
+    finally:
+        authorization_release.set()
+        handle.close(time.monotonic_ns() + 1_000_000_000)
+
+
+def test_on_fault_exception_is_contained_with_bounded_diagnostic() -> None:
+    module = FakeSoundDevice()
+
+    def throwing_fault(_fault: BackendFault) -> None:
+        raise RuntimeError("pool fault receiver rejected notification")
+
+    handle = SoundDeviceAudioBackend(module).create_input(
+        stream_spec(),
+        lambda *_args: BackendCallbackDirective.CONTINUE,
+        throwing_fault,
+    )
+    handle.start(time.monotonic_ns() + 1_000_000_000)
+
+    with pytest.raises(module.CallbackStop):
+        module.invoke_callback(
+            np.zeros((4, 4), dtype=np.float32),
+            4,
+            object(),
+            NativeStatus(input_overflow=True),
+        )
+
+    assert handle.fault_delivery_error is not None
+    assert "on_fault RuntimeError" in handle.fault_delivery_error.summary
+    assert len(handle.fault_delivery_error.summary) <= 256
+    handle.close(time.monotonic_ns() + 1_000_000_000)

@@ -13,6 +13,8 @@ from .contracts import (
     CaptureOutcome,
     CaptureOutcomeStatus,
     CaptureReservation,
+    CaptureReserveClaim,
+    CaptureReservePending,
     CaptureReserveResult,
     CaptureReserveStatus,
     CommitResult,

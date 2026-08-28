@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import threading
+import time
 import ntpath
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -43,6 +44,7 @@ from app.service.plc_result_sequencer import (
     PlcOperationKind,
     PlcRegistrationResult,
 )
+from app.service.captured_start_dispatcher import CapturedStartWorkResult
 
 from .contracts import (
     ABSENT,
@@ -56,6 +58,8 @@ from .contracts import (
     CapturedStartRequest,
     CaptureOutcome,
     CaptureOutcomeStatus,
+    CaptureReserveClaim,
+    CaptureReservePending,
     CaptureReserveStatus,
     CommitResult,
     CoordinatorLifecycle,
@@ -221,6 +225,8 @@ class _RunContext:
     frozen: FrozenCapturedRun | FrozenImportedRun | None = None
     ticket: PlcIngressTicket | None = None
     reservation: object | None = None
+    reserve_claim: CaptureReserveClaim | None = None
+    reserve_claim_cancel_attempted: bool = False
     reservation_cancel_attempted: bool = False
     reservation_cancel_in_flight: bool = False
     durable_active: bool = False
@@ -556,6 +562,9 @@ class MultiRunCoordinator:
             )
             self._condition.notify_all()
         try:
+            for context in runs:
+                if context.reserve_claim is not None:
+                    self._request_stop_for_run(context)
             for owner, context, identity, action, durable_run in actions:
                 self._dispatch_shutdown_cancel(
                     owner,
@@ -903,7 +912,34 @@ class MultiRunCoordinator:
             idle_preaccept = (
                 self._is_current(context) and context.action is None
             )
+            if idle_preaccept and (
+                context.reserve_claim is not None
+                and not context.reserve_claim_cancel_attempted
+            ):
+                context.reserve_claim_cancel_attempted = True
+                reserve_claim_to_cancel = context.reserve_claim
+                reservation_to_cancel = None
+            elif idle_preaccept and (
+                context.reservation is not None
+                and not context.reservation_cancel_attempted
+            ):
+                context.reservation_cancel_attempted = True
+                reserve_claim_to_cancel = None
+                reservation_to_cancel = context.reservation
+            else:
+                reserve_claim_to_cancel = None
+                reservation_to_cancel = None
         if idle_preaccept:
+            if reserve_claim_to_cancel is not None:
+                self._cancel_frozen_reserve_claim(
+                    context,
+                    reserve_claim_to_cancel,
+                )
+            elif reservation_to_cancel is not None:
+                self._cancel_frozen_reservation(
+                    context,
+                    reservation_to_cancel,
+                )
             self._publish_preaccept(
                 context,
                 StartStatus.PREFLIGHT_REJECTED,
@@ -1556,7 +1592,10 @@ class MultiRunCoordinator:
             ),
         )
 
-    def start_captured(self, request: CapturedStartRequest) -> StartResult:
+    def start_captured(
+        self,
+        request: CapturedStartRequest,
+    ) -> StartResult | CapturedStartWorkResult:
         if not isinstance(request, CapturedStartRequest):
             return self._immediate_rejection(
                 self._request_run_id(request),
@@ -3093,7 +3132,10 @@ class MultiRunCoordinator:
             self._runs[request.run_id] = context
             return context, None
 
-    def _start_captured(self, request: CapturedStartRequest) -> StartResult:
+    def _start_captured(
+        self,
+        request: CapturedStartRequest,
+    ) -> StartResult | CapturedStartWorkResult:
         context, rejection = self._register_context(request)
         if rejection is not None:
             return rejection
@@ -3188,16 +3230,36 @@ class MultiRunCoordinator:
         if action is None:
             return self._current_start_result(context)
         try:
-            reserve = self._resident.reserve(
-                request.run_id, frozen.hardware_id
-            )
+            begin_reserve = getattr(self._resident, "begin_reserve", None)
+            if callable(begin_reserve):
+                reserve = begin_reserve(
+                    request.run_id,
+                    frozen.hardware_id,
+                    frozen.trigger_monotonic_ns,
+                    time.monotonic_ns() + 5_000_000_000,
+                )
+            else:
+                reserve = self._resident.reserve(
+                    request.run_id, frozen.hardware_id
+                )
             reserve_error = None
         except Exception as exc:
             reserve = None
             reserve_error = exc
+        valid_pending = bool(
+            type(reserve) is CaptureReservePending
+            and reserve.run_id == request.run_id
+            and reserve.hardware_id == frozen.hardware_id
+            and reserve.claim.run_id == request.run_id
+            and reserve.claim.hardware_id == frozen.hardware_id
+        )
         with self._lock:
             current = self._reconcile_action(context, action)
-            if (
+            if current and valid_pending:
+                context.reserve_claim = reserve.claim
+            elif current and type(reserve) is CaptureReservePending:
+                context.reserve_claim = reserve.claim
+            elif (
                 current
                 and reserve is not None
                 and reserve.status is CaptureReserveStatus.RESERVED
@@ -3212,13 +3274,40 @@ class MultiRunCoordinator:
         if not current:
             return self._current_start_result(context)
         if preaccept_reason is not None:
-            self._cancel_reservation_once(context)
+            if context.reserve_claim is not None:
+                self._cancel_reserve_claim_once(context)
+            else:
+                self._cancel_reservation_once(context)
             return self._publish_preaccept(
                 context,
                 StartStatus.PREFLIGHT_REJECTED,
                 TerminalErrorCategory.PREFLIGHT_REJECTED,
                 preaccept_reason,
             )
+        if type(reserve) is CaptureReservePending:
+            if not valid_pending:
+                self._cancel_reserve_claim_once(context)
+                return self._publish_preaccept(
+                    context,
+                    StartStatus.RESIDENT_UNAVAILABLE,
+                    TerminalErrorCategory.RESIDENT_UNAVAILABLE,
+                    "Resident pending reserve returned mismatched identity",
+                )
+            return self._park_captured_reserve(context, frozen, reserve)
+        return self._continue_captured_reserve(
+            context,
+            frozen,
+            reserve,
+            reserve_error,
+        )
+
+    def _continue_captured_reserve(
+        self,
+        context: _RunContext,
+        frozen: FrozenCapturedRun,
+        reserve: object,
+        reserve_error: Exception | None,
+    ) -> StartResult:
         if reserve_error is not None:
             return self._publish_preaccept(
                 context,
@@ -3304,6 +3393,148 @@ class MultiRunCoordinator:
         if current_failure is not None:
             return current_failure
         return self._activate_captured(context, frozen)
+
+    def _park_captured_reserve(
+        self,
+        context: _RunContext,
+        frozen: FrozenCapturedRun,
+        pending: CaptureReservePending,
+    ) -> CapturedStartWorkResult:
+        claim = pending.claim
+        return CapturedStartWorkResult.parked(
+            wait=pending.wake_signal.wait,
+            continuation=lambda: self._resume_captured_reserve(
+                context,
+                frozen,
+                claim,
+            ),
+            cancel=lambda: self._cancel_parked_captured_reserve(
+                context,
+                claim,
+            ),
+        )
+
+    def _resume_captured_reserve(
+        self,
+        context: _RunContext,
+        frozen: FrozenCapturedRun,
+        claim: CaptureReserveClaim,
+    ) -> StartResult | CapturedStartWorkResult:
+        with self._lock:
+            current = self._is_current(context)
+            claim_current = context.reserve_claim is claim
+            preaccept_reason = (
+                self._pop_preaccept_contender_locked(
+                    context,
+                    "Resident reserve continuation",
+                )
+                if current and claim_current
+                else None
+            )
+        if not current or not claim_current:
+            return self._current_start_result(context)
+        if preaccept_reason is not None:
+            self._cancel_reserve_claim_once(context)
+            return self._publish_preaccept(
+                context,
+                StartStatus.PREFLIGHT_REJECTED,
+                TerminalErrorCategory.PREFLIGHT_REJECTED,
+                preaccept_reason,
+            )
+        with self._lock:
+            action = self._try_set_next_action_locked(
+                context,
+                ExternalActionKind.RESIDENT_RESERVE,
+                CoordinatorPhase.RESERVING,
+            )
+        if action is None:
+            self._cancel_reserve_claim_once(context)
+            return self._current_start_result(context)
+        try:
+            reserve = self._resident.resume_reserve(claim)
+            reserve_error = None
+        except Exception as exc:
+            reserve = None
+            reserve_error = exc
+        valid_pending = bool(
+            type(reserve) is CaptureReservePending
+            and reserve.claim is claim
+            and reserve.run_id == context.run_id
+            and reserve.hardware_id == frozen.hardware_id
+        )
+        with self._lock:
+            current = self._reconcile_action(context, action)
+            if current and valid_pending:
+                context.reserve_claim = claim
+            elif current and type(reserve) is CaptureReservePending:
+                context.reserve_claim = claim
+            elif current:
+                context.reserve_claim = None
+                if (
+                    reserve is not None
+                    and reserve.status is CaptureReserveStatus.RESERVED
+                    and reserve.run_id == context.run_id
+                    and reserve.hardware_id == frozen.hardware_id
+                    and reserve.reservation is not None
+                ):
+                    context.reservation = reserve.reservation
+            preaccept_reason = (
+                self._pop_preaccept_contender_locked(
+                    context,
+                    "Resident reserve continuation",
+                )
+                if current
+                else None
+            )
+        if not current:
+            return self._current_start_result(context)
+        if preaccept_reason is not None:
+            if type(reserve) is CaptureReservePending:
+                self._cancel_reserve_claim_once(context)
+            else:
+                self._cancel_reservation_once(context)
+            return self._publish_preaccept(
+                context,
+                StartStatus.PREFLIGHT_REJECTED,
+                TerminalErrorCategory.PREFLIGHT_REJECTED,
+                preaccept_reason,
+            )
+        if type(reserve) is CaptureReservePending:
+            if not valid_pending:
+                self._cancel_reserve_claim_once(context)
+                return self._publish_preaccept(
+                    context,
+                    StartStatus.RESIDENT_UNAVAILABLE,
+                    TerminalErrorCategory.RESIDENT_UNAVAILABLE,
+                    "Resident reserve continuation returned mismatched identity",
+                )
+            return self._park_captured_reserve(context, frozen, reserve)
+        return self._continue_captured_reserve(
+            context,
+            frozen,
+            reserve,
+            reserve_error,
+        )
+
+    def _cancel_parked_captured_reserve(
+        self,
+        context: _RunContext,
+        claim: CaptureReserveClaim,
+    ) -> None:
+        with self._lock:
+            if (
+                not self._is_current(context)
+                or context.reserve_claim is not claim
+            ):
+                return
+            context.cancel_requested = True
+        self._cancel_reserve_claim_once(context)
+        self._publish_preaccept(
+            context,
+            StartStatus.PREFLIGHT_REJECTED,
+            TerminalErrorCategory.PREFLIGHT_REJECTED,
+            "captured-start dispatcher closed during Resident reserve",
+        )
 
     def _prepare_current_collector(
         self,
@@ -4437,6 +4668,42 @@ class MultiRunCoordinator:
             context.reservation_cancel_attempted = True
             reservation = context.reservation
         self._cancel_frozen_reservation(context, reservation)
+
+    def _cancel_reserve_claim_once(self, context: _RunContext) -> None:
+        with self._lock:
+            if (
+                not self._is_current(context)
+                or context.reserve_claim is None
+                or context.reserve_claim_cancel_attempted
+                or context.action is not None
+            ):
+                return
+            context.reserve_claim_cancel_attempted = True
+            claim = context.reserve_claim
+        self._cancel_frozen_reserve_claim(context, claim)
+
+    def _cancel_frozen_reserve_claim(
+        self,
+        context: _RunContext,
+        claim: CaptureReserveClaim,
+    ) -> None:
+        try:
+            self._resident.cancel_reserve(claim)
+        except Exception as exc:
+            self._diagnose(
+                "Resident reserve continuation cancel",
+                context,
+                TerminalErrorCategory.RESIDENT_UNAVAILABLE,
+                exc,
+            )
+        finally:
+            with self._lock:
+                if (
+                    self._is_current(context)
+                    and context.reserve_claim is claim
+                ):
+                    context.reserve_claim = None
+                self._condition.notify_all()
 
     def _cancel_frozen_reservation(
         self, context: _RunContext, reservation: object

@@ -1509,6 +1509,12 @@ class RawManagedInputBackendPort(Protocol):
     def refresh_requires_reinitialize(self) -> bool: ...
 
 
+class ManagedInputEndpointResolverBoundary(Protocol):
+    def resolve(
+        self, frozen: HardwareEndpointIdentity
+    ) -> HardwareEndpointIdentity: ...
+
+
 class ManagedInputDiscoveryBoundary(Protocol):
     @property
     def refresh_requires_reinitialize(self) -> bool: ...

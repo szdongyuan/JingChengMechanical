@@ -34,7 +34,6 @@ from app.service.multi_run_integration.production_composition import (
     ProductionCompositionError,
     ProductionGraphFactory,
     ProductionCurrentCollectorFactory,
-    _LiveDisplayAudioBackend,
     _ProductionLiveDisplayManager,
 )
 from app.service.multi_run_coordinator_mvp.contracts import (
@@ -42,10 +41,7 @@ from app.service.multi_run_coordinator_mvp.contracts import (
     TriggerSource,
 )
 from app.service.analysis.resident_audio_mvp.contracts import (
-    BackendCallbackDirective,
     BackendCallbackStatus,
-    BackendCloseResult,
-    BackendCloseStatus,
 )
 from tests.multi_run_coordinator_mvp._support import (
     canonical_payload,
@@ -283,6 +279,7 @@ def test_live_display_uses_frozen_calibration_and_feeds_configured_monitor(
         def __init__(self, **kwargs):
             self.kwargs = kwargs
             self.chunks = []
+            self.feed_threads = []
             self.started = False
             self.stopped = False
             self.error_occurred = SimpleNamespace(connect=lambda _slot: None)
@@ -292,6 +289,7 @@ def test_live_display_uses_frozen_calibration_and_feeds_configured_monitor(
             self.started = True
 
         def feed(self, chunk):
+            self.feed_threads.append(threading.current_thread().name)
             self.chunks.append(np.asarray(chunk).copy())
             return True
 
@@ -377,6 +375,9 @@ def test_live_display_uses_frozen_calibration_and_feeds_configured_monitor(
         monitors[0].chunks[0],
         [[1.0, 10.0], [2.0, 20.0]],
     )
+    assert monitors[0].feed_threads == [
+        "production-monitor-display-fanout"
+    ]
     manager.close()
 
 
@@ -417,354 +418,83 @@ def test_live_display_fanout_never_runs_on_input_callback_thread(
     manager.close()
 
 
-class _ReplacementHandle:
-    def __init__(self, owner, spec, callback, on_fault):
-        self.owner = owner
-        self.spec = spec
-        self.callback = callback
-        self.on_fault = on_fault
-        self.started = 0
-        self.stopped = 0
-        self.closed = 0
-
-    def start(self, _deadline):
-        self.started += 1
-        self.owner.on_start(self)
-
-    def request_stop(self):
-        self.stopped += 1
-
-    def close(self, _deadline):
-        self.closed += 1
-        return BackendCloseResult(BackendCloseStatus.CLOSED)
-
-    def restart_native_once(self, _deadline):
-        raise AssertionError("an unavailable handle must never be restarted")
-
-
-class _ReplacementDelegate:
-    def __init__(self):
-        self.handles = {}
-        self.on_start = lambda _handle: None
-
-    def create_input(self, spec, callback, on_fault):
-        handle = _ReplacementHandle(
-            self,
-            spec,
-            callback,
-            on_fault,
-        )
-        self.handles.setdefault(spec.hardware_id, []).append(handle)
-        return handle
-
-
-def _replacement_backend(delegate=None, *, callback=None, manager=None):
-    delegate = delegate or _ReplacementDelegate()
-    backend = _LiveDisplayAudioBackend(
-        delegate,
-        manager or SimpleNamespace(accept_block=lambda *_args: None),
-    )
-    proxy = backend.create_input(
-        SimpleNamespace(
-            hardware_id="managed-input-3",
-            sample_rate_hz=44_100,
-        ),
-        callback or (lambda *_args: BackendCallbackDirective.CONTINUE),
-        lambda _fault: None,
-    )
-    return backend, delegate, proxy
-
-
-def test_live_audio_backend_capture_ready_skips_rebuild_for_fresh_callback(
+def test_live_display_queue_drops_oldest_block_at_fixed_capacity_four(
     monkeypatch,
 ):
-    clock = [1_000_000_000]
-    monkeypatch.setattr(
-        "app.service.multi_run_integration.production_composition.time.monotonic_ns",
-        lambda: clock[0],
+    diagnostics = []
+    manager = _ProductionLiveDisplayManager(
+        bus=SimpleNamespace(),
+        diagnostic_callback=diagnostics.append,
     )
-    backend, delegate, _proxy = _replacement_backend()
-    first = delegate.handles["managed-input-3"][0]
-    first.callback(
-        np.zeros((2, 1), dtype=np.float32),
+    manager._runs_by_hardware["managed-input-9"] = {"run": object()}
+    processing_started = threading.Event()
+    release_processing = threading.Event()
+    processed = []
+
+    def slow_first(block):
+        processed.append(int(block.samples[0, 0]))
+        if len(processed) == 1:
+            processing_started.set()
+            assert release_processing.wait(1.0)
+
+    monkeypatch.setattr(manager, "_process_block", slow_first)
+    manager.accept_block(
+        "managed-input-9",
+        np.full((2, 1), 0, dtype=np.float32),
         2,
-        900_000_000,
-        BackendCallbackStatus.OK,
+        time.monotonic_ns(),
+        16_000,
     )
+    assert processing_started.wait(1.0)
 
-    assert backend.capture_ready("3") is True
-    assert len(delegate.handles["managed-input-3"]) == 1
-
-
-def test_live_audio_backend_rebuilds_stale_handle_in_new_generation(
-    monkeypatch,
-):
-    clock = [1_000_000_000]
-    monkeypatch.setattr(
-        "app.service.multi_run_integration.production_composition.time.monotonic_ns",
-        lambda: clock[0],
-    )
-    delegate = _ReplacementDelegate()
-    delegate.on_start = lambda handle: handle.callback(
-        np.ones((2, 1), dtype=np.float32),
-        2,
-        clock[0],
-        BackendCallbackStatus.OK,
-    )
-    backend, delegate, proxy = _replacement_backend(delegate)
-    proxy.start(clock[0] + 1_000_000_000)
-    first = delegate.handles["managed-input-3"][0]
-    clock[0] += 1_000_000_001
-
-    assert backend.capture_ready("3") is True
-    assert len(delegate.handles["managed-input-3"]) == 2
-    assert first.stopped == 1
-    assert first.closed == 1
-    assert first.callback(
-        np.ones((2, 1), dtype=np.float32),
-        2,
-        clock[0],
-        BackendCallbackStatus.OK,
-    ) is BackendCallbackDirective.STOP
-
-
-def test_live_audio_backend_rebuilds_faulted_handle_once(
-    monkeypatch,
-):
-    clock = [1_000_000_000]
-    monkeypatch.setattr(
-        "app.service.multi_run_integration.production_composition.time.monotonic_ns",
-        lambda: clock[0],
-    )
-    resident_callbacks = []
-    delegate = _ReplacementDelegate()
-    delegate.on_start = lambda handle: handle.callback(
-        np.ones((2, 1), dtype=np.float32),
-        2,
-        clock[0],
-        BackendCallbackStatus.OK,
-    )
-    backend, delegate, _proxy = _replacement_backend(
-        delegate,
-        callback=lambda *_args: (
-            resident_callbacks.append("accepted")
-            or BackendCallbackDirective.CONTINUE
-        ),
-    )
-    first = delegate.handles["managed-input-3"][0]
-
-    assert first.callback(
-        np.ones((2, 1), dtype=np.float32),
-        2,
-        clock[0],
-        BackendCallbackStatus.BACKEND_FAULT,
-    ) is BackendCallbackDirective.STOP
-    assert backend.capture_ready("3") is True
-    assert len(delegate.handles["managed-input-3"]) == 2
-    assert resident_callbacks == ["accepted"]
-
-
-def test_live_audio_backend_rebuild_accepts_synchronous_new_callback(
-    monkeypatch,
-):
-    clock = [1_000_000_000]
-    monkeypatch.setattr(
-        "app.service.multi_run_integration.production_composition.time.monotonic_ns",
-        lambda: clock[0],
-    )
-    accepted = []
-    delegate = _ReplacementDelegate()
-    delegate.on_start = lambda handle: handle.callback(
-        np.ones((2, 1), dtype=np.float32),
-        2,
-        clock[0],
-        BackendCallbackStatus.OK,
-    )
-    backend, delegate, _proxy = _replacement_backend(
-        delegate,
-        manager=SimpleNamespace(
-            accept_block=lambda *args: accepted.append(args)
-        ),
-    )
-
-    assert backend.capture_ready("3") is True
-    assert len(delegate.handles["managed-input-3"]) == 2
-    assert len(accepted) == 1
-    assert accepted[0][0] == "managed-input-3"
-
-
-def test_live_audio_backend_rebuild_waits_for_delayed_new_callback():
-    callback_delivered = threading.Event()
-    delegate = _ReplacementDelegate()
-
-    def on_start(handle):
-        def deliver():
-            time.sleep(0.02)
-            handle.callback(
-                np.ones((2, 1), dtype=np.float32),
-                2,
-                time.monotonic_ns(),
-                BackendCallbackStatus.OK,
-            )
-            callback_delivered.set()
-
-        threading.Thread(target=deliver, daemon=True).start()
-
-    delegate.on_start = on_start
-    backend, delegate, _proxy = _replacement_backend(delegate)
-
-    assert backend.capture_ready("3") is True
-    assert callback_delivered.wait(1)
-    assert len(delegate.handles["managed-input-3"]) == 2
-
-
-def test_live_audio_backend_rebuild_rejects_stop_and_isolates_other_hardware(
-    monkeypatch,
-):
-    clock = [1_000_000_000]
-    monkeypatch.setattr(
-        "app.service.multi_run_integration.production_composition.time.monotonic_ns",
-        lambda: clock[0],
-    )
-    delegate = _ReplacementDelegate()
-    backend, delegate, _target = _replacement_backend(
-        delegate,
-        callback=lambda *_args: BackendCallbackDirective.STOP,
-    )
-    backend.create_input(
-        SimpleNamespace(
-            hardware_id="managed-input-4",
-            sample_rate_hz=44_100,
-        ),
-        lambda *_args: BackendCallbackDirective.CONTINUE,
-        lambda _fault: None,
-    )
-    def stop_on_start(handle):
-        handle.callback(
-            np.ones((2, 1), dtype=np.float32),
+    for value in range(1, 6):
+        manager.accept_block(
+            "managed-input-9",
+            np.full((2, 1), value, dtype=np.float32),
             2,
-            clock[0],
-            BackendCallbackStatus.OK,
+            time.monotonic_ns(),
+            16_000,
         )
-        clock[0] += 1_000_000_000
 
-    delegate.on_start = stop_on_start
+    assert len(manager._block_queue) == 4
+    release_processing.set()
+    assert manager.wait_until_idle(1.0)
+    assert processed == [0, 2, 3, 4, 5]
+    assert len(diagnostics) == 1
+    assert "live_display_queue_overflow" in diagnostics[0]
+    assert "capacity_blocks=4" in diagnostics[0]
+    manager._runs_by_hardware.clear()
+    manager.close()
 
-    assert backend.capture_ready("3") is False
-    assert len(delegate.handles["managed-input-3"]) == 2
-    assert len(delegate.handles["managed-input-4"]) == 1
 
-
-def test_live_audio_backend_capture_ready_attempts_once_per_stale_probe(
+def test_live_display_exception_isolated_to_diagnostic(
     monkeypatch,
 ):
-    clock = [1_000_000_000]
-    monkeypatch.setattr(
-        "app.service.multi_run_integration.production_composition.time.monotonic_ns",
-        lambda: clock[0],
+    diagnostics = []
+    manager = _ProductionLiveDisplayManager(
+        bus=SimpleNamespace(),
+        diagnostic_callback=diagnostics.append,
     )
-    delegate = _ReplacementDelegate()
-    delegate.on_start = lambda _handle: clock.__setitem__(
-        0,
-        clock[0] + 1_000_000_000,
-    )
-    backend, delegate, _proxy = _replacement_backend(delegate)
+    manager._runs_by_hardware["managed-input-9"] = {"run": object()}
 
-    assert backend.capture_ready("3") is False
-    assert backend.capture_ready("3") is False
-    assert len(delegate.handles["managed-input-3"]) == 3
+    def fail_display(_block):
+        raise RuntimeError("display exploded")
 
-
-def test_rebuild_without_callback_records_one_reason_and_keeps_other_stream_usable(
-    monkeypatch,
-):
-    from dataclasses import replace
-
-    from app.service.multi_run_coordinator_mvp import (
-        CaptureReserveResult,
-        CaptureReserveStatus,
-        HistoryFactKind,
-        StartStatus,
-    )
-    from tests.multi_run_coordinator_mvp._support import Harness, RUN_IDS
-
-    clock = [1_000_000_000]
-    monkeypatch.setattr(
-        "app.service.multi_run_integration.production_composition.time.monotonic_ns",
-        lambda: clock[0],
-    )
-
-    delegate = _ReplacementDelegate()
-    delegate.on_start = lambda handle: (
-        clock.__setitem__(0, clock[0] + 1_000_000_000)
-        if handle.spec.hardware_id == "managed-input-1"
-        else None
-    )
-    backend = _LiveDisplayAudioBackend(
-        delegate,
-        SimpleNamespace(accept_block=lambda *_args: None),
-    )
-    for hardware_id in ("managed-input-1", "managed-input-2"):
-        backend.create_input(
-            SimpleNamespace(
-                hardware_id=hardware_id,
-                sample_rate_hz=44_100,
-            ),
-            lambda *_args: BackendCallbackDirective.CONTINUE,
-            lambda _fault: None,
-        )
-    healthy = delegate.handles["managed-input-2"][0]
-    healthy.callback(
+    monkeypatch.setattr(manager, "_process_block", fail_display)
+    manager.accept_block(
+        "managed-input-9",
         np.ones((2, 1), dtype=np.float32),
         2,
-        clock[0],
-        BackendCallbackStatus.OK,
+        time.monotonic_ns(),
+        16_000,
     )
 
-    harness = Harness()
-    resident = harness.resident
-    reason = (
-        "音频输入设备未返回采样；已尝试重新启动音频流，"
-        "请检查设备连接或重启软件。"
-    )
-
-    class ReadinessResident:
-        def reserve(self, run_id, hardware_id):
-            if not backend.capture_ready(hardware_id):
-                return CaptureReserveResult(
-                    status=CaptureReserveStatus.NOT_READY,
-                    run_id=run_id,
-                    hardware_id=hardware_id,
-                    reservation=None,
-                    reason=reason,
-                )
-            return resident.reserve(run_id, hardware_id)
-
-        def __getattr__(self, name):
-            return getattr(resident, name)
-
-    harness.resident = ReadinessResident()
-    harness.captured_freezer.result_factory = lambda request: replace(
-        frozen_captured(request),
-        hardware_id="1" if request.run_id == RUN_IDS[0] else "2",
-    )
-    coordinator = harness.coordinator()
-
-    failed = coordinator.start_captured(captured_request(RUN_IDS[0]))
-    healthy_result = coordinator.start_captured(captured_request(RUN_IDS[1]))
-
-    failed_history = [
-        event
-        for event in harness.history.calls
-        if event.kind is HistoryFactKind.RUN_TERMINATED
+    assert manager.wait_until_idle(1.0)
+    assert diagnostics == [
+        "live monitor/display fanout failed: display exploded"
     ]
-    assert failed.status is StartStatus.RESIDENT_UNAVAILABLE
-    assert failed.reason == reason
-    assert len(failed_history) == 1
-    assert failed_history[0].projection.reason == reason
-    assert healthy_result.status is StartStatus.ACCEPTED_ACTIVE
-    assert len(delegate.handles["managed-input-1"]) == 2
-    assert len(delegate.handles["managed-input-2"]) == 1
+    manager._runs_by_hardware.clear()
+    manager.close()
 
 
 def test_activate_requires_attached_history_before_coordinator_construction():
@@ -991,11 +721,22 @@ def _isolated_stream_prepare(
         for item in managed_inputs
     )
     resident = Resident()
+    passive_audio_backend = object()
+    adapter_calls = []
+
+    def build_resident_adapter(**kwargs):
+        adapter_calls.append(kwargs)
+        return resident
+
     prerequisites = SimpleNamespace(
         managed_inputs=managed_inputs,
         configs=configs,
-        build_sounddevice_audio_backend=lambda _module: object(),
-        build_resident_adapter=lambda **_kwargs: resident,
+        passive_audio_backend=passive_audio_backend,
+        adapter_calls=adapter_calls,
+        build_sounddevice_audio_backend=(
+            lambda _module: passive_audio_backend
+        ),
+        build_resident_adapter=build_resident_adapter,
     )
     diagnostics = []
     factory = ProductionGraphFactory(
@@ -1012,6 +753,8 @@ def test_bad_endpoint_is_diagnosed_once_while_healthy_exact_endpoint_prepares(
     monkeypatch,
     tmp_path,
 ):
+    import app.service.multi_run_integration.production_composition as module
+
     factory, prerequisites, resident, diagnostics = _isolated_stream_prepare(
         monkeypatch,
         tmp_path,
@@ -1021,6 +764,17 @@ def test_bad_endpoint_is_diagnosed_once_while_healthy_exact_endpoint_prepares(
 
     upstream = factory.prepare_upstream(prerequisites)
 
+    assert len(prerequisites.adapter_calls) == 1
+    adapter_call = prerequisites.adapter_calls[0]
+    assert adapter_call["backend"] is prerequisites.passive_audio_backend
+    assert isinstance(
+        adapter_call["endpoint_resolver"],
+        module.ManagedInputEndpointResolver,
+    )
+    assert adapter_call["endpoint_resolver"]._backend.__class__.__name__ == (
+        "RawBackend"
+    )
+    assert adapter_call["drain_observer"].__self__ is upstream.live_display
     assert tuple(
         endpoint.hardware_id.value for endpoint in resident.opened_endpoints
     ) == (2,)

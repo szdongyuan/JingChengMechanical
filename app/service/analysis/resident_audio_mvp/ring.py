@@ -142,6 +142,24 @@ class _ResidentRing:
         ):
             raise ValueError("invalid callback monotonic timestamp")
 
+        self.append_ingress(
+            samples,
+            callback_monotonic_ns=callback_monotonic_ns,
+        )
+
+    def append_ingress(
+        self,
+        samples: np.ndarray,
+        *,
+        callback_monotonic_ns: int,
+    ) -> None:
+        """Append one block already normalized by callback ingress."""
+        sample_rate_hz = self._sample_rate_hz
+        logical_frames = self._logical_frames
+        if sample_rate_hz is None or logical_frames is None:
+            raise RuntimeError("ring timeline is not configured")
+        frame_count = samples.shape[0]
+
         duration_ns = round(frame_count * 1_000_000_000 / sample_rate_hz)
         estimated_start_ns = callback_monotonic_ns - duration_ns
         if estimated_start_ns < 0:

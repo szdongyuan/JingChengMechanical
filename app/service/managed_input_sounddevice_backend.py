@@ -10,8 +10,6 @@ from app.service.analysis.resident_audio_mvp.contracts import (
     AudioInputFaultCallback,
     BackendCallbackDirective,
     BackendCallbackStatus,
-    BackendCloseResult,
-    BackendCloseStatus,
     ResidentStreamSpec,
 )
 from app.service.analysis.resident_audio_mvp import sounddevice_backend as _resident
@@ -77,66 +75,6 @@ class _MonotonicAuthorityInputHandle(_resident._SoundDeviceInputHandle):
         if type(value) is not int or value < 0:
             raise ValueError("monotonic authority returned an invalid value")
         return value
-
-    def start(self, deadline_monotonic_ns: int) -> None:
-        if (
-            type(deadline_monotonic_ns) is not int
-            or deadline_monotonic_ns <= self._now_ns()
-        ):
-            raise ValueError("start deadline must be a future integer")
-        with self._lock:
-            if self._thread is not None:
-                raise RuntimeError("sounddevice input handle is single-use")
-            thread = threading.Thread(
-                name=f"resident-sounddevice-{self._spec.hardware_id}",
-                target=self._control,
-                daemon=True,
-            )
-            self._thread = thread
-            thread.start()
-        remaining = max(
-            0.0,
-            (deadline_monotonic_ns - self._now_ns()) / 1_000_000_000,
-        )
-        if not self._start_done.wait(remaining):
-            with self._lock:
-                self._stop_requested = True
-                self._close_requested = True
-                self._wake.set()
-            raise TimeoutError(
-                f"sounddevice start deadline expired for {self._spec.hardware_id}"
-            )
-        with self._lock:
-            error = self._start_error
-        if error is not None:
-            raise error
-
-    def close(self, deadline_monotonic_ns: int) -> BackendCloseResult:
-        if type(deadline_monotonic_ns) is not int:
-            raise ValueError("close deadline must be an integer")
-        with self._lock:
-            if self._close_result is not None:
-                return self._close_result
-            if self._thread is None:
-                self._close_result = BackendCloseResult(
-                    BackendCloseStatus.CLOSED
-                )
-                return self._close_result
-            self._stop_requested = True
-            self._close_requested = True
-            self._wake.set()
-        remaining = max(
-            0.0,
-            (deadline_monotonic_ns - self._now_ns()) / 1_000_000_000,
-        )
-        if not self._control_done.wait(remaining):
-            return _resident._not_confirmed(
-                f"sounddevice close {self._spec.hardware_id} not confirmed"
-            )
-        with self._lock:
-            return self._close_result or _resident._not_confirmed(
-                f"sounddevice close {self._spec.hardware_id} missing result"
-            )
 
     def _native_callback(
         self,
@@ -270,6 +208,7 @@ class ManagedInputSoundDeviceBackend:
         if not callable(getattr(sounddevice_module, "query_hostapis", None)):
             raise TypeError("sounddevice module must provide query_hostapis")
         self._sounddevice = sounddevice_module
+        self._scan_lock = threading.Lock()
         self._last_scan: RawBackendInputScan | None = None
 
     @property
@@ -282,6 +221,13 @@ class ManagedInputSoundDeviceBackend:
     ) -> RawBackendInputScan:
         if type(scan_id) is not BackendScanId:
             raise TypeError("scan_id must be an exact BackendScanId")
+        with self._scan_lock:
+            return self._query_raw_input_endpoints_locked(scan_id)
+
+    def _query_raw_input_endpoints_locked(
+        self,
+        scan_id: BackendScanId,
+    ) -> RawBackendInputScan:
         devices = tuple(self._sounddevice.query_devices())
         hostapis_raw = tuple(self._sounddevice.query_hostapis())
         hostapis = tuple(
@@ -333,15 +279,16 @@ class ManagedInputSoundDeviceBackend:
         scan_id: BackendScanId,
         device_index: int,
     ) -> InputEndpointObservation | None:
-        scan = self._last_scan
-        if scan is None or scan.scan_id != scan_id:
-            return None
-        matches = tuple(
-            item
-            for item in scan.observations
-            if item.device_index == device_index
-        )
-        return matches[0] if len(matches) == 1 else None
+        with self._scan_lock:
+            scan = self._last_scan
+            if scan is None or scan.scan_id != scan_id:
+                return None
+            matches = tuple(
+                item
+                for item in scan.observations
+                if item.device_index == device_index
+            )
+            return matches[0] if len(matches) == 1 else None
 
 
 __all__ = [
