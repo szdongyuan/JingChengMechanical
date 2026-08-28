@@ -1112,12 +1112,15 @@ class _FrozenRunFreezer:
         live_display: _ProductionLiveDisplayManager | None = None,
         dashboard_config_loader=None,
         calibration_loader=None,
+        ai_toolchain_loader=None,
     ) -> None:
         if (
             dashboard_config_loader is not None
             and not callable(dashboard_config_loader)
         ):
             raise TypeError("dashboard_config_loader must be callable or None")
+        if ai_toolchain_loader is not None and not callable(ai_toolchain_loader):
+            raise TypeError("ai_toolchain_loader must be callable or None")
         self._configs = {
             int(item.config_id): item for item in prerequisites.configs
         }
@@ -1125,6 +1128,7 @@ class _FrozenRunFreezer:
         self._live_display = live_display
         self._dashboard_config_loader = dashboard_config_loader
         self._calibration_loader = calibration_loader
+        self._ai_toolchain_loader = ai_toolchain_loader
 
     def _config(self, request) -> tuple[object, dict[str, object]]:
         ingress = _decode_payload(request.ingress_payload)
@@ -1303,8 +1307,8 @@ class _FrozenRunFreezer:
             canonical,
         )
 
-    @staticmethod
     def _analysis_input(
+        self,
         config,
         ingress: Mapping[str, object],
         values: Mapping[str, object],
@@ -1321,6 +1325,22 @@ class _FrozenRunFreezer:
             raise ValueError("frozen analysis window is invalid")
         start_seconds = float(offset_ms) / 1000.0
         end_seconds = start_seconds + float(duration)
+        toolchain = None
+        if self._ai_toolchain_loader is not None:
+            toolchain = self._ai_toolchain_loader(int(config.config_id))
+            if toolchain is not None:
+                if not isinstance(toolchain, Mapping):
+                    raise ValueError("frozen AI toolchain must be an object")
+                toolchain = deepcopy(dict(toolchain))
+        execution_timeout_seconds = max(
+            30.0,
+            float(duration) * 2.0,
+        )
+        if toolchain is not None:
+            timeout_seconds = toolchain.get("timeout_seconds")
+            if type(timeout_seconds) is not float:
+                raise ValueError("frozen AI toolchain timeout is invalid")
+            execution_timeout_seconds += timeout_seconds
         envelope = {
             "schema": "analysis-input/v1",
             "config": values,
@@ -1333,12 +1353,9 @@ class _FrozenRunFreezer:
                 "window_start_seconds": start_seconds,
                 "window_end_seconds": end_seconds,
                 "algorithm_revision": "legacy-judgment/v1",
-                "execution_timeout_seconds": max(
-                    30.0,
-                    float(duration) * 2.0,
-                ),
+                "execution_timeout_seconds": execution_timeout_seconds,
                 "queue_timeout_seconds": None,
-                "toolchain": None,
+                "toolchain": toolchain,
             },
         }
         canonical = freeze_analysis_envelope(envelope).encode("utf-8")
@@ -1932,8 +1949,11 @@ class ProductionGraphFactory:
         event_bus=None,
         dashboard_config_loader=None,
         calibration_loader=None,
+        ai_toolchain_loader=None,
         result_artifact_store: AnalysisResultArtifactStore | None = None,
     ) -> None:
+        if ai_toolchain_loader is not None and not callable(ai_toolchain_loader):
+            raise TypeError("ai_toolchain_loader must be callable or None")
         self._runtime = runtime
         self._plc_dispatch_ports = plc_dispatch_ports
         self._plc_result_sequencer = plc_result_sequencer
@@ -1943,6 +1963,7 @@ class ProductionGraphFactory:
         self._event_bus = event_bus
         self._dashboard_config_loader = dashboard_config_loader
         self._calibration_loader = calibration_loader
+        self._ai_toolchain_loader = ai_toolchain_loader
         self._result_artifact_store = result_artifact_store
 
     def prepare_upstream(self, prerequisites):
@@ -2159,12 +2180,14 @@ class ProductionGraphFactory:
                 live_display=upstream.live_display,
                 dashboard_config_loader=self._dashboard_config_loader,
                 calibration_loader=self._calibration_loader,
+                ai_toolchain_loader=self._ai_toolchain_loader,
             )
             imported_freezer = _ImportedRunFreezer(
                 prerequisites,
                 self._output_directory,
                 dashboard_config_loader=self._dashboard_config_loader,
                 calibration_loader=self._calibration_loader,
+                ai_toolchain_loader=self._ai_toolchain_loader,
             )
             coordinator = MultiRunCoordinator(
                 captured_freezer=captured_freezer,
@@ -2533,6 +2556,7 @@ def build_production_composition_builder(container) -> ProductionCompositionBuil
             container.config_service.load_config_for_result_dashboard
         ),
         calibration_loader=container.hss_service.get_input_hardware,
+        ai_toolchain_loader=container.ai_service.freeze_bound_toolchain,
         result_artifact_store=container.analysis_result_artifact_store,
     )
     return ProductionCompositionBuilder(

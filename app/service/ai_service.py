@@ -6,6 +6,7 @@ and UI ViewModel adaptation.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -425,6 +426,77 @@ class AiService:
         }
 
     # ── Binding CRUD (for config UI) ────────────────────────
+
+    def freeze_bound_toolchain(self, config_id: int) -> dict | None:
+        """Freeze an enabled binding into the durable analysis envelope shape.
+
+        Production runs must not re-read a mutable binding after acceptance.
+        Returning ``None`` keeps AI optional; an enabled but invalid binding
+        fails closed instead of silently skipping the configured toolchain.
+        """
+        binding = self.resolve_binding(config_id)
+        if binding is None or not binding["enabled"]:
+            return None
+
+        toolchain_id = binding["toolchain_id"]
+        if not isinstance(toolchain_id, str) or not toolchain_id.strip():
+            raise ValueError("Enabled AI binding has no toolchain selected")
+        toolchain = self.get_toolchain(toolchain_id)
+        if toolchain is None or not toolchain.enabled:
+            raise ValueError("Bound AI toolchain was not found or is disabled")
+        if toolchain.protocol_version != _SUPPORTED_PROTOCOL_VERSION:
+            raise ValueError("Bound AI toolchain protocol version is unsupported")
+
+        execution_mode = str(toolchain.execution_mode or "").strip()
+        if execution_mode not in _SUPPORTED_EXECUTION_MODES:
+            raise ValueError("Bound AI toolchain execution mode is unsupported")
+        entrypoint = str(toolchain.entrypoint or "").strip()
+        if not entrypoint:
+            raise ValueError("Bound AI toolchain entrypoint is empty")
+        raw_package_dir = str(toolchain.package_dir or "").strip()
+        if not raw_package_dir:
+            raise ValueError("Bound AI toolchain package directory is invalid")
+        package_dir = os.path.abspath(raw_package_dir)
+        if not os.path.isdir(package_dir):
+            raise ValueError("Bound AI toolchain package directory is invalid")
+
+        timeout_ms = binding["effective_timeout_ms"]
+        if (
+            isinstance(timeout_ms, bool)
+            or not isinstance(timeout_ms, int)
+            or timeout_ms <= 0
+        ):
+            raise ValueError("Bound AI toolchain timeout is invalid")
+        params = json.loads(self._normalize_params_json(binding["params_json"]))
+
+        revision_payload = {
+            "toolchain_id": toolchain.toolchain_id,
+            "updated_time": str(toolchain.updated_time or ""),
+            "version": str(toolchain.version or ""),
+            "execution_mode": execution_mode,
+            "entrypoint": entrypoint,
+            "package_dir": package_dir,
+            "params": params,
+            "timeout_ms": timeout_ms,
+        }
+        revision_bytes = json.dumps(
+            revision_payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return {
+            "toolchain_id": toolchain.toolchain_id,
+            "execution_revision": (
+                "sha256:" + hashlib.sha256(revision_bytes).hexdigest()
+            ),
+            "execution_mode": execution_mode,
+            "entrypoint": entrypoint,
+            "package_dir": package_dir,
+            "params": params,
+            "timeout_seconds": float(timeout_ms) / 1000.0,
+        }
 
     def _binding_table_has_legacy_offset_column(self, database) -> bool:
         cursor = database.execute_sql("PRAGMA table_info(test_config_ai_binding_table)")
