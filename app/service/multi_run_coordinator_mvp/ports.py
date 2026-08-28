@@ -27,6 +27,8 @@ from .contracts import (
     AudioSaveRequest,
     CaptureOutcome,
     CaptureReservation,
+    CaptureReserveClaim,
+    CaptureReservePending,
     CaptureReserveResult,
     CapturedAudioSaveRequest,
     CapturedStartRequest,
@@ -78,6 +80,21 @@ class CaptureOutcomeSink(Protocol):
 
 class ResidentCapturePort(Protocol):
     def reserve(self, run_id: str, hardware_id: str) -> CaptureReserveResult: ...
+
+    def begin_reserve(
+        self,
+        run_id: str,
+        hardware_id: str,
+        trigger_monotonic_ns: int,
+        deadline_monotonic_ns: int,
+    ) -> CaptureReserveResult | CaptureReservePending: ...
+
+    def resume_reserve(
+        self,
+        claim: CaptureReserveClaim,
+    ) -> CaptureReserveResult | CaptureReservePending: ...
+
+    def cancel_reserve(self, claim: CaptureReserveClaim) -> bool: ...
 
     def register_completion(
         self,

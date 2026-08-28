@@ -30,7 +30,11 @@ from .contracts import (
     CaptureOutcomeStatus,
     MaintenanceReadiness,
     MaintenanceStatus,
+    LifecycleFuture,
+    LifecycleOutcome,
+    LifecycleStatus,
     OpenResult,
+    ReadinessTicket,
     ResidentError,
     ResidentErrorCode,
     ResidentRequestError,
@@ -40,6 +44,7 @@ from .contracts import (
     StreamOpenResult,
     StreamOpenStatus,
 )
+from .diagnostics import DiagnosticReason, DiagnosticStage, ResidentDiagnostic
 from .pool import ResidentAudioPool
 from .sounddevice_backend import SoundDeviceAudioBackend
 
@@ -73,10 +78,17 @@ __all__ = [
     "CaptureOutcomeStatus",
     "MaintenanceReadiness",
     "MaintenanceStatus",
+    "DiagnosticReason",
+    "DiagnosticStage",
+    "LifecycleFuture",
+    "LifecycleOutcome",
+    "LifecycleStatus",
     "OpenResult",
+    "ReadinessTicket",
     "ResidentAudioPool",
     "ResidentError",
     "ResidentErrorCode",
+    "ResidentDiagnostic",
     "ResidentRequestError",
     "ResidentStreamSpec",
     "ShutdownReport",

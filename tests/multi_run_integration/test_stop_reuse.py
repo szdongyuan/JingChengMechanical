@@ -79,7 +79,9 @@ class _ResidentProbe:
         return self.delegate.register_completion(reservation, sink)
 
     def start(self, reservation, trigger_monotonic_ns, target_frame_count):
-        self.start_calls.append(reservation)
+        self.start_calls.append(
+            (reservation, trigger_monotonic_ns, target_frame_count)
+        )
         return self.delegate.start(
             reservation,
             trigger_monotonic_ns,
@@ -126,13 +128,14 @@ def test_stop_all_then_new_signal_reuses_same_resident_handle(qapp, tmp_path):
     )
     handle_name, handle = next(iter(backend.handles.items()))
     original_handle_id = id(handle)
+    old_trigger_ns = backend.clock() + 1
 
     try:
         first = coordinator.start_captured(
             _captured_request(
                 old_run_id,
                 plc_id=1,
-                trigger_monotonic_ns=backend.clock() + 1,
+                trigger_monotonic_ns=old_trigger_ns,
             )
         )
         assert first.status is StartStatus.ACCEPTED_ACTIVE
@@ -156,11 +159,12 @@ def test_stop_all_then_new_signal_reuses_same_resident_handle(qapp, tmp_path):
         assert repeated_stop.canceled_accepted_run_ids == ()
         assert resident_probe.cancel_calls == [old_reservation]
 
+        new_trigger_ns = backend.clock() + 1
         second = coordinator.start_captured(
             _captured_request(
                 new_run_id,
                 plc_id=1,
-                trigger_monotonic_ns=backend.clock() + 1,
+                trigger_monotonic_ns=new_trigger_ns,
             )
         )
         assert second.status is StartStatus.ACCEPTED_ACTIVE
@@ -170,8 +174,10 @@ def test_stop_all_then_new_signal_reuses_same_resident_handle(qapp, tmp_path):
             (old_run_id, hardware_id),
             (new_run_id, hardware_id),
         ]
-        assert resident_probe.start_calls[0].hardware_id == hardware_id
-        assert resident_probe.start_calls[1].hardware_id == hardware_id
+        assert resident_probe.start_calls[0][0].hardware_id == hardware_id
+        assert resident_probe.start_calls[0][1] == old_trigger_ns
+        assert resident_probe.start_calls[1][0].hardware_id == hardware_id
+        assert resident_probe.start_calls[1][1] == new_trigger_ns
 
         _drain_until(
             qapp,

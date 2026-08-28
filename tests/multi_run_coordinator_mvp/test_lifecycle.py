@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import math
+import time
 from threading import Event, Thread
 
 import pytest
@@ -45,6 +46,10 @@ from app.service.multi_run_coordinator_mvp.coordinator import (
     _PublishingContext,
     _RunContext,
 )
+from app.service.captured_start_dispatcher import (
+    CapturedStartDispatcher,
+    CapturedStartWorkResult,
+)
 
 from ._support import (
     ATTEMPT_IDS,
@@ -57,6 +62,7 @@ from ._support import (
     saved_outcome,
 )
 from .test_bridge_initial import drive_to_bridge, terminal_report
+from .test_initial_runs import _PendingResident
 from .test_result_operations import (
     db_failed_reanalysis_report,
     manual_request,
@@ -124,6 +130,132 @@ def test_stop_all_idle_closes_admission_for_the_operation_then_reopens() -> None
     assert report.pending_analysis_attempt_ids == ()
     assert report.restart_required is False
     assert coordinator.snapshot().lifecycle is CoordinatorLifecycle.OPEN
+
+
+def test_shutdown_cancels_parked_reserve_before_continuation_can_resume() -> None:
+    harness = Harness()
+    resident = _PendingResident(harness.trace)
+    harness.resident = resident
+    coordinator = harness.coordinator()
+
+    parked = coordinator.start_captured(captured_request())
+    assert type(parked) is CapturedStartWorkResult
+    assert resident.resume_calls == []
+
+    coordinator.begin_shutdown()
+    assert resident.cancel_reserve_calls == [resident.claim]
+    assert resident.resume_calls == []
+
+    parked.continuation()
+    assert resident.resume_calls == []
+    assert harness.persistence.active_calls == []
+    assert harness.resident.start_calls == []
+
+
+def test_stop_all_cancels_parked_reserve_before_continuation_can_resume() -> None:
+    harness = Harness()
+    resident = _PendingResident(harness.trace)
+    harness.resident = resident
+    coordinator = harness.coordinator()
+
+    parked = coordinator.start_captured(captured_request())
+    assert type(parked) is CapturedStartWorkResult
+
+    report = coordinator.stop_all(1.0)
+    assert report.status is StopStatus.SETTLED
+    assert resident.cancel_reserve_calls == [resident.claim]
+    assert resident.resume_calls == []
+
+    parked.continuation()
+    assert resident.resume_calls == []
+    assert harness.persistence.active_calls == []
+
+
+def test_stop_after_resumed_reservation_reconciliation_cancels_reservation_once() -> None:
+    harness = Harness()
+    resident = _PendingResident(harness.trace)
+    harness.resident = resident
+    coordinator = harness.coordinator()
+    request = captured_request()
+    parked = coordinator.start_captured(request)
+    assert type(parked) is CapturedStartWorkResult
+
+    continuation_entered = Event()
+    continuation_release = Event()
+    original_continue = coordinator._continue_captured_reserve
+
+    def gated_continue(context, frozen, reserve, reserve_error):
+        continuation_entered.set()
+        assert continuation_release.wait(2.0)
+        return original_continue(context, frozen, reserve, reserve_error)
+
+    coordinator._continue_captured_reserve = gated_continue
+    resident.ready.set()
+    continuation_results = []
+    continuation_worker = Thread(
+        target=lambda: continuation_results.append(parked.continuation())
+    )
+    continuation_worker.start()
+    assert continuation_entered.wait(1.0)
+    with coordinator._lock:
+        context = coordinator._runs[request.run_id]
+        reservation = context.reservation
+        assert reservation is not None
+        assert context.reserve_claim is None
+        assert context.action is None
+    assert len(resident.reserve_calls) == 1
+
+    try:
+        report = coordinator.stop_all(0.0)
+    finally:
+        continuation_release.set()
+        continuation_worker.join(2.0)
+
+    assert not continuation_worker.is_alive()
+    assert len(continuation_results) == 1
+    assert report.status is StopStatus.SETTLED
+    assert resident.cancel_reserve_calls == []
+    assert len(resident.cancel_calls) == 1
+    canceled = resident.cancel_calls[0]
+    assert canceled is reservation
+    assert canceled.run_id == request.run_id
+    assert canceled.hardware_id == "hardware-1"
+    with coordinator._lock:
+        live = coordinator._runs.get(request.run_id)
+        assert live is None or live.reservation is None
+
+
+def test_shutdown_cancel_wakes_dispatcher_and_releases_parked_permit() -> None:
+    harness = Harness()
+    resident = _PendingResident(harness.trace)
+    harness.resident = resident
+    coordinator = harness.coordinator()
+    dispatcher = CapturedStartDispatcher(capacity=1, worker_count=1)
+    probe_ran = Event()
+
+    try:
+        assert dispatcher.try_submit(
+            lambda: coordinator.start_captured(captured_request()),
+            lane_key="hardware-1",
+        )
+        deadline = time.monotonic() + 2.0
+        while not resident.begin_calls:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+
+        coordinator.begin_shutdown()
+        while not dispatcher.try_submit(
+            lambda: probe_ran.set(),
+            lane_key="hardware-1",
+        ):
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        assert probe_ran.wait(1.0)
+        assert resident.cancel_reserve_calls == [resident.claim]
+        assert resident.resume_calls == []
+    finally:
+        resident.ready.set()
+        assert dispatcher.close(timeout_seconds=2.0)
 
 
 @pytest.mark.parametrize("value", [True, -1.0, math.nan, math.inf, -math.inf])

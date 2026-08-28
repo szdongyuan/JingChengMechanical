@@ -19,6 +19,7 @@ from .contracts import (
     ResidentErrorCode,
     ResidentStreamSpec,
 )
+from .ingress import _IngressBlock, _SpscIngress
 from .ring import _ResidentRing
 
 
@@ -55,7 +56,7 @@ class _DrainOwner:
         hardware_id: str,
         work_event: threading.Event,
         control_event: threading.Event,
-        progress: Callable[[str], bool],
+        drain_generation: Callable[[], bool],
     ) -> _DrainOwner:
         stop_event = threading.Event()
 
@@ -66,7 +67,7 @@ class _DrainOwner:
                 work_event.clear()
                 if stop_event.is_set():
                     return
-                if progress(hardware_id):
+                if drain_generation():
                     work_event.set()
                     control_event.set()
 
@@ -95,15 +96,20 @@ class _ResidentStreamSlot:
         "_decision_lock",
         "_drain_owner",
         "_dropped_callback_count",
+        "_dropped_observer_count",
+        "_drain_progress_event",
+        "_drained_sequence",
         "_fault",
         "_fault_monotonic_ns",
         "_first_block_event",
+        "_first_block_drained_event",
         "_first_block_seen",
-        "_first_block_monotonic_ns",
         "_generation",
         "_handle",
+        "_ingress",
         "_lock",
         "_monotonic_ns",
+        "_progress_event",
         "_ring",
         "_spec",
         "_startup_close_owned",
@@ -133,8 +139,16 @@ class _ResidentStreamSlot:
                 sample_rate_hz=spec.sample_rate_hz,
                 frames_per_buffer=spec.frames_per_buffer,
             )
+        self._ingress = _SpscIngress.for_stream(
+            sample_rate_hz=spec.sample_rate_hz,
+            frames_per_buffer=spec.frames_per_buffer,
+            input_channel_count=spec.input_channel_count,
+            capture_channel_indices=spec.capture_channel_indices,
+        )
         self._generation = object()
+        self._progress_event = threading.Event()
         self._first_block_event = threading.Event()
+        self._first_block_drained_event = threading.Event()
         self._work_event: threading.Event | None = None
         self._control_event: threading.Event | None = None
         self._drain_owner: _DrainOwner | None = None
@@ -142,13 +156,15 @@ class _ResidentStreamSlot:
         self._state = "OPENING"
         self._accepting = True
         self._first_block_seen = False
-        self._first_block_monotonic_ns: int | None = None
         self._fault: ResidentError | None = None
         self._fault_monotonic_ns: int | None = None
         self._close_attempted = False
         self._close_result = None
         self._startup_close_owned = True
         self._dropped_callback_count = 0
+        self._dropped_observer_count = 0
+        self._drained_sequence = 0
+        self._drain_progress_event = threading.Event()
 
     def backend_entrypoints(
         self,
@@ -177,14 +193,29 @@ class _ResidentStreamSlot:
     def publish_drain_owner(
         self,
         progress: Callable[[str], bool] | None = None,
+        observer: Callable[[np.ndarray, int, int], None] | None = None,
     ) -> None:
         work_event = threading.Event()
         control_event = threading.Event()
+
+        def drain_generation() -> bool:
+            block = self._drain_ingress()
+            try:
+                more_progress = (
+                    False
+                    if progress is None
+                    else progress(self._spec.hardware_id)
+                )
+            finally:
+                if block is not None:
+                    self._finish_drain_block(block, observer)
+            return self._ingress.has_pending or more_progress
+
         drain_owner = _DrainOwner.create(
             self._spec.hardware_id,
             work_event,
             control_event,
-            progress if progress is not None else lambda _hardware_id: False,
+            drain_generation,
         )
         self._work_event = work_event
         self._control_event = control_event
@@ -198,23 +229,13 @@ class _ResidentStreamSlot:
         callback_monotonic_ns: int,
         status: BackendCallbackStatus,
     ) -> BackendCallbackDirective:
-        decision_lock = self._decision_lock
-        if decision_lock is None:
-            return self._callback_under_decision_lock(
-                generation,
-                samples,
-                frame_count,
-                callback_monotonic_ns,
-                status,
-            )
-        with decision_lock:
-            return self._callback_under_decision_lock(
-                generation,
-                samples,
-                frame_count,
-                callback_monotonic_ns,
-                status,
-            )
+        return self._callback_under_decision_lock(
+            generation,
+            samples,
+            frame_count,
+            callback_monotonic_ns,
+            status,
+        )
 
     def _callback_under_decision_lock(
         self,
@@ -224,103 +245,165 @@ class _ResidentStreamSlot:
         callback_monotonic_ns: int,
         status: BackendCallbackStatus,
     ) -> BackendCallbackDirective:
-        with self._lock:
-            if generation is not self._generation or not self._accepting:
-                self._record_stale_entry_locked()
-                return BackendCallbackDirective.STOP
+        if generation is not self._generation or not self._accepting:
+            self._record_stale_entry_locked()
+            return BackendCallbackDirective.STOP
+        try:
             trusted_monotonic_ns = self._monotonic_ns()
-            try:
-                if type(status) is not BackendCallbackStatus:
-                    raise ValueError("invalid callback status")
-                if status is not BackendCallbackStatus.OK:
-                    self._latch_fault_locked(
-                        _fault_error(
-                            phase="callback status",
-                            hardware_id=self._spec.hardware_id,
-                            detail=status.value,
-                        ),
-                        trusted_monotonic_ns,
-                    )
-                    return BackendCallbackDirective.STOP
-                if (
-                    not isinstance(samples, np.ndarray)
-                    or samples.dtype != np.dtype(np.float32)
-                    or samples.ndim != 2
-                    or not samples.flags.c_contiguous
-                    or type(frame_count) is not int
-                    or frame_count < 1
-                    or frame_count > self._spec.frames_per_buffer
-                    or samples.shape
-                    != (frame_count, self._spec.input_channel_count)
-                    or type(callback_monotonic_ns) is not int
-                    or callback_monotonic_ns < 0
-                    or callback_monotonic_ns > trusted_monotonic_ns
-                ):
-                    raise ValueError("invalid callback audio metadata")
-                selected = np.ascontiguousarray(
-                    samples[:, self._spec.capture_channel_indices],
-                    dtype=np.float32,
-                )
-                self._ring.append(
-                    selected,
-                    callback_monotonic_ns=callback_monotonic_ns,
-                )
-                self._first_block_seen = True
-                self._first_block_monotonic_ns = callback_monotonic_ns
-                self._first_block_event.set()
-                work_event = self._work_event
-                control_event = self._control_event
-                if work_event is None or control_event is None:
-                    raise RuntimeError("drain owner is not published")
-                work_event.set()
-                control_event.set()
-                return BackendCallbackDirective.CONTINUE
-            except Exception as exc:
-                self._latch_fault_locked(
+            if type(status) is not BackendCallbackStatus:
+                raise ValueError("invalid callback status")
+            if status is not BackendCallbackStatus.OK:
+                self._latch_callback_fault(
                     _fault_error(
-                        phase="callback",
+                        phase="callback status",
                         hardware_id=self._spec.hardware_id,
-                        detail=f"{type(exc).__name__}: {_safe_detail(exc)}",
+                        detail=status.value,
                     ),
                     trusted_monotonic_ns,
                 )
                 return BackendCallbackDirective.STOP
+            if (
+                not isinstance(samples, np.ndarray)
+                or samples.dtype != np.dtype(np.float32)
+                or samples.ndim != 2
+                or not samples.flags.c_contiguous
+                or type(frame_count) is not int
+                or frame_count < 1
+                or frame_count > self._spec.frames_per_buffer
+                or samples.shape
+                != (frame_count, self._spec.input_channel_count)
+                or type(callback_monotonic_ns) is not int
+                or callback_monotonic_ns < 0
+                or callback_monotonic_ns > trusted_monotonic_ns
+            ):
+                raise ValueError("invalid callback audio metadata")
+            if not self._ingress.try_push(
+                samples,
+                frame_count,
+                callback_monotonic_ns,
+                trusted_monotonic_ns,
+            ):
+                self._latch_callback_fault(
+                    _fault_error(
+                        phase="callback ingress",
+                        hardware_id=self._spec.hardware_id,
+                        detail="ingress_overflow",
+                    ),
+                    trusted_monotonic_ns,
+                )
+                return BackendCallbackDirective.STOP
+            self._first_block_seen = True
+            self._progress_event.set()
+            self._first_block_event.set()
+            work_event = self._work_event
+            control_event = self._control_event
+            if work_event is None or control_event is None:
+                raise RuntimeError("drain owner is not published")
+            work_event.set()
+            control_event.set()
+            return BackendCallbackDirective.CONTINUE
+        except Exception as exc:
+            try:
+                trusted_monotonic_ns
+            except UnboundLocalError:
+                trusted_monotonic_ns = 0
+            self._latch_callback_fault(
+                _fault_error(
+                    phase="callback",
+                    hardware_id=self._spec.hardware_id,
+                    detail=f"{type(exc).__name__}: {_safe_detail(exc)}",
+                ),
+                trusted_monotonic_ns,
+            )
+            return BackendCallbackDirective.STOP
+
+    def _drain_ingress(
+        self,
+    ) -> _IngressBlock | None:
+        block = self._ingress.peek()
+        if block is None:
+            return None
+        append_lock = (
+            self._lock
+            if self._decision_lock is None
+            else self._decision_lock
+        )
+        try:
+            with append_lock:
+                if self._fault is None:
+                    self._ring.append_ingress(
+                        block.samples,
+                        callback_monotonic_ns=block.callback_monotonic_ns,
+                    )
+                    self._drained_sequence = block.sequence
+                    self._drain_progress_event.set()
+                    self._first_block_drained_event.set()
+        except Exception as exc:
+            with append_lock:
+                self._latch_fault_locked(
+                    _fault_error(
+                        phase="worker drain",
+                        hardware_id=self._spec.hardware_id,
+                        detail=(
+                            f"{type(exc).__name__}: {_safe_detail(exc)}"
+                        ),
+                    ),
+                    self._monotonic_ns(),
+                )
+                self._drain_progress_event.set()
+            self._ingress.release(block.sequence)
+            return None
+        return block
+
+    def _finish_drain_block(
+        self,
+        block: _IngressBlock,
+        observer: Callable[[np.ndarray, int, int], None] | None,
+    ) -> None:
+        try:
+            if observer is not None and self._fault is None:
+                observer(
+                    block.samples,
+                    block.frame_count,
+                    block.callback_monotonic_ns,
+                )
+        except Exception:
+            self._dropped_observer_count = min(
+                self._dropped_observer_count + 1,
+                (1 << 63) - 1,
+            )
+        finally:
+            self._ingress.release(block.sequence)
 
     def _on_fault_for_generation(
         self,
         generation: object,
         fault: BackendFault,
     ) -> None:
-        decision_lock = self._decision_lock
-        if decision_lock is None:
-            self._on_fault_under_decision_lock(generation, fault)
-            return
-        with decision_lock:
-            self._on_fault_under_decision_lock(generation, fault)
+        self._on_fault_under_decision_lock(generation, fault)
 
     def _on_fault_under_decision_lock(
         self,
         generation: object,
         fault: BackendFault,
     ) -> None:
-        with self._lock:
-            if generation is not self._generation or not self._accepting:
-                self._record_stale_entry_locked()
-                return
-            trusted_monotonic_ns = self._monotonic_ns()
-            if not isinstance(fault, BackendFault):
-                error = _fault_error(
-                    phase="backend fault",
-                    hardware_id=self._spec.hardware_id,
-                    detail="invalid BackendFault",
-                )
-            else:
-                error = _fault_error(
-                    phase="backend fault",
-                    hardware_id=self._spec.hardware_id,
-                    detail=f"{fault.status.value}: {fault.summary}",
-                )
-            self._latch_fault_locked(error, trusted_monotonic_ns)
+        if generation is not self._generation or not self._accepting:
+            self._record_stale_entry_locked()
+            return
+        trusted_monotonic_ns = self._monotonic_ns()
+        if not isinstance(fault, BackendFault):
+            error = _fault_error(
+                phase="backend fault",
+                hardware_id=self._spec.hardware_id,
+                detail="invalid BackendFault",
+            )
+        else:
+            error = _fault_error(
+                phase="backend fault",
+                hardware_id=self._spec.hardware_id,
+                detail=f"{fault.status.value}: {fault.summary}",
+            )
+        self._latch_callback_fault(error, trusted_monotonic_ns)
 
     def _record_stale_entry_locked(self) -> None:
         self._dropped_callback_count = min(
@@ -329,6 +412,13 @@ class _ResidentStreamSlot:
         )
 
     def _latch_fault_locked(
+        self,
+        error: ResidentError,
+        fault_monotonic_ns: int,
+    ) -> None:
+        self._latch_callback_fault(error, fault_monotonic_ns)
+
+    def _latch_callback_fault(
         self,
         error: ResidentError,
         fault_monotonic_ns: int,
@@ -344,6 +434,42 @@ class _ResidentStreamSlot:
         if self._control_event is not None:
             self._control_event.set()
 
+    @property
+    def callback_sequence(self) -> int:
+        return self._ingress.accepted_sequence
+
+    @property
+    def callback_heartbeat_monotonic_ns(self) -> int | None:
+        return self._ingress.heartbeat_monotonic_ns
+
+    def wait_for_callback_after(
+        self,
+        sequence: int,
+        timeout_seconds: float,
+    ) -> bool:
+        if self.callback_sequence > sequence:
+            return True
+        self._progress_event.clear()
+        if self.callback_sequence > sequence:
+            return True
+        if not self._progress_event.wait(timeout_seconds):
+            return False
+        return self.callback_sequence > sequence
+
+    def wait_for_drain_after(
+        self,
+        sequence: int,
+        timeout_seconds: float,
+    ) -> bool:
+        if self._drained_sequence > sequence:
+            return True
+        self._drain_progress_event.clear()
+        if self._drained_sequence > sequence:
+            return True
+        if not self._drain_progress_event.wait(timeout_seconds):
+            return False
+        return self._drained_sequence > sequence
+
     def latch_owner_fault(
         self,
         error: ResidentError,
@@ -357,11 +483,14 @@ class _ResidentStreamSlot:
         owner_monotonic_ns: int,
     ) -> tuple[bool, ResidentError | None]:
         with self._lock:
+            heartbeat_monotonic_ns = (
+                self._ingress.heartbeat_monotonic_ns
+            )
             if (
                 self._fault is None
                 and self._first_block_seen
-                and self._first_block_monotonic_ns is not None
-                and self._first_block_monotonic_ns <= deadline_monotonic_ns
+                and heartbeat_monotonic_ns is not None
+                and heartbeat_monotonic_ns <= deadline_monotonic_ns
                 and owner_monotonic_ns <= deadline_monotonic_ns
             ):
                 self._state = "READY"

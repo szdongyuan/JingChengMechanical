@@ -10,6 +10,8 @@ from typing import Callable, Protocol
 
 import numpy as np
 
+from .diagnostics import DiagnosticReason, ResidentDiagnostic
+
 
 MAX_BOUNDED_TEXT_CHARS = 256
 MAX_INDEX = (1 << 31) - 1
@@ -84,6 +86,14 @@ class BackendCloseStatus(str, Enum):
     NOT_CONFIRMED = "NOT_CONFIRMED"
 
 
+class LifecycleStatus(str, Enum):
+    GENERATION_CONTINUOUS = "GENERATION_CONTINUOUS"
+    GENERATION_REPLACED = "GENERATION_REPLACED"
+    RECOVERY_PENDING = "RECOVERY_PENDING"
+    RECOVERY_FAILED = "RECOVERY_FAILED"
+    LIFECYCLE_CANCELLED = "LIFECYCLE_CANCELLED"
+
+
 def _bounded_text(value: object, field_name: str) -> str:
     if type(value) is not str or not value or len(value) > MAX_BOUNDED_TEXT_CHARS:
         raise _invalid(f"{field_name} must be a non-empty bounded string")
@@ -144,6 +154,159 @@ def _invalid(summary: str) -> ResidentRequestError:
     object.__setattr__(error, "code", ResidentErrorCode.INVALID)
     object.__setattr__(error, "summary", bounded_summary)
     return ResidentRequestError(error)
+
+
+@dataclass(frozen=True, slots=True)
+class LifecycleOutcome:
+    status: LifecycleStatus
+    generation_id: str | None = None
+    diagnostic: ResidentDiagnostic | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.status) is not LifecycleStatus:
+            raise _invalid("lifecycle status must be an exact LifecycleStatus")
+        if self.status in (
+            LifecycleStatus.GENERATION_CONTINUOUS,
+            LifecycleStatus.GENERATION_REPLACED,
+        ):
+            _bounded_text(self.generation_id, "generation_id")
+            if self.status is LifecycleStatus.GENERATION_REPLACED:
+                if (
+                    type(self.diagnostic) is not ResidentDiagnostic
+                    or self.diagnostic.reason_code
+                    is not DiagnosticReason.GENERATION_REPLACED_FOR_TRIGGER
+                ):
+                    raise _invalid(
+                        "GENERATION_REPLACED requires its replacement diagnostic"
+                    )
+            elif self.diagnostic is not None and type(
+                self.diagnostic
+            ) is not ResidentDiagnostic:
+                raise _invalid("lifecycle diagnostic is invalid")
+            return
+        if self.generation_id is not None:
+            raise _invalid("non-generation lifecycle outcome has no generation_id")
+        if type(self.diagnostic) is not ResidentDiagnostic:
+            raise _invalid("non-generation lifecycle outcome requires a diagnostic")
+
+
+class LifecycleFuture:
+    """Read-only one-shot result shared by readiness observers."""
+
+    __slots__ = ("_event", "_lock", "_outcome")
+
+    def __new__(cls) -> LifecycleFuture:
+        raise TypeError("LifecycleFuture is created only by ResidentAudioPool")
+
+    def wait(self, timeout_seconds: float | None) -> LifecycleOutcome | None:
+        timeout: int | float | None
+        if timeout_seconds is None:
+            timeout = None
+        else:
+            if type(timeout_seconds) not in (int, float):
+                raise _invalid(
+                    "timeout_seconds must be finite non-negative seconds or None"
+                )
+            timeout = timeout_seconds
+            if (
+                timeout < 0
+                or timeout > threading.TIMEOUT_MAX
+                or not math.isfinite(timeout)
+            ):
+                raise _invalid(
+                    "timeout_seconds must be finite non-negative seconds or None"
+                )
+        if not self._event.wait(timeout):
+            return None
+        return self._outcome
+
+    def result_if_ready(self) -> LifecycleOutcome | None:
+        if not self._event.is_set():
+            return None
+        return self._outcome
+
+
+class _LifecyclePublisher:
+    __slots__ = ("_future",)
+
+    def __init__(self, future: LifecycleFuture) -> None:
+        self._future = future
+
+    def settle(self, outcome: LifecycleOutcome) -> bool:
+        if type(outcome) is not LifecycleOutcome:
+            raise _invalid("lifecycle outcome must be exact")
+        with self._future._lock:
+            if self._future._outcome is not None:
+                return False
+            self._future._outcome = outcome
+            self._future._event.set()
+            return True
+
+
+def _new_lifecycle_future() -> tuple[LifecycleFuture, _LifecyclePublisher]:
+    future = object.__new__(LifecycleFuture)
+    future._event = threading.Event()
+    future._lock = threading.Lock()
+    future._outcome = None
+    return future, _LifecyclePublisher(future)
+
+
+@dataclass(frozen=True, slots=True, init=False, eq=False)
+class ReadinessTicket:
+    ticket_id: str
+    hardware_id: str
+    future: LifecycleFuture = field(repr=False)
+    _owner_nonce: object = field(repr=False)
+
+    def __new__(cls) -> ReadinessTicket:
+        raise TypeError("ReadinessTicket is created only by ResidentAudioPool")
+
+    def __repr__(self) -> str:
+        return (
+            "ReadinessTicket("
+            f"ticket_id={self.ticket_id!r}, "
+            f"hardware_id={self.hardware_id!r})"
+        )
+
+
+def _issue_readiness_ticket(
+    *,
+    ticket_id: str,
+    hardware_id: str,
+    future: LifecycleFuture,
+    owner_nonce: object,
+) -> ReadinessTicket:
+    _bounded_text(ticket_id, "ticket_id")
+    _bounded_text(hardware_id, "hardware_id")
+    if type(future) is not LifecycleFuture:
+        raise _invalid("future must be an exact LifecycleFuture")
+    if owner_nonce is None:
+        raise _invalid("owner_nonce must authenticate an owner")
+    ticket = object.__new__(ReadinessTicket)
+    object.__setattr__(ticket, "ticket_id", ticket_id)
+    object.__setattr__(ticket, "hardware_id", hardware_id)
+    object.__setattr__(ticket, "future", future)
+    object.__setattr__(ticket, "_owner_nonce", owner_nonce)
+    return ticket
+
+
+def _validate_readiness_ticket(
+    value: object,
+    *,
+    owner_nonce: object,
+) -> ReadinessTicket:
+    if type(value) is not ReadinessTicket:
+        raise _invalid("ticket must be an exact ReadinessTicket")
+    try:
+        _bounded_text(value.ticket_id, "ticket_id")
+        _bounded_text(value.hardware_id, "hardware_id")
+        future = value.future
+        actual_owner = value._owner_nonce
+    except AttributeError:
+        raise _invalid("readiness ticket is malformed") from None
+    if type(future) is not LifecycleFuture or actual_owner is not owner_nonce:
+        raise _invalid("readiness ticket is not owned by this pool")
+    return value
 
 
 @dataclass(frozen=True, slots=True)

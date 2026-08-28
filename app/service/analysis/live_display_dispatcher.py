@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -148,7 +149,9 @@ class LiveDisplayDispatcher:
             self._log_queue_overflow()
         return True
 
-    def stop(self, timeout: float = 1.0) -> None:
+    def stop(self, timeout: float = 1.0) -> bool:
+        timeout = max(0.0, float(timeout))
+        deadline = time.monotonic() + timeout
         with self._emit_stop_lock:
             with self._condition:
                 self._closed = True
@@ -166,19 +169,17 @@ class LiveDisplayDispatcher:
                 loudness_thread = self._loudness_thread
 
         timed_out = False
-        if thread is not None and thread is not threading.current_thread():
-            thread.join(timeout)
-            if thread.is_alive():
-                timed_out = True
-        if (
-            loudness_thread is not None
-            and loudness_thread is not threading.current_thread()
-        ):
-            loudness_thread.join(timeout)
-            if loudness_thread.is_alive():
+        current_thread = threading.current_thread()
+        for worker in (thread, loudness_thread):
+            if worker is None:
+                continue
+            if worker is not current_thread:
+                worker.join(max(0.0, deadline - time.monotonic()))
+            if worker.is_alive():
                 timed_out = True
         if timed_out:
             self._log_stop_timeout(timeout)
+        return not timed_out
 
     def _run(self) -> None:
         set_current_thread_priority(THREAD_PRIORITY_BELOW_NORMAL)
@@ -248,8 +249,6 @@ class LiveDisplayDispatcher:
         )
 
     def wait_until_idle(self, timeout: float) -> bool:
-        import time
-
         deadline = time.monotonic() + max(0.0, float(timeout))
         with self._condition:
             while self._queue or self._active_work:

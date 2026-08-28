@@ -284,7 +284,7 @@ def test_allocation_enforces_exact_ring_frame_boundary(
 ) -> None:
     rate = 48_000
     frames_per_buffer = 256
-    ring_frames = rate * 2 + frames_per_buffer
+    ring_frames = rate * 10 + frames_per_buffer
     monkeypatch.setattr(
         adapter_module,
         "MAX_ALLOCATABLE_FRAMES",
@@ -311,8 +311,8 @@ def test_allocation_enforces_exact_ring_byte_boundary_without_large_allocation(
     channels = MAX_INPUT_CHANNELS
     bytes_per_frame = channels * np.dtype(np.float32).itemsize
     boundary_frames = MAX_RING_BYTES_PER_STREAM // bytes_per_frame
-    rate = MAX_SAMPLE_RATE_HZ
-    frames_per_buffer = boundary_frames - rate * 2
+    rate = 100_000
+    frames_per_buffer = boundary_frames - rate * 10
     allocation_shapes: list[tuple[int, int]] = []
 
     def reject_large_allocation(
@@ -525,6 +525,8 @@ def test_startup_forwards_exact_pool_open_dependencies_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     backend = FakeBackend()
+    resolver = type("Resolver", (), {"resolve": lambda self, frozen: frozen})()
+    observer = lambda *_args: None
     real_open = ResidentAudioPool.open
     calls: list[dict[str, object]] = []
 
@@ -547,6 +549,8 @@ def test_startup_forwards_exact_pool_open_dependencies_once(
         startup_stream_timeout_s=2.5,
         fault_close_timeout_s=3.5,
         shutdown_timeout_s=4.5,
+        endpoint_resolver=resolver,
+        drain_observer=observer,
     ).open_startup_streams((endpoint(1),))
 
     assert ready_ids(result) == (1,)
@@ -557,6 +561,11 @@ def test_startup_forwards_exact_pool_open_dependencies_once(
     assert calls[0]["startup_stream_timeout_s"] == 2.5
     assert calls[0]["fault_close_timeout_s"] == 3.5
     assert calls[0]["shutdown_timeout_s"] == 4.5
+    assert calls[0]["endpoint_resolver"] is resolver
+    assert calls[0]["drain_observer"] is observer
+    assert calls[0]["endpoint_identities"] == {
+        "managed-input-1": endpoint(1)
+    }
 
 
 def test_repeated_open_returns_identical_frozen_startup_result() -> None:

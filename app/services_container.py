@@ -1105,7 +1105,7 @@ class ServiceContainer:
             return False
         captured_workorder = dict(workorder or {})
 
-        def start_captured() -> None:
+        def start_captured() -> object:
             request = self.build_captured_start_request(
                 source=source,
                 trigger_monotonic_ns=trigger_monotonic_ns,
@@ -1113,7 +1113,7 @@ class ServiceContainer:
                 plc_id=plc_id,
                 config_id=config_id,
             )
-            start(request)
+            return start(request)
 
         route_plc_id = next(
             (

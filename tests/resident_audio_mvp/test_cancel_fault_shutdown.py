@@ -216,6 +216,494 @@ def test_shutdown_first_makes_later_start_return_same_terminal_completion() -> N
     assert pool.cancel_capture(binding).outcome is outcome
 
 
+def test_shutdown_uses_one_deadline_for_an_inflight_recovery_worker() -> None:
+    from tests.resident_audio_mvp.test_recovery import (
+        SequencedBackend,
+        StaticResolver,
+        open_recoverable,
+    )
+
+    clock = ManualMonotonicClock()
+    backend = SequencedBackend(clock)
+    resolver = StaticResolver()
+    candidate_entered = threading.Event()
+    release_candidate = threading.Event()
+
+    def blocked_candidate(handle: object) -> None:
+        candidate_entered.set()
+        if release_candidate.wait(1):
+            handle.emit_valid()
+
+    backend.start_actions = [
+        lambda handle: handle.emit_valid(),
+        blocked_candidate,
+    ]
+    pool = open_recoverable(backend, resolver, clock)
+    backend.handles[0].fault()
+    ticket = pool.begin_readiness("mic-1", clock() + 5_000_000_000)
+    assert candidate_entered.wait(0.5)
+
+    deadline_ns = clock() + 50_000_000
+    report = pool.shutdown(deadline_monotonic_ns=deadline_ns)
+
+    assert report.status is ShutdownStatus.NON_CLEAN
+    assert report.deadline_monotonic_ns == deadline_ns
+    assert report.unjoined_worker_ids == ("recovery:mic-1",)
+    outcome = ticket.future.result_if_ready()
+    assert outcome is not None
+    assert outcome.status.value == "LIFECYCLE_CANCELLED"
+    release_candidate.set()
+    cleanup_deadline = time.monotonic() + 0.5
+    while not backend.handles[1].close_deadlines:
+        if time.monotonic() >= cleanup_deadline:
+            raise AssertionError("superseded candidate was not retired")
+        time.sleep(0.001)
+    assert backend.handles[1].request_stop_calls == 1
+    assert backend.handles[1].close_deadlines == [deadline_ns]
+
+
+def test_shutdown_clamps_superseded_candidate_retirement_and_reconciles_it() -> None:
+    from tests.resident_audio_mvp.test_recovery import (
+        SequencedBackend,
+        StaticResolver,
+        open_recoverable,
+        wait_for,
+    )
+
+    clock = ManualMonotonicClock()
+    backend = SequencedBackend(clock)
+    resolver = StaticResolver()
+    candidate_entered = threading.Event()
+    release_candidate = threading.Event()
+    close_entered = threading.Event()
+    release_close = threading.Event()
+
+    def blocked_candidate(handle: object) -> None:
+        candidate_entered.set()
+        assert release_candidate.wait(1)
+        handle.emit_valid()
+
+    backend.start_actions = [
+        lambda handle: handle.emit_valid(),
+        blocked_candidate,
+    ]
+    pool = open_recoverable(backend, resolver, clock)
+    backend.handles[0].fault()
+    recovery_deadline_ns = clock() + 6_000_000_000
+    pool.begin_readiness("mic-1", recovery_deadline_ns)
+    assert candidate_entered.wait(0.5)
+    candidate = backend.handles[1]
+
+    def blocking_close(deadline_monotonic_ns: int) -> BackendCloseResult:
+        candidate.close_deadlines.append(deadline_monotonic_ns)
+        close_entered.set()
+        assert release_close.wait(1)
+        return BackendCloseResult(BackendCloseStatus.CLOSED)
+
+    candidate.close = blocking_close  # type: ignore[method-assign]
+    shutdown_deadline_ns = clock() + 1_050_000_000
+    reports = []
+    shutdown_finished = threading.Event()
+
+    def run_shutdown() -> None:
+        reports.append(
+            pool.shutdown(deadline_monotonic_ns=shutdown_deadline_ns)
+        )
+        shutdown_finished.set()
+
+    shutdown_thread = threading.Thread(target=run_shutdown)
+    shutdown_thread.start()
+    wait_for(lambda: pool._state == "CLOSING")
+    release_candidate.set()
+    assert close_entered.wait(0.5)
+    finalized_before_reconciliation = shutdown_finished.is_set()
+    release_close.set()
+    shutdown_thread.join(1)
+
+    assert not shutdown_thread.is_alive()
+    assert not finalized_before_reconciliation
+    assert candidate.close_deadlines == [shutdown_deadline_ns]
+    assert candidate.close_deadlines[0] < recovery_deadline_ns
+    assert reports[0].status is ShutdownStatus.CLOSED
+    assert reports[0].unclosed_hardware_ids == ()
+    assert reports[0].unjoined_worker_ids == ()
+
+
+def _pool_with_timed_out_orphan():
+    from tests.resident_audio_mvp.test_recovery import (
+        SequencedBackend,
+        StaticResolver,
+        open_recoverable,
+    )
+
+    clock = ManualMonotonicClock()
+    backend = SequencedBackend(clock)
+    pool = open_recoverable(backend, StaticResolver(), clock)
+    handle = backend.handles[0]
+    lifecycle = type("Lifecycle", (), {"value": "CALL_TIMED_OUT"})()
+    unresolved = BackendCloseResult(
+        BackendCloseStatus.NOT_CONFIRMED,
+        ResidentError(ResidentErrorCode.NON_CLEAN, "native close still running"),
+    )
+
+    def timed_out_close(deadline_monotonic_ns: int) -> BackendCloseResult:
+        handle.close_deadlines.append(deadline_monotonic_ns)
+        return unresolved
+
+    handle.lifecycle_state = lifecycle
+    handle.close = timed_out_close  # type: ignore[method-assign]
+    handle.fault()
+    outcome = pool.begin_readiness(
+        "mic-1", clock() + 5_000_000_000
+    ).future.wait(0.5)
+    assert outcome.status.value == "GENERATION_REPLACED"
+    assert pool.orphan_counts() == (1, {"mic-1": 1})
+    return pool, backend, clock, handle, lifecycle
+
+
+def test_shutdown_waits_for_timed_out_orphan_that_closes_within_budget() -> None:
+    pool, _backend, clock, handle, lifecycle = _pool_with_timed_out_orphan()
+    wait_entered = threading.Event()
+    release_wait = threading.Event()
+    wait_timeouts: list[float] = []
+
+    def wait_for_lifecycle_settle(timeout_seconds: float) -> bool:
+        wait_timeouts.append(timeout_seconds)
+        if timeout_seconds <= 0:
+            return False
+        wait_entered.set()
+        if not release_wait.wait(timeout_seconds):
+            return False
+        lifecycle.value = "CLOSED"
+        return True
+
+    handle.wait_for_lifecycle_settle = wait_for_lifecycle_settle
+    reports = []
+    shutdown_thread = threading.Thread(
+        target=lambda: reports.append(
+            pool.shutdown(deadline_monotonic_ns=clock() + 1_000_000_000)
+        )
+    )
+    shutdown_thread.start()
+    assert wait_entered.wait(0.5)
+    release_wait.set()
+    shutdown_thread.join(1)
+
+    assert not shutdown_thread.is_alive()
+    assert reports[0].status is ShutdownStatus.CLOSED
+    assert pool.orphan_counts() == (0, {})
+    assert handle.request_stop_calls == 1
+    assert len(handle.close_deadlines) == 1
+    assert 0 < wait_timeouts[-1] <= 1.0
+
+
+def test_shutdown_reports_still_timed_out_orphan_without_second_command() -> None:
+    pool, _backend, clock, handle, _lifecycle = _pool_with_timed_out_orphan()
+    wait_timeouts: list[float] = []
+
+    def wait_for_lifecycle_settle(timeout_seconds: float) -> bool:
+        wait_timeouts.append(timeout_seconds)
+        clock.advance_seconds(timeout_seconds)
+        return False
+
+    handle.wait_for_lifecycle_settle = wait_for_lifecycle_settle
+    deadline_ns = clock() + 50_000_000
+    report = pool.shutdown(deadline_monotonic_ns=deadline_ns)
+
+    assert report.status is ShutdownStatus.NON_CLEAN
+    assert report.unclosed_hardware_ids == ("mic-1",)
+    assert pool.orphan_counts() == (1, {"mic-1": 1})
+    assert handle.request_stop_calls == 1
+    assert len(handle.close_deadlines) == 1
+    assert wait_timeouts[-1] == pytest.approx(0.05)
+    assert sum(timeout > 0 for timeout in wait_timeouts) == 1
+
+
+def _pool_with_timed_out_endpoint_scan(monkeypatch: pytest.MonkeyPatch):
+    from app.service.managed_input_contracts import (
+        BackendScanId,
+        InputEndpointDescriptor,
+        InputEndpointObservation,
+        RawBackendInputScan,
+        RawHostApiIdentity,
+        StableUidCapability,
+        StableUidContract,
+    )
+    from app.service.managed_input_endpoint_resolver import (
+        ManagedInputEndpointResolver,
+    )
+    from tests.resident_audio_mvp.test_recovery import (
+        SequencedBackend,
+        open_recoverable,
+    )
+
+    clock = ManualMonotonicClock()
+
+    class BlockingScans:
+        def __init__(self) -> None:
+            self.calls: list[BackendScanId] = []
+            self.first_entered = threading.Event()
+            self.advance_to_timeout = threading.Event()
+            self.first_release = threading.Event()
+            self.first_returned = threading.Event()
+
+        def query_raw_input_endpoints(
+            self,
+            scan_id: BackendScanId,
+        ) -> RawBackendInputScan:
+            self.calls.append(scan_id)
+            self.first_entered.set()
+            assert self.advance_to_timeout.wait(1)
+            clock.advance_seconds(5)
+            self.first_release.wait()
+            descriptor = InputEndpointDescriptor(
+                "Exact mic-1",
+                "WASAPI",
+                1_000.0,
+                1,
+            )
+            result = RawBackendInputScan(
+                scan_id=scan_id,
+                complete=True,
+                stable_uid_capability=StableUidCapability.SUPPORTED,
+                stable_uid_contract=StableUidContract.REVIEWED_OPAQUE_UID,
+                hostapis=(RawHostApiIdentity(0, "WASAPI"),),
+                observations=(
+                    InputEndpointObservation(
+                        scan_id=scan_id,
+                        observation_id=(
+                            f"{scan_id.process_instance_id}:"
+                            f"{scan_id.sequence}:3"
+                        ),
+                        device_index=3,
+                        hostapi_index=0,
+                        stable_backend_uid="uid-1",
+                        descriptor=descriptor,
+                    ),
+                ),
+            )
+            self.first_returned.set()
+            return result
+
+    class ObservedResolver(ManagedInputEndpointResolver):
+        def __init__(self, scans: BlockingScans) -> None:
+            super().__init__(scans, monotonic_ns=clock)
+            self.shutdown_calls = 0
+
+        def shutdown(self, deadline_monotonic_ns: int) -> tuple[str, ...]:
+            self.shutdown_calls += 1
+            return super().shutdown(deadline_monotonic_ns)
+
+    monkeypatch.setattr(pool_module, "retry_delay", lambda _attempt: 10.0)
+    scans = BlockingScans()
+    resolver = ObservedResolver(scans)
+    backend = SequencedBackend(clock)
+    pool = open_recoverable(backend, resolver, clock)
+    backend.handles[0].fault()
+    assert scans.first_entered.wait(0.5)
+    ticket = pool.begin_readiness("mic-1", clock() + 5_000_000_000)
+    scans.advance_to_timeout.set()
+    outcome = ticket.future.wait(0.5)
+    assert outcome is not None
+    assert outcome.status.value == "RECOVERY_PENDING"
+    assert len(scans.calls) == 1
+    return pool, backend, clock, scans, resolver
+
+
+def test_shutdown_reconciles_endpoint_scan_released_within_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool, backend, clock, scans, resolver = (
+        _pool_with_timed_out_endpoint_scan(monkeypatch)
+    )
+    reports = []
+    shutdown_thread = threading.Thread(
+        target=lambda: reports.append(
+            pool.shutdown(deadline_monotonic_ns=clock() + 1_000_000_000)
+        )
+    )
+    shutdown_thread.start()
+    deadline = time.monotonic() + 0.5
+    while pool._state != "CLOSING":
+        if time.monotonic() >= deadline:
+            raise AssertionError("shutdown did not enter CLOSING")
+        time.sleep(0.001)
+    scans.first_release.set()
+    shutdown_thread.join(1)
+
+    assert not shutdown_thread.is_alive()
+    assert scans.first_returned.is_set()
+    assert reports[0].status is ShutdownStatus.CLOSED
+    assert reports[0].unjoined_worker_ids == ()
+    assert resolver.shutdown_calls == 1
+    assert len(scans.calls) == 1
+    assert backend.handles[0].request_stop_calls == 1
+    assert len(backend.handles[0].close_deadlines) == 1
+
+
+def test_shutdown_reports_endpoint_scan_blocked_past_deadline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool, backend, clock, scans, resolver = (
+        _pool_with_timed_out_endpoint_scan(monkeypatch)
+    )
+    report = pool.shutdown(
+        deadline_monotonic_ns=clock() + 50_000_000
+    )
+
+    assert report.status is ShutdownStatus.NON_CLEAN
+    assert report.unjoined_worker_ids == ("managed-input-scan-1",)
+    assert resolver.shutdown_calls == 1
+    assert len(scans.calls) == 1
+    assert backend.handles[0].request_stop_calls == 1
+    assert len(backend.handles[0].close_deadlines) == 1
+    scans.first_release.set()
+    assert scans.first_returned.wait(0.5)
+
+
+def test_repeated_shutdown_keeps_endpoint_scan_evidence_without_rejoining(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool, _backend, clock, scans, resolver = (
+        _pool_with_timed_out_endpoint_scan(monkeypatch)
+    )
+    first = pool.shutdown(
+        deadline_monotonic_ns=clock() + 10_000_000
+    )
+    scans.first_release.set()
+    assert scans.first_returned.wait(0.5)
+
+    second = pool.shutdown()
+
+    assert first.status is ShutdownStatus.NON_CLEAN
+    assert first.unjoined_worker_ids == ("managed-input-scan-1",)
+    assert second is first
+    assert resolver.shutdown_calls == 1
+    assert len(scans.calls) == 1
+
+
+def _pool_with_recovery_ready_to_start():
+    from tests.resident_audio_mvp.test_recovery import (
+        SequencedBackend,
+        StaticResolver,
+        open_recoverable,
+    )
+
+    clock = ManualMonotonicClock()
+    backend = SequencedBackend(clock)
+    pool = open_recoverable(backend, StaticResolver(), clock)
+    return pool, clock
+
+
+def test_shutdown_never_joins_published_but_unstarted_recovery_worker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool, clock = _pool_with_recovery_ready_to_start()
+    real_start = threading.Thread.start
+    real_join = threading.Thread.join
+    recovery_start_entered = threading.Event()
+    release_recovery_start = threading.Event()
+    recovery_join_entered = threading.Event()
+
+    def gated_start(thread: threading.Thread) -> None:
+        if thread.name == "resident-recovery-mic-1":
+            recovery_start_entered.set()
+            assert release_recovery_start.wait(3)
+        real_start(thread)
+
+    def observed_join(
+        thread: threading.Thread,
+        timeout: float | None = None,
+    ) -> None:
+        if thread.name == "resident-recovery-mic-1":
+            recovery_join_entered.set()
+        real_join(thread, timeout)
+
+    monkeypatch.setattr(threading.Thread, "start", gated_start)
+    monkeypatch.setattr(threading.Thread, "join", observed_join)
+    pool._slots["mic-1"].latch_owner_fault(
+        ResidentError(ResidentErrorCode.FAULT, "backend fault before recovery")
+    )
+    readiness_tickets = []
+    readiness_errors: list[BaseException] = []
+
+    def begin_readiness() -> None:
+        try:
+            readiness_tickets.append(
+                pool.begin_readiness(
+                    "mic-1",
+                    clock() + 5_000_000_000,
+                )
+            )
+        except BaseException as exc:
+            readiness_errors.append(exc)
+
+    readiness_thread = threading.Thread(target=begin_readiness)
+    readiness_thread.start()
+    assert recovery_start_entered.wait(0.5)
+    reports = []
+    shutdown_errors: list[BaseException] = []
+
+    def own_shutdown() -> None:
+        try:
+            reports.append(
+                pool.shutdown(
+                    deadline_monotonic_ns=clock() + 1_000_000_000
+                )
+            )
+        except BaseException as exc:
+            shutdown_errors.append(exc)
+
+    shutdown_thread = threading.Thread(target=own_shutdown)
+    shutdown_thread.start()
+    recovery_join_entered.wait(1.2)
+    release_recovery_start.set()
+    readiness_thread.join(1)
+    shutdown_thread.join(2)
+
+    assert not readiness_thread.is_alive()
+    assert not shutdown_thread.is_alive()
+    assert readiness_errors == []
+    assert shutdown_errors == []
+    assert len(readiness_tickets) == 1
+    assert len(reports) == 1
+    assert reports[0].status in {ShutdownStatus.CLOSED, ShutdownStatus.NON_CLEAN}
+    assert pool.shutdown() is reports[0]
+    assert pool._recovery_states["mic-1"].starting is False
+
+
+def test_recovery_worker_start_failure_rolls_back_and_settles_future(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pool, clock = _pool_with_recovery_ready_to_start()
+    real_start = threading.Thread.start
+
+    def failed_start(thread: threading.Thread) -> None:
+        if thread.name == "resident-recovery-mic-1":
+            raise RuntimeError("thread creation failed")
+        real_start(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", failed_start)
+    pool._slots["mic-1"].latch_owner_fault(
+        ResidentError(ResidentErrorCode.FAULT, "backend fault before recovery")
+    )
+    ticket = pool.begin_readiness(
+        "mic-1",
+        clock() + 5_000_000_000,
+    )
+    outcome = ticket.future.wait(0.5)
+    state = pool._recovery_states["mic-1"]
+
+    assert outcome is not None
+    assert outcome.status.value == "RECOVERY_FAILED"
+    assert outcome.diagnostic.stage.value == "internal"
+    assert outcome.diagnostic.reason_code.value == "invariant_violation"
+    assert "thread creation failed" in outcome.diagnostic.detail
+    assert state.worker is None
+    assert state.starting is False
+    assert pool.shutdown().status is ShutdownStatus.CLOSED
+
+
 def test_fault_quarantines_only_one_hardware_and_closes_once() -> None:
     pool, backend = open_pool(("mic-1", "mic-2"))
     failed = pool.reserve_capture("run-failed", "mic-1")

@@ -5,6 +5,7 @@ import dataclasses
 import inspect
 from pathlib import Path
 import threading
+import time
 import uuid
 
 import numpy as np
@@ -391,10 +392,42 @@ def test_reserve_rejects_stale_input_before_allocating_capture() -> None:
 
     assert result.status is CaptureReserveStatus.NOT_READY
     assert result.reason == (
-        "音频输入设备未返回采样；已尝试重新启动音频流，"
-        "请检查设备连接或重启软件。"
+        "liveness/heartbeat_stale: readiness probe reported unavailable"
     )
     assert observed_hardware_ids == [route.coordinator_hardware_id]
+    assert managed_input.capture_target_calls == []
+    assert pool.reserve_calls == []
+
+
+def test_reserve_maps_readiness_probe_exception_without_masking_its_stage() -> None:
+    route = _route(1)
+    pool = _ReservePool()
+    managed_input = _ManagedInput(
+        {
+            (route.managed_hardware_id, route.generation): ResidentCaptureTarget(
+                pool=pool,  # type: ignore[arg-type]
+                resident_hardware_id="resident-1",
+                generation=route.generation,
+            )
+        }
+    )
+
+    def failed_probe(_hardware_id: str) -> bool:
+        raise OSError("endpoint poll failed")
+
+    port = ManagedResidentCapturePort(
+        managed_input,
+        (route,),
+        readiness_probe=failed_probe,
+    )
+
+    result = port.reserve(_run_id(), route.coordinator_hardware_id)
+
+    assert result.status is CaptureReserveStatus.NOT_READY
+    assert result.reason == (
+        "liveness/backend_fault: readiness probe OSError: endpoint poll failed"
+    )
+    assert "未返回采样" not in result.reason
     assert managed_input.capture_target_calls == []
     assert pool.reserve_calls == []
 
@@ -797,6 +830,38 @@ def test_synchronous_completion_maps_all_owned_audio_fields() -> None:
     assert type(outcome.audio.interleaved_bytes) is bytes
 
 
+def test_trusted_private_resident_values_are_not_reconstructed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.service.multi_run_coordinator_mvp.managed_resident_capture_port as adapter
+
+    def forbidden_replace(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("trusted Resident value was reconstructed")
+
+    monkeypatch.setattr(adapter, "replace", forbidden_replace, raising=False)
+
+    completed_port, _, completed_pools = _port()
+    completed_pool = completed_pools[0]
+    _, completed_reservation = _reserve_one(completed_port)
+    delivered: list[object] = []
+    delivered_event = threading.Event()
+    completed_pool.start_outcome_factory = _resident_completed
+    completed_port.register_completion(
+        completed_reservation,
+        lambda outcome: (delivered.append(outcome), delivered_event.set()),
+    )
+    completed_port.start(completed_reservation, 11, 3)
+
+    assert delivered_event.wait(1)
+    assert delivered[0].status is CaptureOutcomeStatus.COMPLETED
+
+    cancelled_port, _, _ = _port()
+    _, cancelled_reservation = _reserve_one(cancelled_port)
+    cancelled = cancelled_port.cancel(cancelled_reservation)
+
+    assert cancelled.status is ResidentCancelStatus.CANCELLED
+
+
 def test_ready_waiter_cannot_retire_before_successful_registration_transition(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1107,7 +1172,9 @@ def test_six_simultaneous_completions_each_deliver_once() -> None:
     }
 
 
-def test_sink_runs_outside_adapter_lock_and_callback_exception_is_isolated() -> None:
+def test_sink_runs_outside_adapter_lock_and_callback_exception_is_isolated(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     port, _, pools = _port()
     pool = pools[0]
     _, first = _reserve_one(port)
@@ -1120,13 +1187,26 @@ def test_sink_runs_outside_adapter_lock_and_callback_exception_is_isolated() -> 
         raise RuntimeError("caller callback failed")
 
     port.register_completion(first, sink)
-    pool.completions["binding-1"].publish(
-        _resident_completed(pool.bindings["binding-1"])
-    )
+    with caplog.at_level(
+        "ERROR",
+        logger=(
+            "app.service.multi_run_coordinator_mvp."
+            "managed_resident_capture_port"
+        ),
+    ):
+        pool.completions["binding-1"].publish(
+            _resident_completed(pool.bindings["binding-1"])
+        )
 
     assert sink_returned.wait(1)
     replacement = port.reserve(_run_id(3), "coordinator-1")
     assert replacement.status is CaptureReserveStatus.RESERVED
+    log_deadline = time.monotonic() + 1.0
+    while "completion_sink/callback_failed" not in caplog.text:
+        assert time.monotonic() < log_deadline
+        time.sleep(0.001)
+    assert "completion_sink/callback_failed" in caplog.text
+    assert "RuntimeError: caller callback failed" in caplog.text
 
 
 def test_cancel_before_register_creates_no_waiter_and_retires_capacity() -> None:
@@ -1773,8 +1853,6 @@ def test_static_adapter_uses_only_public_managed_resident_seams_and_one_waiter()
     assert "deque" not in source
     for forbidden in (
         ".sleep(",
-        "retry",
-        "recovery",
         "backoff",
         "event_bus",
         "proxy",
@@ -1803,6 +1881,24 @@ def test_static_adapter_uses_only_public_managed_resident_seams_and_one_waiter()
     assert ast.unparse(wait_calls[0]) == "completion.wait(None)"
     assert "pool.capture_completion(binding)" in ast.unparse(waiter)
     assert "completion.result_if_ready()" in ast.unparse(waiter)
+    resume = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "resume_reserve"
+    )
+    resume_calls = {
+        node.func.attr
+        for node in ast.walk(resume)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+    }
+    assert "reserve" not in resume_calls
+    assert "begin_reserve" not in resume_calls
+    assert not any(
+        isinstance(node, (ast.For, ast.While))
+        for node in ast.walk(resume)
+    )
     public_object_names = {
         "managed_input",
         "target",
