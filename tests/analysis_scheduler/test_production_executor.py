@@ -66,6 +66,22 @@ class _Token:
         return False
 
 
+class _ResidentAiRuntime:
+    def __init__(self, result_factory):
+        self.calls = []
+        self.shutdown_calls = 0
+        self._result_factory = result_factory
+
+    def analyze(self, **kwargs):
+        self.calls.append(kwargs)
+        if callable(self._result_factory):
+            return self._result_factory(kwargs)
+        return self._result_factory
+
+    def shutdown_all(self):
+        self.shutdown_calls += 1
+
+
 class _Judgment:
     def __init__(self, *, overall: str = "合格", limit_pass: bool = True):
         self.calls = []
@@ -155,6 +171,14 @@ def _toolchain(**changes):
     return AiToolchainSnapshot(**values)
 
 
+def _plain_frozen(value):
+    if type(value) is FrozenResultObject:
+        return {key: _plain_frozen(item) for key, item in value.items}
+    if type(value) is tuple:
+        return [_plain_frozen(item) for item in value]
+    return value
+
+
 def _job(
     *,
     toolchain=None,
@@ -163,6 +187,7 @@ def _job(
     channel_count=1,
     audio_dtype="float32",
     current_trace_json=None,
+    audio_path=None,
 ):
     config = config or {
         "config_id": 11,
@@ -196,7 +221,11 @@ def _job(
         audio=PersistedAudioReference(
             reference_id="audio-1",
             storage_kind=AudioStorageKind.CAPTURED_FINAL_WAV,
-            absolute_path=str(PureWindowsPath("C:/audio/final.wav")),
+            absolute_path=(
+                str(PureWindowsPath("C:/audio/final.wav"))
+                if audio_path is None
+                else str(audio_path)
+            ),
             sample_rate_hz=48_000,
             channel_count=channel_count,
             frame_count=48_000,
@@ -232,9 +261,16 @@ def _required_loudness_config() -> dict:
 
 def test_executor_uses_only_frozen_snapshot_weighting(monkeypatch):
     judgment = _Judgment()
-    executor = ProductionAnalysisExecutor(judgment_engine=judgment)
+    ai_runtime = _ResidentAiRuntime(
+        lambda _kwargs: pytest.fail("disabled AI must not be invoked")
+    )
+    executor = ProductionAnalysisExecutor(
+        judgment_engine=judgment,
+        ai_runtime=ai_runtime,
+    )
     result = executor.execute(_job(), _Audio(), _Token())
     assert result.status is AnalysisExecutionStatus.SUCCEEDED
+    assert ai_runtime.calls == []
     assert len(judgment.calls) == 1
     args, kwargs = judgment.calls[0]
     assert args[0]["channels"][0]["spl_weighting"] == "Z"
@@ -745,26 +781,111 @@ def test_executor_never_reopens_or_resamples_frozen_golden_artifact(monkeypatch)
     assert judgment.calls[0][1]["allow_golden_runtime_resample"] is False
 
 
-def test_nonempty_ai_snapshot_fails_before_execution_as_frozen_ai_unsupported():
-    toolchain = _toolchain()
-    with pytest.raises(AnalysisExecutionError) as captured:
-        ProductionAnalysisExecutor(judgment_engine=_Judgment()).execute(
-            _job(toolchain=toolchain), _Audio(), _Token()
-        )
-    error = captured.value.error
-    assert error.category is AnalysisErrorCategory.ANALYSIS_EXECUTION_FAILED
-    assert error.stage is AnalysisStage.EXECUTE
-    assert error.summary == (
-        f"FROZEN_AI_UNSUPPORTED:{frozen_ai_snapshot_identity(toolchain)}"
+def test_resident_ai_snapshot_calls_frozen_runtime_and_merges_score_into_review(
+    tmp_path,
+):
+    def resident_success(kwargs):
+        return {
+            "module_status": "success",
+            "response_payload": {
+                "protocol_version": 1,
+                "request_id": kwargs["request_id"],
+                "ai_result": {
+                    "ai_label": "FAIL",
+                    "score": 0.12,
+                    "extra": {
+                        "decision_threshold": 0.5,
+                        "channel_index": 0,
+                    },
+                },
+            },
+        }
+
+    runtime = _ResidentAiRuntime(resident_success)
+    judgment = _Judgment()
+    toolchain = _toolchain(execution_mode="resident_process")
+    job = _job(
+        toolchain=toolchain,
+        audio_path=str((tmp_path / "final.wav").resolve()),
+    )
+    result = ProductionAnalysisExecutor(
+        judgment_engine=judgment,
+        ai_runtime=runtime,
+    ).execute(job, _Audio(), _Token())
+
+    assert result.status is AnalysisExecutionStatus.SUCCEEDED
+    assert len(judgment.calls) == 1
+    assert len(runtime.calls) == 1
+    call = runtime.calls[0]
+    assert call["toolchain_id"] == toolchain.toolchain_id
+    assert call["entrypoint"] == toolchain.entrypoint
+    assert call["package_dir"] == toolchain.package_dir
+    assert call["timeout_ms"] == 1_250
+    assert call["request_id"] == call["request_payload"]["request_id"]
+    assert call["request_payload"]["protocol_version"] == 1
+    assert call["request_payload"]["test_run_id"] == "run-1"
+    assert call["request_payload"]["toolchain_id"] == toolchain.toolchain_id
+    assert call["request_payload"]["params"] == {"z": 1, "a": "值"}
+    assert call["request_payload"]["segments"][0]["audio_path"] == (
+        job.audio.absolute_path
     )
 
+    payload = _plain_frozen(result.result_payload)
+    assert payload["judgment"] == "FAIL"
+    nested = payload["result"]
+    assert nested["limit_pass"] is True
+    assert nested["ai_pass"] is False
+    assert nested["ai_score"] == pytest.approx(0.12)
+    assert nested["judgment_payload"]["ai_pass"] is False
+    assert nested["judgment_payload"]["ai_score"] == pytest.approx(0.12)
+    assert nested["summary_payload"]["overall_status"] == "fail"
+    ai_row = nested["summary_payload"]["rows"][-1]
+    assert ai_row["item_key"] == "ai"
+    assert ai_row["actual_display"] == "0.12"
+    assert ai_row["status"] == "NG"
+    assert ai_row["constrained"] is True
 
-def test_nonempty_ai_snapshot_never_calls_any_ai_runtime_or_legacy_executor():
+
+def test_resident_ai_failure_preserves_legacy_result_and_surfaces_no_result(
+    tmp_path,
+):
+    runtime = _ResidentAiRuntime(
+        {
+            "module_status": "timeout",
+            "error_summary": "Process timed out",
+        }
+    )
     judgment = _Judgment()
-    executor = ProductionAnalysisExecutor(judgment_engine=judgment)
-    with pytest.raises(AnalysisExecutionError):
-        executor.execute(_job(toolchain=_toolchain()), _Audio(), _Token())
-    assert judgment.calls == []
+
+    result = ProductionAnalysisExecutor(
+        judgment_engine=judgment,
+        ai_runtime=runtime,
+    ).execute(
+        _job(
+            toolchain=_toolchain(execution_mode="resident_process"),
+            audio_path=str((tmp_path / "final.wav").resolve()),
+        ),
+        _Audio(),
+        _Token(),
+    )
+
+    assert result.status is AnalysisExecutionStatus.SUCCEEDED
+    assert len(judgment.calls) == 1
+    assert len(runtime.calls) == 1
+    payload = _plain_frozen(result.result_payload)
+    assert payload["judgment"] == "PASS"
+    nested = payload["result"]
+    assert nested["limit_pass"] is True
+    assert nested["ai_pass"] is None
+    assert nested["ai_score"] is None
+    assert nested["judgment_payload"]["overall"] == "合格"
+    assert nested["summary_payload"]["overall_status"] == "no_result"
+    assert nested["summary_payload"]["error_message"] == "Process timed out"
+    ai_row = nested["summary_payload"]["rows"][-1]
+    assert ai_row["item_key"] == "ai"
+    assert ai_row["actual_display"] == "--"
+    assert ai_row["status"] == "无结果"
+    assert ai_row["constrained"] is True
 
 
 def test_frozen_ai_failure_summary_binds_canonical_snapshot_identity():

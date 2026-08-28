@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 from dataclasses import asdict, fields, is_dataclass
+from pathlib import Path
 from typing import Mapping
 
 import numpy as np
@@ -13,6 +14,7 @@ import numpy as np
 from app.service.analysis import dsp
 from app.service.analysis.golden_reference import FrozenGoldenArtifact
 from app.service.analysis.judgment import JudgmentEngine, _runtime_channel_defaults
+from app.service.ai_resident_runtime import ResidentToolchainRuntime
 from app.service.analysis.review_payloads import (
     build_chart_payload,
     build_summary_payload,
@@ -387,18 +389,184 @@ class ProductionAnalysisExecutor:
         frozen_golden_artifacts: Mapping[
             tuple[int, int], FrozenGoldenArtifact
         ] | None = None,
+        ai_runtime: object | None = None,
     ) -> None:
         self._judgment = judgment_engine or JudgmentEngine(None)
         self._golden = dict(frozen_golden_artifacts or {})
+        self._ai_runtime = ai_runtime or ResidentToolchainRuntime()
+
+    def close(self) -> None:
+        self._ai_runtime.shutdown_all()
+
+    def _run_frozen_ai(
+        self,
+        *,
+        job: AnalysisJob,
+        config: dict,
+        workorder: dict,
+        channel_order: list[int],
+    ) -> dict:
+        toolchain = job.snapshot.ai_toolchain
+        if toolchain is None:
+            return {"status": "skipped"}
+        if toolchain.execution_mode != "resident_process":
+            return {
+                "status": "process_error",
+                "error_message": "AI execution mode is not supported",
+            }
+
+        params = _decode_object(toolchain.params_json, "AI params")
+        request_id = job.analysis_attempt_id
+        duration_ms = int(
+            round(
+                (
+                    job.snapshot.analysis_window_end_seconds
+                    - job.snapshot.analysis_window_start_seconds
+                )
+                * 1000.0
+            )
+        )
+        audio_parent = Path(job.audio.absolute_path).parent
+        ai_runs_root = (
+            audio_parent.parent / "ai_runs"
+            if audio_parent.name.lower() == "run_audio"
+            else audio_parent / "ai_runs"
+        )
+        work_dir = ai_runs_root / job.analysis_attempt_id
+        artifacts_dir = work_dir / "artifacts"
+        artifacts_dir.mkdir(parents=True, exist_ok=True)
+        request = {
+            "protocol_version": 1,
+            "request_id": request_id,
+            "test_run_id": job.run_id,
+            "toolchain_id": toolchain.toolchain_id,
+            "segments": [
+                {
+                    "segment_id": (
+                        job.audio.audio_data_id or job.audio.reference_id
+                    ),
+                    "role": "device_1",
+                    "audio_path": job.audio.absolute_path,
+                    "channels": list(range(job.audio.channel_count)),
+                    "source_channels": list(channel_order),
+                    "channel_map": [
+                        {
+                            "logical_channel": column,
+                            "source_channel": source,
+                        }
+                        for column, source in enumerate(channel_order)
+                    ],
+                    "duration_ms": duration_ms,
+                    "sample_rate": job.audio.sample_rate_hz,
+                    "metadata": {},
+                }
+            ],
+            "context": {
+                "config_id": config.get("config_id"),
+                "workorder": workorder,
+            },
+            "params": params,
+            "window_info": {
+                "final_window_offset_ms": int(
+                    round(
+                        job.snapshot.analysis_window_start_seconds
+                        * 1000.0
+                    )
+                ),
+                "final_window_duration_ms": duration_ms,
+            },
+        }
+        (work_dir / "request.json").write_text(
+            json.dumps(request, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        transport = self._ai_runtime.analyze(
+            toolchain_id=toolchain.toolchain_id,
+            entrypoint=toolchain.entrypoint,
+            package_dir=toolchain.package_dir,
+            request_id=request_id,
+            request_payload=request,
+            artifacts_dir=str(artifacts_dir),
+            timeout_ms=max(
+                1,
+                int(round(toolchain.timeout_seconds * 1000.0)),
+            ),
+        )
+        if transport.get("module_status") != "success":
+            return {
+                "status": str(
+                    transport.get("module_status") or "process_error"
+                ),
+                "error_message": str(
+                    transport.get("error_summary") or "AI analysis failed"
+                ),
+            }
+        response = transport.get("response_payload")
+        if isinstance(response, dict):
+            (work_dir / "response.json").write_text(
+                json.dumps(response, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        if (
+            not isinstance(response, dict)
+            or response.get("request_id") != request_id
+        ):
+            return {
+                "status": "protocol_error",
+                "error_message": "AI response is invalid",
+            }
+        ai_result = response.get("ai_result")
+        if not isinstance(ai_result, dict):
+            return {
+                "status": "protocol_error",
+                "error_message": "AI result is missing",
+            }
+        score_value = ai_result.get("score")
+        score = (
+            float(score_value)
+            if type(score_value) in (int, float)
+            and math.isfinite(float(score_value))
+            else None
+        )
+        extra = ai_result.get("extra")
+        extra = extra if isinstance(extra, dict) else {}
+        threshold_value = extra.get(
+            "decision_threshold",
+            params.get("decision_threshold", 0.5),
+        )
+        threshold = (
+            float(threshold_value)
+            if type(threshold_value) in (int, float)
+            and math.isfinite(float(threshold_value))
+            else 0.5
+        )
+        label = str(ai_result.get("ai_label") or "").strip()
+        normalized_label = label.upper()
+        if normalized_label in {"PASS", "OK"}:
+            passed = True
+        elif normalized_label in {"FAIL", "NG"}:
+            passed = False
+        else:
+            passed = score is not None and score >= threshold
+        reported_channel = extra.get("channel_index")
+        channel_index = None
+        if (
+            type(reported_channel) is int
+            and 0 <= reported_channel < len(channel_order)
+        ):
+            channel_index = channel_order[reported_channel]
+        return {
+            "status": "success",
+            "threshold": threshold,
+            "score": score,
+            "passed": passed,
+            "ai_label": label or None,
+            "channel_index": channel_index,
+            "error_message": None,
+            "summary": ai_result.get("summary"),
+        }
 
     def execute(self, job: AnalysisJob, audio, cancel_token) -> AnalysisExecutionResult:
-        toolchain = job.snapshot.ai_toolchain
-        if toolchain is not None:
-            summary = (
-                "FROZEN_AI_UNSUPPORTED:"
-                f"{frozen_ai_snapshot_identity(toolchain)}"
-            )
-            raise _failure(summary)
         try:
             config = _decode_object(
                 job.snapshot.config_snapshot_json,
@@ -542,10 +710,24 @@ class ProductionAnalysisExecutor:
                 )
             ):
                 raise ValueError("legacy judgment result is incoherent")
-            judgment = _map_legacy_verdict(
-                result.overall,
-                result.limit_pass,
+            ai_review = self._run_frozen_ai(
+                job=job,
+                config=config,
+                workorder=workorder,
+                channel_order=channel_order,
             )
+            ai_pass = ai_review.get("passed")
+            result.ai_pass = ai_pass if type(ai_pass) is bool else None
+            ai_score = ai_review.get("score")
+            result.ai_score = (
+                float(ai_score) if type(ai_score) is float else None
+            )
+            result.overall = (
+                "合格"
+                if result.limit_pass and result.ai_pass is not False
+                else "不合格"
+            )
+            judgment = "PASS" if result.overall == "合格" else "FAIL"
             judgment_payload = _plain_result(result)
             current_trace_payload = None
             if job.snapshot.current_trace_json:
@@ -594,7 +776,7 @@ class ProductionAnalysisExecutor:
             summary_payload = build_summary_payload(
                 config=config,
                 judgment_payload=judgment_payload,
-                ai_review={"status": "skipped"},
+                ai_review=ai_review,
                 chart_payload=chart_payload,
             )
             duration_sec = float(audio.frame_count) / float(audio.sample_rate_hz)
@@ -602,8 +784,8 @@ class ProductionAnalysisExecutor:
                 {
                     "legacy_overall": str(result.overall),
                     "limit_pass": bool(result.limit_pass),
-                    "ai_pass": None,
-                    "ai_score": None,
+                    "ai_pass": result.ai_pass,
+                    "ai_score": result.ai_score,
                     "analysis_window": [
                         float(item) for item in result.analysis_window
                     ],

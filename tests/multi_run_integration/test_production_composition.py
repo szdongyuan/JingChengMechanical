@@ -1408,6 +1408,100 @@ def test_run_freezer_loads_latest_calibration_for_each_new_run(tmp_path):
     assert first_payload.value_id != second_payload.value_id
 
 
+def test_run_freezer_snapshots_enabled_ai_toolchain_for_each_new_run(tmp_path):
+    import app.service.multi_run_integration.production_composition as module
+
+    current_toolchain = {
+        "toolchain_id": "20260828-physical-ai",
+        "execution_revision": "revision-1",
+        "execution_mode": "resident_process",
+        "entrypoint": r"C:\AI\stft_cnn_demo_runner.exe",
+        "package_dir": r"C:\AI",
+        "params": {
+            "decision_threshold": 0.5,
+            "display_name": "三段STFT异音检测",
+        },
+        "timeout_seconds": 30.0,
+    }
+    load_calls = []
+
+    def load_toolchain(config_id):
+        load_calls.append(config_id)
+        return current_toolchain
+
+    config = SimpleNamespace(config_id=11, selected_channels=(0,))
+    freezer = module._FrozenRunFreezer(
+        SimpleNamespace(configs=(config,)),
+        tmp_path,
+        ai_toolchain_loader=load_toolchain,
+    )
+    values = {
+        "analysis_duration": 2.25,
+        "analysis_window_offset_ms": 750,
+    }
+
+    first_payload = freezer._analysis_input(
+        config,
+        {"work_order": {"sn": "SN-001"}},
+        values,
+    )
+    current_toolchain["execution_revision"] = "revision-2"
+    current_toolchain["params"]["decision_threshold"] = 0.65
+    second_payload = freezer._analysis_input(
+        config,
+        {"work_order": {"sn": "SN-002"}},
+        values,
+    )
+
+    first = json.loads(first_payload.canonical_bytes)
+    second = json.loads(second_payload.canonical_bytes)
+    assert load_calls == [11, 11]
+    assert first["analysis"]["toolchain"] == {
+        "toolchain_id": "20260828-physical-ai",
+        "execution_revision": "revision-1",
+        "execution_mode": "resident_process",
+        "entrypoint": r"C:\AI\stft_cnn_demo_runner.exe",
+        "package_dir": r"C:\AI",
+        "params": {
+            "decision_threshold": 0.5,
+            "display_name": "三段STFT异音检测",
+        },
+        "timeout_seconds": 30.0,
+    }
+    assert second["analysis"]["toolchain"]["execution_revision"] == "revision-2"
+    assert second["analysis"]["toolchain"]["params"]["decision_threshold"] == 0.65
+    assert first_payload.value_id != second_payload.value_id
+
+
+def test_run_freezer_keeps_ai_disabled_when_loader_returns_none(tmp_path):
+    import app.service.multi_run_integration.production_composition as module
+
+    load_calls = []
+
+    def load_toolchain(config_id):
+        load_calls.append(config_id)
+        return None
+
+    config = SimpleNamespace(config_id=11, selected_channels=(0,))
+    freezer = module._FrozenRunFreezer(
+        SimpleNamespace(configs=(config,)),
+        tmp_path,
+        ai_toolchain_loader=load_toolchain,
+    )
+    payload = freezer._analysis_input(
+        config,
+        {"work_order": {}},
+        {
+            "analysis_duration": 1.0,
+            "analysis_window_offset_ms": 0,
+        },
+    )
+
+    frozen = json.loads(payload.canonical_bytes)
+    assert load_calls == [11]
+    assert frozen["analysis"]["toolchain"] is None
+
+
 @pytest.mark.parametrize(
     ("analysis_duration", "record_duration", "expected_frames"),
     [
