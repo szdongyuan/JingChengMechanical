@@ -52,6 +52,7 @@ from ._support import (
     Harness,
     FakeResident,
     FakeCurrentCollector,
+    canonical_payload,
     captured_request,
     completed_capture,
     frozen_captured,
@@ -327,43 +328,110 @@ def test_each_accepted_run_owns_one_isolated_current_collector() -> None:
     assert imported.current_factory.calls == []
 
 
-def test_enabled_current_create_or_start_failure_is_pre_resident_current_invalid() -> None:
-    cases = ("factory-none", "factory-exception", "start-false", "start-exception")
-    for index, case in enumerate(cases):
-        harness = Harness()
-        harness.captured_freezer.result_factory = lambda request: frozen_captured(
-            request,
-            current_enabled=True,
-        )
-        collector = FakeCurrentCollector(harness.trace)
-        if case == "factory-none":
-            harness.current_factory.collectors.append(None)
-        elif case == "factory-exception":
-            harness.current_factory.exception = RuntimeError("create failed")
-        elif case == "start-false":
-            collector.start_result = False
-            harness.current_factory.collectors.append(collector)
-        else:
-            collector.start_exception = RuntimeError("start failed")
-            harness.current_factory.collectors.append(collector)
-        coordinator = harness.coordinator()
+@pytest.mark.parametrize(
+    ("case", "expected_stage"),
+    (
+        ("factory-none", "create current collector"),
+        ("factory-exception", "create current collector"),
+        ("start-false", "start current collector"),
+        ("start-exception", "start current collector"),
+    ),
+)
+def test_current_setup_failure_is_diagnostic_and_audio_path_continues(
+    case: str,
+    expected_stage: str,
+) -> None:
+    harness = Harness()
+    harness.save_dispatcher.synchronous_outcome = saved_outcome
+    harness.captured_freezer.result_factory = lambda request: frozen_captured(
+        request,
+        current_enabled=True,
+    )
+    collector = FakeCurrentCollector(harness.trace)
+    if case == "factory-none":
+        harness.current_factory.collectors.append(None)
+    elif case == "factory-exception":
+        harness.current_factory.exception = RuntimeError("create failed")
+    elif case == "start-false":
+        collector.start_result = False
+        harness.current_factory.collectors.append(collector)
+    else:
+        collector.start_exception = RuntimeError("start failed")
+        harness.current_factory.collectors.append(collector)
+    coordinator = harness.coordinator()
 
-        result = coordinator.start_captured(captured_request(RUN_IDS[index]))
+    result = coordinator.start_captured(captured_request())
+    assert result.status is StartStatus.ACCEPTED_ACTIVE
+    assert len(harness.resident.register_calls) == 1
+    assert len(harness.resident.start_calls) == 1
 
-        assert result.status is StartStatus.ACCEPTED_TERMINAL
-        assert result.terminal is not None
-        assert (
-            result.terminal.error_category
-            is TerminalErrorCategory.CURRENT_TRACE_INVALID
-        )
-        assert (
-            "create" if case.startswith("factory") else "start"
-        ) in result.terminal.reason
-        assert harness.resident.register_calls == []
-        assert harness.resident.start_calls == []
-        assert harness.persistence.current_calls == []
-        assert harness.save_dispatcher.calls == []
-        assert harness.scheduler.initial_calls == []
+    harness.resident.complete(completed_capture(harness.resident.register_calls[0]))
+
+    assert harness.persistence.terminal_calls == []
+    assert harness.persistence.current_calls == []
+    assert len(harness.save_dispatcher.calls) == 1
+    assert len(harness.scheduler.initial_calls) == 1
+    diagnostics = [
+        fact
+        for fact in harness.diagnostics.calls
+        if fact.stage == expected_stage
+    ]
+    assert len(diagnostics) == 1
+    assert diagnostics[0].run_id == RUN_IDS[0]
+    assert diagnostics[0].category is TerminalErrorCategory.CURRENT_TRACE_INVALID
+
+
+@pytest.mark.parametrize(
+    ("current_meter", "creation_error"),
+    (
+        ("not-an-object", "frozen current_meter must be an object"),
+        ({"enabled": "yes"}, "frozen current_meter.enabled must be a bool"),
+    ),
+)
+def test_malformed_current_config_is_auxiliary_to_frozen_audio_input(
+    current_meter: object,
+    creation_error: str,
+) -> None:
+    harness = Harness()
+    harness.save_dispatcher.synchronous_outcome = saved_outcome
+    request = captured_request()
+    malformed = replace(
+        frozen_captured(request),
+        config_payload=canonical_payload(
+            {
+                "schema": "jingcheng-run-config/v1",
+                "config": {
+                    "config_id": 7,
+                    "config_name": "配置 A",
+                    "current_meter": current_meter,
+                    "fault_types": [],
+                },
+            }
+        ),
+    )
+    harness.captured_freezer.result_factory = lambda _request: malformed
+    harness.current_factory.exception = ValueError(creation_error)
+    coordinator = harness.coordinator()
+
+    result = coordinator.start_captured(request)
+    assert result.status is StartStatus.ACCEPTED_ACTIVE
+    assert len(harness.current_factory.calls) == 1
+    assert len(harness.resident.register_calls) == 1
+    assert len(harness.resident.start_calls) == 1
+
+    harness.resident.complete(completed_capture(harness.resident.register_calls[0]))
+
+    assert harness.persistence.terminal_calls == []
+    assert len(harness.save_dispatcher.calls) == 1
+    assert len(harness.scheduler.initial_calls) == 1
+    diagnostics = [
+        fact
+        for fact in harness.diagnostics.calls
+        if fact.stage == "create current collector"
+    ]
+    assert len(diagnostics) == 1
+    assert diagnostics[0].run_id == request.run_id
+    assert creation_error in diagnostics[0].message
 
 
 def test_admission_seventh_capacity_is_resident_authority() -> None:

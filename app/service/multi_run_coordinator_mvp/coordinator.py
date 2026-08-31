@@ -3544,28 +3544,30 @@ class MultiRunCoordinator:
         try:
             collector = self._current_collector_factory(context.run_id, frozen)
         except Exception as exc:
-            return self._terminalize(
+            self._diagnose(
+                "create current collector",
                 context,
-                TerminalConclusion.ERROR,
                 TerminalErrorCategory.CURRENT_TRACE_INVALID,
-                self._exception_reason("create current collector", exc),
+                exc,
             )
+            return None
         try:
             enabled = self._current_source_enabled(frozen)
         except Exception as exc:
-            return self._terminalize(
+            self._diagnose(
+                "current configuration",
                 context,
-                TerminalConclusion.ERROR,
                 TerminalErrorCategory.CURRENT_TRACE_INVALID,
-                self._exception_reason("create current collector", exc),
+                exc,
             )
+            return None
         if collector is None:
             if enabled:
-                return self._terminalize(
+                self._diagnose(
+                    "create current collector",
                     context,
-                    TerminalConclusion.ERROR,
                     TerminalErrorCategory.CURRENT_TRACE_INVALID,
-                    "create current collector returned None",
+                    RuntimeError("create current collector returned None"),
                 )
             return None
         with self._lock:
@@ -3625,22 +3627,21 @@ class MultiRunCoordinator:
                 self._cleanup_terminal_current(context)
             return self._current_start_result(context)
         if start_error is not None:
-            return self._terminalize(
+            self._diagnose(
+                "start current collector",
                 context,
-                TerminalConclusion.ERROR,
                 TerminalErrorCategory.CURRENT_TRACE_INVALID,
-                self._exception_reason(
-                    "start current collector",
-                    start_error,
-                ),
+                start_error,
             )
+            return None
         if started is not True:
-            return self._terminalize(
+            self._diagnose(
+                "start current collector",
                 context,
-                TerminalConclusion.ERROR,
                 TerminalErrorCategory.CURRENT_TRACE_INVALID,
-                "start current collector returned false",
+                RuntimeError("start current collector returned false"),
             )
+            return None
         return None
 
     def _freeze_captured(
@@ -3663,7 +3664,6 @@ class MultiRunCoordinator:
         frozen_error = None
         if isinstance(frozen, FrozenCapturedRun):
             try:
-                self._current_source_enabled(frozen)
                 self._frozen_channel_order(frozen)
             except Exception as exc:
                 frozen_error = exc
@@ -5168,23 +5168,13 @@ class MultiRunCoordinator:
 
     def _cleanup_terminal_current(self, context: _RunContext) -> None:
         _, errors = self._read_settled_current(context)
-        if not errors:
-            return
-        stage, error = errors[0]
-        detail = self._bounded(
-            f"{stage}: {self._exception_reason('current cleanup', error)}"
-        )
-        with self._lock:
-            self._restart_required = True
-            self._lifecycle = CoordinatorLifecycle.CLOSED
-            self._record_lifecycle_error_locked(detail)
-            self._condition.notify_all()
-        self._diagnose(
-            "current cleanup",
-            context,
-            TerminalErrorCategory.CAPTURE_FAILED,
-            RuntimeError(detail),
-        )
+        for stage, error in errors:
+            self._diagnose(
+                f"current cleanup {stage}",
+                context,
+                TerminalErrorCategory.CURRENT_TRACE_INVALID,
+                error,
+            )
 
     def _settle_completed_current(
         self,
@@ -5192,6 +5182,13 @@ class MultiRunCoordinator:
         audio: object,
     ) -> None:
         samples, errors = self._read_settled_current(context)
+        for stage, error in errors:
+            self._diagnose(
+                f"current {stage}",
+                context,
+                TerminalErrorCategory.CURRENT_TRACE_INVALID,
+                error,
+            )
         with self._lock:
             contender = self._pop_pending_terminal_locked(context)
             lifecycle_cancel = bool(
@@ -5209,15 +5206,6 @@ class MultiRunCoordinator:
                 TerminalConclusion.MANUAL_STOPPED,
                 TerminalErrorCategory.MANUAL_STOPPED,
                 "Coordinator lifecycle stop requested",
-            )
-            return
-        if errors:
-            stage, error = errors[0]
-            self._terminalize(
-                context,
-                TerminalConclusion.ERROR,
-                TerminalErrorCategory.CURRENT_TRACE_INVALID,
-                self._exception_reason(f"current {stage}", error),
             )
             return
         frozen = context.frozen
@@ -5241,13 +5229,13 @@ class MultiRunCoordinator:
         try:
             trace = current_samples_to_trace(samples)
         except Exception as exc:
-            self._terminalize(
+            self._diagnose(
+                "current conversion",
                 context,
-                TerminalConclusion.ERROR,
                 TerminalErrorCategory.CURRENT_TRACE_INVALID,
-                self._exception_reason("current validate", exc),
+                exc,
             )
-            return
+            trace = None
         if trace is not None:
             try:
                 result = self._persistence.attach_current_trace(
@@ -5259,20 +5247,16 @@ class MultiRunCoordinator:
                 result = None
                 attach_error = exc
             if result is not CommitResult.COMMITTED:
-                self._terminalize(
+                self._diagnose(
+                    "current attach",
                     context,
-                    TerminalConclusion.ERROR,
                     TerminalErrorCategory.CURRENT_TRACE_PERSIST_FAILED,
                     (
-                        self._exception_reason(
-                            "current attach",
-                            attach_error,
-                        )
+                        attach_error
                         if attach_error is not None
-                        else "current attach was not committed"
+                        else RuntimeError("current attach was not committed")
                     ),
                 )
-                return
         self._begin_save(context, selected_audio)
 
     def _begin_save(self, context: _RunContext, source: object) -> None:
