@@ -298,6 +298,7 @@ def test_default_semantic_config_routes_manual_ingress_from_frozen_prepare_ident
     assert services.factory_mode.start_manual({"sn": "SN-101"}) is True
     assert coordinators[0].captured_event.wait(timeout=2)
     assert len(coordinators[0].captured) == 1
+    assert coordinators[0].captured[0].source is TriggerSource.MANUAL
     ingress = json.loads(
         coordinators[0].captured[0].ingress_payload.canonical_bytes
     )
@@ -357,6 +358,10 @@ def test_two_plc_starts_do_not_wait_for_first_start_admission(
     assert [item.trigger_monotonic_ns for item in coordinator.captured] == [
         111_222,
         333_444,
+    ]
+    assert [item.source for item in coordinator.captured] == [
+        TriggerSource.PLC,
+        TriggerSource.PLC,
     ]
     assert [
         json.loads(item.ingress_payload.canonical_bytes)["config"]["config_id"]

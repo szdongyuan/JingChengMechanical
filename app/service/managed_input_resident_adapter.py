@@ -99,6 +99,11 @@ class ResidentManagedInputAdapter:
         fault_close_timeout_s: float,
         shutdown_timeout_s: float,
         calibration_wait_margin_s: float,
+        endpoint_resolver: object | None = None,
+        drain_observer: Callable[
+            [str, np.ndarray, int, int, int], None
+        ]
+        | None = None,
         monotonic_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
         self._frames_per_buffer = _require_exact_int(
@@ -134,6 +139,14 @@ class ResidentManagedInputAdapter:
         self._level_meter = level_meter
         self._calibration_wait_margin_s = calibration_wait_margin_s
         self._monotonic_ns = monotonic_ns
+        if endpoint_resolver is not None and not callable(
+            getattr(endpoint_resolver, "resolve", None)
+        ):
+            raise TypeError("endpoint_resolver must provide resolve")
+        self._endpoint_resolver = endpoint_resolver
+        if drain_observer is not None and not callable(drain_observer):
+            raise TypeError("drain_observer must be callable or None")
+        self._drain_observer = drain_observer
 
         self._lock = threading.Lock()
         self._state = "NEW"
@@ -203,6 +216,13 @@ class ResidentManagedInputAdapter:
                     startup_stream_timeout_s=self._startup_stream_timeout_s,
                     fault_close_timeout_s=self._fault_close_timeout_s,
                     shutdown_timeout_s=self._shutdown_timeout_s,
+                    endpoint_identities={
+                        resident_id_by_managed[item.hardware_id]: item
+                        for item in ordered
+                        if item.hardware_id not in conversion_failures
+                    },
+                    endpoint_resolver=self._endpoint_resolver,
+                    drain_observer=self._drain_observer,
                 )
             except Exception:
                 pool = None
@@ -462,7 +482,9 @@ class ResidentManagedInputAdapter:
             return "unsupported_channel_count"
         channel_count = endpoint.input_channels
         bytes_per_frame = channel_count * np.dtype(np.float32).itemsize
-        ring_frames = int(rate) * 2 + self._frames_per_buffer
+        # The Ring keeps a two-second logical mapping window inside a larger
+        # ten-second physical buffer used to isolate downstream scheduling.
+        ring_frames = int(rate) * 10 + self._frames_per_buffer
         if (
             ring_frames > MAX_ALLOCATABLE_FRAMES
             or ring_frames > MAX_RING_BYTES_PER_STREAM // bytes_per_frame

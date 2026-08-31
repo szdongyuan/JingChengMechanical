@@ -771,7 +771,7 @@ def test_stop_suppresses_display_emits_after_busy_worker_timeout():
     ) is True
     assert pipeline.started.wait(1.0)
 
-    dispatcher.stop(timeout=0.01)
+    assert dispatcher.stop(timeout=0.01) is False
 
     assert bus.log.calls
     assert "did not stop" in bus.log.calls[-1][0].lower()
@@ -784,6 +784,36 @@ def test_stop_suppresses_display_emits_after_busy_worker_timeout():
     assert bus.loudness_updated.calls == []
     assert bus.octave_updated.calls == []
     assert bus.fft_updated.calls == []
+
+
+def test_stop_uses_one_deadline_for_both_workers():
+    bus = _Bus()
+    dispatcher = LiveDisplayDispatcher(
+        pipelines=[],
+        bus=bus,
+        config_id=7,
+    )
+    release = threading.Event()
+    display_thread = threading.Thread(target=release.wait)
+    loudness_thread = threading.Thread(target=release.wait)
+    display_thread.start()
+    loudness_thread.start()
+    dispatcher._thread = display_thread
+    dispatcher._loudness_thread = loudness_thread
+
+    try:
+        started = time.monotonic()
+        result = dispatcher.stop(timeout=0.05)
+        elapsed = time.monotonic() - started
+
+        assert result is False
+        assert elapsed < 0.08
+        assert display_thread.is_alive()
+        assert loudness_thread.is_alive()
+    finally:
+        release.set()
+        display_thread.join(1.0)
+        loudness_thread.join(1.0)
 
 
 def test_submit_after_stop_is_rejected_without_thread_restart_or_emit():

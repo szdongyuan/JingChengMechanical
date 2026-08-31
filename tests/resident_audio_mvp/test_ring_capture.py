@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import inspect
 import threading
+import time
 import weakref
 from dataclasses import fields
 
@@ -195,6 +196,13 @@ def make_slot() -> tuple[_ResidentStreamSlot, ManualMonotonicClock]:
     )
     slot.publish_drain_owner()
     return slot, clock
+
+
+def wait_for_slot_drain(slot: _ResidentStreamSlot) -> None:
+    deadline = time.monotonic() + 1
+    while slot._ingress.has_pending and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert not slot._ingress.has_pending
 
 
 def callback_block() -> np.ndarray:
@@ -443,6 +451,7 @@ def test_positive_callback_delay_keeps_stream_available_for_later_runs() -> None
         1_000_000_000,
         BackendCallbackStatus.OK,
     )
+    wait_for_slot_drain(slot)
     clock.advance_ns(1_000_000_000)
     before_cursor = slot._ring.write_cursor
 
@@ -453,6 +462,7 @@ def test_positive_callback_delay_keeps_stream_available_for_later_runs() -> None
         1_500_000_001,
         BackendCallbackStatus.OK,
     )
+    wait_for_slot_drain(slot)
 
     assert first is BackendCallbackDirective.CONTINUE
     assert second is BackendCallbackDirective.CONTINUE
@@ -538,6 +548,7 @@ def test_large_timeline_overlap_still_faults_without_partial_append() -> None:
         1_000_000_000,
         BackendCallbackStatus.OK,
     )
+    wait_for_slot_drain(slot)
     clock.advance_ns(1_000_000_000)
     before_cursor = slot._ring.write_cursor
 
@@ -548,9 +559,10 @@ def test_large_timeline_overlap_still_faults_without_partial_append() -> None:
         899_999_999,
         BackendCallbackStatus.OK,
     )
+    wait_for_slot_drain(slot)
 
     assert first is BackendCallbackDirective.CONTINUE
-    assert second is BackendCallbackDirective.STOP
+    assert second is BackendCallbackDirective.CONTINUE
     assert slot._fault is not None
     assert slot._ring.write_cursor == before_cursor
 
@@ -568,6 +580,7 @@ def test_timestamp_rollback_and_format_change_fault_without_partial_append() -> 
         )
         is BackendCallbackDirective.CONTINUE
     )
+    wait_for_slot_drain(slot)
     before_cursor = slot._ring.write_cursor
     clock.advance_ns(1_000_000_000)
 
@@ -578,8 +591,9 @@ def test_timestamp_rollback_and_format_change_fault_without_partial_append() -> 
         999_999_999,
         BackendCallbackStatus.OK,
     )
+    wait_for_slot_drain(slot)
 
-    assert directive is BackendCallbackDirective.STOP
+    assert directive is BackendCallbackDirective.CONTINUE
     assert slot._fault is not None
     assert slot._ring.write_cursor == before_cursor
 

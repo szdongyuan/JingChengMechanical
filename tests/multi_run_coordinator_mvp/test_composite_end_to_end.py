@@ -29,6 +29,8 @@ from app.service.multi_run_coordinator_mvp import (
     CommitResult,
     CapturedAudioSaveRequest,
     CapturedStartRequest,
+    CaptureReserveResult,
+    CaptureReserveStatus,
     FinalPathRequest,
     FrozenCapturedRun,
     FrozenImportedRun,
@@ -1389,3 +1391,62 @@ def test_non_clean_upstream_skips_owner_phase_b_and_keeps_persistence_open(
         if not runtime.closed:
             cleanup = bridge.close_persistence_after_upstream_stopped()
             assert cleanup.status is BridgeDatabaseCloseStatus.DATABASE_CLOSED
+
+
+def test_recovery_compatibility_preserves_category_and_history_projection() -> None:
+    for index, source in enumerate(
+        (TriggerSource.MANUAL, TriggerSource.PLC),
+        start=2,
+    ):
+        timestamp = 9_000_000_000 + index
+        ingress = Harness()
+        request = replace(
+            captured_request(RUN_IDS[index], source=source),
+            trigger_monotonic_ns=timestamp,
+        )
+
+        accepted = ingress.coordinator().start_captured(request)
+
+        assert accepted.status is StartStatus.ACCEPTED_ACTIVE
+        assert ingress.resident.start_calls[0][1] == timestamp
+
+    unavailable = Harness()
+    unavailable.resident.reserve_results.append(
+        CaptureReserveResult(
+            status=CaptureReserveStatus.NOT_READY,
+            run_id=RUN_IDS[0],
+            hardware_id="hardware-1",
+            reservation=None,
+            reason="resolve_endpoint/endpoint_missing: exact endpoint unavailable",
+        )
+    )
+
+    rejected = unavailable.coordinator().start_captured(
+        captured_request(RUN_IDS[0])
+    )
+
+    assert rejected.status is StartStatus.RESIDENT_UNAVAILABLE
+    assert rejected.terminal is not None
+    assert (
+        rejected.terminal.error_category
+        is TerminalErrorCategory.RESIDENT_UNAVAILABLE
+    )
+    assert rejected.reason == (
+        "resolve_endpoint/endpoint_missing: exact endpoint unavailable"
+    )
+
+    projected = Harness()
+    frozen = frozen_captured(captured_request(RUN_IDS[1]))
+    projected.captured_freezer.result_factory = lambda _request: frozen
+
+    started = projected.coordinator().start_captured(
+        captured_request(RUN_IDS[1])
+    )
+
+    assert started.status is StartStatus.ACCEPTED_ACTIVE
+    assert projected.projector.calls[0].projection.history_labels is (
+        frozen.history_labels
+    )
+    assert projected.history.calls[0].projection.history_labels is (
+        frozen.history_labels
+    )

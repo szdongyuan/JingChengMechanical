@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-import threading
+import logging
 import math
+import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from enum import Enum, auto
 from typing import final
 
@@ -15,6 +16,8 @@ from app.service.analysis.resident_audio_mvp import (
     CapturedAudio,
     CaptureOutcome as ResidentCaptureOutcome,
     CaptureOutcomeStatus as ResidentCaptureOutcomeStatus,
+    LifecycleOutcome,
+    LifecycleStatus,
     ResidentError,
     ResidentErrorCode,
     ResidentRequestError,
@@ -34,12 +37,21 @@ from .contracts import (
     CaptureOutcome,
     CaptureOutcomeStatus,
     CaptureReservation,
+    CaptureReserveClaim,
+    CaptureReservePending,
     CaptureReserveResult,
     CaptureReserveStatus,
+    CaptureReserveWakeSignal,
     ResidentCancelResult,
     ResidentCancelStatus,
     TerminalErrorCategory,
+    _issue_capture_reserve_claim,
+    _issue_capture_reserve_wake_signal,
+    _validate_capture_reserve_claim,
 )
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 _MAX_RESERVATIONS = 6
@@ -168,6 +180,12 @@ class _ReservationEntry:
 class _ReserveClaim:
     run_id: str
     report_id: str
+    token: CaptureReserveClaim | None = None
+    route: ManagedResidentCaptureRoute | None = None
+    target: ResidentCaptureTarget | None = None
+    readiness_ticket: object | None = None
+    wake_signal: CaptureReserveWakeSignal | None = None
+    cancel_requested: bool = False
     in_flight: bool = True
     settled_at: float | None = None
 
@@ -203,9 +221,223 @@ class ManagedResidentCapturePort:
         self._lock = threading.Lock()
         self._condition = threading.Condition(self._lock)
         self._lifecycle = _Lifecycle.OPEN
+        self._claim_owner_nonce = object()
+        self._next_claim_number = 1
         self._reserve_claims: dict[str, _ReserveClaim] = {}
         self._reservations: dict[str, _ReservationEntry] = {}
         self._clean_close_report: ManagedResidentCaptureCloseReport | None = None
+
+    def begin_reserve(
+        self,
+        run_id: str,
+        hardware_id: str,
+        trigger_monotonic_ns: int,
+        deadline_monotonic_ns: int,
+    ) -> CaptureReserveResult | CaptureReservePending:
+        with self._lock:
+            if self._lifecycle is not _Lifecycle.OPEN:
+                return self._reserve_failure(
+                    CaptureReserveStatus.CLOSING,
+                    run_id,
+                    hardware_id,
+                    "managed Resident capture port is closing",
+                )
+            route = self._routes.get(hardware_id)
+            if route is None:
+                return self._reserve_failure(
+                    CaptureReserveStatus.NOT_READY,
+                    run_id,
+                    hardware_id,
+                    "capture route is not configured",
+                )
+            if self._run_has_capacity_owner_locked(run_id):
+                return self._reserve_failure(
+                    CaptureReserveStatus.FAULT,
+                    run_id,
+                    hardware_id,
+                    "admission/duplicate_run_id: run already owns capture capacity",
+                )
+            if (
+                len(self._reservations) + len(self._reserve_claims)
+                >= _MAX_RESERVATIONS
+            ):
+                return self._reserve_failure(
+                    CaptureReserveStatus.CAPACITY,
+                    run_id,
+                    hardware_id,
+                    "admission/capture_capacity: managed Resident capacity is six",
+                )
+            claim_number = self._next_claim_number
+            self._next_claim_number += 1
+            token = _issue_capture_reserve_claim(
+                claim_id=f"resident-reserve-{claim_number:08d}",
+                run_id=run_id,
+                hardware_id=hardware_id,
+                trigger_monotonic_ns=trigger_monotonic_ns,
+                deadline_monotonic_ns=deadline_monotonic_ns,
+                owner_nonce=self._claim_owner_nonce,
+            )
+            claim = _ReserveClaim(
+                run_id=run_id,
+                report_id=token.claim_id,
+                token=token,
+                route=route,
+            )
+            self._reserve_claims[run_id] = claim
+
+        try:
+            target = self._managed_input.capture_target(
+                route.managed_hardware_id,
+                route.generation,
+            )
+            self._validate_target(target, route)
+            ticket = target.pool.begin_readiness(
+                target.resident_hardware_id,
+                deadline_monotonic_ns,
+            )
+            future = ticket.future
+            outcome = future.result_if_ready()
+        except Exception as exc:
+            cancelled = self._release_claim(claim)
+            if cancelled:
+                return self._reserve_failure(
+                    CaptureReserveStatus.CLOSING,
+                    run_id,
+                    hardware_id,
+                    "lifecycle/closing: reserve claim was cancelled",
+                )
+            return self._reserve_exception(exc, run_id, hardware_id)
+
+        claim.target = target
+        claim.readiness_ticket = ticket
+        if outcome is not None:
+            return self._complete_reserve_claim(claim, outcome)
+
+        wake_signal = _issue_capture_reserve_wake_signal(
+            claim=token,
+            owner_nonce=self._claim_owner_nonce,
+            wait=future.wait,
+        )
+        with self._lock:
+            current = self._reserve_claims.get(run_id)
+            if (
+                current is not claim
+                or claim.cancel_requested
+                or self._lifecycle is not _Lifecycle.OPEN
+            ):
+                self._release_claim_locked(claim)
+                return self._reserve_failure(
+                    CaptureReserveStatus.CLOSING,
+                    run_id,
+                    hardware_id,
+                    "lifecycle/closing: capture port closed during readiness",
+                )
+            claim.wake_signal = wake_signal
+            claim.in_flight = False
+            claim.settled_at = time.monotonic()
+            self._condition.notify_all()
+        return CaptureReservePending(
+            run_id,
+            hardware_id,
+            token,
+            wake_signal,
+        )
+
+    def resume_reserve(
+        self,
+        claim: CaptureReserveClaim,
+    ) -> CaptureReserveResult | CaptureReservePending:
+        token = _validate_capture_reserve_claim(
+            claim,
+            owner_nonce=self._claim_owner_nonce,
+        )
+        with self._lock:
+            current = self._reserve_claims.get(token.run_id)
+            if current is None or current.token is not token:
+                if self._lifecycle is not _Lifecycle.OPEN:
+                    return self._reserve_failure(
+                        CaptureReserveStatus.CLOSING,
+                        token.run_id,
+                        token.hardware_id,
+                        "lifecycle/closing: reserve continuation was cancelled",
+                    )
+                raise ValueError("capture reserve claim is unknown or already settled")
+            if current.in_flight:
+                raise ValueError("capture reserve claim is already being resumed")
+            if current.target is None or current.readiness_ticket is None:
+                raise RuntimeError("capture reserve claim is not resumable")
+            current.in_flight = True
+            current.settled_at = None
+            future = current.readiness_ticket.future
+
+        try:
+            remaining_ns = token.deadline_monotonic_ns - time.monotonic_ns()
+            outcome = (
+                None
+                if remaining_ns <= 0
+                else future.wait(remaining_ns / 1_000_000_000)
+            )
+        except Exception as exc:
+            cancelled = self._release_claim(current)
+            return self._reserve_failure(
+                (
+                    CaptureReserveStatus.CLOSING
+                    if cancelled
+                    else CaptureReserveStatus.FAULT
+                ),
+                token.run_id,
+                token.hardware_id,
+                (
+                    "lifecycle/closing: reserve claim was cancelled"
+                    if cancelled
+                    else _bounded_reason(
+                        exc,
+                        "Resident readiness continuation failed",
+                    )
+                ),
+            )
+        if outcome is None:
+            cancelled = self._release_claim(current)
+            return self._reserve_failure(
+                (
+                    CaptureReserveStatus.CLOSING
+                    if cancelled
+                    else CaptureReserveStatus.NOT_READY
+                ),
+                token.run_id,
+                token.hardware_id,
+                (
+                    "lifecycle/closing: reserve claim was cancelled"
+                    if cancelled
+                    else (
+                        "background_retry/retry_scheduled: Resident readiness "
+                        "deadline elapsed"
+                    )
+                ),
+            )
+        return self._complete_reserve_claim(current, outcome)
+
+    def cancel_reserve(self, claim: CaptureReserveClaim) -> bool:
+        token = _validate_capture_reserve_claim(
+            claim,
+            owner_nonce=self._claim_owner_nonce,
+        )
+        with self._lock:
+            current = self._reserve_claims.get(token.run_id)
+            if (
+                current is None
+                or current.token is not token
+                or current.cancel_requested
+            ):
+                return False
+            current.cancel_requested = True
+            if current.wake_signal is not None:
+                current.wake_signal._cancel()
+            if not current.in_flight:
+                self._release_claim_locked(current)
+            else:
+                self._condition.notify_all()
+            return True
 
     def reserve(self, run_id: str, hardware_id: str) -> CaptureReserveResult:
         with self._lock:
@@ -227,17 +459,24 @@ class ManagedResidentCapturePort:
             if self._readiness_probe is not None:
                 try:
                     input_ready = self._readiness_probe(hardware_id) is True
-                except Exception:
-                    input_ready = False
+                except Exception as exc:
+                    return self._reserve_failure(
+                        CaptureReserveStatus.NOT_READY,
+                        run_id,
+                        hardware_id,
+                        _bounded_reason(
+                            "liveness/backend_fault: readiness probe "
+                            f"{type(exc).__name__}: {exc}",
+                            "liveness/backend_fault: readiness probe failed",
+                        ),
+                    )
                 if not input_ready:
                     return self._reserve_failure(
                         CaptureReserveStatus.NOT_READY,
                         run_id,
                         hardware_id,
-                        (
-                            "音频输入设备未返回采样；已尝试重新启动音频流，"
-                            "请检查设备连接或重启软件。"
-                        ),
+                        "liveness/heartbeat_stale: "
+                        "readiness probe reported unavailable",
                     )
             if run_id in self._reserve_claims:
                 return self._reserve_failure(
@@ -545,6 +784,12 @@ class ManagedResidentCapturePort:
                 entry.cancel_requested = True
                 entry.close_requested = True
                 cancel_entries.append((entry, no_waiter))
+            for run_id, claim in tuple(self._reserve_claims.items()):
+                if claim.token is not None:
+                    claim.cancel_requested = True
+                    if not claim.in_flight:
+                        claim.settled_at = time.monotonic()
+                        del self._reserve_claims[run_id]
             observed_claims = tuple(self._reserve_claims.values())
             observed_start_entries = tuple(
                 entry
@@ -707,8 +952,12 @@ class ManagedResidentCapturePort:
         try:
             if sink is not None:
                 sink(mapped)
-        except Exception:
-            pass
+        except Exception as exc:
+            _LOGGER.exception(
+                "completion_sink/callback_failed %s: %s",
+                type(exc).__name__,
+                _bounded_reason(exc, "completion sink failed"),
+            )
         finally:
             with self._lock:
                 current = self._reservations.get(reservation_id)
@@ -819,10 +1068,7 @@ class ManagedResidentCapturePort:
             or type(error.code) is not ResidentErrorCode
         ):
             return False
-        try:
-            return replace(error) == error
-        except Exception:
-            return False
+        return type(error.summary) is str and bool(error.summary)
 
     @staticmethod
     def _resident_outcome_is_coherent(
@@ -834,10 +1080,6 @@ class ManagedResidentCapturePort:
             or type(outcome.status) is not ResidentCaptureOutcomeStatus
             or outcome.binding is not entry.binding
         ):
-            return False
-        try:
-            replace(outcome)
-        except Exception:
             return False
         if outcome.status is ResidentCaptureOutcomeStatus.COMPLETED:
             return (
@@ -871,10 +1113,6 @@ class ManagedResidentCapturePort:
             type(result) is not CancelResult
             or type(result.status) is not CancelStatus
         ):
-            return False
-        try:
-            replace(result)
-        except Exception:
             return False
         if result.status is CancelStatus.INVALID:
             return (
@@ -1042,6 +1280,212 @@ class ManagedResidentCapturePort:
             audio=None,
             error_category=TerminalErrorCategory.CAPTURE_FAILED,
             reason=_bounded_reason(reason, "Resident capture failed"),
+        )
+
+    def _complete_reserve_claim(
+        self,
+        claim: _ReserveClaim,
+        outcome: object,
+    ) -> CaptureReserveResult:
+        token = claim.token
+        if token is None:
+            raise RuntimeError("two-phase reserve claim has no token")
+        with self._lock:
+            current = self._reserve_claims.get(token.run_id)
+            if (
+                current is not claim
+                or claim.cancel_requested
+                or self._lifecycle is not _Lifecycle.OPEN
+            ):
+                self._release_claim_locked(claim)
+                return self._reserve_failure(
+                    CaptureReserveStatus.CLOSING,
+                    token.run_id,
+                    token.hardware_id,
+                    "lifecycle/closing: reserve claim was cancelled",
+                )
+        if type(outcome) is not LifecycleOutcome:
+            self._release_claim(claim)
+            return self._reserve_failure(
+                CaptureReserveStatus.FAULT,
+                token.run_id,
+                token.hardware_id,
+                "internal/invariant_violation: malformed readiness outcome",
+            )
+        if outcome.status is LifecycleStatus.GENERATION_CONTINUOUS:
+            if type(outcome.generation_id) is not str or not outcome.generation_id:
+                self._release_claim(claim)
+                return self._reserve_failure(
+                    CaptureReserveStatus.FAULT,
+                    token.run_id,
+                    token.hardware_id,
+                    "internal/invariant_violation: readiness has no generation",
+                )
+            return self._reserve_pinned_generation(
+                claim,
+                outcome.generation_id,
+            )
+
+        status = (
+            CaptureReserveStatus.CLOSING
+            if outcome.status is LifecycleStatus.LIFECYCLE_CANCELLED
+            else CaptureReserveStatus.NOT_READY
+        )
+        reason = self._lifecycle_reason(outcome)
+        self._release_claim(claim)
+        return self._reserve_failure(
+            status,
+            token.run_id,
+            token.hardware_id,
+            reason,
+        )
+
+    def _reserve_pinned_generation(
+        self,
+        claim: _ReserveClaim,
+        generation_id: str,
+    ) -> CaptureReserveResult:
+        token = claim.token
+        target = claim.target
+        if token is None or target is None:
+            raise RuntimeError("two-phase reserve claim is incomplete")
+        try:
+            binding = target.pool.reserve_capture(
+                token.run_id,
+                target.resident_hardware_id,
+                generation_id=generation_id,
+            )
+            self._validate_binding(
+                binding,
+                token.run_id,
+                target.resident_hardware_id,
+            )
+            reservation = CaptureReservation(
+                reservation_id=binding.binding_id,
+                run_id=token.run_id,
+                hardware_id=token.hardware_id,
+            )
+        except Exception as exc:
+            self._release_claim(claim)
+            if (
+                isinstance(exc, ResidentRequestError)
+                and exc.error.code is ResidentErrorCode.NOT_READY
+                and "generation changed" in exc.error.summary
+            ):
+                return self._reserve_failure(
+                    CaptureReserveStatus.NOT_READY,
+                    token.run_id,
+                    token.hardware_id,
+                    (
+                        "publish_candidate/generation_replaced_for_trigger: "
+                        f"{exc.error.summary}"
+                    ),
+                )
+            return self._reserve_exception(
+                exc,
+                token.run_id,
+                token.hardware_id,
+            )
+
+        entry = _ReservationEntry(
+            reservation=reservation,
+            target=target,
+            binding=binding,
+        )
+        with self._lock:
+            current = self._reserve_claims.get(token.run_id)
+            if (
+                current is claim
+                and not claim.cancel_requested
+                and self._lifecycle is _Lifecycle.OPEN
+                and reservation.reservation_id not in self._reservations
+            ):
+                claim.in_flight = False
+                claim.settled_at = time.monotonic()
+                self._reservations[reservation.reservation_id] = entry
+                del self._reserve_claims[token.run_id]
+                self._condition.notify_all()
+                return CaptureReserveResult(
+                    status=CaptureReserveStatus.RESERVED,
+                    run_id=token.run_id,
+                    hardware_id=token.hardware_id,
+                    reservation=reservation,
+                    reason="",
+                )
+            claim.report_id = reservation.reservation_id
+            late_status = (
+                CaptureReserveStatus.CLOSING
+                if (
+                    claim.cancel_requested
+                    or self._lifecycle is not _Lifecycle.OPEN
+                )
+                else CaptureReserveStatus.FAULT
+            )
+            self._condition.notify_all()
+
+        _, clean = self._call_cancel(entry)
+        with self._lock:
+            current = self._reserve_claims.get(token.run_id)
+            if current is claim:
+                claim.in_flight = False
+                claim.settled_at = time.monotonic()
+                if clean:
+                    del self._reserve_claims[token.run_id]
+                else:
+                    entry.state = _ReservationState.NON_CLEAN
+                    entry.cancel_requested = True
+                    entry.cancel_settlement = "NON_CLEAN"
+                    self._reservations[reservation.reservation_id] = entry
+                    del self._reserve_claims[token.run_id]
+                self._condition.notify_all()
+        return self._reserve_failure(
+            late_status,
+            token.run_id,
+            token.hardware_id,
+            (
+                "lifecycle/closing: capture port closed during reservation"
+                if late_status is CaptureReserveStatus.CLOSING
+                else "internal/invariant_violation: duplicate Resident binding"
+            ),
+        )
+
+    @staticmethod
+    def _lifecycle_reason(outcome: LifecycleOutcome) -> str:
+        diagnostic = outcome.diagnostic
+        if diagnostic is None:
+            return _bounded_reason(
+                outcome.status.value,
+                "Resident lifecycle unavailable",
+            )
+        return _bounded_reason(
+            (
+                f"{diagnostic.stage.value}/{diagnostic.reason_code.value}: "
+                f"{diagnostic.detail}"
+            ),
+            "Resident lifecycle unavailable",
+        )
+
+    def _release_claim(self, claim: _ReserveClaim) -> bool:
+        with self._lock:
+            cancelled = (
+                claim.cancel_requested
+                or self._lifecycle is not _Lifecycle.OPEN
+            )
+            self._release_claim_locked(claim)
+            return cancelled
+
+    def _release_claim_locked(self, claim: _ReserveClaim) -> None:
+        current = self._reserve_claims.get(claim.run_id)
+        if current is claim:
+            claim.in_flight = False
+            claim.settled_at = time.monotonic()
+            del self._reserve_claims[claim.run_id]
+            self._condition.notify_all()
+
+    def _run_has_capacity_owner_locked(self, run_id: str) -> bool:
+        return run_id in self._reserve_claims or any(
+            entry.reservation.run_id == run_id
+            for entry in self._reservations.values()
         )
 
     def _matching_entry(

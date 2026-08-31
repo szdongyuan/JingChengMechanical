@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -532,10 +533,14 @@ def test_prerequisites_keep_application_consumers_in_python_system_monotonic_dom
     managed = _managed(channels=1, trusted=(0,))
     config = _config(managed.hardware_id, selected=(0,))
     prepared, _, _, _ = _prepare((config.config_id,))
+    resolver = SimpleNamespace(resolve=lambda frozen: frozen)
+    observer = lambda *_args: None
     resident = prepared.build_resident_adapter(
         backend=object(),
         level_meter=lambda *_: 0.0,
         max_capture_frames=512,
+        endpoint_resolver=resolver,
+        drain_observer=observer,
     )
 
     class SoundDevice:
@@ -547,6 +552,8 @@ def test_prerequisites_keep_application_consumers_in_python_system_monotonic_dom
 
     assert prepared.monotonic_domain == PYTHON_SYSTEM_MONOTONIC_DOMAIN
     assert resident._monotonic_ns() == 1_000_000_000
+    assert resident._endpoint_resolver is resolver
+    assert resident._drain_observer is observer
     assert sounddevice.monotonic_domain == PYTHON_SYSTEM_MONOTONIC_DOMAIN
 
 

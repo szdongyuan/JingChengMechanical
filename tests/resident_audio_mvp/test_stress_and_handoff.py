@@ -17,6 +17,13 @@ import app.service.analysis.resident_audio_mvp.pool as pool_module
 from app.service.analysis.resident_audio_mvp import (
     CancelStatus,
     CaptureOutcomeStatus,
+    DiagnosticReason,
+    DiagnosticStage,
+    LifecycleFuture,
+    LifecycleOutcome,
+    LifecycleStatus,
+    ReadinessTicket,
+    ResidentDiagnostic,
     ResidentAudioPool,
     ResidentErrorCode,
     ResidentRequestError,
@@ -248,9 +255,17 @@ def test_public_exports_and_static_import_boundary() -> None:
 
     assert public.ResidentAudioPool is ResidentAudioPool
     assert public.SoundDeviceAudioBackend is SoundDeviceAudioBackend
+    assert public.DiagnosticReason is DiagnosticReason
+    assert public.DiagnosticStage is DiagnosticStage
+    assert public.LifecycleFuture is LifecycleFuture
+    assert public.LifecycleOutcome is LifecycleOutcome
+    assert public.LifecycleStatus is LifecycleStatus
+    assert public.ReadinessTicket is ReadinessTicket
+    assert public.ResidentDiagnostic is ResidentDiagnostic
     assert not hasattr(public, "_ResidentStreamSlot")
     assert not hasattr(public, "_ResidentRing")
     assert not hasattr(public, "_CaptureCompletionPublisher")
+    assert not hasattr(public, "_LifecyclePublisher")
 
     package = (
         Path(__file__).parents[2]
@@ -264,7 +279,6 @@ def test_public_exports_and_static_import_boundary() -> None:
         "_leaf_kernel",
         "ledger",
         "seeded",
-        "recovery",
         "reopen",
         "artifact",
         "settlement",

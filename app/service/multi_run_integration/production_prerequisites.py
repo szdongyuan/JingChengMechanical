@@ -106,6 +106,8 @@ class PreparedProductionPrerequisites:
         fault_close_timeout_s: float = 5.0,
         shutdown_timeout_s: float = 5.0,
         calibration_wait_margin_s: float = 1.0,
+        endpoint_resolver: object | None = None,
+        drain_observer=None,
     ) -> ResidentManagedInputAdapter:
         if len(self.managed_inputs) > 6:
             raise ProductionPrerequisiteError(
@@ -125,6 +127,8 @@ class PreparedProductionPrerequisites:
             fault_close_timeout_s=float(fault_close_timeout_s),
             shutdown_timeout_s=float(shutdown_timeout_s),
             calibration_wait_margin_s=float(calibration_wait_margin_s),
+            endpoint_resolver=endpoint_resolver,
+            drain_observer=drain_observer,
             monotonic_ns=monotonic_ns,
         )
         return adapter

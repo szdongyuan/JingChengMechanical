@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from threading import Event, Thread
+import time
 from types import SimpleNamespace
 from dataclasses import replace
 
@@ -35,6 +36,12 @@ from app.service.multi_run_coordinator_mvp.contracts import (
     AnalysisOutcome,
     AnalysisOutcomeStatus,
     SchedulerSubmitStatus,
+    CaptureReservePending,
+    _issue_capture_reserve_claim,
+    _issue_capture_reserve_wake_signal,
+)
+from app.service.captured_start_dispatcher import (
+    CapturedStartDispatcher,
 )
 
 from ._support import (
@@ -43,6 +50,7 @@ from ._support import (
     SAVE_JOB_IDS,
     AUDIO_IDS,
     Harness,
+    FakeResident,
     FakeCurrentCollector,
     captured_request,
     completed_capture,
@@ -52,6 +60,68 @@ from ._support import (
     completed_analysis,
     payload,
 )
+
+
+class _PendingResident(FakeResident):
+    def __init__(self, trace: list[str]) -> None:
+        super().__init__(trace)
+        self.owner_nonce = object()
+        self.ready = Event()
+        self.begin_calls: list[tuple[str, str, int, int]] = []
+        self.resume_calls: list[object] = []
+        self.cancel_reserve_calls: list[object] = []
+        self.claim = None
+        self.pending_hardware_ids = {"hardware-1"}
+
+    def begin_reserve(
+        self,
+        run_id: str,
+        hardware_id: str,
+        trigger_monotonic_ns: int,
+        deadline_monotonic_ns: int,
+    ) -> CaptureReservePending:
+        self.trace.append("begin_reserve")
+        self.begin_calls.append(
+            (
+                run_id,
+                hardware_id,
+                trigger_monotonic_ns,
+                deadline_monotonic_ns,
+            )
+        )
+        if hardware_id not in self.pending_hardware_ids:
+            return self.reserve(run_id, hardware_id)
+        self.claim = _issue_capture_reserve_claim(
+            claim_id=f"claim-{run_id}",
+            run_id=run_id,
+            hardware_id=hardware_id,
+            trigger_monotonic_ns=trigger_monotonic_ns,
+            deadline_monotonic_ns=deadline_monotonic_ns,
+            owner_nonce=self.owner_nonce,
+        )
+        return CaptureReservePending(
+            run_id,
+            hardware_id,
+            self.claim,
+            _issue_capture_reserve_wake_signal(
+                claim=self.claim,
+                owner_nonce=self.owner_nonce,
+                wait=lambda timeout: (
+                    True if self.ready.wait(timeout) else None
+                ),
+            ),
+        )
+
+    def resume_reserve(self, claim):
+        self.trace.append("resume_reserve")
+        self.resume_calls.append(claim)
+        return self.reserve(claim.run_id, claim.hardware_id)
+
+    def cancel_reserve(self, claim) -> bool:
+        self.trace.append("cancel_reserve")
+        self.cancel_reserve_calls.append(claim)
+        self.ready.set()
+        return True
 
 
 def _assert_error_physical_plc_payload(value: object) -> None:
@@ -83,6 +153,91 @@ def _assert_error_physical_plc_payload(value: object) -> None:
 
 def test_admission_package_root_exports_coordinator() -> None:
     assert package.MultiRunCoordinator.__name__ == "MultiRunCoordinator"
+
+
+def test_resident_pending_parks_then_resumes_same_claim_and_original_trigger() -> None:
+    harness = Harness()
+    resident = _PendingResident(harness.trace)
+    harness.resident = resident
+    coordinator = harness.coordinator()
+    dispatcher = CapturedStartDispatcher(capacity=2, worker_count=2)
+    request = captured_request()
+
+    def start():
+        return coordinator.start_captured(request)
+
+    try:
+        assert dispatcher.try_submit(start, lane_key="hardware-1")
+        deadline = time.monotonic() + 2.0
+        while not resident.begin_calls:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        assert len(harness.captured_freezer.calls) == 1
+        assert len(resident.begin_calls) == 1
+        assert resident.resume_calls == []
+        assert harness.persistence.active_calls == []
+        with coordinator._lock:
+            context = coordinator._runs[request.run_id]
+            assert context.action is None
+            assert context.reserve_claim is resident.claim
+
+        resident.ready.set()
+        deadline = time.monotonic() + 2.0
+        while not resident.start_calls:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+
+        assert resident.resume_calls == [resident.claim]
+        assert len(harness.captured_freezer.calls) == 1
+        assert len(resident.begin_calls) == 1
+        assert resident.begin_calls[0][2] == request.trigger_monotonic_ns
+        assert resident.start_calls[0][1] == request.trigger_monotonic_ns
+    finally:
+        resident.ready.set()
+        assert dispatcher.close(timeout_seconds=2.0)
+
+
+def test_parked_hardware_does_not_block_healthy_hardware_start() -> None:
+    harness = Harness()
+    resident = _PendingResident(harness.trace)
+    harness.resident = resident
+    harness.captured_freezer.result_factory = lambda request: replace(
+        frozen_captured(request),
+        hardware_id=(
+            "hardware-1" if request.run_id == RUN_IDS[0] else "hardware-2"
+        ),
+    )
+    coordinator = harness.coordinator()
+    dispatcher = CapturedStartDispatcher(capacity=2, worker_count=2)
+
+    try:
+        assert dispatcher.try_submit(
+            lambda: coordinator.start_captured(captured_request(RUN_IDS[0])),
+            lane_key="hardware-1",
+        )
+        deadline = time.monotonic() + 2.0
+        while not resident.begin_calls:
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+
+        assert dispatcher.try_submit(
+            lambda: coordinator.start_captured(captured_request(RUN_IDS[1])),
+            lane_key="hardware-2",
+        )
+        assert not dispatcher.try_submit(
+            lambda: None,
+            lane_key="hardware-3",
+        )
+        while not any(
+            reservation.hardware_id == "hardware-2"
+            for reservation, _, _ in resident.start_calls
+        ):
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+        assert resident.resume_calls == []
+    finally:
+        resident.ready.set()
+        assert dispatcher.close(timeout_seconds=2.0)
 
 
 def test_admission_invalid_request_calls_no_port() -> None:
