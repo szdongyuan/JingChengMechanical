@@ -141,61 +141,50 @@ def _start_enabled_current(
     return coordinator, collector
 
 
-def test_failed_or_canceled_current_cleanup_preserves_terminal_and_latches_restart() -> None:
-    for index, (status, category, failing_stage) in enumerate(
-        (
-            (
-                package.CaptureOutcomeStatus.FAILED,
-                TerminalErrorCategory.CAPTURE_FAILED,
-                "stop",
-            ),
-            (
-                package.CaptureOutcomeStatus.CANCELLED,
-                TerminalErrorCategory.CAPTURE_CANCELLED,
-                "samples",
-            ),
-        )
-    ):
-        harness = Harness()
-        coordinator, collector = _start_enabled_current(
-            harness,
-            run_id=RUN_IDS[index],
-            samples=[CurrentSample(0.0, 1.0)],
-        )
-        if failing_stage == "stop":
-            collector.stop_exception = TimeoutError("stop timed out")
-        else:
-            collector.samples_exception = RuntimeError("samples failed")
-        reservation = harness.resident.register_calls[0]
-        harness.resident.complete(
-            package.CaptureOutcome(
-                run_id=RUN_IDS[index],
-                reservation=reservation,
-                status=status,
-                audio=None,
-                error_category=category,
-                reason="capture terminal",
-            )
-        )
+def test_terminal_current_cleanup_failures_are_diagnostic_and_allow_later_runs() -> None:
+    harness = Harness()
+    coordinator, collector = _start_enabled_current(
+        harness,
+        samples=[CurrentSample(0.0, 1.0)],
+    )
+    collector.stop_exception = TimeoutError("stop timed out")
+    collector.samples_exception = RuntimeError("samples failed")
+    reservation = harness.resident.register_calls[0]
 
-        assert harness.persistence.terminal_calls[-1].error_category is category
-        assert harness.persistence.terminal_calls[-1].reason == "capture terminal"
-        assert len(collector.stop_calls) == 1
-        assert collector.samples_calls == 1
-        assert harness.persistence.current_calls == []
-        assert harness.save_dispatcher.calls == []
-        assert harness.scheduler.initial_calls == []
-        assert coordinator.snapshot().restart_required is True
-        assert (
-            coordinator.start_captured(captured_request(RUN_IDS[index + 8])).status
-            is StartStatus.INGRESS_CLOSED
+    harness.resident.complete(
+        package.CaptureOutcome(
+            run_id=RUN_IDS[0],
+            reservation=reservation,
+            status=package.CaptureOutcomeStatus.FAILED,
+            audio=None,
+            error_category=TerminalErrorCategory.CAPTURE_FAILED,
+            reason="capture terminal",
         )
-        cleanup_diagnostics = [
-            fact
-            for fact in harness.diagnostics.calls
-            if fact.stage == "current cleanup"
-        ]
-        assert len(cleanup_diagnostics) == 1
+    )
+
+    terminal = harness.persistence.terminal_calls[-1]
+    assert terminal.error_category is TerminalErrorCategory.CAPTURE_FAILED
+    assert terminal.reason == "capture terminal"
+    assert len(collector.stop_calls) == 1
+    assert collector.samples_calls == 1
+    assert coordinator.snapshot().restart_required is False
+    cleanup_diagnostics = [
+        fact
+        for fact in harness.diagnostics.calls
+        if fact.stage.startswith("current cleanup ")
+    ]
+    assert [fact.stage for fact in cleanup_diagnostics] == [
+        "current cleanup stop",
+        "current cleanup samples",
+    ]
+    assert {fact.run_id for fact in cleanup_diagnostics} == {RUN_IDS[0]}
+
+    harness.current_factory.collectors.append(FakeCurrentCollector(harness.trace))
+    next_result = coordinator.start_captured(captured_request(RUN_IDS[1]))
+
+    assert next_result.status is StartStatus.ACCEPTED_ACTIVE
+    assert len(harness.resident.register_calls) == 2
+    assert len(harness.resident.start_calls) == 2
 
 
 def test_capture_failure_claims_terminal_before_blocking_current_cleanup() -> None:
@@ -351,11 +340,12 @@ def test_channel_order_mismatch_fails_before_attach_audio_or_scheduler() -> None
     assert harness.scheduler.initial_calls == []
 
 
-def test_current_attach_requires_committed_before_audio_and_scheduler() -> None:
+def test_current_attach_failure_is_diagnostic_and_audio_path_continues() -> None:
     for index, failure in enumerate(
         (CommitResult.REJECTED, CommitResult.UNAVAILABLE, RuntimeError("attach failed"))
     ):
         harness = Harness()
+        harness.save_dispatcher.synchronous_outcome = saved_outcome
         if isinstance(failure, Exception):
             harness.persistence.current_exception = failure
         else:
@@ -369,15 +359,22 @@ def test_current_attach_requires_committed_before_audio_and_scheduler() -> None:
 
         harness.resident.complete(completed_capture(reservation))
 
-        terminal = harness.persistence.terminal_calls[-1]
-        assert (
-            terminal.error_category
-            is TerminalErrorCategory.CURRENT_TRACE_PERSIST_FAILED
-        )
+        assert harness.persistence.terminal_calls == []
         assert len(collector.stop_calls) == 1
         assert len(harness.persistence.current_calls) == 1
-        assert harness.save_dispatcher.calls == []
-        assert harness.scheduler.initial_calls == []
+        assert len(harness.save_dispatcher.calls) == 1
+        assert len(harness.scheduler.initial_calls) == 1
+        diagnostics = [
+            fact
+            for fact in harness.diagnostics.calls
+            if fact.stage == "current attach"
+        ]
+        assert len(diagnostics) == 1
+        assert diagnostics[0].run_id == RUN_IDS[index]
+        assert (
+            diagnostics[0].category
+            is TerminalErrorCategory.CURRENT_TRACE_PERSIST_FAILED
+        )
 
 
 class _ImportedFreezer:

@@ -29,32 +29,31 @@ class CurrentSample:
     monotonic_time: float | None = None
 
 
-def current_samples_to_trace(samples: list[CurrentSample]) -> CurrentTrace | None:
-    """Convert one settled acquisition list without sorting or resampling."""
+def current_samples_to_trace(
+    samples: Iterable[CurrentSample],
+) -> CurrentTrace | None:
+    """Build a trace in arrival order while repairing software timestamps."""
 
-    if type(samples) is not list:
-        raise ValueError("current samples must be an exact list")
-    if not samples:
-        return None
     pairs: list[tuple[float, float]] = []
-    previous_time: float | int | None = None
-    for sample in samples:
-        if type(sample) is not CurrentSample:
-            raise ValueError("current sample must be exact")
-        time_sec = sample.time_sec
-        current_a = sample.current_a
-        if (
-            type(time_sec) not in (int, float)
-            or type(current_a) not in (int, float)
-            or not math.isfinite(time_sec)
-            or not math.isfinite(current_a)
-            or time_sec < 0
-            or (previous_time is not None and time_sec <= previous_time)
-        ):
-            raise ValueError("current sample shape is invalid")
+    previous_time: float | None = None
+    for sample in samples or ():
+        if not isinstance(sample, CurrentSample):
+            continue
+        try:
+            time_sec = float(sample.time_sec)
+            current_a = float(sample.current_a)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(time_sec) or not math.isfinite(current_a):
+            continue
+        time_sec = max(0.0, time_sec)
+        if previous_time is not None and time_sec <= previous_time:
+            time_sec = math.nextafter(previous_time, math.inf)
+        if not math.isfinite(time_sec):
+            continue
         pairs.append((time_sec, current_a))
         previous_time = time_sec
-    return CurrentTrace(samples=tuple(pairs))
+    return CurrentTrace(samples=tuple(pairs)) if pairs else None
 
 
 def rebase_current_samples(

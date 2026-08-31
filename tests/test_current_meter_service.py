@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import threading
 import time
 
@@ -30,26 +31,49 @@ class _ReadResult:
         return False
 
 
-def test_current_samples_to_trace_is_strict_ordered_and_inference_free():
+def test_current_samples_to_trace_clamps_negative_time_and_repairs_collisions():
+    trace = current_samples_to_trace(
+        [
+            CurrentSample(-1.0, 1.25),
+            CurrentSample(0.0, 1.50),
+        ]
+    )
+
+    assert trace is not None
+    assert trace.samples == (
+        (0.0, 1.25),
+        (math.nextafter(0.0, math.inf), 1.50),
+    )
+
+
+def test_current_samples_to_trace_preserves_arrival_order_and_repairs_backward_time():
+    first = 0.1
+    second = math.nextafter(first, math.inf)
+    third = math.nextafter(second, math.inf)
+    trace = current_samples_to_trace(
+        [
+            CurrentSample(first, 1.25),
+            CurrentSample(first, 1.50),
+            CurrentSample(0.05, 1.75),
+        ]
+    )
+
+    assert trace == CurrentTrace(
+        samples=((first, 1.25), (second, 1.50), (third, 1.75))
+    )
+
+
+def test_current_samples_to_trace_skips_unusable_samples_without_inventing_values():
     assert current_samples_to_trace([]) is None
     trace = current_samples_to_trace(
         [
-            CurrentSample(0.0, 1.25),
-            CurrentSample(0.1, 1.5),
+            object(),
+            CurrentSample(float("nan"), 1.0),
+            CurrentSample(0.0, float("nan")),
+            CurrentSample(0.25, 2.5),
         ]
     )
-    assert trace == CurrentTrace(samples=((0.0, 1.25), (0.1, 1.5)))
-
-    invalid_values = (
-        (CurrentSample(0.1, 1.0), CurrentSample(0.0, 2.0)),
-        (CurrentSample(0.0, 1.0), CurrentSample(0.0, 2.0)),
-        (CurrentSample(-0.1, 1.0),),
-        (CurrentSample(True, 1.0),),
-        ({"time_sec": 0.0, "current_a": 1.0},),
-    )
-    for samples in invalid_values:
-        with pytest.raises(ValueError):
-            current_samples_to_trace(list(samples))
+    assert trace == CurrentTrace(samples=((0.25, 2.5),))
 
 
 class _ClientStub:
