@@ -398,6 +398,13 @@ def _make_module(
         ai_service=ai_service or _AiServiceStub(binding=binding),
         config_package_service=config_package_service or _ConfigPackageServiceStub(),
         hss_service=hardware_service or _HardwareServiceStub(),
+        factory_mode=SimpleNamespace(
+            state=SimpleNamespace(
+                selected_config_ids=(),
+                run_phase="idle",
+                start_ready_reason="",
+            ),
+        ),
         bus=services_bus,
     )
     return ConfigModule(services)
@@ -512,6 +519,60 @@ def _fault_editor_text_with_length(length: int) -> str:
     names = [f"n{index}" for index in range(32)]
     base = ",".join(names)
     return names[0] + (" " * (length - len(base))) + "," + ",".join(names[1:])
+
+
+def test_factory_selection_launcher_is_always_available(qapp):
+    module = _make_module()
+
+    assert module.btn_select_active_configs.text() == "选择使用配置"
+    assert module.btn_select_active_configs.isEnabled() is True
+
+
+def test_factory_selection_launcher_opens_modal_without_resolving_dirty_editor(
+    qapp,
+    monkeypatch,
+):
+    module = _make_module(
+        config_service=_ConfigServiceStub(
+            loaded_configs={7: _detail_payload([], config_id=7)}
+        )
+    )
+    module.spin_record.setValue(module.spin_record.value() + 1.0)
+    opened = []
+    monkeypatch.setattr(
+        "ui.modules.config.FactoryConfigSelectionDialog.exec",
+        lambda dialog: opened.append(dialog),
+    )
+
+    module.btn_select_active_configs.click()
+
+    assert opened
+    assert module._has_unsaved_changes() is True
+
+
+def test_factory_selection_launcher_reuses_one_modal_instance(qapp, monkeypatch):
+    module = _make_module()
+    events = []
+    monkeypatch.setattr(
+        "ui.modules.config.FactoryConfigSelectionDialog.prepare_for_open",
+        lambda dialog: events.append(("prepare", id(dialog))),
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.FactoryConfigSelectionDialog.exec",
+        lambda dialog: events.append(("exec", id(dialog))),
+    )
+
+    module.btn_select_active_configs.click()
+    module.btn_select_active_configs.click()
+
+    assert [event for event, _identity in events] == [
+        "prepare",
+        "prepare",
+        "exec",
+        "prepare",
+        "exec",
+    ]
+    assert len({identity for _event, identity in events}) == 1
 
 
 def test_fault_types_editor_is_single_global_comma_editor(qapp) -> None:

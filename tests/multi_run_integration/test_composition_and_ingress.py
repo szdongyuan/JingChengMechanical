@@ -36,6 +36,13 @@ def _prepared_runtime(tmp_path: Path) -> RunPersistenceDatabase:
 
 
 def _minimal_services(monkeypatch) -> None:
+    class MinimalConfigService:
+        golden_sample_service = object()
+
+        @staticmethod
+        def load_config(config_id):
+            return {"config_id": config_id, "plc_id": config_id}
+
     monkeypatch.setattr(
         services_module.DbConnectionService,
         "connect",
@@ -54,7 +61,7 @@ def _minimal_services(monkeypatch) -> None:
     monkeypatch.setattr(
         services_module,
         "ConfigService",
-        lambda _bus: SimpleNamespace(golden_sample_service=object()),
+        lambda _bus: MinimalConfigService(),
     )
     monkeypatch.setattr(services_module, "AudioDataService", lambda: object())
     monkeypatch.setattr(
@@ -478,13 +485,14 @@ def test_prepare_failure_enters_degraded_mode_with_not_ready_factory_controller(
     assert "重启" in services.production_unavailable_reason
 
 
-def test_degraded_reason_survives_real_selection_restore_refresh_and_edit(
+def test_degraded_reason_survives_real_selection_confirm_refresh_and_edit(
     monkeypatch,
     tmp_path,
-    qapp,
 ):
+    from PyQt6.QtWidgets import QApplication
     from ui.modules.workorder import WorkOrderModule
 
+    qapp = QApplication.instance() or QApplication([])
     _minimal_services(monkeypatch)
 
     class FailedBuilder:
@@ -514,17 +522,21 @@ def test_degraded_reason_survives_real_selection_restore_refresh_and_edit(
         ),
     )
 
+    initial_result = services.factory_mode.confirm_selection((101,))
+    persisted.clear()
     workorder = WorkOrderModule(services)
     try:
         restored = services.factory_mode.state
-        workorder._on_config_selection_changed((202,))
+        apply_result = services.factory_mode.confirm_selection((202,))
         edited = services.factory_mode.state
         refreshed = services.factory_mode.refresh_selection()
         changed = services.factory_mode.handle_configuration_changed()
 
+        assert initial_result.status == "applied"
+        assert apply_result.status == "applied"
         assert services.production_selection_locked is False
         assert restored.selected_config_ids == (101,)
-        assert workorder.config_selector.enabled_config_ids() == (202,)
+        assert workorder.value()["selected_config_ids"] == (202,)
         assert edited.selected_config_ids == (202,)
         assert persisted == [(202,)]
         for state in (restored, edited, refreshed, changed):
@@ -772,6 +784,9 @@ def test_undefined_plc_semantics_report_one_physical_boundary_failure_and_diagno
     )
     builder.plc = services.plc_result_sequencer
     _attach(services)
+
+    assert services.pending_plc_start_signal_reset_ids == {11}
+    assert diagnostics == []
 
     result = services.publish_plc_semantic_result(
         plc_id=1,

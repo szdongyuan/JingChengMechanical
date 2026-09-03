@@ -45,6 +45,10 @@ PRODUCTION_SELECTION_LEASE_NOTICE = (
 )
 
 
+class PendingSelectionPersistenceIndeterminateError(RuntimeError):
+    pass
+
+
 def _active_selection_lease() -> _SelectionLease | None:
     if _ACTIVE_SELECTION_LEASE is None:
         return None
@@ -585,6 +589,11 @@ class FactorySelectionSettings:
         with _SELECTION_LEASE_LOCK:
             settings = self._open_settings()
             verification_settings = self._open_verification_settings()
+            missing = object()
+            previous_raw_value = verification_settings.value(
+                self.PENDING_SETTINGS_KEY,
+                missing,
+            )
             raw_value = json.dumps(list(normalized), separators=(",", ":"))
             try:
                 settings.setValue(self.PENDING_SETTINGS_KEY, raw_value)
@@ -594,28 +603,167 @@ class FactorySelectionSettings:
                     callable(status)
                     and status() != QSettings.Status.NoError
                 ):
-                    return "下次启动配置保存失败"
+                    return self._resolve_failed_pending_write(
+                        settings,
+                        verification_settings,
+                        previous_raw_value,
+                        missing,
+                        normalized,
+                    )
+            except PendingSelectionPersistenceIndeterminateError:
+                raise
             except Exception:
-                return "下次启动配置保存失败"
+                return self._resolve_failed_pending_write(
+                    settings,
+                    verification_settings,
+                    previous_raw_value,
+                    missing,
+                    normalized,
+                )
 
-            missing = object()
-            persisted = verification_settings.value(
-                self.PENDING_SETTINGS_KEY,
+            persisted = self._read_pending_raw_value(
+                verification_settings,
                 missing,
             )
             if persisted is missing:
-                return "下次启动配置保存失败"
+                return self._resolve_failed_pending_write(
+                    settings,
+                    verification_settings,
+                    previous_raw_value,
+                    missing,
+                    normalized,
+                )
             try:
                 decoded = json.loads(persisted)
             except (TypeError, ValueError):
-                return "下次启动配置保存失败"
+                return self._resolve_failed_pending_write(
+                    settings,
+                    verification_settings,
+                    previous_raw_value,
+                    missing,
+                    normalized,
+                )
             if (
                 not isinstance(decoded, list)
                 or any(type(config_id) is not int for config_id in decoded)
                 or tuple(decoded) != normalized
             ):
-                return "下次启动配置保存失败"
+                return self._resolve_failed_pending_write(
+                    settings,
+                    verification_settings,
+                    previous_raw_value,
+                    missing,
+                    normalized,
+                )
             return None
+
+    def _resolve_failed_pending_write(
+        self,
+        settings: QSettings,
+        verification_settings: QSettings,
+        previous_raw_value,
+        missing,
+        requested: tuple[int, ...],
+    ) -> str | None:
+        self._restore_pending_raw_value(
+            settings,
+            verification_settings,
+            previous_raw_value,
+            missing,
+        )
+        durable = self._read_pending_raw_value(
+            verification_settings,
+            missing,
+        )
+        if self._raw_pending_matches(durable, requested, missing):
+            return None
+        if (
+            durable is missing
+            if previous_raw_value is missing
+            else durable == previous_raw_value
+        ):
+            return "下次启动配置保存失败"
+
+        raw_requested = json.dumps(list(requested), separators=(",", ":"))
+        try:
+            settings.setValue(self.PENDING_SETTINGS_KEY, raw_requested)
+            settings.sync()
+        except Exception:
+            pass
+        durable = self._read_pending_raw_value(
+            verification_settings,
+            missing,
+        )
+        if self._raw_pending_matches(durable, requested, missing):
+            return None
+        if (
+            durable is missing
+            if previous_raw_value is missing
+            else durable == previous_raw_value
+        ):
+            return "下次启动配置保存失败"
+        raise PendingSelectionPersistenceIndeterminateError(
+            "下次启动配置持久化状态不确定"
+        )
+
+    def _read_pending_raw_value(
+        self,
+        verification_settings: QSettings,
+        missing,
+    ):
+        try:
+            return verification_settings.value(
+                self.PENDING_SETTINGS_KEY,
+                missing,
+            )
+        except Exception:
+            return object()
+
+    @staticmethod
+    def _raw_pending_matches(raw_value, expected, missing) -> bool:
+        if raw_value is missing:
+            return False
+        try:
+            decoded = json.loads(raw_value)
+        except (TypeError, ValueError):
+            return False
+        return (
+            isinstance(decoded, list)
+            and all(type(config_id) is int for config_id in decoded)
+            and tuple(decoded) == expected
+        )
+
+    def _restore_pending_raw_value(
+        self,
+        settings: QSettings,
+        verification_settings: QSettings,
+        previous_raw_value,
+        missing,
+    ) -> bool:
+        try:
+            if previous_raw_value is missing:
+                settings.remove(self.PENDING_SETTINGS_KEY)
+            else:
+                settings.setValue(
+                    self.PENDING_SETTINGS_KEY,
+                    previous_raw_value,
+                )
+            settings.sync()
+            status = getattr(settings, "status", None)
+            if (
+                callable(status)
+                and status() != QSettings.Status.NoError
+            ):
+                return False
+            restored = verification_settings.value(
+                self.PENDING_SETTINGS_KEY,
+                missing,
+            )
+        except Exception:
+            return False
+        if previous_raw_value is missing:
+            return restored is missing
+        return restored == previous_raw_value
 
     def clear_pending_selected_config_ids(self) -> None:
         with _SELECTION_LEASE_LOCK:

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+from PyQt6.QtCore import QSettings
+
 from app.service.factory_mode_controller import FactoryModeController
+from app.service.factory_selection_settings import FactorySelectionSettings
 from app.service.multi_run_coordinator_mvp.contracts import (
     CapturedStartRequest,
     FrozenPayload,
@@ -79,6 +84,496 @@ def _services(events):
 
     services.build_captured_start_request = build
     return services, coordinator
+
+
+class _SelectionSettingsSpy:
+    def __init__(self, selected=(101,), pending=None):
+        self.selected = tuple(selected)
+        self.pending = pending
+        self.persist_error = None
+        self.pending_error = None
+        self.persist_calls = []
+        self.pending_calls = []
+        self.reconcile_calls = []
+        self.operation_order = []
+
+    def load_selected_config_ids(self):
+        return self.selected
+
+    def load_pending_selected_config_ids(self):
+        return self.pending
+
+    def save_selected_config_ids(self, selected):
+        selected = tuple(selected)
+        self.persist_calls.append(selected)
+        self.operation_order.append(("persist", selected))
+        if self.persist_error is None:
+            self.selected = selected
+        return self.persist_error
+
+    def save_pending_selected_config_ids(self, selected):
+        selected = tuple(selected)
+        self.pending_calls.append(selected)
+        self.operation_order.append(("persist_pending", selected))
+        if self.pending_error is None:
+            self.pending = selected
+        return self.pending_error
+
+    def reconcile_for_startup(self, existing):
+        existing = tuple(existing)
+        self.reconcile_calls.append(existing)
+        candidate = self.selected if self.pending is None else tuple(self.pending)
+        seen = set()
+        reconciled = tuple(
+            config_id
+            for config_id in candidate
+            if config_id in existing
+            and config_id not in seen
+            and not seen.add(config_id)
+        )
+        if not reconciled and existing:
+            reconciled = (existing[0],)
+        if reconciled != self.selected:
+            self.save_selected_config_ids(reconciled)
+        self.pending = None
+        return reconciled
+
+
+class _DurablePendingSaveSettings(_SelectionSettingsSpy):
+    def __init__(self, *, post_save_load_result):
+        super().__init__()
+        self.post_save_load_result = post_save_load_result
+        self.durable_pending = None
+        self.pending_load_calls = 0
+
+    def load_pending_selected_config_ids(self):
+        self.pending_load_calls += 1
+        if self.durable_pending is None:
+            return self.pending
+        if isinstance(self.post_save_load_result, Exception):
+            raise self.post_save_load_result
+        return self.post_save_load_result
+
+    def save_pending_selected_config_ids(self, selected):
+        selected = tuple(selected)
+        self.pending_calls.append(selected)
+        self.operation_order.append(("persist_pending", selected))
+        self.durable_pending = selected
+        return None
+
+
+class _PendingRollbackFailureSettings:
+    Status = QSettings.Status
+
+    def __init__(self, *, corrupt_after_first=False):
+        self._key = FactorySelectionSettings.PENDING_SETTINGS_KEY
+        self._backing = {self._key: '[101]'}
+        self._pending = dict(self._backing)
+        self._sync_calls = 0
+        self._status = self.Status.NoError
+        self._corrupt_after_first = corrupt_after_first
+
+    def value(self, key, default=None):
+        return self._backing.get(key, default)
+
+    def setValue(self, key, value):
+        self._pending[key] = value
+
+    def remove(self, key):
+        self._pending.pop(key, None)
+
+    def sync(self):
+        self._sync_calls += 1
+        self._status = self.Status.AccessError
+        if self._sync_calls == 1:
+            self._backing.clear()
+            self._backing.update(self._pending)
+        elif self._corrupt_after_first:
+            self._backing[self._key] = "not-json"
+
+    def status(self):
+        return self._status
+
+
+def _selection_controller(*, locked=False, prepared=(101,)):
+    bus = EventBus()
+    settings = _SelectionSettingsSpy()
+    reset_calls = []
+
+    def request_resets(selected):
+        selected = tuple(selected)
+        reset_calls.append(selected)
+        settings.operation_order.append(("reset", selected))
+
+    services = SimpleNamespace(
+        production_selection_locked=locked,
+        config_service=_ConfigService(),
+        factory_selection_settings=settings,
+        request_plc_start_signal_resets_for_configs=request_resets,
+    )
+    controller = FactoryModeController(
+        bus,
+        services,
+        prepared_selected_config_ids=prepared if locked else (),
+        prepared_config_routes=(
+            tuple((config_id, None) for config_id in prepared)
+            if locked
+            else ()
+        ),
+    )
+    if not locked:
+        controller.set_selection(prepared)
+    return controller, services, settings, reset_calls, bus
+
+
+def test_confirm_selection_persists_before_runtime_state_and_resets_only_added_configs():
+    controller, _services, settings, reset_calls, bus = _selection_controller()
+    state_events = []
+    bus.factory_state_changed.connect(
+        lambda state: (
+            settings.operation_order.append(("state", state.selected_config_ids)),
+            state_events.append(state),
+        )
+    )
+
+    result = controller.confirm_selection((101, 202))
+
+    assert result.status == "applied"
+    assert result.selected_config_ids == (101, 202)
+    assert reset_calls == [(202,)]
+    assert settings.operation_order == [
+        ("persist", (101, 202)),
+        ("reset", (202,)),
+        ("state", (101, 202)),
+    ]
+    assert len(state_events) == 1
+
+
+def test_confirm_selection_rejects_persistence_failure_without_runtime_side_effects():
+    controller, _services, settings, reset_calls, bus = _selection_controller()
+    settings.persist_error = "配置保存失败"
+    state_events = []
+    bus.factory_state_changed.connect(state_events.append)
+
+    result = controller.confirm_selection((202,))
+
+    assert result.status == "rejected"
+    assert result.message == "配置保存失败"
+    assert controller.state.selected_config_ids == (101,)
+    assert reset_calls == []
+    assert state_events == []
+
+
+def test_confirm_selection_outside_prepared_routes_returns_restart_required():
+    controller, _services, settings, reset_calls, _bus = _selection_controller(
+        locked=True
+    )
+
+    result = controller.confirm_selection((202,))
+
+    assert result.status == "restart_required"
+    assert settings.load_pending_selected_config_ids() == (202,)
+    assert controller.state.selected_config_ids == (202,)
+    assert controller.state.start_ready is False
+    assert reset_calls == [(202,)]
+
+
+def test_confirm_selection_pending_restart_resets_before_state_publication():
+    controller, _services, settings, _reset_calls, bus = _selection_controller(
+        locked=True
+    )
+    bus.factory_state_changed.connect(
+        lambda state: settings.operation_order.append(
+            ("state", state.selected_config_ids)
+        )
+    )
+
+    result = controller.confirm_selection((202,))
+
+    assert result.status == "restart_required"
+    assert settings.operation_order == [
+        ("persist_pending", (202,)),
+        ("reset", (202,)),
+        ("state", (202,)),
+    ]
+
+
+@pytest.mark.parametrize(
+    "post_save_load_result",
+    [RuntimeError("readback failed"), (101,)],
+    ids=["readback-raises", "readback-mismatches"],
+)
+def test_confirm_selection_trusts_verified_pending_save_without_readback(
+    post_save_load_result,
+):
+    controller, services, _settings, reset_calls, bus = _selection_controller(
+        locked=True
+    )
+    settings = _DurablePendingSaveSettings(
+        post_save_load_result=post_save_load_result
+    )
+    services.factory_selection_settings = settings
+    state_events = []
+    bus.factory_state_changed.connect(state_events.append)
+
+    result = controller.confirm_selection((202,))
+
+    assert settings.durable_pending == (202,)
+    assert settings.pending_load_calls == 0
+    assert result.status == "restart_required"
+    assert result.selected_config_ids == (202,)
+    assert controller.state.selected_config_ids == (202,)
+    assert reset_calls == [(202,)]
+    assert len(state_events) == 1
+
+
+def test_confirm_selection_pending_write_failure_has_no_runtime_or_workorder_side_effects():
+    controller, _services, settings, reset_calls, bus = _selection_controller(
+        locked=True
+    )
+    settings.pending_error = "下次启动配置保存失败"
+    previous_state = controller.state
+    previous_pending = settings.load_pending_selected_config_ids()
+    state_events = []
+    workorder_events = []
+    bus.factory_state_changed.connect(state_events.append)
+    bus.workorder_changed.connect(workorder_events.append)
+
+    result = controller.confirm_selection((202,))
+
+    assert result.status == "rejected"
+    assert result.message == "下次启动配置保存失败"
+    assert controller.state is previous_state
+    assert settings.load_pending_selected_config_ids() == previous_pending
+    assert state_events == []
+    assert workorder_events == []
+    assert reset_calls == []
+
+
+def test_confirm_selection_does_not_reject_durable_pending_after_failed_rollback():
+    bus = EventBus()
+    raw = _PendingRollbackFailureSettings()
+    settings = FactorySelectionSettings(settings=raw)
+    reset_calls = []
+    state_events = []
+    services = SimpleNamespace(
+        production_selection_locked=True,
+        config_service=_ConfigService(),
+        factory_selection_settings=settings,
+        request_plc_start_signal_resets_for_configs=lambda selected: (
+            reset_calls.append(tuple(selected))
+        ),
+    )
+    controller = FactoryModeController(
+        bus,
+        services,
+        prepared_selected_config_ids=(101,),
+        prepared_config_routes=((101, None),),
+    )
+    bus.factory_state_changed.connect(state_events.append)
+
+    result = controller.confirm_selection((202,))
+
+    assert result.status != "rejected"
+    assert result.status == "restart_required"
+    assert settings.load_pending_selected_config_ids() == (202,)
+    assert controller.state.selected_config_ids == (202,)
+    assert reset_calls == [(202,)]
+    assert len(state_events) == 1
+
+
+def test_confirm_selection_blocks_factory_when_pending_durability_is_indeterminate():
+    bus = EventBus()
+    settings = FactorySelectionSettings(
+        settings=_PendingRollbackFailureSettings(corrupt_after_first=True)
+    )
+    notices = []
+    state_events = []
+    blocked = []
+    reset_calls = []
+    bus.factory_selection_notice.connect(notices.append)
+    bus.factory_state_changed.connect(state_events.append)
+    bus.factory_start_blocked.connect(blocked.append)
+    services = SimpleNamespace(
+        production_selection_locked=True,
+        config_service=_ConfigService(),
+        factory_selection_settings=settings,
+        request_plc_start_signal_resets_for_configs=lambda selected: (
+            reset_calls.append(tuple(selected))
+        ),
+    )
+    controller = FactoryModeController(
+        bus,
+        services,
+        prepared_selected_config_ids=(101,),
+        prepared_config_routes=((101, None),),
+    )
+
+    result = controller.confirm_selection((202,))
+
+    assert result.status == "indeterminate"
+    assert "状态不确定" in result.message
+    assert controller.selection_persistence_indeterminate is True
+    assert controller.state.selected_config_ids == (101,)
+    assert controller.state.start_ready is False
+    assert controller.state.start_ready_reason == result.message
+    assert notices == [result.message]
+    assert len(state_events) == 1
+    assert reset_calls == []
+
+    assert controller.start_manual() is False
+    assert blocked[-1].reason == result.message
+    rejected = controller.confirm_selection((101,))
+    assert rejected.status == "rejected"
+    assert rejected.message == result.message
+
+
+def test_internal_pending_selection_blocks_factory_on_indeterminate_write():
+    bus = EventBus()
+    raw = _PendingRollbackFailureSettings(corrupt_after_first=True)
+    settings = FactorySelectionSettings(settings=raw)
+    notices = []
+    state_events = []
+    bus.factory_selection_notice.connect(notices.append)
+    bus.factory_state_changed.connect(state_events.append)
+    services = SimpleNamespace(
+        production_selection_locked=True,
+        config_service=_ConfigService(),
+        factory_selection_settings=settings,
+        request_plc_start_signal_resets_for_configs=lambda _selected: None,
+    )
+    controller = FactoryModeController(
+        bus,
+        services,
+        prepared_selected_config_ids=(101,),
+        prepared_config_routes=((101, None),),
+    )
+
+    state = controller.set_selection((202,))
+
+    assert state is controller.state
+    assert state.selected_config_ids == (101,)
+    assert state.start_ready is False
+    assert "状态不确定" in state.start_ready_reason
+    assert controller.selection_persistence_indeterminate is True
+    assert notices == [state.start_ready_reason]
+    assert len(state_events) == 1
+    assert controller.can_arm() is False
+
+    blocked_state = controller.set_selection((101,))
+    assert blocked_state is state
+    assert notices[-1] == state.start_ready_reason
+
+    sync_calls = raw._sync_calls
+    refreshed_state = controller.handle_configuration_changed()
+    assert refreshed_state is state
+    assert raw._sync_calls == sync_calls
+    assert notices[-1] == state.start_ready_reason
+
+
+def test_confirm_selection_unchanged_has_no_side_effects():
+    controller, _services, settings, reset_calls, bus = _selection_controller()
+    state_events = []
+    bus.factory_state_changed.connect(state_events.append)
+
+    result = controller.confirm_selection((101,))
+
+    assert result.status == "unchanged"
+    assert settings.persist_calls == []
+    assert reset_calls == []
+    assert state_events == []
+
+
+@pytest.mark.parametrize(
+    "selected",
+    [(), (101, 101), (0,), (-1,), (303,), (True,)],
+)
+def test_confirm_selection_rejects_invalid_selection(selected):
+    controller, _services, settings, reset_calls, bus = _selection_controller()
+    state_events = []
+    bus.factory_state_changed.connect(state_events.append)
+
+    result = controller.confirm_selection(selected)
+
+    assert result.status == "rejected"
+    assert result.message == "配置选择无效"
+    assert result.selected_config_ids == (101,)
+    assert settings.persist_calls == []
+    assert reset_calls == []
+    assert state_events == []
+
+
+@pytest.mark.parametrize("phase", ["running", "analyzing", "reanalyzing"])
+def test_confirm_selection_rejects_busy_phases(phase):
+    controller, _services, settings, reset_calls, bus = _selection_controller()
+    controller._state = replace(controller.state, run_phase=phase)
+    state_events = []
+    bus.factory_state_changed.connect(state_events.append)
+
+    result = controller.confirm_selection((202,))
+
+    assert result.status == "rejected"
+    assert result.message
+    assert settings.persist_calls == []
+    assert reset_calls == []
+    assert state_events == []
+
+
+def test_confirm_selection_rejects_while_start_request_is_pending():
+    controller, _services, settings, reset_calls, bus = _selection_controller()
+    controller._state = replace(
+        controller.state,
+        start_ready=False,
+        start_ready_reason="启动请求处理中",
+    )
+    state_events = []
+    bus.factory_state_changed.connect(state_events.append)
+
+    result = controller.confirm_selection((202,))
+
+    assert result.status == "rejected"
+    assert result.message == "启动请求处理中"
+    assert settings.persist_calls == []
+    assert reset_calls == []
+    assert state_events == []
+
+
+def test_initialize_selection_once_resets_prepared_selection_once():
+    controller, _services, settings, reset_calls, bus = _selection_controller(
+        locked=True,
+        prepared=(101, 202),
+    )
+    state_events = []
+    bus.factory_state_changed.connect(state_events.append)
+
+    first = controller.initialize_selection()
+    second = controller.initialize_selection()
+
+    assert first.selected_config_ids == (101, 202)
+    assert second is first
+    assert reset_calls == [(101, 202)]
+    assert settings.persist_calls == []
+    assert state_events == []
+
+
+def test_initialize_selection_once_reconciles_unprepared_selection_once():
+    controller, services, settings, reset_calls, bus = _selection_controller(
+        prepared=()
+    )
+    settings.selected = (202, 202, 303)
+    services.config_service = _ConfigService()
+    state_events = []
+    bus.factory_state_changed.connect(state_events.append)
+
+    first = controller.initialize_selection()
+    second = controller.initialize_selection()
+
+    assert first.selected_config_ids == (202,)
+    assert second is first
+    assert settings.reconcile_calls == [(101, 202)]
+    assert settings.persist_calls == [(202,)]
+    assert reset_calls == [(202,)]
+    assert len(state_events) == 1
 
 
 def test_manual_start_samples_once_as_first_valid_action():

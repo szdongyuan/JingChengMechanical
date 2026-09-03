@@ -671,6 +671,7 @@ class ServiceContainer:
             prepared_config_routes=self._prepared_config_routes,
         )
         self.factory_mode._preserve_production_unavailable_state()
+        self.factory_mode.initialize_selection()
         self.ingress_open = self.multi_run_coordinator is not None
 
     @property

@@ -55,6 +55,9 @@ from model.malfunction_type_table import (
     is_builtin_malfunction_type_id,
 )
 from ui.popups import config_package_dialogs
+from ui.popups.factory_config_selection_dialog import (
+    FactoryConfigSelectionDialog,
+)
 from ui.popups.golden_sample_import_dialog import GoldenSampleImportDialog
 from ui.widgets.cards import Card
 from ui.widgets.collapsible_group_box import CollapsibleGroupBox
@@ -771,6 +774,7 @@ class ConfigModule(QWidget):
         self._top_level_config_dialogs: dict[str, _ConfigSectionCardDialog] = {}
         self._loaded_config_editor_snapshot: dict | None = None
         self._restoring_config_selection = False
+        self._factory_selection_dialog: FactoryConfigSelectionDialog | None = None
         self._result_dashboard_layout = normalize_result_dashboard_layout(None)
         self._result_dashboard_layout_error = None
 
@@ -808,6 +812,12 @@ class ConfigModule(QWidget):
         btn_lay.addWidget(self.btn_import)
         btn_lay.addWidget(self.btn_export)
         left_lay.addWidget(btn_row)
+
+        self.btn_select_active_configs = QPushButton("选择使用配置")
+        self.btn_select_active_configs.setObjectName(
+            "select_active_factory_configs"
+        )
+        left_lay.addWidget(self.btn_select_active_configs)
 
         self.config_list = QListWidget()
         self.config_list.setSelectionMode(
@@ -1223,6 +1233,9 @@ class ConfigModule(QWidget):
         self.btn_delete.clicked.connect(self._on_delete)
         self.btn_import.clicked.connect(self._on_import_package)
         self.btn_export.clicked.connect(self._on_export_package)
+        self.btn_select_active_configs.clicked.connect(
+            self._open_factory_config_selection_dialog
+        )
         self.btn_save.clicked.connect(self._on_save)
         self.btn_manage_fault_types.clicked.connect(
             self._open_malfunction_type_dialog
@@ -3375,6 +3388,15 @@ class ConfigModule(QWidget):
         self._mark_editor_snapshot_clean()
 
     # ── Interactions ────────────────────────────────────────
+
+    def _open_factory_config_selection_dialog(self) -> None:
+        if self._factory_selection_dialog is None:
+            self._factory_selection_dialog = FactoryConfigSelectionDialog(
+                self.services,
+                self,
+            )
+        self._factory_selection_dialog.prepare_for_open()
+        self._factory_selection_dialog.exec()
 
     def _refresh_list(self):
         self.config_list.clear()

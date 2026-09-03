@@ -145,10 +145,19 @@ def test_service_container_constructs_historical_report_service_without_circular
         lambda *, config_service, ai_service: object(),
     )
     monkeypatch.setattr(mod, "FactorySelectionSettings", lambda: object())
+
+    class FactoryModeControllerStub:
+        def __init__(self, bus, services, **_kwargs):
+            self.bus = bus
+            self.services = services
+
+        def initialize_selection(self):
+            return None
+
     monkeypatch.setattr(
         factory_mode_controller,
         "FactoryModeController",
-        lambda bus, services, **_kwargs: object(),
+        FactoryModeControllerStub,
     )
 
     services = mod.ServiceContainer(**_prepared_only_kwargs(tmp_path))
@@ -671,6 +680,50 @@ def test_service_container_owns_factory_mode_controller(monkeypatch, tmp_path):
     assert isinstance(services.factory_mode, controller_cls)
     assert services.factory_mode.bus is services.bus
     assert services.factory_mode.services is services
+
+
+def test_service_container_initializes_factory_selection_once_after_controller_creation(
+    monkeypatch,
+    tmp_path,
+):
+    controller_mod = _load_factory_mode_controller_module()
+    initialize_calls = []
+
+    class FactoryModeControllerSpy:
+        def __init__(self, bus, services, **_kwargs):
+            self.bus = bus
+            self.services = services
+
+        def initialize_selection(self):
+            initialize_calls.append(())
+
+    monkeypatch.setattr(
+        controller_mod,
+        "FactoryModeController",
+        FactoryModeControllerSpy,
+    )
+    monkeypatch.setattr(mod.DbConnectionService, "connect", lambda self: None)
+    monkeypatch.setattr(
+        mod,
+        "HardwareSelectService",
+        MagicMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr(
+        mod,
+        "InputCalibrationService",
+        MagicMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr(
+        mod,
+        "ConfigService",
+        MagicMock(return_value=MagicMock()),
+    )
+    monkeypatch.setattr(mod, "AiService", MagicMock(return_value=MagicMock()))
+
+    services = mod.ServiceContainer(**_prepared_only_kwargs(tmp_path))
+
+    assert services.factory_mode.services is services
+    assert initialize_calls == [()]
 
 
 def test_service_container_exposes_plc_start_hook(monkeypatch):

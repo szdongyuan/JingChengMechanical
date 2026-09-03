@@ -167,6 +167,15 @@ class _FactoryModeStub:
         )
         return self.state
 
+    def confirm_selection(self, selected_config_ids: tuple[int, ...] | list[int]):
+        self.set_selection(selected_config_ids)
+        self._bus.factory_state_changed.emit(self.state)
+        return SimpleNamespace(
+            status="applied",
+            selected_config_ids=self.state.selected_config_ids,
+            message="",
+        )
+
 
 class _MessageBoxSpy:
     def __init__(self):
@@ -1126,11 +1135,11 @@ def test_target_update_clears_rejection_retention_and_never_preselects_persisted
 def test_start_uses_live_workorder_payload_from_current_workorder_module(qapp):
     workorder_module, control_module, services = _make_shared_modules()
 
-    workorder_module.config_selector.set_checked(101, True)
-    workorder_module.config_selector.set_checked(202, True)
+    result = services.factory_mode.confirm_selection((101, 202))
 
     control_module.btn_start.click()
 
+    assert result.status == "applied"
     services.factory_mode.start_manual.assert_called_once_with(
         {
             "sn": "",

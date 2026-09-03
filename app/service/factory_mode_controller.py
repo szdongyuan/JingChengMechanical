@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from PyQt6.QtCore import QObject
 
 from app.service.analysis.test_session import ManualLabelUpdateResult
 from app.service.factory_selection_settings import (
+    PendingSelectionPersistenceIndeterminateError,
     PRODUCTION_CONFIG_RESTART_REQUIRED_NOTICE,
     PRODUCTION_SELECTION_LEASE_NOTICE,
 )
@@ -29,6 +30,16 @@ _ACCEPTED_STARTS = frozenset(
         StartStatus.ACCEPTED_TERMINAL,
     }
 )
+_SELECTION_PERSISTENCE_INDETERMINATE_REASON = (
+    "严重错误：配置选择持久化状态不确定，请重启软件后重新对账。"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class FactorySelectionApplyResult:
+    status: str
+    selected_config_ids: tuple[int, ...]
+    message: str = ""
 
 
 class FactoryModeController(QObject):
@@ -85,6 +96,8 @@ class FactoryModeController(QObject):
         }
         self._restored_selection_has_missing_configs = False
         self._selection_restart_required = False
+        self._selection_persistence_indeterminate = False
+        self._selection_initialized = False
         self._last_plc_ingress: FactoryPlcIngressPayload | None = None
         self._last_scan_ingress: FactoryScanIngressPayload | None = None
         self._connect_bus()
@@ -109,10 +122,287 @@ class FactoryModeController(QObject):
     def selection_restart_required(self) -> bool:
         return self._selection_restart_required
 
+    @property
+    def selection_persistence_indeterminate(self) -> bool:
+        return self._selection_persistence_indeterminate
+
+    def confirm_selection(
+        self,
+        selected_config_ids,
+    ) -> FactorySelectionApplyResult:
+        selected = self._validate_confirmed_selection(selected_config_ids)
+        if selected is None:
+            return self._selection_result(
+                "rejected",
+                message="配置选择无效",
+            )
+        if self._selection_edit_locked():
+            return self._selection_result(
+                "rejected",
+                message=self._selection_lock_reason(),
+            )
+        if selected == tuple(self._state.selected_config_ids):
+            return self._selection_result("unchanged")
+
+        old_selected = tuple(self._state.selected_config_ids)
+        if self._requires_pending_restart(selected):
+            try:
+                error = self._save_pending_selection(selected)
+            except PendingSelectionPersistenceIndeterminateError:
+                self._block_for_indeterminate_selection_persistence()
+                return self._selection_result(
+                    "indeterminate",
+                    message=_SELECTION_PERSISTENCE_INDETERMINATE_REASON,
+                )
+            if error:
+                self.bus.factory_selection_notice.emit(error)
+                return self._selection_result("rejected", message=error)
+            self._request_added_plc_resets(old_selected, selected)
+            self._apply_pending_selection_state(selected)
+            return self._selection_result(
+                "restart_required",
+                message=PRODUCTION_CONFIG_RESTART_REQUIRED_NOTICE,
+            )
+
+        error = self._save_authoritative_selection(selected)
+        if error:
+            self.bus.factory_selection_notice.emit(error)
+            return self._selection_result("rejected", message=error)
+        self._request_added_plc_resets(old_selected, selected)
+        self.set_selection(selected)
+        self.bus.factory_selection_notice.emit("")
+        return self._selection_result("applied")
+
+    def _selection_result(
+        self,
+        status: str,
+        *,
+        message: str = "",
+    ) -> FactorySelectionApplyResult:
+        return FactorySelectionApplyResult(
+            status=status,
+            selected_config_ids=tuple(self._state.selected_config_ids),
+            message=message,
+        )
+
+    def _validate_confirmed_selection(
+        self,
+        selected_config_ids,
+    ) -> tuple[int, ...] | None:
+        try:
+            selected = tuple(selected_config_ids)
+        except TypeError:
+            return None
+        if (
+            not selected
+            or any(
+                type(config_id) is not int or config_id <= 0
+                for config_id in selected
+            )
+            or len(set(selected)) != len(selected)
+        ):
+            return None
+
+        list_configs = getattr(
+            getattr(self.services, "config_service", None),
+            "list_configs",
+            None,
+        )
+        if not callable(list_configs):
+            return None
+        try:
+            rows = tuple(list_configs())
+        except Exception:
+            return None
+        available = {
+            row.get("config_id")
+            for row in rows
+            if type(row) is dict
+            and type(row.get("config_id")) is int
+            and row.get("config_id") > 0
+        }
+        if any(config_id not in available for config_id in selected):
+            return None
+        return selected
+
+    def _selection_edit_locked(self) -> bool:
+        return self._selection_persistence_indeterminate or (
+            self._state.run_phase in {
+                "running",
+                "analyzing",
+                "reanalyzing",
+            }
+            or self._state.start_ready_reason == "启动请求处理中"
+        )
+
+    def _selection_lock_reason(self) -> str:
+        if self._selection_persistence_indeterminate:
+            return _SELECTION_PERSISTENCE_INDETERMINATE_REASON
+        if self._state.start_ready_reason == "启动请求处理中":
+            return "启动请求处理中"
+        return {
+            "running": "当前测试运行中",
+            "analyzing": "当前测试分析中",
+            "reanalyzing": "当前正在重新分析",
+        }.get(self._state.run_phase, "当前无法修改配置选择")
+
+    def _requires_pending_restart(
+        self,
+        selected: tuple[int, ...],
+    ) -> bool:
+        if not bool(
+            getattr(self.services, "production_selection_locked", False)
+        ):
+            return False
+        prepared_ids = {
+            config_id
+            for config_id, _plc_id in self._prepared_config_routes
+        }
+        return self._selection_restart_required or any(
+            config_id not in prepared_ids for config_id in selected
+        )
+
+    def _save_authoritative_selection(
+        self,
+        selected: tuple[int, ...],
+    ) -> str | None:
+        save = getattr(
+            getattr(self.services, "factory_selection_settings", None),
+            "save_selected_config_ids",
+            None,
+        )
+        if not callable(save):
+            return "配置保存失败"
+        try:
+            error = save(selected)
+        except Exception:
+            return "配置保存失败"
+        return None if not error else str(error)
+
+    def _save_pending_selection(
+        self,
+        selected: tuple[int, ...],
+    ) -> str | None:
+        settings = getattr(
+            self.services,
+            "factory_selection_settings",
+            None,
+        )
+        save = getattr(settings, "save_pending_selected_config_ids", None)
+        if not callable(save):
+            return "下次启动配置保存失败"
+        try:
+            error = save(selected)
+            if error:
+                return str(error)
+        except PendingSelectionPersistenceIndeterminateError:
+            raise
+        except Exception:
+            return "下次启动配置保存失败"
+        return None
+
+    def _request_added_plc_resets(
+        self,
+        old_selected: tuple[int, ...],
+        selected: tuple[int, ...],
+    ) -> None:
+        old_ids = set(old_selected)
+        added = tuple(
+            config_id for config_id in selected if config_id not in old_ids
+        )
+        request_resets = getattr(
+            self.services,
+            "request_plc_start_signal_resets_for_configs",
+            None,
+        )
+        if added and callable(request_resets):
+            request_resets(added)
+
+    def initialize_selection(self) -> FactoryControllerState:
+        if self._selection_initialized:
+            return self._state
+        self._selection_initialized = True
+        if bool(
+            getattr(self.services, "production_selection_locked", False)
+        ):
+            selected = tuple(self._state.selected_config_ids)
+        else:
+            selected, had_missing = self._load_reconciled_startup_selection()
+            self.restore_selection(
+                selected,
+                had_missing_configs=had_missing,
+            )
+        self._request_added_plc_resets((), selected)
+        return self._state
+
+    def _load_reconciled_startup_selection(
+        self,
+    ) -> tuple[tuple[int, ...], bool]:
+        config_service = getattr(self.services, "config_service", None)
+        list_configs = getattr(config_service, "list_configs", None)
+        settings = getattr(
+            self.services,
+            "factory_selection_settings",
+            None,
+        )
+        reconcile = getattr(settings, "reconcile_for_startup", None)
+        if not callable(list_configs) or not callable(reconcile):
+            return (), False
+        try:
+            rows = tuple(list_configs())
+        except Exception:
+            return (), False
+        existing = tuple(
+            row.get("config_id")
+            for row in rows
+            if type(row) is dict
+            and type(row.get("config_id")) is int
+            and row.get("config_id") > 0
+        )
+        existing = tuple(dict.fromkeys(existing))
+
+        load_pending = getattr(
+            settings,
+            "load_pending_selected_config_ids",
+            None,
+        )
+        load_selected = getattr(settings, "load_selected_config_ids", None)
+        candidate = ()
+        try:
+            pending = load_pending() if callable(load_pending) else None
+            if pending is not None:
+                candidate = tuple(pending)
+            elif callable(load_selected):
+                candidate = tuple(load_selected())
+            selected = tuple(reconcile(existing))
+        except Exception as exc:
+            self.bus.factory_selection_notice.emit(str(exc))
+            return (), False
+
+        existing_set = set(existing)
+        seen: set[int] = set()
+        had_missing = False
+        for config_id in candidate:
+            if (
+                type(config_id) is not int
+                or config_id <= 0
+                or config_id not in existing_set
+                or config_id in seen
+            ):
+                had_missing = True
+            if type(config_id) is int:
+                seen.add(config_id)
+        return selected, had_missing
+
     def set_selection(
         self,
         selected_config_ids: tuple[int, ...] | list[int],
     ) -> FactoryControllerState:
+        if self._selection_persistence_indeterminate:
+            self.bus.factory_selection_notice.emit(
+                _SELECTION_PERSISTENCE_INDETERMINATE_REASON
+            )
+            return self._state
         selected = tuple(selected_config_ids)
         if bool(
             getattr(self.services, "production_selection_locked", False)
@@ -138,17 +428,21 @@ class FactoryModeController(QObject):
         *,
         had_missing_configs: bool,
     ) -> FactoryControllerState:
-        state = self.set_selection(selected_config_ids)
-        if not had_missing_configs:
-            return state
-        self._restored_selection_has_missing_configs = True
-        self._state = replace(
-            state,
-            selection_ready=False,
-            selection_ready_reason="配置已失效",
-            start_ready=False,
-            start_ready_reason="配置已失效",
-            run_phase="not_ready",
+        selected = tuple(selected_config_ids)
+        if bool(
+            getattr(self.services, "production_selection_locked", False)
+        ):
+            return self.set_selection(selected)
+        self._restored_selection_has_missing_configs = had_missing_configs
+        self._selected_configs = self._load_selected_configs(selected)
+        ready, reason = self._selection_readiness(selected)
+        self._state = FactoryControllerState(
+            selected_config_ids=selected,
+            run_phase="armed" if ready else "not_ready",
+            selection_ready=ready,
+            selection_ready_reason=reason,
+            start_ready=ready,
+            start_ready_reason=reason,
         )
         self._emit_state()
         return self._state
@@ -246,6 +540,8 @@ class FactoryModeController(QObject):
         return self._set_pending_selection(selected)
 
     def can_arm(self) -> bool:
+        if self._selection_persistence_indeterminate:
+            return False
         if bool(
             getattr(self.services, "production_selection_locked", False)
         ):
@@ -364,6 +660,11 @@ class FactoryModeController(QObject):
         return value
 
     def _reject_selection_mutation(self) -> bool:
+        if self._selection_persistence_indeterminate:
+            self.bus.factory_selection_notice.emit(
+                _SELECTION_PERSISTENCE_INDETERMINATE_REASON
+            )
+            return True
         if not bool(
             getattr(self.services, "production_selection_locked", False)
         ):
@@ -412,6 +713,9 @@ class FactoryModeController(QObject):
         self,
         selected: tuple[int, ...],
     ) -> FactoryControllerState:
+        if self._selection_persistence_indeterminate:
+            self._reject_selection_mutation()
+            return self._state
         if (
             any(
                 type(config_id) is not int or config_id <= 0
@@ -427,18 +731,27 @@ class FactoryModeController(QObject):
             "factory_selection_settings",
             None,
         )
-        save = getattr(settings, "save_pending_selected_config_ids", None)
-        if not callable(save):
+        if not callable(
+            getattr(settings, "save_pending_selected_config_ids", None)
+        ) or not callable(
+            getattr(settings, "load_pending_selected_config_ids", None)
+        ):
             self._reject_selection_mutation()
             return self._state
         try:
-            error = save(selected)
-        except Exception:
-            error = "下次启动配置保存失败"
+            error = self._save_pending_selection(selected)
+        except PendingSelectionPersistenceIndeterminateError:
+            return self._block_for_indeterminate_selection_persistence()
         if error:
-            self.bus.factory_selection_notice.emit(str(error))
+            self.bus.factory_selection_notice.emit(error)
             return self._state
 
+        return self._apply_pending_selection_state(selected)
+
+    def _apply_pending_selection_state(
+        self,
+        selected: tuple[int, ...],
+    ) -> FactoryControllerState:
         self._selection_restart_required = True
         self._restored_selection_has_missing_configs = False
         self._selected_configs = {
@@ -463,6 +776,34 @@ class FactoryModeController(QObject):
         self._emit_state()
         self.bus.factory_selection_notice.emit(
             PRODUCTION_CONFIG_RESTART_REQUIRED_NOTICE
+        )
+        return self._state
+
+    def _block_for_indeterminate_selection_persistence(
+        self,
+    ) -> FactoryControllerState:
+        self._selection_persistence_indeterminate = True
+        self._selection_restart_required = True
+        self._state = replace(
+            self._state,
+            run_phase=(
+                self._state.run_phase
+                if self._state.run_phase
+                in {"running", "analyzing", "reanalyzing"}
+                else "not_ready"
+            ),
+            selection_ready=False,
+            selection_ready_reason=(
+                _SELECTION_PERSISTENCE_INDETERMINATE_REASON
+            ),
+            start_ready=False,
+            start_ready_reason=(
+                _SELECTION_PERSISTENCE_INDETERMINATE_REASON
+            ),
+        )
+        self._emit_state()
+        self.bus.factory_selection_notice.emit(
+            _SELECTION_PERSISTENCE_INDETERMINATE_REASON
         )
         return self._state
 
