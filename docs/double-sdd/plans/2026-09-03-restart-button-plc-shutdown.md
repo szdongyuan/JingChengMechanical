@@ -15,6 +15,7 @@
 - Create `tests/test_plc_service_shutdown.py`: focused regression tests for the real `PlcService` Qt slot contract, staged resource behavior, and legacy combined stop entry point.
 - Modify `tests/multi_run_integration/test_shutdown_order.py`: exercise the production `PlcServiceThreadShutdownOwner` and `_invoke_plc_thread_slot` boundary with a real `PlcService` on a real `QThread`, and require a clean aggregate shutdown report.
 - Modify `app/service/plc_service.py`: implement staged shutdown slots and delegate the legacy `stop_plc_service` slot to them.
+- Modify `app/services_container.py`: after the blocking queued disconnect call returns, consume the real service's immutable disconnect acknowledgement and raise on failure so the application shutdown owner records a non-clean stage.
 
 No other production modules should change. In particular, preserve the existing ordering in `app/service/multi_run_integration/shutdown.py`, the strict report check in `app/main_window.py`, and the restart command construction.
 
@@ -24,6 +25,7 @@ No other production modules should change. In particular, preserve the existing 
 - Create: `tests/test_plc_service_shutdown.py`
 - Modify: `tests/multi_run_integration/test_shutdown_order.py`
 - Modify: `app/service/plc_service.py:119-135`
+- Modify: `app/services_container.py:202-215`
 - Test: `tests/test_plc_service_shutdown.py`, `tests/multi_run_integration/test_shutdown_order.py`
 
 - [ ] **Step 1: Write the failing Qt-slot contract test**
@@ -265,7 +267,15 @@ Replace the body of `stop_plc_service` in `app/service/plc_service.py` with dele
         self.disconnect_plc_service()
 ```
 
-Do not change `_disconnect`, `PlcServiceThreadShutdownOwner`, shutdown stage ordering, or restart safety checks.
+Do not change `PlcServiceThreadShutdownOwner`, shutdown stage ordering, or restart safety checks. A minimal internal change to `_disconnect` is allowed only to return or record the already-caught disconnect failure while preserving all existing callers and side effects.
+
+The Qt slot boundary must also explicitly acknowledge physical disconnect failure. Python exceptions raised by a Qt slot invoked through `BlockingQueuedConnection` are not a reliable caller-side result, and the existing `_disconnect()` intentionally swallows client errors for legacy runtime/manual behavior. Therefore:
+
+- `disconnect_plc_service()` must record an immutable success/failure acknowledgement for its most recent invocation while preserving the legacy combined-stop behavior.
+- `_invoke_plc_thread_slot()` must check that acknowledgement immediately after the blocking `disconnect_plc_service` invocation and raise in the shutdown caller on failure.
+- The acknowledgement must be reset at the start of every disconnect invocation so stale failures cannot contaminate later calls.
+- Add a real-thread integration regression in `tests/multi_run_integration/test_shutdown_order.py` with `client.disconnect.side_effect = RuntimeError("disconnect failed")`; require `report.clean is False`, `report.restart_required is True`, and a `plc_owners[0]` error containing the failure detail.
+- Do not change manual-disconnect UI behavior or weaken the aggregate exact-clean gate.
 
 - [ ] **Step 7: Run the focused tests and verify they pass**
 

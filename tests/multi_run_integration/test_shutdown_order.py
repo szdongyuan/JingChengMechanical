@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+from PyQt6.QtCore import QCoreApplication, QThread
 
 from app.service.analysis.scheduler.models import (
     ShutdownReport as SchedulerShutdownReport,
@@ -31,7 +33,9 @@ from app.service.multi_run_integration.shutdown import (
     ApplicationShutdownResources,
     PlcServiceThreadShutdownOwner,
 )
+from app.service.plc_service import PlcService
 from app.service.plc_result_sequencer import PlcShutdownReport
+from app.services_container import _invoke_plc_thread_slot
 from app.service.run_persistence.run_persistence_scheduler_bridge import (
     BridgeDatabaseCloseResult,
     BridgeDatabaseCloseStatus,
@@ -843,6 +847,102 @@ def test_plc_split_stop_preserves_connection_until_sequencer_then_disconnects_be
     assert trace.index("plc.shutdown") < trace.index("invoke.disconnect_plc_service")
     assert trace.index("invoke.disconnect_plc_service") < trace.index("thread.quit")
     assert trace.index("thread.quit") < trace.index("thread.wait")
+
+
+def test_real_plc_service_completes_thread_affine_application_shutdown():
+    app = QCoreApplication.instance() or QCoreApplication([])
+    _trace, _calls, resources = _harness()
+    bus = SimpleNamespace(log=SimpleNamespace(emit=lambda *_args: None))
+    client = MagicMock()
+    service = PlcService(
+        bus,
+        lambda *_args: None,
+        "127.0.0.1",
+        field_offsets_dict={"start_signal_offset": "0.0"},
+        plc_id=7,
+    )
+    service.plc_client = client
+    thread = QThread()
+    service.moveToThread(thread)
+    thread.finished.connect(service.deleteLater)
+    thread.start()
+    binding = PlcServiceThreadShutdownOwner(
+        service,
+        thread,
+        _invoke_plc_thread_slot,
+    )
+    resources = replace(
+        resources,
+        external_producers=(binding,),
+        plc_owners=(binding,),
+    )
+
+    try:
+        report = ApplicationShutdownOwner(
+            resources,
+            monotonic=_Clock(),
+            timeout_seconds=5.0,
+        ).shutdown()
+
+        assert report.clean is True
+        assert report.restart_required is False
+        client.disconnect.assert_called_once_with()
+        assert thread.isRunning() is False
+    finally:
+        if thread.isRunning():
+            thread.quit()
+            thread.wait(1000)
+        del app
+
+
+def test_real_plc_disconnect_failure_is_nonclean_across_thread_boundary():
+    app = QCoreApplication.instance() or QCoreApplication([])
+    _trace, _calls, resources = _harness()
+    bus = SimpleNamespace(log=SimpleNamespace(emit=lambda *_args: None))
+    client = MagicMock()
+    client.disconnect.side_effect = RuntimeError("disconnect failed")
+    service = PlcService(
+        bus,
+        lambda *_args: None,
+        "127.0.0.1",
+        field_offsets_dict={"start_signal_offset": "0.0"},
+        plc_id=7,
+    )
+    service.plc_client = client
+    thread = QThread()
+    service.moveToThread(thread)
+    thread.finished.connect(service.deleteLater)
+    thread.start()
+    binding = PlcServiceThreadShutdownOwner(
+        service,
+        thread,
+        _invoke_plc_thread_slot,
+    )
+    resources = replace(
+        resources,
+        external_producers=(binding,),
+        plc_owners=(binding,),
+    )
+
+    try:
+        report = ApplicationShutdownOwner(
+            resources,
+            monotonic=_Clock(),
+            timeout_seconds=5.0,
+        ).shutdown()
+
+        assert report.clean is False
+        assert report.restart_required is True
+        owner_stage = next(
+            stage for stage in report.stages if stage.name == "plc_owners[0]"
+        )
+        assert "disconnect failed" in (owner_stage.detail or "")
+        client.disconnect.assert_called_once_with()
+    finally:
+        if thread.isRunning():
+            thread.quit()
+            thread.wait(1000)
+        del app
 
 
 def test_plc_thread_affine_invocation_failure_is_nonclean_once_without_disconnect_retry():

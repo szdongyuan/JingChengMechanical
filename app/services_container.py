@@ -54,6 +54,7 @@ from app.service.plc_result_sequencer import (
     PlcResultAttemptReport,
     PlcResultSequencer,
 )
+from app.service.plc_service import PlcDisconnectAcknowledgement
 from app.service.run_persistence.database import RunPersistenceDatabase
 from app.service.run_persistence.analysis_result_artifact import (
     AnalysisResultArtifactStore,
@@ -212,6 +213,21 @@ def _invoke_plc_thread_slot(
         method_name,
         Qt.ConnectionType.BlockingQueuedConnection,
     )
+    if method_name != "disconnect_plc_service":
+        return
+    acknowledgement = getattr(service, "disconnect_acknowledgement", None)
+    if (
+        type(acknowledgement) is PlcDisconnectAcknowledgement
+        and acknowledgement.success is True
+    ):
+        return
+    detail = (
+        acknowledgement.detail
+        if type(acknowledgement) is PlcDisconnectAcknowledgement
+        and acknowledgement.detail
+        else "PLC disconnect was not acknowledged"
+    )
+    raise RuntimeError(detail)
 
 
 @dataclass(frozen=True)

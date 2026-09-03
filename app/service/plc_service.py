@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 import struct
 import time
@@ -10,6 +11,12 @@ import snap7.util
 from snap7.error import S7Error
 
 from app.service.log_manager import LogManager
+
+
+@dataclass(frozen=True)
+class PlcDisconnectAcknowledgement:
+    success: bool
+    detail: str | None = None
 
 
 class PlcService(QObject):
@@ -82,7 +89,12 @@ class PlcService(QObject):
         self._reconnect_timer_ms = 0  # 重连计时器
         self._last_connect_error = ""
         self._last_current_read_error = ""
+        self._disconnect_acknowledgement: PlcDisconnectAcknowledgement | None = None
         self.plc_dispatch_requested.connect(self._execute_dispatch_command)
+
+    @property
+    def disconnect_acknowledgement(self) -> PlcDisconnectAcknowledgement | None:
+        return self._disconnect_acknowledgement
 
     @pyqtSlot(object)
     def _execute_dispatch_command(self, command):
@@ -117,9 +129,7 @@ class PlcService(QObject):
         # self._start_value_timer()
 
     @pyqtSlot()
-    def stop_plc_service(self):
-        self.logger.info(f"停止 PLC 服务")
-        # 停止监听，销毁定时器并主动断开 PLC 连接。
+    def stop_ingress_polling(self):
         if self.timer is not None:
             self.timer.stop()
             self.timer.deleteLater()
@@ -128,11 +138,25 @@ class PlcService(QObject):
             self.value_timer.stop()
             self.value_timer.deleteLater()
             self.value_timer = None
-        self._disconnect()
-        self.state_changed.emit("未连接")
         self._last_value = None
+
+    @pyqtSlot()
+    def disconnect_plc_service(self):
+        self._disconnect_acknowledgement = None
+        disconnect_error = self._disconnect()
+        self._disconnect_acknowledgement = PlcDisconnectAcknowledgement(
+            success=disconnect_error is None,
+            detail=None if disconnect_error is None else str(disconnect_error),
+        )
+        self.state_changed.emit("未连接")
         self.bus.log.emit(f"PLC{self._plc_id}停止监听")
         self.logger.info(f"PLC{self._plc_id}停止监听")
+
+    @pyqtSlot()
+    def stop_plc_service(self):
+        self.logger.info("停止 PLC 服务")
+        self.stop_ingress_polling()
+        self.disconnect_plc_service()
 
     def _connect_once(self):
         """
@@ -165,19 +189,21 @@ class PlcService(QObject):
             self.logger.error(f"PLC{self._plc_id}连接失败: {exc}")
             self.bus.log.emit(f"PLC{self._plc_id}连接失败: {exc}")
 
-    def _disconnect(self):
+    def _disconnect(self) -> Exception | None:
         # 断开当前 PLC 连接，并清空 plc_client，供后续重连使用。
         if self.plc_client is None:
-            return
+            return None
+        disconnect_error: Exception | None = None
         try:
             self.plc_client.disconnect()
-        except Exception:
-            pass
+        except Exception as exc:
+            disconnect_error = exc
         self.plc_client = None
         if self.timer is not None:
             self.state_changed.emit("重连中")
         else:
             self.state_changed.emit("未连接")
+        return disconnect_error
 
     def _try_reconnect(self):
         self.logger.info(f"{self._plc_id}触发重新连接")
