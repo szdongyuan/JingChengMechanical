@@ -60,6 +60,7 @@ class DbConnectionService:
     _REQUIRED_TEST_CONFIG_COLUMNS = frozenset(
         {
             "fault_types_json",
+            "manual_judgment_buttons_visible",
             "vibration_view_channel_index",
             "input_hardware_device_id",
             "result_dashboard_layout",
@@ -234,6 +235,7 @@ class DbConnectionService:
             self._REQUIRED_TEST_CONFIG_COLUMNS,
         )
         self._ensure_fault_types_column_definition()
+        self._ensure_manual_judgment_visibility_column_definition()
         self._ensure_required_table_columns(
             "managed_audio_input_table",
             self._REQUIRED_MANAGED_AUDIO_INPUT_COLUMNS,
@@ -302,6 +304,28 @@ class DbConnectionService:
             raise DatabaseStartupError(
                 "Database schema is incomplete: invalid test_config_table "
                 "column definition: fault_types_json. "
+                "Copy a prepared database before starting the application."
+            )
+
+    def _ensure_manual_judgment_visibility_column_definition(self) -> None:
+        cursor = db.execute_sql("PRAGMA table_info(test_config_table)")
+        row = next(
+            (
+                candidate
+                for candidate in cursor.fetchall()
+                if candidate[1] == "manual_judgment_buttons_visible"
+            ),
+            None,
+        )
+        actual = (
+            None
+            if row is None
+            else (row[2].upper(), bool(row[3]), row[4], int(row[5]))
+        )
+        if actual != ("INTEGER", True, "0", 0):
+            raise DatabaseStartupError(
+                "Database schema is incomplete: invalid test_config_table "
+                "column definition: manual_judgment_buttons_visible. "
                 "Copy a prepared database before starting the application."
             )
 

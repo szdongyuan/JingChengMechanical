@@ -183,6 +183,7 @@ def test_service_container_freezes_one_config_and_opens_six_low_latency_streams(
     config = {
         "config_id": "config-1",
         "fault_types": [" bearing ", "seal", "bearing"],
+        "manual_judgment_buttons_visible": True,
         "nested": {"channels": [0, 1]},
     }
     builder = _composition_builder(trace, streams, coordinators)
@@ -217,11 +218,12 @@ def test_service_container_freezes_one_config_and_opens_six_low_latency_streams(
     assert request.fallback_history_labels.value_id.startswith("sha256:")
     assert ingress["history_labels"] == decoded_labels
     assert decoded_labels == {
-        "schema": "jingcheng-history-labels/v1",
+        "schema": "jingcheng-history-labels/v2",
         "config": {
             "config_id": 11,
             "name": "config-1",
             "fault_types": ["bearing", "seal"],
+            "manual_judgment_buttons_visible": True,
             "details": [],
         },
         "sn": "SN-1",
@@ -235,6 +237,93 @@ def test_service_container_freezes_one_config_and_opens_six_low_latency_streams(
         StartStatus.ACTIVE_COMMIT_REJECTED,
     )
     assert len(set(services.preaccept_terminal_statuses)) == 5
+
+
+def test_captured_and_imported_history_labels_freeze_prepared_visibility(
+    monkeypatch,
+    tmp_path,
+):
+    _minimal_services(monkeypatch)
+    builder = _composition_builder(
+        [],
+        [_Stream("hardware-1")],
+        [],
+    )
+    services = services_module.ServiceContainer(
+        run_persistence_database=_prepared_runtime(tmp_path),
+        production_composition_builder=builder,
+        semantic_config={
+            "config_id": "mutable-fallback",
+            "fault_types": [],
+            "manual_judgment_buttons_visible": False,
+        },
+    )
+    prepared_values = {
+        "config_name": "Prepared config",
+        "fault_types_json": '["异响"]',
+        "manual_judgment_buttons_visible": True,
+    }
+    services.prepared_production_composition._prerequisites = SimpleNamespace(
+        configs=(SimpleNamespace(config_id=11, values=prepared_values),)
+    )
+
+    captured = services.build_captured_start_request(
+        source=TriggerSource.MANUAL,
+        trigger_monotonic_ns=123,
+        workorder={},
+        config_id=11,
+    )
+    imported = services.build_imported_start_request(
+        trigger_monotonic_ns=124,
+        source_path=tmp_path / "source.wav",
+    )
+    prepared_values["manual_judgment_buttons_visible"] = False
+
+    for request in (captured, imported):
+        labels = decode_history_labels_payload(
+            value_id=request.fallback_history_labels.value_id,
+            canonical_bytes=request.fallback_history_labels.canonical_bytes,
+        )
+        assert labels["config"]["manual_judgment_buttons_visible"] is True
+
+
+def test_unresolved_imported_history_labels_freeze_visibility_false(
+    monkeypatch,
+    tmp_path,
+):
+    _minimal_services(monkeypatch)
+    builder = _composition_builder(
+        [],
+        [_Stream("hardware-1")],
+        [],
+        config_routes=((11, None), (12, None)),
+    )
+    services = services_module.ServiceContainer(
+        run_persistence_database=_prepared_runtime(tmp_path),
+        production_composition_builder=builder,
+        semantic_config={
+            "config_id": "mutable-fallback",
+            "fault_types": ["异响"],
+            "manual_judgment_buttons_visible": True,
+        },
+    )
+
+    imported = services.build_imported_start_request(
+        trigger_monotonic_ns=124,
+        source_path=tmp_path / "source.wav",
+    )
+    labels = decode_history_labels_payload(
+        value_id=imported.fallback_history_labels.value_id,
+        canonical_bytes=imported.fallback_history_labels.canonical_bytes,
+    )
+
+    assert labels["config"] == {
+        "config_id": None,
+        "name": "未解析配置",
+        "fault_types": [],
+        "manual_judgment_buttons_visible": False,
+        "details": [],
+    }
 
 
 def test_service_container_committed_enrichment_reaches_qt_adapter_once(

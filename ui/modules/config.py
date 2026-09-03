@@ -869,18 +869,6 @@ class ConfigModule(QWidget):
         self.ed_name = QLineEdit()
         gf_lay.addRow("配置名称", self.ed_name)
 
-        self.fault_types_editor = _FaultTypeMultiSelectCombo()
-        self.fault_types_editor.setObjectName("fault_types_editor")
-        fault_types_row = QWidget()
-        fault_types_lay = QHBoxLayout(fault_types_row)
-        fault_types_lay.setContentsMargins(0, 0, 0, 0)
-        fault_types_lay.setSpacing(6)
-        self.btn_manage_fault_types = QPushButton("故障类型管理")
-        self.btn_manage_fault_types.setFixedWidth(120)
-        fault_types_lay.addWidget(self.fault_types_editor, 1)
-        fault_types_lay.addWidget(self.btn_manage_fault_types)
-        gf_lay.addRow("故障类型", fault_types_row)
-
         self.spin_record = _NoWheelSpinBox()
         self.spin_record.setRange(0.1, 3600.0)
         self.spin_record.setSingleStep(0.5)
@@ -916,6 +904,35 @@ class ConfigModule(QWidget):
         gf_lay.addRow(self.chk_allow_incomplete_recording_analysis)
 
         scroll_lay.addWidget(Card("全局参数", global_form))
+
+        manual_judgment_form = QWidget()
+        manual_judgment_lay = QFormLayout(manual_judgment_form)
+        manual_judgment_lay.setContentsMargins(0, 0, 0, 0)
+        manual_judgment_lay.setHorizontalSpacing(10)
+        manual_judgment_lay.setVerticalSpacing(8)
+
+        self.chk_manual_judgment_buttons_visible = QCheckBox(
+            "在主页结果中显示人工标注按钮"
+        )
+        self.chk_manual_judgment_buttons_visible.setObjectName(
+            "manual_judgment_buttons_visible"
+        )
+        manual_judgment_lay.addRow(self.chk_manual_judgment_buttons_visible)
+
+        self.fault_types_editor = _FaultTypeMultiSelectCombo()
+        self.fault_types_editor.setObjectName("fault_types_editor")
+        fault_types_row = QWidget()
+        fault_types_lay = QHBoxLayout(fault_types_row)
+        fault_types_lay.setContentsMargins(0, 0, 0, 0)
+        fault_types_lay.setSpacing(6)
+        self.btn_manage_fault_types = QPushButton("故障类型管理")
+        self.btn_manage_fault_types.setFixedWidth(120)
+        fault_types_lay.addWidget(self.fault_types_editor, 1)
+        fault_types_lay.addWidget(self.btn_manage_fault_types)
+        manual_judgment_lay.addRow("故障类型", fault_types_row)
+
+        self.manual_judgment_group = Card("人工标注", manual_judgment_form)
+        scroll_lay.addWidget(self.manual_judgment_group)
 
         # PLC binding remains visible at the top level.
         plc_form = QWidget()
@@ -1743,19 +1760,123 @@ class ConfigModule(QWidget):
                     return
         self._on_channel_tab_clicked(0)
 
-    def _apply_loaded_config_state(self, config_id: int, loaded: dict) -> None:
-        self._skip_reload = True
-        try:
-            self._refresh_list()
-            self._select_config_by_id(config_id)
-        finally:
-            self._skip_reload = False
-        self._current_config_id = config_id
-        self._populate_detail(loaded)
+    def _capture_config_load_transaction_state(self) -> dict:
+        return {
+            "config_id": self._current_config_id,
+            "editor_snapshot": self._capture_editor_snapshot(),
+            "clean_snapshot": copy.deepcopy(
+                self._loaded_config_editor_snapshot
+            ),
+            "loaded_ai_binding_state": copy.deepcopy(
+                self._loaded_ai_binding_state
+            ),
+            "ai_binding_dirty": self._ai_binding_dirty,
+            "golden_editor_state": copy.deepcopy(self._golden_editor_state),
+            "section_state": self._capture_collapsible_section_state(),
+            "selected_channel_index": self._selected_channel_index(),
+            "empty_label_visible": not self.empty_label.isHidden(),
+            "detail_visible": not self.detail.isHidden(),
+            "delete_enabled": self.btn_delete.isEnabled(),
+            "export_enabled": self.btn_export.isEnabled(),
+            "save_enabled": self.btn_save.isEnabled(),
+        }
 
-    def _reload_authoritative_config_state(self, config_id: int) -> None:
-        loaded = self.services.config_service.load_config(config_id)
-        self._apply_loaded_config_state(config_id, loaded)
+    def _restore_ai_binding_transaction_state(
+        self,
+        *,
+        editor_state: dict,
+        loaded_state: dict,
+        dirty: bool,
+    ) -> None:
+        binding = self._normalize_ai_binding(editor_state)
+        bound_toolchain_id = binding["toolchain_id"]
+        with self._suspend_ai_binding_dirty_updates():
+            self._refresh_ai_toolchains(bound_toolchain_id)
+            self.chk_ai_enabled.setChecked(binding["enabled"])
+            index = self.combo_ai_toolchain.findData(bound_toolchain_id)
+            self.combo_ai_toolchain.setCurrentIndex(index if index >= 0 else 0)
+            self.spin_ai_timeout.setValue(binding["timeout_ms"] or 0)
+        self._loaded_ai_binding_state = copy.deepcopy(loaded_state)
+        self._ai_binding_dirty = dirty
+
+    def _restore_config_load_transaction_state(self, state: dict) -> None:
+        config_id = state["config_id"]
+        editor_snapshot = state["editor_snapshot"]
+        if config_id is None or editor_snapshot is None:
+            self._reset_editor_after_failed_initial_load()
+            return
+
+        previous_config = editor_snapshot.get("config")
+        if not isinstance(previous_config, dict):
+            raise ValueError("previous configuration snapshot is unavailable")
+
+        self._current_config_id = config_id
+        self._golden_editor_state = copy.deepcopy(state["golden_editor_state"])
+        self._populate_detail(
+            copy.deepcopy(previous_config),
+            mark_clean=False,
+            discard_staged_bindings=False,
+        )
+        self._golden_editor_state = copy.deepcopy(state["golden_editor_state"])
+        self._restore_ai_binding_transaction_state(
+            editor_state=editor_snapshot["ai_binding"],
+            loaded_state=state["loaded_ai_binding_state"],
+            dirty=state["ai_binding_dirty"],
+        )
+        self._loaded_config_editor_snapshot = copy.deepcopy(
+            state["clean_snapshot"]
+        )
+        self._restore_collapsible_section_state(state["section_state"])
+        self._restore_selected_channel_tab(state["selected_channel_index"])
+        self.empty_label.setVisible(state["empty_label_visible"])
+        self.detail.setVisible(state["detail_visible"])
+        self.btn_delete.setEnabled(state["delete_enabled"])
+        self.btn_export.setEnabled(state["export_enabled"])
+        self.btn_save.setEnabled(state["save_enabled"])
+        self._restore_current_config_selection()
+
+    def _load_config_to_editor_atomically(
+        self,
+        *,
+        config_id: int,
+        refresh_list: bool,
+    ) -> dict:
+        previous_state = self._capture_config_load_transaction_state()
+        try:
+            loaded = self.services.config_service.load_config(config_id)
+            self._populate_detail(
+                loaded,
+                mark_clean=False,
+                discard_staged_bindings=False,
+            )
+            if refresh_list:
+                self._skip_reload = True
+                try:
+                    self._refresh_list()
+                    self._select_config_by_id(config_id)
+                finally:
+                    self._skip_reload = False
+            else:
+                self._select_config_by_id(config_id, suppress_reload=True)
+            self._current_config_id = config_id
+            self._discard_all_staged_bindings()
+            self._refresh_all_golden_sections()
+            self.empty_label.setVisible(False)
+            self.detail.setVisible(True)
+            self.btn_delete.setEnabled(True)
+            self.btn_export.setEnabled(True)
+            self.btn_save.setEnabled(True)
+            self._mark_editor_snapshot_clean()
+            return loaded
+        except Exception:
+            self._restore_config_load_transaction_state(previous_state)
+            raise
+
+    def _reload_authoritative_config_state(self, config_id: int) -> dict:
+        return self._load_config_to_editor_atomically(
+            config_id=config_id,
+            refresh_list=True,
+        )
 
     def _capture_editor_snapshot(self) -> dict | None:
         if self._current_config_id is None:
@@ -3201,6 +3322,9 @@ class ConfigModule(QWidget):
         data = {
             "config_id": self._current_config_id,
             "config_name": self.ed_name.text(),
+            "manual_judgment_buttons_visible": (
+                self.chk_manual_judgment_buttons_visible.isChecked()
+            ),
             "fault_types": parse_fault_types_editor(
                 self.fault_types_editor.text()
             ),
@@ -3351,10 +3475,28 @@ class ConfigModule(QWidget):
 
     # ── Populate UI from data ───────────────────────────────
 
-    def _populate_detail(self, data: dict):
+    def _populate_detail(
+        self,
+        data: dict,
+        *,
+        mark_clean: bool = True,
+        discard_staged_bindings: bool = True,
+    ):
+        manual_judgment_buttons_visible = data.get(
+            "manual_judgment_buttons_visible",
+            False,
+        )
+        if type(manual_judgment_buttons_visible) is not bool:
+            raise ValueError(
+                "manual_judgment_buttons_visible must be a boolean"
+            )
         self._hide_top_level_config_dialogs()
-        self._discard_all_staged_bindings()
+        if discard_staged_bindings:
+            self._discard_all_staged_bindings()
         self.ed_name.setText(data["config_name"])
+        self.chk_manual_judgment_buttons_visible.setChecked(
+            manual_judgment_buttons_visible
+        )
         self.fault_types_editor.setText(
             render_fault_types_editor(data["fault_types"])
         )
@@ -3385,7 +3527,8 @@ class ConfigModule(QWidget):
         self._build_channel_tabs(all_indices, data.get("channels"))
         self._populate_ai_binding(data["config_id"])
         self._refresh_all_golden_sections()
-        self._mark_editor_snapshot_clean()
+        if mark_clean:
+            self._mark_editor_snapshot_clean()
 
     # ── Interactions ────────────────────────────────────────
 
@@ -3446,11 +3589,25 @@ class ConfigModule(QWidget):
             self._restoring_config_selection = False
 
     def _load_config_into_editor(self, config_id: int) -> None:
-        self._current_config_id = config_id
-        data = self.services.config_service.load_config(config_id)
-        self.empty_label.setVisible(False)
-        self.detail.setVisible(True)
-        self._populate_detail(data)
+        self._load_config_to_editor_atomically(
+            config_id=config_id,
+            refresh_list=False,
+        )
+
+    def _reset_editor_after_failed_initial_load(self) -> None:
+        self._current_config_id = None
+        self._loaded_config_editor_snapshot = None
+        self._restoring_config_selection = True
+        try:
+            self.config_list.setCurrentRow(-1)
+        finally:
+            self._restoring_config_selection = False
+        self._hide_top_level_config_dialogs()
+        self.empty_label.setVisible(True)
+        self.detail.setVisible(False)
+        self.btn_delete.setEnabled(False)
+        self.btn_export.setEnabled(False)
+        self.btn_save.setEnabled(False)
 
     def _on_item_changed(self, current: QListWidgetItem | None, _prev):
         if current is None:
@@ -3625,8 +3782,7 @@ class ConfigModule(QWidget):
             if callable(commit_pending_save):
                 pending_save_committed = True
                 commit_pending_save(pending_save)
-            loaded = self.services.config_service.load_config(saved_id)
-            self._apply_loaded_config_state(saved_id, loaded)
+            loaded = self._reload_authoritative_config_state(saved_id)
             self._restore_collapsible_section_state(section_state)
             self._restore_selected_channel_tab(selected_channel_index)
             self.services.bus.status.emit("配置已保存")

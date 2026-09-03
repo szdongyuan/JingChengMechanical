@@ -307,6 +307,7 @@ class ResultHistoryModule(QWidget):
             selected_snapshot is not None
             and not selected_snapshot.is_active_run
             and selected_snapshot.manual_judgment_allowed
+            and selected_snapshot.config.manual_judgment_buttons_visible
         )
         next_entries: dict[
             str,

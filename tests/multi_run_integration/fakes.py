@@ -42,12 +42,14 @@ def history_labels(
     *,
     config_id: int | None = 7,
     fault_types: tuple[str, ...] = ("异响", "漏装"),
+    manual_judgment_buttons_visible: bool = False,
     sn: str = "SN-1",
 ) -> FrozenPayload:
     value_id, canonical = encode_history_labels_payload(
         config_id=config_id,
         name="Frozen config",
         fault_types=fault_types,
+        manual_judgment_buttons_visible=manual_judgment_buttons_visible,
         details=({"label": "Channel", "value": "0"},),
         sn=sn,
         trigger_source="manual",

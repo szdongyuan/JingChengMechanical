@@ -1683,7 +1683,11 @@ class ResultDashboardModule(QWidget):
                 fault_types=selected.config.fault_types,
                 manual_judgment_allowed=selected.manual_judgment_allowed,
             )
-            if selected is not None and not selected.is_active_run
+            if (
+                selected is not None
+                and not selected.is_active_run
+                and selected.config.manual_judgment_buttons_visible
+            )
             else None
         )
         if target == self._manual_judgment_target:

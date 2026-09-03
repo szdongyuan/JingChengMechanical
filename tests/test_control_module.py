@@ -389,6 +389,7 @@ def test_real_five_fault_ng_submission_keeps_history_geometry_and_focus(qapp):
                 config_id=101,
                 name="Config Alpha",
                 fault_types=fault_types,
+                manual_judgment_buttons_visible=True,
             ),
             sn=f"SN-{index}",
             trigger_source="manual",

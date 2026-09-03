@@ -1197,6 +1197,12 @@ class _FrozenRunFreezer:
             if type(raw_fault_types) is str
             else []
         )
+        visible = values.get("manual_judgment_buttons_visible", False)
+        if type(visible) is not bool:
+            raise ValueError(
+                "manual_judgment_buttons_visible must be a boolean"
+            )
+        values["manual_judgment_buttons_visible"] = visible
         values["selected_channels"] = list(config.selected_channels)
         runtime_channels = []
         for channel in config.channels:
@@ -1856,10 +1862,21 @@ class _CoordinatorPersistence:
         ]
         if run.hardware_id is not None:
             details.append({"label": "硬件", "value": str(run.hardware_id)})
+        manual_judgment_buttons_visible = config.get(
+            "manual_judgment_buttons_visible",
+            False,
+        )
+        if type(manual_judgment_buttons_visible) is not bool:
+            raise ValueError(
+                "frozen manual_judgment_buttons_visible must be a boolean"
+            )
         labels_value_id, labels_bytes = encode_history_labels_payload(
             config_id=run.config_id,
             name=str(config.get("config_name") or f"Config {run.config_id}"),
             fault_types=config.get("fault_types", []),
+            manual_judgment_buttons_visible=(
+                manual_judgment_buttons_visible
+            ),
             details=details,
             sn=str(
                 envelope.workorder.get("sn")

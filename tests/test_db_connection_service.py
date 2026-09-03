@@ -89,6 +89,7 @@ CHANNEL_CONFIG_COLUMN_SQL = {
 
 TEST_CONFIG_COLUMN_SQL = {
     "fault_types_json": "TEXT NOT NULL DEFAULT '[]'",
+    "manual_judgment_buttons_visible": "INTEGER NOT NULL DEFAULT 0",
     "input_hardware_device_id": "INTEGER DEFAULT NULL",
     "vibration_view_channel_index": "INTEGER DEFAULT NULL",
     "result_dashboard_layout": "TEXT DEFAULT NULL",
@@ -108,6 +109,62 @@ TEST_CONFIG_COLUMN_SQL = {
     "current_meter_poll_interval_ms": "INTEGER NOT NULL DEFAULT 200",
     "current_meter_timeout_ms": "INTEGER NOT NULL DEFAULT 1000",
 }
+
+
+@pytest.mark.parametrize(
+    "definition",
+    [
+        None,
+        "INTEGER DEFAULT 0",
+        "TEXT NOT NULL DEFAULT 0",
+        "INTEGER NOT NULL DEFAULT 1",
+    ],
+)
+def test_connect_requires_exact_manual_judgment_visibility_column_without_mutating(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    definition: str | None,
+) -> None:
+    db_path = tmp_path / "jingchen.db"
+    tmp_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    tmp_db.connect()
+    for table_name in sorted(EXPECTED_RUNTIME_TABLES - {"test_config_table"}):
+        _create_table(tmp_db, table_name)
+    columns = dict(TEST_CONFIG_COLUMN_SQL)
+    if definition is None:
+        columns.pop("manual_judgment_buttons_visible")
+    else:
+        columns["manual_judgment_buttons_visible"] = definition
+    column_sql = ", ".join(
+        f"{name} {column_definition}"
+        for name, column_definition in columns.items()
+    )
+    tmp_db.execute_sql(
+        f"CREATE TABLE test_config_table (id INTEGER PRIMARY KEY, {column_sql})"
+    )
+    tmp_db.execute_sql("INSERT INTO test_config_table (id) VALUES (1)")
+    before = tmp_db.execute_sql("PRAGMA table_info(test_config_table)").fetchall()
+    tmp_db.close()
+    monkeypatch.setattr(svc_mod, "DB_PATH", str(db_path))
+    monkeypatch.setattr(svc_mod, "db", tmp_db)
+
+    with pytest.raises(
+        DatabaseStartupError,
+        match="manual_judgment_buttons_visible",
+    ):
+        svc_mod.DbConnectionService().connect()
+
+    check_db = SqliteDatabase(str(db_path), pragmas={"foreign_keys": 1})
+    check_db.connect()
+    try:
+        assert check_db.execute_sql(
+            "PRAGMA table_info(test_config_table)"
+        ).fetchall() == before
+        assert check_db.execute_sql(
+            "SELECT id FROM test_config_table"
+        ).fetchall() == [(1,)]
+    finally:
+        check_db.close()
 
 
 def test_runtime_schema_requires_managed_input_without_legacy_hardware_fallback():

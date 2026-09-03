@@ -73,6 +73,7 @@ def _card(
     *,
     active: bool = False,
     index: int = 0,
+    manual_judgment_buttons_visible: bool = True,
 ) -> ResultHistoryCardSnapshot:
     started = datetime(2026, 7, 26, 9, 0) + timedelta(minutes=index)
     return ResultHistoryCardSnapshot(
@@ -83,6 +84,9 @@ def _card(
             details=(
                 ConfigSummaryField("转速", f"{1000 + index} rpm"),
                 ConfigSummaryField("测量模式", "终检"),
+            ),
+            manual_judgment_buttons_visible=(
+                manual_judgment_buttons_visible
             ),
         ),
         sn=f"SN-{index}",
@@ -1091,6 +1095,44 @@ def test_manual_actions_hide_without_legal_selection(qapp):
         )
     )
 
+    assert actions.parentWidget() is module
+    assert actions.isHidden()
+    assert not actions.isEnabled()
+
+
+def test_manual_judgment_buttons_false_detaches_hides_and_disables_actions(
+    qapp,
+):
+    actions = QWidget()
+    module = ResultHistoryModule(manual_judgment_widget=actions)
+    visible = _card("visible", index=1)
+    hidden = _card(
+        "hidden",
+        index=2,
+        manual_judgment_buttons_visible=False,
+    )
+    module.render_snapshot(
+        _snapshot(
+            terminal_cards=(visible, hidden),
+            follow_latest=False,
+            selected_run_id="visible",
+        )
+    )
+    assert actions.parentWidget() is _card_for(
+        module,
+        "visible",
+    ).manual_judgment_slot
+
+    module.render_snapshot(
+        _snapshot(
+            terminal_cards=(visible, hidden),
+            follow_latest=False,
+            selected_run_id="hidden",
+            revision=2,
+        )
+    )
+
+    assert _card_for(module, "hidden").manual_judgment_widget is None
     assert actions.parentWidget() is module
     assert actions.isHidden()
     assert not actions.isEnabled()

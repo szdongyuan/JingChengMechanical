@@ -317,6 +317,10 @@ class HistoryQtAdapter(QObject):
                 for item in config_value["details"]
             ),
             fault_types=tuple(config_value["fault_types"]),
+            manual_judgment_buttons_visible=config_value.get(
+                "manual_judgment_buttons_visible",
+                False,
+            ),
         )
         kind = event.kind
         if kind is HistoryFactKind.RECORDING:

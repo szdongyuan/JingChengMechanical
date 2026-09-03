@@ -144,6 +144,7 @@ def services():
 def card(
     run_id: str, *, active=False, revision=0, reanalyzing=False,
     operation_id=None, fault_types=(), fault_type=None,
+    manual_judgment_buttons_visible=True,
 ):
     return ResultHistoryCardSnapshot(
         run_id=run_id,
@@ -152,6 +153,9 @@ def card(
             name="Frozen config",
             details=(ConfigSummaryField("Channel", "0"),),
             fault_types=tuple(fault_types),
+            manual_judgment_buttons_visible=(
+                manual_judgment_buttons_visible
+            ),
         ),
         sn="SN",
         trigger_source="test",
@@ -215,6 +219,86 @@ def test_manual_target_uses_only_frozen_history_labels(qapp):
     accepted = module.request_manual_judgment("NG", "漏装")
     assert accepted.request.fault_type == "漏装"
     assert emitted == [accepted.request]
+
+
+def test_manual_judgment_buttons_false_publishes_no_homepage_target(qapp):
+    module = ResultDashboardModule(services())
+    targets = []
+    module.manual_judgment_target_changed.connect(targets.append)
+    module.apply_history_event(
+        RunTerminated(
+            card("visible", revision=1),
+            review_payload=review("visible"),
+        )
+    )
+    module.apply_history_event(
+        RunTerminated(
+            card(
+                "hidden",
+                revision=1,
+                manual_judgment_buttons_visible=False,
+            ),
+            review_payload=review("hidden"),
+        )
+    )
+
+    assert targets[-1] is None
+    assert module._manual_judgment_target is None
+
+
+def test_manual_judgment_buttons_visibility_is_frozen_per_run(qapp):
+    service_bundle = services()
+    current_config = {"manual_judgment_buttons_visible": False}
+    service_bundle.config_service.load_config.side_effect = None
+    service_bundle.config_service.load_config.return_value = dict(current_config)
+    service_bundle.config_service.load_config_for_result_dashboard.side_effect = None
+    service_bundle.config_service.load_config_for_result_dashboard.return_value = (
+        dict(current_config)
+    )
+    module = ResultDashboardModule(service_bundle)
+    targets = []
+    module.manual_judgment_target_changed.connect(targets.append)
+    module.apply_history_event(
+        RunTerminated(
+            card(
+                "old-hidden",
+                revision=1,
+                manual_judgment_buttons_visible=False,
+            ),
+            review_payload=review("old-hidden"),
+        )
+    )
+
+    current_config["manual_judgment_buttons_visible"] = True
+    service_bundle.config_service.load_config.return_value = dict(current_config)
+    service_bundle.config_service.load_config_for_result_dashboard.return_value = (
+        dict(current_config)
+    )
+    module.set_follow_latest(False)
+    module.select_run("old-hidden")
+
+    assert module._manual_judgment_target is None
+
+    module.apply_history_event(
+        RunTerminated(
+            card(
+                "new-visible",
+                revision=1,
+                manual_judgment_buttons_visible=True,
+            ),
+            review_payload=review("new-visible"),
+        )
+    )
+    module.select_run("new-visible")
+
+    assert targets[-1] == ManualJudgmentTarget(
+        "new-visible",
+        1,
+        (),
+        True,
+    )
+    service_bundle.config_service.load_config.assert_not_called()
+    service_bundle.config_service.load_config_for_result_dashboard.assert_not_called()
 
 
 def test_dashboard_manual_actions_keep_viewport_host_and_overlay_focused_slot(qapp):

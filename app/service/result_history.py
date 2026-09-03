@@ -101,6 +101,7 @@ class FrozenConfigSummary:
     name: str
     details: tuple[ConfigSummaryField, ...] = ()
     fault_types: tuple[str, ...] = ()
+    manual_judgment_buttons_visible: bool = False
 
     def __post_init__(self) -> None:
         _require_exact_instance(self, FrozenConfigSummary)
@@ -108,6 +109,10 @@ class FrozenConfigSummary:
             raise ResultHistoryError("config_id must be an integer or None")
         if type(self.name) is not str:
             raise ResultHistoryError("config summary name must be a string")
+        if type(self.manual_judgment_buttons_visible) is not bool:
+            raise ResultHistoryError(
+                "manual_judgment_buttons_visible must be a bool"
+            )
         if type(self.details) is not tuple or not all(
             type(item) is ConfigSummaryField for item in self.details
         ):
@@ -640,6 +645,9 @@ def _clone_config_summary(
         config_id=config.config_id,
         name=config.name,
         fault_types=tuple(config.fault_types),
+        manual_judgment_buttons_visible=(
+            config.manual_judgment_buttons_visible
+        ),
         details=tuple(
             ConfigSummaryField(label=item.label, value=item.value)
             for item in config.details

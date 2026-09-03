@@ -1361,6 +1361,7 @@ def test_frozen_run_freezer_converts_channel_json_columns_to_runtime_values():
         values={
             "config_name": "test",
             "fault_types_json": "[]",
+            "manual_judgment_buttons_visible": True,
         },
         channels=(
             SimpleNamespace(
@@ -1382,6 +1383,84 @@ def test_frozen_run_freezer_converts_channel_json_columns_to_runtime_values():
         {"kind": "upper", "points": []}
     ]
     assert channel["ai_config"] == {"enabled": False}
+    assert semantic["manual_judgment_buttons_visible"] is True
+
+
+@pytest.mark.parametrize("invalid", [0, 1, "true", None])
+def test_frozen_run_freezer_rejects_non_boolean_manual_judgment_buttons_visibility(
+    invalid,
+):
+    import app.service.multi_run_integration.production_composition as module
+
+    config = SimpleNamespace(
+        config_id=11,
+        selected_channels=(),
+        values={
+            "config_name": "test",
+            "fault_types_json": "[]",
+            "manual_judgment_buttons_visible": invalid,
+        },
+        channels=(),
+    )
+
+    with pytest.raises(ValueError, match="manual_judgment_buttons_visible"):
+        module._FrozenRunFreezer._semantic_config(config)
+
+
+def test_durable_terminal_history_labels_use_frozen_manual_judgment_buttons_visibility() -> None:
+    import app.service.multi_run_integration.production_composition as module
+    from app.service.fault_types import decode_history_labels_payload
+    from app.service.run_persistence.analysis_envelope import (
+        freeze_analysis_envelope,
+    )
+    from tests.run_persistence.conftest import make_analysis_envelope
+
+    run_id = RUN_IDS[0]
+    attempt_id = RUN_IDS[1]
+    frozen_config = {
+        "config_id": 11,
+        "config_name": "Frozen visible config",
+        "fault_types": ["异响"],
+        "manual_judgment_buttons_visible": True,
+        "selected_channels": [0],
+    }
+    run = SimpleNamespace(
+        state="SUCCEEDED",
+        judgment="PASS",
+        causal_revision=4,
+        config_snapshot_json=freeze_analysis_envelope(
+            make_analysis_envelope(
+                config=frozen_config,
+                workorder={"sn": "SN-FROZEN"},
+            )
+        ),
+        calibration_snapshot_json='{"kind":"NONE"}',
+        trigger_source="MANUAL",
+        config_id=11,
+        hardware_id=None,
+        fault_type=None,
+        manual_judgment_revision=None,
+    )
+    attempt = SimpleNamespace(
+        attempt_id=attempt_id,
+        result_payload_json='{"judgment":"PASS","result":{}}',
+    )
+    persistence = object.__new__(module._CoordinatorPersistence)
+    persistence._runs = SimpleNamespace(get=lambda requested: run)
+    persistence._attempts = SimpleNamespace(
+        latest_successful_for_run=lambda requested: attempt
+    )
+    persistence._audio = SimpleNamespace(get_for_run=lambda requested: None)
+
+    facts = persistence.load_result_control_facts(run_id)
+
+    assert facts is not None
+    labels = decode_history_labels_payload(
+        value_id=facts.current_projection.history_labels.value_id,
+        canonical_bytes=facts.current_projection.history_labels.canonical_bytes,
+    )
+    assert labels["schema"] == "jingcheng-history-labels/v2"
+    assert labels["config"]["manual_judgment_buttons_visible"] is True
 
 
 def test_run_freezer_snapshots_current_dashboard_layout_at_acceptance(tmp_path):

@@ -36,6 +36,7 @@ from app.service.result_history import (
     RunTerminated,
     TerminalResultReplaced,
 )
+from app.service.result_history_contracts import ManualJudgmentTarget
 from app.services_container import FactoryControllerState
 from ui.modules.result_dashboard import ResultDashboardModule
 from ui.modules.result import ResultModule
@@ -195,13 +196,21 @@ def _config(
     }
 
 
-def _card(run_id: str, *, revision: int = 0):
+def _card(
+    run_id: str,
+    *,
+    revision: int = 0,
+    manual_judgment_buttons_visible: bool = True,
+):
     return ResultHistoryCardSnapshot(
         run_id=run_id,
         config=FrozenConfigSummary(
             101,
             "Frozen",
             (ConfigSummaryField("mode", "history"),),
+            manual_judgment_buttons_visible=(
+                manual_judgment_buttons_visible
+            ),
         ),
         sn="SN",
         trigger_source="manual",
@@ -214,6 +223,50 @@ def _card(run_id: str, *, revision: int = 0):
         manual_judgment_allowed=True,
         manual_reanalysis_allowed=True,
         revision=revision,
+    )
+
+
+def test_dashboard_manual_judgment_buttons_require_frozen_visibility_flag(qapp):
+    module = ResultDashboardModule(_services())
+    targets = []
+    module.manual_judgment_target_changed.connect(targets.append)
+
+    module.apply_history_event(
+        RunTerminated(
+            _card(
+                "hidden",
+                revision=1,
+                manual_judgment_buttons_visible=False,
+            ),
+            review_payload=ReviewDisplayPayload(
+                FactoryReviewPayload(
+                    displayed_config_id=101,
+                    run_id="hidden",
+                ),
+                _config([]),
+            ),
+        )
+    )
+    assert targets == []
+    assert module._manual_judgment_target is None
+
+    module.apply_history_event(
+        RunTerminated(
+            _card("visible", revision=2),
+            review_payload=ReviewDisplayPayload(
+                FactoryReviewPayload(
+                    displayed_config_id=101,
+                    run_id="visible",
+                ),
+                _config([]),
+            ),
+        )
+    )
+    assert targets[-1] == ManualJudgmentTarget(
+        "visible",
+        2,
+        (),
+        True,
     )
 
 

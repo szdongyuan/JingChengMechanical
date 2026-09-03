@@ -1191,6 +1191,44 @@ def test_build_summary_payload_displays_chinese_ai_defect_label_with_score():
     assert ai_row["constrained"] is True
 
 
+def test_visibility_flag_does_not_change_analysis_or_ai_summary_semantics():
+    hidden_config = _make_ai_only_config()
+    hidden_config["fault_types"] = ["嗡嗡音"]
+    hidden_config["manual_judgment_buttons_visible"] = False
+    visible_config = dict(hidden_config)
+    visible_config["manual_judgment_buttons_visible"] = True
+    judgment_payload = _make_ai_only_judgment_payload(
+        ai_pass=False,
+        ai_score=0.91,
+    )
+    ai_review = {
+        "status": "success",
+        "threshold": 0.5,
+        "score": 0.91,
+        "passed": False,
+        "ai_label": "嗡嗡音",
+    }
+
+    hidden_summary = build_summary_payload(
+        config=hidden_config,
+        judgment_payload=judgment_payload,
+        ai_review=ai_review,
+    )
+    visible_summary = build_summary_payload(
+        config=visible_config,
+        judgment_payload=judgment_payload,
+        ai_review=ai_review,
+    )
+
+    assert hidden_summary == visible_summary
+    assert hidden_summary["overall_status"] == "fail"
+    assert hidden_summary["overall_label"] == "FAIL"
+    ai_row = hidden_summary["rows"][-1]
+    assert ai_row["status"] == "NG"
+    assert ai_row["actual_value"] == pytest.approx(0.91)
+    assert ai_row["failure_label"] == "嗡嗡音"
+
+
 def test_build_summary_payload_keeps_scoreless_success_with_ai_threshold_as_no_result_even_when_judgment_used_ai_label():
     summary = build_summary_payload(
         config=_make_ai_only_config(),

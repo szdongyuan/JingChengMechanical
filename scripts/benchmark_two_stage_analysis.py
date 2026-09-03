@@ -895,6 +895,10 @@ class _QtEndpoint:
             config_id=config["config_id"],
             name=str(config.get("config_name") or "benchmark"),
             fault_types=tuple(config.get("fault_types") or ()),
+            manual_judgment_buttons_visible=config.get(
+                "manual_judgment_buttons_visible",
+                False,
+            ),
             details=({"label": "scenario", "value": "latency"},),
             sn=f"BENCH-{attempt_id[:8]}",
             trigger_source="manual",

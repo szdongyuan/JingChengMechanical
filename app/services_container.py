@@ -784,7 +784,9 @@ class ServiceContainer:
         workorder: Mapping[str, object],
         config_id: int | None,
     ) -> tuple[dict[str, object], FrozenPayload]:
-        name, fault_types = self._history_config(config_id)
+        name, fault_types, manual_judgment_buttons_visible = (
+            self._history_config(config_id)
+        )
         trigger_source = {
             TriggerSource.PLC: "plc",
             TriggerSource.MANUAL: "manual",
@@ -796,6 +798,9 @@ class ServiceContainer:
             config_id=config_id,
             name=name,
             fault_types=fault_types,
+            manual_judgment_buttons_visible=(
+                manual_judgment_buttons_visible
+            ),
             details=[],
             sn=sn if type(sn) is str else "",
             trigger_source=trigger_source,
@@ -808,9 +813,9 @@ class ServiceContainer:
     def _history_config(
         self,
         config_id: int | None,
-    ) -> tuple[str, list[str]]:
+    ) -> tuple[str, list[str], bool]:
         if config_id is None:
-            return "未解析配置", []
+            return "未解析配置", [], False
         prepared = self.prepared_production_composition
         prerequisites = getattr(prepared, "_prerequisites", None)
         for candidate in tuple(getattr(prerequisites, "configs", ()) or ()):
@@ -824,11 +829,17 @@ class ServiceContainer:
                 if type(raw_fault_types) is str
                 else []
             )
+            visible = values.get("manual_judgment_buttons_visible", False)
+            if type(visible) is not bool:
+                raise ValueError(
+                    "manual_judgment_buttons_visible must be a boolean"
+                )
             return (
                 name
                 if type(name) is str and name
                 else f"Config {config_id}",
                 fault_types,
+                visible,
             )
         semantic = self._semantic_config
         name = semantic.get("config_name") or semantic.get("name")
@@ -851,7 +862,12 @@ class ServiceContainer:
             if isinstance(raw_fault_types, (list, tuple))
             else []
         )
-        return name, fault_types
+        visible = semantic.get("manual_judgment_buttons_visible", False)
+        if type(visible) is not bool:
+            raise ValueError(
+                "manual_judgment_buttons_visible must be a boolean"
+            )
+        return name, fault_types, visible
 
     def build_captured_start_request(
         self,

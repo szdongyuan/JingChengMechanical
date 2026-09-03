@@ -1026,6 +1026,13 @@ class ConfigPackageService:
         config_root["fault_types"] = normalize_fault_types(
             config_root["fault_types"]
         )
+        if "manual_judgment_buttons_visible" in config_root:
+            if type(config_root["manual_judgment_buttons_visible"]) is not bool:
+                raise ValueError(
+                    "manual_judgment_buttons_visible must be a boolean"
+                )
+        else:
+            config_root["manual_judgment_buttons_visible"] = False
 
         golden_assets = config_payload.get("golden_sample_assets", {})
         if golden_assets is None:

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -205,6 +207,69 @@ def test_every_history_fact_maps_exhaustively_in_fifo_order(qapp):
     assert card.fault_type == "异响"
     assert not diagnostics
     assert not evictions
+
+
+def test_history_label_versions_project_frozen_manual_judgment_buttons_visibility(
+    qapp,
+):
+    from app.service.multi_run_integration.history_qt_adapter import HistoryQtAdapter
+
+    dashboard = DashboardProbe()
+    diagnostics = []
+    adapter = HistoryQtAdapter(dashboard, diagnostic_callback=diagnostics.append)
+    legacy_value = {
+        "schema": "jingcheng-history-labels/v1",
+        "config": {
+            "config_id": 7,
+            "name": "Legacy config",
+            "fault_types": ["异响"],
+            "details": [],
+        },
+        "sn": "SN-LEGACY",
+        "trigger_source": "manual",
+    }
+    legacy_bytes = json.dumps(
+        legacy_value,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    legacy_labels = FrozenPayload(
+        "sha256:" + hashlib.sha256(legacy_bytes).hexdigest(),
+        legacy_bytes,
+    )
+
+    adapter.publish(
+        projected_event(
+            HistoryFactKind.RUN_TERMINATED,
+            run_id=RUN_IDS[0],
+            expected_revision=1,
+            proposed_revision=2,
+            operation_id=RUN_IDS[6],
+            result_attempt_id=RUN_IDS[6],
+            labels=history_labels(manual_judgment_buttons_visible=True),
+        )
+    )
+    adapter.publish(
+        projected_event(
+            HistoryFactKind.RUN_TERMINATED,
+            run_id=RUN_IDS[1],
+            expected_revision=1,
+            proposed_revision=2,
+            operation_id=RUN_IDS[7],
+            result_attempt_id=RUN_IDS[7],
+            labels=legacy_labels,
+        )
+    )
+    _drain(qapp)
+
+    cards = {
+        card.run_id: card for card in dashboard.store.snapshot().terminal_cards
+    }
+    assert cards[RUN_IDS[0]].config.manual_judgment_buttons_visible is True
+    assert cards[RUN_IDS[1]].config.manual_judgment_buttons_visible is False
+    assert diagnostics == []
 
 
 def test_one_run_keeps_its_first_start_and_terminal_times_across_phase_updates(
@@ -598,6 +663,7 @@ def test_post_store_projection_failure_keeps_eviction_and_disables_manual_target
         eviction_callback=evictions.append,
         diagnostic_callback=adapter_diagnostics.append,
     )
+    visible_labels = history_labels(manual_judgment_buttons_visible=True)
 
     for run_id in RUN_IDS[:6]:
         adapter.publish(
@@ -610,6 +676,7 @@ def test_post_store_projection_failure_keeps_eviction_and_disables_manual_target
                 conclusion=TerminalConclusion.ERROR,
                 error_category=TerminalErrorCategory.ANALYSIS_FAILED,
                 reason="analysis failed",
+                labels=visible_labels,
             )
         )
     _drain(qapp)
@@ -629,6 +696,7 @@ def test_post_store_projection_failure_keeps_eviction_and_disables_manual_target
             conclusion=TerminalConclusion.ERROR,
             error_category=TerminalErrorCategory.ANALYSIS_FAILED,
             reason="analysis failed",
+            labels=visible_labels,
         )
     )
     _drain(qapp)

@@ -233,6 +233,7 @@ def test_history_labels_codec_exact_shape_trigger_mapping_and_unresolved_form() 
         config_id=7,
         name="配置 A",
         fault_types=[" 异响 ", "漏装"],
+        manual_judgment_buttons_visible=True,
         details=[{"label": "录音时长", "value": "10 s"}],
         sn="SN-001",
         trigger_source="manual",
@@ -242,22 +243,63 @@ def test_history_labels_codec_exact_shape_trigger_mapping_and_unresolved_form() 
         canonical_bytes=payload,
     )
     assert set(decoded) == {"schema", "config", "sn", "trigger_source"}
-    assert set(decoded["config"]) == {"config_id", "name", "fault_types", "details"}
+    assert decoded["schema"] == "jingcheng-history-labels/v2"
+    assert set(decoded["config"]) == {
+        "config_id",
+        "name",
+        "fault_types",
+        "manual_judgment_buttons_visible",
+        "details",
+    }
     assert decoded["config"]["fault_types"] == ["异响", "漏装"]
+    assert decoded["config"]["manual_judgment_buttons_visible"] is True
 
     for trigger in ("plc", "manual", "scan", "import_audio"):
-        identity, canonical = encode_history_labels_payload(
-            config_id=None,
-            name="未解析配置",
-            fault_types=[],
-            details=[],
-            sn="",
-            trigger_source=trigger,
-        )
-        assert decode_history_labels_payload(
-            value_id=identity,
-            canonical_bytes=canonical,
-        )["trigger_source"] == trigger
+        for visible in (False, True):
+            config_id = 7 if visible else None
+            identity, canonical = encode_history_labels_payload(
+                config_id=config_id,
+                name="配置 A" if config_id is not None else "未解析配置",
+                fault_types=[] if config_id is None else ["异响"],
+                manual_judgment_buttons_visible=visible,
+                details=[],
+                sn="",
+                trigger_source=trigger,
+            )
+            round_tripped = decode_history_labels_payload(
+                value_id=identity,
+                canonical_bytes=canonical,
+            )
+            assert round_tripped["trigger_source"] == trigger
+            assert (
+                round_tripped["config"]["manual_judgment_buttons_visible"]
+                is visible
+            )
+
+
+def test_history_labels_v1_canonical_bytes_and_hash_remain_unchanged() -> None:
+    legacy_bytes = (
+        b'{"config":{"config_id":7,"details":[{"label":"\xe5\xbd\x95\xe9\x9f\xb3\xe6\x97\xb6\xe9\x95\xbf",'
+        b'"value":"10 s"}],"fault_types":["\xe5\xbc\x82\xe5\x93\x8d","\xe6\xbc\x8f\xe8\xa3\x85"],'
+        b'"name":"\xe9\x85\x8d\xe7\xbd\xae A"},"schema":"jingcheng-history-labels/v1",'
+        b'"sn":"SN-001","trigger_source":"manual"}'
+    )
+    legacy_id = "sha256:44c601ddd4b38820f41c425ef468cc955b7361ba02152862aa6b58821b52602f"
+
+    decoded = decode_history_labels_payload(
+        value_id=legacy_id,
+        canonical_bytes=legacy_bytes,
+    )
+
+    assert decoded["schema"] == "jingcheng-history-labels/v1"
+    assert set(decoded["config"]) == {
+        "config_id",
+        "name",
+        "fault_types",
+        "details",
+    }
+    assert "manual_judgment_buttons_visible" not in decoded["config"]
+    assert "sha256:" + hashlib.sha256(legacy_bytes).hexdigest() == legacy_id
 
 
 @pytest.mark.parametrize(
@@ -266,6 +308,7 @@ def test_history_labels_codec_exact_shape_trigger_mapping_and_unresolved_form() 
         {"trigger_source": "PLC"},
         {"details": [{"label": "x", "value": 1}]},
         {"fault_types": ["异响"]},
+        {"manual_judgment_buttons_visible": True},
     ],
 )
 def test_history_labels_rejects_invalid_stable_or_unresolved_values(updates: dict) -> None:
@@ -273,6 +316,7 @@ def test_history_labels_rejects_invalid_stable_or_unresolved_values(updates: dic
         "config_id": None,
         "name": "未解析配置",
         "fault_types": [],
+        "manual_judgment_buttons_visible": False,
         "details": [],
         "sn": "",
         "trigger_source": "plc",
@@ -287,6 +331,7 @@ def test_history_labels_decoder_rejects_wrong_shape_noncanonical_and_identity() 
         config_id=1,
         name="Cfg",
         fault_types=[],
+        manual_judgment_buttons_visible=False,
         details=[],
         sn="SN",
         trigger_source="scan",
@@ -315,3 +360,45 @@ def test_history_labels_decoder_rejects_wrong_shape_noncanonical_and_identity() 
                 value_id=identity,
                 canonical_bytes=canonical,
             )
+
+
+@pytest.mark.parametrize("visible", [0, 1, "true", None])
+def test_history_labels_v2_requires_exact_boolean_on_encode(visible: object) -> None:
+    with pytest.raises(ValueError, match="manual_judgment_buttons_visible"):
+        encode_history_labels_payload(
+            config_id=1,
+            name="Cfg",
+            fault_types=[],
+            manual_judgment_buttons_visible=visible,
+            details=[],
+            sn="SN",
+            trigger_source="manual",
+        )
+
+
+@pytest.mark.parametrize("visible", [pytest.param("missing"), 0, 1, "false", None])
+def test_history_labels_v2_decoder_rejects_missing_or_non_boolean_visible(
+    visible: object,
+) -> None:
+    config = {
+        "config_id": 1,
+        "name": "Cfg",
+        "fault_types": [],
+        "details": [],
+    }
+    if visible != "missing":
+        config["manual_judgment_buttons_visible"] = visible
+    identity, canonical = _canonical_identity(
+        {
+            "schema": "jingcheng-history-labels/v2",
+            "config": config,
+            "sn": "SN",
+            "trigger_source": "manual",
+        }
+    )
+
+    with pytest.raises(ValueError, match="shape|manual_judgment_buttons_visible"):
+        decode_history_labels_payload(
+            value_id=identity,
+            canonical_bytes=canonical,
+        )
