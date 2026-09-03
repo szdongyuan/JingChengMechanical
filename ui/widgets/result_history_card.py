@@ -12,7 +12,7 @@ from PyQt6.QtCore import (
     Qt,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QKeyEvent, QMouseEvent
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QKeyEvent, QMouseEvent
 from PyQt6.QtWidgets import (
     QFrame,
     QHeaderView,
@@ -181,32 +181,80 @@ class _FittedSummaryTable(QTableWidget):
         self._last_fitted_result_width = self.columnWidth(3)
 
 
-class _WrappedStatusLabel(QLabel):
-    """Report the full wrapped text height for the width offered by layout."""
+class _FittedStatusLabel(QLabel):
+    """Keep the complete status on one line at the largest readable size."""
 
-    def _wrapped_height(self, width: int) -> int:
-        return self.fontMetrics().boundingRect(
-            QRect(0, 0, max(1, width), 10_000),
-            Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap,
-            self.text(),
-        ).height()
+    _MAX_PIXEL_SIZE = 32
+    _MIN_PIXEL_SIZE = 18
 
-    def heightForWidth(self, width: int) -> int:
-        return max(48, self._wrapped_height(width))
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._full_text = ""
+        self._color = "#424242"
+        self._fit_timer = QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.timeout.connect(self._fit_text)
 
-    def refresh_wrapped_minimum_height(self) -> None:
-        required_height = max(
-            48,
-            self._wrapped_height(self.contentsRect().width()),
-        )
-        if self.minimumHeight() == required_height:
-            return
-        self.setMinimumHeight(required_height)
-        self.updateGeometry()
+    def set_display(self, text: str, color: str) -> None:
+        self._full_text = text
+        self._color = color
+        self.setText(text)
+        self.setToolTip(f"结果摘要：{text}")
+        self.setAccessibleDescription(f"结果摘要：{text}")
+        self._apply_style(self._MAX_PIXEL_SIZE)
+        self._fit_text()
+        self._schedule_fit()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self.refresh_wrapped_minimum_height()
+        if event.oldSize().width() != event.size().width():
+            self._schedule_fit()
+
+    def _schedule_fit(self) -> None:
+        if not self._fit_timer.isActive():
+            self._fit_timer.start(0)
+
+    def _fit_text(self) -> None:
+        available_width = self.contentsRect().width()
+        if available_width <= 0:
+            return
+
+        chosen_size = self._MIN_PIXEL_SIZE
+        complete_text_fits = False
+        for pixel_size in range(
+            self._MAX_PIXEL_SIZE,
+            self._MIN_PIXEL_SIZE - 1,
+            -1,
+        ):
+            metrics = QFontMetrics(self._font_at_size(pixel_size))
+            if metrics.horizontalAdvance(self._full_text) <= available_width:
+                chosen_size = pixel_size
+                complete_text_fits = True
+                break
+
+        self._apply_style(chosen_size)
+        if complete_text_fits:
+            visible_text = self._full_text
+        else:
+            metrics = QFontMetrics(self._font_at_size(chosen_size))
+            visible_text = metrics.elidedText(
+                self._full_text,
+                Qt.TextElideMode.ElideRight,
+                available_width,
+            )
+        self.setText(visible_text)
+
+    def _font_at_size(self, pixel_size: int) -> QFont:
+        font = self.font()
+        font.setPixelSize(pixel_size)
+        font.setWeight(QFont.Weight.ExtraBold)
+        return font
+
+    def _apply_style(self, pixel_size: int) -> None:
+        self.setStyleSheet(
+            f"font-size: {pixel_size}px; font-weight: 800; "
+            f"color: {self._color};"
+        )
 
 
 class ResultHistoryCard(QFrame):
@@ -311,21 +359,20 @@ class ResultHistoryCard(QFrame):
             "结果摘要",
         )
         caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        badge = _WrappedStatusLabel()
+        badge = _FittedStatusLabel()
         badge.setTextFormat(Qt.TextFormat.PlainText)
         badge.setObjectName("result_history_card_summary_overall")
         badge.setAccessibleName("结果摘要总结果")
         badge.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         status_layout.addWidget(badge)
         badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        badge.setWordWrap(True)
+        badge.setWordWrap(False)
         badge_size_policy = QSizePolicy(
             QSizePolicy.Policy.Expanding,
-            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
         )
-        badge_size_policy.setHeightForWidth(True)
         badge.setSizePolicy(badge_size_policy)
-        badge.setMinimumHeight(48)
+        badge.setFixedHeight(48)
         self._set_overall_display(
             badge,
             overall,
@@ -676,7 +723,7 @@ class ResultHistoryCard(QFrame):
         )
         overall = _CONCLUSION_TEXT[conclusion]
         if conclusion is ResultConclusion.NG and fault_type:
-            overall = f"{overall}（{fault_type}）"
+            overall = f"{overall}：{fault_type}"
         badge = self.findChild(
             QLabel,
             "result_history_card_summary_overall",
@@ -773,9 +820,10 @@ class ResultHistoryCard(QFrame):
             self._snapshot.conclusion is ResultConclusion.NG
             and self._snapshot.fault_type
         ):
-            fault_suffix = f"（{self._snapshot.fault_type}）"
-            if not overall.endswith(fault_suffix):
-                overall = f"{overall}{fault_suffix}"
+            return (
+                f"{_CONCLUSION_TEXT[ResultConclusion.NG]}："
+                f"{self._snapshot.fault_type}"
+            )
         return overall
 
     def _overall_color(self, summary: dict | None) -> str:
@@ -800,32 +848,12 @@ class ResultHistoryCard(QFrame):
         return "#424242"
 
     @staticmethod
-    def _set_overall_display(label: QLabel, text: str, color: str) -> None:
-        label.setText(text)
-        label.setToolTip(f"结果摘要：{text}")
-        label.setStyleSheet(
-            f"font-size: 32px; font-weight: 800; color: {color};"
-        )
-        if isinstance(label, _WrappedStatusLabel):
-            label.refresh_wrapped_minimum_height()
-            status_container = label.parentWidget()
-            status_layout = status_container.layout()
-            if status_layout is not None:
-                status_layout.invalidate()
-                status_layout.activate()
-            status_container.updateGeometry()
-            owner = status_container
-            while owner is not None and not isinstance(
-                owner,
-                ResultHistoryCard,
-            ):
-                owner = owner.parentWidget()
-            if owner is not None:
-                owner.updateGeometry()
-                if owner.isWindow() and owner.isVisible():
-                    owner.layout().invalidate()
-                    owner.layout().activate()
-                    owner.adjustSize()
+    def _set_overall_display(
+        label: _FittedStatusLabel,
+        text: str,
+        color: str,
+    ) -> None:
+        label.set_display(text, color)
 
     @classmethod
     def _average_display(cls, summary: dict | None, item_key: str) -> str:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import replace
 from datetime import datetime
 
 import pytest
@@ -9,7 +10,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QRect, Qt
-from PyQt6.QtGui import QPalette
+from PyQt6.QtGui import QFontMetrics, QPalette
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import (
     QApplication,
@@ -133,6 +134,40 @@ def _summary_table(card):
     assert table.rowCount() == 6
     assert [table.item(row, 0).text() for row in range(6)] == _SUMMARY_LABELS
     return table
+
+
+def _status_font_size(label: QLabel) -> int:
+    match = re.search(r"font-size:\s*(\d+)px", label.styleSheet())
+    assert match is not None
+    stylesheet_size = int(match.group(1))
+    assert label.font().pixelSize() == stylesheet_size
+    return stylesheet_size
+
+
+def _status_text_width(
+    label: QLabel,
+    text: str,
+    pixel_size: int,
+) -> int:
+    effective_font = label.font()
+    effective_font.setPixelSize(pixel_size)
+    return QFontMetrics(effective_font).horizontalAdvance(text)
+
+
+def _assert_complete_status_uses_largest_fitting_size(
+    label: QLabel,
+    full_status: str,
+) -> int:
+    available_width = label.contentsRect().width()
+    assert available_width > 0
+    chosen_size = _status_font_size(label)
+    assert _status_text_width(label, full_status, chosen_size) <= available_width
+    if chosen_size < 32:
+        assert (
+            _status_text_width(label, full_status, chosen_size + 1)
+            > available_width
+        )
+    return chosen_size
 
 
 def _required_wrapped_result_height(
@@ -476,7 +511,7 @@ def test_ng_overall_includes_frozen_fault_type(qapp):
     assert caption is not None
     assert overall is not None
     assert caption.text() == "结果摘要"
-    assert overall.text() == "不通过（异响）"
+    assert overall.text() == "不通过：异响"
 
 
 @pytest.mark.parametrize(
@@ -484,13 +519,13 @@ def test_ng_overall_includes_frozen_fault_type(qapp):
     [
         (
             ResultConclusion.NG,
-            "风扇叶片安装方向和固定状态异常需要立即停机进行人工复核",
-            "不通过（风扇叶片安装方向和固定状态异常需要立即停机进行人工复核）",
+            "异响",
+            "不通过：异响",
         ),
         (ResultConclusion.NO_RESULT, None, "无结果"),
     ],
 )
-def test_failure_card_renders_large_centered_wrapping_overall_status(
+def test_failure_card_renders_large_centered_single_line_overall_status(
     qapp,
     conclusion,
     fault_type,
@@ -523,37 +558,193 @@ def test_failure_card_renders_large_centered_wrapping_overall_status(
     assert overall.text() == expected
     assert overall.textFormat() is Qt.TextFormat.PlainText
     assert overall.accessibleName() == "结果摘要总结果"
-    assert overall.wordWrap() is True
+    assert expected in overall.accessibleDescription()
+    assert overall.wordWrap() is False
     assert overall.alignment() & Qt.AlignmentFlag.AlignHCenter
     assert (
         overall.sizePolicy().horizontalPolicy()
         is QSizePolicy.Policy.Expanding
     )
-    assert overall.minimumHeight() >= 48
-    available_width = max(1, overall.contentsRect().width())
-    wrapped_bounds = overall.fontMetrics().boundingRect(
-        QRect(0, 0, available_width, 10_000),
-        Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap,
-        overall.text(),
+    assert (
+        overall.sizePolicy().verticalPolicy()
+        is QSizePolicy.Policy.Fixed
     )
-    assert overall.height() >= max(
-        overall.minimumHeight(),
-        wrapped_bounds.height(),
-    )
-    if conclusion is ResultConclusion.NG:
-        assert wrapped_bounds.height() > overall.fontMetrics().height()
+    assert overall.minimumHeight() == 48
+    assert overall.maximumHeight() == 48
+    assert overall.height() == 48
     assert "font-size: 32px" in overall.styleSheet()
     assert "font-weight: 800" in overall.styleSheet()
     assert "#d93025" in overall.styleSheet().lower()
 
 
-def test_manual_ok_preview_shrinks_long_wrapped_overall_status(qapp):
+def test_single_line_four_character_fault_stays_complete_at_default_size(qapp):
+    full_status = "不通过：风扇异常"
     card = ResultHistoryCard(
         _snapshot(
             conclusion=ResultConclusion.NG,
-            fault_type=(
-                "风扇叶片安装方向和固定状态异常需要立即停机进行人工复核"
-            ),
+            fault_type="风扇异常",
+        )
+    )
+    card.setFixedWidth(360)
+    card.show()
+    qapp.processEvents()
+    qapp.processEvents()
+    overall = card.findChild(
+        QLabel,
+        "result_history_card_summary_overall",
+    )
+
+    assert card.width() == 360
+    assert overall is not None
+    assert overall.text() == full_status
+    assert overall.toolTip() == f"结果摘要：{full_status}"
+    assert full_status in overall.accessibleDescription()
+    assert overall.wordWrap() is False
+    assert overall.height() == 48
+    assert "font-size: 32px" in overall.styleSheet()
+    assert _assert_complete_status_uses_largest_fitting_size(
+        overall,
+        full_status,
+    ) == 32
+
+
+def test_adaptive_status_shrinks_to_keep_long_fault_complete(qapp):
+    fault_type = "风扇叶片安装异常"
+    full_status = f"不通过：{fault_type}"
+    configured_ng = _snapshot(
+        conclusion=ResultConclusion.NG,
+        fault_type=fault_type,
+    )
+    baseline = ResultHistoryCard(
+        replace(
+            configured_ng,
+            conclusion=ResultConclusion.OK,
+            fault_type=None,
+        )
+    )
+    baseline.setFixedWidth(360)
+    baseline.show()
+    qapp.processEvents()
+    qapp.processEvents()
+    baseline_height = baseline.height()
+
+    card = ResultHistoryCard(
+        configured_ng
+    )
+    card.setFixedWidth(360)
+    card.show()
+    qapp.processEvents()
+    qapp.processEvents()
+    overall = card.findChild(
+        QLabel,
+        "result_history_card_summary_overall",
+    )
+
+    assert overall is not None
+    assert overall.text() == full_status
+    assert overall.wordWrap() is False
+    assert overall.height() == 48
+    assert card.height() == baseline_height
+    chosen_size = _assert_complete_status_uses_largest_fitting_size(
+        overall,
+        full_status,
+    )
+    assert 18 <= chosen_size <= 31
+    assert overall.toolTip() == f"结果摘要：{full_status}"
+    assert full_status in overall.accessibleDescription()
+
+
+def test_adaptive_status_elides_at_minimum_size_but_keeps_full_metadata(qapp):
+    fault_type = "风扇叶片安装方向和固定状态异常需要立即停机进行人工复核"
+    assert len(fault_type.encode("utf-8")) <= 128
+    full_status = f"不通过：{fault_type}"
+    card = ResultHistoryCard(
+        _snapshot(
+            conclusion=ResultConclusion.NG,
+            fault_type=fault_type,
+        )
+    )
+    card.setFixedWidth(360)
+    card.show()
+    qapp.processEvents()
+    qapp.processEvents()
+    overall = card.findChild(
+        QLabel,
+        "result_history_card_summary_overall",
+    )
+
+    assert overall is not None
+    available_width = overall.contentsRect().width()
+    assert available_width > 0
+    assert _status_font_size(overall) == 18
+    assert _status_text_width(overall, full_status, 18) > available_width
+    assert overall.text() != full_status
+    assert overall.text().endswith("…")
+    assert full_status.startswith(overall.text()[:-1])
+    assert _status_text_width(overall, overall.text(), 18) <= available_width
+    assert overall.wordWrap() is False
+    assert overall.height() == 48
+    assert overall.toolTip() == f"结果摘要：{full_status}"
+    assert full_status in overall.accessibleDescription()
+
+
+def test_adaptive_status_refits_on_in_place_summary_update(qapp):
+    fault_type = "风扇叶片安装异常"
+    full_status = f"不通过：{fault_type}"
+    updated = _snapshot(
+        conclusion=ResultConclusion.NG,
+        fault_type=fault_type,
+    )
+    initial = replace(
+        updated,
+        conclusion=ResultConclusion.OK,
+        fault_type=None,
+    )
+    card = ResultHistoryCard(initial)
+    card.setFixedWidth(360)
+    card.show()
+    qapp.processEvents()
+    qapp.processEvents()
+    overall = card.findChild(
+        QLabel,
+        "result_history_card_summary_overall",
+    )
+    assert overall is not None
+    initial_card_height = card.height()
+    assert overall.text() == "通过"
+    assert _status_font_size(overall) == 32
+
+    card.update_snapshot(updated, None)
+    qapp.processEvents()
+    qapp.processEvents()
+
+    assert card.findChild(
+        QLabel,
+        "result_history_card_summary_overall",
+    ) is overall
+    assert overall.text() == full_status
+    chosen_size = _assert_complete_status_uses_largest_fitting_size(
+        overall,
+        full_status,
+    )
+    assert 18 <= chosen_size <= 31
+    assert overall.height() == 48
+    assert card.height() == initial_card_height
+    assert overall.toolTip() == f"结果摘要：{full_status}"
+    assert full_status in overall.accessibleDescription()
+
+
+def test_manual_preview_refits_ng_then_restores_ok_default_size(qapp):
+    fault_type = "风扇叶片安装异常"
+    configured_ng = _snapshot(
+        conclusion=ResultConclusion.NG,
+        fault_type=fault_type,
+    )
+    card = ResultHistoryCard(
+        replace(
+            configured_ng,
+            conclusion=ResultConclusion.OK,
+            fault_type=None,
         )
     )
     card.setFixedWidth(360)
@@ -565,9 +756,27 @@ def test_manual_ok_preview_shrinks_long_wrapped_overall_status(qapp):
         "result_history_card_summary_overall",
     )
     assert overall is not None
-    long_status_height = overall.height()
-    long_card_height = card.height()
-    assert long_status_height > 48
+    initial_card_height = card.height()
+    full_status = f"不通过：{fault_type}"
+
+    card.preview_manual_judgment("NG", fault_type)
+    qapp.processEvents()
+    qapp.processEvents()
+
+    assert card.findChild(
+        QLabel,
+        "result_history_card_summary_overall",
+    ) is overall
+    assert overall.text() == full_status
+    chosen_size = _assert_complete_status_uses_largest_fitting_size(
+        overall,
+        full_status,
+    )
+    assert 18 <= chosen_size <= 31
+    assert overall.height() == 48
+    assert card.height() == initial_card_height
+    assert overall.toolTip() == f"结果摘要：{full_status}"
+    assert full_status in overall.accessibleDescription()
 
     card.preview_manual_judgment("OK", None)
     qapp.processEvents()
@@ -578,27 +787,101 @@ def test_manual_ok_preview_shrinks_long_wrapped_overall_status(qapp):
         "result_history_card_summary_overall",
     ) is overall
     assert overall.text() == "通过"
-    assert overall.height() < long_status_height
-    assert card.height() < long_card_height
+    assert overall.height() == 48
+    assert card.height() == initial_card_height
     assert overall.minimumHeight() == 48
-    assert overall.height() >= 48
+    assert overall.maximumHeight() == 48
     assert overall.textFormat() is Qt.TextFormat.PlainText
     assert overall.accessibleName() == "结果摘要总结果"
-    assert overall.wordWrap() is True
+    assert "通过" in overall.accessibleDescription()
+    assert overall.wordWrap() is False
     assert overall.alignment() & Qt.AlignmentFlag.AlignHCenter
     assert "font-size: 32px" in overall.styleSheet()
+    assert _assert_complete_status_uses_largest_fitting_size(
+        overall,
+        "通过",
+    ) == 32
     assert "font-weight: 800" in overall.styleSheet()
     assert "#188038" in overall.styleSheet().lower()
+
+
+def test_adaptive_status_refits_same_label_when_card_narrows_then_widens(qapp):
+    full_status = "不通过：风扇异常"
+    card = ResultHistoryCard(
+        _snapshot(
+            conclusion=ResultConclusion.NG,
+            fault_type="风扇异常",
+        )
+    )
+    card.setFixedWidth(360)
+    card.show()
+    qapp.processEvents()
+    qapp.processEvents()
+    overall = card.findChild(
+        QLabel,
+        "result_history_card_summary_overall",
+    )
+    assert overall is not None
+    initial_card_height = card.height()
+    assert overall.text() == full_status
+    assert _status_font_size(overall) == 32
+    assert overall.height() == 48
+
+    card.setFixedWidth(220)
+    qapp.processEvents()
+    qapp.processEvents()
+
+    assert card.findChild(
+        QLabel,
+        "result_history_card_summary_overall",
+    ) is overall
+    available_width = overall.contentsRect().width()
+    assert available_width > 0
+    chosen_size = _status_font_size(overall)
+    assert chosen_size < 32
+    assert (
+        _status_text_width(overall, overall.text(), chosen_size)
+        <= available_width
+    )
+    if overall.text() == full_status:
+        assert (
+            _status_text_width(overall, full_status, chosen_size + 1)
+            > available_width
+        )
+    else:
+        assert chosen_size == 18
+        assert _status_text_width(overall, full_status, 18) > available_width
+        assert overall.text().endswith("…")
+    assert overall.height() == 48
+    assert card.height() == initial_card_height
+    assert overall.toolTip() == f"结果摘要：{full_status}"
+    assert full_status in overall.accessibleDescription()
+
+    card.setFixedWidth(360)
+    qapp.processEvents()
+    qapp.processEvents()
+
+    assert card.findChild(
+        QLabel,
+        "result_history_card_summary_overall",
+    ) is overall
+    assert overall.text() == full_status
+    assert _assert_complete_status_uses_largest_fitting_size(
+        overall,
+        full_status,
+    ) == 32
+    assert overall.height() == 48
+    assert card.height() == initial_card_height
 
 
 @pytest.mark.parametrize(
     ("overall_label", "expected"),
     [
-        ("不通过", "不通过（异响）"),
-        ("不通过（异响）", "不通过（异响）"),
+        ("不通过", "不通过：异响"),
+        ("不通过（异响）", "不通过：异响"),
     ],
 )
-def test_ng_review_overall_appends_frozen_fault_type_exactly_once(
+def test_ng_review_overall_canonicalizes_frozen_fault_type_exactly_once(
     qapp,
     overall_label,
     expected,

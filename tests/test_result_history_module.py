@@ -1096,7 +1096,7 @@ def test_manual_actions_hide_without_legal_selection(qapp):
     assert not actions.isEnabled()
 
 
-def test_long_manual_fault_text_expands_card_and_preserves_scroll(qapp):
+def test_long_manual_fault_text_keeps_card_height_and_preserves_scroll(qapp):
     actions = QWidget()
     action_layout = QVBoxLayout(actions)
     action_layout.addWidget(QPushButton("manual action", actions))
@@ -1189,18 +1189,11 @@ def test_long_manual_fault_text_expands_card_and_preserves_scroll(qapp):
     )
 
     assert current_target is target_card
-    card_growth = geometry_after[1] - geometry_before[1]
-    assert card_growth > 0
+    assert actions.parentWidget() is current_target.manual_judgment_slot
     assert geometry_after[0] == geometry_before[0]
+    assert geometry_after[1] == geometry_before[1]
     assert geometry_after[2] == geometry_before[2]
-    assert all(
-        after - before == card_growth
-        for before, after in zip(
-            geometry_before[3],
-            geometry_after[3],
-            strict=True,
-        )
-    )
-    assert geometry_after[4] - geometry_before[4] == card_growth
-    assert geometry_after[5] - geometry_before[5] == card_growth
+    assert geometry_after[3] == geometry_before[3]
+    assert geometry_after[4] == geometry_before[4]
+    assert geometry_after[5] == geometry_before[5]
     assert geometry_after[6] == geometry_before[6]
