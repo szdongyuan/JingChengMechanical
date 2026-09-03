@@ -159,6 +159,48 @@ def test_concurrent_duplicate_publication_has_one_artifact_owner(
     assert store.load_reference(published[0].reference_json) == payload
 
 
+def test_delete_reference_waits_for_inflight_publication_lease(
+    tmp_path: Path,
+) -> None:
+    store = AnalysisResultArtifactStore(tmp_path / "results")
+    payload = _large_canonical_payload()
+    attempt_id = "d86481c9-9d64-428b-96d9-4c71da8c30dc"
+    committed = store.publish(attempt_id, "PASS", payload)
+    store.settle_publication(committed, retain=True)
+    duplicate = store.publish(attempt_id, "PASS", payload)
+
+    retired_path = store.delete_reference(duplicate.reference_json)
+
+    assert retired_path == duplicate.path
+    assert duplicate.path.is_file()
+    store.settle_publication(duplicate, retain=False)
+    assert duplicate.path.exists() is False
+
+
+def test_reader_lease_defers_retirement_until_hydration_finishes(
+    tmp_path: Path,
+) -> None:
+    store = AnalysisResultArtifactStore(tmp_path / "results")
+    payload = _large_canonical_payload()
+    published = store.publish(
+        "36a86b88-26bb-49af-b8a1-2df5aedc8105",
+        "PASS",
+        payload,
+    )
+    store.settle_publication(published, retain=True)
+    lease = store.acquire_read_lease(
+        published.reference_json,
+        expected_judgment="PASS",
+    )
+
+    store.delete_reference(published.reference_json)
+
+    assert published.path.is_file()
+    assert store.load_read_lease(lease) == payload
+    store.release_read_lease(lease)
+    assert published.path.exists() is False
+
+
 def test_attempt_repository_stores_reference_but_reads_full_payload(
     prepared_database_path: Path,
     tmp_path: Path,

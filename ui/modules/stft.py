@@ -1154,6 +1154,14 @@ class StftModule(QWidget):
             or not isinstance(chart_payload, dict)
         ):
             return
+        if (
+            not chart_payload
+            and self._factory_state.run_phase in self._REVIEW_PHASES
+        ):
+            for cache_key in list(self._stft_cache):
+                if cache_key[:2] == (config_id, run_id):
+                    del self._stft_cache[cache_key]
+            return
 
         seeded_channels: set[int] = set()
         has_imported_stft_payload = False

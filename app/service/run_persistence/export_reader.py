@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import sqlite3
 
@@ -24,6 +25,10 @@ from app.service.run_persistence.contracts import (
     validate_uuid4,
 )
 from app.service.run_persistence.database import RunPersistenceDatabase
+from app.service.run_persistence.analysis_result_artifact import (
+    AnalysisResultArtifactStore,
+)
+from app.service.run_persistence.attempt_repository import AttemptRepository
 from app.service.run_persistence.run_repository import (
     _decode_current_trace_json,
 )
@@ -117,10 +122,67 @@ _SOURCE_SQL_TABLES = ("run", "audio", "analysis_attempt")
 
 
 class RunExportReader:
-    def __init__(self, runtime: RunPersistenceDatabase) -> None:
+    def __init__(
+        self,
+        runtime: RunPersistenceDatabase,
+        *,
+        result_artifact_store: AnalysisResultArtifactStore | None = None,
+    ) -> None:
         if not isinstance(runtime, RunPersistenceDatabase):
             raise TypeError("runtime must be a RunPersistenceDatabase")
+        if (
+            result_artifact_store is not None
+            and not isinstance(
+                result_artifact_store,
+                AnalysisResultArtifactStore,
+            )
+        ):
+            raise TypeError(
+                "result_artifact_store must be an AnalysisResultArtifactStore"
+            )
         self._runtime = runtime
+        self._result_artifact_store = result_artifact_store
+
+    def pending_enrichment_run_ids(
+        self,
+        run_ids: tuple[str, ...],
+    ) -> tuple[str, ...]:
+        """Return selected runs whose latest success is the lightweight Decision."""
+
+        selected = self._validate_selection(run_ids)
+        attempts = AttemptRepository(
+            self._runtime,
+            result_artifact_store=self._result_artifact_store,
+        )
+        pending: list[str] = []
+        for run_id in selected:
+            attempt = attempts.latest_successful_for_run(run_id)
+            if attempt is None:
+                continue
+            payload = attempt.result_payload_json
+            if type(payload) is not str or not payload:
+                raise RunExportReadError(
+                    f"run {run_id} analysis result artifact is unavailable"
+                )
+            try:
+                root = json.loads(payload)
+                result = root["result"]
+                chart_payload = result["chart_payload"]
+            except (KeyError, TypeError, ValueError):
+                raise RunExportReadError(
+                    f"run {run_id} analysis result artifact is unavailable"
+                ) from None
+            if type(root) is not dict or type(result) is not dict:
+                raise RunExportReadError(
+                    f"run {run_id} analysis result artifact is unavailable"
+                )
+            if type(chart_payload) is not dict:
+                raise RunExportReadError(
+                    f"run {run_id} analysis result artifact is unavailable"
+                )
+            if not chart_payload:
+                pending.append(run_id)
+        return tuple(pending)
 
     def list_durable(self) -> tuple[DurableRunListRow, ...]:
         """List every durable run without applying export eligibility."""

@@ -63,6 +63,7 @@ from app.service.multi_run_coordinator_mvp.contracts import (
     ABSENT,
     AudioSaveSourceKind,
     AudioMetadataConstraints,
+    CapturedAudioSaveRequest,
     CommitResult,
     FinalPathRequest,
     FrozenCapturedRun,
@@ -79,6 +80,7 @@ from app.service.multi_run_coordinator_mvp.contracts import (
     ResultControlFacts,
     ResultProjection,
     ResultProjectionPhase,
+    SaveSubmitStatus,
     TerminalConclusion,
 )
 from app.service.multi_run_coordinator_mvp.coordinator import MultiRunCoordinator
@@ -305,6 +307,37 @@ class _HistoryProjector:
             proposed_revision=proposed,
             projection=fact.projection,
         )
+
+
+class _EnrichmentProjectionSink:
+    """Route a durable Enrichment through coordinator fencing to Qt only."""
+
+    def __init__(self, history_sink: object) -> None:
+        self._history_sink = history_sink
+        self._coordinator = None
+        self._quiet_guard = None
+
+    def attach(self, coordinator: MultiRunCoordinator) -> None:
+        self._coordinator = coordinator
+
+    def attach_quiet_guard(self, quiet_guard) -> None:
+        if not callable(quiet_guard):
+            raise TypeError("quiet_guard must be callable")
+        self._quiet_guard = quiet_guard
+
+    def __call__(self, event: object) -> None:
+        coordinator = self._coordinator
+        if coordinator is None:
+            return
+        quiet_guard = self._quiet_guard
+        if quiet_guard is not None:
+            quiet_guard(None, "qt_chart_projection")
+        projection = coordinator.project_enrichment(event)
+        if projection is None:
+            return
+        publish = getattr(self._history_sink, "publish_enrichment", None)
+        if callable(publish):
+            publish(projection)
 
 
 class _Diagnostics:
@@ -1016,6 +1049,83 @@ class _ProductionLiveDisplayManager:
             except Exception:
                 pass
 
+
+class _CaptureSaveLifecycleAuthority:
+    """Keep captured runs active through authoritative WAV publication."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._active_run_ids: set[str] = set()
+
+    def begin(self, run_id: str) -> None:
+        with self._lock:
+            if run_id in self._active_run_ids:
+                return
+            if len(self._active_run_ids) >= 6:
+                raise RuntimeError("capture lifecycle capacity exceeded")
+            self._active_run_ids.add(run_id)
+
+    def settle(self, run_id: str) -> bool:
+        with self._lock:
+            if run_id not in self._active_run_ids:
+                return False
+            self._active_run_ids.remove(run_id)
+            return True
+
+    def has_active_runs(self) -> bool:
+        with self._lock:
+            return bool(self._active_run_ids)
+
+    def snapshot(self) -> tuple[str, ...]:
+        with self._lock:
+            return tuple(sorted(self._active_run_ids))
+
+
+class _CaptureLifecycleSaver:
+    def __init__(self, delegate, lifecycle: _CaptureSaveLifecycleAuthority) -> None:
+        self._delegate = delegate
+        self._lifecycle = lifecycle
+
+    def save_captured(self, request, cancel_token):
+        try:
+            return self._delegate.save_captured(request, cancel_token)
+        finally:
+            self._lifecycle.settle(request.run_id)
+
+    def save_imported(self, request, cancel_token):
+        return self._delegate.save_imported(request, cancel_token)
+
+
+class _CaptureLifecycleSaveDispatcher:
+    def __init__(
+        self,
+        delegate: BoundedAudioSaveDispatcher,
+        lifecycle: _CaptureSaveLifecycleAuthority,
+    ) -> None:
+        self._delegate = delegate
+        self._lifecycle = lifecycle
+
+    def try_submit(self, request, sink):
+        try:
+            submission = self._delegate.try_submit(request, sink)
+        except Exception:
+            if isinstance(request, CapturedAudioSaveRequest):
+                self._lifecycle.settle(request.run_id)
+            raise
+        if (
+            isinstance(request, CapturedAudioSaveRequest)
+            and submission.status is not SaveSubmitStatus.ACCEPTED
+        ):
+            self._lifecycle.settle(request.run_id)
+        return submission
+
+    def cancel(self, run_id, save_job_id):
+        return self._delegate.cancel(run_id, save_job_id)
+
+    def shutdown(self, deadline_monotonic):
+        return self._delegate.shutdown(deadline_monotonic)
+
+
 class _FrozenRunFreezer:
     """Freeze Coordinator runs only from the prepare-owned immutable facts."""
 
@@ -1028,6 +1138,7 @@ class _FrozenRunFreezer:
         dashboard_config_loader=None,
         calibration_loader=None,
         ai_toolchain_loader=None,
+        ai_toolchain_readiness=None,
     ) -> None:
         if (
             dashboard_config_loader is not None
@@ -1036,6 +1147,11 @@ class _FrozenRunFreezer:
             raise TypeError("dashboard_config_loader must be callable or None")
         if ai_toolchain_loader is not None and not callable(ai_toolchain_loader):
             raise TypeError("ai_toolchain_loader must be callable or None")
+        if (
+            ai_toolchain_readiness is not None
+            and not callable(ai_toolchain_readiness)
+        ):
+            raise TypeError("ai_toolchain_readiness must be callable or None")
         self._configs = {
             int(item.config_id): item for item in prerequisites.configs
         }
@@ -1044,6 +1160,7 @@ class _FrozenRunFreezer:
         self._dashboard_config_loader = dashboard_config_loader
         self._calibration_loader = calibration_loader
         self._ai_toolchain_loader = ai_toolchain_loader
+        self._ai_toolchain_readiness = ai_toolchain_readiness
 
     def _config(self, request) -> tuple[object, dict[str, object]]:
         ingress = _decode_payload(request.ingress_payload)
@@ -1247,6 +1364,9 @@ class _FrozenRunFreezer:
                 if not isinstance(toolchain, Mapping):
                     raise ValueError("frozen AI toolchain must be an object")
                 toolchain = deepcopy(dict(toolchain))
+                readiness = self._ai_toolchain_readiness
+                if readiness is not None and readiness(toolchain) is not True:
+                    raise ValueError("frozen AI toolchain revision is not ready")
         execution_timeout_seconds = max(
             30.0,
             float(duration) * 2.0,
@@ -1504,13 +1624,19 @@ class _ImportedRunFreezer(_FrozenRunFreezer):
 
 
 class _CoordinatorPersistence:
-    def __init__(self, runtime, result_artifact_store=None) -> None:
+    def __init__(
+        self,
+        runtime,
+        result_artifact_store=None,
+        capture_lifecycle: _CaptureSaveLifecycleAuthority | None = None,
+    ) -> None:
         self._runs = RunRepository(runtime)
         self._audio = AudioRepository(runtime)
         self._attempts = AttemptRepository(
             runtime,
             result_artifact_store=result_artifact_store,
         )
+        self._capture_lifecycle = capture_lifecycle
 
     @staticmethod
     def _committed(result) -> CommitResult:
@@ -1553,7 +1679,19 @@ class _CoordinatorPersistence:
                 None if captured else frozen_run.source_reference.frame_count
             ),
         )
-        return self._committed(self._runs.insert_active(inserted))
+        try:
+            committed = self._committed(self._runs.insert_active(inserted))
+        except Exception:
+            if captured and self._capture_lifecycle is not None:
+                self._capture_lifecycle.settle(frozen_run.run_id)
+            raise
+        if (
+            captured
+            and committed is CommitResult.COMMITTED
+            and self._capture_lifecycle is not None
+        ):
+            self._capture_lifecycle.begin(frozen_run.run_id)
+        return committed
 
     def commit_initial_terminal(self, fact) -> CommitResult:
         if fact.conclusion in (TerminalConclusion.OK, TerminalConclusion.NG):
@@ -1582,9 +1720,13 @@ class _CoordinatorPersistence:
             ),
             judgment=judgment,
         )
-        return self._committed(
-            self._runs.finish_active(fact.run_id, terminal)
-        )
+        try:
+            return self._committed(
+                self._runs.finish_active(fact.run_id, terminal)
+            )
+        finally:
+            if self._capture_lifecycle is not None:
+                self._capture_lifecycle.settle(fact.run_id)
 
     def apply_manual_judgment(self, request, facts) -> ManualProjectionResult:
         config = _decode_payload(facts.config_payload)["config"]
@@ -1748,6 +1890,13 @@ class _CoordinatorPersistence:
             ),
             fault_type=run.fault_type,
             manual_judgment_revision=run.manual_judgment_revision,
+            terminal_revision=(
+                hashlib.sha256(
+                    attempt.result_payload_json.encode("utf-8")
+                ).hexdigest()
+                if run.manual_judgment_revision is None
+                else None
+            ),
         )
         return ResultControlFacts(
             run_id=run_id,
@@ -2098,29 +2247,46 @@ class ProductionGraphFactory:
             audio_authority = ProductionRunAudioAdapter(
                 AudioPersistenceService(AudioPublication(), audio, runs)
             )
-            saver = ProductionAudioSaver(audio_authority)
-            save_dispatcher = BoundedAudioSaveDispatcher(
-                saver,
-                saver,
-                worker_count=2,
-                outstanding_capacity=6,
+            capture_lifecycle = _CaptureSaveLifecycleAuthority()
+            saver = _CaptureLifecycleSaver(
+                ProductionAudioSaver(audio_authority),
+                capture_lifecycle,
             )
+            save_dispatcher = _CaptureLifecycleSaveDispatcher(
+                BoundedAudioSaveDispatcher(
+                    saver,
+                    saver,
+                    worker_count=2,
+                    outstanding_capacity=6,
+                ),
+                capture_lifecycle,
+            )
+            enrichment_projection = _EnrichmentProjectionSink(history_sink)
             boundary = AnalysisPersistenceBoundary(
                 runtime=self._runtime,
                 attempt_repository=attempts,
                 now_utc=_utc_now_text,
+                enrichment_sink=enrichment_projection,
             )
-            live_display = getattr(upstream, "live_display", None)
-            capture_active = getattr(live_display, "has_active_runs", None)
-            if callable(capture_active):
-                analysis_executor = prerequisites.build_analysis_executor(
-                    capture_active=capture_active,
-                    process_count=_PRODUCTION_ANALYSIS_WORKER_COUNT,
-                )
-            else:
-                analysis_executor = prerequisites.build_analysis_executor(
-                    process_count=_PRODUCTION_ANALYSIS_WORKER_COUNT,
-                )
+            analysis_executor = prerequisites.build_analysis_executor(
+                capture_active=capture_lifecycle.has_active_runs,
+                process_count=_PRODUCTION_ANALYSIS_WORKER_COUNT,
+                enrichment_sink=boundary.accept_enrichment,
+                enrichment_failure_sink=boundary.retire_enrichment,
+            )
+            quiet_guard = getattr(
+                analysis_executor,
+                "require_quiet_epoch",
+                None,
+            )
+            if callable(quiet_guard):
+                enrichment_projection.attach_quiet_guard(quiet_guard)
+            if callable(
+                getattr(analysis_executor, "mark_decision_committed", None)
+            ) and callable(
+                getattr(analysis_executor, "retire_staged_attempt", None)
+            ):
+                boundary.attach_staged_executor(analysis_executor)
             start_analysis = getattr(analysis_executor, "start", None)
             if callable(start_analysis):
                 start_analysis()
@@ -2151,6 +2317,11 @@ class ProductionGraphFactory:
                 dashboard_config_loader=self._dashboard_config_loader,
                 calibration_loader=self._calibration_loader,
                 ai_toolchain_loader=self._ai_toolchain_loader,
+                ai_toolchain_readiness=getattr(
+                    analysis_executor,
+                    "binding_ready",
+                    None,
+                ),
             )
             imported_freezer = _ImportedRunFreezer(
                 prerequisites,
@@ -2158,6 +2329,11 @@ class ProductionGraphFactory:
                 dashboard_config_loader=self._dashboard_config_loader,
                 calibration_loader=self._calibration_loader,
                 ai_toolchain_loader=self._ai_toolchain_loader,
+                ai_toolchain_readiness=getattr(
+                    analysis_executor,
+                    "binding_ready",
+                    None,
+                ),
             )
             coordinator = MultiRunCoordinator(
                 captured_freezer=captured_freezer,
@@ -2166,6 +2342,7 @@ class ProductionGraphFactory:
                 persistence=_CoordinatorPersistence(
                     self._runtime,
                     self._result_artifact_store,
+                    capture_lifecycle,
                 ),
                 save_dispatcher=save_dispatcher,
                 scheduler=bridge,
@@ -2182,6 +2359,7 @@ class ProductionGraphFactory:
                     log_callback=self._diagnostic_callback,
                 ),
             )
+            enrichment_projection.attach(coordinator)
             playback_backend = SoundDevicePlaybackBackend()
             playback = RunScopedPlaybackService(
                 run_repository=runs,

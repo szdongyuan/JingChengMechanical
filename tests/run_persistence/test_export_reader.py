@@ -20,6 +20,9 @@ from app.service.run_persistence.contracts import (
     freeze_run_inputs,
 )
 from app.service.run_persistence.database import RunPersistenceDatabase
+from app.service.run_persistence.analysis_result_artifact import (
+    AnalysisResultArtifactStore,
+)
 from app.service.run_persistence.export_reader import (
     RunExportReadError,
     RunExportReader,
@@ -212,6 +215,30 @@ def _insert_attempt(
             ),
         )
     return attempt_id
+
+
+def _set_attempt_result_payload(
+    runtime: RunPersistenceDatabase,
+    attempt_id: str,
+    payload: dict[str, object] | None,
+) -> None:
+    with runtime.operation() as database:
+        database.execute_sql(
+            "UPDATE analysis_attempt SET result_payload_json = ? "
+            "WHERE attempt_id = ?",
+            (
+                None
+                if payload is None
+                else json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                attempt_id,
+            ),
+        )
 
 
 def _replace_config(
@@ -716,3 +743,52 @@ def test_read_many_rejects_invalid_selection_and_malformed_facts_before_file_io(
             reader.read_many(selection)
 
     assert calls == []
+
+
+def test_pending_enrichment_reads_latest_durable_attempt_payload(
+    prepared_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+    run_id = _insert_active(runtime)
+    _finish(runtime, run_id)
+    audio_id = _insert_audio(runtime, run_id, tmp_path / "pending.wav")
+    attempt_id = _insert_attempt(runtime, run_id, audio_id)
+    artifact_store = AnalysisResultArtifactStore(tmp_path / "run_results")
+    artifact_store.ensure_ready()
+    reader = RunExportReader(
+        runtime,
+        result_artifact_store=artifact_store,
+    )
+    lightweight = {
+        "judgment": "PASS",
+        "result": {
+            "chart_payload": {},
+            "summary_payload": {"overall_status": "pass", "rows": []},
+        },
+    }
+    _set_attempt_result_payload(runtime, attempt_id, lightweight)
+
+    assert reader.pending_enrichment_run_ids((run_id,)) == (run_id,)
+
+    full = json.loads(json.dumps(lightweight))
+    full["result"]["chart_payload"] = {
+        "0": {"fft": {"frequencies_hz": [100.0], "levels_db": [-3.0]}}
+    }
+    full_json = json.dumps(
+        full,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    published = artifact_store.publish(attempt_id, "PASS", full_json)
+    with runtime.operation() as database:
+        database.execute_sql(
+            "UPDATE analysis_attempt SET result_payload_json = ? "
+            "WHERE attempt_id = ?",
+            (published.reference_json, attempt_id),
+        )
+    artifact_store.settle_publication(published, retain=True)
+
+    assert reader.pending_enrichment_run_ids((run_id,)) == ()

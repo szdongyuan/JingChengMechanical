@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import base64
+from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
 import json
 import logging
 import math
@@ -19,6 +21,8 @@ from app.service.analysis.scheduler import (
     MAX_ERROR_SUMMARY_UTF8_BYTES,
     AiToolchainSnapshot,
     AnalysisCancelOrigin,
+    AnalysisBundleIdentity,
+    AnalysisEnrichmentReport,
     AnalysisError,
     AnalysisErrorCategory,
     AnalysisInputSnapshot,
@@ -37,12 +41,16 @@ from app.service.analysis.scheduler import (
     FrozenResultObject,
     FrozenResultPayload,
     PersistedAudioReference,
+    REQUIRED_ENRICHMENT_CHART_METRICS,
     ShutdownReport,
     ShutdownStatus,
     SubmitReceipt,
     SubmitStatus,
     validate_frozen_result_payload,
     canonical_toolchain_lane_key,
+)
+from app.service.analysis.staged_result_payload import (
+    decode_and_validate_canonical_result,
 )
 from app.service.run_persistence.attempt_repository import (
     AttemptOutcome,
@@ -75,6 +83,10 @@ from app.service.run_persistence.database import (
 from app.service.run_persistence.run_repository import RunRecord, RunRepository
 
 
+# Bounded best-effort protection for impossible or late duplicate callbacks.
+_TERMINAL_REPLAY_CAPACITY = 64
+
+
 def _require_exact_enum(value: object, enum_type: type[Enum], name: str) -> None:
     if type(value) is not enum_type:
         raise TypeError(f"{name} must be an exact {enum_type.__name__}")
@@ -83,6 +95,86 @@ def _require_exact_enum(value: object, enum_type: type[Enum], name: str) -> None
 def _require_exact_bool(value: object, name: str) -> None:
     if type(value) is not bool:
         raise TypeError(f"{name} must be an exact bool")
+
+
+def _identity_digest(value: str) -> str:
+    return "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _bundle_identity_for_job(job: AnalysisJob) -> AnalysisBundleIdentity:
+    return AnalysisBundleIdentity(
+        run_id=job.run_id,
+        analysis_attempt_id=job.analysis_attempt_id,
+        content_revision=job.audio.content_revision,
+        algorithm_revision=job.snapshot.algorithm_revision,
+        config_identity=_identity_digest(job.snapshot.config_snapshot_json),
+        calibration_identity=_identity_digest(
+            job.snapshot.calibration_snapshot_json
+        ),
+        channel_mapping_identity=_identity_digest(
+            job.snapshot.channel_mapping_json
+        ),
+        window_start_seconds=float(job.snapshot.analysis_window_start_seconds),
+        window_end_seconds=float(job.snapshot.analysis_window_end_seconds),
+    )
+
+
+def _outcome_replay_digest(outcome: AnalysisOutcome) -> bytes:
+    if (
+        outcome.status is AnalysisStatus.SUCCEEDED
+        and outcome.result_payload is not None
+    ):
+        try:
+            canonical = decode_analysis_result_payload(
+                outcome.result_payload
+            ).result_payload_json
+        except (TypeError, ValueError):
+            canonical = ""
+        return hashlib.sha256(
+            b"SUCCEEDED\0" + canonical.encode("utf-8")
+        ).digest()
+    return hashlib.sha256(repr(outcome).encode("utf-8")).digest()
+
+
+def _expected_chart_manifest_for_job(
+    job: AnalysisJob,
+) -> tuple[tuple[int, tuple[str, ...]], ...] | None:
+    try:
+        config = json.loads(
+            job.snapshot.config_snapshot_json,
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except (TypeError, ValueError, RecursionError):
+        return None
+    if type(config) is not dict:
+        return None
+    selected = config.get("selected_channels")
+    if (
+        type(selected) is not list
+        or not selected
+        or any(type(channel) is not int or channel < 0 for channel in selected)
+        or len(set(selected)) != len(selected)
+    ):
+        return None
+    vibration_channel = config.get("vibration_view_channel_index")
+    if vibration_channel is not None and (
+        type(vibration_channel) is not int
+        or vibration_channel not in selected
+    ):
+        return None
+    vibration_metrics = ("fft", "octave", "stft")
+    return tuple(
+        (
+            channel,
+            (
+                vibration_metrics
+                if channel == vibration_channel
+                else REQUIRED_ENRICHMENT_CHART_METRICS
+            ),
+        )
+        for channel in sorted(selected)
+    )
 
 
 def _require_uuid4(value: object, name: str) -> str:
@@ -361,6 +453,10 @@ class BridgeInputError(ValueError):
     """A facade request does not satisfy the exact bridge input contract."""
 
 
+class AnalysisEnrichmentPersistenceError(RuntimeError):
+    """A valid Enrichment could not be durably committed."""
+
+
 @dataclass(frozen=True, slots=True)
 class DecodedAnalysisResult:
     judgment: Judgment
@@ -383,6 +479,36 @@ class DecodedAnalysisResult:
             raise TypeError(
                 "result_payload_zlib must be nonempty exact bytes or None"
             )
+
+
+@dataclass(frozen=True, slots=True)
+class EnrichmentCommittedEvent:
+    """Immutable non-terminal fact emitted after artifact replacement commits."""
+
+    identity: AnalysisBundleIdentity
+    judgment: Judgment
+    result_payload_json: str
+    terminal_revision: str
+    committed_at: str
+
+    def __post_init__(self) -> None:
+        if type(self.identity) is not AnalysisBundleIdentity:
+            raise TypeError("identity must be an exact AnalysisBundleIdentity")
+        _require_exact_enum(self.judgment, Judgment, "judgment")
+        _require_nonempty_string(
+            self.result_payload_json,
+            "result_payload_json",
+        )
+        if (
+            type(self.terminal_revision) is not str
+            or len(self.terminal_revision) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.terminal_revision
+            )
+        ):
+            raise ValueError("terminal_revision must be a lowercase sha256 digest")
+        validate_utc_timestamp(self.committed_at)
 
 
 @dataclass(frozen=True, slots=True)
@@ -958,6 +1084,10 @@ class CoordinatorAnalysisTerminalReportSink(Protocol):
     def __call__(self, report: BridgeTerminalReport) -> None: ...
 
 
+class CoordinatorAnalysisEnrichmentCommittedSink(Protocol):
+    def __call__(self, event: EnrichmentCommittedEvent) -> None: ...
+
+
 @dataclass(slots=True)
 class _AttemptContext:
     job: AnalysisJob
@@ -981,6 +1111,24 @@ class _AttemptContext:
             raise TypeError("terminal_sink must be callable")
 
 
+@dataclass(slots=True)
+class _CommittedDecision:
+    identity: AnalysisBundleIdentity
+    attempt_kind: AttemptKind
+    judgment: Judgment
+    payload_revision: str
+    expected_chart_manifest: tuple[tuple[int, tuple[str, ...]], ...]
+    enrichment_inflight: bool = False
+    enrichment_failure_count: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _TerminalReplay:
+    run_id: str
+    outcome_digest: bytes
+    terminal_report: BridgeTerminalReport
+
+
 class AnalysisPersistenceBoundary:
     """Direct Scheduler start-gate and terminal-outcome Persistence boundary."""
 
@@ -990,6 +1138,7 @@ class AnalysisPersistenceBoundary:
         runtime: RunPersistenceDatabase,
         attempt_repository: AttemptRepository,
         now_utc: Callable[[], str],
+        enrichment_sink: CoordinatorAnalysisEnrichmentCommittedSink | None = None,
     ) -> None:
         if runtime is None:
             raise BridgeInputError("runtime is required")
@@ -997,24 +1146,49 @@ class AnalysisPersistenceBoundary:
             raise BridgeInputError("attempt_repository is required")
         if not callable(now_utc):
             raise BridgeInputError("now_utc must be callable")
+        if enrichment_sink is not None and not callable(enrichment_sink):
+            raise BridgeInputError("enrichment_sink must be callable or None")
         self._runtime = runtime
         self._attempt_repository = attempt_repository
         self._now_utc = now_utc
+        self._enrichment_sink = enrichment_sink
+        self._staged_executor = None
         self._lock = threading.Lock()
         self._submit_condition = threading.Condition(self._lock)
         self._submission_admission_open = True
         self._inflight_submit_claims: set[object] = set()
         self._contexts: dict[str, _AttemptContext] = {}
+        self._committed_decisions: dict[str, _CommittedDecision] = {}
+        self._terminal_replays: OrderedDict[str, _TerminalReplay] = OrderedDict()
         self._persistence_quarantined = False
         self._quarantine_claimed = False
         self._scheduler_shutdown_result: BridgeSchedulerShutdownResult | None = None
         self._database_close_result: BridgeDatabaseCloseResult | None = None
         self.logger = logging.getLogger("core")
 
+    def attach_staged_executor(self, staged_executor: object) -> None:
+        if not callable(
+            getattr(staged_executor, "mark_decision_committed", None)
+        ) or not callable(
+            getattr(staged_executor, "retire_staged_attempt", None)
+        ):
+            raise TypeError("staged_executor must provide decision lifecycle hooks")
+        self._staged_executor = staged_executor
+
     @property
     def _context_count(self) -> int:
         with self._lock:
             return len(self._contexts)
+
+    @property
+    def _pending_enrichment_count(self) -> int:
+        with self._lock:
+            return len(self._committed_decisions)
+
+    @property
+    def _terminal_replay_count(self) -> int:
+        with self._lock:
+            return len(self._terminal_replays)
 
     def _register_context(self, context: _AttemptContext) -> None:
         if type(context) is not _AttemptContext:
@@ -1023,6 +1197,15 @@ class AnalysisPersistenceBoundary:
         with self._lock:
             if attempt_id in self._contexts:
                 raise RuntimeError("attempt context already registered")
+            if context.attempt_kind is AttemptKind.REANALYSIS:
+                retired = [
+                    decision_attempt_id
+                    for decision_attempt_id, decision
+                    in self._committed_decisions.items()
+                    if decision.identity.run_id == context.job.run_id
+                ]
+                for decision_attempt_id in retired:
+                    self._committed_decisions.pop(decision_attempt_id, None)
             self._contexts[attempt_id] = context
 
     def _claim_submission(self) -> object | None:
@@ -1074,6 +1257,204 @@ class AnalysisPersistenceBoundary:
 
     def _discard_context(self, context: _AttemptContext) -> None:
         self._remove_context(context.job.analysis_attempt_id, context)
+
+    def _record_enrichment_failure(
+        self,
+        attempt_id: str,
+        decision: _CommittedDecision,
+    ) -> None:
+        with self._lock:
+            current = self._committed_decisions.get(attempt_id)
+            if current is not decision:
+                return
+            current.enrichment_inflight = False
+            current.enrichment_failure_count += 1
+            if current.enrichment_failure_count >= 2:
+                self._committed_decisions.pop(attempt_id, None)
+
+    def _retire_enrichment(
+        self,
+        attempt_id: str,
+        decision: _CommittedDecision,
+    ) -> None:
+        with self._lock:
+            if self._committed_decisions.get(attempt_id) is decision:
+                self._committed_decisions.pop(attempt_id, None)
+
+    def retire_enrichment(
+        self,
+        identity: AnalysisBundleIdentity,
+        reason_code: str,
+    ) -> bool:
+        """Retire only the exact active Enrichment identity, without a terminal."""
+
+        if type(identity) is not AnalysisBundleIdentity:
+            raise TypeError("identity must be an exact AnalysisBundleIdentity")
+        _require_code(reason_code)
+        attempt_id = identity.analysis_attempt_id
+        with self._lock:
+            decision = self._committed_decisions.get(attempt_id)
+            if decision is None or decision.identity != identity:
+                return False
+            self._committed_decisions.pop(attempt_id, None)
+        self.logger.warning(
+            "enrichment retired: "
+            f"run_id={identity.run_id}, attempt_id={attempt_id}, "
+            f"code={reason_code}"
+        )
+        return True
+
+    def accept_enrichment(
+        self,
+        report: AnalysisEnrichmentReport,
+    ) -> EnrichmentCommittedEvent | None:
+        """Commit a matching full payload without creating another terminal."""
+
+        if type(report) is not AnalysisEnrichmentReport:
+            raise TypeError("report must be an exact AnalysisEnrichmentReport")
+        if self._persistence_is_unusable():
+            return None
+        judgment = Judgment(report.judgment)
+        attempt_id = report.identity.analysis_attempt_id
+        with self._lock:
+            decision = self._committed_decisions.get(attempt_id)
+            if decision is None or decision.identity != report.identity:
+                return None
+            if (
+                decision.judgment is not judgment
+                or decision.expected_chart_manifest != report.chart_manifest
+            ):
+                raise AnalysisEnrichmentPersistenceError(
+                    "enrichment report differs from the committed Decision"
+                )
+            if decision.enrichment_inflight:
+                return None
+            decision.enrichment_inflight = True
+            expected_revision = decision.payload_revision
+        try:
+            committed_at = self._now_utc()
+            validate_utc_timestamp(committed_at)
+            result = self._attempt_repository.replace_succeeded_result(
+                attempt_id=attempt_id,
+                run_id=report.identity.run_id,
+                judgment=judgment,
+                expected_payload_revision=expected_revision,
+                result_payload_json=report.canonical_result_json,
+                result_payload_zlib=report.result_payload_zlib,
+                now=committed_at,
+            )
+            checked = _validate_transaction_result(result)
+        except Exception:
+            if self._persistence_is_unusable():
+                self._retire_enrichment(attempt_id, decision)
+            else:
+                self._record_enrichment_failure(attempt_id, decision)
+            raise
+
+        if checked.state is TransactionState.UNKNOWN:
+            self._latch_repository_quarantine()
+            self._retire_enrichment(attempt_id, decision)
+            raise AnalysisEnrichmentPersistenceError(
+                "enrichment database state is unknown"
+            )
+        if checked.state is TransactionState.ROLLED_BACK:
+            self._record_enrichment_failure(attempt_id, decision)
+            raise AnalysisEnrichmentPersistenceError(
+                checked.reason or "enrichment database update rolled back"
+            )
+        if checked.value is not True:
+            self._retire_enrichment(attempt_id, decision)
+            return None
+        self._retire_enrichment(attempt_id, decision)
+        event = EnrichmentCommittedEvent(
+            identity=report.identity,
+            judgment=judgment,
+            result_payload_json=report.canonical_result_json,
+            terminal_revision=expected_revision,
+            committed_at=committed_at,
+        )
+        sink = self._enrichment_sink
+        if sink is not None:
+            try:
+                sink(event)
+            except Exception:
+                pass
+        return event
+
+    def _remember_committed_decision(
+        self,
+        context: _AttemptContext,
+        scheduler_outcome: AnalysisOutcome,
+        report: BridgeTerminalReport,
+    ) -> bool:
+        if (
+            report.status is not BridgeTerminalStatus.COMMITTED
+            or report.attempt_state is not AttemptState.SUCCEEDED
+            or report.judgment is None
+            or report.result_payload_json is None
+        ):
+            return False
+        try:
+            decode_and_validate_canonical_result(
+                report.result_payload_json,
+                "decision result_payload_json",
+                require_empty_chart_payload=True,
+            )
+        except (TypeError, ValueError):
+            return False
+        payload_revision = hashlib.sha256(
+            report.result_payload_json.encode("utf-8")
+        ).hexdigest()
+        identity = _bundle_identity_for_job(context.job)
+        expected_chart_manifest = _expected_chart_manifest_for_job(context.job)
+        decision = (
+            None
+            if expected_chart_manifest is None
+            else _CommittedDecision(
+                identity=identity,
+                attempt_kind=context.attempt_kind,
+                judgment=report.judgment,
+                payload_revision=payload_revision,
+                expected_chart_manifest=expected_chart_manifest,
+            )
+        )
+        replay = _TerminalReplay(
+            run_id=context.job.run_id,
+            outcome_digest=_outcome_replay_digest(scheduler_outcome),
+            terminal_report=report,
+        )
+        with self._lock:
+            attempt_id = identity.analysis_attempt_id
+            if decision is not None:
+                self._committed_decisions[attempt_id] = decision
+            self._terminal_replays[attempt_id] = replay
+            while len(self._terminal_replays) > _TERMINAL_REPLAY_CAPACITY:
+                self._terminal_replays.popitem(last=False)
+        return decision is not None
+
+    def _settle_staged_decision(
+        self,
+        attempt_id: str,
+        report: BridgeTerminalReport,
+        *,
+        committed_decision: bool,
+    ) -> None:
+        staged_executor = self._staged_executor
+        if staged_executor is None:
+            return
+        try:
+            if committed_decision:
+                staged_executor.mark_decision_committed(attempt_id)
+            else:
+                staged_executor.retire_staged_attempt(
+                    attempt_id,
+                    report.code,
+                )
+        except Exception:
+            self.logger.exception(
+                "staged analysis lifecycle failed: attempt_id=%s",
+                attempt_id,
+            )
 
     def _reconcile_accepted(
         self,
@@ -1257,16 +1638,27 @@ class AnalysisPersistenceBoundary:
             )
         )
 
-    def __call__(self, outcome: AnalysisOutcome) -> None:
+    def __call__(self, outcome: AnalysisOutcome) -> BridgeTerminalReport | None:
         if type(outcome) is not AnalysisOutcome:
             return None
         claimed: tuple[_AttemptContext, AnalysisOutcome] | None = None
         try:
             with self._lock:
                 context = self._contexts.get(outcome.analysis_attempt_id)
+                if context is None:
+                    replay = self._terminal_replays.get(
+                        outcome.analysis_attempt_id
+                    )
+                    if (
+                        replay is not None
+                        and replay.run_id == outcome.run_id
+                        and replay.outcome_digest
+                        == _outcome_replay_digest(outcome)
+                    ):
+                        return replay.terminal_report
+                    return None
                 if (
-                    context is None
-                    or context.job.run_id != outcome.run_id
+                    context.job.run_id != outcome.run_id
                     or context.job.kind is not outcome.kind
                     or context.job.audio.reference_id
                     != outcome.audio_reference_id
@@ -1284,9 +1676,19 @@ class AnalysisPersistenceBoundary:
                 claimed = context, outcome
             report = self._process_claimed_outcome(*claimed)
             self._deliver_terminal_once(context, report)
+            return report
         except Exception:
             if claimed is not None:
                 context, claimed_outcome = claimed
+                staged_executor = self._staged_executor
+                if staged_executor is not None:
+                    try:
+                        staged_executor.retire_staged_attempt(
+                            claimed_outcome.analysis_attempt_id,
+                            "PERSISTENCE_BOUNDARY_FAILED",
+                        )
+                    except Exception:
+                        pass
                 self._remove_context(
                     claimed_outcome.analysis_attempt_id,
                     context,
@@ -1324,7 +1726,13 @@ class AnalysisPersistenceBoundary:
         outcome: AnalysisOutcome,
     ) -> BridgeTerminalReport:
         if not self._scheduler_outcome_is_coherent(outcome):
-            return self._unsupported_scheduler_outcome(context)
+            report = self._unsupported_scheduler_outcome(context)
+            self._settle_staged_decision(
+                context.job.analysis_attempt_id,
+                report,
+                committed_decision=False,
+            )
+            return report
         if (
             outcome.status is AnalysisStatus.FAILED
             and outcome.error is not None
@@ -1346,6 +1754,11 @@ class AnalysisPersistenceBoundary:
                 code="ANALYSIS_DB_STATE_UNKNOWN",
                 summary=outcome.error.summary,
                 restart_required=True,
+            )
+            self._settle_staged_decision(
+                context.job.analysis_attempt_id,
+                report,
+                committed_decision=False,
             )
             return report
         start_result_invalid = (
@@ -1371,7 +1784,7 @@ class AnalysisPersistenceBoundary:
                 queued=queued,
             )
             if start_result_invalid:
-                return BridgeTerminalReport(
+                report = BridgeTerminalReport(
                     status=BridgeTerminalStatus.DB_UNKNOWN,
                     run_id=context.job.run_id,
                     analysis_attempt_id=context.job.analysis_attempt_id,
@@ -1385,8 +1798,30 @@ class AnalysisPersistenceBoundary:
                     persistence_result=None,
                     restart_required=True,
                 )
+                self._settle_staged_decision(
+                    context.job.analysis_attempt_id,
+                    report,
+                    committed_decision=False,
+                )
+                return report
+            committed_decision = self._remember_committed_decision(
+                context,
+                outcome,
+                report,
+            )
+            self._settle_staged_decision(
+                context.job.analysis_attempt_id,
+                report,
+                committed_decision=committed_decision,
+            )
             return report
-        return self._unsupported_scheduler_outcome(context)
+        report = self._unsupported_scheduler_outcome(context)
+        self._settle_staged_decision(
+            context.job.analysis_attempt_id,
+            report,
+            committed_decision=False,
+        )
+        return report
 
     @staticmethod
     def _scheduler_outcome_is_coherent(outcome: AnalysisOutcome) -> bool:
@@ -1846,10 +2281,19 @@ class RunPersistenceSchedulerBridge:
             context = self.boundary._contexts.get(
                 request.analysis_attempt_id
             )
+            pending_decision = self.boundary._committed_decisions.get(
+                request.analysis_attempt_id
+            )
             if (
-                context is None
-                or context.job.run_id != request.run_id
-                or context.terminal_claimed
+                (
+                    context is None
+                    or context.job.run_id != request.run_id
+                    or context.terminal_claimed
+                )
+                and (
+                    pending_decision is None
+                    or pending_decision.identity.run_id != request.run_id
+                )
             ):
                 return self._cancel_rejected(
                     request,
@@ -1857,7 +2301,16 @@ class RunPersistenceSchedulerBridge:
                 )
             if (
                 request.origin is AnalysisCancelOrigin.RESULT_EVICTION
-                and context.attempt_kind is AttemptKind.INITIAL
+                and (
+                    (
+                        context is not None
+                        and context.attempt_kind is AttemptKind.INITIAL
+                    )
+                    or (
+                        pending_decision is not None
+                        and pending_decision.attempt_kind is AttemptKind.INITIAL
+                    )
+                )
             ):
                 return self._cancel_rejected(
                     request,
@@ -1917,8 +2370,25 @@ class RunPersistenceSchedulerBridge:
                 active = self.boundary._contexts.get(
                     request.analysis_attempt_id
                 )
-                if active is context and active.cancel_origin is None:
+                if (
+                    active is not None
+                    and active is context
+                    and active.cancel_origin is None
+                ):
                     active.cancel_origin = request.origin
+        if (
+            pending_decision is not None
+            and status is not BridgeCancelStatus.RUN_ID_MISMATCH
+        ):
+            with self.boundary._lock:
+                active_decision = self.boundary._committed_decisions.get(
+                    request.analysis_attempt_id
+                )
+                if active_decision is pending_decision:
+                    self.boundary._committed_decisions.pop(
+                        request.analysis_attempt_id,
+                        None,
+                    )
         return BridgeCancelResult(
             status=status,
             run_id=request.run_id,
@@ -1986,6 +2456,8 @@ class RunPersistenceSchedulerBridge:
         )
         with self.boundary._lock:
             self.boundary._scheduler_shutdown_result = result
+            if status is BridgeSchedulerShutdownStatus.SCHEDULER_CLOSED:
+                self.boundary._committed_decisions.clear()
         return result
 
     def close_persistence_after_upstream_stopped(

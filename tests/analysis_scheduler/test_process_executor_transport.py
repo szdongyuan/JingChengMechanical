@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 import threading
+import time
 import zlib
 
 import pytest
@@ -16,17 +17,23 @@ from app.service.analysis.scheduler import (
     AnalysisExecutionStatus,
     FrozenResultObject,
 )
+from tests.analysis_scheduler.test_staged_process_executor import _decision, _enrichment
 
 
 class _FakeConnection:
-    def __init__(self) -> None:
+    def __init__(self, slot_id: int) -> None:
+        self.slot_id = slot_id
         self.entered = threading.Event()
         self.release = threading.Event()
         self._ready_delivered = False
         self.closed = False
+        self.attempt_id = None
+        self.last_message = None
 
     def send(self, message) -> None:
-        if message[0] == "execute":
+        self.last_message = message
+        if message[0] == "decision":
+            self.attempt_id = message[1].analysis_attempt_id
             self.entered.set()
 
     def poll(self, _timeout: float) -> bool:
@@ -37,20 +44,27 @@ class _FakeConnection:
     def recv(self):
         if not self._ready_delivered:
             self._ready_delivered = True
-            return "ready", None
-        return (
-            "result",
-            AnalysisExecutionResult(
-                AnalysisExecutionStatus.NO_RESULT,
-                None,
-            ),
-        )
+            return "ready", ()
+        if self.last_message[0] == "enrich":
+            return "enrich", _enrichment(self.last_message[1])
+        if self.last_message[0] == "discard":
+            return "discard", self.last_message[1]
+        return "decision", _decision(self.attempt_id, self.slot_id)
 
     def close(self) -> None:
         self.closed = True
 
 
 class _FakeChildConnection:
+    def close(self) -> None:
+        return None
+
+
+class _FakeControlConnection:
+    def poll(self, timeout: float) -> bool:
+        time.sleep(min(timeout, 0.01))
+        return False
+
     def close(self) -> None:
         return None
 
@@ -79,8 +93,9 @@ class _FakeProcessContext:
         self.processes: list[_FakeProcess] = []
 
     def Pipe(self, *, duplex: bool):
-        assert duplex is True
-        connection = _FakeConnection()
+        if not duplex:
+            return _FakeControlConnection(), _FakeChildConnection()
+        connection = _FakeConnection(len(self.connections))
         self.connections.append(connection)
         return connection, _FakeChildConnection()
 
@@ -147,9 +162,12 @@ def test_default_process_pool_runs_second_call_before_first_finishes(
     results = []
     errors = []
 
+    next_attempt = iter(("attempt-1", "attempt-2"))
+
     def execute() -> None:
         try:
-            results.append(executor.execute(object(), audio, object()))
+            job = SimpleNamespace(analysis_attempt_id=next(next_attempt))
+            results.append(executor.execute(job, audio, object()))
         except BaseException as exc:
             errors.append(exc)
 

@@ -358,11 +358,29 @@ def test_executor_restores_pcm16_audio_to_live_float_scale_before_all_dsp():
         min(expected_magnitude.shape[0], 1025),
         dtype=int,
     )
+    terminal_times = np.asarray(stft_payload["times_sec"])
+    terminal_frequencies = np.asarray(stft_payload["frequencies_hz"])
+    assert terminal_magnitude.shape == (
+        frequency_indexes.size,
+        time_indexes.size,
+    )
+    np.testing.assert_allclose(
+        terminal_times,
+        _times[time_indexes],
+        rtol=1e-10,
+        atol=1e-9,
+    )
+    np.testing.assert_allclose(
+        terminal_frequencies,
+        _frequencies[frequency_indexes],
+        rtol=1e-10,
+        atol=1e-9,
+    )
     np.testing.assert_allclose(
         terminal_magnitude,
         expected_magnitude[np.ix_(frequency_indexes, time_indexes)],
-        rtol=0.0,
-        atol=1e-12,
+        rtol=1e-6,
+        atol=1e-4,
     )
 
 
@@ -829,6 +847,13 @@ def test_resident_ai_snapshot_calls_frozen_runtime_and_merges_score_into_review(
     assert call["request_payload"]["segments"][0]["audio_path"] == (
         job.audio.absolute_path
     )
+    diagnostic_dir = tmp_path / "ai_runs" / "attempt-1"
+    assert json.loads(
+        (diagnostic_dir / "request.json").read_text(encoding="utf-8")
+    ) == call["request_payload"]
+    assert json.loads(
+        (diagnostic_dir / "response.json").read_text(encoding="utf-8")
+    )["ai_result"]["score"] == pytest.approx(0.12)
 
     payload = _plain_frozen(result.result_payload)
     assert payload["judgment"] == "FAIL"

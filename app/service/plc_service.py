@@ -25,6 +25,7 @@ class PlcService(QObject):
     connect_result = pyqtSignal(bool, str)
     # 连接状态通知界面信号
     state_changed = pyqtSignal(str)
+    plc_dispatch_requested = pyqtSignal(object)
     read_time_ms = 60000
     limit_field = (
         "res_product_model_offset",
@@ -81,6 +82,11 @@ class PlcService(QObject):
         self._reconnect_timer_ms = 0  # 重连计时器
         self._last_connect_error = ""
         self._last_current_read_error = ""
+        self.plc_dispatch_requested.connect(self._execute_dispatch_command)
+
+    @pyqtSlot(object)
+    def _execute_dispatch_command(self, command):
+        command.execute(self)
 
     @pyqtSlot()
     def start_plc_service(self):
@@ -225,17 +231,50 @@ class PlcService(QObject):
         return False
 
     def _write_testing_signal(self, testing):
+        try:
+            self._write_testing_signal_acknowledged(testing)
+        except Exception as exc:
+            self.bus.log.emit(f"PLC {self._plc_id} 写入测试中信号失败: {exc}")
+            self.logger.error(f"PLC 写入测试中信号失败: {exc}")
+
+    def _write_testing_signal_acknowledged(self, testing):
         self.logger.info(f"self._field_offsets_dict的值是: {self._field_offsets_dict}")
         offset = self._field_offsets_dict.get("res_testing_signal_offset")
         self.logger.info(f"offset的值是: {offset}")
         if not offset:
             self.logger.warning(f"PLC {self._plc_id} 未找到偏移配置: res_testing_signal_offset")
             return
-        try:
-            self.write_plc_value(offset, "bool", testing)
-        except Exception as exc:
-            self.bus.log.emit(f"PLC {self._plc_id} 写入测试中信号失败: {exc}")
-            self.logger.error(f"PLC 写入测试中信号失败: {exc}")
+        self.write_plc_value(offset, "bool", testing)
+
+    def write_result(self, plc_id, test_result):
+        """Write one complete result and surface physical boundary failures."""
+
+        if plc_id != self._plc_id:
+            raise ValueError("PLC result was dispatched to the wrong target")
+        if self.plc_client is None:
+            raise RuntimeError("PLC target is not connected")
+        plc_values = [
+            ("res_error_code_offset", "string", test_result.get("error_code")),
+            ("res_sn_code_offset", "string", test_result.get("sn_code")),
+            ("res_result_offset", "bool", test_result.get("test_result")),
+            ("res_score_offset", "real", test_result.get("score")),
+            ("res_spl_offset", "real", test_result.get("spl")),
+            ("res_loudness_offset", "real", test_result.get("loudness")),
+            ("res_vibrate_data_offset", "real", test_result.get("vibrate")),
+            ("res_ai_score_offset", "real", test_result.get("ai_score")),
+        ]
+        for field_name, value_type, value in plc_values:
+            offset = self._field_offsets_dict.get(field_name)
+            if not offset:
+                self.logger.warning(f"PLC {self._plc_id} 未找到偏移配置: {field_name}")
+                continue
+            self.write_plc_value(offset, value_type, value)
+        if test_result.get("finished", False):
+            finish_offset = self._field_offsets_dict.get("res_finish_signal_offset")
+            if finish_offset:
+                self.write_plc_value(finish_offset, "bool", True)
+            self._write_testing_signal_acknowledged(False)
+        self.bus.log.emit(f"PLC {self._plc_id} 写入测试结果完成")
 
     def last_write_test_result_to_plc(self, plc_id, test_result):
         """
@@ -255,32 +294,8 @@ class PlcService(QObject):
         if plc_id != self._plc_id:
             return
         print(f"id:{plc_id},{self._plc_id}, result:{test_result}")
-        if self.plc_client is None:
-            return
-        plc_values = [
-            ("res_error_code_offset", "string", test_result.get("error_code")),
-            ("res_sn_code_offset", "string", test_result.get("sn_code")),
-            ("res_result_offset", "bool", test_result.get("test_result")),
-            ("res_score_offset", "real", test_result.get("score")),
-            ("res_spl_offset", "real", test_result.get("spl")),
-            ("res_loudness_offset", "real", test_result.get("loudness")),
-            ("res_vibrate_data_offset", "real", test_result.get("vibrate")),
-            ("res_ai_score_offset", "real", test_result.get("ai_score")),
-        ]
         try:
-            for field_name, type, value in plc_values:
-                offset = self._field_offsets_dict.get(field_name)
-                if not offset:
-                    self.logger.warning(f"PLC {self._plc_id} 未找到偏移配置: {field_name}")
-                    continue
-                self.write_plc_value(offset, type, value)
-            # 最后写结束信号
-            if test_result.get("finished", False):
-                finish_offset = self._field_offsets_dict.get("res_finish_signal_offset")
-                if finish_offset:
-                    self.write_plc_value(finish_offset, "bool", True)
-                self._write_testing_signal(False)
-            self.bus.log.emit(f"PLC {self._plc_id} 写入测试结果完成")
+            self.write_result(plc_id, test_result)
         except Exception as exc:
             self.bus.log.emit(f"PLC {self._plc_id} 写入测试结果失败: {exc}")
             self.logger.error(f"PLC 写入测试结果失败: {exc}")

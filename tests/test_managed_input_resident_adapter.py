@@ -823,6 +823,7 @@ def test_calibration_success_uses_exact_resident_capture_and_meter_view(
     reserved: list[tuple[str, str]] = []
     started: list[tuple[object, int, int]] = []
     meter_calls: list[tuple[np.ndarray, int]] = []
+    meter_threads: list[tuple[str, int | None]] = []
     capture_started = threading.Event()
     duration_frames = 300
     adapter: ResidentManagedInputAdapter
@@ -835,6 +836,8 @@ def test_calibration_success_uses_exact_resident_capture_and_meter_view(
     def meter(samples: np.ndarray, sample_rate_hz: int) -> float:
         assert adapter._lock.acquire(blocking=False) is True
         adapter._lock.release()
+        current = threading.current_thread()
+        meter_threads.append((current.name, current.ident))
         meter_calls.append((samples, sample_rate_hz))
         return -17.25
 
@@ -916,6 +919,10 @@ def test_calibration_success_uses_exact_resident_capture_and_meter_view(
     assert len(trigger_calls) == 1
     assert trigger_calls[0] > 0
     assert len(meter_calls) == 1
+    assert meter_threads == [
+        (threading.current_thread().name, threading.current_thread().ident)
+    ]
+    assert not meter_threads[0][0].startswith("resident-audio-drain-")
     channel_view, sample_rate_hz = meter_calls[0]
     assert channel_view.ndim == 1
     assert channel_view.shape == (duration_frames,)

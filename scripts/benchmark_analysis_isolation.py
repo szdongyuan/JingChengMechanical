@@ -6,6 +6,7 @@ import json
 import multiprocessing
 import threading
 import time
+import uuid
 from pathlib import PureWindowsPath
 
 import numpy as np
@@ -47,7 +48,7 @@ class _Token:
         return False
 
 
-def _job(audio: _Audio) -> AnalysisJob:
+def _job(audio: _Audio, *, attempt_id: str | None = None) -> AnalysisJob:
     config = {
         "config_id": 1,
         "selected_channels": [0, 1],
@@ -78,7 +79,7 @@ def _job(audio: _Audio) -> AnalysisJob:
     )
     return AnalysisJob(
         run_id="benchmark-run",
-        analysis_attempt_id="benchmark-attempt",
+        analysis_attempt_id=attempt_id or str(uuid.uuid4()),
         kind=AnalysisKind.AUTOMATIC,
         audio=PersistedAudioReference(
             reference_id="benchmark-audio",
@@ -95,7 +96,7 @@ def _job(audio: _Audio) -> AnalysisJob:
     )
 
 
-def _measure(label: str, execute) -> None:
+def _measure(label: str, execute) -> dict[str, object]:
     gaps: list[float] = []
     stop = threading.Event()
 
@@ -114,31 +115,67 @@ def _measure(label: str, execute) -> None:
     elapsed = time.perf_counter() - started
     stop.set()
     thread.join()
+    result = {
+        "label": label,
+        "elapsed_seconds": elapsed,
+        "max_heartbeat_gap_seconds": max(gaps, default=0.0),
+        "gaps_over_20ms": sum(gap > 0.02 for gap in gaps),
+    }
     print(
         label,
-        f"elapsed={elapsed:.3f}s",
-        f"max_heartbeat_gap={max(gaps, default=0.0):.3f}s",
-        f"gaps_over_20ms={sum(gap > 0.02 for gap in gaps)}",
+        f"elapsed={result['elapsed_seconds']:.3f}s",
+        f"max_heartbeat_gap={result['max_heartbeat_gap_seconds']:.3f}s",
+        f"gaps_over_20ms={result['gaps_over_20ms']}",
     )
+    return result
 
 
 def main() -> None:
     multiprocessing.freeze_support()
     audio = _Audio()
-    job = _job(audio)
     token = _Token()
+    measurements = []
 
     local = ProductionAnalysisExecutor()
-    local.execute(job, audio, token)
-    _measure("in_process", lambda: local.execute(job, audio, token))
+    local.execute(_job(audio), audio, token)
+    measurements.append(
+        _measure(
+            "in_process_full",
+            lambda: local.execute(_job(audio), audio, token),
+        )
+    )
 
     isolated = ProcessIsolatedAnalysisExecutor()
     isolated.start()
+
+    def isolated_decision() -> None:
+        job = _job(audio)
+        isolated.execute(job, audio, token)
+        isolated.discard_attempt(
+            job.analysis_attempt_id,
+            reason_code="BENCHMARK_DECISION_COMPLETE",
+        )
+
     try:
-        _measure("isolated_cold", lambda: isolated.execute(job, audio, token))
-        _measure("isolated_warm", lambda: isolated.execute(job, audio, token))
+        measurements.append(_measure("isolated_cold_decision", isolated_decision))
+        measurements.append(_measure("isolated_warm_decision", isolated_decision))
     finally:
         isolated.close()
+    print(
+        json.dumps(
+            {
+                "schema": "analysis-isolation-benchmark/v2",
+                "input": {
+                    "duration_seconds": audio.frame_count / audio.sample_rate_hz,
+                    "sample_rate_hz": audio.sample_rate_hz,
+                    "channel_count": audio.channel_count,
+                },
+                "measurements": measurements,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
 
 
 if __name__ == "__main__":

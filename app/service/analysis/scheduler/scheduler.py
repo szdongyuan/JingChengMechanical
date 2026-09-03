@@ -378,6 +378,25 @@ class AnalysisScheduler:
                 self._record_submit_rejection_locked(rejection.status)
                 self._wake_locked()
                 return rejection
+            register_staged = getattr(
+                self._analysis_executor,
+                "register_staged_attempt",
+                None,
+            )
+            if callable(register_staged) and register_staged(job) is False:
+                rejection = SubmitReceipt(
+                    status=SubmitStatus.QUEUE_FULL,
+                    run_id=job.run_id,
+                    analysis_attempt_id=job.analysis_attempt_id,
+                    submission_sequence=None,
+                    error=self._admission_error(
+                        AnalysisErrorCategory.ANALYSIS_QUEUE_FULL,
+                        "staged analysis capacity is full",
+                    ),
+                )
+                self._record_submit_rejection_locked(rejection.status)
+                self._wake_locked()
+                return rejection
             self._submission_sequence += 1
             sequence = self._submission_sequence
             record = _AttemptRecord(
@@ -1345,6 +1364,24 @@ class AnalysisScheduler:
                     self._publish_diagnostic(sink_event)
         finally:
             self._callback_context.depth = depth
+            if outcome.status is not AnalysisStatus.SUCCEEDED:
+                retire_staged = getattr(
+                    self._analysis_executor,
+                    "retire_staged_attempt",
+                    None,
+                )
+                if callable(retire_staged):
+                    try:
+                        retire_staged(
+                            outcome.analysis_attempt_id,
+                            (
+                                outcome.error.category.value
+                                if outcome.error is not None
+                                else outcome.status.value
+                            ),
+                        )
+                    except Exception:
+                        pass
 
     def diagnostics(self) -> SchedulerDiagnostics:
         now = self._read_clock()

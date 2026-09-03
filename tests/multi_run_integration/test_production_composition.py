@@ -37,17 +37,25 @@ from app.service.multi_run_integration.production_composition import (
     _ProductionLiveDisplayManager,
 )
 from app.service.multi_run_coordinator_mvp.contracts import (
+    CaptureReserveResult,
+    CaptureReserveStatus,
+    CommitResult,
     FrozenPayload,
+    StartStatus,
     TriggerSource,
 )
+from app.service.captured_start_dispatcher import CapturedStartWorkResult
 from app.service.analysis.resident_audio_mvp.contracts import (
     BackendCallbackStatus,
 )
 from tests.multi_run_coordinator_mvp._support import (
+    Harness,
+    RUN_IDS,
     canonical_payload,
     captured_request,
     frozen_captured,
 )
+from tests.multi_run_coordinator_mvp.test_lifecycle import _PendingResident
 
 
 class _Prerequisites:
@@ -1227,6 +1235,43 @@ def test_run_freezer_snapshots_enabled_ai_toolchain_for_each_new_run(tmp_path):
     assert first_payload.value_id != second_payload.value_id
 
 
+def test_captured_freezer_rejects_exact_ai_revision_before_capture_when_unready(
+    tmp_path,
+):
+    import app.service.multi_run_integration.production_composition as module
+
+    toolchain = {
+        "toolchain_id": "resident-ai",
+        "execution_revision": "sha256:revision-1",
+        "execution_mode": "resident_process",
+        "entrypoint": r"C:\AI\resident.exe",
+        "package_dir": r"C:\AI",
+        "params": {"decision_threshold": 0.5},
+        "timeout_seconds": 2.0,
+    }
+    readiness_calls = []
+    config = SimpleNamespace(config_id=11, selected_channels=(0,))
+    freezer = module._FrozenRunFreezer(
+        SimpleNamespace(configs=(config,)),
+        tmp_path,
+        ai_toolchain_loader=lambda _config_id: toolchain,
+        ai_toolchain_readiness=lambda frozen: readiness_calls.append(frozen)
+        or False,
+    )
+
+    with pytest.raises(ValueError, match="not ready"):
+        freezer._analysis_input(
+            config,
+            {"work_order": {"sn": "SN-unready"}},
+            {
+                "analysis_duration": 1.0,
+                "analysis_window_offset_ms": 0,
+            },
+        )
+
+    assert readiness_calls == [toolchain]
+
+
 def test_run_freezer_keeps_ai_disabled_when_loader_returns_none(tmp_path):
     import app.service.multi_run_integration.production_composition as module
 
@@ -1464,6 +1509,27 @@ def test_run_freezer_snapshots_current_dashboard_layout_at_acceptance(tmp_path):
     assert later_config["result_dashboard_layout"] == later_layout
     assert run_config["analysis_duration"] == 0.01
     assert analysis_config["analysis_duration"] == 0.01
+    capture_lifecycle = module._CaptureSaveLifecycleAuthority()
+    assert capture_lifecycle.snapshot() == ()
+    from app.service.run_persistence.prepare_database import (
+        prepare_run_persistence_database,
+    )
+    from tests.run_persistence.test_audio_repository import ready_runtime
+
+    runtime = ready_runtime(
+        prepare_run_persistence_database(tmp_path / "active-gate.db")
+    )
+    persistence = module._CoordinatorPersistence(
+        runtime,
+        capture_lifecycle=capture_lifecycle,
+    )
+    assert persistence.create_active(frozen) is CommitResult.COMMITTED
+    assert persistence.create_active(later_frozen) is CommitResult.COMMITTED
+    assert capture_lifecycle.snapshot() == (
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+    )
+    runtime.close_after_upstream_stopped()
 
 
 def test_real_composition_uses_one_python_system_monotonic_domain_for_all_consumers():
@@ -1581,7 +1647,87 @@ def test_real_activation_failure_closes_dispatcher_scheduler_upstream_and_lease_
     ]
     assert len(scheduler_configs) == 1
     assert scheduler_configs[0].worker_count == 2
-    assert executor_build_kwargs == [{"process_count": 2}]
+    assert len(executor_build_kwargs) == 1
+    assert executor_build_kwargs[0]["process_count"] == 2
+    capture_active = executor_build_kwargs[0]["capture_active"]
+    assert type(capture_active.__self__) is module._CaptureSaveLifecycleAuthority
+    assert callable(executor_build_kwargs[0]["enrichment_sink"])
+    assert callable(executor_build_kwargs[0]["enrichment_failure_sink"])
+
+
+def test_real_activation_wires_dynamic_ai_readiness_into_captured_freezer(
+    monkeypatch,
+    tmp_path,
+):
+    import app.service.multi_run_integration.production_composition as module
+
+    trace = []
+    captured_kwargs = {}
+
+    class Dispatcher:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def shutdown(self, _deadline):
+            pass
+
+    class Scheduler:
+        def __init__(self, **_kwargs):
+            pass
+
+        def shutdown(self, _timeout):
+            pass
+
+    class Bridge:
+        def shutdown(self, _timeout):
+            pass
+
+    class Executor:
+        def start(self):
+            pass
+
+        def binding_ready(self, _binding):
+            return True
+
+        def close(self):
+            pass
+
+    executor = Executor()
+
+    def capture_freezer(*_args, **kwargs):
+        captured_kwargs.update(kwargs)
+        raise RuntimeError("freezer wiring observed")
+
+    monkeypatch.setattr(module, "BoundedAudioSaveDispatcher", Dispatcher)
+    monkeypatch.setattr(module, "AnalysisScheduler", Scheduler)
+    monkeypatch.setattr(module, "RunPersistenceSchedulerBridge", lambda **_kwargs: Bridge())
+    monkeypatch.setattr(module, "_FrozenRunFreezer", capture_freezer)
+    prerequisites = _Prerequisites(trace)
+    prerequisites.selected_config_ids = ()
+    prerequisites.configs = ()
+    prerequisites.build_analysis_executor = lambda **_kwargs: executor
+    upstream = _Upstream(trace)
+    upstream.resident_capture = object()
+    upstream.managed_resident = object()
+    upstream.live_display = SimpleNamespace(has_active_runs=lambda: False)
+    factory = ProductionGraphFactory(
+        runtime=object(),
+        plc_dispatch_ports=object(),
+        plc_result_sequencer=object(),
+        output_directory=tmp_path,
+    )
+    prepared = PreparedProductionComposition(
+        prerequisites=prerequisites,
+        upstream=upstream,
+        graph_factory=factory,
+    )
+
+    with pytest.raises(ProductionCompositionError, match="freezer wiring observed"):
+        prepared.activate(SimpleNamespace(publish=lambda _event: None))
+
+    readiness = captured_kwargs["ai_toolchain_readiness"]
+    assert readiness.__self__ is executor
+    assert readiness.__func__ is Executor.binding_ready
 
 
 @pytest.mark.parametrize("stream_count", [1, 6])
@@ -1799,3 +1945,325 @@ def test_publication_probe_failure_rejects_before_backend_or_streams(
         factory.prepare_upstream(SimpleNamespace())
 
     assert backend_constructions == []
+
+
+def test_committed_enrichment_sink_projects_only_to_history_ui():
+    from app.service.multi_run_integration.production_composition import (
+        _EnrichmentProjectionSink,
+    )
+
+    event = object()
+    projection = object()
+    coordinator = SimpleNamespace(
+        project_enrichment=Mock(return_value=projection)
+    )
+    history = SimpleNamespace(publish_enrichment=Mock())
+    sink = _EnrichmentProjectionSink(history)
+    sink.attach(coordinator)
+
+    sink(event)
+
+    coordinator.project_enrichment.assert_called_once_with(event)
+    history.publish_enrichment.assert_called_once_with(projection)
+
+
+def test_committed_enrichment_rechecks_shared_quiet_epoch_before_qt_projection():
+    from app.service.multi_run_integration.production_composition import (
+        _EnrichmentProjectionSink,
+    )
+
+    event = object()
+    projection = object()
+    trace = []
+    coordinator = SimpleNamespace(
+        project_enrichment=lambda value: (
+            trace.append(("fence", value)),
+            projection,
+        )[1]
+    )
+    history = SimpleNamespace(
+        publish_enrichment=lambda value: trace.append(("qt", value))
+    )
+    quiet_guard = Mock(side_effect=lambda epoch, checkpoint: trace.append(
+        ("quiet", epoch, checkpoint)
+    ))
+    sink = _EnrichmentProjectionSink(history)
+    sink.attach(coordinator)
+    sink.attach_quiet_guard(quiet_guard)
+
+    sink(event)
+
+    assert trace == [
+        ("quiet", None, "qt_chart_projection"),
+        ("fence", event),
+        ("qt", projection),
+    ]
+
+
+def test_real_captured_save_owns_fresh_quiet_epoch_after_live_frames_finish(
+    monkeypatch,
+    tmp_path,
+):
+    import app.service.analysis.process_executor as process_executor_module
+    from app.service.analysis.process_executor import (
+        ProcessIsolatedAnalysisExecutor,
+    )
+    from app.service.multi_run_coordinator_mvp import (
+        AudioSaveStatus,
+        SaveCancelToken,
+    )
+    from app.service.multi_run_integration.production_composition import (
+        _CaptureLifecycleSaver,
+        _CaptureSaveLifecycleAuthority,
+    )
+    from app.service.run_persistence.prepare_database import (
+        prepare_run_persistence_database,
+    )
+    from tests.analysis_scheduler.test_staged_process_executor import (
+        _Context,
+        _FakeCaptureClock,
+        _audio,
+        _job,
+    )
+    from tests.multi_run_integration.test_production_audio_saver import (
+        _captured_request,
+        _insert_active,
+        _real_saver,
+    )
+    from tests.run_persistence.test_audio_repository import ready_runtime
+
+    run_id = "12345678-1234-4234-8234-123456789abc"
+    now = "2026-09-01T01:00:00.000000Z"
+    runtime = ready_runtime(
+        prepare_run_persistence_database(tmp_path / "capture-save-gate.db")
+    )
+    _insert_active(runtime, run_id=run_id, now=now)
+    real_saver, _runs = _real_saver(runtime, now)
+    request = _captured_request(run_id, tmp_path / "authoritative.wav")
+    save_entered = threading.Event()
+    save_release = threading.Event()
+
+    class BlockingRealSaver:
+        def save_captured(self, actual_request, cancel_token):
+            save_entered.set()
+            assert save_release.wait(2.0)
+            return real_saver.save_captured(actual_request, cancel_token)
+
+        def save_imported(self, actual_request, cancel_token):
+            return real_saver.save_imported(actual_request, cancel_token)
+
+    authority = _CaptureSaveLifecycleAuthority()
+    authority.begin(run_id)
+    gated_saver = _CaptureLifecycleSaver(BlockingRealSaver(), authority)
+    context = _Context()
+    clock = _FakeCaptureClock()
+    clock.set_active(False)
+    monkeypatch.setattr(
+        process_executor_module.multiprocessing,
+        "get_context",
+        lambda method: context if method == "spawn" else None,
+    )
+    reports = []
+    executor = ProcessIsolatedAnalysisExecutor(
+        process_count=1,
+        capture_active=authority.has_active_runs,
+        monotonic=clock.monotonic,
+        quiet_wait=clock.wait,
+        enrichment_sink=reports.append,
+    )
+    save_outcomes = []
+    save_thread = threading.Thread(
+        target=lambda: save_outcomes.append(
+            gated_saver.save_captured(request, SaveCancelToken())
+        )
+    )
+    try:
+        executor.execute(_job("save-gate"), _audio(), object())
+        assert executor.mark_decision_committed("save-gate") is True
+        save_thread.start()
+        assert save_entered.wait(1.0)
+
+        clock.advance(1.0)
+        threading.Event().wait(0.30)
+        assert reports == []
+        assert authority.has_active_runs() is True
+        assert not any(
+            message[0] == "enrich" for message in context.connections[0].sent
+        )
+
+        save_release.set()
+        save_thread.join(2.0)
+        assert not save_thread.is_alive()
+        assert save_outcomes[0].status is AudioSaveStatus.SAVED
+        assert authority.has_active_runs() is False
+        assert Path(request.final_path_request.final_path).exists()
+
+        assert executor.quiet_epoch_id() == 1
+        clock.advance(0.249)
+        threading.Event().wait(0.05)
+        assert reports == []
+        clock.advance(0.001)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and not reports:
+            threading.Event().wait(0.01)
+
+        assert len(reports) == 1
+        commands = [message[0] for message in context.connections[0].sent]
+        assert commands.count("enrich") == 1
+        assert commands.count("enrich_transport") == 1
+    finally:
+        save_release.set()
+        save_thread.join(2.0)
+        executor.close()
+        runtime.close_after_upstream_stopped()
+
+
+def test_capture_lifecycle_settles_dispatch_rejection_and_saver_exception(
+    tmp_path,
+):
+    from app.service.multi_run_coordinator_mvp import SaveSubmitStatus
+    from app.service.multi_run_integration.production_composition import (
+        _CaptureLifecycleSaveDispatcher,
+        _CaptureLifecycleSaver,
+        _CaptureSaveLifecycleAuthority,
+    )
+    from tests.multi_run_integration.test_production_audio_saver import (
+        _captured_request,
+    )
+
+    run_id = "12345678-1234-4234-8234-123456789abc"
+    request = _captured_request(run_id, tmp_path / "rejected.wav")
+    authority = _CaptureSaveLifecycleAuthority()
+
+    authority.begin(run_id)
+    rejected = SimpleNamespace(
+        try_submit=lambda _request, _sink: SimpleNamespace(
+            status=SaveSubmitStatus.SATURATED
+        ),
+    )
+    dispatcher = _CaptureLifecycleSaveDispatcher(rejected, authority)
+    submission = dispatcher.try_submit(request, lambda _outcome: None)
+    assert submission.status is SaveSubmitStatus.SATURATED
+    assert authority.snapshot() == ()
+
+    class RaisingSaver:
+        def save_captured(self, _request, _cancel_token):
+            raise RuntimeError("atomic publication failed")
+
+    authority.begin(run_id)
+    saver = _CaptureLifecycleSaver(RaisingSaver(), authority)
+    with pytest.raises(RuntimeError, match="publication failed"):
+        saver.save_captured(request, object())
+    assert authority.snapshot() == ()
+
+    run_ids = tuple(f"bounded-run-{index}" for index in range(6))
+    for active_run_id in run_ids:
+        authority.begin(active_run_id)
+    assert authority.snapshot() == run_ids
+    with pytest.raises(RuntimeError, match="capacity"):
+        authority.begin("bounded-run-seventh")
+    for active_run_id in run_ids:
+        assert authority.settle(active_run_id) is True
+    assert authority.has_active_runs() is False
+
+
+class _BeginCaptureLifecycleOnActiveCommit:
+    def __init__(self, delegate, authority) -> None:
+        self._delegate = delegate
+        self._authority = authority
+
+    def create_active(self, frozen):
+        result = self._delegate.create_active(frozen)
+        if result is CommitResult.COMMITTED:
+            self._authority.begin(frozen.run_id)
+        return result
+
+    def commit_initial_terminal(self, fact):
+        try:
+            return self._delegate.commit_initial_terminal(fact)
+        finally:
+            self._authority.settle(fact.run_id)
+
+    def __getattr__(self, name):
+        return getattr(self._delegate, name)
+
+
+@pytest.mark.parametrize(
+    ("resident_status", "start_status"),
+    [
+        (CaptureReserveStatus.CAPACITY, StartStatus.CAPTURE_CAPACITY),
+        (CaptureReserveStatus.NOT_READY, StartStatus.RESIDENT_UNAVAILABLE),
+        (CaptureReserveStatus.FAULT, StartStatus.RESIDENT_UNAVAILABLE),
+        (CaptureReserveStatus.CLOSING, StartStatus.RESIDENT_UNAVAILABLE),
+    ],
+)
+def test_capture_lifecycle_is_not_acquired_for_resident_preaccept_rejection(
+    resident_status,
+    start_status,
+):
+    import app.service.multi_run_integration.production_composition as module
+
+    harness = Harness()
+    authority = module._CaptureSaveLifecycleAuthority()
+    harness.persistence = _BeginCaptureLifecycleOnActiveCommit(
+        harness.persistence,
+        authority,
+    )
+    harness.resident.reserve_results.append(
+        CaptureReserveResult(
+            status=resident_status,
+            run_id=RUN_IDS[0],
+            hardware_id="hardware-1",
+            reservation=None,
+            reason=resident_status.name,
+        )
+    )
+
+    result = harness.coordinator().start_captured(captured_request())
+
+    assert result.status is start_status
+    assert authority.snapshot() == ()
+    assert harness.persistence._delegate.active_calls == []
+
+
+def test_capture_lifecycle_is_not_acquired_for_canceled_parked_reservation():
+    import app.service.multi_run_integration.production_composition as module
+
+    harness = Harness()
+    authority = module._CaptureSaveLifecycleAuthority()
+    harness.persistence = _BeginCaptureLifecycleOnActiveCommit(
+        harness.persistence,
+        authority,
+    )
+    resident = _PendingResident(harness.trace)
+    harness.resident = resident
+    coordinator = harness.coordinator()
+
+    parked = coordinator.start_captured(captured_request())
+    assert type(parked) is CapturedStartWorkResult
+    coordinator.begin_shutdown()
+    parked.continuation()
+
+    assert authority.snapshot() == ()
+    assert harness.persistence._delegate.active_calls == []
+    assert resident.resume_calls == []
+
+
+def test_capture_lifecycle_is_acquired_after_active_commit_before_start():
+    import app.service.multi_run_integration.production_composition as module
+
+    harness = Harness()
+    authority = module._CaptureSaveLifecycleAuthority()
+    harness.persistence = _BeginCaptureLifecycleOnActiveCommit(
+        harness.persistence,
+        authority,
+    )
+    coordinator = harness.coordinator()
+
+    result = coordinator.start_captured(captured_request())
+
+    assert result.status is StartStatus.ACCEPTED_ACTIVE
+    assert authority.snapshot() == (RUN_IDS[0],)
+    assert len(harness.resident.start_calls) == 1
+    coordinator.stop_all(1.0)
+    assert authority.snapshot() == ()

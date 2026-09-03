@@ -7,12 +7,14 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import sip
 from PyQt6.QtCore import QCoreApplication, QEvent, Qt
-from PyQt6.QtWidgets import QApplication, QWidget
+from PyQt6.QtGui import QPaintEvent
+from PyQt6.QtWidgets import QApplication, QScrollArea, QWidget
 
 try:
     from pyqtgraph.widgets.GraphicsView import GraphicsView
@@ -23,6 +25,7 @@ else:
     _NOOP_GRAPHICS_VIEW_PAINT_EVENT = lambda self, event: None
 
 from app.service.factory_review_payloads import FactoryReviewPayload
+from app.service.analysis.frames import StftFrame
 from app.service.result_history import (
     ConfigSummaryField,
     FrozenConfigSummary,
@@ -31,9 +34,13 @@ from app.service.result_history import (
     ResultPhase,
     ReviewDisplayPayload,
     RunTerminated,
+    TerminalResultReplaced,
 )
 from app.services_container import FactoryControllerState
 from ui.modules.result_dashboard import ResultDashboardModule
+from ui.modules.result import ResultModule
+from ui.modules.result_history import ResultHistoryModule
+from ui.modules.stft import StftModule
 from ui.widgets.cards import Card
 
 
@@ -188,7 +195,7 @@ def _config(
     }
 
 
-def _card(run_id: str):
+def _card(run_id: str, *, revision: int = 0):
     return ResultHistoryCardSnapshot(
         run_id=run_id,
         config=FrozenConfigSummary(
@@ -206,7 +213,7 @@ def _card(run_id: str):
         is_active_run=False,
         manual_judgment_allowed=True,
         manual_reanalysis_allowed=True,
-        revision=0,
+        revision=revision,
     )
 
 
@@ -420,3 +427,263 @@ def test_dashboard_cleanup_keeps_projection_callbacks_inside_owned_qt_tree(qapp)
     assert bus.parent() is module
     assert chart.parent() is not None
     module.close()
+
+
+def test_stft_decision_with_empty_charts_clears_same_run_live_image(qapp):
+    services = _services()
+    services.config_service.load_config.return_value = {
+        "config_id": 101,
+        "selected_channels": [0],
+        "channels": [{"channel_index": 0}],
+    }
+    module = StftModule(services)
+    module.selected_display_channel_provider = lambda: 0
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="running",
+        )
+    )
+    services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(config_id=101, run_id="run-1")
+    )
+    services.bus.stft_updated.emit(
+        101,
+        "run-1",
+        0,
+        StftFrame(
+            time=0.1,
+            frequencies=np.asarray([100.0, 200.0]),
+            magnitudes=np.asarray([-3.0, -4.0]),
+        ),
+    )
+    assert module.canvas.heatmap.has_image() is True
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="reviewing",
+        )
+    )
+    services.bus.factory_review_changed.emit(
+        FactoryReviewPayload(
+            displayed_config_id=101,
+            run_id="run-1",
+            chart_payload={},
+        )
+    )
+
+    assert module.canvas.heatmap.has_image() is False
+
+
+def _decision_payload(
+    run_id: str,
+    config: dict,
+    terminal_revision: str,
+    *,
+    attempt_id: str,
+    history_revision: int,
+) -> ReviewDisplayPayload:
+    return ReviewDisplayPayload(
+        {
+            "_projection_identity": {
+                "attempt_id": attempt_id,
+                "terminal_revision": terminal_revision,
+                "history_revision": history_revision,
+            },
+            "chart_payload": {},
+            "judgment_payload": {"overall_pass": True},
+            "summary_payload": {
+                "overall_status": "pass",
+                "overall_label": "通过",
+                "rows": [],
+            },
+        },
+        config,
+    )
+
+
+def _decision_event(
+    run_id: str,
+    config: dict,
+    terminal_revision: str,
+    *,
+    attempt_id: str = "attempt-1",
+    history_revision: int = 0,
+):
+    card = _card(run_id, revision=history_revision)
+    return RunTerminated(
+        card,
+        review_payload=_decision_payload(
+            run_id,
+            config,
+            terminal_revision,
+            attempt_id=attempt_id,
+            history_revision=history_revision,
+        ),
+    )
+
+
+def test_review_page_preserves_pre_feature_layout_without_result_card(qapp):
+    module = ResultDashboardModule(_services())
+    module.apply_history_event(
+        _event("run-1", _config([_panel("spectrum", "spectrum")]))
+    )
+
+    review_page = module.findChild(QWidget, "result_dashboard_review_page")
+    assert review_page is not None
+    assert review_page.layout().count() == 1
+    assert isinstance(review_page.layout().itemAt(0).widget(), QScrollArea)
+    assert review_page.findChildren(ResultModule) == []
+    assert not hasattr(module, "decision_result_widget")
+
+
+def test_dashboard_acknowledges_only_after_visible_history_summary_paints(qapp):
+    terminal_revision = "decision-r1"
+    module = ResultDashboardModule(_services())
+    history = module.findChild(ResultHistoryModule, "result_history_module")
+    history_painted = []
+    dashboard_painted = []
+    history.decisionPainted.connect(
+        lambda revision, painted_at: history_painted.append(
+            (revision, painted_at)
+        )
+    )
+    module.decisionPainted.connect(
+        lambda revision, painted_at: dashboard_painted.append(
+            (revision, painted_at)
+        )
+    )
+    module.show()
+    qapp.processEvents()
+
+    module.apply_history_event(
+        _decision_event(
+            "run-1",
+            _config([_panel("spectrum", "spectrum")]),
+            terminal_revision,
+        )
+    )
+
+    summary = history.findChild(
+        QWidget,
+        "result_history_card_summary_overall",
+    )
+    assert summary is not None
+    assert summary.text() == "结果摘要：通过"
+    assert history_painted == []
+    assert dashboard_painted == []
+    assert history.project_decision_revision(
+        "run-1",
+        "attempt-1",
+        "stale-decision",
+        0,
+    ) is False
+    assert history.project_decision_revision(
+        "run-1",
+        "stale-attempt",
+        terminal_revision,
+        0,
+    ) is False
+    for _ in range(3):
+        qapp.processEvents()
+    assert len(history_painted) == 1
+    assert len(dashboard_painted) == 1
+    assert history_painted[0][0] == (
+        "run-1",
+        "attempt-1",
+        terminal_revision,
+        0,
+    )
+    assert dashboard_painted[0][0] == terminal_revision
+    assert history_painted[0][1] == dashboard_painted[0][1]
+    assert type(dashboard_painted[0][1]) is int
+    assert dashboard_painted[0][1] > 0
+
+
+def test_same_terminal_hash_acknowledges_each_new_attempt_once(qapp):
+    terminal_revision = "same-result-hash"
+    config = _config([_panel("spectrum", "spectrum")])
+    module = ResultDashboardModule(_services())
+    painted = []
+    module.decisionPainted.connect(
+        lambda revision, painted_at: painted.append((revision, painted_at))
+    )
+    module.show()
+    qapp.processEvents()
+
+    module.apply_history_event(
+        _decision_event(
+            "run-1",
+            config,
+            terminal_revision,
+            attempt_id="attempt-1",
+            history_revision=0,
+        )
+    )
+    for _ in range(3):
+        qapp.processEvents()
+    assert [item[0] for item in painted] == [terminal_revision]
+
+    module.apply_history_event(
+        TerminalResultReplaced(
+            "run-1",
+            0,
+            _card("run-1", revision=1),
+            review_payload=_decision_payload(
+                "run-1",
+                config,
+                terminal_revision,
+                attempt_id="attempt-2",
+                history_revision=1,
+            ),
+        )
+    )
+    assert [item[0] for item in painted] == [terminal_revision]
+    for _ in range(3):
+        qapp.processEvents()
+    assert [item[0] for item in painted] == [
+        terminal_revision,
+        terminal_revision,
+    ]
+    qapp.processEvents()
+    assert len(painted) == 2
+
+
+def test_reselecting_unchanged_painted_run_does_not_acknowledge_twice(qapp):
+    config = _config([_panel("spectrum", "spectrum")])
+    module = ResultDashboardModule(_services())
+    painted = []
+    module.decisionPainted.connect(
+        lambda revision, painted_at: painted.append((revision, painted_at))
+    )
+    module.show()
+    qapp.processEvents()
+
+    for run_id, attempt_id, terminal_revision in (
+        ("run-a", "attempt-a", "hash-a"),
+        ("run-b", "attempt-b", "hash-b"),
+    ):
+        module.apply_history_event(
+            _decision_event(
+                run_id,
+                config,
+                terminal_revision,
+                attempt_id=attempt_id,
+            )
+        )
+        for _ in range(3):
+            qapp.processEvents()
+    assert [item[0] for item in painted] == ["hash-a", "hash-b"]
+
+    module.set_follow_latest(False)
+    module.select_run("run-a")
+    selected_card = module._history_module._card_entries["run-a"][1]
+    QApplication.sendEvent(
+        selected_card,
+        QPaintEvent(selected_card.rect()),
+    )
+    for _ in range(3):
+        qapp.processEvents()
+
+    assert [item[0] for item in painted] == ["hash-a", "hash-b"]

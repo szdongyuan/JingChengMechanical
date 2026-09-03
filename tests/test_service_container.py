@@ -212,6 +212,10 @@ def test_service_container_wires_one_durable_run_export_reader_and_archive_servi
     assert services.run_persistence_database is runtime
     assert type(services.run_export_reader) is RunExportReader
     assert services.run_export_reader._runtime is runtime
+    assert (
+        services.run_export_reader._result_artifact_store
+        is services.analysis_result_artifact_store
+    )
     assert type(services.run_archive_service) is RunArchiveService
     assert services.run_archive_service._reader is services.run_export_reader
     assert type(services.run_data_management_service) is RunDataManagementService

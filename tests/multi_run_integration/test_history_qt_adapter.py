@@ -663,6 +663,51 @@ def test_post_store_projection_failure_keeps_eviction_and_disables_manual_target
     assert reanalysis_requests == []
 
 
+def test_post_store_transient_projection_failure_refreshes_once_next_event_loop(
+    qapp,
+    monkeypatch,
+):
+    from app.service.multi_run_integration.history_qt_adapter import HistoryQtAdapter
+
+    dashboard = ResultDashboardModule(
+        SimpleNamespace(config_service=SimpleNamespace())
+    )
+    diagnostics = []
+    dashboard.history_diagnostic.connect(diagnostics.append)
+    adapter = HistoryQtAdapter(dashboard)
+    event = projected_event(
+        HistoryFactKind.RUN_TERMINATED,
+        run_id=RUN_IDS[0],
+        expected_revision=1,
+        proposed_revision=2,
+        operation_id=RUN_IDS[0],
+        conclusion=TerminalConclusion.ERROR,
+        error_category=TerminalErrorCategory.ANALYSIS_FAILED,
+        reason="analysis failed",
+    )
+    mapped = adapter._map_event(event)
+    original = dashboard._project_snapshot
+    calls = []
+
+    def fail_once(*args, **kwargs):
+        calls.append("project")
+        if len(calls) == 1:
+            raise RuntimeError("transient widget projection failure")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard, "_project_snapshot", fail_once)
+
+    dashboard.apply_history_event(mapped)
+
+    assert dashboard.history_snapshot().selected_run_id == RUN_IDS[0]
+    assert dashboard.projected_run_id() is None
+    assert calls == ["project"]
+    _drain(qapp)
+    assert calls == ["project", "project"]
+    assert dashboard.projected_snapshot().selected_run_id == RUN_IDS[0]
+    assert len(diagnostics) == 1
+
+
 def test_destroyed_target_queue_store_and_projection_failures_are_diagnostic_only(qapp):
     from app.service.multi_run_integration.history_qt_adapter import HistoryQtAdapter
 

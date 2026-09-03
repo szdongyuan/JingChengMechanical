@@ -1308,7 +1308,7 @@ def test_only_committed_bridge_reports_publish(status: BridgeTerminalStatus) -> 
     assert harness.persistence.terminal_calls == []
 
 
-def test_committed_initial_plc_failure_retires_and_later_start_continues() -> None:
+def test_committed_initial_plc_failure_keeps_original_decision_pending() -> None:
     harness = Harness()
     request = captured_request(source=TriggerSource.PLC)
     harness.projector.exception = RuntimeError("history failed")
@@ -1324,8 +1324,10 @@ def test_committed_initial_plc_failure_retires_and_later_start_continues() -> No
 
     assert len(harness.plc.publish_calls) == 1
     assert len(harness.diagnostics.calls) >= 2
-    assert coordinator.snapshot().pending_publication_run_ids == ()
-    assert coordinator.snapshot().restart_required is False
+    assert coordinator.snapshot().pending_publication_run_ids == (
+        request.run_id,
+    )
+    assert coordinator.snapshot().restart_required is True
     assert (
         coordinator.start_captured(
             captured_request(RUN_IDS[1], source=TriggerSource.PLC)

@@ -5,6 +5,8 @@ from dataclasses import replace
 import os
 from pathlib import Path
 import threading
+import time
+import wave
 
 import numpy as np
 import pytest
@@ -15,6 +17,15 @@ from PyQt6.QtCore import QThread
 from PyQt6.QtWidgets import QApplication
 
 from app.service.current_meter_service import CurrentSample
+from app.service.analysis import process_executor as process_executor_module
+from app.service.analysis.process_executor import ProcessIsolatedAnalysisExecutor
+from app.service.analysis.scheduler import (
+    AnalysisScheduler,
+    AnalysisSchedulerConfig,
+    AudioStorageKind,
+    PersistedAudioReference as SchedulerAudioReference,
+    SubmitStatus,
+)
 from app.service.multi_run_coordinator_mvp import (
     AudioSaveOutcome,
     AudioSaveStatus,
@@ -23,6 +34,7 @@ from app.service.multi_run_coordinator_mvp import (
     PersistedAudioFormat,
     PersistedAudioReference,
     PlcIngressTicket,
+    SaveCancelToken,
     StartStatus,
     TriggerSource,
 )
@@ -44,6 +56,24 @@ from tests.multi_run_coordinator_mvp.test_composite_end_to_end import (
     _real_resident_port,
 )
 from tests.multi_run_integration.fakes import history_labels
+from tests.analysis_scheduler.fakes import (
+    ManualClock,
+    PassThroughStartGate,
+    RecordingAudioLoader,
+    make_job,
+)
+from tests.analysis_scheduler.test_staged_process_executor import (
+    _BlockingDecisionContext,
+    _FakeCaptureClock,
+)
+from tests.multi_run_integration.test_production_audio_saver import (
+    _insert_active,
+    _real_saver,
+)
+from app.service.run_persistence.prepare_database import (
+    prepare_run_persistence_database,
+)
+from tests.run_persistence.test_audio_repository import ready_runtime
 
 
 @pytest.fixture(scope="session")
@@ -54,11 +84,13 @@ def qapp() -> QApplication:
 class _Dashboard:
     def __init__(self) -> None:
         self.store = ResultHistoryStore()
+        self.apply_threads = []
 
     def thread(self):
         return QThread.currentThread()
 
     def apply_history_event(self, event):
+        self.apply_threads.append(threading.current_thread().name)
         return self.store.apply(event)
 
 
@@ -166,6 +198,7 @@ def _drain_until(qapp: QApplication, predicate) -> None:
 def test_six_resident_streams_run_six_parallel_captures_with_isolated_identity(
     qapp,
     tmp_path,
+    monkeypatch,
 ):
     resident, managed_input, backend, routes = _real_resident_port(6)
     handle_ids = {
@@ -195,6 +228,21 @@ def test_six_resident_streams_run_six_parallel_captures_with_isolated_identity(
     )
 
     harness = Harness()
+    integrity_runtime = ready_runtime(
+        prepare_run_persistence_database(tmp_path / "integrity.db")
+    )
+    integrity_now = "2026-08-31T12:00:00.000000Z"
+    for run_id in original_run_ids:
+        _insert_active(
+            integrity_runtime,
+            run_id=run_id,
+            now=integrity_now,
+        )
+    integrity_saver, _integrity_runs = _real_saver(
+        integrity_runtime,
+        integrity_now,
+    )
+    persistence_threads = []
     save_dispatcher = _BarrierSaveDispatcher(harness.save_dispatcher)
     collectors = [
         FakeCurrentCollector(
@@ -271,7 +319,9 @@ def test_six_resident_streams_run_six_parallel_captures_with_isolated_identity(
 
         backend.clock.advance_ns(round(8 * 1_000_000_000 / 48_000))
         samples = np.arange(16, dtype=np.float32).reshape(8, 2)
+        no_analysis_baseline_bytes = samples[1:3, :].copy().tobytes(order="C")
         save_by_run = {}
+        integrity_references = {}
         for position, index in enumerate(capture_order):
             run_id = original_run_ids[index]
             backend.handles[f"managed-input-{index + 1}"].emit(samples.copy())
@@ -279,6 +329,38 @@ def test_six_resident_streams_run_six_parallel_captures_with_isolated_identity(
             save_by_run[run_id] = next(
                 pair for pair in save_dispatcher.calls if pair[0].run_id == run_id
             )
+            captured_audio = save_by_run[run_id][0].audio
+            assert captured_audio.frame_count == 2
+            assert captured_audio.sample_rate_hz == 48_000
+            assert captured_audio.channel_count == 2
+            assert captured_audio.channel_indices == (0, 1)
+            assert type(captured_audio.interleaved_bytes) is bytes
+            assert captured_audio.interleaved_bytes == no_analysis_baseline_bytes
+            captured_array = np.frombuffer(
+                captured_audio.interleaved_bytes,
+                dtype=np.float32,
+            ).reshape(2, 2)
+            assert captured_array.dtype == np.dtype(np.float32)
+            assert captured_array.tobytes(order="C") == no_analysis_baseline_bytes
+            persistence_threads.append(threading.current_thread().name)
+            persisted = integrity_saver.save_captured(
+                save_by_run[run_id][0],
+                SaveCancelToken(),
+            )
+            assert persisted.status is AudioSaveStatus.SAVED
+            assert persisted.persisted_audio is not None
+            assert persisted.persisted_audio.content_revision == 1
+            integrity_references[run_id] = persisted.persisted_audio
+            final_path = Path(persisted.persisted_audio.final_path)
+            expected_pcm = np.full((2, 2), 32767, dtype="<i2").tobytes(
+                order="C"
+            )
+            with wave.open(str(final_path), "rb") as reader:
+                assert reader.getnframes() == 2
+                assert reader.getframerate() == 48_000
+                assert reader.getnchannels() == 2
+                assert reader.getsampwidth() == 2
+                assert reader.readframes(2) == expected_pcm
 
             if position == 0:
                 request, sink = save_by_run[run_id]
@@ -308,6 +390,112 @@ def test_six_resident_streams_run_six_parallel_captures_with_isolated_identity(
                     for name, handle in backend.handles.items()
                 } == handle_ids
 
+        analysis_context = _BlockingDecisionContext()
+        capture_clock = _FakeCaptureClock()
+        enrichment_reports = []
+        decision_commit_threads = []
+        monkeypatch.setattr(
+            process_executor_module.multiprocessing,
+            "get_context",
+            lambda method: analysis_context if method == "spawn" else None,
+        )
+        staged_executor = ProcessIsolatedAnalysisExecutor(
+            process_count=2,
+            capture_active=capture_clock.capture_active,
+            monotonic=capture_clock.monotonic,
+            quiet_wait=capture_clock.wait,
+            enrichment_sink=enrichment_reports.append,
+        )
+
+        def commit_durable_decision(outcome) -> None:
+            decision_commit_threads.append(threading.current_thread().name)
+            assert staged_executor.mark_decision_committed(
+                outcome.analysis_attempt_id
+            )
+
+        analysis_scheduler = AnalysisScheduler(
+            config=AnalysisSchedulerConfig(
+                worker_count=2,
+                pending_capacity=6,
+            ),
+            audio_loader=RecordingAudioLoader(),
+            analysis_executor=staged_executor,
+            start_gate=PassThroughStartGate(),
+            outcome_sink=commit_durable_decision,
+            clock=ManualClock(1.0),
+        )
+        try:
+            analysis_jobs = []
+            for index, run_id in enumerate(original_run_ids):
+                base = make_job(index + 101, run_id=run_id)
+                persisted = integrity_references[run_id]
+                analysis_jobs.append(
+                    replace(
+                        base,
+                        audio=SchedulerAudioReference(
+                            reference_id=persisted.audio_id,
+                            storage_kind=(
+                                AudioStorageKind.CAPTURED_FINAL_WAV
+                            ),
+                            absolute_path=persisted.final_path,
+                            sample_rate_hz=persisted.sample_rate_hz,
+                            channel_count=persisted.channel_count,
+                            frame_count=persisted.frame_count,
+                            dtype="<i2",
+                            content_revision=(
+                                f"{persisted.audio_id}:"
+                                f"{persisted.byte_size}"
+                            ),
+                            audio_data_id=persisted.audio_id,
+                        ),
+                    )
+                )
+            assert [
+                analysis_scheduler.submit(job).status for job in analysis_jobs
+            ] == [SubmitStatus.ACCEPTED] * 6
+            deadline = time.monotonic() + 1.0
+            while (
+                time.monotonic() < deadline
+                and len(analysis_context.connections) < 2
+            ):
+                threading.Event().wait(0.01)
+            assert len(analysis_context.connections) == 2
+            assert all(
+                connection.decision_entered.wait(1.0)
+                for connection in analysis_context.connections
+            )
+            assert set(staged_executor.attempt_state_snapshot()) == {
+                job.analysis_attempt_id for job in analysis_jobs
+            }
+
+            capture_clock.set_active(False)
+            assert staged_executor.quiet_epoch_id() == 1
+            capture_clock.advance(0.249)
+            for connection in analysis_context.connections:
+                connection.decision_release.set()
+            threading.Event().wait(0.05)
+            assert enrichment_reports == []
+
+            capture_clock.advance(0.001)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline and len(enrichment_reports) < 6:
+                threading.Event().wait(0.01)
+            assert len(enrichment_reports) == 6
+            assert len(decision_commit_threads) == 6
+            assert all(
+                name.startswith("analysis-scheduler-worker-")
+                for name in decision_commit_threads
+            )
+            assert all(
+                not name.startswith("resident-audio-drain-")
+                for name in decision_commit_threads
+            )
+        finally:
+            for connection in analysis_context.connections:
+                connection.decision_release.set()
+            analysis_scheduler.shutdown(5.0)
+            staged_executor.close()
+
         save_order = (2, 0, 5, 1, 4, 3)
         for index in save_order:
             if index == first_released_index:
@@ -327,6 +515,19 @@ def test_six_resident_streams_run_six_parallel_captures_with_isolated_identity(
             for request, _sink in harness.scheduler.initial_calls
         } == {
             run_id: AUDIO_IDS[index]
+            for index, run_id in enumerate(original_run_ids)
+        }
+        scheduler_audio_metadata = {
+            request.run_id: (
+                request.audio_reference.content_revision,
+                request.audio_reference.frame_count,
+                request.audio_reference.sample_rate_hz,
+                request.audio_reference.channel_count,
+            )
+            for request, _sink in harness.scheduler.initial_calls
+        }
+        assert scheduler_audio_metadata == {
+            run_id: (f"{AUDIO_IDS[index]}:16", 2, 48_000, 2)
             for index, run_id in enumerate(original_run_ids)
         }
         assert set(coordinator.snapshot().analysis_attempt_ids) == set(
@@ -360,6 +561,28 @@ def test_six_resident_streams_run_six_parallel_captures_with_isolated_identity(
         assert snapshot.selected_run_id == reuse_run_id
         assert snapshot.follow_latest is True
         assert adapter_diagnostics == []
+        assert dashboard.apply_threads
+        assert set(dashboard.apply_threads) == {threading.current_thread().name}
+        assert all(
+            not name.startswith("resident-audio-drain-")
+            for name in dashboard.apply_threads
+        )
+        assert persistence_threads == [threading.current_thread().name] * 6
+        assert all(
+            not name.startswith("resident-audio-drain-")
+            for name in persistence_threads
+        )
+        resident_pool = managed_input._pool
+        assert resident_pool is not None
+        for slot in resident_pool._slots.values():
+            assert slot._ingress.overflow_count == 0
+            assert slot._fault is None
+            assert slot._dropped_callback_count == 0
+            blocks = slot._ring.block_metadata
+            assert all(
+                left.end_cursor == right.start_cursor
+                for left, right in zip(blocks, blocks[1:])
+            )
 
         terminal_tickets = {
             ticket.run_id: ticket

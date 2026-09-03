@@ -19,6 +19,7 @@ from app.service.multi_run_coordinator_mvp import (
     HistoryFactKind,
     ProjectedHistoryEvent,
     ResultProjection,
+    ResultEnrichmentProjection,
     ResultProjectionPhase,
     TerminalConclusion,
     TerminalErrorCategory,
@@ -76,6 +77,15 @@ class _DecodedBridgeResult:
     analysis_attempt_id: str
     judgment: str
     value: dict[str, object]
+
+
+@dataclass(frozen=True)
+class _MappedEnrichment:
+    run_id: str
+    attempt_id: str
+    terminal_revision: str
+    expected_revision: int
+    review_payload: ReviewDisplayPayload
 
 
 _PREACCEPT_COMBINATIONS = {
@@ -156,6 +166,26 @@ class HistoryQtAdapter(QObject):
                 exc,
             )
 
+    def publish_enrichment(self, event: ResultEnrichmentProjection) -> None:
+        run_id = getattr(event, "run_id", None)
+        try:
+            mapped = self._map_enrichment(event)
+        except Exception as exc:
+            self._diagnose(
+                HistoryQtAdapterDiagnosticCode.MAPPING_FAILED,
+                run_id if type(run_id) is str else None,
+                exc,
+            )
+            return
+        try:
+            self._enqueue(mapped)
+        except Exception as exc:
+            self._diagnose(
+                HistoryQtAdapterDiagnosticCode.QUEUE_FAILED,
+                event.run_id,
+                exc,
+            )
+
     def _qt_enqueue(self, event: object) -> None:
         self._queued_event.emit(event)
 
@@ -177,6 +207,9 @@ class HistoryQtAdapter(QObject):
             )
             return
         try:
+            if type(event) is _MappedEnrichment:
+                target.apply_enrichment_projection(event)
+                return
             transition = target.apply_history_event(event)
         except Exception as exc:
             self._diagnose(
@@ -200,6 +233,39 @@ class HistoryQtAdapter(QObject):
                 evicted_run_id,
                 exc,
             )
+
+    @staticmethod
+    def _map_enrichment(
+        event: ResultEnrichmentProjection,
+    ) -> _MappedEnrichment:
+        if type(event) is not ResultEnrichmentProjection:
+            raise TypeError(
+                "enrichment event must be an exact ResultEnrichmentProjection"
+            )
+        event.__post_init__()
+        decoded = _decode_bridge_result(event.result_payload)
+        if decoded.analysis_attempt_id != event.attempt_id:
+            raise ValueError(
+                "enrichment payload must match the projection attempt"
+            )
+        review = deepcopy(decoded.value["result"])
+        if type(review) is not dict:
+            raise ValueError("enrichment result must be an object")
+        dashboard_config = review.get("config_payload")
+        if type(dashboard_config) is not dict:
+            raise ValueError(
+                "enrichment result requires its frozen config payload"
+            )
+        return _MappedEnrichment(
+            run_id=event.run_id,
+            attempt_id=event.attempt_id,
+            terminal_revision=event.terminal_revision,
+            expected_revision=event.expected_revision,
+            review_payload=ReviewDisplayPayload(
+                review=review,
+                dashboard_config=dashboard_config,
+            ),
+        )
 
     def _diagnose(
         self,
@@ -410,6 +476,16 @@ class HistoryQtAdapter(QObject):
                 if decoded_result is not None
                 else {}
             )
+            if (
+                decoded_result is not None
+                and event.operation_id == decoded_result.analysis_attempt_id
+                and event.projection.terminal_revision is not None
+            ):
+                review["_projection_identity"] = {
+                    "attempt_id": decoded_result.analysis_attempt_id,
+                    "terminal_revision": event.projection.terminal_revision,
+                    "history_revision": event.proposed_revision,
+                }
             if (
                 isinstance(review, dict)
                 and event.projection.manual_judgment_revision is not None

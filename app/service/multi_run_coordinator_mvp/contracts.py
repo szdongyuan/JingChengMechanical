@@ -1495,6 +1495,7 @@ class ResultProjection:
     result_payload: FrozenPayload | None
     fault_type: str | None = None
     manual_judgment_revision: int | None = None
+    terminal_revision: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.phase, ResultProjectionPhase):
@@ -1508,6 +1509,18 @@ class ResultProjection:
                 self.manual_judgment_revision,
                 "manual_judgment_revision",
             )
+        if self.terminal_revision is not None:
+            if (
+                type(self.terminal_revision) is not str
+                or len(self.terminal_revision) != 64
+                or any(
+                    character not in "0123456789abcdef"
+                    for character in self.terminal_revision
+                )
+            ):
+                raise ValueError(
+                    "terminal_revision must be a lowercase sha256 digest"
+                )
         if self.fault_type is not None and (
             self.conclusion is not TerminalConclusion.NG
             or self.manual_judgment_revision is None
@@ -1539,6 +1552,45 @@ class ResultProjection:
                 self.result_payload,
                 allow_none=False,
             )
+        if self.terminal_revision is not None and (
+            self.phase is not ResultProjectionPhase.TERMINAL
+            or self.conclusion
+            not in {TerminalConclusion.OK, TerminalConclusion.NG}
+            or self.result_payload is None
+            or self.manual_judgment_revision is not None
+        ):
+            raise ValueError(
+                "terminal_revision requires an automatic successful terminal projection"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class ResultEnrichmentProjection:
+    """Exact-revision chart refresh for one already-committed Decision."""
+
+    run_id: str
+    attempt_id: str
+    terminal_revision: str
+    expected_revision: int
+    result_payload: FrozenPayload
+
+    def __post_init__(self) -> None:
+        require_uuid4(self.run_id, "run_id")
+        require_uuid4(self.attempt_id, "attempt_id")
+        if (
+            type(self.terminal_revision) is not str
+            or len(self.terminal_revision) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in self.terminal_revision
+            )
+        ):
+            raise ValueError(
+                "terminal_revision must be a lowercase sha256 digest"
+            )
+        _require_positive_int(self.expected_revision, "expected_revision")
+        if not isinstance(self.result_payload, FrozenPayload):
+            raise ValueError("result_payload must be a FrozenPayload")
 
 
 @dataclass(frozen=True, slots=True)

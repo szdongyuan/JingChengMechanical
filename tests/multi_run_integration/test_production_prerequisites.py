@@ -10,6 +10,7 @@ from scipy.io import wavfile
 
 import app.service.analysis.golden_reference as golden_module
 from app.service.analysis.golden_reference import freeze_golden_artifact
+from app.service.analysis.process_executor import ProcessIsolatedAnalysisExecutor
 from app.service.factory_selection_settings import FactorySelectionSettings
 from app.service.golden_sample_service import GoldenSampleService
 from app.service.managed_input_contracts import serialize_calibration_json
@@ -19,10 +20,14 @@ from app.service.multi_run_integration.production_prerequisites import (
     ProductionPrerequisites,
 )
 from model.channel_config_table import ChannelConfigTable
+from model.ai_toolchain_table import AiToolchainTable
 from model.input_hardware_table import InputHardwareTable
 from model.managed_audio_input_table import ManagedAudioInputTable
 from model.plc_table import PlcTable
 from model.test_config_table import TestConfigTable
+from model.test_config_ai_binding_table import (
+    TestConfigAiBindingTable as _TestConfigAiBindingTable,
+)
 
 
 class _Settings:
@@ -662,6 +667,126 @@ def test_prepare_accepts_nonzero_golden_source_channel_as_audit_binding(
     ] == 7
     assert prepared.golden_artifacts[0].channel_count == 1
     prepared.close()
+
+
+def test_prepare_freezes_unique_selected_ai_toolchains_for_every_process_slot(
+    setup_test_db,
+    tmp_path: Path,
+):
+    managed = _managed()
+    first = _config(managed.hardware_id)
+    second = _config(managed.hardware_id, name="second")
+    settings, _ = _settings_for((first.config_id, second.config_id))
+    calls = []
+
+    def load_toolchain(config_id: int):
+        calls.append(config_id)
+        return {
+            "toolchain_id": "selected-ai",
+            "execution_revision": "sha256:selected-r1",
+            "execution_mode": "resident_process",
+            "entrypoint": "python resident.py",
+            "package_dir": str(tmp_path),
+            "params": {"threshold": 0.5},
+            "timeout_seconds": 2.0,
+        }
+
+    prepared = ProductionPrerequisites(
+        settings,
+        ai_toolchain_loader=load_toolchain,
+    ).prepare(monotonic_authority=_Clock())
+    executor = prepared.build_analysis_executor(process_count=2)
+    try:
+        assert calls == [first.config_id, second.config_id]
+        assert len(prepared.selected_toolchains) == 1
+        snapshot = prepared.selected_toolchains[0]
+        assert snapshot.toolchain_id == "selected-ai"
+        assert snapshot.execution_revision == "sha256:selected-r1"
+        assert snapshot.params_json == '{"threshold":0.5}'
+        assert type(executor) is ProcessIsolatedAnalysisExecutor
+        assert executor._selected_toolchains == (snapshot,)
+    finally:
+        executor.close()
+        prepared.close()
+
+
+def test_prepare_rejects_selected_ai_binding_that_cannot_be_frozen(
+    setup_test_db,
+):
+    managed = _managed()
+    config = _config(managed.hardware_id)
+    settings, _ = _settings_for((config.config_id,))
+
+    with pytest.raises(ProductionPrerequisiteError, match="AI toolchain"):
+        ProductionPrerequisites(
+            settings,
+            ai_toolchain_loader=lambda _config_id: {
+                "toolchain_id": "selected-ai",
+                "execution_revision": "sha256:selected-r1",
+            },
+        ).prepare(monotonic_authority=_Clock())
+
+
+def test_default_prerequisite_loader_freezes_database_ai_binding(
+    setup_test_db,
+    tmp_path: Path,
+):
+    managed = _managed()
+    config = _config(managed.hardware_id)
+    toolchain = AiToolchainTable.create(
+        toolchain_id="database-ai",
+        display_name="Database AI",
+        version="1",
+        entrypoint="python resident.py",
+        package_dir=str(tmp_path),
+        protocol_version=1,
+        execution_mode="resident_process",
+        default_timeout_ms=2_000,
+        params_json='{"threshold":0.5}',
+        enabled=True,
+    )
+    _TestConfigAiBindingTable.create(
+        config=config,
+        enabled=True,
+        toolchain=toolchain,
+    )
+    settings, _ = _settings_for((config.config_id,))
+
+    prepared = ProductionPrerequisites(settings).prepare(
+        monotonic_authority=_Clock()
+    )
+    try:
+        assert len(prepared.selected_toolchains) == 1
+        assert prepared.selected_toolchains[0].toolchain_id == "database-ai"
+        assert prepared.selected_toolchains[0].execution_revision.startswith(
+            "sha256:"
+        )
+    finally:
+        prepared.close()
+
+
+@pytest.mark.parametrize("loudness_required", [False, True])
+def test_selected_loudness_limit_controls_required_dsp_startup_readiness(
+    setup_test_db,
+    loudness_required,
+):
+    managed = _managed(channels=1, trusted=(0,))
+    config = _config(managed.hardware_id, selected=(0,))
+    ChannelConfigTable.update(
+        loudness_lower_enabled=loudness_required,
+    ).where(
+        ChannelConfigTable.config == config.config_id
+    ).execute()
+    settings, _ = _settings_for((config.config_id,))
+    prepared = ProductionPrerequisites(settings).prepare(
+        monotonic_authority=_Clock()
+    )
+    executor = prepared.build_analysis_executor(process_count=1)
+    try:
+        assert executor._require_loudness_backend is loudness_required
+    finally:
+        executor.close()
+        prepared.close()
 
 
 def test_prepare_rejects_golden_source_identity_or_digest_drift_during_single_read(

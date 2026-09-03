@@ -575,23 +575,48 @@ git commit -m "tmp/sdd: verify staged analysis latency budgets"
 - Modify: `docs/double-sdd/plans/2026-08-31-two-stage-analysis-latency.md` checkbox state during execution
 - No unrelated source edits
 
-- [ ] **Step 1: Run the complete automated suite**
+- [x] **Step 1: Run the complete automated suite**
 
 Run: `$env:PYTHONPATH=(Get-Location).Path; .\.venv\Scripts\python.exe -m pytest -q`
 
 Expected: all tests PASS. Record any environment-only skips explicitly.
 
-- [ ] **Step 2: Run fresh single and six-run benchmarks**
+Final isolated coverage at `ed3c539`: 9,803 collected; 9,741 passed,
+61 failed, and 1 named-host performance case skipped. Every failure was
+reproduced on the recorded clean base `86c7e5f`; no feature-only regression
+remained. Isolation was required because two baseline coordinator failures
+retain background threads after their reports.
+
+- [x] **Step 2: Run fresh single and six-run benchmarks**
 
 Repeat Task 7 Steps 5–8 after the full suite, including the 8-second/48 kHz/two-channel p50/p95/max report; do not reuse earlier output.
 
-- [ ] **Step 3: Inspect compatibility artifacts**
+Fresh report: `build/task8-analysis-latency-final.json`, SHA-256
+`d737df32fd56439dff347b2b0dc00a68ce749214862ad359ad0f82f4b6ebecf3`.
+Decision-visible maxima were 143.4 ms (single), 443.3 ms (six-run overlap),
+and 153.5 ms (two-channel). Chart maxima were 1,672.4 ms, 4,823.4 ms,
+and 3,328.1 ms respectively, so the chart SLA is not accepted. The report is
+`SLA_NOT_EVALUATED` because live PLC and the production persistence endpoint
+were intentionally not exercised.
+
+- [x] **Step 3: Inspect compatibility artifacts**
 
 Load at least one pre-change artifact and one new enriched artifact through the production reader. Open history/detail/export paths in tests and compare required topology, chart fields, resolution, judgment, channel mapping, and exported WAV/result contents.
 
 Using the same real production WAV and the same synthetic near-threshold fixtures used for automatic analysis, run imported-audio analysis and manual rejudgment end to end. Assert their final compatible payloads, judgments, limit conclusions, chart resolution, history/detail access, and export behavior remain valid; record timings for information but do not apply the 0.5/1.5-second SLA to these two paths.
 
-- [ ] **Step 4: Inspect repository state**
+No pre-change on-disk artifact was available. Production-reader compatibility
+was therefore verified with the pre-change inline canonical payload and the new
+enriched artifact reference in a temporary prepared database/store. The
+history/detail/export/archive paths and 17 focused compatibility cases passed.
+The real WAV and synthetic near-threshold WAV preserved exact conclusions
+across automatic, imported, and manual rejudgment paths. Imported/manual
+continuous fields met Section 11.2 tolerances; optimized automatic output met
+the independent automatic oracle tolerances in the focused parity matrix.
+Informational imported/manual timings were 1,080.8/1,158.3 ms for the real WAV
+and 162.8/89.8 ms for the near-threshold WAV.
+
+- [x] **Step 4: Inspect repository state**
 
 Run:
 
@@ -603,7 +628,7 @@ git log --oneline --decorate -12
 
 Confirm no user-owned `main.spec` change or untracked local tooling was committed.
 
-- [ ] **Step 5: Commit final plan/README bookkeeping if changed**
+- [x] **Step 5: Commit final plan/README bookkeeping if changed**
 
 ```powershell
 git add README.md docs/double-sdd/plans/2026-08-31-two-stage-analysis-latency.md

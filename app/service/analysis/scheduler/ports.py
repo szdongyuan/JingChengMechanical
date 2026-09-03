@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Protocol
 
+from ..staged_execution import AnalysisEnrichmentReport
+
 from .models import (
     AnalysisError,
     AnalysisErrorCategory,
@@ -66,6 +68,10 @@ class AnalysisStartGate(Protocol):
 
 class OutcomeSink(Protocol):
     def __call__(self, outcome: AnalysisOutcome) -> None: ...
+
+
+class AnalysisEnrichmentSink(Protocol):
+    def __call__(self, report: AnalysisEnrichmentReport) -> None: ...
 
 
 class MonotonicClock(Protocol):

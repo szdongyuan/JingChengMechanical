@@ -486,3 +486,165 @@ def test_write_run_archive_rejects_target_source_alias_before_any_mutation(
     assert source.read_bytes() == source_before
     if target_before is not None:
         assert target.read_bytes() == target_before
+
+
+class _ExportWaitReader:
+    def __init__(self, record, pending):
+        self.record = record
+        self.pending = pending
+        self.pending_calls = []
+        self.read_calls = []
+
+    def pending_enrichment_run_ids(self, run_ids):
+        self.pending_calls.append(run_ids)
+        if isinstance(self.pending, Exception):
+            raise self.pending
+        return (run_ids[0],) if self.pending else ()
+
+    def read_many(self, run_ids):
+        self.read_calls.append(run_ids)
+        return (self.record,)
+
+
+class _ExportWaitClock:
+    def __init__(self):
+        self.value = 0.0
+        self.waits = []
+
+    def monotonic(self):
+        return self.value
+
+    def wait(self, seconds):
+        self.waits.append(seconds)
+        self.value += seconds
+
+
+def test_archive_export_waits_for_enrichment_then_reloads_full_facts(
+    tmp_path,
+    monkeypatch,
+):
+    import app.service.run_record_export.archive as archive_module
+
+    source = tmp_path / "wait-success.wav"
+    _write_pcm16_wav(source)
+    reader = _ExportWaitReader(_record(source), pending=True)
+    clock = _ExportWaitClock()
+
+    def release_enrichment(seconds):
+        clock.wait(seconds)
+        reader.pending = False
+
+    written = []
+    monkeypatch.setattr(
+        archive_module,
+        "write_run_archive",
+        lambda records, target_path, **kwargs: written.append(
+            (records, target_path, kwargs)
+        )
+        or target_path,
+    )
+    service = archive_module.RunArchiveService(
+        reader,
+        enrichment_wait_timeout_seconds=2.0,
+        monotonic=clock.monotonic,
+        wait=release_enrichment,
+        enrichment_poll_seconds=0.1,
+    )
+
+    result = service.export((RUN_ID,), str(tmp_path / "success.zip"))
+
+    assert result.endswith("success.zip")
+    assert reader.pending_calls == [(RUN_ID,), (RUN_ID,)]
+    assert reader.read_calls == [(RUN_ID,)]
+    assert len(written) == 1
+
+
+def test_archive_export_timeout_writes_no_partial_archive(tmp_path, monkeypatch):
+    import app.service.run_record_export.archive as archive_module
+
+    source = tmp_path / "wait-timeout.wav"
+    _write_pcm16_wav(source)
+    reader = _ExportWaitReader(_record(source), pending=True)
+    clock = _ExportWaitClock()
+    monkeypatch.setattr(
+        archive_module,
+        "write_run_archive",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("partial archive must not be written")
+        ),
+    )
+    target = tmp_path / "timeout.zip"
+    service = archive_module.RunArchiveService(
+        reader,
+        enrichment_wait_timeout_seconds=0.5,
+        monotonic=clock.monotonic,
+        wait=clock.wait,
+        enrichment_poll_seconds=0.2,
+    )
+
+    with pytest.raises(archive_module.RunArchiveError, match="artifact unavailable"):
+        service.export((RUN_ID,), str(target))
+
+    assert reader.read_calls == []
+    assert target.exists() is False
+    assert clock.value == pytest.approx(0.5)
+
+
+def test_archive_export_permanent_artifact_failure_uses_existing_error(
+    tmp_path,
+    monkeypatch,
+):
+    import app.service.run_record_export.archive as archive_module
+
+    source = tmp_path / "wait-failed.wav"
+    _write_pcm16_wav(source)
+    reader = _ExportWaitReader(
+        _record(source),
+        pending=RuntimeError("artifact reference is corrupt"),
+    )
+    clock = _ExportWaitClock()
+    monkeypatch.setattr(
+        archive_module,
+        "write_run_archive",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("partial archive must not be written")
+        ),
+    )
+    service = archive_module.RunArchiveService(
+        reader,
+        monotonic=clock.monotonic,
+        wait=clock.wait,
+    )
+
+    with pytest.raises(archive_module.RunArchiveError, match="artifact unavailable"):
+        service.export((RUN_ID,), str(tmp_path / "failed.zip"))
+
+    assert reader.read_calls == []
+    assert clock.waits == []
+
+
+def test_archive_export_already_full_does_not_wait(tmp_path, monkeypatch):
+    import app.service.run_record_export.archive as archive_module
+
+    source = tmp_path / "already-full.wav"
+    _write_pcm16_wav(source)
+    reader = _ExportWaitReader(_record(source), pending=False)
+    clock = _ExportWaitClock()
+    monkeypatch.setattr(
+        archive_module,
+        "write_run_archive",
+        lambda records, target_path, **_kwargs: target_path,
+    )
+    service = archive_module.RunArchiveService(
+        reader,
+        monotonic=clock.monotonic,
+        wait=lambda _seconds: (_ for _ in ()).throw(
+            AssertionError("full result must not wait")
+        ),
+    )
+
+    service.export((RUN_ID,), str(tmp_path / "full.zip"))
+
+    assert reader.pending_calls == [(RUN_ID,)]
+    assert reader.read_calls == [(RUN_ID,)]
+    assert clock.waits == []

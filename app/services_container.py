@@ -43,6 +43,7 @@ from app.service.multi_run_coordinator_mvp.contracts import (
 from app.service.multi_run_integration.captured_start_dispatcher import (
     CapturedStartDispatcher,
 )
+from app.service.multi_run_integration.plc_dispatch import PlcDispatchPorts
 from app.service.multi_run_integration.shutdown import (
     ApplicationShutdownOwner,
     ApplicationShutdownResources,
@@ -193,6 +194,9 @@ class _PostDurableHistorySink:
         ):
             return
         self._delivery.publish(event)
+
+    def publish_enrichment(self, event: object) -> None:
+        self._primary.publish_enrichment(event)
 
 
 def _invoke_plc_thread_slot(
@@ -529,13 +533,14 @@ class ServiceContainer:
                     settlement.reason or "run persistence startup did not settle"
                 )
                 return
-        self.run_export_reader = RunExportReader(
-            runtime
-        )
-        self.run_archive_service = RunArchiveService(self.run_export_reader)
         self.analysis_result_artifact_store = AnalysisResultArtifactStore(
             runtime.path.parent / "run_results"
         )
+        self.run_export_reader = RunExportReader(
+            runtime,
+            result_artifact_store=self.analysis_result_artifact_store,
+        )
+        self.run_archive_service = RunArchiveService(self.run_export_reader)
         self.run_data_management_service = RunDataManagementService(
             runtime,
             result_artifact_store=self.analysis_result_artifact_store,
@@ -568,11 +573,14 @@ class ServiceContainer:
         )
         self.factory_selection_settings = FactorySelectionSettings()
 
-        self.plc_dispatch_ports = None
+        self.plc_dispatch_ports = PlcDispatchPorts(
+            plc_services=self.plc_services,
+            plc_threads=self.plc_threads,
+        )
         report_attempt = self._dispatch_plc_attempt_report
         self._plc_report_attempt = report_attempt
         self.plc_result_sequencer = PlcResultSequencer(
-            write_result=self.bus.write_test_result_sign.emit,
+            write_result=self.plc_dispatch_ports.write_result,
             report_attempt=report_attempt,
         )
         builder = self.production_composition_builder

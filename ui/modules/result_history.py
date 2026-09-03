@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from math import isfinite
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QEvent, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
@@ -43,6 +44,7 @@ class ResultHistoryModule(QWidget):
 
     run_selected = pyqtSignal(str)
     follow_latest_requested = pyqtSignal(bool)
+    decisionPainted = pyqtSignal(object, object)
 
     def __init__(
         self,
@@ -65,6 +67,16 @@ class ResultHistoryModule(QWidget):
         self._rendered_snapshot: ResultHistorySnapshot | None = None
         self._manual_judgment_widget = manual_judgment_widget
         self._manual_judgment_card: ResultHistoryCard | None = None
+        self._pending_paint_decision: tuple[str, str, str, int] | None = None
+        self._paint_ack_scheduled = False
+        self._last_painted_decision_by_run: dict[
+            str, tuple[str, str, str, int]
+        ] = {}
+        self._paint_ack_timer = QTimer(self)
+        self._paint_ack_timer.setSingleShot(True)
+        self._paint_ack_timer.timeout.connect(
+            self._finish_pending_decision_paint
+        )
 
         self.setObjectName("result_history_module")
         self.setAccessibleName("结果历史摘要")
@@ -175,6 +187,93 @@ class ResultHistoryModule(QWidget):
         finally:
             self.setUpdatesEnabled(True)
             self.update()
+
+    def project_decision_revision(
+        self,
+        run_id: str,
+        attempt_id: str,
+        terminal_revision: str,
+        history_revision: int,
+    ) -> bool:
+        decision = (
+            run_id,
+            attempt_id,
+            terminal_revision,
+            history_revision,
+        )
+        if (
+            not self._decision_projection_is_current(decision)
+            or decision == self._pending_paint_decision
+            or decision == self._last_painted_decision_by_run.get(run_id)
+        ):
+            return False
+        entry = self._card_entries[run_id]
+        entry[1].installEventFilter(self)
+        self._pending_paint_decision = decision
+        entry[1].update()
+        return True
+
+    def eventFilter(self, watched, event) -> bool:
+        decision = self._pending_paint_decision
+        if (
+            decision is not None
+            and event.type() is QEvent.Type.Paint
+            and self._card_entries.get(decision[0], (None, None))[1]
+            is watched
+            and not self._paint_ack_scheduled
+        ):
+            self._paint_ack_scheduled = True
+            self._paint_ack_timer.setProperty("expectedDecision", decision)
+            self._paint_ack_timer.start(0)
+        return super().eventFilter(watched, event)
+
+    def _finish_pending_decision_paint(self) -> None:
+        self._paint_ack_scheduled = False
+        expected = self._paint_ack_timer.property("expectedDecision")
+        if (
+            type(expected) is not tuple
+            or self._pending_paint_decision != expected
+            or not self._decision_projection_is_current(expected)
+        ):
+            return
+        self._pending_paint_decision = None
+        self._last_painted_decision_by_run[expected[0]] = expected
+        self.decisionPainted.emit(expected, time.perf_counter_ns())
+
+    def _decision_projection_is_current(
+        self,
+        decision: tuple[str, str, str, int],
+    ) -> bool:
+        run_id, attempt_id, terminal_revision, history_revision = decision
+        snapshot = self._rendered_snapshot
+        entry = self._card_entries.get(run_id)
+        if (
+            snapshot is None
+            or snapshot.selected_run_id != run_id
+            or entry is None
+            or entry[0].revision != history_revision
+            or entry[0].phase is not ResultPhase.TERMINAL
+        ):
+            return False
+        payload = (
+            self._payload_provider(run_id)
+            if self._payload_provider is not None
+            else None
+        )
+        if type(payload) is not ReviewDisplayPayload:
+            return False
+        review = payload.review
+        identity = (
+            review.get("_projection_identity")
+            if type(review) is dict
+            else None
+        )
+        return (
+            type(identity) is dict
+            and identity.get("attempt_id") == attempt_id
+            and identity.get("terminal_revision") == terminal_revision
+            and identity.get("history_revision") == history_revision
+        )
 
     def preview_manual_judgment(
         self,
@@ -288,6 +387,7 @@ class ResultHistoryModule(QWidget):
         self._set_manual_judgment_card(manual_judgment_card)
         self._terminal_empty.setVisible(not snapshot.terminal_cards)
         self._rendered_snapshot = snapshot
+        self._discard_stale_decision_paint_state()
         self._restore_scroll_value(scroll_value)
         if reveal_selected and snapshot.selected_run_id is not None:
             QTimer.singleShot(
@@ -296,6 +396,21 @@ class ResultHistoryModule(QWidget):
                     run_id
                 ),
             )
+
+    def _discard_stale_decision_paint_state(self) -> None:
+        pending = self._pending_paint_decision
+        if pending is not None and not self._decision_projection_is_current(
+            pending
+        ):
+            self._paint_ack_timer.stop()
+            self._paint_ack_scheduled = False
+            self._pending_paint_decision = None
+        retained_run_ids = self._card_entries.keys()
+        self._last_painted_decision_by_run = {
+            run_id: decision
+            for run_id, decision in self._last_painted_decision_by_run.items()
+            if run_id in retained_run_ids
+        }
 
     def _set_manual_judgment_card(
         self,

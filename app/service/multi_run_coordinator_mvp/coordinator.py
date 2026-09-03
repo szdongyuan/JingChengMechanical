@@ -27,6 +27,7 @@ from app.service.run_persistence import (
     BridgeSubmissionStatus,
     BridgeTerminalReport,
     BridgeTerminalStatus,
+    EnrichmentCommittedEvent,
     InitialAnalysisRequest,
     Judgment as BridgeJudgment,
     ReanalysisRequest as BridgeReanalysisRequest,
@@ -92,6 +93,7 @@ from .contracts import (
     ResidentCancelResult,
     ResidentCancelStatus,
     ResultControlFacts,
+    ResultEnrichmentProjection,
     ResultOperationPhase,
     ResultProjection,
     ResultProjectionPhase,
@@ -307,6 +309,16 @@ class _ResultReportViolationDiagnostic:
     attempt_id: str | None
 
 
+@dataclass(slots=True)
+class _DecisionProjectionState:
+    run_id: str
+    attempt_id: str
+    terminal_revision: str
+    history_revision: int
+    conclusion: TerminalConclusion
+    enriched: bool = False
+
+
 class MultiRunCoordinator:
     def __init__(
         self,
@@ -358,6 +370,48 @@ class MultiRunCoordinator:
         self._child_cancel_actions: set[ExternalAction] = set()
         self._child_cancel_action_durable: dict[ExternalAction, bool] = {}
         self._result_history_actions: set[ExternalAction] = set()
+        self._decision_projections: dict[str, _DecisionProjectionState] = {}
+
+    def project_enrichment(
+        self,
+        event: EnrichmentCommittedEvent,
+    ) -> ResultEnrichmentProjection | None:
+        """Fence one durable Enrichment to its committed Decision projection."""
+
+        if type(event) is not EnrichmentCommittedEvent:
+            return None
+        identity = event.identity
+        with self._lock:
+            state = self._decision_projections.get(identity.run_id)
+            if (
+                state is None
+                or state.enriched
+                or state.attempt_id != identity.analysis_attempt_id
+                or state.terminal_revision != event.terminal_revision
+                or (
+                    state.conclusion is TerminalConclusion.OK
+                    and event.judgment is not BridgeJudgment.PASS
+                )
+                or (
+                    state.conclusion is TerminalConclusion.NG
+                    and event.judgment is not BridgeJudgment.FAIL
+                )
+            ):
+                return None
+            state.enriched = True
+            history_revision = state.history_revision
+        return ResultEnrichmentProjection(
+            run_id=identity.run_id,
+            attempt_id=identity.analysis_attempt_id,
+            terminal_revision=event.terminal_revision,
+            expected_revision=history_revision,
+            result_payload=FrozenPayload(
+                value_id=(
+                    f"bridge-result:{identity.analysis_attempt_id}"
+                ),
+                canonical_bytes=event.result_payload_json.encode("utf-8"),
+            ),
+        )
 
     def snapshot(self) -> CoordinatorSnapshot:
         with self._lock:
@@ -459,6 +513,21 @@ class MultiRunCoordinator:
             self._request_stop_for_operation(context)
 
         with self._lock:
+            if any(
+                isinstance(context, _PublishingContext)
+                and context.plc_unsettled
+                for context in self._runs.values()
+            ):
+                self._restart_required = True
+                self._lifecycle = CoordinatorLifecycle.CLOSED
+                self._promote_stop_errors_locked()
+                self._condition.notify_all()
+                return self._stop_report_locked(
+                    StopStatus.CLOSED,
+                    canceled_runs,
+                    canceled_reanalysis,
+                    timed_out=False,
+                )
             while self._stop_has_blockers_locked():
                 try:
                     remaining = max(
@@ -1931,6 +2000,7 @@ class MultiRunCoordinator:
         if not isinstance(notice, HistoryEvictionNotice):
             return False
         with self._lock:
+            self._decision_projections.pop(notice.run_id, None)
             context = self._result_operations.get(notice.run_id)
             if context is None or context.history_suppressed:
                 return False
@@ -2740,6 +2810,9 @@ class MultiRunCoordinator:
                     value_id=f"bridge-result:{report.analysis_attempt_id}",
                     canonical_bytes=report.result_payload_json.encode("utf-8"),
                 ),
+                terminal_revision=hashlib.sha256(
+                    report.result_payload_json.encode("utf-8")
+                ).hexdigest(),
             )
             return HistoryFactKind.REANALYSIS_COMPLETED, projection
         if report.attempt_state is BridgeAttemptState.NO_RESULT:
@@ -2851,6 +2924,7 @@ class MultiRunCoordinator:
         fact: HistoryProjectionFact,
         stage: str,
     ) -> None:
+        decision_state = None
         with self._lock:
             if (
                 not self._result_operation_is_current(context)
@@ -2858,6 +2932,10 @@ class MultiRunCoordinator:
                 or context.report_channel_invalid
             ):
                 return
+            if fact.kind is HistoryFactKind.REANALYSIS_STARTED:
+                self._decision_projections.pop(context.run_id, None)
+            elif fact.kind is HistoryFactKind.TERMINAL_RESULT_REPLACED:
+                decision_state = self._decision_projections.get(context.run_id)
             history_action = ExternalAction(
                 kind=(
                     ExternalActionKind.ANALYZING_HISTORY
@@ -2887,6 +2965,11 @@ class MultiRunCoordinator:
                     or context.report_channel_invalid
                 ):
                     return
+                if fact.kind is HistoryFactKind.REANALYSIS_COMPLETED:
+                    self._remember_decision_projection_locked(
+                        fact,
+                        expected_history_revision=event.proposed_revision,
+                    )
             try:
                 self._history_sink.publish(event)
                 sink_error = None
@@ -2894,6 +2977,13 @@ class MultiRunCoordinator:
                 sink_error = exc
             with self._lock:
                 context.last_published_revision = event.proposed_revision
+                if (
+                    sink_error is None
+                    and decision_state is not None
+                    and self._decision_projections.get(context.run_id)
+                    is decision_state
+                ):
+                    decision_state.history_revision = event.proposed_revision
             if sink_error is not None:
                 self._diagnose_result_operation(
                     f"{stage} sink",
@@ -4280,6 +4370,15 @@ class MultiRunCoordinator:
             if history_allowed
             else None
         )
+        if history_fact is not None:
+            self._remember_decision_projection_locked(
+                history_fact,
+                expected_history_revision=(
+                    1
+                    if history_fact.expected_revision is ABSENT
+                    else history_fact.expected_revision + 1
+                ),
+            )
         plc_in_flight = plc_settlement is not _PlcSettlementKind.NONE
         publication = _PublishingContext(
             run_id=context.run_id,
@@ -4317,7 +4416,46 @@ class MultiRunCoordinator:
                 reason=fact.reason,
                 history_labels=fact.history_labels,
                 result_payload=getattr(fact, "result_payload", None),
+                terminal_revision=(
+                    MultiRunCoordinator._result_payload_revision(
+                        fact.result_payload
+                    )
+                    if (
+                        isinstance(fact, TerminalFact)
+                        and fact.attempt_id is not None
+                        and fact.result_payload is not None
+                        and fact.conclusion
+                        in {TerminalConclusion.OK, TerminalConclusion.NG}
+                    )
+                    else None
+                ),
             ),
+        )
+
+    @staticmethod
+    def _result_payload_revision(payload: FrozenPayload) -> str:
+        return hashlib.sha256(payload.canonical_bytes).hexdigest()
+
+    def _remember_decision_projection_locked(
+        self,
+        fact: HistoryProjectionFact,
+        *,
+        expected_history_revision: int,
+    ) -> None:
+        projection = fact.projection
+        if (
+            projection.terminal_revision is None
+            or fact.operation_id is None
+            or projection.conclusion
+            not in {TerminalConclusion.OK, TerminalConclusion.NG}
+        ):
+            return
+        self._decision_projections[fact.run_id] = _DecisionProjectionState(
+            run_id=fact.run_id,
+            attempt_id=fact.operation_id,
+            terminal_revision=projection.terminal_revision,
+            history_revision=expected_history_revision,
+            conclusion=projection.conclusion,
         )
 
     def _publish_terminal_history(
@@ -4632,6 +4770,9 @@ class MultiRunCoordinator:
                 context.plc_in_flight = False
             if error is not None:
                 context.errors.append(self._bounded(str(error)))
+                if part == "plc":
+                    context.plc_unsettled = True
+                    self._restart_required = True
             self._condition.notify_all()
         if error is not None:
             self._diagnose(

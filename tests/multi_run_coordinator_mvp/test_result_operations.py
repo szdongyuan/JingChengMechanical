@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import inspect
 import math
 from threading import Event, Thread
@@ -8,7 +9,7 @@ from threading import Event, Thread
 import pytest
 
 import app.service.multi_run_coordinator_mvp as package
-from app.service.analysis.scheduler import AnalysisCancelOrigin
+from app.service.analysis.scheduler import AnalysisBundleIdentity, AnalysisCancelOrigin
 from app.service.run_persistence import (
     AttemptKind,
     AttemptState,
@@ -17,6 +18,7 @@ from app.service.run_persistence import (
     BridgeSubmissionStatus,
     BridgeTerminalReport,
     BridgeTerminalStatus,
+    EnrichmentCommittedEvent,
     Judgment,
     TransactionResult,
     TransactionState,
@@ -28,8 +30,11 @@ from ._support import (
     RUN_IDS,
     SAVE_JOB_IDS,
     Harness,
+    captured_request,
+    completed_capture,
     payload,
     run_config_payload,
+    saved_outcome,
 )
 
 
@@ -205,6 +210,79 @@ def reanalysis_report(
         terminal_at="2026-07-27T09:00:00.000000Z",
         persistence_result=TransactionResult(TransactionState.COMMITTED, True),
         restart_required=False,
+    )
+
+
+def drive_pending_enrichment_decision(harness: Harness):
+    decision_json = '{"judgment":"PASS","result":{"chart_payload":{}}}'
+    coordinator = harness.coordinator()
+    request = captured_request()
+    coordinator.start_captured(request)
+    harness.resident.complete(
+        completed_capture(harness.resident.register_calls[0])
+    )
+    save_request, save_sink = harness.save_dispatcher.calls[0]
+    save_sink(saved_outcome(save_request))
+    harness.scheduler.complete_report(
+        BridgeTerminalReport(
+            status=BridgeTerminalStatus.COMMITTED,
+            run_id=request.run_id,
+            analysis_attempt_id=ATTEMPT_IDS[0],
+            attempt_kind=AttemptKind.INITIAL,
+            attempt_state=AttemptState.SUCCEEDED,
+            judgment=Judgment.PASS,
+            result_payload_json=decision_json,
+            code="ANALYSIS_SUCCEEDED",
+            summary=None,
+            terminal_at="2026-07-27T09:00:00.000000Z",
+            persistence_result=TransactionResult(
+                TransactionState.COMMITTED,
+                True,
+            ),
+            restart_required=False,
+        )
+    )
+    terminal_event = next(
+        event
+        for event in reversed(harness.history.calls)
+        if event.kind is package.HistoryFactKind.RUN_TERMINATED
+    )
+    terminal_revision = hashlib.sha256(
+        decision_json.encode("utf-8")
+    ).hexdigest()
+    harness.persistence.facts_by_run[request.run_id] = dataclasses.replace(
+        result_facts(
+            run_id=request.run_id,
+            revision=terminal_event.proposed_revision,
+            fault_types=("异响",),
+        ),
+        current_projection=terminal_event.projection,
+    )
+    return coordinator, request.run_id, terminal_event, terminal_revision
+
+
+def pending_enrichment_event(
+    run_id: str,
+    terminal_revision: str,
+) -> EnrichmentCommittedEvent:
+    return EnrichmentCommittedEvent(
+        identity=AnalysisBundleIdentity(
+            run_id=run_id,
+            analysis_attempt_id=ATTEMPT_IDS[0],
+            content_revision="audio-content-r1",
+            algorithm_revision="algorithm-r1",
+            config_identity="config-r1",
+            calibration_identity="calibration-r1",
+            channel_mapping_identity="channel-map-r1",
+            window_start_seconds=0.0,
+            window_end_seconds=1.0,
+        ),
+        judgment=Judgment.PASS,
+        result_payload_json=(
+            '{"judgment":"PASS","result":{"chart_payload":{"0":{}}}}'
+        ),
+        terminal_revision=terminal_revision,
+        committed_at="2026-07-27T09:00:00.100000Z",
     )
 
 
@@ -599,6 +677,148 @@ def test_manual_committed_replacement_uses_ui_revision_once_and_never_plc_or_ana
     assert harness.plc.register_calls == []
     assert harness.plc.publish_calls == []
     assert coordinator.snapshot().accepted_active_run_ids == ()
+
+
+def test_manual_history_block_preserves_enrichment_at_original_decision_revision():
+    harness = Harness()
+    coordinator, run_id, terminal_event, terminal_revision = (
+        drive_pending_enrichment_decision(harness)
+    )
+    original_revision = terminal_event.proposed_revision
+    history_count = len(harness.history.calls)
+    initial_analysis_count = len(harness.scheduler.initial_calls)
+    plc_register_count = len(harness.plc.register_calls)
+    plc_publish_count = len(harness.plc.publish_calls)
+    entered = Event()
+    release = Event()
+    hook = harness.history.hooks[
+        package.HistoryFactKind.TERMINAL_RESULT_REPLACED
+    ]
+    hook.entered = entered
+    hook.release = release
+    results = []
+    worker = Thread(
+        target=lambda: results.append(
+            coordinator.apply_manual(
+                manual_request(
+                    run_id=run_id,
+                    revision=original_revision,
+                    fault_type="异响",
+                )
+            )
+        )
+    )
+
+    worker.start()
+    assert entered.wait(2)
+    projected = coordinator.project_enrichment(
+        pending_enrichment_event(run_id, terminal_revision)
+    )
+
+    assert type(projected) is package.ResultEnrichmentProjection
+    assert projected.expected_revision == original_revision
+    assert len(harness.persistence.manual_calls) == 1
+    assert len(harness.history.calls) == history_count + 1
+    assert len(harness.scheduler.initial_calls) == initial_analysis_count
+    assert len(harness.scheduler.reanalysis_calls) == 0
+    assert len(harness.plc.register_calls) == plc_register_count
+    assert len(harness.plc.publish_calls) == plc_publish_count
+    release.set()
+    worker.join(2)
+    assert not worker.is_alive()
+    assert results[0].status is package.OperationStatus.COMPLETED
+    assert coordinator.project_enrichment(
+        pending_enrichment_event(run_id, terminal_revision)
+    ) is None
+
+
+def test_manual_history_enqueue_advances_enrichment_to_exact_new_revision():
+    harness = Harness()
+    coordinator, run_id, terminal_event, terminal_revision = (
+        drive_pending_enrichment_decision(harness)
+    )
+    entered = Event()
+    release = Event()
+    hook = harness.history.hooks[
+        package.HistoryFactKind.TERMINAL_RESULT_REPLACED
+    ]
+    hook.entered = entered
+    hook.release = release
+    results = []
+    worker = Thread(
+        target=lambda: results.append(
+            coordinator.apply_manual(
+                manual_request(
+                    run_id=run_id,
+                    revision=terminal_event.proposed_revision,
+                    fault_type="异响",
+                )
+            )
+        )
+    )
+
+    worker.start()
+    assert entered.wait(2)
+    manual_event = harness.history.calls[-1]
+    release.set()
+    worker.join(2)
+    assert not worker.is_alive()
+    projected = coordinator.project_enrichment(
+        pending_enrichment_event(run_id, terminal_revision)
+    )
+
+    assert results[0].status is package.OperationStatus.COMPLETED
+    assert type(projected) is package.ResultEnrichmentProjection
+    assert projected.expected_revision == manual_event.proposed_revision
+    assert manual_event.proposed_revision == terminal_event.proposed_revision + 1
+    assert coordinator.project_enrichment(
+        pending_enrichment_event(run_id, terminal_revision)
+    ) is None
+
+
+def test_reanalysis_start_and_cancel_do_not_restore_old_enrichment_ownership():
+    harness = Harness()
+    coordinator, run_id, terminal_event, terminal_revision = (
+        drive_pending_enrichment_decision(harness)
+    )
+    harness.scheduler.bridge_results.append(
+        harness.scheduler.accepted_bridge_result(run_id, ATTEMPT_IDS[1])
+    )
+
+    submitted = coordinator.start_reanalysis(
+        reanalysis_request(
+            run_id=run_id,
+            revision=terminal_event.proposed_revision,
+        )
+    )
+    coordinator.cancel_reanalysis(
+        package.ReanalysisCancelRequest(
+            run_id=run_id,
+            attempt_id=submitted.attempt_id,
+            expected_revision=terminal_event.proposed_revision + 1,
+        )
+    )
+    harness.scheduler.complete_report(
+        reanalysis_report(
+            run_id=run_id,
+            attempt_id=ATTEMPT_IDS[1],
+            state=AttemptState.CANCELED,
+            judgment=None,
+            result_json=None,
+            code="REANALYSIS_CANCELED",
+        )
+    )
+
+    assert submitted.status is package.OperationStatus.SUBMITTED
+    assert [
+        event.kind for event in harness.history.calls[-2:]
+    ] == [
+        package.HistoryFactKind.REANALYSIS_STARTED,
+        package.HistoryFactKind.REANALYSIS_CANCELLED,
+    ]
+    assert coordinator.project_enrichment(
+        pending_enrichment_event(run_id, terminal_revision)
+    ) is None
 
 
 def test_manual_history_exception_is_diagnostic_only_after_durable_commit():

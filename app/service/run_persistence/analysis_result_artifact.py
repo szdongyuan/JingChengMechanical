@@ -32,10 +32,17 @@ class PublishedAnalysisResult:
     lease_id: str
 
 
+@dataclass(frozen=True, slots=True)
+class AnalysisResultReadLease:
+    path: Path
+    lease_id: str
+
+
 @dataclass(slots=True)
 class _PublicationState:
     inflight: int
     retained: bool
+    retire_pending: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,6 +135,12 @@ class AnalysisResultArtifactStore:
         self._lock = threading.RLock()
         self._publication_states: dict[Path, _PublicationState] = {}
         self._publication_leases: dict[str, Path] = {}
+        self._read_leases: dict[
+            str,
+            tuple[Path, _ArtifactReference],
+        ] = {}
+        self._read_counts: dict[Path, int] = {}
+        self._pending_deletes: set[Path] = set()
 
     @property
     def root(self) -> Path:
@@ -178,6 +191,18 @@ class AnalysisResultArtifactStore:
             type(value) is dict
             and value.get("schema") == _REFERENCE_SCHEMA
         )
+
+    @staticmethod
+    def payload_revision(payload_json: str) -> str:
+        """Return the artifact content revision for one valid JSON payload."""
+
+        return hashlib.sha256(_validate_payload_json(payload_json)).hexdigest()
+
+    @staticmethod
+    def reference_payload_revision(reference_json: str) -> str:
+        """Read the immutable payload revision carried by an artifact reference."""
+
+        return AnalysisResultArtifactStore._decode_reference(reference_json).sha256
 
     def publish(
         self,
@@ -278,7 +303,9 @@ class AnalysisResultArtifactStore:
         if state is None:
             state = _PublicationState(
                 inflight=0,
-                retained=not created,
+                retained=(
+                    not created and final_path not in self._pending_deletes
+                ),
             )
             self._publication_states[final_path] = state
         state.inflight += 1
@@ -317,13 +344,15 @@ class AnalysisResultArtifactStore:
                 )
             state.inflight -= 1
             state.retained = state.retained or retain
+            if retain:
+                state.retire_pending = False
+                self._pending_deletes.discard(path)
             if state.inflight != 0:
                 return
-            try:
-                if not state.retained:
-                    path.unlink(missing_ok=True)
-            finally:
-                self._publication_states.pop(path, None)
+            if state.retire_pending or not state.retained:
+                self._pending_deletes.add(path)
+            self._publication_states.pop(path, None)
+            self._delete_pending_if_unleased_locked(path)
 
     def _fsync_root_best_effort(self) -> None:
         if os.name == "nt":
@@ -344,30 +373,51 @@ class AnalysisResultArtifactStore:
         *,
         expected_judgment: str | None = None,
     ) -> str:
-        with self._lock:
-            return self._load_reference_locked(
-                reference_json,
-                expected_judgment=expected_judgment,
-            )
+        lease = self.acquire_read_lease(
+            reference_json,
+            expected_judgment=expected_judgment,
+        )
+        try:
+            return self.load_read_lease(lease)
+        finally:
+            self.release_read_lease(lease)
 
-    def _load_reference_locked(
+    def acquire_read_lease(
         self,
         reference_json: str,
         *,
-        expected_judgment: str | None,
-    ) -> str:
-        reference = self._decode_reference(reference_json)
-        if (
-            expected_judgment is not None
-            and reference.judgment != expected_judgment
-        ):
-            raise AnalysisResultArtifactError(
-                "analysis result artifact judgment does not match the database"
-            )
-        raw = self._verify_path(
-            final_path=self._path_for(reference),
-            reference=reference,
-        )
+        expected_judgment: str | None = None,
+    ) -> AnalysisResultReadLease:
+        with self._lock:
+            reference = self._decode_reference(reference_json)
+            if (
+                expected_judgment is not None
+                and reference.judgment != expected_judgment
+            ):
+                raise AnalysisResultArtifactError(
+                    "analysis result artifact judgment does not match the database"
+                )
+            path = self._path_for(reference)
+            if not path.is_file():
+                raise AnalysisResultArtifactError(
+                    f"analysis result artifact is unavailable: {path}"
+                )
+            lease_id = uuid4().hex
+            self._read_leases[lease_id] = (path, reference)
+            self._read_counts[path] = self._read_counts.get(path, 0) + 1
+            return AnalysisResultReadLease(path=path, lease_id=lease_id)
+
+    def load_read_lease(self, lease: AnalysisResultReadLease) -> str:
+        if type(lease) is not AnalysisResultReadLease:
+            raise TypeError("lease must be an exact AnalysisResultReadLease")
+        with self._lock:
+            leased = self._read_leases.get(lease.lease_id)
+            if leased is None or leased[0] != lease.path:
+                raise AnalysisResultArtifactError(
+                    "analysis result read lease is invalid"
+                )
+            path, reference = leased
+        raw = self._verify_path(final_path=path, reference=reference)
         try:
             payload_json = raw.decode("utf-8")
             json.loads(payload_json, parse_constant=_reject_json_constant)
@@ -377,6 +427,27 @@ class AnalysisResultArtifactStore:
             ) from None
         return payload_json
 
+    def release_read_lease(self, lease: AnalysisResultReadLease) -> None:
+        if type(lease) is not AnalysisResultReadLease:
+            raise TypeError("lease must be an exact AnalysisResultReadLease")
+        with self._lock:
+            leased = self._read_leases.pop(lease.lease_id, None)
+            if leased is None or leased[0] != lease.path:
+                raise AnalysisResultArtifactError(
+                    "analysis result read lease is invalid"
+                )
+            path = leased[0]
+            count = self._read_counts.get(path, 0)
+            if count <= 0:
+                raise AnalysisResultArtifactError(
+                    "analysis result reader state is invalid"
+                )
+            if count == 1:
+                self._read_counts.pop(path, None)
+            else:
+                self._read_counts[path] = count - 1
+            self._delete_pending_if_unleased_locked(path)
+
     def path_for_reference(self, reference_json: str) -> Path:
         return self._path_for(self._decode_reference(reference_json))
 
@@ -385,8 +456,25 @@ class AnalysisResultArtifactStore:
             if not self.is_reference(reference_json):
                 return None
             path = self.path_for_reference(reference_json)
-            path.unlink(missing_ok=True)
+            self._pending_deletes.add(path)
+            state = self._publication_states.get(path)
+            if state is not None and state.inflight:
+                state.retire_pending = True
+            self._delete_pending_if_unleased_locked(path)
             return path
+
+    def _delete_pending_if_unleased_locked(self, path: Path) -> None:
+        if path not in self._pending_deletes:
+            return
+        state = self._publication_states.get(path)
+        if self._read_counts.get(path, 0) or (
+            state is not None and state.inflight
+        ):
+            return
+        try:
+            path.unlink(missing_ok=True)
+        finally:
+            self._pending_deletes.discard(path)
 
     def _verify_path(
         self,
@@ -520,6 +608,7 @@ class AnalysisResultArtifactStore:
 
 
 __all__ = [
+    "AnalysisResultReadLease",
     "AnalysisResultArtifactError",
     "AnalysisResultArtifactStore",
     "PublishedAnalysisResult",

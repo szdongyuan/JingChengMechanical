@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import sqlite3
 import tempfile
+import time
 import wave
 import zipfile
 
@@ -596,8 +597,63 @@ def write_run_archive(
 class RunArchiveService:
     """Read one durable selection and publish it through the pure kernel."""
 
-    def __init__(self, reader: RunExportReaderPort) -> None:
+    def __init__(
+        self,
+        reader: RunExportReaderPort,
+        *,
+        enrichment_wait_timeout_seconds: float = 2.0,
+        enrichment_poll_seconds: float = 0.05,
+        monotonic: Callable[[], float] = time.monotonic,
+        wait: Callable[[float], None] = time.sleep,
+    ) -> None:
+        for value, name in (
+            (enrichment_wait_timeout_seconds, "enrichment_wait_timeout_seconds"),
+            (enrichment_poll_seconds, "enrichment_poll_seconds"),
+        ):
+            if (
+                type(value) is not float
+                or not math.isfinite(value)
+                or value <= 0.0
+            ):
+                raise ValueError(f"{name} must be a finite positive float")
+        if not callable(monotonic) or not callable(wait):
+            raise TypeError("monotonic and wait must be callable")
         self._reader = reader
+        self._enrichment_wait_timeout_seconds = enrichment_wait_timeout_seconds
+        self._enrichment_poll_seconds = enrichment_poll_seconds
+        self._monotonic = monotonic
+        self._wait = wait
+
+    def _await_enrichment(self, run_ids: tuple[str, ...]) -> None:
+        pending_reader = getattr(
+            self._reader,
+            "pending_enrichment_run_ids",
+            None,
+        )
+        if not callable(pending_reader):
+            return
+        try:
+            deadline = (
+                float(self._monotonic())
+                + self._enrichment_wait_timeout_seconds
+            )
+            while True:
+                pending = tuple(pending_reader(run_ids))
+                if not pending:
+                    return
+                remaining = deadline - float(self._monotonic())
+                if remaining <= 0.0:
+                    raise RunArchiveError(
+                        "analysis result artifact unavailable before export timeout"
+                    )
+                self._wait(min(self._enrichment_poll_seconds, remaining))
+        except RunArchiveError:
+            raise
+        except Exception as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            raise RunArchiveError(
+                f"analysis result artifact unavailable: {detail}"
+            ) from None
 
     def inspect_selection(
         self,
@@ -632,6 +688,7 @@ class RunArchiveService:
         *,
         progress_callback: ProgressCallback | None = None,
     ) -> str:
+        self._await_enrichment(run_ids)
         _emit_progress(
             progress_callback,
             0,
