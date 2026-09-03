@@ -569,8 +569,14 @@ def test_dashboard_acknowledges_only_after_visible_history_summary_paints(qapp):
         QWidget,
         "result_history_card_summary_overall",
     )
+    caption = history.findChild(
+        QWidget,
+        "result_history_card_summary_caption",
+    )
     assert summary is not None
-    assert summary.text() == "结果摘要：通过"
+    assert caption is not None
+    assert summary.text() == "通过"
+    assert caption.text() == "结果摘要"
     assert history_painted == []
     assert dashboard_painted == []
     assert history.project_decision_revision(

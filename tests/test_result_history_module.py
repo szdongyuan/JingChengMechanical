@@ -15,6 +15,7 @@ from PyQt6.QtCore import (
     QEvent,
     QObject,
     QPoint,
+    QRect,
     QThread,
     Qt,
     pyqtSignal,
@@ -362,8 +363,9 @@ def test_removed_headings_are_not_visible_but_card_overall_remains(qapp):
     assert "结果历史" not in visible_labels
     assert "自动跟随最新" not in visible_labels
     assert "已解锁" not in visible_labels
-    assert visible_labels.count("进行中") == 0
-    assert "结果摘要：进行中" in visible_labels
+    assert visible_labels.count("结果摘要") == 1
+    assert visible_labels.count("进行中") == 1
+    assert "结果摘要：进行中" not in visible_labels
     assert lock.text() == "🔒"
 
 
@@ -419,6 +421,93 @@ def test_six_terminal_cards_are_scrollable(qapp):
     scroll = _find(module, QScrollArea, "result_history_scroll")
     assert len(module.findChildren(ResultHistoryCard)) == 6
     assert scroll.verticalScrollBar().maximum() > 0
+
+
+def test_reused_long_result_card_refits_when_scrollbar_narrows_it(qapp):
+    long_ai_result = "FANS FAN\nFANS FAN\nFANS FAN"
+    payload = ReviewDisplayPayload(
+        review={
+            "summary_payload": {
+                "rows": [
+                    {
+                        "item_key": "ai",
+                        "result_display": long_ai_result,
+                        "status": "fail",
+                    }
+                ]
+            }
+        },
+        dashboard_config={},
+    )
+    module = ResultHistoryModule(
+        payload_provider=(
+            lambda run_id: payload if run_id == "target" else None
+        )
+    )
+    target = _card("target")
+    module.render_snapshot(
+        _snapshot(
+            terminal_cards=(target,),
+            follow_latest=False,
+            selected_run_id=target.run_id,
+        )
+    )
+    module.resize(360, 500)
+    module.show()
+    qapp.processEvents()
+    qapp.processEvents()
+
+    scroll = _find(module, QScrollArea, "result_history_scroll")
+    target_card = _card_for(module, target.run_id)
+    table = _find(
+        target_card,
+        QTableWidget,
+        "result_history_card_summary_table",
+    )
+    initial_result_width = table.columnWidth(3)
+    initial_row_height = table.rowHeight(5)
+    assert scroll.verticalScrollBar().maximum() == 0
+
+    additional = tuple(
+        _card(f"terminal-{index}", index=index)
+        for index in range(1, 6)
+    )
+    module.render_snapshot(
+        _snapshot(
+            terminal_cards=(target, *additional),
+            follow_latest=False,
+            selected_run_id=target.run_id,
+            revision=2,
+        )
+    )
+    qapp.processEvents()
+    qapp.processEvents()
+
+    current_card = _card_for(module, target.run_id)
+    available_width = max(1, table.columnWidth(3) - 12)
+    required_height = max(
+        23,
+        table.fontMetrics()
+        .boundingRect(
+            QRect(0, 0, available_width, 10_000),
+            Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+            long_ai_result,
+        )
+        .height()
+        + 8,
+    )
+
+    assert current_card is target_card
+    assert scroll.verticalScrollBar().maximum() > 0
+    assert table.columnWidth(3) < initial_result_width
+    assert required_height > initial_row_height
+    assert table.rowHeight(5) >= required_height
+    assert (
+        sum(table.rowHeight(row) for row in range(6))
+        <= table.viewport().height()
+    )
+    assert not table.horizontalScrollBar().isVisible()
+    assert not table.verticalScrollBar().isVisible()
 
 
 def test_lock_control_is_outside_scroll_at_bottom_right(qapp):
@@ -1007,7 +1096,7 @@ def test_manual_actions_hide_without_legal_selection(qapp):
     assert not actions.isEnabled()
 
 
-def test_long_manual_fault_text_keeps_card_and_scroll_geometry_stable(qapp):
+def test_long_manual_fault_text_expands_card_and_preserves_scroll(qapp):
     actions = QWidget()
     action_layout = QVBoxLayout(actions)
     action_layout.addWidget(QPushButton("manual action", actions))
@@ -1100,4 +1189,18 @@ def test_long_manual_fault_text_keeps_card_and_scroll_geometry_stable(qapp):
     )
 
     assert current_target is target_card
-    assert geometry_after == geometry_before
+    card_growth = geometry_after[1] - geometry_before[1]
+    assert card_growth > 0
+    assert geometry_after[0] == geometry_before[0]
+    assert geometry_after[2] == geometry_before[2]
+    assert all(
+        after - before == card_growth
+        for before, after in zip(
+            geometry_before[3],
+            geometry_after[3],
+            strict=True,
+        )
+    )
+    assert geometry_after[4] - geometry_before[4] == card_growth
+    assert geometry_after[5] - geometry_before[5] == card_growth
+    assert geometry_after[6] == geometry_before[6]

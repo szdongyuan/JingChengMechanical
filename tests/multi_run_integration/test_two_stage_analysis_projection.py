@@ -395,8 +395,14 @@ def test_dashboard_paints_summary_then_fills_matching_charts_without_card_change
         QLabel,
         "result_history_card_summary_overall",
     )
+    caption = dashboard._history_module.findChild(
+        QLabel,
+        "result_history_card_summary_caption",
+    )
     assert summary is not None
-    assert summary.text() == "结果摘要：通过"
+    assert caption is not None
+    assert summary.text() == "通过"
+    assert caption.text() == "结果摘要"
     assert painted == []
     QWidget.paintEvent(dashboard, QPaintEvent(dashboard.rect()))
     assert painted == []

@@ -8,12 +8,13 @@ import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QRect, Qt
 from PyQt6.QtGui import QPalette
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import (
     QApplication,
     QLabel,
+    QSizePolicy,
     QTableWidget,
     QVBoxLayout,
     QWidget,
@@ -134,6 +135,19 @@ def _summary_table(card):
     return table
 
 
+def _required_wrapped_result_height(
+    table: QTableWidget,
+    text: str,
+) -> int:
+    available_width = max(1, table.columnWidth(3) - 12)
+    bounds = table.fontMetrics().boundingRect(
+        QRect(0, 0, available_width, 10_000),
+        Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+        text,
+    )
+    return max(23, bounds.height() + 8)
+
+
 def test_summary_table_fits_without_scrollbars_and_uses_current_only_compatibility(qapp):
     rows = [
         {"item_key": "spl", "current_display": "1.20 A"},
@@ -172,13 +186,18 @@ def test_summary_table_fits_without_scrollbars_and_uses_current_only_compatibili
     assert sum(table.rowHeight(row) for row in range(6)) <= table.viewport().height()
 
 
-def test_summary_table_keeps_compact_fixed_rows_and_two_decimal_values(qapp):
+def test_summary_table_keeps_compact_non_wrapped_rows_and_grows_wrapped_rows(
+    qapp,
+):
+    long_ai_result = "不通过（FAN BLADE INSTALLATION ABNORMAL）"
     rows = [
         {
             "item_key": item_key,
             "actual_display": "65.00 dB @ 1000 Hz",
             "current_display": "12.345 mA",
-            "result_display": "不通过（超出允许范围）",
+            "result_display": (
+                long_ai_result if item_key == "ai" else "不通过"
+            ),
             "status": "fail",
         }
         for item_key in (
@@ -207,13 +226,123 @@ def test_summary_table_keeps_compact_fixed_rows_and_two_decimal_values(qapp):
     assert table.verticalScrollBarPolicy() is Qt.ScrollBarPolicy.ScrollBarAlwaysOff
     assert not table.horizontalScrollBar().isVisible()
     assert not table.verticalScrollBar().isVisible()
-    assert [table.rowHeight(row) for row in range(table.rowCount())] == [
-        23
-    ] * 6
+    assert all(table.rowHeight(row) >= 23 for row in range(5))
+    required_height = _required_wrapped_result_height(table, long_ai_result)
+    assert required_height > 23
+    assert table.rowHeight(5) >= required_height
+    assert table.item(5, 3).text() == long_ai_result
+    assert table.item(5, 3).toolTip() == long_ai_result
     assert [table.item(row, 2).text() for row in range(6)] == [
         "12.35 mA"
     ] * 6
     assert sum(table.rowHeight(row) for row in range(6)) <= table.viewport().height()
+
+
+def test_summary_table_preserves_and_fits_long_ai_result(qapp):
+    long_ai_result = "不通过（FAN BLADE INSTALLATION ABNORMAL）"
+    rows = [
+        {
+            "item_key": "ai",
+            "actual_display": "0.42",
+            "current_display": "1.20 A",
+            "result_display": long_ai_result,
+            "status": "fail",
+        }
+    ]
+    card = ResultHistoryCard(
+        _snapshot(
+            conclusion=ResultConclusion.NG,
+            fault_type="风扇异常",
+        ),
+        payload=ReviewDisplayPayload(
+            review={"summary_payload": {"rows": rows}},
+            dashboard_config={},
+        ),
+    )
+    card.setFixedWidth(360)
+    card.show()
+    qapp.processEvents()
+    qapp.processEvents()
+    table = _summary_table(card)
+
+    assert table.item(5, 3).text() == long_ai_result
+    assert table.item(5, 3).toolTip() == long_ai_result
+    assert table.wordWrap() is True
+    assert table.columnWidth(3) > table.columnWidth(2)
+    required_height = _required_wrapped_result_height(table, long_ai_result)
+    assert required_height > 23
+    assert table.rowHeight(5) >= required_height
+    assert (
+        table.horizontalHeader().height()
+        + sum(table.rowHeight(row) for row in range(6))
+        <= table.height()
+    )
+    assert sum(table.rowHeight(row) for row in range(6)) <= table.viewport().height()
+    assert not table.horizontalScrollBar().isVisible()
+    assert not table.verticalScrollBar().isVisible()
+
+
+def test_in_place_update_refits_long_ai_result(qapp):
+    snapshot = _snapshot()
+    short_payload = ReviewDisplayPayload(
+        review={
+            "summary_payload": {
+                "rows": [
+                    {
+                        "item_key": "ai",
+                        "result_display": "PASS",
+                        "status": "pass",
+                    }
+                ]
+            }
+        },
+        dashboard_config={},
+    )
+    card = ResultHistoryCard(snapshot, payload=short_payload)
+    card.setFixedWidth(360)
+    card.show()
+    qapp.processEvents()
+    qapp.processEvents()
+    table = _summary_table(card)
+    initial_row_height = table.rowHeight(5)
+    initial_table_height = table.height()
+
+    long_ai_result = "不通过（FAN BLADE INSTALLATION ABNORMAL）"
+    long_payload = ReviewDisplayPayload(
+        review={
+            "summary_payload": {
+                "rows": [
+                    {
+                        "item_key": "ai",
+                        "result_display": long_ai_result,
+                        "status": "fail",
+                    }
+                ]
+            }
+        },
+        dashboard_config={},
+    )
+    card.update_snapshot(snapshot, long_payload)
+    qapp.processEvents()
+    qapp.processEvents()
+
+    assert _summary_table(card) is table
+    assert table.item(5, 3).text() == long_ai_result
+    assert table.item(5, 3).toolTip() == long_ai_result
+    assert table.wordWrap() is True
+    assert table.columnWidth(3) > table.columnWidth(2)
+    required_height = _required_wrapped_result_height(table, long_ai_result)
+    assert required_height > initial_row_height
+    assert table.rowHeight(5) >= required_height
+    assert table.height() > initial_table_height
+    assert (
+        table.horizontalHeader().height()
+        + sum(table.rowHeight(row) for row in range(6))
+        <= table.height()
+    )
+    assert sum(table.rowHeight(row) for row in range(6)) <= table.viewport().height()
+    assert not table.horizontalScrollBar().isVisible()
+    assert not table.verticalScrollBar().isVisible()
 
 
 def test_card_action_slot_is_collapsed_until_actions_are_attached(qapp):
@@ -295,7 +424,12 @@ def test_active_card_always_renders_fixed_summary_skeleton(qapp, phase):
     card.show()
     qapp.processEvents()
 
-    assert "结果摘要：进行中" in _visible_text(card)
+    caption = card.findChild(QLabel, "result_history_card_summary_caption")
+    overall = card.findChild(QLabel, "result_history_card_summary_overall")
+    assert caption is not None
+    assert overall is not None
+    assert caption.text() == "结果摘要"
+    assert overall.text() == "进行中"
     assert card.findChild(QLabel, "result_history_card_metric_spl").text() == "--"
     assert card.findChild(QLabel, "result_history_card_metric_loudness").text() == "--"
     table = _summary_table(card)
@@ -306,12 +440,12 @@ def test_active_card_always_renders_fixed_summary_skeleton(qapp, phase):
 @pytest.mark.parametrize(
     ("conclusion", "expected"),
     [
-        (ResultConclusion.OK, "结果摘要：通过"),
-        (ResultConclusion.NG, "结果摘要：不通过"),
-        (ResultConclusion.NO_RESULT, "结果摘要：无结果"),
-        (ResultConclusion.ERROR, "结果摘要：失败"),
-        (ResultConclusion.CAPACITY_REJECTED, "结果摘要：容量已满"),
-        (ResultConclusion.MANUAL_STOPPED, "结果摘要：已停止"),
+        (ResultConclusion.OK, "通过"),
+        (ResultConclusion.NG, "不通过"),
+        (ResultConclusion.NO_RESULT, "无结果"),
+        (ResultConclusion.ERROR, "失败"),
+        (ResultConclusion.CAPACITY_REJECTED, "容量已满"),
+        (ResultConclusion.MANUAL_STOPPED, "已停止"),
     ],
 )
 def test_terminal_card_without_review_keeps_fixed_summary_skeleton(
@@ -323,7 +457,12 @@ def test_terminal_card_without_review_keeps_fixed_summary_skeleton(
         payload=payload,
     )
 
-    assert expected in _visible_text(card)
+    caption = card.findChild(QLabel, "result_history_card_summary_caption")
+    overall = card.findChild(QLabel, "result_history_card_summary_overall")
+    assert caption is not None
+    assert overall is not None
+    assert caption.text() == "结果摘要"
+    assert overall.text() == expected
     _summary_table(card)
 
 
@@ -332,14 +471,131 @@ def test_ng_overall_includes_frozen_fault_type(qapp):
         _snapshot(conclusion=ResultConclusion.NG, fault_type="异响")
     )
 
-    assert "结果摘要：不通过（异响）" in _visible_text(card)
+    caption = card.findChild(QLabel, "result_history_card_summary_caption")
+    overall = card.findChild(QLabel, "result_history_card_summary_overall")
+    assert caption is not None
+    assert overall is not None
+    assert caption.text() == "结果摘要"
+    assert overall.text() == "不通过（异响）"
+
+
+@pytest.mark.parametrize(
+    ("conclusion", "fault_type", "expected"),
+    [
+        (
+            ResultConclusion.NG,
+            "风扇叶片安装方向和固定状态异常需要立即停机进行人工复核",
+            "不通过（风扇叶片安装方向和固定状态异常需要立即停机进行人工复核）",
+        ),
+        (ResultConclusion.NO_RESULT, None, "无结果"),
+    ],
+)
+def test_failure_card_renders_large_centered_wrapping_overall_status(
+    qapp,
+    conclusion,
+    fault_type,
+    expected,
+):
+    card = ResultHistoryCard(
+        _snapshot(
+            conclusion=conclusion,
+            fault_type=fault_type,
+        )
+    )
+    card.setFixedWidth(360)
+    card.show()
+    qapp.processEvents()
+    qapp.processEvents()
+    overall = card.findChild(
+        QLabel,
+        "result_history_card_summary_overall",
+    )
+    caption = card.findChild(
+        QLabel,
+        "result_history_card_summary_caption",
+    )
+
+    assert card.width() == 360
+    assert caption is not None
+    assert overall is not None
+    assert caption.text() == "结果摘要"
+    assert not caption.isHidden()
+    assert overall.text() == expected
+    assert overall.textFormat() is Qt.TextFormat.PlainText
+    assert overall.accessibleName() == "结果摘要总结果"
+    assert overall.wordWrap() is True
+    assert overall.alignment() & Qt.AlignmentFlag.AlignHCenter
+    assert (
+        overall.sizePolicy().horizontalPolicy()
+        is QSizePolicy.Policy.Expanding
+    )
+    assert overall.minimumHeight() >= 48
+    available_width = max(1, overall.contentsRect().width())
+    wrapped_bounds = overall.fontMetrics().boundingRect(
+        QRect(0, 0, available_width, 10_000),
+        Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap,
+        overall.text(),
+    )
+    assert overall.height() >= max(
+        overall.minimumHeight(),
+        wrapped_bounds.height(),
+    )
+    if conclusion is ResultConclusion.NG:
+        assert wrapped_bounds.height() > overall.fontMetrics().height()
+    assert "font-size: 32px" in overall.styleSheet()
+    assert "font-weight: 800" in overall.styleSheet()
+    assert "#d93025" in overall.styleSheet().lower()
+
+
+def test_manual_ok_preview_shrinks_long_wrapped_overall_status(qapp):
+    card = ResultHistoryCard(
+        _snapshot(
+            conclusion=ResultConclusion.NG,
+            fault_type=(
+                "风扇叶片安装方向和固定状态异常需要立即停机进行人工复核"
+            ),
+        )
+    )
+    card.setFixedWidth(360)
+    card.show()
+    qapp.processEvents()
+    qapp.processEvents()
+    overall = card.findChild(
+        QLabel,
+        "result_history_card_summary_overall",
+    )
+    assert overall is not None
+    long_status_height = overall.height()
+    long_card_height = card.height()
+    assert long_status_height > 48
+
+    card.preview_manual_judgment("OK", None)
+    qapp.processEvents()
+    qapp.processEvents()
+
+    assert card.findChild(
+        QLabel,
+        "result_history_card_summary_overall",
+    ) is overall
+    assert overall.text() == "通过"
+    assert overall.height() < long_status_height
+    assert card.height() < long_card_height
+    assert overall.minimumHeight() == 48
+    assert overall.height() >= 48
+    assert overall.textFormat() is Qt.TextFormat.PlainText
+    assert overall.accessibleName() == "结果摘要总结果"
+    assert overall.wordWrap() is True
+    assert overall.alignment() & Qt.AlignmentFlag.AlignHCenter
+    assert "font-size: 32px" in overall.styleSheet()
+    assert "font-weight: 800" in overall.styleSheet()
+    assert "#188038" in overall.styleSheet().lower()
 
 
 @pytest.mark.parametrize(
     ("overall_label", "expected"),
     [
-        ("不通过", "结果摘要：不通过（异响）"),
-        ("不通过（异响）", "结果摘要：不通过（异响）"),
+        ("不通过", "不通过（异响）"),
+        ("不通过（异响）", "不通过（异响）"),
     ],
 )
 def test_ng_review_overall_appends_frozen_fault_type_exactly_once(
@@ -364,6 +620,12 @@ def test_ng_review_overall_appends_frozen_fault_type_exactly_once(
     overall = card.findChild(
         QLabel, "result_history_card_summary_overall"
     )
+    caption = card.findChild(
+        QLabel, "result_history_card_summary_caption"
+    )
+    assert caption is not None
+    assert overall is not None
+    assert caption.text() == "结果摘要"
     assert overall.text() == expected
 
 
@@ -439,7 +701,12 @@ def test_card_renders_compact_legacy_result_summary_payload(qapp):
         "result_history_card_summary_table",
     )
 
-    assert "结果摘要：不通过" in _visible_text(card)
+    caption = card.findChild(QLabel, "result_history_card_summary_caption")
+    overall = card.findChild(QLabel, "result_history_card_summary_overall")
+    assert caption is not None
+    assert overall is not None
+    assert caption.text() == "结果摘要"
+    assert overall.text() == "不通过"
     assert table is not None
     assert table.rowCount() == 6
     assert table.item(0, 0).text() == "声压峰值"
@@ -447,6 +714,53 @@ def test_card_renders_compact_legacy_result_summary_payload(qapp):
     assert table.item(4, 2).text() == "1.20 A"
     for duplicate in _REMOVED_OPERATOR_FIELDS:
         assert duplicate not in _visible_text(card)
+
+
+@pytest.mark.parametrize(
+    ("overall_status", "overall_label", "conclusion", "terminal_color"),
+    [
+        ("pass", "通过", ResultConclusion.OK, "#188038"),
+        ("fail", "不通过", ResultConclusion.NG, "#d93025"),
+    ],
+)
+def test_reanalyzing_uses_neutral_overall_color_with_retained_payload(
+    qapp,
+    overall_status,
+    overall_label,
+    conclusion,
+    terminal_color,
+):
+    payload = ReviewDisplayPayload(
+        review={
+            "summary_payload": {
+                "overall_status": overall_status,
+                "overall_label": overall_label,
+                "rows": [],
+            }
+        },
+        dashboard_config={},
+    )
+    terminal = _snapshot(conclusion=conclusion)
+    card = ResultHistoryCard(terminal, payload=payload)
+    overall = card.findChild(
+        QLabel,
+        "result_history_card_summary_overall",
+    )
+    assert overall is not None
+    assert terminal_color in overall.styleSheet().lower()
+
+    reanalyzing = _snapshot(
+        phase=ResultPhase.REANALYZING,
+        conclusion=conclusion,
+    )
+    card.update_snapshot(reanalyzing, payload)
+
+    assert card.findChild(
+        QLabel,
+        "result_history_card_summary_overall",
+    ) is overall
+    assert overall.text() == "重新分析中"
+    assert "#424242" in overall.styleSheet().lower()
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,8 @@ from PyQt6.QtCore import (
     QEasingCurve,
     QEvent,
     QPropertyAnimation,
+    QRect,
+    QTimer,
     Qt,
     pyqtSignal,
 )
@@ -16,6 +18,7 @@ from PyQt6.QtWidgets import (
     QHeaderView,
     QHBoxLayout,
     QLabel,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -127,23 +130,83 @@ def _result_state(snapshot: ResultHistoryCardSnapshot) -> str:
 
 
 class _FittedSummaryTable(QTableWidget):
-    """Use one stable compact geometry so phase updates cannot shake a card."""
+    """Fit wrapped result text while keeping the summary free of scrollbars."""
 
     _ROW_HEIGHT = 23
 
     def __init__(self, rows: int, columns: int, parent=None) -> None:
         super().__init__(rows, columns, parent)
+        self._last_fitted_result_width = -1
+        self._width_refit_timer = QTimer(self)
+        self._width_refit_timer.setSingleShot(True)
+        self._width_refit_timer.timeout.connect(self._run_width_refit)
 
     def schedule_initial_fit(self) -> None:
+        self._fit_rows()
+        self._schedule_width_refit()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if event.oldSize().width() != event.size().width():
+            self._schedule_width_refit()
+
+    def _schedule_width_refit(self) -> None:
+        if not self._width_refit_timer.isActive():
+            self._width_refit_timer.start(0)
+
+    def _run_width_refit(self) -> None:
+        if self.columnWidth(3) != self._last_fitted_result_width:
+            self._fit_rows()
+
+    def _fit_rows(self) -> None:
+        available_width = max(1, self.columnWidth(3) - 12)
         for row in range(self.rowCount()):
-            self.setRowHeight(row, self._ROW_HEIGHT)
-        target_height = (
+            item = self.item(row, 3)
+            text = item.text() if item is not None else ""
+            bounds = self.fontMetrics().boundingRect(
+                QRect(0, 0, available_width, 10_000),
+                Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+                text,
+            )
+            self.setRowHeight(
+                row,
+                max(self._ROW_HEIGHT, bounds.height() + 8),
+            )
+        self.setFixedHeight(
             self.horizontalHeader().height()
-            + self.rowCount() * self._ROW_HEIGHT
+            + sum(self.rowHeight(row) for row in range(self.rowCount()))
             + self.frameWidth() * 2
             + 2
         )
-        self.setFixedHeight(target_height)
+        self._last_fitted_result_width = self.columnWidth(3)
+
+
+class _WrappedStatusLabel(QLabel):
+    """Report the full wrapped text height for the width offered by layout."""
+
+    def _wrapped_height(self, width: int) -> int:
+        return self.fontMetrics().boundingRect(
+            QRect(0, 0, max(1, width), 10_000),
+            Qt.AlignmentFlag.AlignHCenter | Qt.TextFlag.TextWordWrap,
+            self.text(),
+        ).height()
+
+    def heightForWidth(self, width: int) -> int:
+        return max(48, self._wrapped_height(width))
+
+    def refresh_wrapped_minimum_height(self) -> None:
+        required_height = max(
+            48,
+            self._wrapped_height(self.contentsRect().width()),
+        )
+        if self.minimumHeight() == required_height:
+            return
+        self.setMinimumHeight(required_height)
+        self.updateGeometry()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.refresh_wrapped_minimum_height()
 
 
 class ResultHistoryCard(QFrame):
@@ -237,27 +300,38 @@ class ResultHistoryCard(QFrame):
     ) -> None:
         summary = self._review_summary(payload)
         overall = self._overall_text(summary)
-        badge = self._add_label(
-            layout,
-            f"结果摘要：{overall}",
-            "result_history_card_summary_overall",
-            "结果摘要总结果",
+        status_container = QWidget(self)
+        status_layout = QVBoxLayout(status_container)
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.setSpacing(0)
+        caption = self._add_label(
+            status_layout,
+            "结果摘要",
+            "result_history_card_summary_caption",
+            "结果摘要",
         )
-        status = summary.get("overall_status") if summary is not None else None
-        badge.setStyleSheet(
-            "font-weight: 600; color: "
-            + (
-                "#188038"
-                if status == "pass"
-                else "#d93025"
-                if status in {"fail", "no_result"}
-                else "#424242"
-            )
+        caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge = _WrappedStatusLabel()
+        badge.setTextFormat(Qt.TextFormat.PlainText)
+        badge.setObjectName("result_history_card_summary_overall")
+        badge.setAccessibleName("结果摘要总结果")
+        badge.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        status_layout.addWidget(badge)
+        badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        badge.setWordWrap(True)
+        badge_size_policy = QSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
         )
-
-        badge.setWordWrap(False)
-        badge.setFixedHeight(badge.sizeHint().height())
-        badge.setToolTip(badge.text())
+        badge_size_policy.setHeightForWidth(True)
+        badge.setSizePolicy(badge_size_policy)
+        badge.setMinimumHeight(48)
+        self._set_overall_display(
+            badge,
+            overall,
+            self._overall_color(summary),
+        )
+        layout.addWidget(status_container)
 
         metric_layout = QHBoxLayout()
         metric_layout.setContentsMargins(0, 0, 0, 0)
@@ -303,7 +377,7 @@ class ResultHistoryCard(QFrame):
         table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        table.setWordWrap(False)
+        table.setWordWrap(True)
         table.setStyleSheet(
             "QTableWidget { font-size: 12px; }"
             "QHeaderView::section { padding: 1px; font-size: 12px; }"
@@ -321,11 +395,16 @@ class ResultHistoryCard(QFrame):
         table.verticalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Fixed
         )
-        table.horizontalHeader().setMinimumSectionSize(45)
-        table.horizontalHeader().setSectionResizeMode(
-            QHeaderView.ResizeMode.Stretch
-        )
-        table.horizontalHeader().setStretchLastSection(False)
+        header = table.horizontalHeader()
+        header.setMinimumSectionSize(45)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setStretchLastSection(False)
+        table.setColumnWidth(0, 76)
+        table.setColumnWidth(1, 70)
+        table.setColumnWidth(2, 54)
         for row_index, (item_key, label) in enumerate(_SUMMARY_ROWS):
             row = rows_by_key.get(item_key, {})
             values = (
@@ -333,7 +412,8 @@ class ResultHistoryCard(QFrame):
                 self._summary_value(row),
                 self._current_display(row),
                 self._summary_result_text(
-                    row.get("result_display") or row.get("status") or "-"
+                    row.get("result_display") or row.get("status") or "-",
+                    preserve_details=item_key == "ai",
                 ),
             )
             for column, value in enumerate(values):
@@ -601,12 +681,10 @@ class ResultHistoryCard(QFrame):
             QLabel,
             "result_history_card_summary_overall",
         )
-        prefix, separator, _old_overall = badge.text().partition("：")
-        badge.setText(f"{prefix}{separator or '：'}{overall}")
-        badge.setToolTip(badge.text())
-        badge.setStyleSheet(
-            "font-weight: 600; color: "
-            + ("#188038" if conclusion is ResultConclusion.OK else "#d93025")
+        self._set_overall_display(
+            badge,
+            overall,
+            "#188038" if conclusion is ResultConclusion.OK else "#d93025",
         )
 
         result_state = _CONCLUSION_STATE[conclusion]
@@ -623,21 +701,10 @@ class ResultHistoryCard(QFrame):
             QLabel,
             "result_history_card_summary_overall",
         )
-        prefix, separator, _old_overall = badge.text().partition("\uff1a")
-        badge.setText(
-            f"{prefix}{separator or ': '}{self._overall_text(summary)}"
-        )
-        badge.setToolTip(badge.text())
-        status = summary.get("overall_status") if summary is not None else None
-        badge.setStyleSheet(
-            "font-weight: 600; color: "
-            + (
-                "#188038"
-                if status == "pass"
-                else "#d93025"
-                if status in {"fail", "no_result"}
-                else "#424242"
-            )
+        self._set_overall_display(
+            badge,
+            self._overall_text(summary),
+            self._overall_color(summary),
         )
 
         raw_rows = summary.get("rows") if summary is not None else None
@@ -660,7 +727,8 @@ class ResultHistoryCard(QFrame):
                 self._summary_value(row),
                 self._current_display(row),
                 self._summary_result_text(
-                    row.get("result_display") or row.get("status") or "-"
+                    row.get("result_display") or row.get("status") or "-",
+                    preserve_details=item_key == "ai",
                 ),
             )
             for column, value in enumerate(values):
@@ -709,6 +777,55 @@ class ResultHistoryCard(QFrame):
             if not overall.endswith(fault_suffix):
                 overall = f"{overall}{fault_suffix}"
         return overall
+
+    def _overall_color(self, summary: dict | None) -> str:
+        if self._snapshot.phase is not ResultPhase.TERMINAL:
+            return "#424242"
+        status = summary.get("overall_status") if summary is not None else None
+        if status == "pass" or (
+            status is None
+            and self._snapshot.conclusion is ResultConclusion.OK
+        ):
+            return "#188038"
+        if status in {"fail", "no_result"} or (
+            status is None
+            and self._snapshot.conclusion
+            in {
+                ResultConclusion.NG,
+                ResultConclusion.NO_RESULT,
+                ResultConclusion.ERROR,
+            }
+        ):
+            return "#d93025"
+        return "#424242"
+
+    @staticmethod
+    def _set_overall_display(label: QLabel, text: str, color: str) -> None:
+        label.setText(text)
+        label.setToolTip(f"结果摘要：{text}")
+        label.setStyleSheet(
+            f"font-size: 32px; font-weight: 800; color: {color};"
+        )
+        if isinstance(label, _WrappedStatusLabel):
+            label.refresh_wrapped_minimum_height()
+            status_container = label.parentWidget()
+            status_layout = status_container.layout()
+            if status_layout is not None:
+                status_layout.invalidate()
+                status_layout.activate()
+            status_container.updateGeometry()
+            owner = status_container
+            while owner is not None and not isinstance(
+                owner,
+                ResultHistoryCard,
+            ):
+                owner = owner.parentWidget()
+            if owner is not None:
+                owner.updateGeometry()
+                if owner.isWindow() and owner.isVisible():
+                    owner.layout().invalidate()
+                    owner.layout().activate()
+                    owner.adjustSize()
 
     @classmethod
     def _average_display(cls, summary: dict | None, item_key: str) -> str:
@@ -819,11 +936,17 @@ class ResultHistoryCard(QFrame):
         }.get(text.lower(), text or "—")
 
     @staticmethod
-    def _summary_result_text(value: object) -> str:
+    def _summary_result_text(
+        value: object,
+        *,
+        preserve_details: bool = False,
+    ) -> str:
         text = str(value).strip()
         mapped = _SUMMARY_RESULT_TEXT.get(text.upper())
         if mapped is not None:
             return mapped
+        if preserve_details and text:
+            return text
         if "不通过" in text:
             return "不通过"
         if "通过" in text:
