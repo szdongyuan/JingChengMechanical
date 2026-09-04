@@ -214,7 +214,8 @@ def test_service_container_wires_one_durable_run_export_reader_and_archive_servi
         "ConfigService",
         MagicMock(return_value=MagicMock()),
     )
-    monkeypatch.setattr(mod, "AiService", MagicMock(return_value=MagicMock()))
+    ai_service = MagicMock()
+    monkeypatch.setattr(mod, "AiService", MagicMock(return_value=ai_service))
 
     services = mod.ServiceContainer(run_persistence_database=runtime)
 
@@ -227,6 +228,13 @@ def test_service_container_wires_one_durable_run_export_reader_and_archive_servi
     )
     assert type(services.run_archive_service) is RunArchiveService
     assert services.run_archive_service._reader is services.run_export_reader
+    assert services.run_archive_service._ai_reader is ai_service
+    assert services.ai_service is ai_service
+    assert (
+        services.historical_metric_report_service._cache._judgment_engine._ai
+        is ai_service
+    )
+    assert services.config_package_service._ai_service is ai_service
     assert type(services.run_data_management_service) is RunDataManagementService
     assert services.run_data_management_service._runtime is runtime
     assert hasattr(EventBus, "run_records_deleted")

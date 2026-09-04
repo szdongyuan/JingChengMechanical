@@ -13,12 +13,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PyQt6.QtCore import Qt
-from PyQt6.QtWidgets import QApplication, QFileDialog, QMessageBox
+from PyQt6.QtWidgets import QApplication, QMessageBox
 
 import app.services_container as services_module
 from app.service.run_persistence.contracts import CurrentTrace
 from app.service.run_persistence.database import RunPersistenceDatabase
 from app.service.run_persistence.run_repository import RunRepository
+from app.service.run_record_export import RunDataExportOptions
 from tests.run_persistence.test_export_reader import (
     _finish,
     _insert_active,
@@ -26,6 +27,7 @@ from tests.run_persistence.test_export_reader import (
     _ready_runtime,
 )
 from ui.modules.data_management import DataManagementModule
+import ui.modules.data_management as data_management_module
 
 
 @pytest.fixture
@@ -94,7 +96,13 @@ def _patch_service_container_dependencies(monkeypatch) -> MagicMock:
     monkeypatch.setattr(
         services_module,
         "AiService",
-        MagicMock(return_value=MagicMock()),
+        MagicMock(
+            return_value=MagicMock(
+                get_current_effective_export_values=MagicMock(
+                    return_value={},
+                )
+            )
+        ),
     )
     legacy_export = MagicMock(
         side_effect=AssertionError(
@@ -191,12 +199,22 @@ def test_data_management_exports_selected_terminal_runs_through_service_containe
             Qt.CheckState.Checked
         )
 
-    chosen = tmp_path / "selected-runs"
+    target = tmp_path / "selected-runs.zip"
     messages: list[tuple[str, tuple[object, ...]]] = []
     monkeypatch.setattr(
-        QFileDialog,
-        "getSaveFileName",
-        lambda *args, **kwargs: (str(chosen), "Zip files (*.zip)"),
+        data_management_module,
+        "choose_run_export_options",
+        lambda *args, **kwargs: RunDataExportOptions(
+            include_excel=True,
+            include_audio=True,
+            include_database=True,
+            include_current_csv=True,
+        ),
+    )
+    monkeypatch.setattr(
+        data_management_module,
+        "choose_run_export_path",
+        lambda *args, **kwargs: str(target),
     )
     monkeypatch.setattr(
         QMessageBox,
@@ -212,60 +230,68 @@ def test_data_management_exports_selected_terminal_runs_through_service_containe
     module._export_selected_rows()
     _wait_for_operation_idle(module)
 
-    target = chosen.with_suffix(".zip")
     assert target.is_file()
     assert [kind for kind, _args in messages] == ["success"]
     assert str(target) in messages[0][1][2]
     legacy_export.assert_not_called()
 
-    expected_members = {
-        "copy_data.sqlite3",
-        f"{first_id}/manifest.json",
-        f"{first_id}/channel-001.wav",
-        f"{first_id}/channel-002.wav",
-        f"{first_id}/current.csv",
-        f"{second_id}/manifest.json",
-        f"{second_id}/channel-001.wav",
-    }
     with ZipFile(target, "r") as archive:
-        assert set(archive.namelist()) == expected_members
+        root_manifest = json.loads(archive.read("export_manifest.json"))
+        records_by_id = {
+            record["run_id"]: record for record in root_manifest["records"]
+        }
         first_manifest = json.loads(
-            archive.read(f"{first_id}/manifest.json")
+            archive.read(records_by_id[first_id]["manifest"])
         )
         second_manifest = json.loads(
-            archive.read(f"{second_id}/manifest.json")
+            archive.read(records_by_id[second_id]["manifest"])
         )
-        assert first_manifest["run"]["hardware_id"] == 23
-        assert first_manifest["channels"] == [
+        assert root_manifest["schema"] == "jingcheng-run-export-package/v2"
+        assert root_manifest["counts"] == {
+            "selected_runs": 2,
+            "exported_runs": 2,
+            "skipped_runs": 0,
+            "audio_runs_emitted": 2,
+            "audio_runs_skipped": 0,
+            "audio_files_emitted": 3,
+            "current_runs_emitted": 1,
+            "current_runs_skipped": 1,
+        }
+        assert first_manifest["audio"]["channels"] == [
             {
                 "position": 1,
                 "source_channel": 4,
-                "file": "channel-001.wav",
+                "path": (
+                    f"{records_by_id[first_id]['directory']}/audio/CH5.wav"
+                ),
             },
             {
                 "position": 2,
                 "source_channel": 9,
-                "file": "channel-002.wav",
+                "path": (
+                    f"{records_by_id[first_id]['directory']}/audio/CH10.wav"
+                ),
             },
         ]
-        assert second_manifest["run"]["hardware_id"] == 41
-        assert second_manifest["channels"] == [
+        assert second_manifest["audio"]["channels"] == [
             {
                 "position": 1,
                 "source_channel": 6,
-                "file": "channel-001.wav",
+                "path": (
+                    f"{records_by_id[second_id]['directory']}/audio/CH7.wav"
+                ),
             }
         ]
         assert _read_mono_samples(
-            archive.read(f"{first_id}/channel-001.wav")
+            archive.read(first_manifest["audio"]["channels"][0]["path"])
         ) == first_channels[0]
         assert _read_mono_samples(
-            archive.read(f"{first_id}/channel-002.wav")
+            archive.read(first_manifest["audio"]["channels"][1]["path"])
         ) == first_channels[1]
         assert _read_mono_samples(
-            archive.read(f"{second_id}/channel-001.wav")
+            archive.read(second_manifest["audio"]["channels"][0]["path"])
         ) == second_channels[0]
-        assert archive.read(f"{first_id}/current.csv") == (
+        assert archive.read(first_manifest["current"]["path"]) == (
             b"time_sec,current_a\n0.0,1.25\n0.5,1.75\n"
         )
         restored = sqlite3.connect(":memory:")
@@ -282,17 +308,32 @@ def test_data_management_exports_selected_terminal_runs_through_service_containe
             ).fetchone() == (0,)
         finally:
             restored.close()
-        assert first_manifest["current"] == {
-            "present": True,
-            "file": "current.csv",
-        }
+        assert first_manifest["current"]["status"] == "exported"
+        assert first_manifest["current"]["selected"] is True
         assert second_manifest["current"] == {
-            "present": False,
-            "file": None,
+            "selected": True,
+            "status": "skipped",
+            "reason": (
+                f"run {second_id} current attachment is unavailable: missing"
+            ),
+            "path": None,
         }
+        declared_members = {
+            "export_manifest.json",
+            "检测记录.xlsx",
+            "copy_data.sqlite3",
+            *(record["manifest"] for record in root_manifest["records"]),
+            *(
+                channel["path"]
+                for manifest in (first_manifest, second_manifest)
+                for channel in manifest["audio"]["channels"]
+            ),
+            first_manifest["current"]["path"],
+        }
+        assert set(archive.namelist()) == declared_members
 
 
-def test_data_management_can_skip_bad_selected_runs_during_export(
+def test_data_management_keeps_primary_run_when_audio_is_missing(
     monkeypatch,
     prepared_database_path,
     tmp_path,
@@ -332,20 +373,22 @@ def test_data_management_can_skip_bad_selected_runs_during_export(
             Qt.CheckState.Checked
         )
 
-    chosen = tmp_path / "skip-bad"
+    target = tmp_path / "skip-bad.zip"
     messages: list[tuple[str, tuple[object, ...]]] = []
-    prompts: list[tuple[object, ...]] = []
     monkeypatch.setattr(
-        QFileDialog,
-        "getSaveFileName",
-        lambda *args, **kwargs: (str(chosen), "Zip files (*.zip)"),
+        data_management_module,
+        "choose_run_export_options",
+        lambda *args, **kwargs: RunDataExportOptions(
+            include_excel=False,
+            include_audio=True,
+            include_database=True,
+            include_current_csv=False,
+        ),
     )
     monkeypatch.setattr(
-        QMessageBox,
-        "question",
-        lambda *args: (
-            prompts.append(args) or QMessageBox.StandardButton.Yes
-        ),
+        data_management_module,
+        "choose_run_export_path",
+        lambda *args, **kwargs: str(target),
     )
     monkeypatch.setattr(
         QMessageBox,
@@ -361,27 +404,69 @@ def test_data_management_can_skip_bad_selected_runs_during_export(
     module._export_selected_rows()
     _wait_for_operation_idle(module)
 
-    target = chosen.with_suffix(".zip")
     assert target.is_file()
-    assert len(prompts) == 1
-    assert "跳过" in prompts[0][2]
-    assert bad_id in prompts[0][2]
     assert [kind for kind, _args in messages] == ["success"]
-    assert "已导出 1 条" in messages[0][1][2]
+    assert "已导出 2 条" in messages[0][1][2]
+    assert "音频文件缺失或跳过 1 条" in messages[0][1][2]
     legacy_export.assert_not_called()
 
     with ZipFile(target, "r") as archive:
+        root_manifest = json.loads(archive.read("export_manifest.json"))
+        records_by_id = {
+            record["run_id"]: record for record in root_manifest["records"]
+        }
+        assert set(records_by_id) == {good_id, bad_id}
+        assert root_manifest["counts"] == {
+            "selected_runs": 2,
+            "exported_runs": 2,
+            "skipped_runs": 0,
+            "audio_runs_emitted": 1,
+            "audio_runs_skipped": 1,
+            "audio_files_emitted": 1,
+            "current_runs_emitted": 0,
+            "current_runs_skipped": 0,
+        }
+        assert root_manifest["skips"] == [
+            {
+                "run_id": bad_id,
+                "component": "audio",
+                "reason": (
+                    f"run {bad_id} audio attachment is unavailable: "
+                    "committed audio is missing"
+                ),
+            }
+        ]
+        good_manifest = json.loads(
+            archive.read(records_by_id[good_id]["manifest"])
+        )
+        bad_manifest = json.loads(
+            archive.read(records_by_id[bad_id]["manifest"])
+        )
+        assert good_manifest["audio"]["status"] == "exported"
+        assert bad_manifest["audio"] == {
+            "selected": True,
+            "status": "skipped",
+            "reason": (
+                f"run {bad_id} audio attachment is unavailable: "
+                "committed audio is missing"
+            ),
+            "sample_rate_hz": None,
+            "frame_count": None,
+            "channels": [],
+        }
         assert set(archive.namelist()) == {
+            "export_manifest.json",
             "copy_data.sqlite3",
-            f"{good_id}/manifest.json",
-            f"{good_id}/channel-001.wav",
+            records_by_id[good_id]["manifest"],
+            records_by_id[bad_id]["manifest"],
+            good_manifest["audio"]["channels"][0]["path"],
         }
         restored = sqlite3.connect(":memory:")
         try:
             restored.deserialize(archive.read("copy_data.sqlite3"))
-            assert restored.execute("SELECT run_id FROM run").fetchall() == [
-                (good_id,)
-            ]
+            assert {
+                row[0] for row in restored.execute("SELECT run_id FROM run")
+            } == {good_id, bad_id}
             assert restored.execute("SELECT run_id FROM audio").fetchall() == [
                 (good_id,)
             ]

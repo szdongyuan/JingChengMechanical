@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
-from inspect import Parameter, signature
 import os
 from threading import Event
 
@@ -21,7 +20,6 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDateTimeEdit,
-    QFileDialog,
     QHeaderView,
     QHBoxLayout,
     QInputDialog,
@@ -45,6 +43,7 @@ from app.service.run_persistence.data_management import (
     ManagementJudgment,
     RunManagementQuery,
 )
+from app.service.run_record_export import RunDataExportResult
 from app.service.run_scoped_playback import (
     PlaybackCode,
     PlaybackResult,
@@ -60,6 +59,10 @@ from model.malfunction_type_table import (
 )
 from ui.popups.historical_metric_report_dialog import HistoricalMetricReportDialog
 from ui.popups.run_audio_replay_dialog import RunAudioReplayDialog
+from ui.popups.run_record_export_dialog import (
+    choose_run_export_options,
+    choose_run_export_path,
+)
 
 
 _BEIJING_TIMEZONE = timezone(timedelta(hours=8))
@@ -72,13 +75,16 @@ class _ExportCanceledError(RuntimeError):
 
 class _ExportWorker(QThread):
     progress_changed = pyqtSignal(int, int, str)
-    succeeded = pyqtSignal(str)
+    succeeded = pyqtSignal(object)
     failed = pyqtSignal(str)
     canceled = pyqtSignal()
 
     def __init__(
         self,
-        export_runner: Callable[[Callable[[int, int, str], None]], str],
+        export_runner: Callable[
+            [Callable[[int, int, str], None], Callable[[], None]],
+            RunDataExportResult,
+        ],
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -91,23 +97,20 @@ class _ExportWorker(QThread):
     def run(self) -> None:
         try:
             self._raise_if_cancel_requested()
-            resolved_target = self._export_runner(self._emit_progress)
-            self._raise_if_cancel_requested()
+            result = self._export_runner(
+                self._emit_progress,
+                self._raise_if_cancel_requested,
+            )
         except _ExportCanceledError:
             self.canceled.emit()
             return
         except Exception as exc:
-            if self._cancel_requested.is_set():
-                self.canceled.emit()
-                return
             self.failed.emit(str(exc))
             return
-        self.succeeded.emit(resolved_target)
+        self.succeeded.emit(result)
 
     def _emit_progress(self, completed: int, total: int, message: str) -> None:
-        self._raise_if_cancel_requested()
         self.progress_changed.emit(completed, total, message)
-        self._raise_if_cancel_requested()
 
     def _raise_if_cancel_requested(self) -> None:
         if self._cancel_requested.is_set():
@@ -1269,28 +1272,42 @@ class DataManagementModule(QWidget):
             QMessageBox.warning(self, "提示", "请先勾选要导出的运行记录")
             return
 
-        run_ids = self._prepare_export_run_ids(run_ids)
-        if not run_ids:
+        options = choose_run_export_options(
+            self,
+            selected_count=len(run_ids),
+        )
+        if options is None:
             return
 
         os.makedirs(self.data_dir, exist_ok=True)
-        target_path, _selected_filter = QFileDialog.getSaveFileName(
+        target_path = choose_run_export_path(
             self,
-            "导出运行记录",
-            os.path.join(self.data_dir, "run-records.zip"),
-            "Zip 文件 (*.zip);;所有文件 (*)",
+            output_kind=options.output_kind,
+            initial_dir=self.data_dir,
         )
         if not target_path:
             return
 
         progress = self._export_progress_dialog(len(run_ids))
+        progress_state = {
+            "determinate": False,
+            "value": 0,
+        }
 
         def update_progress(completed: int, total: int, message: str) -> None:
             if total <= 0:
-                progress.setRange(0, 0)
+                if not progress_state["determinate"]:
+                    progress.setRange(0, 0)
             else:
+                total = max(int(total), progress_state["value"])
+                display_value = max(
+                    progress_state["value"],
+                    max(0, min(int(completed), total)),
+                )
+                progress_state["determinate"] = True
+                progress_state["value"] = display_value
                 progress.setRange(0, total)
-                progress.setValue(max(0, min(completed, total)))
+                progress.setValue(display_value)
             progress.setLabelText(message)
             QApplication.processEvents()
 
@@ -1298,17 +1315,17 @@ class DataManagementModule(QWidget):
         progress.show()
         QApplication.processEvents()
 
-        export = self.services.run_archive_service.export
-
-        def run_export(progress_callback) -> str:
-            if self._callable_accepts_progress_callback(export):
-                return self.services.run_archive_service.export(
-                    run_ids,
-                    target_path,
-                    progress_callback=progress_callback,
-                )
-            progress_callback(0, 0, "正在导出运行记录...")
-            return export(run_ids, target_path)
+        def run_export(
+            progress_callback,
+            cancel_check,
+        ) -> RunDataExportResult:
+            return self.services.run_archive_service.export(
+                run_ids,
+                target_path,
+                options=options,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
 
         self._export_progress = progress
         worker = _ExportWorker(run_export, self)
@@ -1319,9 +1336,9 @@ class DataManagementModule(QWidget):
             Qt.ConnectionType.QueuedConnection,
         )
         worker.succeeded.connect(
-            lambda resolved_target: self._finish_export(
+            lambda result: self._finish_export(
                 len(run_ids),
-                resolved_target,
+                result,
                 None,
             ),
             Qt.ConnectionType.QueuedConnection,
@@ -1353,82 +1370,12 @@ class DataManagementModule(QWidget):
         )
         worker.start()
 
-    def _prepare_export_run_ids(
-        self,
-        run_ids: tuple[str, ...],
-    ) -> tuple[str, ...]:
-        inspect_selection = getattr(
-            self.services.run_archive_service,
-            "inspect_selection",
-            None,
-        )
-        if not callable(inspect_selection):
-            return run_ids
-
-        try:
-            inspection = inspect_selection(run_ids)
-        except Exception as exc:
-            QMessageBox.warning(
-                self,
-                "导出检查失败",
-                f"检查导出记录失败：{exc}",
-            )
-            return ()
-
-        skipped = tuple(getattr(inspection, "skipped", ()))
-        exportable_run_ids = tuple(
-            getattr(inspection, "exportable_run_ids", ())
-        )
-        if not skipped:
-            return exportable_run_ids or run_ids
-
-        details = self._format_skipped_export_details(skipped)
-        if not exportable_run_ids:
-            QMessageBox.warning(
-                self,
-                "无法导出",
-                (
-                    f"选中的 {len(run_ids)} 条记录都不能导出。\n\n"
-                    f"{details}"
-                ),
-            )
-            return ()
-
-        answer = QMessageBox.question(
-            self,
-            "跳过不可导出记录",
-            (
-                f"选中 {len(run_ids)} 条，其中 {len(skipped)} 条不能导出。\n"
-                f"是否跳过这些记录，继续导出剩余 "
-                f"{len(exportable_run_ids)} 条？\n\n"
-                f"{details}"
-            ),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
-            return exportable_run_ids
-        return ()
-
-    @staticmethod
-    def _format_skipped_export_details(skipped: tuple[object, ...]) -> str:
-        lines = ["不可导出记录："]
-        for item in skipped[:5]:
-            run_id = str(getattr(item, "run_id", ""))
-            reason = str(getattr(item, "reason", ""))
-            if len(reason) > 160:
-                reason = f"{reason[:157]}..."
-            lines.append(f"- {run_id}: {reason}")
-        if len(skipped) > 5:
-            lines.append(f"... 还有 {len(skipped) - 5} 条")
-        return "\n".join(lines)
-
     def _export_progress_dialog(self, run_count: int) -> QProgressDialog:
         progress = QProgressDialog(
             f"正在准备导出 {run_count} 条记录...",
             "取消",
             0,
-            100,
+            0,
             self,
         )
         progress.setWindowTitle("导出进度")
@@ -1437,13 +1384,12 @@ class DataManagementModule(QWidget):
         progress.setAutoClose(False)
         progress.setAutoReset(False)
         progress.setMinimumWidth(380)
-        progress.setValue(0)
         return progress
 
     def _finish_export(
         self,
         run_count: int,
-        resolved_target: str | None,
+        result: RunDataExportResult | None,
         error_message: str | None,
         *,
         canceled: bool = False,
@@ -1462,11 +1408,22 @@ class DataManagementModule(QWidget):
             )
             return
 
-        if error_message is None:
+        if error_message is None and result is not None:
+            counts = result.counts
+            lines = [f"已导出 {counts.exported_runs} 条运行记录"]
+            if counts.audio_runs_skipped:
+                lines.append(
+                    f"音频文件缺失或跳过 {counts.audio_runs_skipped} 条"
+                )
+            if counts.current_runs_skipped:
+                lines.append(
+                    f"电流数据缺失或跳过 {counts.current_runs_skipped} 条"
+                )
+            lines.extend(("", f"导出位置：\n{result.target_path}"))
             QMessageBox.information(
                 self,
                 "导出完成",
-                f"已导出 {run_count} 条运行记录到：\n{resolved_target}",
+                "\n".join(lines),
             )
         else:
             QMessageBox.warning(
@@ -1487,19 +1444,6 @@ class DataManagementModule(QWidget):
 
     def _clear_export_worker(self) -> None:
         self._export_worker = None
-
-    @staticmethod
-    def _callable_accepts_progress_callback(function) -> bool:
-        try:
-            parameters = signature(function).parameters.values()
-        except (TypeError, ValueError):
-            return True
-        for parameter in parameters:
-            if parameter.kind is Parameter.VAR_KEYWORD:
-                return True
-            if parameter.name == "progress_callback":
-                return True
-        return False
 
     def _batch_update_fault_type(self) -> None:
         if self._operation_active:

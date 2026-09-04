@@ -531,6 +531,7 @@ class ServiceContainer:
         except Exception as exc:
             self._fail_startup(f"application configuration database: {exc}")
             return
+        self.ai_service = AiService()
 
         if self.run_persistence_database is None:
             run_path = (
@@ -556,7 +557,10 @@ class ServiceContainer:
             runtime,
             result_artifact_store=self.analysis_result_artifact_store,
         )
-        self.run_archive_service = RunArchiveService(self.run_export_reader)
+        self.run_archive_service = RunArchiveService(
+            self.run_export_reader,
+            self.ai_service,
+        )
         self.run_data_management_service = RunDataManagementService(
             runtime,
             result_artifact_store=self.analysis_result_artifact_store,
@@ -574,8 +578,6 @@ class ServiceContainer:
 
         # 把 plc工艺表里的读取方法，挂到 services 上
         self.get_process_param_values = None
-
-        self.ai_service = AiService()
 
         self.historical_metric_report_service = HistoricalMetricReportService(
             audio_data_service=self.audio_data_service,

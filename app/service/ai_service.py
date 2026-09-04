@@ -28,6 +28,7 @@ from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable
 from model.ai_execution_table import AiExecutionTable
 from model.test_config_table import TestConfigTable
+from app.service.run_record_export.contracts import AiExportValue
 
 _SUPPORTED_PROTOCOL_VERSION = 1
 _DEFAULT_EXECUTION_MODE = "resident_process"
@@ -841,6 +842,70 @@ class AiService:
             )
         except DoesNotExist:
             return None
+
+    def get_current_effective_export_values(
+        self, run_ids: tuple[str, ...]
+    ) -> dict[str, AiExportValue]:
+        """Return current successful AI display values for selected runs."""
+        if type(run_ids) is not tuple or not run_ids:
+            raise ValueError("run_ids must be a nonempty tuple")
+        for run_id in run_ids:
+            if type(run_id) is not str:
+                raise ValueError("run_ids must contain canonical UUIDv4 strings")
+            try:
+                parsed = uuid.UUID(run_id)
+            except ValueError:
+                raise ValueError(
+                    "run_ids must contain canonical UUIDv4 strings"
+                ) from None
+            if parsed.version != 4 or str(parsed) != run_id:
+                raise ValueError(
+                    "run_ids must contain canonical UUIDv4 strings"
+                )
+        if len(set(run_ids)) != len(run_ids):
+            raise ValueError("run_ids must be unique")
+
+        unavailable = AiExportValue(None, None)
+        values = {run_id: unavailable for run_id in run_ids}
+        found_run_ids: set[str] = set()
+        rows = (
+            AiExecutionTable.select(
+                AiExecutionTable.test_run_id,
+                AiExecutionTable.score,
+                AiExecutionTable.ai_label,
+            )
+            .where(
+                AiExecutionTable.test_run_id.in_(run_ids),
+                AiExecutionTable.is_current_effective == True,
+                AiExecutionTable.module_status == "success",
+            )
+            .order_by(
+                AiExecutionTable.started_time.desc(),
+                AiExecutionTable.request_id.desc(),
+            )
+        )
+        for row in rows:
+            if row.test_run_id in found_run_ids:
+                continue
+            found_run_ids.add(row.test_run_id)
+
+            score = row.score
+            if isinstance(score, bool) or not isinstance(score, (int, float)):
+                score = None
+            else:
+                try:
+                    score = float(score)
+                except (TypeError, ValueError, OverflowError):
+                    score = None
+                else:
+                    if not math.isfinite(score):
+                        score = None
+
+            label = row.ai_label
+            if not isinstance(label, str) or not label.strip():
+                label = None
+            values[row.test_run_id] = AiExportValue(score, label)
+        return values
 
     # ── Orchestrator (full run) ─────────────────────────────
 

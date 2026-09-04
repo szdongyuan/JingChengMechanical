@@ -17,7 +17,6 @@ from PyQt6.QtCore import QDateTime, Qt
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
-    QFileDialog,
     QHeaderView,
     QInputDialog,
     QMessageBox,
@@ -34,13 +33,23 @@ from app.service.run_persistence.data_management import (
     RunFaultTypeOptions,
     RunManagementRow,
 )
+from app.service.run_record_export import (
+    AudioExportFacts,
+    CurrentExportFacts,
+    RunDataExportCounts,
+    RunDataExportOptions,
+    RunDataExportReadReport,
+    RunDataExportRecord,
+    RunDataExportResult,
+)
+from app.service.run_record_export.package import write_run_data_export
 from app.service.run_scoped_playback import (
     PlaybackCode,
     PlaybackResult,
     PlaybackStatus,
     RunPlaybackRequest,
 )
-from ui.modules.data_management import DataManagementModule
+from ui.modules.data_management import DataManagementModule, _ExportWorker
 
 
 RUN_A = "11111111-1111-4111-8111-111111111111"
@@ -213,6 +222,32 @@ def _wait_for_operation_idle(
     QApplication.processEvents()
     assert module._operation_active is False
     assert module._export_worker is None
+
+
+def _export_result(
+    target_path: str,
+    *,
+    options: RunDataExportOptions,
+    selected_runs: int = 2,
+    exported_runs: int = 2,
+    skipped_runs: int = 0,
+    audio_runs_skipped: int = 0,
+    current_runs_skipped: int = 0,
+) -> RunDataExportResult:
+    return RunDataExportResult(
+        target_path=target_path,
+        output_kind=options.output_kind,
+        counts=RunDataExportCounts(
+            selected_runs=selected_runs,
+            exported_runs=exported_runs,
+            skipped_runs=skipped_runs,
+            audio_runs_emitted=0,
+            audio_runs_skipped=audio_runs_skipped,
+            audio_files_emitted=0,
+            current_runs_emitted=0,
+            current_runs_skipped=current_runs_skipped,
+        ),
+    )
 
 
 def test_playback_uses_full_uuid_first_frozen_channel_and_full_duration(qapp):
@@ -868,25 +903,104 @@ def test_batch_update_fault_type_only_shows_common_frozen_options(
     ]
 
 
-def test_export_uses_shared_operation_gate_and_archive_service(
+def test_export_warns_before_opening_settings_when_nothing_is_selected(
+    qapp,
+    monkeypatch,
+):
+    module, _management, _deleted = _module(qapp)
+    warnings = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args: warnings.append(args),
+    )
+    monkeypatch.setattr(
+        "ui.modules.data_management.choose_run_export_options",
+        lambda *args, **kwargs: pytest.fail("settings must not open"),
+    )
+
+    module._export_selected_rows()
+
+    assert warnings[0][1:] == ("提示", "请先勾选要导出的运行记录")
+    assert module._operation_active is False
+
+
+def test_export_settings_cancel_stops_before_path_selection(qapp, monkeypatch):
+    module, _management, _deleted = _module(qapp)
+    _select_all_rows(module)
+    selected_counts = []
+    monkeypatch.setattr(
+        "ui.modules.data_management.choose_run_export_options",
+        lambda _parent, *, selected_count: (
+            selected_counts.append(selected_count),
+            None,
+        )[1],
+    )
+    monkeypatch.setattr(
+        "ui.modules.data_management.choose_run_export_path",
+        lambda *args, **kwargs: pytest.fail("path chooser must not open"),
+    )
+
+    module._export_selected_rows()
+
+    assert selected_counts == [2]
+    assert module._operation_active is False
+
+
+@pytest.mark.parametrize(
+    "options",
+    (
+        RunDataExportOptions(True, False, False, False),
+        RunDataExportOptions(False, True, False, False),
+        RunDataExportOptions(False, False, True, False),
+        RunDataExportOptions(False, False, False, True),
+        RunDataExportOptions(True, True, True, True),
+    ),
+)
+def test_export_routes_output_kind_and_passes_immutable_options_to_service(
     qapp,
     monkeypatch,
     tmp_path,
+    options,
 ):
-    chosen = tmp_path / "operator-choice.zip"
+    chosen = tmp_path / f"operator-choice.{options.output_kind}"
     calls = []
 
     class ArchiveService:
-        def export(self, run_ids, target_path):
-            calls.append((run_ids, target_path))
-            return target_path
+        def inspect_selection(self, _run_ids):
+            raise AssertionError("legacy strict preflight must be unreachable")
+
+        def export(
+            self,
+            run_ids,
+            target_path,
+            *,
+            options,
+            progress_callback,
+            cancel_check,
+        ):
+            calls.append(
+                (run_ids, target_path, options, progress_callback, cancel_check)
+            )
+            cancel_check()
+            progress_callback(0, 0, "正在读取导出数据...")
+            cancel_check()
+            progress_callback(1, 1, "正在写入导出文件...")
+            return _export_result(target_path, options=options)
 
     module, _management, _deleted = _module(qapp, ArchiveService())
     _select_all_rows(module)
     monkeypatch.setattr(
-        QFileDialog,
-        "getSaveFileName",
-        lambda *args, **kwargs: (str(chosen), "Zip files (*.zip)"),
+        "ui.modules.data_management.choose_run_export_options",
+        lambda *_args, **_kwargs: options,
+    )
+    path_kinds = []
+    monkeypatch.setattr(
+        "ui.modules.data_management.choose_run_export_path",
+        lambda _parent, *, output_kind, initial_dir: (
+            path_kinds.append((output_kind, initial_dir)),
+            str(chosen),
+        )[1],
     )
     monkeypatch.setattr(QMessageBox, "information", lambda *args: None)
 
@@ -899,8 +1013,293 @@ def test_export_uses_shared_operation_gate_and_archive_service(
     assert len(calls) == 1
     assert set(calls[0][0]) == {RUN_A, RUN_B}
     assert calls[0][1] == str(chosen)
+    assert calls[0][2] is options
+    assert path_kinds == [(options.output_kind, module.data_dir)]
     assert module._operation_active is False
     assert module.btn_refresh.isEnabled()
+    module.services.audio_data_service.export_zip.assert_not_called()
+
+
+def test_export_path_cancel_stops_before_operation_starts(qapp, monkeypatch):
+    module, _management, _deleted = _module(qapp)
+    _select_all_rows(module)
+    monkeypatch.setattr(
+        "ui.modules.data_management.choose_run_export_options",
+        lambda *_args, **_kwargs: RunDataExportOptions.defaults(),
+    )
+    monkeypatch.setattr(
+        "ui.modules.data_management.choose_run_export_path",
+        lambda *_args, **_kwargs: None,
+    )
+
+    module._export_selected_rows()
+
+    assert module._operation_active is False
+    module.services.run_archive_service.export.assert_not_called()
+
+
+def test_export_worker_returned_result_is_authoritative_when_cancel_is_requested(
+    qapp,
+):
+    result = _export_result(
+        "C:/exports/runs.zip",
+        options=RunDataExportOptions.defaults(),
+    )
+    worker_ref = {}
+    succeeded = []
+    failed = []
+    canceled = []
+
+    def runner(_progress_callback, _cancel_check):
+        worker_ref["worker"].request_cancel()
+        return result
+
+    worker = _ExportWorker(runner)
+    worker_ref["worker"] = worker
+    worker.succeeded.connect(succeeded.append)
+    worker.failed.connect(failed.append)
+    worker.canceled.connect(lambda: canceled.append(True))
+
+    worker.run()
+
+    assert succeeded == [result]
+    assert failed == []
+    assert canceled == []
+
+
+def test_export_worker_reports_non_cancel_failure_even_when_cancel_is_requested(
+    qapp,
+):
+    worker_ref = {}
+    succeeded = []
+    failed = []
+    canceled = []
+
+    def runner(_progress_callback, _cancel_check):
+        worker_ref["worker"].request_cancel()
+        raise RuntimeError("database write failed")
+
+    worker = _ExportWorker(runner)
+    worker_ref["worker"] = worker
+    worker.succeeded.connect(succeeded.append)
+    worker.failed.connect(failed.append)
+    worker.canceled.connect(lambda: canceled.append(True))
+
+    worker.run()
+
+    assert succeeded == []
+    assert failed == ["database write failed"]
+    assert canceled == []
+
+
+def test_export_worker_classifies_in_kernel_progress_cancellation_and_cleans_up(
+    qapp,
+    tmp_path,
+):
+    target = tmp_path / "progress-cancel.xlsx"
+    target.write_bytes(b"existing")
+    record = RunDataExportRecord(
+        run_id=RUN_A,
+        selection_index=0,
+        accepted_at="2026-07-29T01:02:03.000000Z",
+        terminal_at="2026-07-29T01:02:04.000000Z",
+        sn="SN-001",
+        model="MODEL-A",
+        state="SUCCEEDED",
+        terminal_code="ANALYSIS_SUCCEEDED",
+        judgment="PASS",
+        judgment_source="AUTOMATIC",
+        fault_type=None,
+        audio=AudioExportFacts(None, None, None, None, None, "not selected"),
+        current=CurrentExportFacts(None, "not selected"),
+    )
+    report = RunDataExportReadReport((RUN_A,), (record,), ())
+    options = RunDataExportOptions(True, False, False, False)
+    worker_ref = {}
+    progress_events = []
+    succeeded = []
+    failed = []
+    canceled = []
+
+    def runner(progress_callback, cancel_check):
+        def arm_before_kernel_progress(completed, total, message):
+            if message == "正在写入 Excel...":
+                worker_ref["worker"].request_cancel()
+            progress_callback(completed, total, message)
+
+        return write_run_data_export(
+            report,
+            str(target),
+            ai_values={},
+            options=options,
+            progress_callback=arm_before_kernel_progress,
+            cancel_check=cancel_check,
+        )
+
+    worker = _ExportWorker(runner)
+    worker_ref["worker"] = worker
+    worker.progress_changed.connect(
+        lambda *event: progress_events.append(event)
+    )
+    worker.succeeded.connect(succeeded.append)
+    worker.failed.connect(failed.append)
+    worker.canceled.connect(lambda: canceled.append(True))
+
+    worker.run()
+
+    assert any(event[2] == "正在写入 Excel..." for event in progress_events)
+    assert succeeded == []
+    assert failed == []
+    assert canceled == [True]
+    assert target.read_bytes() == b"existing"
+    assert list(tmp_path.glob(".run-export-*.tmp")) == []
+    assert list(tmp_path.glob(".run-export-stage-*")) == []
+
+
+def test_export_progress_starts_indeterminate_then_is_monotonic(qapp, monkeypatch):
+    options = RunDataExportOptions.defaults()
+
+    class ProgressStub:
+        def __init__(self):
+            self.ranges = []
+            self.values = []
+            self.labels = []
+            self.canceled = SimpleNamespace(connect=lambda _slot: None)
+
+        def setRange(self, minimum, maximum):
+            self.ranges.append((minimum, maximum))
+
+        def setValue(self, value):
+            self.values.append(value)
+
+        def setLabelText(self, text):
+            self.labels.append(text)
+
+        def show(self):
+            pass
+
+        def close(self):
+            pass
+
+    progress = ProgressStub()
+
+    class ArchiveService:
+        def export(
+            self,
+            run_ids,
+            target_path,
+            *,
+            options,
+            progress_callback,
+            cancel_check,
+        ):
+            cancel_check()
+            progress_callback(0, 0, "正在读取...")
+            progress_callback(2, 5, "2/5")
+            progress_callback(1, 5, "late 1/5")
+            progress_callback(4, 5, "4/5")
+            return _export_result(target_path, options=options)
+
+    module, _management, _deleted = _module(qapp, ArchiveService())
+    _select_all_rows(module)
+    monkeypatch.setattr(
+        "ui.modules.data_management.choose_run_export_options",
+        lambda *_args, **_kwargs: options,
+    )
+    monkeypatch.setattr(
+        "ui.modules.data_management.choose_run_export_path",
+        lambda *_args, **_kwargs: "C:/exports/runs.zip",
+    )
+    monkeypatch.setattr(module, "_export_progress_dialog", lambda _count: progress)
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: None)
+
+    module._export_selected_rows()
+    _wait_for_operation_idle(module)
+
+    assert progress.ranges[0] == (0, 0)
+    assert (0, 5) in progress.ranges
+    assert progress.values == sorted(progress.values)
+    assert progress.values[-1] == 4
+
+
+def test_export_success_reports_exported_and_nonzero_attachment_skip_counts(
+    qapp,
+    monkeypatch,
+):
+    options = RunDataExportOptions(True, True, True, True)
+
+    class ArchiveService:
+        def export(self, run_ids, target_path, **kwargs):
+            kwargs["cancel_check"]()
+            return _export_result(
+                target_path,
+                options=options,
+                selected_runs=2,
+                exported_runs=2,
+                audio_runs_skipped=1,
+                current_runs_skipped=2,
+            )
+
+    module, _management, _deleted = _module(qapp, ArchiveService())
+    _select_all_rows(module)
+    messages = []
+    monkeypatch.setattr(
+        "ui.modules.data_management.choose_run_export_options",
+        lambda *_args, **_kwargs: options,
+    )
+    monkeypatch.setattr(
+        "ui.modules.data_management.choose_run_export_path",
+        lambda *_args, **_kwargs: "C:/exports/runs.zip",
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "information",
+        lambda *args: messages.append(args),
+    )
+
+    module._export_selected_rows()
+    _wait_for_operation_idle(module)
+
+    assert messages[0][1] == "导出完成"
+    assert "已导出 2 条运行记录" in messages[0][2]
+    assert "音频文件缺失或跳过 1 条" in messages[0][2]
+    assert "电流数据缺失或跳过 2 条" in messages[0][2]
+    assert "C:/exports/runs.zip" in messages[0][2]
+
+
+def test_export_failure_restores_every_operation_control(qapp, monkeypatch):
+    options = RunDataExportOptions.defaults()
+
+    class ArchiveService:
+        def export(self, *args, **kwargs):
+            kwargs["cancel_check"]()
+            raise RuntimeError("database unavailable")
+
+    module, _management, _deleted = _module(qapp, ArchiveService())
+    _select_all_rows(module)
+    module.btn_statistics_report.setEnabled(False)
+    before = tuple(control.isEnabled() for control in module._operation_controls())
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.data_management.choose_run_export_options",
+        lambda *_args, **_kwargs: options,
+    )
+    monkeypatch.setattr(
+        "ui.modules.data_management.choose_run_export_path",
+        lambda *_args, **_kwargs: "C:/exports/runs.zip",
+    )
+    monkeypatch.setattr(
+        QMessageBox,
+        "warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module._export_selected_rows()
+    _wait_for_operation_idle(module)
+
+    after = tuple(control.isEnabled() for control in module._operation_controls())
+    assert after == before
+    assert "database unavailable" in warnings[0][2]
     module.services.audio_data_service.export_zip.assert_not_called()
 
 
@@ -915,23 +1314,38 @@ def test_export_cancel_restores_controls_and_reports_canceled(
     calls = []
     messages = []
     warnings = []
+    options = RunDataExportOptions.defaults()
 
     class ArchiveService:
-        def export(self, run_ids, target_path, *, progress_callback=None):
+        def export(
+            self,
+            run_ids,
+            target_path,
+            *,
+            options,
+            progress_callback,
+            cancel_check,
+        ):
             calls.append((run_ids, target_path))
-            assert progress_callback is not None
-            progress_callback(0, 2, "正在导出运行记录...")
+            cancel_check()
+            progress_callback(0, 0, "正在读取运行记录...")
             progress_seen.set()
             assert continue_export.wait(2)
-            progress_callback(1, 2, "正在写入压缩包 1/2...")
-            return target_path
+            cancel_check()
+            return _export_result(target_path, options=options)
 
     module, _management, _deleted = _module(qapp, ArchiveService())
     _select_all_rows(module)
+    controls_before = tuple(
+        control.isEnabled() for control in module._operation_controls()
+    )
     monkeypatch.setattr(
-        QFileDialog,
-        "getSaveFileName",
-        lambda *args, **kwargs: (str(chosen), "Zip files (*.zip)"),
+        "ui.modules.data_management.choose_run_export_options",
+        lambda *_args, **_kwargs: options,
+    )
+    monkeypatch.setattr(
+        "ui.modules.data_management.choose_run_export_path",
+        lambda *_args, **_kwargs: str(chosen),
     )
     monkeypatch.setattr(
         QMessageBox,
@@ -953,7 +1367,9 @@ def test_export_cancel_restores_controls_and_reports_canceled(
     _wait_for_operation_idle(module)
 
     assert len(calls) == 1
-    assert module.btn_refresh.isEnabled()
+    assert tuple(
+        control.isEnabled() for control in module._operation_controls()
+    ) == controls_before
     assert warnings == []
     assert messages
     assert messages[0][1] == "导出已取消"
