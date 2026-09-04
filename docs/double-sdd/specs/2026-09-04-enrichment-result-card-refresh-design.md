@@ -82,7 +82,7 @@
 - 调用现有卡片摘要更新路径更新表格；
 - 同时重放终态 metric view，使顶部“平均声压级/平均响度”使用新摘要；
 - 保持卡片 QWidget 实例、manual judgment 控件父子关系、滚动位置、选中状态和 revision 不变；
-- run 不存在、仍活动或卡片已销毁时返回未应用，不新增错误状态。
+- run 不存在、仍活动或已从 `_card_entries` 所有权映射移除时返回未应用，不新增错误状态。模块在隐藏/`deleteLater` 前先移除映射，因此不为理论上的“已销毁但仍登记”状态增加第二层 QObject 检查。
 
 `ResultHistoryModule` 的 payload provider 必须改为 overlay-aware provider：对于同一有效
 Decision identity，始终返回“当前权威 Decision/人工 payload + 已缓存 Enrichment”的最新 display
