@@ -188,6 +188,24 @@ class ResultHistoryModule(QWidget):
             self.setUpdatesEnabled(True)
             self.update()
 
+    def refresh_terminal_payload(
+        self,
+        run_id: str,
+        payload: ReviewDisplayPayload,
+    ) -> bool:
+        entry = self._card_entries.get(run_id)
+        if (
+            entry is None
+            or entry[0].is_active_run
+            or entry[0].phase is not ResultPhase.TERMINAL
+        ):
+            return False
+        snapshot, card = entry
+        card.refresh_measurement_summary(payload)
+        self._replay_metric_view(snapshot, card, payload)
+        card.update()
+        return True
+
     def project_decision_revision(
         self,
         run_id: str,

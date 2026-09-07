@@ -753,7 +753,14 @@ class ResultHistoryCard(QFrame):
             self._overall_text(summary),
             self._overall_color(summary),
         )
+        self._update_summary_rows(summary)
 
+    def refresh_measurement_summary(self, payload: object | None) -> None:
+        """Refresh payload-backed rows without changing card judgment state."""
+
+        self._update_summary_rows(self._review_summary(payload))
+
+    def _update_summary_rows(self, summary: dict | None) -> None:
         raw_rows = summary.get("rows") if summary is not None else None
         if not isinstance(raw_rows, list):
             raw_rows = []

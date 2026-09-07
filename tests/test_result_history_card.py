@@ -805,6 +805,75 @@ def test_manual_preview_refits_ng_then_restores_ok_default_size(qapp):
     assert "#188038" in overall.styleSheet().lower()
 
 
+def test_measurement_summary_refresh_preserves_pending_manual_preview(qapp):
+    configured = _snapshot(
+        conclusion=ResultConclusion.NG,
+        fault_type="异响",
+    )
+    snapshot = replace(
+        configured,
+        conclusion=ResultConclusion.OK,
+        fault_type=None,
+    )
+    card = ResultHistoryCard(snapshot)
+    card.preview_manual_judgment("NG", "异响")
+    preview_snapshot = card._snapshot
+    overall = card.findChild(
+        QLabel,
+        "result_history_card_summary_overall",
+    )
+    preview = (
+        overall.text(),
+        overall.styleSheet(),
+        card.property("resultState"),
+        card.accessibleDescription(),
+    )
+    payload = ReviewDisplayPayload(
+        review={
+            "summary_payload": {
+                "overall_status": "pass",
+                "overall_label": "通过",
+                "rows": [
+                    {
+                        "item_key": key,
+                        "actual_display": display,
+                        "status": "pass",
+                        "result_display": "PASS",
+                    }
+                    for key, display in (
+                        ("spl", "58.14 dB"),
+                        ("spl_average", "53.71 dB"),
+                        ("loudness", "11.10 sone"),
+                        ("loudness_average", "8.08 sone"),
+                        ("stft_score", "0.83"),
+                        ("ai", "97.50 %"),
+                    )
+                ],
+            }
+        },
+        dashboard_config={},
+    )
+
+    card.refresh_measurement_summary(payload)
+
+    table = _summary_table(card)
+    assert tuple(table.item(row, 1).text() for row in range(6)) == (
+        "58.14 dB",
+        "53.71 dB",
+        "11.10 sone",
+        "8.08 sone",
+        "0.83",
+        "97.50 %",
+    )
+    assert card._snapshot is preview_snapshot
+    assert (
+        overall.text(),
+        overall.styleSheet(),
+        card.property("resultState"),
+        card.accessibleDescription(),
+    ) == preview
+
+
 def test_adaptive_status_refits_same_label_when_card_narrows_then_widens(qapp):
     full_status = "不通过：风扇异常"
     card = ResultHistoryCard(

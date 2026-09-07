@@ -139,6 +139,38 @@ def _card_for(module: QWidget, run_id: str) -> ResultHistoryCard:
     raise AssertionError(f"card not found: {run_id}")
 
 
+def _complete_review_payload(*, loudness_unit: str = "sone"):
+    loudness_peak = "11.10 sone" if loudness_unit == "sone" else "84.20 phon"
+    loudness_average = "8.08 sone" if loudness_unit == "sone" else "79.40 phon"
+    rows = [
+        ("spl", "58.14 dB"),
+        ("spl_average", "53.71 dB"),
+        ("loudness", loudness_peak),
+        ("loudness_average", loudness_average),
+        ("stft_score", "0.83"),
+        ("ai", "97.50 %"),
+    ]
+    return ReviewDisplayPayload(
+        review={
+            "summary_payload": {
+                "overall_status": "pass",
+                "overall_label": "通过",
+                "rows": [
+                    {
+                        "item_key": key,
+                        "actual_display": display,
+                        "current_display": "CH0",
+                        "status": "pass",
+                        "result_display": "PASS",
+                    }
+                    for key, display in rows
+                ],
+            }
+        },
+        dashboard_config={"config_id": 1},
+    )
+
+
 def _metric(module: QWidget, run_id: str, name: str) -> str:
     card = _card_for(module, run_id)
     label = card.findChild(QLabel, f"result_history_card_metric_{name}")
@@ -756,6 +788,103 @@ def test_changed_snapshot_updates_existing_card_and_preserves_scroll(qapp):
     ):
         assert current[run_id] is identities[run_id]
     assert scroll.verticalScrollBar().value() == initial_scroll
+
+
+def test_refresh_terminal_payload_updates_one_card_in_place_without_side_effects(
+    qapp,
+):
+    actions = QWidget()
+    actions.setLayout(QVBoxLayout())
+    actions.layout().addWidget(QPushButton("manual action", actions))
+    module = ResultHistoryModule(manual_judgment_widget=actions)
+    terminal_cards = tuple(
+        _card(f"terminal-{index}", index=index + 1) for index in range(5)
+    )
+    active = _card("active", active=True, index=20)
+    reanalyzing = replace(
+        _card("reanalyzing", index=21),
+        phase=ResultPhase.REANALYZING,
+        manual_judgment_allowed=False,
+        manual_reanalysis_allowed=False,
+        operation_id="operation-1",
+    )
+    snapshot = _snapshot(
+        active_cards=(active,),
+        terminal_cards=(*terminal_cards, reanalyzing),
+        follow_latest=False,
+        selected_run_id="terminal-3",
+    )
+    module.render_snapshot(snapshot)
+    module.resize(360, 260)
+    module.show()
+    qapp.processEvents()
+    target = _card_for(module, "terminal-3")
+    target_snapshot = module._card_entries["terminal-3"][0]
+    scroll = _find(module, QScrollArea, "result_history_scroll")
+    scrollbar = scroll.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum() // 2)
+    scroll_value = scrollbar.value()
+    card_order = tuple(module._cards)
+    manual_parent = actions.parentWidget()
+
+    assert module.refresh_terminal_payload(
+        "terminal-3", _complete_review_payload()
+    ) is True
+    qapp.processEvents()
+
+    table = _find(
+        target,
+        QTableWidget,
+        "result_history_card_summary_table",
+    )
+    assert tuple(table.item(row, 1).text() for row in range(6)) == (
+        "58.14 dB",
+        "53.71 dB",
+        "11.10 sone",
+        "8.08 sone",
+        "0.83",
+        "97.50 %",
+    )
+    assert _metric(module, "terminal-3", "spl") == "53.71 dB"
+    assert _metric(module, "terminal-3", "loudness") == "8.08 sone"
+    assert _card_for(module, "terminal-3") is target
+    assert module._card_entries["terminal-3"][0] is target_snapshot
+    assert tuple(module._cards) == card_order
+    assert module._rendered_snapshot is snapshot
+    assert module._rendered_snapshot.selected_run_id == "terminal-3"
+    assert scrollbar.value() == scroll_value
+    assert actions.parentWidget() is manual_parent
+    assert manual_parent is target.manual_judgment_slot
+
+    assert module.refresh_terminal_payload(
+        "terminal-3", _complete_review_payload(loudness_unit="phon")
+    ) is True
+    assert tuple(table.item(row, 1).text() for row in range(6))[2:4] == (
+        "84.20 phon",
+        "79.40 phon",
+    )
+    assert _metric(module, "terminal-3", "loudness") == "79.40 phon"
+    before_invalid = tuple(table.item(row, 1).text() for row in range(6))
+    assert module.refresh_terminal_payload("missing", _complete_review_payload()) is False
+    assert module.refresh_terminal_payload("active", _complete_review_payload()) is False
+    assert module.refresh_terminal_payload(
+        "reanalyzing", _complete_review_payload()
+    ) is False
+    assert tuple(table.item(row, 1).text() for row in range(6)) == before_invalid
+
+    module.render_snapshot(
+        _snapshot(
+            active_cards=(active,),
+            terminal_cards=(*terminal_cards[:3], *terminal_cards[4:], reanalyzing),
+            follow_latest=False,
+            selected_run_id="terminal-2",
+            revision=2,
+        )
+    )
+    assert "terminal-3" not in module._card_entries
+    assert module.refresh_terminal_payload(
+        "terminal-3", _complete_review_payload()
+    ) is False
 
 
 def test_recording_to_analysis_phases_update_one_card_without_geometry_jitter(

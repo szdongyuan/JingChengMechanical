@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from threading import Event
 
 import pytest
 from PyQt6.QtCore import QThread
 from PyQt6.QtGui import QPaintEvent
-from PyQt6.QtWidgets import QApplication, QLabel, QWidget
+from PyQt6.QtWidgets import QApplication, QLabel, QTableWidget, QWidget
 
 from app.service.multi_run_integration.history_qt_adapter import HistoryQtAdapter
 from app.services_container import _PostDurableHistorySink
@@ -20,6 +21,7 @@ from app.service.multi_run_coordinator_mvp import (
     TerminalConclusion,
 )
 from ui.modules.result_dashboard import ResultDashboardModule
+from ui.widgets.result_history_card import ResultHistoryCard
 from tests.multi_run_integration.fakes import history_labels
 from tests.test_result_dashboard_module import _config, _panel, _services
 
@@ -45,7 +47,13 @@ from app.service.plc_result_sequencer import (
     PlcOperationKind,
     PlcResultSequencer,
 )
-from app.service.result_history import ActiveRunRemoved, ResultHistoryStore
+from app.service.result_history import (
+    ActiveRunRemoved,
+    ResultHistorySnapshot,
+    ResultHistoryStore,
+    ReviewDisplayPayload,
+)
+from app.service.result_history_contracts import ResultOperationAccepted
 from tests.multi_run_coordinator_mvp._support import (
     ATTEMPT_IDS,
     Harness,
@@ -100,6 +108,108 @@ def _canonical_result(*, charts: dict[str, object]) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _production_shaped_result(
+    *,
+    charts: dict[str, object],
+    complete: bool,
+    summary_valid: bool = True,
+) -> str:
+    result = json.loads(_canonical_result(charts=charts))
+    if not summary_valid:
+        result["result"]["summary_payload"] = ["invalid"]
+        return json.dumps(
+            result,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    measurement_displays = (
+        {
+            "spl": "58.14 dB",
+            "spl_average": "53.71 dB",
+            "loudness": "11.10 sone",
+            "loudness_average": "8.08 sone",
+            "stft_score": "0.83",
+        }
+        if complete
+        else {
+            "spl": "--",
+            "spl_average": "--",
+            "loudness": "--",
+            "loudness_average": "--",
+            "stft_score": "--",
+        }
+    )
+    rows = [
+        {
+            "item_key": key,
+            "actual_display": display,
+            "current_display": "CH0",
+            "status": "pass",
+            "result_display": "PASS",
+        }
+        for key, display in measurement_displays.items()
+    ]
+    rows.extend(
+        (
+            {
+                "item_key": "ai",
+                "actual_display": "1.00 %" if complete else "97.50 %",
+                "current_display": "CH0",
+                "status": "fail" if complete else "pass",
+                "result_display": "FAIL" if complete else "PASS",
+            },
+            {
+                "item_key": "fft_score",
+                "actual_display": "0.91",
+                "current_display": "CH0",
+                "status": "pass",
+                "result_display": "PASS",
+            },
+        )
+    )
+    result["result"]["summary_payload"]["rows"] = rows
+    return json.dumps(
+        result,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _history_card(dashboard: ResultDashboardModule, run_id: str):
+    return next(
+        card
+        for card in dashboard._history_module.findChildren(ResultHistoryCard)
+        if card.property("run_id") == run_id and not card.isHidden()
+    )
+
+
+def _card_table_values(card: ResultHistoryCard) -> tuple[str, ...]:
+    table = card.findChild(QTableWidget, "result_history_card_summary_table")
+    assert table is not None
+    return tuple(table.item(row, 1).text() for row in range(table.rowCount()))
+
+
+def _assert_complete_card(card: ResultHistoryCard) -> None:
+    assert _card_table_values(card) == (
+        "58.14 dB",
+        "53.71 dB",
+        "11.10 sone",
+        "8.08 sone",
+        "0.83",
+        "97.50 %",
+    )
+    assert card.findChild(
+        QLabel, "result_history_card_metric_spl"
+    ).text() == "53.71 dB"
+    assert card.findChild(
+        QLabel, "result_history_card_metric_loudness"
+    ).text() == "8.08 sone"
 
 
 def _bridge_payload(attempt_id: str, value: str) -> FrozenPayload:
@@ -452,6 +562,463 @@ def test_dashboard_paints_summary_then_fills_matching_charts_without_card_change
     assert dashboard.panel_widget("spectrum").has_committed_plot_data() is True
 
 
+def test_selected_card_refreshes_complete_enrichment_summary_in_place(
+    qapp,
+) -> None:
+    run_id = captured_request().run_id
+    attempt_id = ATTEMPT_IDS[0]
+    decision_json = _production_shaped_result(charts={}, complete=False)
+    terminal_revision = hashlib.sha256(decision_json.encode("utf-8")).hexdigest()
+    full_json = _production_shaped_result(
+        charts={
+            "0": {
+                "fft": {
+                    "frequencies_hz": [100.0, 200.0],
+                    "levels_db": [-3.0, -4.0],
+                }
+            }
+        },
+        complete=True,
+    )
+    dashboard = ResultDashboardModule(_services())
+    adapter = HistoryQtAdapter(dashboard)
+    painted = []
+    dashboard.decisionPainted.connect(lambda *args: painted.append(args))
+    dashboard.show()
+    adapter.publish(
+        _decision_history_event(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            decision_json=decision_json,
+            terminal_revision=terminal_revision,
+        )
+    )
+    _drain(qapp)
+
+    before_snapshot = dashboard.history_snapshot()
+    before_card = _history_card(dashboard, run_id)
+    before_terminal = before_snapshot.terminal_cards[0]
+    assert _card_table_values(before_card) == (
+        "--",
+        "--",
+        "--",
+        "--",
+        "--",
+        "97.50 %",
+    )
+    assert before_card.findChild(
+        QLabel, "result_history_card_metric_spl"
+    ).text() == "--"
+    assert before_card.findChild(
+        QLabel, "result_history_card_metric_loudness"
+    ).text() == "--"
+    assert len(painted) == 1
+
+    adapter.publish_enrichment(
+        ResultEnrichmentProjection(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            terminal_revision=terminal_revision,
+            expected_revision=4,
+            result_payload=_bridge_payload(attempt_id, full_json),
+        )
+    )
+    _drain(qapp)
+
+    after_snapshot = dashboard.history_snapshot()
+    after_card = _history_card(dashboard, run_id)
+    assert after_card is before_card
+    _assert_complete_card(after_card)
+    assert after_card.findChild(
+        QLabel, "result_history_card_summary_overall"
+    ).text() == "通过"
+    assert after_snapshot.revision == before_snapshot.revision
+    assert after_snapshot.selected_run_id == before_snapshot.selected_run_id
+    assert after_snapshot.terminal_cards == before_snapshot.terminal_cards
+    assert after_snapshot.terminal_cards[0].terminated_at == before_terminal.terminated_at
+    assert tuple(card.run_id for card in after_snapshot.terminal_cards) == tuple(
+        card.run_id for card in before_snapshot.terminal_cards
+    )
+    assert len(painted) == 1
+    dashboard.close()
+    _drain(qapp)
+
+
+def test_pending_manual_preview_survives_enrichment_and_refresh(qapp) -> None:
+    run_id = captured_request().run_id
+    attempt_id = ATTEMPT_IDS[0]
+    fault_type = "异响"
+    decision_json = _production_shaped_result(charts={}, complete=False)
+    terminal_revision = hashlib.sha256(decision_json.encode("utf-8")).hexdigest()
+    dashboard = ResultDashboardModule(_services())
+    adapter = HistoryQtAdapter(dashboard)
+    dashboard.show()
+    adapter.publish(
+        _decision_history_event(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            decision_json=decision_json,
+            terminal_revision=terminal_revision,
+            fault_types=(fault_type, "漏装"),
+        )
+    )
+    _drain(qapp)
+    card = _history_card(dashboard, run_id)
+    request = dashboard.request_manual_judgment("NG", fault_type)
+    assert type(request) is ResultOperationAccepted
+    preview = (
+        card.findChild(QLabel, "result_history_card_summary_overall").text(),
+        card.property("resultState"),
+        card.accessibleDescription(),
+    )
+    assert preview == ("不通过：异响", "ng", "结果状态：不通过")
+    assert "#d93025" in card.findChild(
+        QLabel, "result_history_card_summary_overall"
+    ).styleSheet().lower()
+
+    adapter.publish_enrichment(
+        ResultEnrichmentProjection(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            terminal_revision=terminal_revision,
+            expected_revision=4,
+            result_payload=_bridge_payload(
+                attempt_id,
+                _production_shaped_result(charts={}, complete=True),
+            ),
+        )
+    )
+    _drain(qapp)
+    dashboard.refresh_history_projection()
+
+    assert _history_card(dashboard, run_id) is card
+    _assert_complete_card(card)
+    assert (
+        card.findChild(QLabel, "result_history_card_summary_overall").text(),
+        card.property("resultState"),
+        card.accessibleDescription(),
+    ) == preview
+    assert card._snapshot.conclusion.name == "NG"
+    assert card._snapshot.fault_type == fault_type
+
+    adapter.publish(
+        _manual_history_event(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            decision_json=decision_json,
+            expected_revision=4,
+            fault_type=fault_type,
+        )
+    )
+    _drain(qapp)
+
+    committed = dashboard.history_snapshot().terminal_cards[0]
+    assert committed.conclusion.name == "NG"
+    assert committed.fault_type == fault_type
+    assert committed.manual_judgment_revision == committed.revision == 5
+    _assert_complete_card(card)
+    assert card.findChild(
+        QLabel, "result_history_card_summary_overall"
+    ).text() == "不通过：异响"
+    assert card.property("resultState") == "ng"
+    dashboard.close()
+    _drain(qapp)
+
+
+def test_valid_enrichment_chart_with_invalid_summary_preserves_card_text(
+    qapp,
+) -> None:
+    run_id = captured_request().run_id
+    attempt_id = ATTEMPT_IDS[0]
+    decision_json = _production_shaped_result(charts={}, complete=False)
+    terminal_revision = hashlib.sha256(decision_json.encode("utf-8")).hexdigest()
+    dashboard = ResultDashboardModule(_services())
+    adapter = HistoryQtAdapter(dashboard)
+    dashboard.show()
+    adapter.publish(
+        _decision_history_event(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            decision_json=decision_json,
+            terminal_revision=terminal_revision,
+        )
+    )
+    _drain(qapp)
+    card = _history_card(dashboard, run_id)
+    before = (
+        _card_table_values(card),
+        card.findChild(QLabel, "result_history_card_metric_spl").text(),
+        card.findChild(QLabel, "result_history_card_metric_loudness").text(),
+    )
+
+    adapter.publish_enrichment(
+        ResultEnrichmentProjection(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            terminal_revision=terminal_revision,
+            expected_revision=4,
+            result_payload=_bridge_payload(
+                attempt_id,
+                _production_shaped_result(
+                    charts={
+                        "0": {
+                            "fft": {
+                                "frequencies_hz": [100.0],
+                                "levels_db": [-3.0],
+                            }
+                        }
+                    },
+                    complete=True,
+                    summary_valid=False,
+                ),
+            ),
+        )
+    )
+    _drain(qapp)
+
+    assert dashboard.panel_widget("spectrum").has_committed_plot_data() is True
+    assert (
+        _card_table_values(card),
+        card.findChild(QLabel, "result_history_card_metric_spl").text(),
+        card.findChild(QLabel, "result_history_card_metric_loudness").text(),
+    ) == before
+    dashboard.close()
+    _drain(qapp)
+
+
+def test_partial_enrichment_overlay_preserves_missing_current_rows_and_order():
+    current = ReviewDisplayPayload(
+        review={
+            "summary_payload": {
+                "overall_status": "fail",
+                "overall_label": "不通过（异响）",
+                "error_message": "decision-error",
+                "manual_fault": "异响",
+                "rows": [
+                    {"item_key": "spl", "actual_display": "--"},
+                    {"item_key": "spl_average", "actual_display": "40.00 dB"},
+                    {"item_key": "loudness", "actual_display": "--"},
+                    {
+                        "item_key": "loudness_average",
+                        "actual_display": "4.00 sone",
+                    },
+                    {"item_key": "stft_score", "actual_display": "0.40"},
+                    {
+                        "item_key": "ai",
+                        "actual_display": "97.50 %",
+                        "status": "pass",
+                        "result_display": "PASS",
+                    },
+                    {"item_key": "octave_score", "actual_display": "0.75"},
+                ],
+            },
+            "chart_payload": {"old": {"value": 1}},
+            "decision_only": "preserved",
+        },
+        dashboard_config={"config_id": 7, "layout": "decision"},
+    )
+    enrichment = ReviewDisplayPayload(
+        review={
+            "summary_payload": {
+                "overall_status": "pass",
+                "overall_label": "通过",
+                "error_message": "enrichment-error",
+                "manual_fault": "overwritten",
+                "rows": [
+                    {"item_key": "spl", "actual_display": "58.14 dB"},
+                    {
+                        "item_key": "loudness_average",
+                        "actual_display": "8.08 sone",
+                    },
+                    {
+                        "item_key": "ai",
+                        "actual_display": "1.00 %",
+                        "status": "fail",
+                        "result_display": "FAIL",
+                    },
+                    {"item_key": "fft_score", "actual_display": "0.91"},
+                ],
+            },
+            "chart_payload": {"0": {"fft": {"frequencies_hz": [100.0]}}},
+        },
+        dashboard_config={"config_id": 99, "layout": "enrichment"},
+    )
+    current_before = deepcopy(current)
+    enrichment_before = deepcopy(enrichment)
+
+    overlay = ResultDashboardModule._merge_enrichment_display_overlay(
+        current,
+        enrichment,
+    )
+
+    assert overlay.dashboard_config == current.dashboard_config
+    assert overlay.review["decision_only"] == "preserved"
+    assert overlay.review["chart_payload"] == enrichment.review["chart_payload"]
+    summary = overlay.review["summary_payload"]
+    assert {
+        key: summary[key]
+        for key in (
+            "overall_status",
+            "overall_label",
+            "error_message",
+            "manual_fault",
+        )
+    } == {
+        "overall_status": "fail",
+        "overall_label": "不通过（异响）",
+        "error_message": "decision-error",
+        "manual_fault": "异响",
+    }
+    assert [row["item_key"] for row in summary["rows"]] == [
+        "spl",
+        "spl_average",
+        "loudness",
+        "loudness_average",
+        "stft_score",
+        "ai",
+        "octave_score",
+        "fft_score",
+    ]
+    rows = {row["item_key"]: row for row in summary["rows"]}
+    assert rows["spl"]["actual_display"] == "58.14 dB"
+    assert rows["spl_average"]["actual_display"] == "40.00 dB"
+    assert rows["loudness"]["actual_display"] == "--"
+    assert rows["loudness_average"]["actual_display"] == "8.08 sone"
+    assert rows["stft_score"]["actual_display"] == "0.40"
+    assert rows["octave_score"]["actual_display"] == "0.75"
+    assert rows["fft_score"]["actual_display"] == "0.91"
+    assert rows["ai"]["actual_display"] == "97.50 %"
+    assert rows["ai"]["result_display"] == "PASS"
+    assert current == current_before
+    assert enrichment == enrichment_before
+
+
+def test_cached_enrichment_recovers_after_initial_card_refresh_miss(qapp) -> None:
+    run_id = captured_request().run_id
+    attempt_id = ATTEMPT_IDS[0]
+    decision_json = _production_shaped_result(charts={}, complete=False)
+    terminal_revision = hashlib.sha256(decision_json.encode("utf-8")).hexdigest()
+    dashboard = ResultDashboardModule(_services())
+    adapter = HistoryQtAdapter(dashboard)
+    dashboard.show()
+    adapter.publish(
+        _decision_history_event(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            decision_json=decision_json,
+            terminal_revision=terminal_revision,
+        )
+    )
+    _drain(qapp)
+    card = _history_card(dashboard, run_id)
+    refresh_terminal_payload = dashboard._history_module.refresh_terminal_payload
+    missed = []
+
+    def miss_first_refresh(*args):
+        missed.append(args[0])
+        return False
+
+    dashboard._history_module.refresh_terminal_payload = miss_first_refresh
+    adapter.publish_enrichment(
+        ResultEnrichmentProjection(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            terminal_revision=terminal_revision,
+            expected_revision=4,
+            result_payload=_bridge_payload(
+                attempt_id,
+                _production_shaped_result(
+                    charts={
+                        "0": {
+                            "fft": {
+                                "frequencies_hz": [100.0],
+                                "levels_db": [-3.0],
+                            }
+                        }
+                    },
+                    complete=True,
+                ),
+            ),
+        )
+    )
+    _drain(qapp)
+
+    assert missed == [run_id]
+    assert _card_table_values(card)[:5] == ("--", "--", "--", "--", "--")
+    assert dashboard.panel_widget("spectrum").has_committed_plot_data() is True
+    assert dashboard._applied_enrichment_keys == {
+        (run_id, attempt_id, terminal_revision)
+    }
+
+    dashboard._history_module.refresh_terminal_payload = refresh_terminal_payload
+    dashboard.refresh_history_projection()
+    _assert_complete_card(card)
+    dashboard.close()
+    _drain(qapp)
+
+
+def test_mismatched_enrichment_keeps_existing_overlay_and_does_not_refresh(
+    qapp,
+) -> None:
+    run_id = captured_request().run_id
+    attempt_id = ATTEMPT_IDS[0]
+    decision_json = _production_shaped_result(charts={}, complete=False)
+    terminal_revision = hashlib.sha256(decision_json.encode("utf-8")).hexdigest()
+    dashboard = ResultDashboardModule(_services())
+    adapter = HistoryQtAdapter(dashboard)
+    painted = []
+    dashboard.decisionPainted.connect(lambda *args: painted.append(args))
+    dashboard.show()
+    adapter.publish(
+        _decision_history_event(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            decision_json=decision_json,
+            terminal_revision=terminal_revision,
+        )
+    )
+    _drain(qapp)
+    full_json = _production_shaped_result(charts={}, complete=True)
+    adapter.publish_enrichment(
+        ResultEnrichmentProjection(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            terminal_revision=terminal_revision,
+            expected_revision=4,
+            result_payload=_bridge_payload(attempt_id, full_json),
+        )
+    )
+    _drain(qapp)
+    _assert_complete_card(_history_card(dashboard, run_id))
+    refresh_calls = []
+    refresh_terminal_payload = dashboard._history_module.refresh_terminal_payload
+
+    def count_refresh(*args):
+        refresh_calls.append(args[0])
+        return refresh_terminal_payload(*args)
+
+    dashboard._history_module.refresh_terminal_payload = count_refresh
+    adapter.publish_enrichment(
+        ResultEnrichmentProjection(
+            run_id=run_id,
+            attempt_id=attempt_id,
+            terminal_revision="b" * 64,
+            expected_revision=4,
+            result_payload=_bridge_payload(attempt_id, full_json),
+        )
+    )
+    _drain(qapp)
+
+    _assert_complete_card(_history_card(dashboard, run_id))
+    assert refresh_calls == []
+    assert dashboard._applied_enrichment_keys == {
+        (run_id, attempt_id, terminal_revision)
+    }
+    assert len(painted) == 1
+    dashboard.close()
+    _drain(qapp)
+
+
 def test_dashboard_ignores_enrichment_after_selection_changes(qapp) -> None:
     first_run = captured_request().run_id
     second_run = "00000000-0000-4000-8000-000000000002"
@@ -785,7 +1352,7 @@ def test_unselected_matching_enrichment_is_retained_until_selection(qapp) -> Non
     second_run = "00000000-0000-4000-8000-000000000002"
     first_attempt = ATTEMPT_IDS[0]
     second_attempt = "10000000-0000-4000-8000-000000000002"
-    decision_json = _canonical_result(charts={})
+    decision_json = _production_shaped_result(charts={}, complete=False)
     terminal_revision = hashlib.sha256(decision_json.encode("utf-8")).hexdigest()
     dashboard = ResultDashboardModule(_services())
     adapter = HistoryQtAdapter(dashboard)
@@ -804,7 +1371,7 @@ def test_unselected_matching_enrichment_is_retained_until_selection(qapp) -> Non
             )
         )
         _drain(qapp)
-    full_json = _canonical_result(
+    full_json = _production_shaped_result(
         charts={
             "0": {
                 "fft": {
@@ -812,7 +1379,8 @@ def test_unselected_matching_enrichment_is_retained_until_selection(qapp) -> Non
                     "levels_db": [-3.0],
                 }
             }
-        }
+        },
+        complete=True,
     )
     painted = []
     dashboard.decisionPainted.connect(lambda *args: painted.append(args))
@@ -831,8 +1399,10 @@ def test_unselected_matching_enrichment_is_retained_until_selection(qapp) -> Non
     assert dashboard.selected_run_id() == second_run
     assert painted == []
     assert dashboard.panel_widget("spectrum").has_committed_plot_data() is False
+    _assert_complete_card(_history_card(dashboard, first_run))
     dashboard.set_follow_latest(False)
     dashboard.select_run(first_run)
+    _assert_complete_card(_history_card(dashboard, first_run))
     assert dashboard.panel_widget("spectrum").has_committed_plot_data() is True
 
 
@@ -842,9 +1412,9 @@ def test_manual_fault_then_new_recording_keeps_late_charts_on_one_reselection(
     old_run = captured_request().run_id
     new_run = "00000000-0000-4000-8000-000000000002"
     attempt_id = ATTEMPT_IDS[0]
-    decision_json = _canonical_result(charts={})
+    decision_json = _production_shaped_result(charts={}, complete=False)
     terminal_revision = hashlib.sha256(decision_json.encode("utf-8")).hexdigest()
-    full_json = _canonical_result(
+    full_json = _production_shaped_result(
         charts={
             "0": {
                 "fft": {
@@ -852,7 +1422,8 @@ def test_manual_fault_then_new_recording_keeps_late_charts_on_one_reselection(
                     "levels_db": [-3.0],
                 }
             }
-        }
+        },
+        complete=True,
     )
     dashboard = ResultDashboardModule(_services())
     adapter = HistoryQtAdapter(dashboard)
@@ -894,6 +1465,7 @@ def test_manual_fault_then_new_recording_keeps_late_charts_on_one_reselection(
         )
     )
     _drain(qapp)
+    _assert_complete_card(_history_card(dashboard, old_run))
     dashboard.select_run(old_run)
 
     card = dashboard.history_snapshot().terminal_cards[0]
@@ -901,6 +1473,7 @@ def test_manual_fault_then_new_recording_keeps_late_charts_on_one_reselection(
     assert card.conclusion.name == "NG"
     assert card.fault_type == "异响"
     assert card.manual_judgment_revision == card.revision == 5
+    _assert_complete_card(_history_card(dashboard, old_run))
     assert dashboard.panel_widget("spectrum").has_committed_plot_data() is True
     assert dashboard._factory_display.review_payload.summary_payload[
         "overall_status"
@@ -918,7 +1491,7 @@ def test_manual_before_enrichment_updates_selected_charts_without_summary_loss(
 ) -> None:
     run_id = captured_request().run_id
     attempt_id = ATTEMPT_IDS[0]
-    decision_json = _canonical_result(charts={})
+    decision_json = _production_shaped_result(charts={}, complete=False)
     terminal_revision = hashlib.sha256(decision_json.encode("utf-8")).hexdigest()
     dashboard = ResultDashboardModule(_services())
     adapter = HistoryQtAdapter(dashboard)
@@ -951,7 +1524,7 @@ def test_manual_before_enrichment_updates_selected_charts_without_summary_loss(
             expected_revision=5,
             result_payload=_bridge_payload(
                 attempt_id,
-                _canonical_result(
+                _production_shaped_result(
                     charts={
                         "0": {
                             "fft": {
@@ -959,7 +1532,8 @@ def test_manual_before_enrichment_updates_selected_charts_without_summary_loss(
                                 "levels_db": [-3.0],
                             }
                         }
-                    }
+                    },
+                    complete=True,
                 ),
             ),
         )
@@ -969,6 +1543,7 @@ def test_manual_before_enrichment_updates_selected_charts_without_summary_loss(
     card = dashboard.history_snapshot().terminal_cards[0]
     assert card.fault_type == "漏装"
     assert card.manual_judgment_revision == 5
+    _assert_complete_card(_history_card(dashboard, run_id))
     assert dashboard.panel_widget("spectrum").has_committed_plot_data() is True
     assert dashboard._factory_display.review_payload.summary_payload[
         "overall_label"
@@ -982,7 +1557,7 @@ def test_enrichment_before_manual_keeps_charts_and_manual_result_authoritative(
 ) -> None:
     run_id = captured_request().run_id
     attempt_id = ATTEMPT_IDS[0]
-    decision_json = _canonical_result(charts={})
+    decision_json = _production_shaped_result(charts={}, complete=False)
     terminal_revision = hashlib.sha256(decision_json.encode("utf-8")).hexdigest()
     dashboard = ResultDashboardModule(_services())
     adapter = HistoryQtAdapter(dashboard)
@@ -1006,7 +1581,7 @@ def test_enrichment_before_manual_keeps_charts_and_manual_result_authoritative(
             expected_revision=4,
             result_payload=_bridge_payload(
                 attempt_id,
-                _canonical_result(
+                _production_shaped_result(
                     charts={
                         "0": {
                             "fft": {
@@ -1014,13 +1589,15 @@ def test_enrichment_before_manual_keeps_charts_and_manual_result_authoritative(
                                 "levels_db": [-3.0],
                             }
                         }
-                    }
+                    },
+                    complete=True,
                 ),
             ),
         )
     )
     _drain(qapp)
     assert dashboard.panel_widget("spectrum").has_committed_plot_data() is True
+    _assert_complete_card(_history_card(dashboard, run_id))
     assert dashboard._applied_enrichment_keys == {enrichment_key}
     assert enrichment_key in dashboard._enriched_payload_by_binding
 
@@ -1039,6 +1616,7 @@ def test_enrichment_before_manual_keeps_charts_and_manual_result_authoritative(
     assert card.conclusion.name == "NG"
     assert card.fault_type == "异响"
     assert card.manual_judgment_revision == card.revision == 5
+    _assert_complete_card(_history_card(dashboard, run_id))
     assert dashboard.panel_widget("spectrum").has_committed_plot_data() is True
     assert dashboard._applied_enrichment_keys == {enrichment_key}
     assert enrichment_key in dashboard._enriched_payload_by_binding
@@ -1048,6 +1626,25 @@ def test_enrichment_before_manual_keeps_charts_and_manual_result_authoritative(
     assert dashboard._factory_display.review_payload.summary_payload[
         "overall_label"
     ] == "不通过（异响）"
+    dashboard.refresh_history_projection()
+    dashboard.set_follow_latest(False)
+    dashboard.select_run(run_id)
+    _assert_complete_card(_history_card(dashboard, run_id))
+
+    before_rebuild = _history_card(dashboard, run_id)
+    dashboard._history_module.render_snapshot(
+        ResultHistorySnapshot(
+            revision=dashboard.history_snapshot().revision,
+            follow_latest=False,
+            selected_run_id=None,
+            active_cards=(),
+            terminal_cards=(),
+        )
+    )
+    dashboard.refresh_history_projection()
+    after_rebuild = _history_card(dashboard, run_id)
+    assert after_rebuild is not before_rebuild
+    _assert_complete_card(after_rebuild)
     dashboard.close()
     _drain(qapp)
 
@@ -1057,7 +1654,7 @@ def test_repeated_manual_changes_before_enrichment_keep_latest_fault_and_apply_o
 ) -> None:
     run_id = captured_request().run_id
     attempt_id = ATTEMPT_IDS[0]
-    decision_json = _canonical_result(charts={})
+    decision_json = _production_shaped_result(charts={}, complete=False)
     terminal_revision = hashlib.sha256(decision_json.encode("utf-8")).hexdigest()
     dashboard = ResultDashboardModule(_services())
     adapter = HistoryQtAdapter(dashboard)
@@ -1098,7 +1695,7 @@ def test_repeated_manual_changes_before_enrichment_keep_latest_fault_and_apply_o
         expected_revision=6,
         result_payload=_bridge_payload(
             attempt_id,
-            _canonical_result(
+            _production_shaped_result(
                 charts={
                     "0": {
                         "fft": {
@@ -1106,10 +1703,19 @@ def test_repeated_manual_changes_before_enrichment_keep_latest_fault_and_apply_o
                             "levels_db": [-3.0],
                         }
                     }
-                }
+                },
+                complete=True,
             ),
         ),
     )
+    refresh_calls = []
+    refresh_terminal_payload = dashboard._history_module.refresh_terminal_payload
+
+    def count_refresh(*args):
+        refresh_calls.append(args[0])
+        return refresh_terminal_payload(*args)
+
+    dashboard._history_module.refresh_terminal_payload = count_refresh
     adapter.publish_enrichment(enrichment)
     adapter.publish_enrichment(enrichment)
     _drain(qapp)
@@ -1117,11 +1723,13 @@ def test_repeated_manual_changes_before_enrichment_keep_latest_fault_and_apply_o
     card = dashboard.history_snapshot().terminal_cards[0]
     assert card.fault_type == "漏装"
     assert card.manual_judgment_revision == card.revision == 6
+    _assert_complete_card(_history_card(dashboard, run_id))
     assert dashboard.panel_widget("spectrum").has_committed_plot_data() is True
     assert dashboard._factory_display.review_payload.summary_payload[
         "overall_label"
     ] == "不通过（漏装）"
     assert len(dashboard._applied_enrichment_keys) == 1
+    assert refresh_calls == [run_id]
     dashboard.close()
     _drain(qapp)
 
@@ -1133,7 +1741,7 @@ def test_cancelled_reanalysis_does_not_revive_old_enrichment_but_new_attempt_doe
     old_attempt = ATTEMPT_IDS[0]
     operation_id = "10000000-0000-4000-8000-000000000002"
     new_attempt = operation_id
-    decision_json = _canonical_result(charts={})
+    decision_json = _production_shaped_result(charts={}, complete=False)
     old_terminal = hashlib.sha256(decision_json.encode("utf-8")).hexdigest()
     dashboard = ResultDashboardModule(_services())
     adapter = HistoryQtAdapter(dashboard)
@@ -1156,6 +1764,34 @@ def test_cancelled_reanalysis_does_not_revive_old_enrichment_but_new_attempt_doe
             fault_type="异响",
         )
     )
+    _drain(qapp)
+    old_enrichment = ResultEnrichmentProjection(
+        run_id=run_id,
+        attempt_id=old_attempt,
+        terminal_revision=old_terminal,
+        expected_revision=5,
+        result_payload=_bridge_payload(
+            old_attempt,
+            _production_shaped_result(
+                charts={
+                    "0": {
+                        "fft": {
+                            "frequencies_hz": [1],
+                            "levels_db": [-3.0],
+                        }
+                    }
+                },
+                complete=True,
+            ),
+        ),
+    )
+    adapter.publish_enrichment(old_enrichment)
+    _drain(qapp)
+    _assert_complete_card(_history_card(dashboard, run_id))
+    assert dashboard._applied_enrichment_keys == {
+        (run_id, old_attempt, old_terminal)
+    }
+
     adapter.publish(
         _reanalysis_event(
             kind=HistoryFactKind.REANALYSIS_STARTED,
@@ -1175,25 +1811,14 @@ def test_cancelled_reanalysis_does_not_revive_old_enrichment_but_new_attempt_doe
         )
     )
     _drain(qapp)
-    old_enrichment = ResultEnrichmentProjection(
-        run_id=run_id,
-        attempt_id=old_attempt,
-        terminal_revision=old_terminal,
-        expected_revision=5,
-        result_payload=_bridge_payload(
-            old_attempt,
-            _canonical_result(
-                charts={
-                    "0": {
-                        "fft": {
-                            "frequencies_hz": [1],
-                            "levels_db": [-3.0],
-                        }
-                    }
-                }
-            ),
-        ),
+    assert _card_table_values(_history_card(dashboard, run_id))[:5] == (
+        "--",
+        "--",
+        "--",
+        "--",
+        "--",
     )
+    assert dashboard._applied_enrichment_keys == set()
     adapter.publish_enrichment(old_enrichment)
     _drain(qapp)
     assert dashboard.panel_widget("spectrum").has_committed_plot_data() is False
@@ -1230,7 +1855,7 @@ def test_cancelled_reanalysis_does_not_revive_old_enrichment_but_new_attempt_doe
             expected_revision=9,
             result_payload=_bridge_payload(
                 new_attempt,
-                _canonical_result(
+                _production_shaped_result(
                     charts={
                         "0": {
                             "fft": {
@@ -1238,7 +1863,8 @@ def test_cancelled_reanalysis_does_not_revive_old_enrichment_but_new_attempt_doe
                                 "levels_db": [-3.0],
                             }
                         }
-                    }
+                    },
+                    complete=True,
                 ),
             ),
         )
@@ -1248,6 +1874,7 @@ def test_cancelled_reanalysis_does_not_revive_old_enrichment_but_new_attempt_doe
     assert dashboard._applied_enrichment_keys == {
         (run_id, new_attempt, new_terminal)
     }
+    _assert_complete_card(_history_card(dashboard, run_id))
     assert dashboard.panel_widget("spectrum").has_committed_plot_data() is True
     dashboard.close()
     _drain(qapp)
@@ -1257,7 +1884,7 @@ def test_eviction_and_close_purge_all_staged_projection_payloads(qapp) -> None:
     dashboard = ResultDashboardModule(_services())
     adapter = HistoryQtAdapter(dashboard)
     dashboard.show()
-    decision_json = _canonical_result(charts={})
+    decision_json = _production_shaped_result(charts={}, complete=False)
     terminal_revision = hashlib.sha256(decision_json.encode("utf-8")).hexdigest()
     first_run = captured_request().run_id
     first_attempt = ATTEMPT_IDS[0]
@@ -1279,7 +1906,7 @@ def test_eviction_and_close_purge_all_staged_projection_payloads(qapp) -> None:
             expected_revision=2,
             result_payload=_bridge_payload(
                 first_attempt,
-                _canonical_result(
+                _production_shaped_result(
                     charts={
                         "0": {
                             "fft": {
@@ -1287,12 +1914,14 @@ def test_eviction_and_close_purge_all_staged_projection_payloads(qapp) -> None:
                                 "levels_db": [-3.0],
                             }
                         }
-                    }
+                    },
+                    complete=True,
                 ),
             ),
         )
     )
     _drain(qapp)
+    _assert_complete_card(_history_card(dashboard, first_run))
     for index in range(2, 5):
         active_run = f"00000000-0000-4000-8000-{index:012d}"
         adapter.publish(_active_recording_event(run_id=active_run))
@@ -1306,10 +1935,12 @@ def test_eviction_and_close_purge_all_staged_projection_payloads(qapp) -> None:
         dashboard.apply_history_event(ActiveRunRemoved(active_run))
         assert dashboard.selected_run_id() == first_run
     for index in range(2, ResultHistoryStore.MAX_TERMINAL_RESULTS + 2):
+        latest_run = f"00000000-0000-4000-8000-{index:012d}"
+        latest_attempt = f"10000000-0000-4000-8000-{index:012d}"
         adapter.publish(
             _decision_history_event(
-                run_id=f"00000000-0000-4000-8000-{index:012d}",
-                attempt_id=f"10000000-0000-4000-8000-{index:012d}",
+                run_id=latest_run,
+                attempt_id=latest_attempt,
                 decision_json=decision_json,
                 terminal_revision=terminal_revision,
                 revision=2,
@@ -1328,7 +1959,21 @@ def test_eviction_and_close_purge_all_staged_projection_payloads(qapp) -> None:
         or dashboard._current_decision_key[0] != first_run
     )
     assert first_run not in dashboard._last_acknowledged_decision_by_run
+    assert first_run not in dashboard._history_module._card_entries
     dashboard.close()
+    _drain(qapp)
+    adapter.publish_enrichment(
+        ResultEnrichmentProjection(
+            run_id=latest_run,
+            attempt_id=latest_attempt,
+            terminal_revision=terminal_revision,
+            expected_revision=2,
+            result_payload=_bridge_payload(
+                latest_attempt,
+                _production_shaped_result(charts={}, complete=True),
+            ),
+        )
+    )
     _drain(qapp)
     assert dashboard._decision_binding_by_run == {}
     assert dashboard._decision_origin_revision_by_run == {}

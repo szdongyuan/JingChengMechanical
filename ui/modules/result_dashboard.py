@@ -248,7 +248,7 @@ class ResultDashboardModule(QWidget):
 
         self._history_module = ResultHistoryModule(
             self,
-            payload_provider=self._history_store.display_payload,
+            payload_provider=self._display_payload_for_run,
             config_provider=self._load_history_config,
             manual_judgment_widget=manual_judgment_widget,
         )
@@ -352,7 +352,7 @@ class ResultDashboardModule(QWidget):
         return transition
 
     def apply_enrichment_projection(self, event: object) -> bool:
-        """Refresh selected charts without changing the terminal history card."""
+        """Refresh matching terminal display data without changing history."""
 
         self._require_dashboard_thread()
         run_id = getattr(event, "run_id", None)
@@ -417,13 +417,12 @@ class ResultDashboardModule(QWidget):
             return False
         self._applied_enrichment_keys.add(key)
         self._enriched_payload_by_binding[key] = payload
+        overlay = self._display_payload_for_run(run_id)
+        if type(overlay) is ReviewDisplayPayload:
+            self._history_module.refresh_terminal_payload(run_id, overlay)
         if snapshot.selected_run_id == run_id:
-            current_payload = self._history_store.display_payload(run_id)
-            if type(current_payload) is ReviewDisplayPayload:
-                self._show_review(
-                    target,
-                    self._merge_chart_overlay(current_payload, payload),
-                )
+            if type(overlay) is ReviewDisplayPayload:
+                self._show_review(target, overlay)
         return True
 
     def project_history_transition(
@@ -564,11 +563,24 @@ class ResultDashboardModule(QWidget):
             return None
         if any(card.run_id == run_id for card in snapshot.active_cards):
             return None
-        selected = self._find_selected_card(snapshot)
-        binding = self._decision_binding_by_run.get(run_id)
+        return self._display_payload_for_run(run_id)
+
+    def _display_payload_for_run(self, run_id: str):
         base_payload = self._history_store.display_payload(run_id)
+        snapshot = self._history_store.snapshot()
+        selected = next(
+            (
+                card
+                for card in snapshot.terminal_cards
+                if card.run_id == run_id
+            ),
+            None,
+        )
+        binding = self._decision_binding_by_run.get(run_id)
         if (
             selected is None
+            or selected.is_active_run
+            or selected.phase is not ResultPhase.TERMINAL
             or binding is None
             or type(base_payload) is not ReviewDisplayPayload
         ):
@@ -592,10 +604,10 @@ class ResultDashboardModule(QWidget):
         )
         if enriched is None:
             return base_payload
-        return self._merge_chart_overlay(base_payload, enriched)
+        return self._merge_enrichment_display_overlay(base_payload, enriched)
 
     @staticmethod
-    def _merge_chart_overlay(
+    def _merge_enrichment_display_overlay(
         current: ReviewDisplayPayload,
         enrichment: ReviewDisplayPayload,
     ) -> ReviewDisplayPayload:
@@ -607,9 +619,43 @@ class ResultDashboardModule(QWidget):
         ):
             return current
         chart_payload = enrichment_review.get("chart_payload")
-        if not isinstance(chart_payload, dict):
+        summary_payload = enrichment_review.get("summary_payload")
+        overlay_applied = False
+        if isinstance(chart_payload, dict):
+            current_review["chart_payload"] = deepcopy(chart_payload)
+            overlay_applied = True
+        current_summary = current_review.get("summary_payload")
+        if isinstance(current_summary, dict) and isinstance(
+            summary_payload,
+            dict,
+        ):
+            enrichment_rows = summary_payload.get("rows")
+            current_rows = current_summary.get("rows")
+            if isinstance(enrichment_rows, list) and isinstance(
+                current_rows,
+                list,
+            ):
+                rows_by_key = {
+                    row["item_key"]: deepcopy(row)
+                    for row in current_rows
+                    if isinstance(row, dict)
+                    and isinstance(row.get("item_key"), str)
+                    and row["item_key"].strip()
+                }
+                enrichment_rows_by_key = {
+                    row["item_key"]: deepcopy(row)
+                    for row in enrichment_rows
+                    if isinstance(row, dict)
+                    and isinstance(row.get("item_key"), str)
+                    and row["item_key"].strip()
+                    and row["item_key"] != "ai"
+                }
+                if enrichment_rows_by_key:
+                    rows_by_key.update(enrichment_rows_by_key)
+                    current_summary["rows"] = list(rows_by_key.values())
+                    overlay_applied = True
+        if not overlay_applied:
             return current
-        current_review["chart_payload"] = deepcopy(chart_payload)
         return ReviewDisplayPayload(
             review=current_review,
             dashboard_config=deepcopy(current.dashboard_config),
@@ -667,6 +713,10 @@ class ResultDashboardModule(QWidget):
             )
             return
         if type(payload) is ReviewDisplayPayload:
+            self._history_module.refresh_terminal_payload(
+                selected.run_id,
+                payload,
+            )
             self._show_review(selected, payload)
             return
         if type(payload) is ErrorDisplayPayload:
