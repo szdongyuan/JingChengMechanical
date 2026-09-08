@@ -1,0 +1,77 @@
+{
+  "main_base": "c16cfc97b7e16b6a3be9729207cd7e523c2b3caf",
+  "remote_head": "a530bdd09a255a43133d55e7cf43297843117c09",
+  "main_worktree": "C:/Users/DY/Documents/ChatGPT/New project",
+  "files": [
+    {
+      "Path": "app/main_window.py",
+      "Hash": "368768059243F8264AFF67FC66F09776E000BCAD3B6D3B81ADA9766C1FF8F4BD",
+      "status": " M"
+    },
+    {
+      "Path": "app/service/db_connection_service.py",
+      "Hash": "76D2C2536525EDECDE4756535D85CA99EC247B574D1F56CC3D9AFD2C950F2224",
+      "status": " M"
+    },
+    {
+      "Path": "app/service/managed_input_sounddevice_backend.py",
+      "Hash": "85978852D1FE0BE2EC9EF63058E6B18202115262B21F07E6C5B8F91F5317507A",
+      "status": " M"
+    },
+    {
+      "Path": "docs/double-sdd/plans/2026-09-04-movable-resizable-video-preview.md",
+      "Hash": "2F8F59EBC15743CF7705BA455B75ABD639BD583E7C70DD55C962632A1B29774F",
+      "status": " M"
+    },
+    {
+      "Path": "main.spec",
+      "Hash": "2C2CA227F8387D4917C5EE7957894223A356560E17650D7566EEEE5244DBCE2A",
+      "status": " M"
+    },
+    {
+      "Path": "tests/resident_audio_mvp/test_ring_capture.py",
+      "Hash": "49B8F3D61367507CC2B66DCC0D4EDD2D0C683AFD6EB2D41A0F0C5D094DDA1687",
+      "status": " M"
+    },
+    {
+      "Path": "tests/test_db_connection_service.py",
+      "Hash": "F2783523C9B5D17E7AE3BF56E358E87C4E3DFBB5BB0845284AFAC165FE5C7EBA",
+      "status": " M"
+    },
+    {
+      "Path": "tests/test_managed_input_sounddevice_backend.py",
+      "Hash": "43922B525A70195231A18C57E22E4BD2DE3A9A9B4857EF3B2C0E91EB7B8470C1",
+      "status": " M"
+    },
+    {
+      "Path": "tests/test_result_history_card.py",
+      "Hash": "6664464E4635EA8BA9E0A1253D99F184E53040ED7B4C6632878D6C1401097728",
+      "status": " M"
+    },
+    {
+      "Path": "tests/test_result_history_module.py",
+      "Hash": "66196AFAD96A8A3035049801C6C124D24CF18B001BB176213B49864C13CCEA6C",
+      "status": " M"
+    },
+    {
+      "Path": "tests/test_video_preview_integration.py",
+      "Hash": "0134465B380E9D0A3510024C029960A0E620E6EDCDADA9D2398A119E2262EACC",
+      "status": "??"
+    },
+    {
+      "Path": "tests/test_video_preview_overlay.py",
+      "Hash": "DC67590CDDAA5004670BF47A685349DC87A21029FCCF5DD87234B5656DC06586",
+      "status": "??"
+    },
+    {
+      "Path": "ui/widgets/result_history_card.py",
+      "Hash": "21786359D2F6E7759CECCBDCA73F68FB5ED4C7267D7A668A22D442B2CCAB709A",
+      "status": " M"
+    },
+    {
+      "Path": "ui/widgets/video_preview_overlay.py",
+      "Hash": "A1ACB4FB830F58FF299E1BDDDFDBAA4F3774DFD2108336F71D377D57D1F66E69",
+      "status": "??"
+    }
+  ]
+}
