@@ -58,6 +58,7 @@ from model.malfunction_type_table import (
     ensure_builtin_malfunction_type,
 )
 from ui.popups.historical_metric_report_dialog import HistoricalMetricReportDialog
+from ui.popups.historical_analysis_dialog import HistoricalAnalysisDialog
 from ui.popups.run_audio_replay_dialog import RunAudioReplayDialog
 from ui.popups.run_record_export_dialog import (
     choose_run_export_options,
@@ -143,6 +144,9 @@ class DataManagementModule(QWidget):
         ("judgment_source", "判定来源"),
         ("fault_type", "故障类型"),
     )
+    _ANALYSIS_COLUMN = len(_columns) + 1
+    _PLAYBACK_COLUMN = _ANALYSIS_COLUMN + 1
+    _DELETE_COLUMN = _PLAYBACK_COLUMN + 1
     _PLAYBACK_FAILURE_MESSAGES = {
         PlaybackCode.BUSY: "回放服务正在忙，请稍后再试",
         PlaybackCode.PERSISTED_AUDIO_UNAVAILABLE: "此记录没有可回放的音频",
@@ -180,6 +184,7 @@ class DataManagementModule(QWidget):
         self._export_progress: QProgressDialog | None = None
         self._report_dialog = None
         self._replay_dialogs: dict[str, RunAudioReplayDialog] = {}
+        self._analysis_dialogs: dict[str, HistoricalAnalysisDialog] = {}
         self._initial_column_widths_applied = False
         self._fault_type_options_cache: tuple[
             tuple[str, str | None],
@@ -269,11 +274,12 @@ class DataManagementModule(QWidget):
         filter_layout.addStretch(1)
         layout.addWidget(filters)
 
-        self.table = QTableWidget(0, len(self._columns) + 3, self)
+        self.table = QTableWidget(0, self._DELETE_COLUMN + 1, self)
         self.table.setHorizontalHeaderLabels(
             [
                 "选择",
                 *(label for _name, label in self._columns),
+                "查看分析结果",
                 "回放",
                 "删除",
             ]
@@ -520,6 +526,13 @@ class DataManagementModule(QWidget):
                         )
                         item.setToolTip(record.run_id)
                     self.table.setItem(row_index, column_index, item)
+                analysis_button = QPushButton("查看分析结果")
+                analysis_button.setFixedHeight(24)
+                analysis_button.setStyleSheet("padding: 2px 6px; border-radius: 6px;")
+                analysis_button.clicked.connect(
+                    lambda _checked=False, run_id=record.run_id: self._show_analysis(run_id)
+                )
+                self.table.setCellWidget(row_index, self._ANALYSIS_COLUMN, analysis_button)
                 play_button = self._create_table_action_button(
                     QStyle.StandardPixmap.SP_MediaPlay,
                     "data_management_play_button",
@@ -532,7 +545,7 @@ class DataManagementModule(QWidget):
                 )
                 self.table.setCellWidget(
                     row_index,
-                    self.table.columnCount() - 2,
+                    self._PLAYBACK_COLUMN,
                     play_button,
                 )
                 delete_button = self._create_table_action_button(
@@ -547,7 +560,7 @@ class DataManagementModule(QWidget):
                 )
                 self.table.setCellWidget(
                     row_index,
-                    self.table.columnCount() - 1,
+                    self._DELETE_COLUMN,
                     delete_button,
                 )
         finally:
@@ -600,7 +613,8 @@ class DataManagementModule(QWidget):
             "fault_type": 0.70,
         }
         action_width = 48
-        fixed_width = 54 + (2 * action_width)
+        analysis_width = 120
+        fixed_width = 54 + analysis_width + (2 * action_width)
         base_width = fixed_width + sum(minimum_widths.values())
         available_width = max(self.table.viewport().width() - 2, base_width)
         extra_width = max(0, available_width - base_width)
@@ -619,12 +633,10 @@ class DataManagementModule(QWidget):
                 )
             applied_widths[column] = width
             self.table.setColumnWidth(column, width)
-        for column in (
-            self.table.columnCount() - 2,
-            self.table.columnCount() - 1,
-        ):
+        self.table.setColumnWidth(self._ANALYSIS_COLUMN, analysis_width)
+        for column in (self._PLAYBACK_COLUMN, self._DELETE_COLUMN):
             self.table.setColumnWidth(column, action_width)
-        used_width = 54 + (2 * action_width) + sum(applied_widths.values())
+        used_width = fixed_width + sum(applied_widths.values())
         remainder = max(0, available_width - used_width)
         if remainder and applied_widths:
             fault_column = self._fault_type_column_index()
@@ -993,6 +1005,24 @@ class DataManagementModule(QWidget):
             0.0,
             float(frame_count) / float(sample_rate_hz),
         )
+
+    def _show_analysis(self, run_id: str) -> None:
+        dialog = self._analysis_dialogs.get(run_id)
+        if dialog is None:
+            dialog = HistoricalAnalysisDialog(run_id=run_id, services=self.services, parent=self)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            self._analysis_dialogs[run_id] = dialog
+            dialogs = self._analysis_dialogs
+
+            def forget_dialog(*_args):
+                if dialogs.get(run_id) is dialog:
+                    dialogs.pop(run_id)
+
+            dialog.destroyed.connect(forget_dialog)
+            dialog.label_saved.connect(self.refresh_table)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
 
     def _play_run(self, run_id: str) -> None:
         try:

@@ -145,9 +145,13 @@ class RunScopedPlaybackService:
         self._current_run_id: str | None = None
         self._owned_run_id: str | None = None
         self._generation_owned = False
+        self._playback_owner: object | None = None
         self._stop_requested = False
 
-    def play(self, request: RunPlaybackRequest) -> PlaybackResult:
+    def play(
+        self, request: RunPlaybackRequest, *, owner: object | None = None
+    ) -> PlaybackResult:
+        """Start playback, optionally associating its generation with a caller token."""
         if type(request) is not RunPlaybackRequest:
             raise TypeError("request must be an exact RunPlaybackRequest")
         if not self._operation_gate.acquire(blocking=False):
@@ -155,7 +159,7 @@ class RunScopedPlaybackService:
         try:
             if self._closed:
                 return _result(PlaybackCode.SERVICE_CLOSED, request.run_id)
-            return self._play_owned(request)
+            return self._play_owned(request, owner)
         finally:
             self._operation_gate.release()
 
@@ -164,6 +168,22 @@ class RunScopedPlaybackService:
         if not self._operation_gate.acquire(blocking=False):
             return _lifecycle_result(PlaybackLifecycleCode.BUSY)
         try:
+            if self._shutdown_report is not None:
+                return self._shutdown_report
+            return self._finish_generation(timeout, request_stop=True)
+        finally:
+            self._operation_gate.release()
+
+    def stop_if_owner(
+        self, owner: object, timeout_seconds: float
+    ) -> PlaybackLifecycleReport:
+        """Stop only the generation belonging to this exact non-None caller token."""
+        timeout = _validate_timeout_seconds(timeout_seconds)
+        if not self._operation_gate.acquire(blocking=False):
+            return _lifecycle_result(PlaybackLifecycleCode.BUSY)
+        try:
+            if owner is None or self._playback_owner is not owner:
+                return _lifecycle_result(PlaybackLifecycleCode.CLEAN)
             if self._shutdown_report is not None:
                 return self._shutdown_report
             return self._finish_generation(timeout, request_stop=True)
@@ -195,7 +215,9 @@ class RunScopedPlaybackService:
         finally:
             self._operation_gate.release()
 
-    def _play_owned(self, request: RunPlaybackRequest) -> PlaybackResult:
+    def _play_owned(
+        self, request: RunPlaybackRequest, owner: object | None
+    ) -> PlaybackResult:
         run_resolution = self._resolve_run(request)
         if type(run_resolution) is PlaybackResult:
             return run_resolution
@@ -235,6 +257,7 @@ class RunScopedPlaybackService:
             output_host_api,
             gain_db,
             replaced_run_id,
+            owner,
         )
 
     def _start_generation(
@@ -246,11 +269,13 @@ class RunScopedPlaybackService:
         output_host_api: str,
         gain_db: float,
         replaced_run_id: str | None,
+        owner: object | None,
     ) -> PlaybackResult:
         remaining = self._startup_remaining()
         if remaining is None:
             return _result(PlaybackCode.DEADLINE_CLOCK_FAILED, run_id)
 
+        self._playback_owner = owner
         try:
             report = self._backend.start(
                 segment,
@@ -678,6 +703,7 @@ class RunScopedPlaybackService:
 
     def _clear_generation(self) -> None:
         self._generation_owned = False
+        self._playback_owner = None
         self._owned_run_id = None
         self._current_run_id = None
         self._stop_requested = False

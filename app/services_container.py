@@ -61,6 +61,7 @@ from app.service.run_persistence.analysis_result_artifact import (
 )
 from app.service.run_persistence.data_management import RunDataManagementService
 from app.service.run_persistence.export_reader import RunExportReader
+from app.service.run_persistence.historical_analysis_reader import HistoricalAnalysisReader
 from app.service.run_persistence.startup import settle_startup
 from app.service.run_record_export.archive import RunArchiveService
 from app.service.result_history import ResultHistoryStore
@@ -554,6 +555,10 @@ class ServiceContainer:
             runtime.path.parent / "run_results"
         )
         self.run_export_reader = RunExportReader(
+            runtime,
+            result_artifact_store=self.analysis_result_artifact_store,
+        )
+        self.historical_analysis_reader = HistoricalAnalysisReader(
             runtime,
             result_artifact_store=self.analysis_result_artifact_store,
         )

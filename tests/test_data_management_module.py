@@ -199,6 +199,142 @@ def _select_all_rows(module: DataManagementModule) -> None:
         module.table.item(row_index, 0).setCheckState(Qt.CheckState.Checked)
 
 
+def _analysis_button(module, row=0):
+    buttons = module.table.findChildren(QPushButton)
+    assert any(button.text() == "查看分析结果" for button in buttons)
+    return module.table.cellWidget(row, module.table.columnCount() - 3)
+
+
+def _historical_module(qapp, qtbot):
+    from tests.test_historical_analysis_dialog import Reader, snapshot
+
+    module, management, _ = _module(qapp)
+    qtbot.addWidget(module)
+    values = {run_id: snapshot(run_id=run_id) for run_id in (RUN_A, RUN_B)}
+    reader = Reader(values[RUN_A])
+    reader.read = lambda run_id: values[run_id]
+    module.services.historical_analysis_reader = reader
+    return module, management, reader, values
+
+
+def test_analysis_buttons_open_exact_uuid_and_reuse_only_same_run(qapp, qtbot, monkeypatch):
+    from ui.popups.historical_analysis_dialog import HistoricalAnalysisDialog
+
+    module, _, _, _ = _historical_module(qapp, qtbot)
+    _analysis_button(module).click()
+    first = module._analysis_dialogs[RUN_A]
+    qtbot.waitUntil(lambda: first.snapshot is not None)
+    assert isinstance(first, HistoricalAnalysisDialog)
+    assert first.run_id == first.snapshot.run.run_id == RUN_A
+    assert first.services is module.services
+    assert first.testAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+    raised, activated = [], []
+    monkeypatch.setattr(first, "raise_", lambda: raised.append(True))
+    monkeypatch.setattr(first, "activateWindow", lambda: activated.append(True))
+    _analysis_button(module).click()
+    assert module._analysis_dialogs == {RUN_A: first}
+    assert raised == activated == [True]
+    _analysis_button(module, 1).click()
+    second = module._analysis_dialogs[RUN_B]
+    qtbot.waitUntil(lambda: second.snapshot is not None)
+    assert second is not first
+    assert second.snapshot.run.run_id == RUN_B
+    first.close()
+    qtbot.waitUntil(lambda: RUN_A not in module._analysis_dialogs)
+    assert module._analysis_dialogs == {RUN_B: second}
+    _analysis_button(module).click()
+    reopened = module._analysis_dialogs[RUN_A]
+    qtbot.waitUntil(lambda: reopened.snapshot is not None)
+    assert reopened is not first
+    reopened.close()
+    second.close()
+
+
+def test_analysis_registry_cleanup_does_not_remove_replacement(qapp, qtbot):
+    from PyQt6 import sip
+
+    module, _, _, _ = _historical_module(qapp, qtbot)
+    _analysis_button(module).click()
+    previous = module._analysis_dialogs[RUN_A]
+    qtbot.waitUntil(lambda: previous.snapshot is not None)
+    replacement = object()
+    module._analysis_dialogs[RUN_A] = replacement
+    previous.close()
+    qtbot.waitUntil(lambda: sip.isdeleted(previous))
+    assert module._analysis_dialogs[RUN_A] is replacement
+    module._analysis_dialogs.clear()
+
+
+@pytest.mark.parametrize("fail_save", [False, True])
+def test_analysis_label_save_refreshes_only_on_commit_preserving_list_context(
+    qapp, qtbot, fail_save,
+):
+    from dataclasses import replace
+    from model.malfunction_type_table import GOOD_MALFUNCTION_TYPE_NAME
+
+    module, management, _, values = _historical_module(qapp, qtbot)
+    module.edit_model.setText("MODEL-A")
+    management.next_page = _page(page=2, total_count=60, total_pages=2)
+    module._request_and_render(2)
+    _select_all_rows(module)
+    applied = module._applied_query
+    management.queries.clear()
+
+    def save(run_id, label):
+        management.updated_fault_types.append((run_id, label))
+        if fail_save:
+            raise RuntimeError("database busy")
+        values[run_id] = replace(values[run_id], run=replace(values[run_id].run,
+            judgment="PASS", judgment_source="MANUAL"))
+        return True
+
+    management.update_fault_type = save
+    _analysis_button(module).click()
+    widget = module._analysis_dialogs[RUN_A]
+    qtbot.waitUntil(lambda: widget.snapshot is not None)
+    widget.label_combo.setCurrentIndex(widget.label_combo.findData(GOOD_MALFUNCTION_TYPE_NAME))
+    widget.save_label_button.click()
+    qtbot.waitUntil(lambda: widget.save_label_button.isEnabled())
+    assert management.updated_fault_types == [(RUN_A, GOOD_MALFUNCTION_TYPE_NAME)]
+    assert management.queries == ([] if fail_save else [applied])
+    assert widget.snapshot.run.judgment == ("FAIL" if fail_save else "PASS")
+    assert module._applied_query == applied
+    assert module._page == 2
+    assert _visible_checked_run_ids(module) == {RUN_A, RUN_B}
+    if fail_save:
+        assert "database busy" in widget.status_label.text()
+    widget.close()
+
+
+def test_analysis_text_column_has_space_without_changing_old_action_widths(qapp):
+    module, _, _ = _module(qapp)
+    button = _analysis_button(module)
+    assert button.text() == "查看分析结果"
+    assert module.table.columnWidth(module.table.columnCount() - 3) >= 120
+    assert module.table.columnWidth(module.table.columnCount() - 2) == 48
+    assert module.table.columnWidth(module.table.columnCount() - 1) == 48
+
+
+def test_analysis_button_text_fits_compact_row_with_application_style(qapp, qtbot, monkeypatch):
+    from consts.style import APP_QSS
+    from PyQt6.QtWidgets import QStyle, QStyleOptionButton
+
+    module, _, _ = _module(qapp)
+    qtbot.addWidget(module)
+    monkeypatch.setattr(module, "_refresh_fault_type_options_cache", lambda: None)
+    module.setStyleSheet(APP_QSS)
+    module.resize(1550, 450)
+    module.show()
+    QApplication.processEvents()
+    button = _analysis_button(module)
+    option = QStyleOptionButton()
+    option.initFrom(button)
+    contents = button.style().subElementRect(QStyle.SubElement.SE_PushButtonContents, option, button)
+    assert contents.height() >= button.fontMetrics().height()
+    assert button.sizeHint().height() <= module.table.rowHeight(0)
+    assert button.sizeHint().width() <= module.table.columnWidth(module._ANALYSIS_COLUMN)
+
+
 def _visible_checked_run_ids(module: DataManagementModule) -> set[str]:
     checked = set()
     for row_index in range(module.table.rowCount()):
@@ -368,6 +504,7 @@ def test_page_projects_sn_model_filters_paging_and_destructive_controls(qapp):
         "判定",
         "判定来源",
         "故障类型",
+        "查看分析结果",
         "回放",
         "删除",
     ]
@@ -405,7 +542,7 @@ def test_page_projects_sn_model_filters_paging_and_destructive_controls(qapp):
     )
     play = module.table.cellWidget(0, module.table.columnCount() - 2)
     delete = module.table.cellWidget(0, module.table.columnCount() - 1)
-    fault_type = module.table.cellWidget(0, module.table.columnCount() - 3)
+    fault_type = module.table.cellWidget(0, module._fault_type_column_index())
     assert isinstance(fault_type, QComboBox)
     assert fault_type.objectName() == "data_management_fault_type_combo"
     assert fault_type.height() == 24
@@ -502,7 +639,7 @@ def test_fault_type_options_are_cached_on_show_and_reused_by_combos(
     module.refresh_table()
 
     assert calls == [0]
-    fault_combo = module.table.cellWidget(0, module.table.columnCount() - 3)
+    fault_combo = module.table.cellWidget(0, module._fault_type_column_index())
     assert fault_combo.findData("缓存类型-A") >= 0
 
     management.next_page = _page(
@@ -517,7 +654,7 @@ def test_fault_type_options_are_cached_on_show_and_reused_by_combos(
     module.refresh_table()
 
     assert calls == [0]
-    fault_combo = module.table.cellWidget(0, module.table.columnCount() - 3)
+    fault_combo = module.table.cellWidget(0, module._fault_type_column_index())
     fault_combo.showPopup()
     fault_combo.hidePopup()
     assert calls == [0]
@@ -533,7 +670,7 @@ def test_fault_type_options_are_cached_on_show_and_reused_by_combos(
         (_row(RUN_B, accepted_fault_types=("缓存类型-B",)),)
     )
     module.refresh_table()
-    fault_combo = module.table.cellWidget(0, module.table.columnCount() - 3)
+    fault_combo = module.table.cellWidget(0, module._fault_type_column_index())
     assert fault_combo.findData("缓存类型-B") >= 0
     module.close()
 
@@ -592,7 +729,7 @@ def test_fault_type_combo_filters_options_to_record_frozen_fault_types(
 
     module.refresh_table()
 
-    fault_combo = module.table.cellWidget(0, module.table.columnCount() - 3)
+    fault_combo = module.table.cellWidget(0, module._fault_type_column_index())
     assert fault_combo.findData("良品") >= 0
     assert fault_combo.findData("不良") >= 0
     assert fault_combo.findData("针响") >= 0
@@ -608,7 +745,7 @@ def test_fault_type_combo_ignores_wheel_to_avoid_accidental_update(qapp):
             self.ignored = True
 
     module, management, _deleted = _module(qapp)
-    fault_combo = module.table.cellWidget(0, module.table.columnCount() - 3)
+    fault_combo = module.table.cellWidget(0, module._fault_type_column_index())
     old_index = fault_combo.currentIndex()
     event = WheelEventStub()
 
