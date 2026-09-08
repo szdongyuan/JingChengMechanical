@@ -14,6 +14,8 @@ from itertools import count
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from app.service.ai_subprocess import ai_subprocess_creation_flags
+
 if TYPE_CHECKING:
     from app.service.analysis.scheduler import AiToolchainSnapshot
 
@@ -1181,6 +1183,7 @@ class ResidentToolchainRuntime:
             errors="replace",
             bufsize=1,
             cwd=package_dir or None,
+            creationflags=ai_subprocess_creation_flags(),
         )
         if process.stdin is None or process.stdout is None or process.stderr is None:
             raise RuntimeError("Resident process stdio pipes are unavailable")

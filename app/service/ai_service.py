@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from peewee import DoesNotExist, IntegrityError
 
 from app.service.ai_resident_runtime import ResidentToolchainRuntime
+from app.service.ai_subprocess import ai_subprocess_creation_flags
 from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable
 from model.ai_execution_table import AiExecutionTable
@@ -691,6 +692,7 @@ class AiService:
                 text=True,
                 timeout=timeout_ms / 1000.0,
                 cwd=package_dir or None,
+                creationflags=ai_subprocess_creation_flags(),
             )
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             finished_at = _now_iso()

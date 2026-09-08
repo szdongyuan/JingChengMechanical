@@ -8,6 +8,7 @@ import textwrap
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -401,6 +402,46 @@ def runtime():
         yield helper
     finally:
         helper.shutdown_all()
+
+
+def test_start_process_preserves_pipes_and_uses_no_console_flags(
+    runtime, monkeypatch
+):
+    captured = {}
+
+    def _popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(stdin=object(), stdout=object(), stderr=object())
+
+    class _Thread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(ai_resident_runtime.subprocess, "Popen", _popen)
+    monkeypatch.setattr(ai_resident_runtime.threading, "Thread", _Thread)
+    monkeypatch.setattr(
+        ai_resident_runtime,
+        "ai_subprocess_creation_flags",
+        lambda: 0x08000000,
+    )
+
+    runtime._start_process("tc-1", "tool.exe --serve", package_dir="C:/AI")
+
+    assert captured["kwargs"] == {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "bufsize": 1,
+        "cwd": "C:/AI",
+        "creationflags": 0x08000000,
+    }
 
 
 def _toolchain_snapshot(

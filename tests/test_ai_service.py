@@ -1244,20 +1244,28 @@ class TestToolchainRegistryCrud:
 
 
 class TestRunAiAnalysisRouting:
-    def test_execute_toolchain_runs_with_package_dir_cwd(
+    def test_execute_toolchain_preserves_io_and_uses_no_console_flags(
         self, ai_service, tmp_path, monkeypatch
     ):
         package_dir = tmp_path / "pkg"
         package_dir.mkdir()
         captured = {}
+        expected_flags = 0x08000000
+
+        monkeypatch.setattr(
+            ai_service_module,
+            "ai_subprocess_creation_flags",
+            lambda: expected_flags,
+        )
 
         def _run(cmd, **kwargs):
-            captured["cwd"] = kwargs.get("cwd")
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+            return subprocess.CompletedProcess(cmd, 7, stdout="out", stderr="err")
 
         monkeypatch.setattr(subprocess, "run", _run)
 
-        ai_service.execute_toolchain(
+        result = ai_service.execute_toolchain(
             entrypoint="python main.py",
             package_dir=str(package_dir),
             request_json_path="request.json",
@@ -1266,7 +1274,16 @@ class TestRunAiAnalysisRouting:
             timeout_ms=30000,
         )
 
-        assert captured["cwd"] == str(package_dir)
+        assert captured["kwargs"] == {
+            "capture_output": True,
+            "text": True,
+            "timeout": 30.0,
+            "cwd": str(package_dir),
+            "creationflags": expected_flags,
+        }
+        assert result["exit_code"] == 7
+        assert result["stdout_excerpt"] == "out"
+        assert result["stderr_excerpt"] == "err"
 
     def test_run_ai_analysis_routes_resident_process_through_runtime(
         self, ai_service, config, toolchain, tmp_path, monkeypatch
