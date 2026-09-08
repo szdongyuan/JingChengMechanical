@@ -7,6 +7,8 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
+from PyQt6.QtCore import Qt
+
 from app.service.run_persistence import CurrentTrace
 
 try:  # pragma: no cover - exercised by integration with installed dependency.
@@ -547,7 +549,10 @@ class PlcCurrentCollector:
                 else self._time_origin
             )
             try:
-                signal.connect(self._signal_handler)
+                signal.connect(
+                    self._signal_handler,
+                    Qt.ConnectionType.DirectConnection,
+                )
             except Exception as exc:
                 self._log_message(f"PLC 电流采集启动失败: {exc}")
                 return False
