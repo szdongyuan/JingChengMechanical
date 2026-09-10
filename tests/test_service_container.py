@@ -191,9 +191,11 @@ def test_service_container_owns_one_history_store_and_attaches_one_adapter():
     assert "HistoryQtAdapter" in source
 
 
+@pytest.mark.parametrize("score", [0, 0.875])
 def test_service_container_wires_one_durable_run_export_reader_and_archive_service(
     monkeypatch,
     tmp_path,
+    score,
 ):
     runtime = RunPersistenceDatabase(
         prepare_run_persistence_database(tmp_path / "prepared.sqlite3")
@@ -219,6 +221,37 @@ def test_service_container_wires_one_durable_run_export_reader_and_archive_servi
 
     services = mod.ServiceContainer(run_persistence_database=runtime)
 
+    from openpyxl import load_workbook
+    from tests.run_persistence.test_export_reader import (
+        _finish, _insert_active, _insert_audio, _insert_attempt,
+        _set_attempt_result_payload,
+    )
+    from app.service.run_record_export.contracts import RunDataExportOptions
+
+    run_id = _insert_active(runtime)
+    audio_id = _insert_audio(runtime, run_id, tmp_path / "unused.wav")
+    attempt_id = _insert_attempt(runtime, run_id, audio_id)
+    _set_attempt_result_payload(runtime, attempt_id, {
+        "judgment": "PASS",
+        "result": {"review": {"ai_result": {
+            "status": "success", "score": score, "ai_label": "  原始标签  ",
+        }}},
+    })
+    _finish(runtime, run_id)
+    # The legacy reader has no AI rows, as on the affected installation.
+    ai_service.get_current_effective_export_values.return_value = {}
+    target = tmp_path / "persisted-ai.xlsx"
+    services.run_archive_service.export(
+        (run_id,), str(target),
+        options=RunDataExportOptions(True, False, False, False),
+    )
+    workbook = load_workbook(target)
+    try:
+        assert workbook.active["H2"].value == score
+        assert workbook.active["I2"].value == "  原始标签  "
+    finally:
+        workbook.close()
+
     assert services.run_persistence_database is runtime
     assert type(services.run_export_reader) is RunExportReader
     assert services.run_export_reader._runtime is runtime
@@ -228,7 +261,9 @@ def test_service_container_wires_one_durable_run_export_reader_and_archive_servi
     )
     assert type(services.run_archive_service) is RunArchiveService
     assert services.run_archive_service._reader is services.run_export_reader
-    assert services.run_archive_service._ai_reader is ai_service
+    from app.service.run_persistence.ai_export_reader import RunAiExportReader
+    assert type(services.run_archive_service._ai_reader) is RunAiExportReader
+    assert services.run_archive_service._ai_reader._runtime is runtime
     assert services.ai_service is ai_service
     assert (
         services.historical_metric_report_service._cache._judgment_engine._ai

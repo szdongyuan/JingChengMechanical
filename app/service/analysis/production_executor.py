@@ -1411,8 +1411,9 @@ class ProductionAnalysisExecutor:
             and math.isfinite(float(threshold_value))
             else 0.5
         )
-        label = str(ai_result.get("ai_label") or "").strip()
-        normalized_label = label.upper()
+        raw_label = ai_result.get("ai_label")
+        label = raw_label if isinstance(raw_label, str) else None
+        normalized_label = (label or "").strip().upper()
         if normalized_label in {"PASS", "OK"}:
             passed = True
         elif normalized_label in {"FAIL", "NG"}:
@@ -1431,7 +1432,7 @@ class ProductionAnalysisExecutor:
             "threshold": threshold,
             "score": score,
             "passed": passed,
-            "ai_label": label or None,
+            "ai_label": label,
             "channel_index": channel_index,
             "error_message": None,
             "summary": ai_result.get("summary"),
@@ -1717,6 +1718,11 @@ class ProductionAnalysisExecutor:
                     ],
                     "channel_results": judgment_payload["channel_results"],
                     "review": {
+                        "ai_result": {
+                            "status": ai_review.get("status"),
+                            "score": ai_review.get("score"),
+                            "ai_label": ai_review.get("ai_label"),
+                        },
                         "algorithm_revision": job.snapshot.algorithm_revision,
                         "workorder_snapshot_json": (
                             job.snapshot.workorder_snapshot_json

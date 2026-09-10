@@ -102,6 +102,27 @@ class _Runtime:
         pass
 
 
+@pytest.mark.parametrize("raw_label", ["  自定义标签  ", " PASS ", " NG "])
+def test_decision_and_enrichment_preserve_raw_ai_snapshot(tmp_path, raw_label):
+    class LabelRuntime(_Runtime):
+        def analyze(self, **kwargs):
+            response = super().analyze(**kwargs)
+            response["response_payload"]["ai_result"]["ai_label"] = raw_label
+            return response
+
+    audio = _Audio(sample_rate=8_000, channel_count=1)
+    executor = ProductionAnalysisExecutor(ai_runtime=LabelRuntime())
+    decision = executor.execute_decision(_job(tmp_path, audio, ai=True), audio, _Token())
+    decision_result = json.loads(decision.canonical_result_json)["result"]
+    assert decision_result["review"]["ai_result"] == {
+        "status": "success", "score": 0.875, "ai_label": raw_label,
+    }
+    assert decision_result["ai_pass"] is (raw_label.strip() != "NG")
+    enrichment = executor.execute_enrichment(decision.bundle_token)
+    enriched_result = json.loads(enrichment.canonical_result_json)["result"]
+    assert enriched_result["review"] == decision_result["review"]
+
+
 def _job(
     tmp_path: Path,
     audio: _Audio,

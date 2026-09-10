@@ -470,9 +470,13 @@ def test_executor_maps_established_legacy_verdict_and_nests_review_facts_under_r
     assert type(nested["review"]) is FrozenResultObject
     review = dict(nested["review"].items)
     assert set(review) == {
+        "ai_result",
         "algorithm_revision",
         "workorder_snapshot_json",
         "workorder",
+    }
+    assert dict(review["ai_result"].items) == {
+        "status": "skipped", "score": None, "ai_label": None,
     }
     assert type(nested["summary_payload"]) is FrozenResultObject
     assert type(nested["chart_payload"]) is FrozenResultObject

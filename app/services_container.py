@@ -64,6 +64,7 @@ from app.service.run_persistence.export_reader import RunExportReader
 from app.service.run_persistence.historical_analysis_reader import HistoricalAnalysisReader
 from app.service.run_persistence.startup import settle_startup
 from app.service.run_record_export.archive import RunArchiveService
+from app.service.run_persistence.ai_export_reader import RunAiExportReader
 from app.service.result_history import ResultHistoryStore
 from consts.running_consts import base_dir
 
@@ -564,7 +565,10 @@ class ServiceContainer:
         )
         self.run_archive_service = RunArchiveService(
             self.run_export_reader,
-            self.ai_service,
+            RunAiExportReader(
+                runtime,
+                result_artifact_store=self.analysis_result_artifact_store,
+            ),
         )
         self.run_data_management_service = RunDataManagementService(
             runtime,
