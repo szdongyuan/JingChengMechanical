@@ -1359,6 +1359,122 @@ def test_export_progress_starts_indeterminate_then_is_monotonic(qapp, monkeypatc
     assert progress.values[-1] == 4
 
 
+@pytest.fixture
+def captured_export_progress(qapp, monkeypatch):
+    """Capture the real UI callback while controlling widget reentrant calls."""
+    class Signal:
+        def __init__(self):
+            self.slots = []
+
+        def connect(self, slot, *_args):
+            self.slots.append(slot)
+
+    class Worker:
+        def __init__(self, *_args):
+            for name in ("progress_changed", "succeeded", "failed", "canceled", "finished"):
+                setattr(self, name, Signal())
+
+        def start(self):
+            pass
+
+        def deleteLater(self):
+            pass
+
+    class Progress:
+        def __init__(self):
+            self.canceled = Signal()
+            self.writes = []
+            self.hook = None
+
+        def write(self, method, value):
+            self.writes.append((method, value))
+            if self.hook is not None:
+                self.hook(method)
+
+        def setRange(self, minimum, maximum):
+            self.write("range", (minimum, maximum))
+
+        def setValue(self, value):
+            self.write("value", value)
+
+        def setLabelText(self, text):
+            self.write("label", text)
+
+        def show(self):
+            pass
+
+        def close(self):
+            pass
+
+    module, _, _ = _module(qapp)
+    _select_all_rows(module)
+    options = RunDataExportOptions.defaults()
+    progress = Progress()
+    monkeypatch.setattr("ui.modules.data_management._ExportWorker", Worker)
+    monkeypatch.setattr("ui.modules.data_management.choose_run_export_options", lambda *a, **k: options)
+    monkeypatch.setattr("ui.modules.data_management.choose_run_export_path", lambda *a, **k: "unused.zip")
+    monkeypatch.setattr(module, "_export_progress_dialog", lambda _count: progress)
+    monkeypatch.setattr(QMessageBox, "information", lambda *a: None)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a: None)
+    module._export_selected_rows()
+    update = module._export_worker.progress_changed.slots[0]
+    yield module, progress, update, options
+    module._export_worker = None
+    module.close()
+
+
+@pytest.mark.parametrize("terminal", ["success", "failure", "cancel"])
+@pytest.mark.parametrize("during", [None, "range", "value"])
+def test_export_progress_ignores_terminal_and_replaced_dialogs(captured_export_progress, terminal, during):
+    module, progress, update, options = captured_export_progress
+    terminal_writes = []
+
+    def finish():
+        module._finish_export(
+            2, _export_result("unused.zip", options=options) if terminal == "success" else None,
+            "failure" if terminal == "failure" else None, canceled=terminal == "cancel",
+        )
+        terminal_writes[:] = progress.writes
+
+    if during is None:
+        finish()
+    else:
+        def hook(method):
+            if method == during:
+                progress.hook = None
+                finish()
+        progress.hook = hook
+    update(1, 5, "stale")
+    assert progress.writes == terminal_writes
+    assert module._operation_active is False
+    # Starting a subsequent operation must not reactivate this closure.
+    module._export_worker = None
+    replacement = type(progress)()
+    module._export_progress_dialog = lambda _count: replacement
+    module._export_selected_rows()
+    before = list(replacement.writes)
+    update(5, 5, "old operation")
+    assert replacement.writes == before
+    assert progress.writes == terminal_writes
+    assert module._export_progress is replacement
+    assert module._operation_active
+
+
+@pytest.mark.parametrize("during", ["range", "value"])
+def test_export_older_nested_progress_does_not_overwrite_newer_progress(captured_export_progress, during):
+    module, progress, update, _ = captured_export_progress
+
+    def hook(method):
+        if method == during:
+            progress.hook = None
+            update(4, 5, "newer")
+
+    progress.hook = hook
+    update(1, 5, "older")
+    assert [value for method, value in progress.writes if method == "value"][-1] == 4
+    assert [value for method, value in progress.writes if method == "label"][-1] == "newer"
+
+
 def test_export_success_reports_exported_and_nonzero_attachment_skip_counts(
     qapp,
     monkeypatch,

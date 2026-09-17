@@ -1322,9 +1322,21 @@ class DataManagementModule(QWidget):
         progress_state = {
             "determinate": False,
             "value": 0,
+            "revision": 0,
         }
 
+        def progress_is_current(revision: int) -> bool:
+            return (
+                self._export_progress is progress
+                and self._operation_active
+                and progress_state["revision"] == revision
+            )
+
         def update_progress(completed: int, total: int, message: str) -> None:
+            if not progress_is_current(progress_state["revision"]):
+                return
+            progress_state["revision"] += 1
+            revision = progress_state["revision"]
             if total <= 0:
                 if not progress_state["determinate"]:
                     progress.setRange(0, 0)
@@ -1337,9 +1349,14 @@ class DataManagementModule(QWidget):
                 progress_state["determinate"] = True
                 progress_state["value"] = display_value
                 progress.setRange(0, total)
+                if not progress_is_current(revision):
+                    return
                 progress.setValue(display_value)
+            # Modal widgets can process events internally. A terminal signal or
+            # newer nested update must win over this callback's remaining writes.
+            if not progress_is_current(revision):
+                return
             progress.setLabelText(message)
-            QApplication.processEvents()
 
         self._set_operation_active(True)
         progress.show()
