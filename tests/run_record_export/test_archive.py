@@ -96,6 +96,151 @@ def _temp_artifacts(parent: Path) -> list[Path]:
     return list(parent.glob(".run-archive-*.tmp"))
 
 
+def test_attachment_split_checks_cancellation_around_reads_and_every_4096_frames(
+    tmp_path,
+):
+    from app.service.run_record_export.attachments import split_pcm16_wav
+
+    source = tmp_path / "large.wav"
+    frames = tuple(range(9_000))
+    _write_pcm16_wav(source, channels=(frames, frames))
+    checks = []
+
+    channels = split_pcm16_wav(
+        str(source),
+        sample_rate_hz=8_000,
+        channel_count=2,
+        frame_count=9_000,
+        cancel_check=lambda: checks.append(len(checks)),
+    )
+
+    assert len(channels) == 2
+    # Before and after each bounded read, including the final EOF check.
+    assert len(checks) >= 8
+
+
+def test_attachment_split_can_cancel_during_final_mono_wav_serialization(tmp_path):
+    from app.service.run_record_export.attachments import split_pcm16_wav
+
+    source = tmp_path / "serialization-cancel.wav"
+    frames = tuple(range(9_000))
+    _write_pcm16_wav(source, channels=(frames, frames))
+    checks = 0
+
+    def cancel():
+        nonlocal checks
+        checks += 1
+        # Reads and their final EOF check consume nine checkpoints. This
+        # cancellation therefore lands in bounded mono-WAV serialization.
+        if checks == 12:
+            raise RuntimeError("serialization canceled")
+
+    with pytest.raises(RuntimeError, match="serialization canceled"):
+        split_pcm16_wav(
+            str(source),
+            sample_rate_hz=8_000,
+            channel_count=2,
+            frame_count=9_000,
+            cancel_check=cancel,
+        )
+
+    assert checks == 12
+
+
+def test_streaming_attachment_split_is_chunked_writes_real_mono_files_and_returns_no_payload(
+    tmp_path,
+    monkeypatch,
+):
+    from app.service.run_record_export import attachments
+
+    source = tmp_path / "streaming.wav"
+    expected_channels = (
+        tuple((index % 20_000) - 10_000 for index in range(9_000)),
+        tuple(10_000 - (index % 20_000) for index in range(9_000)),
+        tuple((index % 1_001) - 500 for index in range(9_000)),
+    )
+    _write_pcm16_wav(source, channels=expected_channels)
+    outputs = tuple(tmp_path / f"CH{index}.wav" for index in range(1, 4))
+    read_sizes = []
+    real_wave_open = attachments.wave.open
+
+    class ReaderSpy:
+        def __init__(self, reader):
+            self._reader = reader
+
+        def __enter__(self):
+            self._reader.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._reader.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self._reader, name)
+
+        def readframes(self, frame_count):
+            read_sizes.append(frame_count)
+            assert frame_count <= 4_096
+            return self._reader.readframes(frame_count)
+
+    def wave_open_spy(path, mode=None):
+        opened = real_wave_open(path, mode)
+        if str(path) == str(source) and mode == "rb":
+            return ReaderSpy(opened)
+        return opened
+
+    monkeypatch.setattr(attachments.wave, "open", wave_open_spy)
+
+    result = attachments.write_pcm16_wav_channels(
+        str(source),
+        output_paths=outputs,
+        sample_rate_hz=8_000,
+        channel_count=3,
+        frame_count=9_000,
+    )
+
+    assert result is None
+    assert read_sizes == [4_096, 4_096, 808, 1]
+    for output, expected in zip(outputs, expected_channels, strict=True):
+        assert _read_pcm16_member(output.read_bytes()) == (
+            1,
+            8_000,
+            9_000,
+            expected,
+        )
+
+
+@pytest.mark.parametrize(
+    "samples",
+    [
+        (),
+        ((0.0, 1.0), (0.0, 2.0)),
+        ((-0.1, 1.0),),
+        ((0.0, float("nan")),),
+        ((False, 1.0),),
+    ],
+)
+def test_current_attachment_rejects_the_complete_invalid_tuple(samples):
+    from app.service.run_record_export.attachments import serialize_current_csv
+
+    with pytest.raises(ValueError):
+        serialize_current_csv(samples)
+
+
+def test_current_attachment_is_utf8_lf_round_trip_text_with_trailing_lf():
+    from app.service.run_record_export.attachments import serialize_current_csv
+
+    payload = serialize_current_csv(((0.0, 0.1), (0.25, -1.2345678901234567)))
+
+    assert not payload.startswith(b"\xef\xbb\xbf")
+    assert b"\r" not in payload
+    assert payload == (
+        b"time_sec,current_a\n"
+        b"0.0,0.1\n"
+        b"0.25,-1.2345678901234567\n"
+    )
+
+
 def test_resolve_export_target_applies_extension_only_when_missing(tmp_path):
     from app.service.run_record_export.archive import resolve_export_target
 
@@ -486,3 +631,72 @@ def test_write_run_archive_rejects_target_source_alias_before_any_mutation(
     assert source.read_bytes() == source_before
     if target_before is not None:
         assert target.read_bytes() == target_before
+
+
+def test_configurable_service_never_awaits_chart_enrichment(tmp_path, monkeypatch):
+    import app.service.run_record_export.archive as archive_module
+    from app.service.run_record_export.contracts import (
+        AiExportValue,
+        AudioExportFacts,
+        CurrentExportFacts,
+        RunDataExportCounts,
+        RunDataExportOptions,
+        RunDataExportReadReport,
+        RunDataExportRecord,
+        RunDataExportResult,
+    )
+
+    record = RunDataExportRecord(
+        run_id=RUN_ID,
+        selection_index=0,
+        accepted_at="2026-07-28T01:02:03.000000Z",
+        terminal_at="2026-07-28T01:02:04.000000Z",
+        sn="SN-1",
+        model="MODEL-1",
+        state="SUCCEEDED",
+        terminal_code="ANALYSIS_SUCCEEDED",
+        judgment="PASS",
+        judgment_source="AUTOMATIC",
+        fault_type=None,
+        audio=AudioExportFacts(None, None, None, None, None, "not selected"),
+        current=CurrentExportFacts(None, "not selected"),
+    )
+    report = RunDataExportReadReport((RUN_ID,), (record,), ())
+
+    class Reader:
+        def __init__(self):
+            self.read_calls = []
+
+        def pending_enrichment_run_ids(self, _run_ids):
+            raise AssertionError("chart enrichment must not be awaited")
+
+        def read_configurable_report(self, run_ids, *, cancel_check=None):
+            self.read_calls.append(run_ids)
+            return report
+
+    class AiReader:
+        def get_current_effective_export_values(self, run_ids):
+            assert run_ids == (RUN_ID,)
+            return {RUN_ID: AiExportValue(None, None)}
+
+    options = RunDataExportOptions(True, False, False, False)
+    target = str(tmp_path / "records.xlsx")
+    package_calls = []
+
+    def package(received_report, received_target, **kwargs):
+        package_calls.append((received_report, received_target, kwargs))
+        return RunDataExportResult(
+            received_target,
+            "xlsx",
+            RunDataExportCounts(1, 1, 0, 0, 0, 0, 0, 0),
+        )
+
+    monkeypatch.setattr(archive_module, "write_configurable_package", package)
+    reader = Reader()
+    result = archive_module.RunArchiveService(reader, AiReader()).export(
+        (RUN_ID,), target, options=options
+    )
+
+    assert result.target_path == target
+    assert reader.read_calls == [(RUN_ID,)]
+    assert package_calls[0][0] is report

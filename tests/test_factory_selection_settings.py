@@ -181,6 +181,9 @@ class _SharedBackingSettings:
     def status(self):
         return self._status
 
+    def remove(self, key: str) -> None:
+        self._pending.pop(key, None)
+
 
 class _WrongPayloadOnFailedSyncSettings:
     def __init__(
@@ -530,6 +533,57 @@ def test_pending_selection_reports_sync_or_readback_failure(sync_outcome):
         store.save_pending_selected_config_ids((101, 202))
         == "下次启动配置保存失败"
     )
+
+
+@pytest.mark.parametrize(
+    "prior_raw",
+    [
+        '[303,101]',
+        None,
+    ],
+)
+def test_pending_selection_post_write_failure_restores_exact_prior_raw_value(
+    prior_raw,
+):
+    key = FactorySelectionSettings.PENDING_SETTINGS_KEY
+    backing = {} if prior_raw is None else {key: prior_raw}
+    raw = _SharedBackingSettings(
+        backing=backing,
+        sync_outcomes=[
+            (QSettings.Status.AccessError, True),
+            (QSettings.Status.NoError, True),
+        ],
+    )
+    store = FactorySelectionSettings(settings=raw)
+
+    error = store.save_pending_selected_config_ids((202,))
+
+    assert error == "下次启动配置保存失败"
+    missing = object()
+    assert raw.value(key, missing) == (
+        missing if prior_raw is None else prior_raw
+    )
+    assert store.load_pending_selected_config_ids() == (
+        None if prior_raw is None else (303, 101)
+    )
+
+
+def test_pending_selection_failed_rollback_reconciles_durable_requested_value():
+    key = FactorySelectionSettings.PENDING_SETTINGS_KEY
+    backing = {key: '[101]'}
+    raw = _SharedBackingSettings(
+        backing=backing,
+        sync_outcomes=[
+            (QSettings.Status.AccessError, True),
+            (QSettings.Status.AccessError, False),
+        ],
+    )
+    store = FactorySelectionSettings(settings=raw)
+
+    error = store.save_pending_selected_config_ids((202,))
+
+    assert error is None
+    assert store.load_pending_selected_config_ids() == (202,)
 
 
 def test_reconcile_for_startup_prefers_pending_and_prunes_missing_duplicates():

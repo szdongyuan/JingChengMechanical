@@ -7,6 +7,8 @@ import wave
 
 import pytest
 
+from tests.test_audio_wav import write_numeric_wav
+
 from app.service.run_persistence import audio_publication as publication_module
 from app.service.run_persistence.audio_publication import (
     AudioPublication,
@@ -22,6 +24,26 @@ def wav_bytes(path: Path, *, rate=8_000, channels=1, width=2, frames=8) -> bytes
         writer.setsampwidth(width)
         writer.writeframes(b"\x01\x00" * frames * channels)
     return path.read_bytes()
+
+
+@pytest.mark.parametrize('bits,floating', [(24, False), (32, True), (64, True)])
+def test_publication_preserves_original_precision_bytes(tmp_path, bits, floating):
+    source = tmp_path / 'precision.wav'
+    write_numeric_wav(source, bits=bits, floating=floating)
+    final = tmp_path / 'archive.wav'
+    result = AudioPublication().publish(source, final, 8000, 2, bits // 8, 3)
+    assert result.ok, result.reason
+    assert final.read_bytes() == source.read_bytes()
+    assert result.metadata.container_format == ('WAV_IEEE_FLOAT' if floating else 'WAV_PCM')
+    assert result.metadata.frame_count == 3
+    assert result.metadata.channel_count == 2
+
+
+def test_pcm_only_verifier_keeps_rejecting_ieee_float(tmp_path):
+    path = tmp_path / 'float.wav'
+    write_numeric_wav(path, bits=32, floating=True)
+    with pytest.raises(ValueError, match='PCM'):
+        verify_wav_pcm(path, 8000, 2, 4, 3)
 
 
 def test_verify_real_supported_pcm_and_rejects_invalid_or_incomplete(tmp_path):

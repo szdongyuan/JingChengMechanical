@@ -31,6 +31,7 @@ scipy_datas, scipy_binaries, scipy_hiddenimports = collect_all(
 )
 
 binaries = list(scipy_binaries)
+binaries.append(("app/native/capture_buffer.dll", "app/native"))
 if os.path.exists(snap7_dll):
     binaries.append((snap7_dll, "snap7/lib"))
 
@@ -100,16 +101,43 @@ a = Analysis(
     binaries=binaries,
     datas=datas,
     hiddenimports=[
+        'app.service.capture_process.worker',
         *collect_submodules('snap7'),
         *scipy_hiddenimports,
     ],
     hookspath=[],
-    runtime_hooks=[],
-    excludes=[],
+    runtime_hooks=['scripts/capture_spawn_hook.py'],
+    excludes=[
+        'PyQt5',
+        'PySide2',
+        'PySide6',
+        'torch',
+        'tensorflow',
+        'matplotlib',
+        'pytest',
+        'IPython',
+        'jupyter',
+        'notebook',
+        'pandas',
+        'pygame',
+        'tkinter',
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
 )
+
+# Codex's packaging environment adds Poppler's ICU 78 directory to PATH.
+# PyInstaller may then collect its version-suffixed icuuc.dll as a dependency
+# of Qt6Core.  Qt expects the unversioned Windows ICU exports, so that foreign
+# DLL shadows System32's compatible icuuc.dll and makes PyQt6.QtGui fail with
+# WinError 127.  Never ship those two Poppler ICU files with this application.
+_foreign_icu_names = {"icuuc.dll", "icudt78.dll"}
+a.binaries = [
+    entry
+    for entry in a.binaries
+    if os.path.basename(entry[0]).lower() not in _foreign_icu_names
+]
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 

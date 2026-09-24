@@ -80,8 +80,9 @@ class _ResidentRing:
             or frames_per_buffer < 1
         ):
             raise ValueError("invalid ring timeline configuration")
-        logical_frames = math.ceil(sample_rate_hz * 2.0)
-        if self._capacity_frames < logical_frames + frames_per_buffer:
+        logical_frames = min(math.ceil(sample_rate_hz * 10.0),
+                             self._capacity_frames - frames_per_buffer)
+        if logical_frames < 1:
             raise ValueError("ring capacity is smaller than its logical window")
         self._sample_rate_hz = sample_rate_hz
         self._frames_per_buffer = frames_per_buffer
@@ -304,7 +305,9 @@ class _ResidentRing:
             previous = item
 
         newest = blocks[-1]
-        logical_cutoff_ns = newest.estimated_end_ns - 2_000_000_000
+        logical_cutoff_ns = newest.estimated_end_ns - round(
+            self._logical_frames * 1_000_000_000 / sample_rate_hz
+        )
         if trigger_monotonic_ns < logical_cutoff_ns:
             return _MappingResult(_MappingStatus.EXPIRED)
 

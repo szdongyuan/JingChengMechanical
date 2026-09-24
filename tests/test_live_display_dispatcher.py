@@ -954,3 +954,136 @@ def test_stop_clears_spl_emission_throttle_state():
     dispatcher.stop()
 
     assert dispatcher._last_spl_emit_time_by_key == {}
+
+
+class _CoarsePipeline:
+    channel_index = 0
+    sample_rate = 1000
+    _nfft = 20
+    _overlap = .5
+
+    def __init__(self, block_call=None):
+        self.calls = 0
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.block_call = block_call
+        self.resets = 0
+
+    def reset(self):
+        self.resets += 1
+
+    def process_chunk(self, mono, elapsed_time, *, compute_loudness=True):
+        self.calls += 1
+        if self.calls == self.block_call:
+            self.started.set()
+            assert self.release.wait(2)
+        return {"stft_frames": [StftFrame(elapsed_time, np.arange(513.), np.full(513, mono[0]))]}
+
+
+def _coarse_dispatcher(pipeline, bus, interval=.1):
+    return LiveDisplayDispatcher(pipelines=[pipeline], bus=bus, config_id=7,
+                                 coarse_stft=True, stft_emit_interval_sec=interval)
+
+
+def _submit_coarse(dispatcher, index=0, value=1, run="run-1", source="source-1", start=None):
+    return dispatcher.submit(np.array([[value]], dtype=float), elapsed_time=.005 + index * .01,
+                             frame_run_id=run, live_loudness_channel_index=None,
+                             sample_start=index * 10 if start is None else start,
+                             sample_end=index * 10 + 10 if start is None else start + 10,
+                             source_continuity=source)
+
+
+def test_coarse_quiet_tail_emits_without_further_submission():
+    bus = _Bus()
+    emitted = threading.Event()
+    original_emit = bus.stft_updated.emit
+    bus.stft_updated.emit = lambda *args: (original_emit(*args), emitted.set())
+    dispatcher = _coarse_dispatcher(_CoarsePipeline(), bus)
+    try:
+        assert _submit_coarse(dispatcher)
+        assert emitted.wait(2)
+        call, = bus.stft_updated.calls
+        assert call[:3] == (7, "run-1", 0)
+        assert call[3].time_bounds == pytest.approx((0, .01))
+        assert call[3].source_frame_count == 1
+    finally:
+        dispatcher.stop()
+
+
+def test_coarse_idle_includes_pending_tail_and_drains_it():
+    bus = _Bus()
+    dispatcher = _coarse_dispatcher(_CoarsePipeline(), bus, interval=10)
+    try:
+        assert _submit_coarse(dispatcher)
+        _wait_until(lambda: not dispatcher._active_work and not dispatcher.pending_count)
+        assert dispatcher.wait_until_idle(2)
+        assert len(bus.stft_updated.calls) == 1
+        assert dispatcher._coarse_pending == {}
+    finally:
+        dispatcher.stop()
+
+
+def test_coarse_stop_clears_tail_and_suppresses_blocked_dsp_results():
+    bus = _Bus()
+    pipeline = _CoarsePipeline(block_call=2)
+    dispatcher = _coarse_dispatcher(pipeline, bus, interval=10)
+    try:
+        assert _submit_coarse(dispatcher)
+        assert _submit_coarse(dispatcher, 1)
+        assert pipeline.started.wait(1)
+        assert dispatcher.stop(timeout=.01) is False
+        assert dispatcher._coarse_pending == {}
+        pipeline.release.set()
+        dispatcher._thread.join(2)
+        assert not dispatcher._thread.is_alive()
+        assert bus.stft_updated.calls == []
+        assert dispatcher._coarse_pending == {}
+    finally:
+        pipeline.release.set()
+        dispatcher.stop()
+
+
+@pytest.mark.parametrize("change", ["source", "sample", "run"])
+def test_coarse_pre_gap_blocked_work_keeps_original_identity(change):
+    bus = _Bus()
+    pipeline = _CoarsePipeline(block_call=1)
+    dispatcher = _coarse_dispatcher(pipeline, bus, interval=10)
+    try:
+        assert _submit_coarse(dispatcher)
+        assert pipeline.started.wait(1)
+        kwargs = {"source": "source-2"} if change == "source" else {"start": 30} if change == "sample" else {"run": "run-2"}
+        assert _submit_coarse(dispatcher, 1, value=9, **kwargs)
+        pipeline.release.set()
+        assert dispatcher.wait_until_idle(2)
+        calls = bus.stft_updated.calls
+        assert len(calls) == 2
+        assert [c[3].source_frame_count for c in calls] == [1, 1]
+        assert [c[3].magnitudes.max() for c in calls] == [1, 9]
+        assert [c[1] for c in calls] == ["run-1", "run-2" if change == "run" else "run-1"]
+        assert pipeline.resets == 1
+    finally:
+        pipeline.release.set()
+        dispatcher.stop()
+
+
+def test_coarse_two_channels_keep_independent_peaks_and_original_signal_identity():
+    bus = _Bus()
+    first, second = _CoarsePipeline(), _CoarsePipeline()
+    second.channel_index = 1
+    dispatcher = LiveDisplayDispatcher(pipelines=[first, second], bus=bus, config_id=7,
+                                       coarse_stft=True, stft_emit_interval_sec=.1)
+    try:
+        for i in range(10):
+            assert dispatcher.submit(np.array([[20 if i == 4 else 1, 70 if i == 7 else 2]]),
+                                     elapsed_time=.005 + i * .01, frame_run_id="run-1",
+                                     live_loudness_channel_index=None, sample_start=i, sample_end=i + 1)
+            _wait_until(lambda: second.calls == i + 1)
+        assert dispatcher.wait_until_idle(2)
+        for channel, peak in [(0, 20), (1, 70)]:
+            calls = [c for c in bus.stft_updated.calls if c[2] == channel]
+            assert sum(c[3].source_frame_count for c in calls) == 10
+            assert max(c[3].magnitudes.max() for c in calls) == peak
+            assert all(len(c[3].magnitudes) <= 256 for c in calls)
+            assert all(c[:3] == (7, "run-1", channel) for c in calls)
+    finally:
+        dispatcher.stop()

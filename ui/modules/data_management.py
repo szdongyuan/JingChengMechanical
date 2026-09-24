@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
-from inspect import Parameter, signature
 import os
 from threading import Event
 
@@ -15,13 +14,13 @@ from PyQt6.QtCore import (
     QThread,
     QTimer,
     pyqtSignal,
+    pyqtSlot,
 )
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDateTimeEdit,
-    QFileDialog,
     QHeaderView,
     QHBoxLayout,
     QInputDialog,
@@ -45,6 +44,7 @@ from app.service.run_persistence.data_management import (
     ManagementJudgment,
     RunManagementQuery,
 )
+from app.service.run_record_export import RunDataExportResult
 from app.service.run_scoped_playback import (
     PlaybackCode,
     PlaybackResult,
@@ -59,7 +59,14 @@ from model.malfunction_type_table import (
     ensure_builtin_malfunction_type,
 )
 from ui.popups.historical_metric_report_dialog import HistoricalMetricReportDialog
+from ui.popups.historical_analysis_dialog import HistoricalAnalysisDialog, historical_playback
+from ui.popups.import_audio_analysis_dialog import ImportAudioAnalysisDialog
+from app.service.offline_audio_import import ImportRequest, ImportPhase, ImportStatus
 from ui.popups.run_audio_replay_dialog import RunAudioReplayDialog
+from ui.popups.run_record_export_dialog import (
+    choose_run_export_options,
+    choose_run_export_path,
+)
 
 
 _BEIJING_TIMEZONE = timezone(timedelta(hours=8))
@@ -72,13 +79,16 @@ class _ExportCanceledError(RuntimeError):
 
 class _ExportWorker(QThread):
     progress_changed = pyqtSignal(int, int, str)
-    succeeded = pyqtSignal(str)
+    succeeded = pyqtSignal(object)
     failed = pyqtSignal(str)
     canceled = pyqtSignal()
 
     def __init__(
         self,
-        export_runner: Callable[[Callable[[int, int, str], None]], str],
+        export_runner: Callable[
+            [Callable[[int, int, str], None], Callable[[], None]],
+            RunDataExportResult,
+        ],
         parent=None,
     ) -> None:
         super().__init__(parent)
@@ -91,23 +101,20 @@ class _ExportWorker(QThread):
     def run(self) -> None:
         try:
             self._raise_if_cancel_requested()
-            resolved_target = self._export_runner(self._emit_progress)
-            self._raise_if_cancel_requested()
+            result = self._export_runner(
+                self._emit_progress,
+                self._raise_if_cancel_requested,
+            )
         except _ExportCanceledError:
             self.canceled.emit()
             return
         except Exception as exc:
-            if self._cancel_requested.is_set():
-                self.canceled.emit()
-                return
             self.failed.emit(str(exc))
             return
-        self.succeeded.emit(resolved_target)
+        self.succeeded.emit(result)
 
     def _emit_progress(self, completed: int, total: int, message: str) -> None:
-        self._raise_if_cancel_requested()
         self.progress_changed.emit(completed, total, message)
-        self._raise_if_cancel_requested()
 
     def _raise_if_cancel_requested(self) -> None:
         if self._cancel_requested.is_set():
@@ -140,6 +147,9 @@ class DataManagementModule(QWidget):
         ("judgment_source", "判定来源"),
         ("fault_type", "故障类型"),
     )
+    _ANALYSIS_COLUMN = len(_columns) + 1
+    _PLAYBACK_COLUMN = _ANALYSIS_COLUMN + 1
+    _DELETE_COLUMN = _PLAYBACK_COLUMN + 1
     _PLAYBACK_FAILURE_MESSAGES = {
         PlaybackCode.BUSY: "回放服务正在忙，请稍后再试",
         PlaybackCode.PERSISTED_AUDIO_UNAVAILABLE: "此记录没有可回放的音频",
@@ -177,6 +187,10 @@ class DataManagementModule(QWidget):
         self._export_progress: QProgressDialog | None = None
         self._report_dialog = None
         self._replay_dialogs: dict[str, RunAudioReplayDialog] = {}
+        self._analysis_dialogs: dict[str, HistoricalAnalysisDialog] = {}
+        self._import_dialog = None
+        self._import_generation = 0
+        self._import_results_seen: set[str] = set()
         self._initial_column_widths_applied = False
         self._fault_type_options_cache: tuple[
             tuple[str, str | None],
@@ -186,6 +200,12 @@ class DataManagementModule(QWidget):
 
         self._build_ui()
         self.refresh_table()
+        signal = getattr(getattr(services, "bus", None), "offline_import_status", None)
+        if signal is not None:
+            signal.connect(self._on_import_status, Qt.ConnectionType.QueuedConnection)
+        service = getattr(services, "offline_audio_import_service", None)
+        self.btn_import_audio.setEnabled(service is not None)
+        self._on_import_status(getattr(service, "status", None))
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -198,6 +218,8 @@ class DataManagementModule(QWidget):
         toolbar_layout.setSpacing(8)
 
         self.btn_refresh = QPushButton("刷新")
+        self.btn_import_audio = QPushButton("导入音频分析")
+        self.btn_import_audio.clicked.connect(self._import_audio)
         self.btn_statistics_report = QPushButton("统计报告")
         self.btn_select_all = QPushButton("全选")
         self.btn_select_all.setCheckable(True)
@@ -209,6 +231,7 @@ class DataManagementModule(QWidget):
         self.lb_selected = QLabel("已选 0 条")
 
         toolbar_layout.addWidget(self.btn_refresh)
+        toolbar_layout.addWidget(self.btn_import_audio)
         toolbar_layout.addWidget(self.btn_statistics_report)
         toolbar_layout.addWidget(self.btn_select_all)
         toolbar_layout.addWidget(self.btn_select_page)
@@ -218,6 +241,9 @@ class DataManagementModule(QWidget):
         toolbar_layout.addStretch(1)
         toolbar_layout.addWidget(self.lb_selected)
         layout.addWidget(toolbar)
+        self.import_status_label = QLabel("")
+        self.import_status_label.setWordWrap(True)
+        layout.addWidget(self.import_status_label)
 
         filters = QWidget(self)
         filter_layout = QHBoxLayout(filters)
@@ -266,11 +292,12 @@ class DataManagementModule(QWidget):
         filter_layout.addStretch(1)
         layout.addWidget(filters)
 
-        self.table = QTableWidget(0, len(self._columns) + 3, self)
+        self.table = QTableWidget(0, self._DELETE_COLUMN + 1, self)
         self.table.setHorizontalHeaderLabels(
             [
                 "选择",
                 *(label for _name, label in self._columns),
+                "查看分析结果",
                 "回放",
                 "删除",
             ]
@@ -517,6 +544,13 @@ class DataManagementModule(QWidget):
                         )
                         item.setToolTip(record.run_id)
                     self.table.setItem(row_index, column_index, item)
+                analysis_button = QPushButton("查看分析结果")
+                analysis_button.setFixedHeight(24)
+                analysis_button.setStyleSheet("padding: 2px 6px; border-radius: 6px;")
+                analysis_button.clicked.connect(
+                    lambda _checked=False, run_id=record.run_id: self._show_analysis(run_id)
+                )
+                self.table.setCellWidget(row_index, self._ANALYSIS_COLUMN, analysis_button)
                 play_button = self._create_table_action_button(
                     QStyle.StandardPixmap.SP_MediaPlay,
                     "data_management_play_button",
@@ -529,7 +563,7 @@ class DataManagementModule(QWidget):
                 )
                 self.table.setCellWidget(
                     row_index,
-                    self.table.columnCount() - 2,
+                    self._PLAYBACK_COLUMN,
                     play_button,
                 )
                 delete_button = self._create_table_action_button(
@@ -544,7 +578,7 @@ class DataManagementModule(QWidget):
                 )
                 self.table.setCellWidget(
                     row_index,
-                    self.table.columnCount() - 1,
+                    self._DELETE_COLUMN,
                     delete_button,
                 )
         finally:
@@ -597,7 +631,8 @@ class DataManagementModule(QWidget):
             "fault_type": 0.70,
         }
         action_width = 48
-        fixed_width = 54 + (2 * action_width)
+        analysis_width = 120
+        fixed_width = 54 + analysis_width + (2 * action_width)
         base_width = fixed_width + sum(minimum_widths.values())
         available_width = max(self.table.viewport().width() - 2, base_width)
         extra_width = max(0, available_width - base_width)
@@ -616,12 +651,10 @@ class DataManagementModule(QWidget):
                 )
             applied_widths[column] = width
             self.table.setColumnWidth(column, width)
-        for column in (
-            self.table.columnCount() - 2,
-            self.table.columnCount() - 1,
-        ):
+        self.table.setColumnWidth(self._ANALYSIS_COLUMN, analysis_width)
+        for column in (self._PLAYBACK_COLUMN, self._DELETE_COLUMN):
             self.table.setColumnWidth(column, action_width)
-        used_width = 54 + (2 * action_width) + sum(applied_widths.values())
+        used_width = fixed_width + sum(applied_widths.values())
         remainder = max(0, available_width - used_width)
         if remainder and applied_widths:
             fault_column = self._fault_type_column_index()
@@ -991,6 +1024,93 @@ class DataManagementModule(QWidget):
             float(frame_count) / float(sample_rate_hz),
         )
 
+    def _import_audio(self) -> None:
+        service = getattr(self.services, "offline_audio_import_service", None)
+        if service is None or (service.status is not None and not service.status.finished):
+            return
+        if self._import_dialog is not None:
+            self._import_dialog.raise_()
+            return
+        try:
+            config_service = self.services.config_service
+            configs = [config_service.load_config(row["config_id"]) for row in config_service.list_configs()]
+            if not configs:
+                self.import_status_label.setText("请先保存一个配置")
+                return
+            dialog = ImportAudioAnalysisDialog(configs=configs,
+                default_config_id=configs[0]["config_id"] if len(configs) == 1 else None, parent=self)
+        except Exception as exc:
+            self.import_status_label.setText(f"配置加载失败：{exc}")
+            return
+        self._import_dialog = dialog
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.accepted.connect(self._submit_import)
+        dialog.finished.connect(self._import_setup_finished)
+        dialog.open()
+
+    def _import_setup_finished(self, _result):
+        self._import_dialog = None
+
+    def _submit_import(self):
+        request = self._import_dialog.current_request()
+        if request is None:
+            return
+        service = self.services.offline_audio_import_service
+        receipt = service.submit(ImportRequest(source_path=request.wav_path,
+            config_id=request.config_id, assignments=tuple(asdict(item) for item in request.assignments),
+            start_seconds=request.start_sec, duration_seconds=request.duration_sec,
+            use_mic_calibration=request.use_mic_calibration))
+        if not receipt.accepted:
+            self.import_status_label.setText(f"导入失败：{receipt.error}")
+            return
+        self._on_import_status(service.status)
+
+    @pyqtSlot(object)
+    def _on_import_status(self, status):
+        if not isinstance(status, ImportStatus):
+            return
+        # The worker may have retired/deleted a run before queued Qt delivery.
+        latest = getattr(getattr(self.services, "offline_audio_import_service", None), "status", None)
+        if isinstance(latest, ImportStatus) and latest.generation > status.generation:
+            status = latest
+        if status.generation <= self._import_generation:
+            return
+        self._import_generation = status.generation
+        self.btn_import_audio.setEnabled(status.finished)
+        phases = {ImportPhase.ACCEPTED: "已接受导入", ImportPhase.WAITING: "等待生产任务完成",
+            ImportPhase.PREPARING: "正在准备导入", ImportPhase.SAVING: "正在保存音频",
+            ImportPhase.ANALYZING: "正在分析", ImportPhase.COMPLETING_CHARTS: "分析结果已保存，正在完成图表",
+            ImportPhase.COMPLETED: "导入完成", ImportPhase.FAILED: "导入失败", ImportPhase.CANCELED: "导入已取消"}
+        self.import_status_label.setText(" · ".join(filter(None,
+            [phases[status.phase], status.error, *status.warnings])))
+        if status.result_ready:
+            if not self._operation_active and self._applied_query is not None:
+                self._query_and_render(self._applied_query)
+            dialog = self._analysis_dialogs.get(status.run_id)
+            if dialog is not None:
+                dialog.refresh_enrichment()
+            if status.run_id not in self._import_results_seen:
+                self._import_results_seen.add(status.run_id)
+                self._show_analysis(status.run_id)
+
+    def _show_analysis(self, run_id: str) -> None:
+        dialog = self._analysis_dialogs.get(run_id)
+        if dialog is None:
+            dialog = HistoricalAnalysisDialog(run_id=run_id, services=self.services, parent=self)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            self._analysis_dialogs[run_id] = dialog
+            dialogs = self._analysis_dialogs
+
+            def forget_dialog(*_args):
+                if dialogs.get(run_id) is dialog:
+                    dialogs.pop(run_id)
+
+            dialog.destroyed.connect(forget_dialog)
+            dialog.label_saved.connect(self.refresh_table)
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+
     def _play_run(self, run_id: str) -> None:
         try:
             records = self.services.run_export_reader.read_many((run_id,))
@@ -1002,8 +1122,7 @@ class DataManagementModule(QWidget):
             )
         except Exception:
             record = None
-        composition = getattr(self.services, "final_composition", None)
-        playback = getattr(composition, "playback", None)
+        playback = historical_playback(self.services)
         if (
             record is not None
             and isinstance(getattr(record, "source_wav_path", None), str)
@@ -1269,46 +1388,77 @@ class DataManagementModule(QWidget):
             QMessageBox.warning(self, "提示", "请先勾选要导出的运行记录")
             return
 
-        run_ids = self._prepare_export_run_ids(run_ids)
-        if not run_ids:
+        options = choose_run_export_options(
+            self,
+            selected_count=len(run_ids),
+        )
+        if options is None:
             return
 
         os.makedirs(self.data_dir, exist_ok=True)
-        target_path, _selected_filter = QFileDialog.getSaveFileName(
+        target_path = choose_run_export_path(
             self,
-            "导出运行记录",
-            os.path.join(self.data_dir, "run-records.zip"),
-            "Zip 文件 (*.zip);;所有文件 (*)",
+            output_kind=options.output_kind,
+            initial_dir=self.data_dir,
         )
         if not target_path:
             return
 
         progress = self._export_progress_dialog(len(run_ids))
+        progress_state = {
+            "determinate": False,
+            "value": 0,
+            "revision": 0,
+        }
+
+        def progress_is_current(revision: int) -> bool:
+            return (
+                self._export_progress is progress
+                and self._operation_active
+                and progress_state["revision"] == revision
+            )
 
         def update_progress(completed: int, total: int, message: str) -> None:
+            if not progress_is_current(progress_state["revision"]):
+                return
+            progress_state["revision"] += 1
+            revision = progress_state["revision"]
             if total <= 0:
-                progress.setRange(0, 0)
+                if not progress_state["determinate"]:
+                    progress.setRange(0, 0)
             else:
+                total = max(int(total), progress_state["value"])
+                display_value = max(
+                    progress_state["value"],
+                    max(0, min(int(completed), total)),
+                )
+                progress_state["determinate"] = True
+                progress_state["value"] = display_value
                 progress.setRange(0, total)
-                progress.setValue(max(0, min(completed, total)))
+                if not progress_is_current(revision):
+                    return
+                progress.setValue(display_value)
+            # Modal widgets can process events internally. A terminal signal or
+            # newer nested update must win over this callback's remaining writes.
+            if not progress_is_current(revision):
+                return
             progress.setLabelText(message)
-            QApplication.processEvents()
 
         self._set_operation_active(True)
         progress.show()
         QApplication.processEvents()
 
-        export = self.services.run_archive_service.export
-
-        def run_export(progress_callback) -> str:
-            if self._callable_accepts_progress_callback(export):
-                return self.services.run_archive_service.export(
-                    run_ids,
-                    target_path,
-                    progress_callback=progress_callback,
-                )
-            progress_callback(0, 0, "正在导出运行记录...")
-            return export(run_ids, target_path)
+        def run_export(
+            progress_callback,
+            cancel_check,
+        ) -> RunDataExportResult:
+            return self.services.run_archive_service.export(
+                run_ids,
+                target_path,
+                options=options,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
 
         self._export_progress = progress
         worker = _ExportWorker(run_export, self)
@@ -1319,9 +1469,9 @@ class DataManagementModule(QWidget):
             Qt.ConnectionType.QueuedConnection,
         )
         worker.succeeded.connect(
-            lambda resolved_target: self._finish_export(
+            lambda result: self._finish_export(
                 len(run_ids),
-                resolved_target,
+                result,
                 None,
             ),
             Qt.ConnectionType.QueuedConnection,
@@ -1353,82 +1503,12 @@ class DataManagementModule(QWidget):
         )
         worker.start()
 
-    def _prepare_export_run_ids(
-        self,
-        run_ids: tuple[str, ...],
-    ) -> tuple[str, ...]:
-        inspect_selection = getattr(
-            self.services.run_archive_service,
-            "inspect_selection",
-            None,
-        )
-        if not callable(inspect_selection):
-            return run_ids
-
-        try:
-            inspection = inspect_selection(run_ids)
-        except Exception as exc:
-            QMessageBox.warning(
-                self,
-                "导出检查失败",
-                f"检查导出记录失败：{exc}",
-            )
-            return ()
-
-        skipped = tuple(getattr(inspection, "skipped", ()))
-        exportable_run_ids = tuple(
-            getattr(inspection, "exportable_run_ids", ())
-        )
-        if not skipped:
-            return exportable_run_ids or run_ids
-
-        details = self._format_skipped_export_details(skipped)
-        if not exportable_run_ids:
-            QMessageBox.warning(
-                self,
-                "无法导出",
-                (
-                    f"选中的 {len(run_ids)} 条记录都不能导出。\n\n"
-                    f"{details}"
-                ),
-            )
-            return ()
-
-        answer = QMessageBox.question(
-            self,
-            "跳过不可导出记录",
-            (
-                f"选中 {len(run_ids)} 条，其中 {len(skipped)} 条不能导出。\n"
-                f"是否跳过这些记录，继续导出剩余 "
-                f"{len(exportable_run_ids)} 条？\n\n"
-                f"{details}"
-            ),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if answer == QMessageBox.StandardButton.Yes:
-            return exportable_run_ids
-        return ()
-
-    @staticmethod
-    def _format_skipped_export_details(skipped: tuple[object, ...]) -> str:
-        lines = ["不可导出记录："]
-        for item in skipped[:5]:
-            run_id = str(getattr(item, "run_id", ""))
-            reason = str(getattr(item, "reason", ""))
-            if len(reason) > 160:
-                reason = f"{reason[:157]}..."
-            lines.append(f"- {run_id}: {reason}")
-        if len(skipped) > 5:
-            lines.append(f"... 还有 {len(skipped) - 5} 条")
-        return "\n".join(lines)
-
     def _export_progress_dialog(self, run_count: int) -> QProgressDialog:
         progress = QProgressDialog(
             f"正在准备导出 {run_count} 条记录...",
             "取消",
             0,
-            100,
+            0,
             self,
         )
         progress.setWindowTitle("导出进度")
@@ -1437,13 +1517,12 @@ class DataManagementModule(QWidget):
         progress.setAutoClose(False)
         progress.setAutoReset(False)
         progress.setMinimumWidth(380)
-        progress.setValue(0)
         return progress
 
     def _finish_export(
         self,
         run_count: int,
-        resolved_target: str | None,
+        result: RunDataExportResult | None,
         error_message: str | None,
         *,
         canceled: bool = False,
@@ -1462,11 +1541,22 @@ class DataManagementModule(QWidget):
             )
             return
 
-        if error_message is None:
+        if error_message is None and result is not None:
+            counts = result.counts
+            lines = [f"已导出 {counts.exported_runs} 条运行记录"]
+            if counts.audio_runs_skipped:
+                lines.append(
+                    f"音频文件缺失或跳过 {counts.audio_runs_skipped} 条"
+                )
+            if counts.current_runs_skipped:
+                lines.append(
+                    f"电流数据缺失或跳过 {counts.current_runs_skipped} 条"
+                )
+            lines.extend(("", f"导出位置：\n{result.target_path}"))
             QMessageBox.information(
                 self,
                 "导出完成",
-                f"已导出 {run_count} 条运行记录到：\n{resolved_target}",
+                "\n".join(lines),
             )
         else:
             QMessageBox.warning(
@@ -1487,19 +1577,6 @@ class DataManagementModule(QWidget):
 
     def _clear_export_worker(self) -> None:
         self._export_worker = None
-
-    @staticmethod
-    def _callable_accepts_progress_callback(function) -> bool:
-        try:
-            parameters = signature(function).parameters.values()
-        except (TypeError, ValueError):
-            return True
-        for parameter in parameters:
-            if parameter.kind is Parameter.VAR_KEYWORD:
-                return True
-            if parameter.name == "progress_callback":
-                return True
-        return False
 
     def _batch_update_fault_type(self) -> None:
         if self._operation_active:

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
+from PyQt6.QtCore import QCoreApplication, QThread
 
 from app.service.analysis.scheduler.models import (
     ShutdownReport as SchedulerShutdownReport,
@@ -31,7 +33,9 @@ from app.service.multi_run_integration.shutdown import (
     ApplicationShutdownResources,
     PlcServiceThreadShutdownOwner,
 )
+from app.service.plc_service import PlcService
 from app.service.plc_result_sequencer import PlcShutdownReport
+from app.services_container import _invoke_plc_thread_slot
 from app.service.run_persistence.run_persistence_scheduler_bridge import (
     BridgeDatabaseCloseResult,
     BridgeDatabaseCloseStatus,
@@ -267,6 +271,21 @@ def _harness(*, overrides=None):
         shared_audio_backend=SimpleNamespace(close=calls["backend"].invoke),
     )
     return trace, calls, resources
+
+
+@pytest.mark.parametrize("failed_stage", ["begin", "bridge_a", "finish", "capture"])
+def test_owned_child_is_reaped_even_when_higher_level_shutdown_fails(failed_stage):
+    trace, calls, resources = _harness(overrides={failed_stage: RuntimeError("blocked owner")})
+    reaped = []
+    resources.managed_resident.reap_owned_capture_process = lambda timeout: reaped.append(timeout) or True
+    owner = ApplicationShutdownOwner(resources, timeout_seconds=1.0)
+    report = owner.shutdown()
+    assert report.clean is False
+    assert any("blocked owner" in detail for detail in report.errors)
+    assert len(reaped) == 1
+    assert 0.0 <= reaped[0] <= 1.0
+    assert owner.shutdown() is report
+    assert len(reaped) == 1
 
 
 def test_global_shutdown_uses_one_deadline_and_exact_run_skip_matrix():
@@ -695,6 +714,47 @@ def test_prepared_only_shutdown_closes_owned_graph_lease_and_run_database_last()
     ]
 
 
+def test_torque_job_writer_is_joined_before_application_database_closes(tmp_path, qapp):
+    import threading
+    import time
+    from peewee import SqliteDatabase
+    from app.service.torque.jobs import TorqueJobs
+    from app.service.torque.migration import apply_torque_migration
+    from app.service.torque.store import TorqueStore
+    db = SqliteDatabase(tmp_path / 'shutdown-torque.db')
+    db.connect()
+    apply_torque_migration(db)
+    jobs = TorqueJobs(TorqueStore(db))
+    entered, release = threading.Event(), threading.Event()
+    def pause(value):
+        entered.set()
+        assert release.wait(3)
+        return value
+    db.register_function(pause, 'pause_write', 1)
+    db.execute_sql('CREATE TRIGGER wait_write BEFORE INSERT ON torque_rule_table BEGIN SELECT pause_write(NEW.torque_value); END')
+    def close_database():
+        assert not jobs.worker_thread.isRunning()
+        assert db.execute_sql('SELECT torque_value FROM torque_rule_table').fetchone()[0] == 2.5
+        db.close()
+    owner = ApplicationShutdownOwner(ApplicationShutdownResources(
+        application_config_writers=(jobs,),
+        application_config_database=SimpleNamespace(close=close_database),
+        run_persistence_database=SimpleNamespace(close_after_upstream_stopped=lambda: None),
+    ), monotonic=time.monotonic, timeout_seconds=5)
+    jobs.submit('create_rule', 'sn', '000123', 2.5)
+    assert entered.wait(3)
+    timer = threading.Timer(.05, release.set)
+    timer.start()
+    try:
+        assert owner.shutdown().clean
+        assert db.is_closed()
+    finally:
+        release.set()
+        timer.join()
+        jobs.close()
+        db.close()
+
+
 def test_missing_required_active_owner_is_non_clean_and_never_closes_run_database():
     _trace, calls, resources = _harness()
     resources = replace(resources, playback=None)
@@ -843,6 +903,102 @@ def test_plc_split_stop_preserves_connection_until_sequencer_then_disconnects_be
     assert trace.index("plc.shutdown") < trace.index("invoke.disconnect_plc_service")
     assert trace.index("invoke.disconnect_plc_service") < trace.index("thread.quit")
     assert trace.index("thread.quit") < trace.index("thread.wait")
+
+
+def test_real_plc_service_completes_thread_affine_application_shutdown():
+    app = QCoreApplication.instance() or QCoreApplication([])
+    _trace, _calls, resources = _harness()
+    bus = SimpleNamespace(log=SimpleNamespace(emit=lambda *_args: None))
+    client = MagicMock()
+    service = PlcService(
+        bus,
+        lambda *_args: None,
+        "127.0.0.1",
+        field_offsets_dict={"start_signal_offset": "0.0"},
+        plc_id=7,
+    )
+    service.plc_client = client
+    thread = QThread()
+    service.moveToThread(thread)
+    thread.finished.connect(service.deleteLater)
+    thread.start()
+    binding = PlcServiceThreadShutdownOwner(
+        service,
+        thread,
+        _invoke_plc_thread_slot,
+    )
+    resources = replace(
+        resources,
+        external_producers=(binding,),
+        plc_owners=(binding,),
+    )
+
+    try:
+        report = ApplicationShutdownOwner(
+            resources,
+            monotonic=_Clock(),
+            timeout_seconds=5.0,
+        ).shutdown()
+
+        assert report.clean is True
+        assert report.restart_required is False
+        client.disconnect.assert_called_once_with()
+        assert thread.isRunning() is False
+    finally:
+        if thread.isRunning():
+            thread.quit()
+            thread.wait(1000)
+        del app
+
+
+def test_real_plc_disconnect_failure_is_nonclean_across_thread_boundary():
+    app = QCoreApplication.instance() or QCoreApplication([])
+    _trace, _calls, resources = _harness()
+    bus = SimpleNamespace(log=SimpleNamespace(emit=lambda *_args: None))
+    client = MagicMock()
+    client.disconnect.side_effect = RuntimeError("disconnect failed")
+    service = PlcService(
+        bus,
+        lambda *_args: None,
+        "127.0.0.1",
+        field_offsets_dict={"start_signal_offset": "0.0"},
+        plc_id=7,
+    )
+    service.plc_client = client
+    thread = QThread()
+    service.moveToThread(thread)
+    thread.finished.connect(service.deleteLater)
+    thread.start()
+    binding = PlcServiceThreadShutdownOwner(
+        service,
+        thread,
+        _invoke_plc_thread_slot,
+    )
+    resources = replace(
+        resources,
+        external_producers=(binding,),
+        plc_owners=(binding,),
+    )
+
+    try:
+        report = ApplicationShutdownOwner(
+            resources,
+            monotonic=_Clock(),
+            timeout_seconds=5.0,
+        ).shutdown()
+
+        assert report.clean is False
+        assert report.restart_required is True
+        owner_stage = next(
+            stage for stage in report.stages if stage.name == "plc_owners[0]"
+        )
+        assert "disconnect failed" in (owner_stage.detail or "")
+        client.disconnect.assert_called_once_with()
+    finally:
+        if thread.isRunning():
+            thread.quit()
+            thread.wait(1000)
+        del app
 
 
 def test_plc_thread_affine_invocation_failure_is_nonclean_once_without_disconnect_retry():

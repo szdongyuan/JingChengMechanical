@@ -377,6 +377,23 @@ def test_resident_values_enforce_exact_generation_and_partition_types():
         ResidentStartupOpenResult((stream,), (ResidentOpenFailure(ManagedHardwareId(1), "failed"),))
 
 
+def test_resident_open_failure_preserves_legacy_construction_and_optional_detail():
+    legacy = ResidentOpenFailure(ManagedHardwareId(1), "resident_open_failed")
+    assert legacy.detail == ""
+    detailed = ResidentOpenFailure(
+        ManagedHardwareId(1), "resident_open_failed", "synthetic open failure"
+    )
+    assert detailed.detail == "synthetic open failure"
+    assert detailed.error_code == legacy.error_code
+    assert ResidentOpenFailure(ManagedHardwareId(1), "failed", "音" * 256).detail == "音" * 256
+
+
+@pytest.mark.parametrize("detail", [None, 1, "x" * 257, "line\nbreak", "nul\0byte", "\ud800"])
+def test_resident_open_failure_rejects_unbounded_or_unsafe_detail(detail):
+    with pytest.raises(ValueError):
+        ResidentOpenFailure(ManagedHardwareId(1), "resident_open_failed", detail)
+
+
 def test_calibration_measurement_requires_exact_finite_values():
     value = ResidentCalibrationMeasurement(generation(), 0, -12.5, 480)
     assert value.captured_frames == 480

@@ -36,6 +36,13 @@ def _prepared_runtime(tmp_path: Path) -> RunPersistenceDatabase:
 
 
 def _minimal_services(monkeypatch) -> None:
+    class MinimalConfigService:
+        golden_sample_service = object()
+
+        @staticmethod
+        def load_config(config_id):
+            return {"config_id": config_id, "plc_id": config_id}
+
     monkeypatch.setattr(
         services_module.DbConnectionService,
         "connect",
@@ -54,7 +61,7 @@ def _minimal_services(monkeypatch) -> None:
     monkeypatch.setattr(
         services_module,
         "ConfigService",
-        lambda _bus: SimpleNamespace(golden_sample_service=object()),
+        lambda _bus: MinimalConfigService(),
     )
     monkeypatch.setattr(services_module, "AudioDataService", lambda: object())
     monkeypatch.setattr(
@@ -176,6 +183,7 @@ def test_service_container_freezes_one_config_and_opens_six_low_latency_streams(
     config = {
         "config_id": "config-1",
         "fault_types": [" bearing ", "seal", "bearing"],
+        "manual_judgment_buttons_visible": True,
         "nested": {"channels": [0, 1]},
     }
     builder = _composition_builder(trace, streams, coordinators)
@@ -210,11 +218,12 @@ def test_service_container_freezes_one_config_and_opens_six_low_latency_streams(
     assert request.fallback_history_labels.value_id.startswith("sha256:")
     assert ingress["history_labels"] == decoded_labels
     assert decoded_labels == {
-        "schema": "jingcheng-history-labels/v1",
+        "schema": "jingcheng-history-labels/v2",
         "config": {
             "config_id": 11,
             "name": "config-1",
             "fault_types": ["bearing", "seal"],
+            "manual_judgment_buttons_visible": True,
             "details": [],
         },
         "sn": "SN-1",
@@ -228,6 +237,135 @@ def test_service_container_freezes_one_config_and_opens_six_low_latency_streams(
         StartStatus.ACTIVE_COMMIT_REJECTED,
     )
     assert len(set(services.preaccept_terminal_statuses)) == 5
+
+
+def test_captured_and_imported_history_labels_freeze_prepared_visibility(
+    monkeypatch,
+    tmp_path,
+):
+    _minimal_services(monkeypatch)
+    builder = _composition_builder(
+        [],
+        [_Stream("hardware-1")],
+        [],
+    )
+    services = services_module.ServiceContainer(
+        run_persistence_database=_prepared_runtime(tmp_path),
+        production_composition_builder=builder,
+        semantic_config={
+            "config_id": "mutable-fallback",
+            "fault_types": [],
+            "manual_judgment_buttons_visible": False,
+        },
+    )
+    prepared_values = {
+        "config_name": "Prepared config",
+        "fault_types_json": '["异响"]',
+        "manual_judgment_buttons_visible": True,
+    }
+    services.prepared_production_composition._prerequisites = SimpleNamespace(
+        configs=(SimpleNamespace(config_id=11, values=prepared_values),)
+    )
+
+    captured = services.build_captured_start_request(
+        source=TriggerSource.MANUAL,
+        trigger_monotonic_ns=123,
+        workorder={},
+        config_id=11,
+    )
+    imported = services.build_imported_start_request(
+        trigger_monotonic_ns=124,
+        source_path=tmp_path / "source.wav",
+    )
+    prepared_values["manual_judgment_buttons_visible"] = False
+
+    for request in (captured, imported):
+        labels = decode_history_labels_payload(
+            value_id=request.fallback_history_labels.value_id,
+            canonical_bytes=request.fallback_history_labels.canonical_bytes,
+        )
+        assert labels["config"]["manual_judgment_buttons_visible"] is True
+
+
+def test_unresolved_imported_history_labels_freeze_visibility_false(
+    monkeypatch,
+    tmp_path,
+):
+    _minimal_services(monkeypatch)
+    builder = _composition_builder(
+        [],
+        [_Stream("hardware-1")],
+        [],
+        config_routes=((11, None), (12, None)),
+    )
+    services = services_module.ServiceContainer(
+        run_persistence_database=_prepared_runtime(tmp_path),
+        production_composition_builder=builder,
+        semantic_config={
+            "config_id": "mutable-fallback",
+            "fault_types": ["异响"],
+            "manual_judgment_buttons_visible": True,
+        },
+    )
+
+    imported = services.build_imported_start_request(
+        trigger_monotonic_ns=124,
+        source_path=tmp_path / "source.wav",
+    )
+    labels = decode_history_labels_payload(
+        value_id=imported.fallback_history_labels.value_id,
+        canonical_bytes=imported.fallback_history_labels.canonical_bytes,
+    )
+
+    assert labels["config"] == {
+        "config_id": None,
+        "name": "未解析配置",
+        "fault_types": [],
+        "manual_judgment_buttons_visible": False,
+        "details": [],
+    }
+
+
+def test_service_container_committed_enrichment_reaches_qt_adapter_once(
+    monkeypatch,
+    tmp_path,
+):
+    _minimal_services(monkeypatch)
+    qt_bus = []
+    observer_calls = []
+
+    class Adapter:
+        def __init__(self, _dashboard, **_kwargs):
+            pass
+
+        def publish(self, _event):
+            pass
+
+        def publish_enrichment(self, event):
+            qt_bus.append(event)
+
+    monkeypatch.setattr(integration_package, "HistoryQtAdapter", Adapter)
+    trace = []
+    coordinators = []
+    builder = _composition_builder(
+        trace,
+        [_Stream("hardware-1")],
+        coordinators,
+    )
+    services = services_module.ServiceContainer(
+        run_persistence_database=_prepared_runtime(tmp_path),
+        production_composition_builder=builder,
+        semantic_config={"config_id": "config-1", "fault_types": []},
+    )
+    builder.plc = services.plc_result_sequencer
+    services.attach_committed_history_observer(observer_calls.append)
+    _attach(services)
+    enrichment = object()
+
+    services.final_composition.history_sink.publish_enrichment(enrichment)
+
+    assert qt_bus == [enrichment]
+    assert observer_calls == []
 
 
 def test_captured_ingress_preserves_exact_timestamps_and_512_fail_closed(
@@ -436,13 +574,14 @@ def test_prepare_failure_enters_degraded_mode_with_not_ready_factory_controller(
     assert "重启" in services.production_unavailable_reason
 
 
-def test_degraded_reason_survives_real_selection_restore_refresh_and_edit(
+def test_degraded_reason_survives_real_selection_confirm_refresh_and_edit(
     monkeypatch,
     tmp_path,
-    qapp,
 ):
+    from PyQt6.QtWidgets import QApplication
     from ui.modules.workorder import WorkOrderModule
 
+    qapp = QApplication.instance() or QApplication([])
     _minimal_services(monkeypatch)
 
     class FailedBuilder:
@@ -472,17 +611,21 @@ def test_degraded_reason_survives_real_selection_restore_refresh_and_edit(
         ),
     )
 
+    initial_result = services.factory_mode.confirm_selection((101,))
+    persisted.clear()
     workorder = WorkOrderModule(services)
     try:
         restored = services.factory_mode.state
-        workorder._on_config_selection_changed((202,))
+        apply_result = services.factory_mode.confirm_selection((202,))
         edited = services.factory_mode.state
         refreshed = services.factory_mode.refresh_selection()
         changed = services.factory_mode.handle_configuration_changed()
 
+        assert initial_result.status == "applied"
+        assert apply_result.status == "applied"
         assert services.production_selection_locked is False
         assert restored.selected_config_ids == (101,)
-        assert workorder.config_selector.enabled_config_ids() == (202,)
+        assert workorder.value()["selected_config_ids"] == (202,)
         assert edited.selected_config_ids == (202,)
         assert persisted == [(202,)]
         for state in (restored, edited, refreshed, changed):
@@ -690,6 +833,10 @@ def test_task11_ports_share_one_sequencer_with_coordinator(monkeypatch, tmp_path
     live_threads = services.plc_dispatch_ports._plc_threads
     assert dict(live_services) == plc_services
     assert dict(live_threads) == plc_threads
+    assert (
+        services.plc_result_sequencer._write_result.__self__
+        is services.plc_dispatch_ports
+    )
     assert services.plc_result_sequencer is coordinators[0]._plc
 
     replacement_service = object()
@@ -726,6 +873,9 @@ def test_undefined_plc_semantics_report_one_physical_boundary_failure_and_diagno
     )
     builder.plc = services.plc_result_sequencer
     _attach(services)
+
+    assert services.pending_plc_start_signal_reset_ids == {11}
+    assert diagnostics == []
 
     result = services.publish_plc_semantic_result(
         plc_id=1,

@@ -282,6 +282,7 @@ def test_contract_dataclass_fields_and_defaults_are_exact():
         ("dtype", None),
         ("content_revision", None),
         ("audio_data_id", None),
+        ("source_container_format", None),
     ]
     assert [f.name for f in dataclasses.fields(AiToolchainSnapshot)] == [
         "toolchain_id",
@@ -527,6 +528,20 @@ def test_task_one_package_exports_are_exact_and_in_frozen_order():
         "AnalysisStartGateCode",
         "AnalysisStartGateFailure",
         "AnalysisStartGateError",
+        "AnalysisPhase",
+        "AnalysisBundleIdentity",
+        "AnalysisBundleToken",
+        "AnalysisBundleBudget",
+        "AnalysisDecisionEnvelope",
+        "AnalysisEnrichmentReport",
+        "AnalysisTimingBoundary",
+        "AnalysisTimingStatus",
+        "AnalysisStageTimingEvent",
+        "AnalysisStageTimings",
+        "StageTimer",
+        "REQUIRED_RESULT_FIELDS",
+        "build_lightweight_canonical_result",
+        "validate_enrichment_compatibility",
     )
 
 

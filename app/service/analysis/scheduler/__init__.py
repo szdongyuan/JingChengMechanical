@@ -63,6 +63,27 @@ from .ports import (
     MonotonicClock,
     OutcomeSink,
 )
+from ..performance_diagnostics import (
+    AnalysisStageTimingEvent,
+    AnalysisStageTimings,
+    AnalysisTimingBoundary,
+    AnalysisTimingStatus,
+    StageTimer,
+)
+from ..staged_execution import (
+    AnalysisBundleBudget,
+    AnalysisBundleIdentity,
+    AnalysisBundleToken,
+    AnalysisDecisionEnvelope,
+    AnalysisEnrichmentReport,
+    AnalysisPhase,
+    REQUIRED_ENRICHMENT_CHART_METRICS,
+)
+from ..staged_result_payload import (
+    REQUIRED_RESULT_FIELDS,
+    build_lightweight_canonical_result,
+    validate_enrichment_compatibility,
+)
 
 __all__ = (
     "AnalysisScheduler",
@@ -124,4 +145,19 @@ __all__ = (
     "AnalysisStartGateCode",
     "AnalysisStartGateFailure",
     "AnalysisStartGateError",
+    "AnalysisPhase",
+    "AnalysisBundleIdentity",
+    "AnalysisBundleToken",
+    "AnalysisBundleBudget",
+    "AnalysisDecisionEnvelope",
+    "AnalysisEnrichmentReport",
+    "REQUIRED_ENRICHMENT_CHART_METRICS",
+    "AnalysisTimingBoundary",
+    "AnalysisTimingStatus",
+    "AnalysisStageTimingEvent",
+    "AnalysisStageTimings",
+    "StageTimer",
+    "REQUIRED_RESULT_FIELDS",
+    "build_lightweight_canonical_result",
+    "validate_enrichment_compatibility",
 )

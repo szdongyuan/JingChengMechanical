@@ -22,9 +22,11 @@ from app.service.analysis.scheduler import (
     AnalysisSchedulerConfig,
     AnalysisStage,
     FrozenResultObject,
+    REQUIRED_RESULT_FIELDS,
 )
 from app.service.run_persistence import (
     AnalysisPersistenceBoundary,
+    AnalysisResultArtifactStore,
     AttemptKind,
     AttemptRepository,
     AudioPublication,
@@ -76,6 +78,7 @@ TERMINAL_AT = "2026-07-27T12:00:04.000000Z"
 REANALYSIS_QUEUED_AT = "2026-07-27T12:00:05.000000Z"
 REANALYSIS_RUNNING_AT = "2026-07-27T12:00:06.000000Z"
 REANALYSIS_TERMINAL_AT = "2026-07-27T12:00:07.000000Z"
+ENRICHED_AT = "2026-07-27T12:00:08.000000Z"
 
 
 class _UtcSequence:
@@ -140,6 +143,12 @@ class _LegacyJudgment:
                     spl_pass=True,
                     spl_average_db=59.0,
                     spl_average_pass=True,
+                    loudness_min_sone=0.1,
+                    loudness_max_sone=0.2,
+                    loudness_average_sone=0.15,
+                    loudness_pass=True,
+                    loudness_average_pass=True,
+                    loudness_available=True,
                 ),
             ),
             analysis_window=(start_seconds, end_seconds),
@@ -152,11 +161,34 @@ class _RecordingProductionExecutor:
             judgment_engine=_LegacyJudgment()
         )
         self.results = []
+        self.enrichments = []
 
     def execute(self, job, audio, cancel_token):
-        result = self._delegate.execute(job, audio, cancel_token)
+        decision = self._delegate.execute_decision(job, audio, cancel_token)
+        self.enrichments.append(
+            self._delegate.execute_enrichment(decision.bundle_token)
+        )
+        result = AnalysisExecutionResult(
+            status=AnalysisExecutionStatus.SUCCEEDED,
+            result_payload=_freeze_result_json(
+                json.loads(decision.canonical_result_json)
+            ),
+        )
         self.results.append(result)
         return result
+
+
+def _freeze_result_json(value):
+    if type(value) is dict:
+        return FrozenResultObject(
+            items=tuple(
+                (key, _freeze_result_json(item))
+                for key, item in value.items()
+            )
+        )
+    if type(value) is list:
+        return tuple(_freeze_result_json(item) for item in value)
+    return value
 
 
 def _ready_runtime(path: Path) -> RunPersistenceDatabase:
@@ -233,6 +265,10 @@ def _persist_audio(
     tmp_path: Path,
     run_id: str,
     ingress_kind: IngressKind,
+    *,
+    frame_count: int = 4,
+    sample_rate_hz: int = 8_000,
+    channel_count: int = 1,
 ):
     adapter = ProductionRunAudioAdapter(
         AudioPersistenceService(
@@ -243,9 +279,12 @@ def _persist_audio(
     )
     final_path = tmp_path / f"{run_id}.wav"
     if ingress_kind is IngressKind.CAPTURED:
-        samples = np.array(
-            [[0.0], [0.25], [-0.25], [0.5]],
-            dtype=np.float32,
+        time_axis = np.arange(frame_count, dtype=np.float32) / sample_rate_hz
+        mono = (
+            0.25 * np.sin(2.0 * np.pi * 440.0 * time_axis)
+        ).astype(np.float32)
+        samples = np.column_stack(
+            tuple(mono * (1.0 - 0.1 * index) for index in range(channel_count))
         )
         result = adapter.persist_captured(
             CapturedAudioSaveRequest(
@@ -254,9 +293,9 @@ def _persist_audio(
                 source_identity="managed-input:scheduler-bridge-end-to-end",
                 content_revision=1,
                 samples=samples,
-                sample_rate_hz=8_000,
-                channel_count=1,
-                frame_count=4,
+                sample_rate_hz=sample_rate_hz,
+                channel_count=channel_count,
+                frame_count=frame_count,
                 final_path=str(final_path),
                 now=SAVED_AT,
             )
@@ -272,9 +311,9 @@ def _persist_audio(
                 content_revision=1,
                 source_path=str(source_path),
                 final_path=str(final_path),
-                expected_sample_rate_hz=8_000,
+                expected_sample_rate_hz=sample_rate_hz,
                 expected_channel_count=1,
-                expected_frame_count=4,
+                expected_frame_count=frame_count,
                 now=SAVED_AT,
             )
         )
@@ -290,8 +329,12 @@ def _build_real_stack(
     now_utc=None,
     executor=None,
     scheduler_wrapper_factory=None,
+    result_artifact_store=None,
 ):
-    attempts = AttemptRepository(runtime)
+    attempts = AttemptRepository(
+        runtime,
+        result_artifact_store=result_artifact_store,
+    )
     now_utc = now_utc or _UtcSequence(
             QUEUED_AT,
             RUNNING_AT,
@@ -481,7 +524,7 @@ def test_real_audio_scheduler_bridge_initial_and_selected_window_reanalysis(
                 bridge.close_persistence_after_upstream_stopped()
 
 
-def test_legacy_success_payload_survives_scheduler_and_bridge_unchanged(
+def test_staged_success_commits_compatible_lightweight_payload(
     prepared_database_path: Path,
     tmp_path: Path,
 ) -> None:
@@ -491,7 +534,7 @@ def test_legacy_success_payload_survives_scheduler_and_bridge_unchanged(
         config={
             "config_id": 7,
             "selected_channels": [0],
-            "input_device_samplerate": 8_000.0,
+            "input_device_samplerate": 44_100.0,
             "channels": [
                 {
                     "channel_index": 0,
@@ -505,7 +548,7 @@ def test_legacy_success_payload_survives_scheduler_and_bridge_unchanged(
         },
         analysis={
             "window_start_seconds": 0.0,
-            "window_end_seconds": 0.0005,
+            "window_end_seconds": 1.0,
             "algorithm_revision": "legacy-success-v1",
             "execution_timeout_seconds": 30.0,
             "queue_timeout_seconds": None,
@@ -523,13 +566,22 @@ def test_legacy_success_payload_survives_scheduler_and_bridge_unchanged(
         tmp_path,
         run_id,
         IngressKind.CAPTURED,
+        frame_count=44_100,
+        sample_rate_hz=44_100,
     )
     executor = _RecordingProductionExecutor()
+    result_store = AnalysisResultArtifactStore(tmp_path / "analysis-results")
     bridge, _ = _build_real_stack(
         runtime,
         loader,
         executor=executor,
-        now_utc=_UtcSequence(QUEUED_AT, RUNNING_AT, TERMINAL_AT),
+        now_utc=_UtcSequence(
+            QUEUED_AT,
+            RUNNING_AT,
+            TERMINAL_AT,
+            ENRICHED_AT,
+        ),
+        result_artifact_store=result_store,
     )
     try:
         _, report = _submit_and_wait(
@@ -547,25 +599,40 @@ def test_legacy_success_payload_survives_scheduler_and_bridge_unchanged(
         with sqlite3.connect(prepared_database_path) as connection:
             attempt = connection.execute(
                 """
-                SELECT state, judgment, result_payload_json
+                SELECT state, judgment, result_payload_json, terminal_at
                 FROM analysis_attempt
                 WHERE run_id = ?
                 """,
                 (run_id,),
             ).fetchone()
-        assert attempt == ("SUCCEEDED", "PASS", expected_json)
+        assert attempt[:2] == ("SUCCEEDED", "PASS")
+        assert result_store.load_reference(attempt[2]) == expected_json
+        assert attempt[3] == TERMINAL_AT
         decoded = json.loads(expected_json)
         assert set(decoded) == {"judgment", "result"}
         assert decoded["judgment"] == "PASS"
-        assert set(decoded["result"]) == {
-            "legacy_overall",
-            "limit_pass",
-            "ai_pass",
-            "ai_score",
-            "analysis_window",
-            "channel_results",
-            "review",
-        }
+        assert tuple(sorted(decoded["result"])) == tuple(
+            sorted(REQUIRED_RESULT_FIELDS)
+        )
+        assert decoded["result"]["chart_payload"] == {}
+        assert decoded["result"]["summary_payload"]
+        assert decoded["result"]["channel_results"]
+
+        event = bridge.boundary.accept_enrichment(executor.enrichments[0])
+        assert event is not None, executor.enrichments[0].chart_manifest
+        with sqlite3.connect(prepared_database_path) as connection:
+            enriched_reference, terminal_at = connection.execute(
+                """
+                SELECT result_payload_json, terminal_at
+                FROM analysis_attempt
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        assert result_store.load_reference(enriched_reference) == (
+            executor.enrichments[0].canonical_result_json
+        )
+        assert terminal_at == TERMINAL_AT
     finally:
         if not runtime.closed:
             phase_a = bridge.stop_and_join_scheduler(5.0)
@@ -573,6 +640,94 @@ def test_legacy_success_payload_survives_scheduler_and_bridge_unchanged(
                 phase_a.status
                 is BridgeSchedulerShutdownStatus.SCHEDULER_CLOSED
             ):
+                bridge.close_persistence_after_upstream_stopped()
+
+
+def test_vibration_channel_enrichment_manifest_commits_full_artifact(
+    prepared_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+    run_id = str(uuid4())
+    config = {
+        "config_id": 7,
+        "selected_channels": [0, 1],
+        "vibration_view_channel_index": 1,
+        "input_device_samplerate": 48_000.0,
+        "channels": [
+            {"channel_index": 0, "spl_weighting": "Z"},
+            {"channel_index": 1, "spl_weighting": "Z"},
+        ],
+    }
+    envelope = make_analysis_envelope(
+        config=config,
+        channel_mapping={
+            "schema": "audio-channel-map/v1",
+            "channel_order": [0, 1],
+        },
+        analysis={
+            "window_start_seconds": 0.0,
+            "window_end_seconds": 1.0,
+            "algorithm_revision": "legacy-vibration-v1",
+            "execution_timeout_seconds": 30.0,
+            "queue_timeout_seconds": None,
+            "toolchain": None,
+        },
+    )
+    _insert_active_run(
+        runtime,
+        run_id,
+        IngressKind.CAPTURED,
+        analysis_envelope=envelope,
+    )
+    loader, reference = _persist_audio(
+        runtime,
+        tmp_path,
+        run_id,
+        IngressKind.CAPTURED,
+        frame_count=48_000,
+        sample_rate_hz=48_000,
+        channel_count=2,
+    )
+    executor = _RecordingProductionExecutor()
+    result_store = AnalysisResultArtifactStore(tmp_path / "analysis-results")
+    bridge, _ = _build_real_stack(
+        runtime,
+        loader,
+        executor=executor,
+        now_utc=_UtcSequence(QUEUED_AT, RUNNING_AT, TERMINAL_AT, ENRICHED_AT),
+        result_artifact_store=result_store,
+    )
+    try:
+        _, terminal = _submit_and_wait(
+            lambda sink: bridge.submit_initial(
+                InitialAnalysisRequest(run_id, reference), sink
+            )
+        )
+        assert terminal.status is BridgeTerminalStatus.COMMITTED
+        enrichment = executor.enrichments[0]
+        assert enrichment.chart_manifest == (
+            (0, ("fft", "loudness", "octave", "spl", "stft", "stft_score")),
+            (1, ("fft", "octave", "stft")),
+        )
+
+        event = bridge.boundary.accept_enrichment(enrichment)
+
+        assert event is not None
+        assert event.judgment.value == terminal.judgment.value
+        with sqlite3.connect(prepared_database_path) as connection:
+            reference_json, terminal_at = connection.execute(
+                "SELECT result_payload_json, terminal_at FROM analysis_attempt WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        assert result_store.load_reference(reference_json) == (
+            enrichment.canonical_result_json
+        )
+        assert terminal_at == TERMINAL_AT
+    finally:
+        if not runtime.closed:
+            phase_a = bridge.stop_and_join_scheduler(5.0)
+            if phase_a.status is BridgeSchedulerShutdownStatus.SCHEDULER_CLOSED:
                 bridge.close_persistence_after_upstream_stopped()
 
 

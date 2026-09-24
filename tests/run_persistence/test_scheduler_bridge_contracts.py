@@ -12,6 +12,7 @@ import pytest
 
 from app.service.analysis.scheduler import (
     AiToolchainSnapshot,
+    AnalysisBundleIdentity,
     AnalysisCancelOrigin,
     AnalysisInputSnapshot,
     AnalysisJob,
@@ -32,6 +33,7 @@ from app.service.run_persistence import (
     AttemptState,
     DatabaseLifecycleCode,
     Judgment,
+    EnrichmentCommittedEvent,
     TransactionResult,
     TransactionState,
     freeze_analysis_envelope,
@@ -227,6 +229,37 @@ def test_request_values_are_frozen_exact_and_validate_identity() -> None:
             AnalysisCancelOrigin.USER_STOP,
             "界" * 171,
         )
+
+
+def test_enrichment_committed_event_is_frozen_and_carries_terminal_revision() -> None:
+    identity = AnalysisBundleIdentity(
+        run_id=RUN_ID,
+        analysis_attempt_id=ATTEMPT_ID,
+        content_revision=f"{AUDIO_ID}:1024",
+        algorithm_revision="algorithm-1",
+        config_identity="config-1",
+        calibration_identity="calibration-1",
+        channel_mapping_identity="channels-1",
+        window_start_seconds=0.0,
+        window_end_seconds=3.0,
+    )
+    event = EnrichmentCommittedEvent(
+        identity=identity,
+        judgment=Judgment.PASS,
+        result_payload_json='{"judgment":"PASS","result":{}}',
+        terminal_revision="a" * 64,
+        committed_at=NOW,
+    )
+
+    assert tuple(field.name for field in fields(event)) == (
+        "identity",
+        "judgment",
+        "result_payload_json",
+        "terminal_revision",
+        "committed_at",
+    )
+    with pytest.raises(FrozenInstanceError):
+        event.committed_at = NOW  # type: ignore[misc]
 
 
 def test_reanalysis_request_has_exact_selected_window_fields() -> None:
@@ -812,6 +845,7 @@ def test_boundary_and_submit_signatures_require_one_per_submit_sink() -> None:
         "runtime",
         "attempt_repository",
         "now_utc",
+        "enrichment_sink",
     ]
     assert list(
         inspect.signature(bridge_module.RunPersistenceSchedulerBridge.submit_initial).parameters
@@ -1408,7 +1442,8 @@ def test_prepare_analysis_facts_maps_closed_durable_kind_and_audio_reference(
         sample_rate_hz=48_000,
         channel_count=2,
         frame_count=144_000,
-        dtype="<i2",
+        dtype="<f8" if ingress == "IMPORTED" else "<i2",
+        source_container_format="WAV_PCM" if ingress == "IMPORTED" else None,
         content_revision=f"{AUDIO_ID}:576044",
         audio_data_id=AUDIO_ID,
     )

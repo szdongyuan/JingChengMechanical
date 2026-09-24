@@ -4,6 +4,8 @@ Orchestrates: recorder -> pipelines -> judgment -> result.
 """
 from __future__ import annotations
 
+from app.service.ai_threshold import coerce_probability
+
 import inspect
 import json
 import math
@@ -126,6 +128,7 @@ class TestSession:
             config_id=self.config_id,
             coalesce_pending=True,
             stft_emit_interval_sec=0.05,
+            coarse_stft=True,
         )
 
     def set_live_loudness_channel_index(self, channel_index: int | None):
@@ -602,6 +605,8 @@ class TestSession:
             )
             return result
 
+        override = envelope.get("decision_threshold_source") == "request_params"
+        coerce_score = coerce_probability if override else self._coerce_ai_score
         module_status = str(envelope.get("module_status") or "").strip().lower()
         channel_index = self._coerce_ai_channel_index(envelope.get("channel_index"))
         envelope_threshold = self._coerce_ai_score(envelope.get("decision_threshold"))
@@ -609,7 +614,7 @@ class TestSession:
             self._last_ai_review = self._make_ai_review(
                 status=module_status or "error",
                 threshold=envelope_threshold,
-                score=self._coerce_ai_score(envelope.get("score")),
+                score=coerce_score(envelope.get("score")),
                 channel_index=channel_index,
                 error_message=self._normalize_ai_error(
                     envelope.get("error_summary"),
@@ -624,7 +629,7 @@ class TestSession:
             return result
 
         effective_threshold = envelope_threshold
-        score = self._coerce_ai_score(envelope.get("score"))
+        score = coerce_score(envelope.get("score"))
         ai_label = envelope.get("ai_label")
         normalized_ai_label = self._normalize_ai_label(ai_label)
         chinese_label_decision = self._ai_pass_from_chinese_label(normalized_ai_label)
@@ -633,7 +638,16 @@ class TestSession:
         ai_review_status = "success"
         ai_review_error = None
 
-        if score is not None and chinese_label_decision is not None:
+        if override:
+            if score is None:
+                ai_review_status = "missing_score"
+                ai_review_error = "AI score must be a finite number between 0 and 1 for decision_threshold override"
+            elif effective_threshold is None:
+                ai_review_error = "AI decision threshold unavailable"
+            else:
+                ai_pass = score >= effective_threshold
+            normalized_ai_label = None if ai_pass is None else "PASS" if ai_pass else "FAIL"
+        elif score is not None and chinese_label_decision is not None:
             ai_pass = chinese_label_decision
         elif score is not None:
             if effective_threshold is not None:
@@ -663,7 +677,7 @@ class TestSession:
             ai_review_status = "missing_score"
             ai_review_error = "AI score and usable AI label are unavailable"
 
-        review_threshold = None if chinese_label_decision is not None else effective_threshold
+        review_threshold = None if chinese_label_decision is not None and not override else effective_threshold
         self._last_ai_review = self._make_ai_review(
             status=ai_review_status,
             threshold=review_threshold,

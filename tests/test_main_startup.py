@@ -44,6 +44,8 @@ class FakeWindow:
 @pytest.fixture(autouse=True)
 def fake_qt_startup(monkeypatch):
     FakeApplication.instances.clear()
+    monkeypatch.setattr(startup_mod, "_load_gui_dependencies", lambda: None)
+    monkeypatch.setattr(startup_mod, "DatabaseStartupError", DatabaseStartupError)
     monkeypatch.setattr(startup_mod, "QApplication", FakeApplication)
     monkeypatch.setattr(startup_mod, "QIcon", MagicMock(side_effect=lambda path: path))
     monkeypatch.setattr(startup_mod, "asset_path", lambda name: f"asset:{name}")

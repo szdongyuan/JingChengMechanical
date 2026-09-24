@@ -103,6 +103,9 @@ def compute_stft_score_payload(
     absolute_start_sec=0.0,
     loudness_context_signal=None,
     loudness_trace=None,
+    stft_times=None,
+    stft_frequencies=None,
+    stft_magnitudes=None,
 ) -> dict | None:
     config = normalize_score_config(score_config)
     if not config["stft_score_enabled"]:
@@ -113,15 +116,24 @@ def compute_stft_score_payload(
         return None
     sig, resolved_sample_rate, resolved_nfft, resolved_overlap = prepared
 
-    try:
-        relative_times, frequencies_hz, magnitudes_db = dsp.compute_stft(
-            sig,
-            resolved_sample_rate,
-            resolved_nfft,
-            resolved_overlap,
-        )
-    except Exception:
-        return None
+    if (
+        stft_times is not None
+        and stft_frequencies is not None
+        and stft_magnitudes is not None
+    ):
+        relative_times = stft_times
+        frequencies_hz = stft_frequencies
+        magnitudes_db = stft_magnitudes
+    else:
+        try:
+            relative_times, frequencies_hz, magnitudes_db = dsp.compute_stft(
+                sig,
+                resolved_sample_rate,
+                resolved_nfft,
+                resolved_overlap,
+            )
+        except Exception:
+            return None
 
     relative_times = _float_array_or_none(relative_times, reshape=True)
     frequencies_hz = _float_array_or_none(frequencies_hz, reshape=True)

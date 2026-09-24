@@ -426,9 +426,9 @@ def test_poll_once_preserves_baseline_and_rising_edge_sequence(
         "read_start",
         "poll_current",
         "read_start",
+        "trigger_clock",
         "poll_current",
         ("write_testing", True),
-        "trigger_clock",
         "read_workorder",
         "on_start",
         ("auto_reset", "0.0", "bool", False),
@@ -468,3 +468,24 @@ def test_failed_required_start_read_skips_current_and_start_processing():
     assert calls == ["read_start"]
     assert starts == []
     assert bus.plc_current_sampled.calls == []
+
+
+def test_trigger_is_latched_before_slow_current_logging_and_testing_write(monkeypatch):
+    now = [10.0]
+    starts = []
+    service, bus = _build_service(on_start_requested=lambda *args: starts.append(args))
+    service._last_value = False
+    service._read_start_bit = lambda: True
+    def delay(*_args):
+        now[0] += 0.25
+        return 1.0
+    service.read_offset_value = delay
+    service._write_testing_signal = delay
+    bus.log.emit = delay
+    service.logger.info = delay
+    service._emit_plc_workorder = lambda: {"sn": "original"}
+    monkeypatch.setattr(plc_service_module, "time", SimpleNamespace(
+        monotonic=lambda: now[0], monotonic_ns=lambda: int(now[0] * 1e9)))
+    service.poll_once()
+    assert starts == [(7, {"sn": "original"}, 10_000_000_000)]
+    assert now[0] > 10.5

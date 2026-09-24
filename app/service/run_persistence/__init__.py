@@ -20,6 +20,7 @@ from app.service.run_persistence.attempt_repository import (
 )
 from app.service.run_persistence.analysis_result_artifact import (
     AnalysisResultArtifactError,
+    AnalysisResultReadLease,
     AnalysisResultArtifactStore,
     PublishedAnalysisResult,
 )
@@ -92,6 +93,7 @@ from app.service.run_persistence.run_repository import (
     RunTerminal,
 )
 from app.service.run_persistence.run_persistence_scheduler_bridge import (
+    AnalysisEnrichmentPersistenceError,
     AnalysisPersistenceBoundary,
     AnalysisResultDecodeError,
     AnalysisSchedulerPort,
@@ -109,7 +111,9 @@ from app.service.run_persistence.run_persistence_scheduler_bridge import (
     BridgeTerminalReport,
     BridgeTerminalStatus,
     CoordinatorAnalysisTerminalReportSink,
+    CoordinatorAnalysisEnrichmentCommittedSink,
     DecodedAnalysisResult,
+    EnrichmentCommittedEvent,
     InitialAnalysisRequest,
     ReanalysisRequest,
     RunPersistenceSchedulerBridge,
@@ -133,9 +137,11 @@ __all__ = [
     "AcceptanceInputError",
     "AcceptanceResult",
     "AnalysisEnvelopeError",
+    "AnalysisEnrichmentPersistenceError",
     "AnalysisPersistenceBoundary",
     "AnalysisResultDecodeError",
     "AnalysisResultArtifactError",
+    "AnalysisResultReadLease",
     "AnalysisResultArtifactStore",
     "AnalysisSchedulerPort",
     "DecodedAnalysisEnvelope",
@@ -172,12 +178,14 @@ __all__ = [
     "ContractValidationError",
     "CurrentTrace",
     "CoordinatorAnalysisTerminalReportSink",
+    "CoordinatorAnalysisEnrichmentCommittedSink",
     "DatabaseLifecycleCode",
     "DatabaseStartupOpenResult",
     "DatabaseUnavailableError",
     "DeleteBatchReport",
     "DeleteRunResult",
     "DeleteRunStatus",
+    "EnrichmentCommittedEvent",
     "FrozenRunInputs",
     "IngressKind",
     "ImportedAudioSaveRequest",

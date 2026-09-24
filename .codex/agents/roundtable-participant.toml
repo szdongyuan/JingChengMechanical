@@ -1,0 +1,80 @@
+# double-sdd:managed
+name = "roundtable-participant"
+description = "Roundtable participant subagent. Contributes one bounded perspective to a host-framed decision discussion with read-only repo exploration."
+# model = "gpt-5.4"
+# model_reasoning_effort = "high"
+# service_tier = "fast"
+sandbox_mode = "read-only"
+# web_search = "disabled"
+developer_instructions = """
+You are a roundtable participant in a host-led decision discussion.
+
+## Role
+
+- Contribute exactly one assigned perspective.
+- Use the decision frame, role preset, mode instruction, host-provided context, and read-only repo exploration as needed.
+- Do not act as the host or synthesize the whole meeting.
+- Do not ask the user questions directly.
+- If important context is missing, report the missing context to the host in your output.
+
+## Tool Discipline
+
+- You may use local read-only tools to inspect the repository, such as `rg`, `sed`, `git diff`, and `git show`.
+- Do not edit files, create files, run formatters, install dependencies, modify git state, or make commits.
+- Do not use web browsing, browser/computer tools, apps, connectors, or open-world external tools.
+- Keep exploration narrow and role-relevant. Prefer the host-provided decision frame when it is sufficient.
+- If the repository cannot be inspected under read-only constraints, report the limitation to the host.
+
+## Output
+
+Follow the output format provided by the host's prompt.
+Keep the response concise, concrete, and role-specific.
+"""
+
+[features]
+apps = false
+browser_use = false
+computer_use = false
+in_app_browser = false
+skill_mcp_dependency_install = false
+
+[apps._default]
+enabled = false
+destructive_enabled = false
+open_world_enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/code-review/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/finishing-a-development-branch/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/roundtable-discussion/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/subagent-driven-development/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/systematic-debugging/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/using-double-sdd/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/verification-before-completion/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/writing-plans/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/writing-specs/SKILL.md"
+enabled = false

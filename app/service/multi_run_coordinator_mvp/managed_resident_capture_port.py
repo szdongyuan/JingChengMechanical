@@ -1258,6 +1258,16 @@ class ManagedResidentCapturePort:
         interleaved_bytes = samples.tobytes(order="C")
         if len(interleaved_bytes) != audio.frame_count * channel_count * 4:
             raise ValueError("completed Resident audio byte length is invalid")
+        try:
+            logging.getLogger(__name__).info(
+                (f"capture mapped run={audio.run_id} hardware={audio.hardware_id} "
+                 f"binding={entry.binding.binding_id} trigger_ns={audio.trigger_monotonic_ns} "
+                 f"start_cursor={audio.start_frame_cursor} frames={audio.frame_count} "
+                 f"completion_ns={audio.completion_monotonic_ns}")[:512]
+            )
+        except Exception:
+            # Diagnostic failures must not invalidate verified captured audio.
+            pass
         return CapturedAudioValue(
             source_identity=entry.binding.binding_id,
             sample_rate_hz=audio.sample_rate_hz,

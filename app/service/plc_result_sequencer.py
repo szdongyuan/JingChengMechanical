@@ -8,6 +8,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import Enum
+from types import MappingProxyType
 from typing import TypeAlias
 
 
@@ -95,7 +96,7 @@ class _Slot:
     ticket: PlcIngressTicket
     accepted: bool = False
     terminal_kind: str | None = None
-    terminal_payload: dict[str, PlcScalar] | None = None
+    terminal_payload: Mapping[str, PlcScalar] | None = None
 
 
 class _Lane:
@@ -355,20 +356,28 @@ class PlcResultSequencer:
                 return
             assert slot.terminal_payload is not None
 
-            try:
-                self._write_result(lane.plc_id, slot.terminal_payload)
-            except PlcResultBoundaryError as exc:
-                outcome = PlcAttemptOutcome.BOUNDARY_FAILED
-                field_name = exc.field_name
-                reason = _exception_reason(exc)
-            except Exception as exc:
-                outcome = PlcAttemptOutcome.BOUNDARY_FAILED
-                field_name = None
-                reason = _exception_reason(exc)
-            else:
-                outcome = PlcAttemptOutcome.BOUNDARY_RETURNED
-                field_name = None
-                reason = None
+            outcome = PlcAttemptOutcome.BOUNDARY_FAILED
+            field_name = None
+            reason = None
+            for attempt_number in range(2):
+                try:
+                    self._write_result(
+                        lane.plc_id,
+                        slot.terminal_payload,
+                    )
+                except PlcResultBoundaryError as exc:
+                    field_name = exc.field_name
+                    reason = _exception_reason(exc)
+                except Exception as exc:
+                    field_name = None
+                    reason = _exception_reason(exc)
+                else:
+                    outcome = PlcAttemptOutcome.BOUNDARY_RETURNED
+                    field_name = None
+                    reason = None
+                    break
+                if attempt_number == 0:
+                    continue
 
             self._emit_report(
                 PlcResultAttemptReport(
@@ -462,7 +471,7 @@ def _validate_shutdown_timeout(timeout_seconds: object) -> None:
         raise ValueError("timeout_seconds must be finite and nonnegative")
 
 
-def _copy_payload(payload: object) -> dict[str, PlcScalar]:
+def _copy_payload(payload: object) -> Mapping[str, PlcScalar]:
     if not isinstance(payload, Mapping):
         raise ValueError("payload must be a mapping")
 
@@ -473,7 +482,7 @@ def _copy_payload(payload: object) -> dict[str, PlcScalar]:
         if value is not None and type(value) not in (bool, int, float, str):
             raise ValueError("payload values must be flat PLC scalars")
         copied[key] = value
-    return copied
+    return MappingProxyType(copied)
 
 
 def _exception_reason(exc: Exception) -> str:

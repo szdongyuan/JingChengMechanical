@@ -13,6 +13,10 @@ from app.service.analysis.golden_reference import (
 )
 from app.service.analysis.process_executor import ProcessIsolatedAnalysisExecutor
 from app.service.analysis.production_executor import ProductionAnalysisExecutor
+from app.service.analysis.scheduler import (
+    AiToolchainSnapshot,
+    canonical_toolchain_lane_key,
+)
 from app.service.factory_selection_settings import FactorySelectionSettings
 from app.service.golden_sample_service import GoldenSampleService
 from app.service.managed_input_registry import ManagedInputRegistry
@@ -75,6 +79,8 @@ class PreparedProductionPrerequisites:
         configs: tuple[FrozenConfigPrerequisite, ...],
         managed_inputs: tuple[FrozenManagedInputPrerequisite, ...],
         golden_artifacts: tuple[FrozenGoldenArtifact, ...],
+        selected_toolchains: tuple[AiToolchainSnapshot, ...],
+        require_loudness_backend: bool,
         monotonic_authority: object,
     ) -> None:
         self._selection_settings = selection_settings
@@ -85,6 +91,8 @@ class PreparedProductionPrerequisites:
         self.configs = configs
         self.managed_inputs = managed_inputs
         self.golden_artifacts = golden_artifacts
+        self.selected_toolchains = selected_toolchains
+        self.require_loudness_backend = require_loudness_backend
         self.monotonic_authority = monotonic_authority
         self.monotonic_domain = PYTHON_SYSTEM_MONOTONIC_DOMAIN
 
@@ -154,6 +162,8 @@ class PreparedProductionPrerequisites:
         judgment_engine: object | None = None,
         capture_active=None,
         process_count: int = 2,
+        enrichment_sink=None,
+        enrichment_failure_sink=None,
     ) -> object:
         artifacts = {
             (item.config_id, item.channel_index): item
@@ -168,6 +178,10 @@ class PreparedProductionPrerequisites:
             frozen_golden_artifacts=artifacts,
             capture_active=capture_active,
             process_count=process_count,
+            selected_toolchains=self.selected_toolchains,
+            enrichment_sink=enrichment_sink,
+            enrichment_failure_sink=enrichment_failure_sink,
+            require_loudness_backend=self.require_loudness_backend,
         )
 
 
@@ -177,11 +191,21 @@ class ProductionPrerequisites:
         selection_settings: FactorySelectionSettings,
         *,
         golden_sample_service: GoldenSampleService | None = None,
+        ai_toolchain_loader=None,
     ) -> None:
+        if ai_toolchain_loader is not None and not callable(ai_toolchain_loader):
+            raise TypeError("ai_toolchain_loader must be callable or None")
         self._selection_settings = selection_settings
         self._golden_samples = (
             golden_sample_service or GoldenSampleService()
         )
+        self._ai_toolchain_service = None
+        if ai_toolchain_loader is None:
+            from app.service.ai_service import AiService
+
+            self._ai_toolchain_service = AiService()
+            ai_toolchain_loader = self._ai_toolchain_service.freeze_bound_toolchain
+        self._ai_toolchain_loader = ai_toolchain_loader
 
     def prepare(
         self,
@@ -219,6 +243,18 @@ class ProductionPrerequisites:
                 for channel in config.channels
                 if channel.golden_artifact is not None
             )
+            selected_toolchains = self._freeze_selected_toolchains(configs)
+            require_loudness_backend = any(
+                channel.values.get(flag) is True
+                for config in configs
+                for channel in config.channels
+                for flag in (
+                    "loudness_lower_enabled",
+                    "loudness_upper_enabled",
+                    "loudness_average_lower_enabled",
+                    "loudness_average_upper_enabled",
+                )
+            )
             return PreparedProductionPrerequisites(
                 selection_settings=self._selection_settings,
                 lease=lease,
@@ -229,11 +265,68 @@ class ProductionPrerequisites:
                     managed[key] for key in sorted(managed)
                 ),
                 golden_artifacts=golden,
+                selected_toolchains=selected_toolchains,
+                require_loudness_backend=require_loudness_backend,
                 monotonic_authority=monotonic_authority,
             )
         except Exception:
             self._selection_settings.release_selection_lease(lease)
             raise
+
+    def _freeze_selected_toolchains(
+        self,
+        configs: tuple[FrozenConfigPrerequisite, ...],
+    ) -> tuple[AiToolchainSnapshot, ...]:
+        loader = self._ai_toolchain_loader
+        if loader is None:
+            return ()
+        unique: dict[
+            tuple[str, str, str, str],
+            AiToolchainSnapshot,
+        ] = {}
+        try:
+            for config in configs:
+                raw = loader(config.config_id)
+                if raw is None:
+                    continue
+                if not isinstance(raw, Mapping):
+                    raise ValueError("frozen AI toolchain must be an object")
+                params = raw.get("params")
+                if not isinstance(params, Mapping):
+                    raise ValueError("frozen AI toolchain params must be an object")
+                params_json = json.dumps(
+                    dict(params),
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                toolchain_id = raw.get("toolchain_id")
+                snapshot = AiToolchainSnapshot(
+                    toolchain_id=toolchain_id,
+                    runtime_lane_key=canonical_toolchain_lane_key(toolchain_id),
+                    execution_revision=raw.get("execution_revision"),
+                    execution_mode=raw.get("execution_mode"),
+                    entrypoint=raw.get("entrypoint"),
+                    package_dir=raw.get("package_dir"),
+                    params_json=params_json,
+                    timeout_seconds=raw.get("timeout_seconds"),
+                )
+                key = (
+                    snapshot.toolchain_id,
+                    snapshot.execution_revision,
+                    snapshot.entrypoint,
+                    snapshot.package_dir,
+                )
+                existing = unique.get(key)
+                if existing is not None and existing != snapshot:
+                    raise ValueError("selected AI revision is inconsistent")
+                unique[key] = snapshot
+        except Exception as exc:
+            raise ProductionPrerequisiteError(
+                "A selected AI toolchain could not be frozen."
+            ) from exc
+        return tuple(unique[key] for key in sorted(unique))
 
     @staticmethod
     def _freeze_managed_inputs(

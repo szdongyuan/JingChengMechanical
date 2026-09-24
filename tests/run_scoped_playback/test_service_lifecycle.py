@@ -176,6 +176,106 @@ def assert_cleared(service: RunScopedPlaybackService) -> None:
     assert service._stop_requested is False
 
 
+def test_conditional_stop_uses_owner_identity_and_stops_only_its_generation():
+    backend = LifecycleBackend()
+    clock = ConstantClock()
+    service = make_service(backend=backend, clock=clock)
+    owner = {"panel": "A"}
+    assert service.play(request(), owner=owner).code is PlaybackCode.STARTED
+    clock_calls = clock.calls
+
+    for wrong_owner in ({"panel": "A"}, None):
+        assert service.stop_if_owner(wrong_owner, 1.0).code is PlaybackLifecycleCode.CLEAN
+    assert clock.calls == clock_calls
+    assert backend.stop_calls == 0
+    assert backend.join_calls == []
+
+    assert service.stop_if_owner(owner, 1.0).code is PlaybackLifecycleCode.CLEAN
+    assert backend.stop_calls == 1
+    assert backend.join_calls == [1.0]
+    assert_cleared(service)
+    assert service.stop_if_owner(owner, 1.0).code is PlaybackLifecycleCode.CLEAN
+    assert backend.stop_calls == 1
+    assert backend.join_calls == [1.0]
+
+
+@pytest.mark.parametrize("replacement_run_id", [RUN_ID, OTHER_RUN_ID])
+@pytest.mark.parametrize("owned_replacement", [True, False])
+def test_old_owner_cannot_stop_owned_or_legacy_takeover(
+    replacement_run_id, owned_replacement
+):
+    backend = LifecycleBackend()
+    runs = FakeRunRepository()
+    audio = FakeAudioRepository()
+    service = make_service(backend=backend, run_repository=runs, audio_repository=audio)
+    owner_a, owner_b = object(), object()
+    assert service.play(request(), owner=owner_a).code is PlaybackCode.STARTED
+    if replacement_run_id == OTHER_RUN_ID:
+        select_other(runs, audio)
+
+    kwargs = {"owner": owner_b} if owned_replacement else {}
+    result = service.play(request(replacement_run_id), **kwargs)
+    assert result.code is PlaybackCode.STARTED
+    assert result.replaced_run_id == RUN_ID
+    assert backend.stop_calls == 1
+    assert backend.join_calls == [1.0]
+    assert len(backend.start_arguments) == 2
+
+    assert service.stop_if_owner(owner_a, 1.0).code is PlaybackLifecycleCode.CLEAN
+    assert service.stop_if_owner(None, 1.0).code is PlaybackLifecycleCode.CLEAN
+    assert backend.stop_calls == 1
+    assert backend.join_calls == [1.0]
+    assert service._current_run_id == replacement_run_id
+    if owned_replacement:
+        report = service.stop_if_owner(owner_b, 1.0)
+    else:
+        assert service.stop_if_owner(owner_b, 1.0).code is PlaybackLifecycleCode.CLEAN
+        assert backend.stop_calls == 1
+        report = service.stop(1.0)
+    assert report.code is PlaybackLifecycleCode.CLEAN
+    assert backend.stop_calls == 2
+    assert_cleared(service)
+
+
+@pytest.mark.parametrize("new_owner", [None, object()])
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        ("missing_run", PlaybackCode.PERSISTED_AUDIO_UNAVAILABLE),
+        ("stop", PlaybackCode.REPLACEMENT_NON_CLEAN),
+        ("join_timeout", PlaybackCode.REPLACEMENT_TIMED_OUT),
+        ("clock", PlaybackCode.DEADLINE_CLOCK_FAILED),
+    ],
+)
+def test_failed_replacement_retains_old_caller_owner(failure, expected, new_owner):
+    backend = LifecycleBackend()
+    runs = FakeRunRepository()
+    service = make_service(backend=backend, run_repository=runs)
+    owner = object()
+    assert service.play(request(), owner=owner).code is PlaybackCode.STARTED
+    if failure == "missing_run":
+        runs.record = None
+    elif failure == "stop":
+        backend.stop_error = RuntimeError("stop failed")
+    elif failure == "join_timeout":
+        backend.joins = [BackendJoinReport(BackendJoinStatus.TIMED_OUT, True)]
+    else:
+        service._monotonic = SequenceClock(RuntimeError("clock failed"))
+
+    assert service.play(request(), owner=new_owner).code is expected
+    stop_calls, join_calls = backend.stop_calls, list(backend.join_calls)
+    assert service.stop_if_owner(new_owner, 1.0).code is PlaybackLifecycleCode.CLEAN
+    assert backend.stop_calls == stop_calls
+    assert backend.join_calls == join_calls
+    assert len(backend.start_arguments) == 1
+
+    backend.stop_error = None
+    service._monotonic = ConstantClock()
+    assert service.stop_if_owner(owner, 1.0).code is PlaybackLifecycleCode.CLEAN
+    assert len(backend.join_calls) == len(join_calls) + 1
+    assert_cleared(service)
+
+
 @pytest.mark.parametrize(
     ("new_run", "expected"),
     [
@@ -454,6 +554,7 @@ def test_all_public_calls_are_busy_during_gate_owned_play_with_zero_extra_work()
     assert entered.wait(2.0)
 
     assert service.play(request()).code is PlaybackCode.BUSY
+    assert service.stop_if_owner(object(), 1.0).code is PlaybackLifecycleCode.BUSY
     for method in ("stop", "join", "shutdown"):
         assert (
             getattr(service, method)(1.0).code
@@ -495,6 +596,7 @@ def test_all_public_calls_are_busy_during_owned_lifecycle_operation(owner_method
     starts = len(backend.start_arguments)
 
     assert service.play(request()).code is PlaybackCode.BUSY
+    assert service.stop_if_owner(object(), 1.0).code is PlaybackLifecycleCode.BUSY
     for method in ("stop", "join", "shutdown"):
         assert (
             getattr(service, method)(1.0).code

@@ -1,0 +1,90 @@
+# double-sdd:managed
+name = "plan-document-reviewer"
+description = "Plan document reviewer subagent. Reviews an implementation plan chunk for completeness, spec alignment, and task decomposition. Expects the plan chunk and spec path in the dispatch prompt."
+# model = "gpt-5.4"
+# model_reasoning_effort = "xhigh"
+# service_tier = "fast"
+# web_search = "disabled"
+developer_instructions = """
+You are a plan document reviewer. Review one implementation-plan chunk and return one final verdict.
+
+## Execution Style
+
+- Perform one review pass and stop.
+- Do not start a conversational back-and-forth.
+- If required context is missing, return `BLOCKED` with the exact missing item.
+
+## Known Workflow Dependencies
+
+The following skills are valid parts of the double-SDD workflow and are not included in your own context so you stay focused on the review itself:
+
+- `subagent-driven-development` — executes the approved plan through implementer and reviewer subagents.
+- `code-review` — defines how implementation review feedback is evaluated, triaged, and acted on.
+- `verification-before-completion` — ensures fixes are verified before work is reported as done.
+Do not report these skills as missing just because you cannot access them yourself.
+
+## What To Check
+
+- TODOs, placeholders, or incomplete task definitions
+- Missing verification steps or expected outputs
+- Gaps between the plan chunk and the referenced spec
+- Tasks that are too large or vague to execute reliably
+- Files that mix responsibilities or are likely to grow unwieldy
+- Missing checkbox tracking syntax on actionable steps
+
+## Output
+
+- `PASS` — the plan chunk is ready for execution
+- `FAIL` — list specific issues with task or section references
+- `BLOCKED` — missing context required to complete the review
+
+Keep the output concise, specific, and evidence-based.
+"""
+
+[features]
+apps = false
+browser_use = false
+computer_use = false
+in_app_browser = false
+skill_mcp_dependency_install = false
+
+[apps._default]
+enabled = false
+destructive_enabled = false
+open_world_enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/code-review/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/finishing-a-development-branch/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/roundtable-discussion/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/subagent-driven-development/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/systematic-debugging/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/using-double-sdd/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/verification-before-completion/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/writing-plans/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/writing-specs/SKILL.md"
+enabled = false

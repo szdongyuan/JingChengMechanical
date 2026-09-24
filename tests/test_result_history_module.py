@@ -15,6 +15,7 @@ from PyQt6.QtCore import (
     QEvent,
     QObject,
     QPoint,
+    QRect,
     QThread,
     Qt,
     pyqtSignal,
@@ -72,6 +73,7 @@ def _card(
     *,
     active: bool = False,
     index: int = 0,
+    manual_judgment_buttons_visible: bool = True,
 ) -> ResultHistoryCardSnapshot:
     started = datetime(2026, 7, 26, 9, 0) + timedelta(minutes=index)
     return ResultHistoryCardSnapshot(
@@ -82,6 +84,9 @@ def _card(
             details=(
                 ConfigSummaryField("转速", f"{1000 + index} rpm"),
                 ConfigSummaryField("测量模式", "终检"),
+            ),
+            manual_judgment_buttons_visible=(
+                manual_judgment_buttons_visible
             ),
         ),
         sn=f"SN-{index}",
@@ -132,6 +137,38 @@ def _card_for(module: QWidget, run_id: str) -> ResultHistoryCard:
         if card.property("run_id") == run_id:
             return card
     raise AssertionError(f"card not found: {run_id}")
+
+
+def _complete_review_payload(*, loudness_unit: str = "sone"):
+    loudness_peak = "11.10 sone" if loudness_unit == "sone" else "84.20 phon"
+    loudness_average = "8.08 sone" if loudness_unit == "sone" else "79.40 phon"
+    rows = [
+        ("spl", "58.14 dB"),
+        ("spl_average", "53.71 dB"),
+        ("loudness", loudness_peak),
+        ("loudness_average", loudness_average),
+        ("stft_score", "0.83"),
+        ("ai", "97.50 %"),
+    ]
+    return ReviewDisplayPayload(
+        review={
+            "summary_payload": {
+                "overall_status": "pass",
+                "overall_label": "通过",
+                "rows": [
+                    {
+                        "item_key": key,
+                        "actual_display": display,
+                        "current_display": "CH0",
+                        "status": "pass",
+                        "result_display": "PASS",
+                    }
+                    for key, display in rows
+                ],
+            }
+        },
+        dashboard_config={"config_id": 1},
+    )
 
 
 def _metric(module: QWidget, run_id: str, name: str) -> str:
@@ -362,8 +399,9 @@ def test_removed_headings_are_not_visible_but_card_overall_remains(qapp):
     assert "结果历史" not in visible_labels
     assert "自动跟随最新" not in visible_labels
     assert "已解锁" not in visible_labels
-    assert visible_labels.count("进行中") == 0
-    assert "结果摘要：进行中" in visible_labels
+    assert visible_labels.count("结果摘要") == 1
+    assert visible_labels.count("进行中") == 1
+    assert "结果摘要：进行中" not in visible_labels
     assert lock.text() == "🔒"
 
 
@@ -419,6 +457,93 @@ def test_six_terminal_cards_are_scrollable(qapp):
     scroll = _find(module, QScrollArea, "result_history_scroll")
     assert len(module.findChildren(ResultHistoryCard)) == 6
     assert scroll.verticalScrollBar().maximum() > 0
+
+
+def test_reused_long_result_card_refits_when_scrollbar_narrows_it(qapp):
+    long_ai_result = "FAN FAN\nFAN FAN\nFAN FAN"
+    payload = ReviewDisplayPayload(
+        review={
+            "summary_payload": {
+                "rows": [
+                    {
+                        "item_key": "ai",
+                        "result_display": long_ai_result,
+                        "status": "fail",
+                    }
+                ]
+            }
+        },
+        dashboard_config={},
+    )
+    module = ResultHistoryModule(
+        payload_provider=(
+            lambda run_id: payload if run_id == "target" else None
+        )
+    )
+    target = _card("target")
+    module.render_snapshot(
+        _snapshot(
+            terminal_cards=(target,),
+            follow_latest=False,
+            selected_run_id=target.run_id,
+        )
+    )
+    module.resize(360, 500)
+    module.show()
+    qapp.processEvents()
+    qapp.processEvents()
+
+    scroll = _find(module, QScrollArea, "result_history_scroll")
+    target_card = _card_for(module, target.run_id)
+    table = _find(
+        target_card,
+        QTableWidget,
+        "result_history_card_summary_table",
+    )
+    initial_result_width = table.columnWidth(3)
+    initial_row_height = table.rowHeight(3)
+    assert scroll.verticalScrollBar().maximum() == 0
+
+    additional = tuple(
+        _card(f"terminal-{index}", index=index)
+        for index in range(1, 6)
+    )
+    module.render_snapshot(
+        _snapshot(
+            terminal_cards=(target, *additional),
+            follow_latest=False,
+            selected_run_id=target.run_id,
+            revision=2,
+        )
+    )
+    qapp.processEvents()
+    qapp.processEvents()
+
+    current_card = _card_for(module, target.run_id)
+    available_width = max(1, table.columnWidth(3) - 12)
+    required_height = max(
+        23,
+        table.fontMetrics()
+        .boundingRect(
+            QRect(0, 0, available_width, 10_000),
+            Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextWordWrap,
+            long_ai_result,
+        )
+        .height()
+        + 8,
+    )
+
+    assert current_card is target_card
+    assert scroll.verticalScrollBar().maximum() > 0
+    assert table.columnWidth(3) < initial_result_width
+    assert required_height > initial_row_height
+    assert table.rowHeight(3) >= required_height
+    assert (
+        sum(table.rowHeight(row) for row in range(table.rowCount()))
+        <= table.viewport().height()
+    )
+    assert not table.horizontalScrollBar().isVisible()
+    assert not table.verticalScrollBar().isVisible()
 
 
 def test_lock_control_is_outside_scroll_at_bottom_right(qapp):
@@ -663,6 +788,100 @@ def test_changed_snapshot_updates_existing_card_and_preserves_scroll(qapp):
     ):
         assert current[run_id] is identities[run_id]
     assert scroll.verticalScrollBar().value() == initial_scroll
+
+
+def test_refresh_terminal_payload_updates_one_card_in_place_without_side_effects(
+    qapp,
+):
+    actions = QWidget()
+    actions.setLayout(QVBoxLayout())
+    actions.layout().addWidget(QPushButton("manual action", actions))
+    module = ResultHistoryModule(manual_judgment_widget=actions)
+    terminal_cards = tuple(
+        _card(f"terminal-{index}", index=index + 1) for index in range(5)
+    )
+    active = _card("active", active=True, index=20)
+    reanalyzing = replace(
+        _card("reanalyzing", index=21),
+        phase=ResultPhase.REANALYZING,
+        manual_judgment_allowed=False,
+        manual_reanalysis_allowed=False,
+        operation_id="operation-1",
+    )
+    snapshot = _snapshot(
+        active_cards=(active,),
+        terminal_cards=(*terminal_cards, reanalyzing),
+        follow_latest=False,
+        selected_run_id="terminal-3",
+    )
+    module.render_snapshot(snapshot)
+    module.resize(360, 260)
+    module.show()
+    qapp.processEvents()
+    target = _card_for(module, "terminal-3")
+    target_snapshot = module._card_entries["terminal-3"][0]
+    scroll = _find(module, QScrollArea, "result_history_scroll")
+    scrollbar = scroll.verticalScrollBar()
+    scrollbar.setValue(scrollbar.maximum() // 2)
+    scroll_value = scrollbar.value()
+    card_order = tuple(module._cards)
+    manual_parent = actions.parentWidget()
+
+    assert module.refresh_terminal_payload(
+        "terminal-3", _complete_review_payload()
+    ) is True
+    qapp.processEvents()
+
+    table = _find(
+        target,
+        QTableWidget,
+        "result_history_card_summary_table",
+    )
+    assert tuple(table.item(row, 1).text() for row in range(4)) == (
+        "58.14 dB",
+        "11.10 sone",
+        "0.83",
+        "97.50 %",
+    )
+    assert _metric(module, "terminal-3", "spl") == "53.71 dB"
+    assert _metric(module, "terminal-3", "loudness") == "8.08 sone"
+    assert _card_for(module, "terminal-3") is target
+    assert module._card_entries["terminal-3"][0] is target_snapshot
+    assert tuple(module._cards) == card_order
+    assert module._rendered_snapshot is snapshot
+    assert module._rendered_snapshot.selected_run_id == "terminal-3"
+    assert scrollbar.value() == scroll_value
+    assert actions.parentWidget() is manual_parent
+    assert manual_parent is target.manual_judgment_slot
+
+    assert module.refresh_terminal_payload(
+        "terminal-3", _complete_review_payload(loudness_unit="phon")
+    ) is True
+    assert tuple(table.item(row, 1).text() for row in range(4))[1:2] == (
+        "84.20 phon",
+    )
+    assert _metric(module, "terminal-3", "loudness") == "79.40 phon"
+    before_invalid = tuple(table.item(row, 1).text() for row in range(4))
+    assert module.refresh_terminal_payload("missing", _complete_review_payload()) is False
+    assert module.refresh_terminal_payload("active", _complete_review_payload()) is False
+    assert module.refresh_terminal_payload(
+        "reanalyzing", _complete_review_payload()
+    ) is False
+    assert tuple(table.item(row, 1).text() for row in range(4)) == before_invalid
+
+    module.render_snapshot(
+        _snapshot(
+            active_cards=(active,),
+            terminal_cards=(*terminal_cards[:3], *terminal_cards[4:], reanalyzing),
+            follow_latest=False,
+            selected_run_id="terminal-2",
+            revision=2,
+        )
+    )
+    assert "terminal-3" not in module._card_entries
+    assert module.refresh_terminal_payload(
+        "terminal-3", _complete_review_payload()
+    ) is False
 
 
 def test_recording_to_analysis_phases_update_one_card_without_geometry_jitter(
@@ -1007,7 +1226,45 @@ def test_manual_actions_hide_without_legal_selection(qapp):
     assert not actions.isEnabled()
 
 
-def test_long_manual_fault_text_keeps_card_and_scroll_geometry_stable(qapp):
+def test_manual_judgment_buttons_false_detaches_hides_and_disables_actions(
+    qapp,
+):
+    actions = QWidget()
+    module = ResultHistoryModule(manual_judgment_widget=actions)
+    visible = _card("visible", index=1)
+    hidden = _card(
+        "hidden",
+        index=2,
+        manual_judgment_buttons_visible=False,
+    )
+    module.render_snapshot(
+        _snapshot(
+            terminal_cards=(visible, hidden),
+            follow_latest=False,
+            selected_run_id="visible",
+        )
+    )
+    assert actions.parentWidget() is _card_for(
+        module,
+        "visible",
+    ).manual_judgment_slot
+
+    module.render_snapshot(
+        _snapshot(
+            terminal_cards=(visible, hidden),
+            follow_latest=False,
+            selected_run_id="hidden",
+            revision=2,
+        )
+    )
+
+    assert _card_for(module, "hidden").manual_judgment_widget is None
+    assert actions.parentWidget() is module
+    assert actions.isHidden()
+    assert not actions.isEnabled()
+
+
+def test_long_manual_fault_text_keeps_card_height_and_preserves_scroll(qapp):
     actions = QWidget()
     action_layout = QVBoxLayout(actions)
     action_layout.addWidget(QPushButton("manual action", actions))
@@ -1100,4 +1357,28 @@ def test_long_manual_fault_text_keeps_card_and_scroll_geometry_stable(qapp):
     )
 
     assert current_target is target_card
-    assert geometry_after == geometry_before
+    assert actions.parentWidget() is current_target.manual_judgment_slot
+    assert geometry_after[0] == geometry_before[0]
+    assert geometry_after[1] == geometry_before[1]
+    assert geometry_after[2] == geometry_before[2]
+    assert geometry_after[3] == geometry_before[3]
+    assert geometry_after[4] == geometry_before[4]
+    assert geometry_after[5] == geometry_before[5]
+    assert geometry_after[6] == geometry_before[6]
+
+
+def test_replay_forwarding_and_recreation_preserve_state_without_selection(qapp):
+    module = ResultHistoryModule()
+    first, other = _card('first'), _card('other', index=1)
+    snapshot = _snapshot(terminal_cards=(first, other))
+    module.render_snapshot(snapshot)
+    played, selected = [], []
+    module.replay_requested.connect(lambda run, channel: played.append((run, channel)))
+    module.run_selected.connect(selected.append)
+    module.set_replay_state('other', (3, 7), 7, True, '')
+    _card_for(module, 'other').replay_button.click()
+    replacement = replace(other, sn='changed')
+    module.render_snapshot(replace(snapshot, terminal_cards=(first, replacement), revision=2))
+    _card_for(module, 'other').replay_button.click()
+    assert played == [('other', 7), ('other', 7)]
+    assert selected == []

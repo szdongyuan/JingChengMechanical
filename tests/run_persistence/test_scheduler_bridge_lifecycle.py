@@ -76,7 +76,7 @@ def _envelope_json() -> str:
     return freeze_analysis_envelope(
         {
             "schema": "analysis-input/v1",
-            "config": {"gain": 2},
+            "config": {"gain": 2, "selected_channels": [0]},
             "workorder": {"part": "P-7"},
             "channel_mapping": {"left": 0},
             "analysis": {
@@ -257,6 +257,7 @@ class _AttemptRepository:
         self.marked = []
         self.queued_finished = []
         self.running_finished = []
+        self.replacements = []
 
     def create_queued(self, attempt):
         self.created.append(attempt)
@@ -278,6 +279,12 @@ class _AttemptRepository:
 
     def finish_running_and_project(self, attempt_id: str, outcome, now: str):
         self.running_finished.append((attempt_id, outcome, now))
+        if isinstance(self.terminal_result, BaseException):
+            raise self.terminal_result
+        return self.terminal_result
+
+    def replace_succeeded_result(self, **arguments):
+        self.replacements.append(arguments)
         if isinstance(self.terminal_result, BaseException):
             raise self.terminal_result
         return self.terminal_result
@@ -542,6 +549,7 @@ def _make_bridge(
     scheduler: _Scheduler | None = None,
     now_utc: Callable[[], str] = lambda: NOW,
     terminal_report_sink: Callable[[object], None] | None = None,
+    enrichment_sink: Callable[[object], None] | None = None,
 ):
     audio_path = tmp_path / "audio.wav"
     audio_path.write_bytes(b"RIFF")
@@ -564,6 +572,7 @@ def _make_bridge(
         runtime=runtime,
         attempt_repository=attempts,
         now_utc=now_utc,
+        enrichment_sink=enrichment_sink,
     )
     scheduler = _Scheduler() if scheduler is None else scheduler
     bridge = RunPersistenceSchedulerBridge(
@@ -814,7 +823,9 @@ def test_reanalysis_selected_window_reaches_exact_durable_scheduler_job(
         "!d", job.snapshot.analysis_window_end_seconds
     ) == struct.pack("!d", selected_end)
     assert job.audio == _reference(audio)
-    assert job.snapshot.config_snapshot_json.encode("utf-8") == b'{"gain":2}'
+    assert job.snapshot.config_snapshot_json.encode("utf-8") == (
+        b'{"gain":2,"selected_channels":[0]}'
+    )
     assert (
         job.snapshot.calibration_snapshot_json.encode("utf-8")
         == b'{"offset":1}'

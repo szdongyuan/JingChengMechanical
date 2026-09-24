@@ -26,6 +26,44 @@ from tests.run_persistence.test_audio_repository import (
     ready_runtime,
 )
 from tests.run_persistence.conftest import make_analysis_envelope
+from tests.test_audio_wav import write_numeric_wav
+
+
+@pytest.mark.parametrize('bits,floating', [(24, False), (32, True), (64, True)])
+def test_import_persists_original_format_and_all_bytes(prepared_database_path, tmp_path, now, bits, floating):
+    runtime = ready_runtime(prepared_database_path)
+    source = tmp_path / 'precision.wav'
+    write_numeric_wav(source, bits=bits, floating=floating)
+    run_id = insert_imported_run(runtime, now, source, expected_frame_count=3)
+    final = tmp_path / 'archived.wav'
+    service = AudioPersistenceService(AudioPublication(), AudioRepository(runtime), RunRepository(runtime))
+    result = service.persist(
+        run_id, source, final, 8000, 2, bits // 8, now,
+        save_job_id=str(uuid4()), source_kind='IMPORTED_SOURCE',
+        source_identity='sha256:immutable-source', content_revision=1,
+        expected_frame_count=3, source_frame_count=3,
+    )
+    assert result.initial_attempt_permitted, result.reason
+    assert final.read_bytes() == source.read_bytes()
+    record = AudioRepository(runtime).get_for_run(run_id)
+    assert record.container_format == ('WAV_IEEE_FLOAT' if floating else 'WAV_PCM')
+    assert (record.channel_count, record.frame_count) == (2, 3)
+
+
+def test_capture_still_rejects_non_pcm16(prepared_database_path, tmp_path, now):
+    runtime = ready_runtime(prepared_database_path)
+    source = tmp_path / 'capture24.wav'
+    write_numeric_wav(source)
+    run_id = insert_run(runtime, now)
+    service = AudioPersistenceService(AudioPublication(), AudioRepository(runtime), RunRepository(runtime))
+    result = service.persist(
+        run_id, source, tmp_path / 'final.wav', 8000, 2, 3, now,
+        save_job_id=str(uuid4()), source_kind='CAPTURED_AUDIO', source_identity='capture:1',
+        content_revision=1, expected_frame_count=3, source_frame_count=3,
+    )
+    assert not result.initial_attempt_permitted
+    assert result.code == 'AUDIO_REQUEST_MISMATCH'
+    assert counts(runtime) == (0, 0)
 
 
 def make_wav(path: Path) -> bytes:

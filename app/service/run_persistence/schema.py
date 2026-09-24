@@ -9,7 +9,7 @@ from peewee import SqliteDatabase
 
 
 RUN_PERSISTENCE_APPLICATION_ID = 1245924688
-RUN_PERSISTENCE_USER_VERSION = 2
+RUN_PERSISTENCE_USER_VERSION = 3
 RUN_PERSISTENCE_TABLES = frozenset({"run", "audio", "analysis_attempt"})
 RUN_PERSISTENCE_RUN_COLUMNS = (
     ("run_id", "TEXT", 1, None, 1, 0),
@@ -112,7 +112,7 @@ _AUDIO_CHECK_TEXTS = (
     "source_kind IN ('CAPTURED_AUDIO', 'IMPORTED_SOURCE')",
     "length(trim(source_identity)) > 0",
     "typeof(content_revision) = 'integer' AND content_revision > 0",
-    "container_format = 'WAV_PCM'",
+    "container_format IN ('WAV_PCM', 'WAV_IEEE_FLOAT')",
     "sample_rate_hz > 0",
     "channel_count > 0",
     "frame_count > 0",
@@ -453,6 +453,9 @@ def _table_foreign_keys(database: SqliteDatabase, table: str) -> tuple:
 
 def validate_run_persistence_schema(
     database: SqliteDatabase,
+    *,
+    expected_user_version: int = RUN_PERSISTENCE_USER_VERSION,
+    require_foreign_keys: bool = True,
 ) -> SchemaValidationResult:
     """Read fixed markers, connection FK state, and the exact user-table set."""
 
@@ -465,15 +468,15 @@ def validate_run_persistence_schema(
         )
 
     user_version = database.execute_sql("PRAGMA user_version").fetchone()[0]
-    if user_version != RUN_PERSISTENCE_USER_VERSION:
+    if user_version != expected_user_version:
         return _failure(
             SchemaValidationCode.DATABASE_USER_VERSION_MISMATCH,
-            RUN_PERSISTENCE_USER_VERSION,
+            expected_user_version,
             user_version,
         )
 
     foreign_keys = database.execute_sql("PRAGMA foreign_keys").fetchone()[0]
-    if foreign_keys != 1:
+    if require_foreign_keys and foreign_keys != 1:
         return _failure(
             SchemaValidationCode.DATABASE_FOREIGN_KEYS_DISABLED,
             1,
@@ -505,6 +508,10 @@ def validate_run_persistence_schema(
             )
 
     for table, expected_checks in RUN_PERSISTENCE_CHECKS.items():
+        if table == "audio" and expected_user_version == 2:
+            expected_checks = (
+                expected_checks - {"container_format IN ('WAV_PCM', 'WAV_IEEE_FLOAT')"}
+            ) | {"container_format = 'WAV_PCM'"}
         actual_check_expressions = _table_checks(database, table)
         actual_checks = frozenset(actual_check_expressions)
         if (

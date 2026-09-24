@@ -36,6 +36,16 @@ class DecodedAnalysisEnvelope:
     queue_timeout_seconds: float | None
     toolchain: DecodedToolchainEnvelope | None
 
+    @property
+    def is_import(self) -> bool:
+        from app.service.analysis.import_mapping import is_import_mapping
+        return is_import_mapping(self.channel_mapping)
+
+    @property
+    def replay_channel_order(self) -> tuple[int, ...]:
+        from app.service.analysis.import_mapping import replay_channel_order
+        return replay_channel_order(self.channel_mapping)
+
 
 _ROOT_KEYS = frozenset(
     {"schema", "config", "workorder", "channel_mapping", "analysis"}
@@ -192,6 +202,12 @@ def _validate_envelope(envelope: dict[str, object]) -> None:
     _require_json_object(root["config"], "config")
     _require_json_object(root["workorder"], "workorder")
     _require_json_object(root["channel_mapping"], "channel_mapping")
+    from app.service.analysis.import_mapping import is_import_mapping, validate_import_mapping
+    if is_import_mapping(root["channel_mapping"]):
+        try:
+            validate_import_mapping(root["channel_mapping"], selected_channels=root["config"].get("selected_channels", ()))
+        except ValueError as exc:
+            raise AnalysisEnvelopeError(str(exc)) from None
 
     analysis = _require_exact_keys(root["analysis"], _ANALYSIS_KEYS, "analysis")
     start = _require_float(

@@ -5,7 +5,7 @@ import json
 import os
 from pathlib import Path
 import threading
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 import time
 from unittest.mock import Mock
 import wave
@@ -25,6 +25,7 @@ from app.service.managed_input_contracts import (
     ResidentStreamGenerationStamp,
 )
 from app.service.multi_run_integration.production_prerequisites import (
+    FrozenConfigPrerequisite,
     PreparedProductionPrerequisites,
 )
 from app.service.multi_run_integration.production_composition import (
@@ -37,17 +38,25 @@ from app.service.multi_run_integration.production_composition import (
     _ProductionLiveDisplayManager,
 )
 from app.service.multi_run_coordinator_mvp.contracts import (
+    CaptureReserveResult,
+    CaptureReserveStatus,
+    CommitResult,
     FrozenPayload,
+    StartStatus,
     TriggerSource,
 )
+from app.service.captured_start_dispatcher import CapturedStartWorkResult
 from app.service.analysis.resident_audio_mvp.contracts import (
     BackendCallbackStatus,
 )
 from tests.multi_run_coordinator_mvp._support import (
+    Harness,
+    RUN_IDS,
     canonical_payload,
     captured_request,
     frozen_captured,
 )
+from tests.multi_run_coordinator_mvp.test_lifecycle import _PendingResident
 
 
 class _Prerequisites:
@@ -231,6 +240,8 @@ def test_live_display_uses_resident_managed_hardware_identity_and_exact_window(
     manager = _ProductionLiveDisplayManager(bus=SimpleNamespace())
     manager.register_frozen(frozen)
 
+    assert manager.wait_until_setup_idle(1.0)
+
     assert "managed-input-9" in manager._runs_by_hardware
     manager.accept_block(
         "managed-input-9",
@@ -352,6 +363,7 @@ def test_live_display_uses_frozen_calibration_and_feeds_configured_monitor(
     manager = _ProductionLiveDisplayManager(bus=SimpleNamespace())
 
     manager.register_frozen(frozen)
+    assert manager.wait_until_setup_idle(1.0)
     manager.accept_block(
         "managed-input-9",
         np.asarray([[1.0, 10.0], [2.0, 20.0]], dtype=np.float32),
@@ -639,6 +651,9 @@ def _isolated_stream_prepare(
     observed_hardware_ids,
     ready_hardware_ids,
     observed_sample_rate_hz=8_000.0,
+    failure_detail=None,
+    device_suffix="",
+    hostapi_name="API",
 ):
     import app.service.multi_run_integration.production_composition as module
 
@@ -650,8 +665,8 @@ def _isolated_stream_prepare(
                 device_index=hardware_id - 1,
                 hostapi_index=0,
                 descriptor=InputEndpointDescriptor(
-                    device_name=f"Input {hardware_id}",
-                    hostapi_name="API",
+                    device_name=f"Input {hardware_id}{device_suffix}",
+                    hostapi_name=hostapi_name,
                     sample_rate_hz=observed_sample_rate_hz,
                     input_channels=1,
                 ),
@@ -694,6 +709,7 @@ def _isolated_stream_prepare(
                         ResidentOpenFailure(
                             endpoint.hardware_id,
                             "resident_open_failed",
+                            **({"detail": failure_detail} if failure_detail is not None else {}),
                         )
                     )
             return ResidentStartupOpenResult(tuple(ready), tuple(failures))
@@ -706,8 +722,8 @@ def _isolated_stream_prepare(
         SimpleNamespace(
             hardware_id=hardware_id,
             stable_backend_uid=None,
-            descriptor_device_name=f"Input {hardware_id}",
-            descriptor_hostapi_name="API",
+            descriptor_device_name=f"Input {hardware_id}{device_suffix}",
+            descriptor_hostapi_name=hostapi_name,
             descriptor_sample_rate_hz=8_000.0,
             descriptor_input_channels=1,
         )
@@ -847,6 +863,140 @@ def test_zero_healthy_streams_fail_global_prepare_after_one_diagnostic_each(
     assert resident.close_calls == 1
 
 
+def test_startup_failure_is_persisted_before_any_diagnostic_listener(monkeypatch, tmp_path):
+    import logging
+    from uuid import uuid4
+    from app.service import log_manager
+
+    log_directory = tmp_path / "log"
+    log_path = log_directory / "main.log"
+    monkeypatch.setattr(log_manager, "LOG_DIR", str(log_directory))
+    monkeypatch.setattr(log_manager, "DEFAULT_LOG", {
+        **log_manager.DEFAULT_LOG, "log_name": str(log_path),
+    })
+    holder = f"startup-test-{uuid4().hex}"
+    real_set_handler = log_manager.LogManager.set_log_handler
+    monkeypatch.setattr(log_manager.LogManager, "set_log_handler", lambda _holder: real_set_handler(holder))
+    factory, prerequisites, resident, _ = _isolated_stream_prepare(
+        monkeypatch, tmp_path, observed_hardware_ids=(1, 2), ready_hardware_ids=set(),
+        failure_detail="synthetic open failure [PaError -9999]",
+    )
+    factory._diagnostic_callback = None
+    try:
+        with pytest.raises(ProductionCompositionError, match="synthetic open failure"):
+            factory.prepare_upstream(prerequisites)
+        persisted = log_path.read_text(encoding="utf-8")
+        for hardware_id in (1, 2):
+            assert f"managed input {hardware_id}" in persisted
+            assert f"Input {hardware_id}" in persisted
+        assert "API" in persisted
+        assert "8000" in persisted and "channels=1" in persisted
+        assert persisted.count("synthetic open failure [PaError -9999]") == 2
+        assert persisted.count("resident_open_failed") == 2
+        assert resident.close_calls == 1
+    finally:
+        logger = logging.getLogger(holder)
+        for handler in tuple(logger.handlers):
+            handler.close()
+            logger.removeHandler(handler)
+
+
+@pytest.mark.parametrize("broken_sink", ["logger", "callback", "both"])
+@pytest.mark.parametrize("partial", [False, True])
+def test_startup_diagnostic_sink_failure_preserves_readiness_and_cleanup(
+    monkeypatch, tmp_path, broken_sink, partial,
+):
+    import app.service.multi_run_integration.production_composition as module
+    factory, prerequisites, resident, diagnostics = _isolated_stream_prepare(
+        monkeypatch, tmp_path, observed_hardware_ids=(1, 2),
+        ready_hardware_ids={2} if partial else set(),
+        failure_detail="synthetic open failure [PaError -9999]",
+    )
+    live_displays = []
+    real_live_display = module._ProductionLiveDisplayManager
+    def create_display(**kwargs):
+        display = real_live_display(**kwargs)
+        live_displays.append(display)
+        return display
+    monkeypatch.setattr(module, "_ProductionLiveDisplayManager", create_display)
+    log_attempts = []
+    def fail_log(*args, **kwargs):
+        log_attempts.append(args)
+        raise RuntimeError("logger unavailable")
+    if broken_sink in {"logger", "both"}:
+        logger = SimpleNamespace(warning=fail_log, error=fail_log, info=fail_log)
+        monkeypatch.setattr(module.LogManager, "set_log_handler", lambda _holder: logger)
+    if broken_sink in {"callback", "both"}:
+        def fail_callback(detail):
+            diagnostics.append(detail)
+            raise RuntimeError("diagnostic callback unavailable")
+        factory._diagnostic_callback = fail_callback
+    if partial:
+        upstream = factory.prepare_upstream(prerequisites)
+        try:
+            assert [item.endpoint.hardware_id.value for item in upstream.streams] == [2]
+            assert resident.close_calls == 0
+            assert not live_displays[0]._closed
+        finally:
+            upstream.close()
+    else:
+        # Cleanup errors must not prevent the other owner from closing or hide the reason.
+        def fail_close(_timeout):
+            resident.close_calls += 1
+            raise RuntimeError("cleanup also failed")
+        resident.close_all = fail_close
+        with pytest.raises(ProductionCompositionError, match="synthetic open failure") as raised:
+            factory.prepare_upstream(prerequisites)
+        assert str(raised.value).startswith("production has zero ready Resident streams")
+    assert resident.close_calls == 1
+    assert live_displays[0]._closed
+    assert any("synthetic open failure" in item for item in diagnostics)
+    if broken_sink in {"logger", "both"}:
+        assert log_attempts
+
+
+def test_first_startup_reason_survives_actual_ui_limit_with_long_metadata(monkeypatch, tmp_path):
+    import main as startup_mod
+    from tests.test_main_startup import FakeApplication
+
+    reason = ("synthetic open failure [PaError -9999]: " + "driver detail " * 15).rstrip()
+    factory, prerequisites, resident, diagnostics = _isolated_stream_prepare(
+        monkeypatch, tmp_path, observed_hardware_ids=(1, 2), ready_hardware_ids=set(),
+        failure_detail=reason, device_suffix="x" * 240, hostapi_name="API" + "y" * 250,
+    )
+    services = SimpleNamespace(startup_failure=None, shutdown=Mock())
+    critical = Mock()
+    def fail_main_window(_services):
+        try:
+            factory.prepare_upstream(prerequisites)
+        except ProductionCompositionError as exc:
+            services.startup_failure = str(exc)
+            raise
+    class Login:
+        def __init__(self, on_login_success, **_kwargs):
+            self.login = on_login_success
+        def show(self):
+            self.login("operator", "user")
+    monkeypatch.setattr(startup_mod, "_load_gui_dependencies", lambda: None)
+    monkeypatch.setattr(startup_mod, "QApplication", FakeApplication)
+    monkeypatch.setattr(startup_mod, "asset_path", lambda _name: str(tmp_path / "absent.ico"))
+    monkeypatch.setattr(startup_mod, "ServiceContainer", lambda: services)
+    monkeypatch.setattr(startup_mod, "DatabaseStartupError", type("DatabaseStartupError", (Exception,), {}))
+    monkeypatch.setattr(startup_mod, "MainWindow", fail_main_window)
+    monkeypatch.setattr(startup_mod, "LoginWindow", Login)
+    monkeypatch.setattr(startup_mod, "QMessageBox", SimpleNamespace(critical=critical))
+    assert startup_mod.run_app(["startup-diagnostics-test"]) == 1
+    displayed = critical.call_args.args[2].split("错误信息：", 1)[1]
+    assert len(displayed) <= 512
+    assert reason in displayed
+    assert "managed input 1" in displayed
+    assert len(diagnostics) == 2
+    assert all(len(item) <= 640 for item in diagnostics)
+    assert all("8000" in item and "channels=1" in item for item in diagnostics)
+    assert resident.close_calls == 1
+    services.shutdown.assert_called_once()
+
+
 def test_zero_exact_endpoints_fail_global_prepare_after_one_diagnostic_each(
     monkeypatch,
     tmp_path,
@@ -864,6 +1014,48 @@ def test_zero_exact_endpoints_fail_global_prepare_after_one_diagnostic_each(
     assert len(diagnostics) == 2
     assert resident.opened_endpoints == ()
     assert resident.close_calls == 0
+
+
+def test_windows_sounddevice_uses_one_capture_child_for_both_routes(monkeypatch, tmp_path):
+    from types import ModuleType
+    import app.service.multi_run_integration.production_composition as module
+    factory, prerequisites, resident, _ = _isolated_stream_prepare(
+        monkeypatch, tmp_path, observed_hardware_ids=(1, 2), ready_hardware_ids={1, 2})
+    factory._sounddevice_module = ModuleType("sounddevice")
+    monkeypatch.setattr(__import__("sys"), "platform", "win32")
+    calls = []
+    def process_factory(**kwargs):
+        calls.append(kwargs)
+        return resident
+    factory._capture_process_factory = process_factory
+    upstream = factory.prepare_upstream(prerequisites)
+    try:
+        assert len(calls) == 1
+        assert calls[0]["config"].frames_per_buffer == 512
+        assert calls[0]["config"].startup_stream_timeout_s == 5.0
+        assert calls[0]["config"].fault_close_timeout_s == 5.0
+        assert calls[0]["config"].shutdown_timeout_s == 5.0
+        assert prerequisites.adapter_calls == []
+        assert upstream.managed_resident is resident
+        assert len(upstream.streams) == 2
+        assert tuple(item.hardware_id.value for item in resident.opened_endpoints) == (1, 2)
+    finally:
+        upstream.close()
+
+
+def test_capture_child_startup_failure_has_no_inprocess_fallback(monkeypatch, tmp_path):
+    from types import ModuleType
+    factory, prerequisites, resident, _ = _isolated_stream_prepare(
+        monkeypatch, tmp_path, observed_hardware_ids=(1, 2), ready_hardware_ids={1, 2})
+    factory._sounddevice_module = ModuleType("sounddevice")
+    def fail_open(_endpoints):
+        raise RuntimeError("child startup failed")
+    resident.open_startup_streams = fail_open
+    factory._capture_process_factory = lambda **_kwargs: resident
+    with pytest.raises(RuntimeError, match="child startup failed"):
+        factory.prepare_upstream(prerequisites)
+    assert prerequisites.adapter_calls == []
+    assert resident.close_calls == 1
 
 
 def _frozen_current_config(current_meter, *, plc_id=None):
@@ -1227,6 +1419,43 @@ def test_run_freezer_snapshots_enabled_ai_toolchain_for_each_new_run(tmp_path):
     assert first_payload.value_id != second_payload.value_id
 
 
+def test_captured_freezer_rejects_exact_ai_revision_before_capture_when_unready(
+    tmp_path,
+):
+    import app.service.multi_run_integration.production_composition as module
+
+    toolchain = {
+        "toolchain_id": "resident-ai",
+        "execution_revision": "sha256:revision-1",
+        "execution_mode": "resident_process",
+        "entrypoint": r"C:\AI\resident.exe",
+        "package_dir": r"C:\AI",
+        "params": {"decision_threshold": 0.5},
+        "timeout_seconds": 2.0,
+    }
+    readiness_calls = []
+    config = SimpleNamespace(config_id=11, selected_channels=(0,))
+    freezer = module._FrozenRunFreezer(
+        SimpleNamespace(configs=(config,)),
+        tmp_path,
+        ai_toolchain_loader=lambda _config_id: toolchain,
+        ai_toolchain_readiness=lambda frozen: readiness_calls.append(frozen)
+        or False,
+    )
+
+    with pytest.raises(ValueError, match="not ready"):
+        freezer._analysis_input(
+            config,
+            {"work_order": {"sn": "SN-unready"}},
+            {
+                "analysis_duration": 1.0,
+                "analysis_window_offset_ms": 0,
+            },
+        )
+
+    assert readiness_calls == [toolchain]
+
+
 def test_run_freezer_keeps_ai_disabled_when_loader_returns_none(tmp_path):
     import app.service.multi_run_integration.production_composition as module
 
@@ -1316,6 +1545,7 @@ def test_frozen_run_freezer_converts_channel_json_columns_to_runtime_values():
         values={
             "config_name": "test",
             "fault_types_json": "[]",
+            "manual_judgment_buttons_visible": True,
         },
         channels=(
             SimpleNamespace(
@@ -1337,6 +1567,84 @@ def test_frozen_run_freezer_converts_channel_json_columns_to_runtime_values():
         {"kind": "upper", "points": []}
     ]
     assert channel["ai_config"] == {"enabled": False}
+    assert semantic["manual_judgment_buttons_visible"] is True
+
+
+@pytest.mark.parametrize("invalid", [0, 1, "true", None])
+def test_frozen_run_freezer_rejects_non_boolean_manual_judgment_buttons_visibility(
+    invalid,
+):
+    import app.service.multi_run_integration.production_composition as module
+
+    config = SimpleNamespace(
+        config_id=11,
+        selected_channels=(),
+        values={
+            "config_name": "test",
+            "fault_types_json": "[]",
+            "manual_judgment_buttons_visible": invalid,
+        },
+        channels=(),
+    )
+
+    with pytest.raises(ValueError, match="manual_judgment_buttons_visible"):
+        module._FrozenRunFreezer._semantic_config(config)
+
+
+def test_durable_terminal_history_labels_use_frozen_manual_judgment_buttons_visibility() -> None:
+    import app.service.multi_run_integration.production_composition as module
+    from app.service.fault_types import decode_history_labels_payload
+    from app.service.run_persistence.analysis_envelope import (
+        freeze_analysis_envelope,
+    )
+    from tests.run_persistence.conftest import make_analysis_envelope
+
+    run_id = RUN_IDS[0]
+    attempt_id = RUN_IDS[1]
+    frozen_config = {
+        "config_id": 11,
+        "config_name": "Frozen visible config",
+        "fault_types": ["异响"],
+        "manual_judgment_buttons_visible": True,
+        "selected_channels": [0],
+    }
+    run = SimpleNamespace(
+        state="SUCCEEDED",
+        judgment="PASS",
+        causal_revision=4,
+        config_snapshot_json=freeze_analysis_envelope(
+            make_analysis_envelope(
+                config=frozen_config,
+                workorder={"sn": "SN-FROZEN"},
+            )
+        ),
+        calibration_snapshot_json='{"kind":"NONE"}',
+        trigger_source="MANUAL",
+        config_id=11,
+        hardware_id=None,
+        fault_type=None,
+        manual_judgment_revision=None,
+    )
+    attempt = SimpleNamespace(
+        attempt_id=attempt_id,
+        result_payload_json='{"judgment":"PASS","result":{}}',
+    )
+    persistence = object.__new__(module._CoordinatorPersistence)
+    persistence._runs = SimpleNamespace(get=lambda requested: run)
+    persistence._attempts = SimpleNamespace(
+        latest_successful_for_run=lambda requested: attempt
+    )
+    persistence._audio = SimpleNamespace(get_for_run=lambda requested: None)
+
+    facts = persistence.load_result_control_facts(run_id)
+
+    assert facts is not None
+    labels = decode_history_labels_payload(
+        value_id=facts.current_projection.history_labels.value_id,
+        canonical_bytes=facts.current_projection.history_labels.canonical_bytes,
+    )
+    assert labels["schema"] == "jingcheng-history-labels/v2"
+    assert labels["config"]["manual_judgment_buttons_visible"] is True
 
 
 def test_run_freezer_snapshots_current_dashboard_layout_at_acceptance(tmp_path):
@@ -1464,6 +1772,27 @@ def test_run_freezer_snapshots_current_dashboard_layout_at_acceptance(tmp_path):
     assert later_config["result_dashboard_layout"] == later_layout
     assert run_config["analysis_duration"] == 0.01
     assert analysis_config["analysis_duration"] == 0.01
+    capture_lifecycle = module._CaptureSaveLifecycleAuthority()
+    assert capture_lifecycle.snapshot() == ()
+    from app.service.run_persistence.prepare_database import (
+        prepare_run_persistence_database,
+    )
+    from tests.run_persistence.test_audio_repository import ready_runtime
+
+    runtime = ready_runtime(
+        prepare_run_persistence_database(tmp_path / "active-gate.db")
+    )
+    persistence = module._CoordinatorPersistence(
+        runtime,
+        capture_lifecycle=capture_lifecycle,
+    )
+    assert persistence.create_active(frozen) is CommitResult.COMMITTED
+    assert persistence.create_active(later_frozen) is CommitResult.COMMITTED
+    assert capture_lifecycle.snapshot() == (
+        "00000000-0000-4000-8000-000000000001",
+        "00000000-0000-4000-8000-000000000002",
+    )
+    runtime.close_after_upstream_stopped()
 
 
 def test_real_composition_uses_one_python_system_monotonic_domain_for_all_consumers():
@@ -1581,7 +1910,87 @@ def test_real_activation_failure_closes_dispatcher_scheduler_upstream_and_lease_
     ]
     assert len(scheduler_configs) == 1
     assert scheduler_configs[0].worker_count == 2
-    assert executor_build_kwargs == [{"process_count": 2}]
+    assert len(executor_build_kwargs) == 1
+    assert executor_build_kwargs[0]["process_count"] == 2
+    capture_active = executor_build_kwargs[0]["capture_active"]
+    assert type(capture_active.__self__) is module._CaptureSaveLifecycleAuthority
+    assert callable(executor_build_kwargs[0]["enrichment_sink"])
+    assert callable(executor_build_kwargs[0]["enrichment_failure_sink"])
+
+
+def test_real_activation_wires_dynamic_ai_readiness_into_captured_freezer(
+    monkeypatch,
+    tmp_path,
+):
+    import app.service.multi_run_integration.production_composition as module
+
+    trace = []
+    captured_kwargs = {}
+
+    class Dispatcher:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def shutdown(self, _deadline):
+            pass
+
+    class Scheduler:
+        def __init__(self, **_kwargs):
+            pass
+
+        def shutdown(self, _timeout):
+            pass
+
+    class Bridge:
+        def shutdown(self, _timeout):
+            pass
+
+    class Executor:
+        def start(self):
+            pass
+
+        def binding_ready(self, _binding):
+            return True
+
+        def close(self):
+            pass
+
+    executor = Executor()
+
+    def capture_freezer(*_args, **kwargs):
+        captured_kwargs.update(kwargs)
+        raise RuntimeError("freezer wiring observed")
+
+    monkeypatch.setattr(module, "BoundedAudioSaveDispatcher", Dispatcher)
+    monkeypatch.setattr(module, "AnalysisScheduler", Scheduler)
+    monkeypatch.setattr(module, "RunPersistenceSchedulerBridge", lambda **_kwargs: Bridge())
+    monkeypatch.setattr(module, "_FrozenRunFreezer", capture_freezer)
+    prerequisites = _Prerequisites(trace)
+    prerequisites.selected_config_ids = ()
+    prerequisites.configs = ()
+    prerequisites.build_analysis_executor = lambda **_kwargs: executor
+    upstream = _Upstream(trace)
+    upstream.resident_capture = object()
+    upstream.managed_resident = object()
+    upstream.live_display = SimpleNamespace(has_active_runs=lambda: False)
+    factory = ProductionGraphFactory(
+        runtime=object(),
+        plc_dispatch_ports=object(),
+        plc_result_sequencer=object(),
+        output_directory=tmp_path,
+    )
+    prepared = PreparedProductionComposition(
+        prerequisites=prerequisites,
+        upstream=upstream,
+        graph_factory=factory,
+    )
+
+    with pytest.raises(ProductionCompositionError, match="freezer wiring observed"):
+        prepared.activate(SimpleNamespace(publish=lambda _event: None))
+
+    readiness = captured_kwargs["ai_toolchain_readiness"]
+    assert readiness.__self__ is executor
+    assert readiness.__func__ is Executor.binding_ready
 
 
 @pytest.mark.parametrize("stream_count", [1, 6])
@@ -1799,3 +2208,406 @@ def test_publication_probe_failure_rejects_before_backend_or_streams(
         factory.prepare_upstream(SimpleNamespace())
 
     assert backend_constructions == []
+
+
+def test_committed_enrichment_sink_projects_only_to_history_ui():
+    from app.service.multi_run_integration.production_composition import (
+        _EnrichmentProjectionSink,
+    )
+
+    event = object()
+    projection = object()
+    coordinator = SimpleNamespace(
+        project_enrichment=Mock(return_value=projection)
+    )
+    history = SimpleNamespace(publish_enrichment=Mock())
+    sink = _EnrichmentProjectionSink(history)
+    sink.attach(coordinator)
+
+    sink(event)
+
+    coordinator.project_enrichment.assert_called_once_with(event)
+    history.publish_enrichment.assert_called_once_with(projection)
+
+
+def test_committed_enrichment_rechecks_shared_quiet_epoch_before_qt_projection():
+    from app.service.multi_run_integration.production_composition import (
+        _EnrichmentProjectionSink,
+    )
+
+    event = object()
+    projection = object()
+    trace = []
+    coordinator = SimpleNamespace(
+        project_enrichment=lambda value: (
+            trace.append(("fence", value)),
+            projection,
+        )[1]
+    )
+    history = SimpleNamespace(
+        publish_enrichment=lambda value: trace.append(("qt", value))
+    )
+    quiet_guard = Mock(side_effect=lambda epoch, checkpoint: trace.append(
+        ("quiet", epoch, checkpoint)
+    ))
+    sink = _EnrichmentProjectionSink(history)
+    sink.attach(coordinator)
+    sink.attach_quiet_guard(quiet_guard)
+
+    sink(event)
+
+    assert trace == [
+        ("quiet", None, "qt_chart_projection"),
+        ("fence", event),
+        ("qt", projection),
+    ]
+
+
+def test_real_captured_save_owns_fresh_quiet_epoch_after_live_frames_finish(
+    monkeypatch,
+    tmp_path,
+):
+    import app.service.analysis.process_executor as process_executor_module
+    from app.service.analysis.process_executor import (
+        ProcessIsolatedAnalysisExecutor,
+    )
+    from app.service.multi_run_coordinator_mvp import (
+        AudioSaveStatus,
+        SaveCancelToken,
+    )
+    from app.service.multi_run_integration.production_composition import (
+        _CaptureLifecycleSaver,
+        _CaptureSaveLifecycleAuthority,
+    )
+    from app.service.run_persistence.prepare_database import (
+        prepare_run_persistence_database,
+    )
+    from tests.analysis_scheduler.test_staged_process_executor import (
+        _Context,
+        _FakeCaptureClock,
+        _audio,
+        _job,
+    )
+    from tests.multi_run_integration.test_production_audio_saver import (
+        _captured_request,
+        _insert_active,
+        _real_saver,
+    )
+    from tests.run_persistence.test_audio_repository import ready_runtime
+
+    run_id = "12345678-1234-4234-8234-123456789abc"
+    now = "2026-09-01T01:00:00.000000Z"
+    runtime = ready_runtime(
+        prepare_run_persistence_database(tmp_path / "capture-save-gate.db")
+    )
+    _insert_active(runtime, run_id=run_id, now=now)
+    real_saver, _runs = _real_saver(runtime, now)
+    request = _captured_request(run_id, tmp_path / "authoritative.wav")
+    save_entered = threading.Event()
+    save_release = threading.Event()
+
+    class BlockingRealSaver:
+        def save_captured(self, actual_request, cancel_token):
+            save_entered.set()
+            assert save_release.wait(2.0)
+            return real_saver.save_captured(actual_request, cancel_token)
+
+        def save_imported(self, actual_request, cancel_token):
+            return real_saver.save_imported(actual_request, cancel_token)
+
+    authority = _CaptureSaveLifecycleAuthority()
+    authority.begin(run_id)
+    gated_saver = _CaptureLifecycleSaver(BlockingRealSaver(), authority)
+    context = _Context()
+    clock = _FakeCaptureClock()
+    clock.set_active(False)
+    monkeypatch.setattr(
+        process_executor_module.multiprocessing,
+        "get_context",
+        lambda method: context if method == "spawn" else None,
+    )
+    reports = []
+    executor = ProcessIsolatedAnalysisExecutor(
+        process_count=1,
+        capture_active=authority.has_active_runs,
+        monotonic=clock.monotonic,
+        quiet_wait=clock.wait,
+        enrichment_sink=reports.append,
+    )
+    save_outcomes = []
+    save_thread = threading.Thread(
+        target=lambda: save_outcomes.append(
+            gated_saver.save_captured(request, SaveCancelToken())
+        )
+    )
+    try:
+        executor.execute(_job("save-gate"), _audio(), object())
+        assert executor.mark_decision_committed("save-gate") is True
+        save_thread.start()
+        assert save_entered.wait(1.0)
+
+        clock.advance(1.0)
+        threading.Event().wait(0.30)
+        assert reports == []
+        assert authority.has_active_runs() is True
+        assert not any(
+            message[0] == "enrich" for message in context.connections[0].sent
+        )
+
+        save_release.set()
+        save_thread.join(2.0)
+        assert not save_thread.is_alive()
+        assert save_outcomes[0].status is AudioSaveStatus.SAVED
+        assert authority.has_active_runs() is False
+        assert Path(request.final_path_request.final_path).exists()
+
+        assert executor.quiet_epoch_id() == 1
+        clock.advance(0.249)
+        threading.Event().wait(0.05)
+        assert reports == []
+        clock.advance(0.001)
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline and not reports:
+            threading.Event().wait(0.01)
+
+        assert len(reports) == 1
+        commands = [message[0] for message in context.connections[0].sent]
+        assert commands.count("enrich") == 1
+        assert commands.count("enrich_transport") == 1
+    finally:
+        save_release.set()
+        save_thread.join(2.0)
+        executor.close()
+        runtime.close_after_upstream_stopped()
+
+
+def test_capture_lifecycle_settles_dispatch_rejection_and_saver_exception(
+    tmp_path,
+):
+    from app.service.multi_run_coordinator_mvp import SaveSubmitStatus
+    from app.service.multi_run_integration.production_composition import (
+        _CaptureLifecycleSaveDispatcher,
+        _CaptureLifecycleSaver,
+        _CaptureSaveLifecycleAuthority,
+    )
+    from tests.multi_run_integration.test_production_audio_saver import (
+        _captured_request,
+    )
+
+    run_id = "12345678-1234-4234-8234-123456789abc"
+    request = _captured_request(run_id, tmp_path / "rejected.wav")
+    authority = _CaptureSaveLifecycleAuthority()
+
+    authority.begin(run_id)
+    rejected = SimpleNamespace(
+        try_submit=lambda _request, _sink: SimpleNamespace(
+            status=SaveSubmitStatus.SATURATED
+        ),
+    )
+    dispatcher = _CaptureLifecycleSaveDispatcher(rejected, authority)
+    submission = dispatcher.try_submit(request, lambda _outcome: None)
+    assert submission.status is SaveSubmitStatus.SATURATED
+    assert authority.snapshot() == ()
+
+    class RaisingSaver:
+        def save_captured(self, _request, _cancel_token):
+            raise RuntimeError("atomic publication failed")
+
+    authority.begin(run_id)
+    saver = _CaptureLifecycleSaver(RaisingSaver(), authority)
+    with pytest.raises(RuntimeError, match="publication failed"):
+        saver.save_captured(request, object())
+    assert authority.snapshot() == ()
+
+    run_ids = tuple(f"bounded-run-{index}" for index in range(6))
+    for active_run_id in run_ids:
+        authority.begin(active_run_id)
+    assert authority.snapshot() == run_ids
+    with pytest.raises(RuntimeError, match="capacity"):
+        authority.begin("bounded-run-seventh")
+    for active_run_id in run_ids:
+        assert authority.settle(active_run_id) is True
+    assert authority.has_active_runs() is False
+
+
+class _BeginCaptureLifecycleOnActiveCommit:
+    def __init__(self, delegate, authority) -> None:
+        self._delegate = delegate
+        self._authority = authority
+
+    def create_active(self, frozen):
+        result = self._delegate.create_active(frozen)
+        if result is CommitResult.COMMITTED:
+            self._authority.begin(frozen.run_id)
+        return result
+
+    def commit_initial_terminal(self, fact):
+        try:
+            return self._delegate.commit_initial_terminal(fact)
+        finally:
+            self._authority.settle(fact.run_id)
+
+    def __getattr__(self, name):
+        return getattr(self._delegate, name)
+
+
+@pytest.mark.parametrize(
+    ("resident_status", "start_status"),
+    [
+        (CaptureReserveStatus.CAPACITY, StartStatus.CAPTURE_CAPACITY),
+        (CaptureReserveStatus.NOT_READY, StartStatus.RESIDENT_UNAVAILABLE),
+        (CaptureReserveStatus.FAULT, StartStatus.RESIDENT_UNAVAILABLE),
+        (CaptureReserveStatus.CLOSING, StartStatus.RESIDENT_UNAVAILABLE),
+    ],
+)
+def test_capture_lifecycle_is_not_acquired_for_resident_preaccept_rejection(
+    resident_status,
+    start_status,
+):
+    import app.service.multi_run_integration.production_composition as module
+
+    harness = Harness()
+    authority = module._CaptureSaveLifecycleAuthority()
+    harness.persistence = _BeginCaptureLifecycleOnActiveCommit(
+        harness.persistence,
+        authority,
+    )
+    harness.resident.reserve_results.append(
+        CaptureReserveResult(
+            status=resident_status,
+            run_id=RUN_IDS[0],
+            hardware_id="hardware-1",
+            reservation=None,
+            reason=resident_status.name,
+        )
+    )
+
+    result = harness.coordinator().start_captured(captured_request())
+
+    assert result.status is start_status
+    assert authority.snapshot() == ()
+    assert harness.persistence._delegate.active_calls == []
+
+
+def test_capture_lifecycle_is_not_acquired_for_canceled_parked_reservation():
+    import app.service.multi_run_integration.production_composition as module
+
+    harness = Harness()
+    authority = module._CaptureSaveLifecycleAuthority()
+    harness.persistence = _BeginCaptureLifecycleOnActiveCommit(
+        harness.persistence,
+        authority,
+    )
+    resident = _PendingResident(harness.trace)
+    harness.resident = resident
+    coordinator = harness.coordinator()
+
+    parked = coordinator.start_captured(captured_request())
+    assert type(parked) is CapturedStartWorkResult
+    coordinator.begin_shutdown()
+    parked.continuation()
+
+    assert authority.snapshot() == ()
+    assert harness.persistence._delegate.active_calls == []
+    assert resident.resume_calls == []
+
+
+def test_capture_lifecycle_is_acquired_after_active_commit_before_start():
+    import app.service.multi_run_integration.production_composition as module
+
+    harness = Harness()
+    authority = module._CaptureSaveLifecycleAuthority()
+    harness.persistence = _BeginCaptureLifecycleOnActiveCommit(
+        harness.persistence,
+        authority,
+    )
+    coordinator = harness.coordinator()
+
+    result = coordinator.start_captured(captured_request())
+
+    assert result.status is StartStatus.ACCEPTED_ACTIVE
+    assert authority.snapshot() == (RUN_IDS[0],)
+    assert len(harness.resident.start_calls) == 1
+    coordinator.stop_all(1.0)
+    assert authority.snapshot() == ()
+
+
+@pytest.mark.parametrize("shutdown", ["close", "ordered", "activation_failure"])
+def test_real_graph_owns_current_history_before_runs_and_releases_it(monkeypatch, tmp_path, shutdown):
+    import app.service.multi_run_integration.production_composition as module
+    from app.service.plc_current_history import CurrentHistoryUnavailable
+    from app.services_container import EventBus
+
+    bus = EventBus()
+    prerequisites = _Prerequisites([])
+    prerequisites.configs = tuple(
+        FrozenConfigPrerequisite(
+            config_id=config_id,
+            input_hardware_device_id=1,
+            selected_channels=(0,),
+            channels=(),
+            managed_input=None,
+            values=MappingProxyType({
+                "plc_id": plc_id,
+                "current_meter_enabled": enabled,
+                "current_meter_source": source,
+            }),
+        )
+        for config_id, plc_id, enabled, source in (
+            (11, 7, True, "plc"),
+            (12, 8, False, "plc"),
+            (13, 9, True, "modbus_tcp"),
+        )
+    )
+    original_values = [dict(config.values) for config in prerequisites.configs]
+    current_config = module._FrozenRunFreezer._semantic_config(prerequisites.configs[0])["current_meter"]
+    prerequisites.monotonic_authority = SimpleNamespace(monotonic=lambda: 1.9)
+
+    def emit_current(stamp, value):
+        for plc_id in (7, 8, 9):
+            bus.plc_current_sampled.emit(plc_id, stamp, value + plc_id - 7)
+
+    executor = SimpleNamespace(
+        start=lambda: emit_current(1.6, 2.0), close=lambda: None)
+    prerequisites.build_analysis_executor = lambda **kwargs: executor
+    upstream = SimpleNamespace(resident_capture=object(), managed_resident=object(),
+        streams=(object(),), live_display=SimpleNamespace(close=lambda: True))
+    for name in ("BoundedAudioSaveDispatcher", "AnalysisScheduler", "RunPersistenceSchedulerBridge",
+                 "_FrozenRunFreezer", "_ImportedRunFreezer", "RunScopedPlaybackService"):
+        monkeypatch.setattr(module, name, lambda *args, **kwargs: Mock())
+    collectors = []
+    def coordinator(**kwargs):
+        assert kwargs["persistence"]._live_display is upstream.live_display
+        collector = kwargs["current_collector_factory"]("run-history", _frozen_current_config(
+            current_config, plc_id=7))
+        assert collector.start()
+        collectors.append(collector)
+        assert [(s.time_sec, s.current_a) for s in collector.samples()] == [(pytest.approx(0.1), 2.0)]
+        if shutdown == "activation_failure":
+            raise RuntimeError("coordinator construction failed")
+        return object()
+    monkeypatch.setattr(module, "MultiRunCoordinator", coordinator)
+    factory = ProductionGraphFactory(runtime=object(), plc_dispatch_ports=object(),
+        plc_result_sequencer=object(), output_directory=tmp_path, event_bus=bus)
+    if shutdown == "activation_failure":
+        with pytest.raises(RuntimeError, match="coordinator construction failed"):
+            factory.activate(prerequisites, upstream, SimpleNamespace(publish=lambda event: None))
+    else:
+        graph = factory.activate(prerequisites, upstream, SimpleNamespace(publish=lambda event: None))
+        emit_current(1.7, 3.0)
+        assert [(s.time_sec, s.current_a) for s in collectors[0].samples()] == [
+            (pytest.approx(0.1), 2.0), (pytest.approx(0.2), 3.0)]
+        for unarmed_plc_id in (8, 9):
+            with pytest.raises(CurrentHistoryUnavailable, match="not armed"):
+                graph.current_history.subscribe(unarmed_plc_id, 1.5, lambda *args: None)
+        if shutdown == "ordered":
+            graph.complete_ordered_shutdown()
+        else:
+            graph.close()
+        assert graph.current_history._closed
+        assert not graph.current_history._samples[7]
+    assert [dict(config.values) for config in prerequisites.configs] == original_values
+    count = len(collectors[0].samples())
+    bus.plc_current_sampled.emit(7, 1.8, 4.0)
+    assert len(collectors[0].samples()) == count
+    collectors[0].stop()

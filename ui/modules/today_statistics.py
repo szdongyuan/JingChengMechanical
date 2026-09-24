@@ -46,7 +46,7 @@ class TodayStatisticsModule(QWidget):
         # 两行显示：第一行总数，第二行 OK / NG 数。
         layout.addWidget(QLabel("今日总测试数："), 0, 0)
         layout.addWidget(self.lb_total, 0, 1)
-        layout.addWidget(QLabel("异常数："), 0, 2)
+        layout.addWidget(QLabel("录制异常数："), 0, 2)
         layout.addWidget(self.lb_abnormal, 0, 3)
         layout.addWidget(QLabel("OK数："), 1, 0)
         layout.addWidget(self.lb_ok, 1, 1)

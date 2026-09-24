@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import builtins
+from contextlib import contextmanager
 import io
 import json
 import os
@@ -20,6 +21,9 @@ from app.service.run_persistence.contracts import (
     freeze_run_inputs,
 )
 from app.service.run_persistence.database import RunPersistenceDatabase
+from app.service.run_persistence.analysis_result_artifact import (
+    AnalysisResultArtifactStore,
+)
 from app.service.run_persistence.export_reader import (
     RunExportReadError,
     RunExportReader,
@@ -27,7 +31,12 @@ from app.service.run_persistence.export_reader import (
 from app.service.run_persistence.run_repository import RunRepository, RunTerminal
 from app.service.run_persistence.contracts import RunState
 from app.service.run_persistence.startup import settle_startup
-from app.service.run_record_export.contracts import RunExportRecord
+from app.service.run_record_export.contracts import (
+    AudioExportFacts,
+    CurrentExportFacts,
+    RunDataExportRecord,
+    RunExportRecord,
+)
 
 
 ACCEPTED_AT = "2026-07-27T12:34:56.123456Z"
@@ -212,6 +221,30 @@ def _insert_attempt(
             ),
         )
     return attempt_id
+
+
+def _set_attempt_result_payload(
+    runtime: RunPersistenceDatabase,
+    attempt_id: str,
+    payload: dict[str, object] | None,
+) -> None:
+    with runtime.operation() as database:
+        database.execute_sql(
+            "UPDATE analysis_attempt SET result_payload_json = ? "
+            "WHERE attempt_id = ?",
+            (
+                None
+                if payload is None
+                else json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                attempt_id,
+            ),
+        )
 
 
 def _replace_config(
@@ -447,6 +480,342 @@ def test_read_many_report_returns_exportable_records_and_skips_bad_facts(
     )
 
 
+def test_configurable_reader_keeps_primary_runs_when_audio_is_unavailable(
+    prepared_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+    no_audio_id = _insert_active(
+        runtime,
+        workorder={"sn": "SN-NONE", "model": "MODEL-NONE"},
+    )
+    _finish(runtime, no_audio_id)
+
+    missing_source_id = _insert_active(
+        runtime,
+        workorder={"sn": "SN-MISSING", "model": "MODEL-MISSING"},
+    )
+    _finish(runtime, missing_source_id)
+    _insert_audio(runtime, missing_source_id, tmp_path / "absent.wav")
+
+    malformed_audio_id = _insert_active(
+        runtime,
+        workorder={"sn": "SN-BAD", "model": "MODEL-BAD"},
+    )
+    _finish(runtime, malformed_audio_id)
+    malformed_source = tmp_path / "malformed.wav"
+    malformed_source.write_bytes(b"present")
+    _insert_audio(runtime, malformed_audio_id, malformed_source)
+    with runtime.operation() as database:
+        database.execute_sql("PRAGMA ignore_check_constraints = ON")
+        database.execute_sql(
+            "UPDATE audio SET sample_rate_hz = 0 WHERE run_id = ?",
+            (malformed_audio_id,),
+        )
+
+    selected = (missing_source_id, malformed_audio_id, no_audio_id)
+    report = RunExportReader(runtime).read_configurable_report(selected)
+
+    assert report.selected_run_ids == selected
+    assert report.skipped == ()
+    assert {type(record) for record in report.records} == {RunDataExportRecord}
+    by_id = {record.run_id: record for record in report.records}
+    assert by_id[missing_source_id].selection_index == 0
+    assert by_id[malformed_audio_id].selection_index == 1
+    assert by_id[no_audio_id].selection_index == 2
+    assert by_id[no_audio_id].sn == "SN-NONE"
+    assert by_id[no_audio_id].model == "MODEL-NONE"
+    assert all(record.audio.issue for record in report.records)
+    assert by_id[no_audio_id].audio == AudioExportFacts(
+        source_wav_path=None,
+        sample_rate_hz=None,
+        channel_count=None,
+        frame_count=None,
+        channel_order=None,
+        issue=by_id[no_audio_id].audio.issue,
+    )
+
+
+def test_configurable_reader_tolerates_identity_and_current_attachment_issues(
+    prepared_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+    run_id = _insert_active(
+        runtime,
+        workorder={"sn": 123, "model": False},
+    )
+    _finish(runtime, run_id)
+    source = tmp_path / "present.wav"
+    source.write_bytes(b"present")
+    _insert_audio(runtime, run_id, source)
+    with runtime.operation() as database:
+        database.execute_sql(
+            "UPDATE run SET current_trace_json = ? WHERE run_id = ?",
+            (
+                '{"schema":"run-current-trace/v1","unit":"A",'
+                '"samples":[[0.0,true]]}',
+                run_id,
+            ),
+        )
+
+    report = RunExportReader(runtime).read_configurable_report((run_id,))
+
+    assert report.skipped == ()
+    (record,) = report.records
+    assert record.sn == ""
+    assert record.model == ""
+    assert record.audio == AudioExportFacts(
+        source_wav_path=str(source),
+        sample_rate_hz=8000,
+        channel_count=1,
+        frame_count=16,
+        channel_order=(0,),
+        issue=None,
+    )
+    assert record.current == CurrentExportFacts(
+        samples=None,
+        issue=record.current.issue,
+    )
+    assert record.current.issue
+
+
+def test_configurable_reader_tolerates_overflowing_current_value(
+    prepared_database_path: Path,
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+    run_id = _insert_active(runtime)
+    _finish(runtime, run_id)
+    oversized_trace = json.dumps(
+        {
+            "schema": "run-current-trace/v1",
+            "unit": "A",
+            "samples": [[0.0, 10**4000]],
+        },
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    with runtime.operation() as database:
+        database.execute_sql(
+            "UPDATE run SET current_trace_json = ? WHERE run_id = ?",
+            (oversized_trace, run_id),
+        )
+
+    report = RunExportReader(runtime).read_configurable_report((run_id,))
+
+    assert report.skipped == ()
+    (record,) = report.records
+    assert record.current == CurrentExportFacts(
+        samples=None,
+        issue=record.current.issue,
+    )
+    assert record.current.issue
+
+
+def test_configurable_reader_skips_invalid_primary_and_sorts_valid_records(
+    prepared_database_path: Path,
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+    lower_id = "00000000-0000-4000-8000-000000000001"
+    higher_id = "00000000-0000-4000-8000-000000000002"
+    earlier_id = "00000000-0000-4000-8000-000000000003"
+    active_id = _insert_active(runtime)
+    inconsistent_id = _insert_active(runtime)
+    _finish(runtime, inconsistent_id)
+    for run_id in (lower_id, higher_id, earlier_id):
+        _insert_active(runtime, run_id=run_id)
+        _finish(runtime, run_id)
+    with runtime.operation() as database:
+        database.execute_sql("PRAGMA ignore_check_constraints = ON")
+        database.execute_sql(
+            "UPDATE run SET judgment_source = 'NONE' WHERE run_id = ?",
+            (inconsistent_id,),
+        )
+        database.execute_sql(
+            "UPDATE run SET accepted_at = ?, terminal_at = ? WHERE run_id = ?",
+            (
+                "2026-07-26T12:34:56.123456Z",
+                "2026-07-26T12:35:56.123456Z",
+                earlier_id,
+            ),
+        )
+
+    missing_id = str(uuid4())
+    selected = (
+        lower_id,
+        missing_id,
+        earlier_id,
+        active_id,
+        higher_id,
+        inconsistent_id,
+    )
+    report = RunExportReader(runtime).read_configurable_report(selected)
+
+    assert report.selected_run_ids == selected
+    assert tuple(record.run_id for record in report.records) == (
+        higher_id,
+        lower_id,
+        earlier_id,
+    )
+    assert tuple(record.selection_index for record in report.records) == (
+        4,
+        0,
+        2,
+    )
+    assert tuple(
+        (skip.run_id, skip.component, skip.selection_index)
+        for skip in report.skipped
+    ) == (
+        (missing_id, "primary", 1),
+        (active_id, "primary", 3),
+        (inconsistent_id, "primary", 5),
+    )
+    assert all(skip.reason for skip in report.skipped)
+
+
+@pytest.mark.parametrize(
+    ("stop_at", "expected_queries"),
+    (
+        (1, ()),
+        (2, ("run",)),
+        (3, ("run",)),
+        (4, ("run", "audio")),
+    ),
+)
+def test_configurable_reader_checks_cancellation_before_and_after_each_query(
+    prepared_database_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stop_at: int,
+    expected_queries: tuple[str, ...],
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+    run_id = _insert_active(runtime)
+    _finish(runtime, run_id)
+    queries: list[str] = []
+
+    real_operation = runtime.operation
+
+    @contextmanager
+    def tracing_operation():
+        with real_operation() as database:
+            class TracingDatabase:
+                def atomic(self):
+                    return database.atomic()
+
+                def execute_sql(self, sql, params=None):
+                    normalized = " ".join(sql.split())
+                    if " FROM run " in f" {normalized} ":
+                        queries.append("run")
+                    elif " FROM audio " in f" {normalized} ":
+                        queries.append("audio")
+                    return database.execute_sql(sql, params)
+
+            yield TracingDatabase()
+
+    monkeypatch.setattr(runtime, "operation", tracing_operation)
+
+    checks = 0
+
+    def cancel() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == stop_at:
+            raise RuntimeError(f"cancel {stop_at}")
+
+    with pytest.raises(RuntimeError, match=f"cancel {stop_at}"):
+        RunExportReader(runtime).read_configurable_report(
+            (run_id,), cancel_check=cancel
+        )
+
+    assert tuple(queries) == expected_queries
+
+
+@pytest.mark.parametrize("first_branch", ("missing", "malformed", "success"))
+def test_configurable_reader_cancels_between_selected_run_projections(
+    prepared_database_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    first_branch: str,
+) -> None:
+    import app.service.run_persistence.export_reader as export_reader_module
+
+    runtime = _ready_runtime(prepared_database_path)
+    later_id = _insert_active(runtime)
+    _finish(runtime, later_id)
+    if first_branch == "missing":
+        first_id = str(uuid4())
+    else:
+        first_id = _insert_active(runtime)
+        _finish(runtime, first_id)
+        if first_branch == "malformed":
+            with runtime.operation() as database:
+                database.execute_sql("PRAGMA ignore_check_constraints = ON")
+                database.execute_sql(
+                    "UPDATE run SET judgment_source = 'NONE' WHERE run_id = ?",
+                    (first_id,),
+                )
+
+    queries: list[str] = []
+    real_operation = runtime.operation
+
+    @contextmanager
+    def tracing_operation():
+        with real_operation() as database:
+            class TracingDatabase:
+                def atomic(self):
+                    return database.atomic()
+
+                def execute_sql(self, sql, params=None):
+                    normalized = " ".join(sql.split())
+                    if " FROM run " in f" {normalized} ":
+                        queries.append("run")
+                    elif " FROM audio " in f" {normalized} ":
+                        queries.append("audio")
+                    return database.execute_sql(sql, params)
+
+            yield TracingDatabase()
+
+    monkeypatch.setattr(runtime, "operation", tracing_operation)
+    real_project = export_reader_module._to_configurable_export_record
+    inspected: list[str] = []
+    armed = False
+
+    def inspect_projection(*args):
+        nonlocal armed
+        inspected.append(args[0].run_id)
+        try:
+            return real_project(*args)
+        finally:
+            if args[0].run_id == first_id:
+                armed = True
+
+    monkeypatch.setattr(
+        export_reader_module,
+        "_to_configurable_export_record",
+        inspect_projection,
+    )
+    checks = 0
+
+    def cancel() -> None:
+        nonlocal armed, checks
+        checks += 1
+        if first_branch == "missing" and checks == 5:
+            armed = True
+        elif armed:
+            raise RuntimeError(f"cancel after {first_branch} projection")
+
+    with pytest.raises(
+        RuntimeError, match=f"cancel after {first_branch} projection"
+    ):
+        RunExportReader(runtime).read_configurable_report(
+            (first_id, later_id), cancel_check=cancel
+        )
+
+    assert queries == ["run", "audio"]
+    assert inspected == ([] if first_branch == "missing" else [first_id])
+
+
 def test_read_copy_database_exports_selected_run_audio_and_attempt_rows(
     prepared_database_path: Path,
     tmp_path: Path,
@@ -516,6 +885,200 @@ def test_read_copy_database_can_be_opened_as_plain_sqlite_file(
         assert copied.execute("SELECT run_id FROM run").fetchall() == [
             (selected_id,)
         ]
+    finally:
+        copied.close()
+
+
+def test_read_copy_database_is_cancel_aware_and_preserves_logical_output(
+    prepared_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+    selected_id = _insert_active(runtime)
+    _finish(runtime, selected_id)
+    audio_id = _insert_audio(runtime, selected_id, tmp_path / "selected.wav")
+    _insert_attempt(runtime, selected_id, audio_id)
+
+    reader = RunExportReader(runtime)
+    expected = reader.read_copy_database((selected_id,))
+    checkpoints: list[int] = []
+    actual = reader.read_copy_database(
+        (selected_id,), cancel_check=lambda: checkpoints.append(len(checkpoints))
+    )
+
+    assert actual == expected
+    # Source reads, table boundaries, row-copy chunks, and serialization are
+    # all interruptible.
+    assert len(checkpoints) >= 16
+
+
+def test_read_copy_database_cancellation_prevents_serialization(
+    prepared_database_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import app.service.run_persistence.export_reader as export_reader_module
+
+    runtime = _ready_runtime(prepared_database_path)
+    selected_id = _insert_active(runtime)
+    _finish(runtime, selected_id)
+    serialize_calls: list[bool] = []
+    real_copy = export_reader_module._copy_sqlite_database
+
+    def copy(*args, **kwargs):
+        serialize_calls.append(True)
+        return real_copy(*args, **kwargs)
+
+    monkeypatch.setattr(export_reader_module, "_copy_sqlite_database", copy)
+    checks = 0
+
+    def cancel():
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise RuntimeError("copy canceled")
+
+    with pytest.raises(RuntimeError, match="copy canceled"):
+        RunExportReader(runtime).read_copy_database(
+            (selected_id,), cancel_check=cancel
+        )
+
+    assert serialize_calls == []
+
+
+def _database_copy_inputs(runtime, selected_id):
+    import app.service.run_persistence.export_reader as export_reader_module
+
+    with runtime.operation() as database:
+        schemas = {
+            table: export_reader_module._source_table_schema(database, table)
+            for table in export_reader_module._SOURCE_SQL_TABLES
+        }
+        columns = {
+            table: export_reader_module._source_table_columns(database, table)
+            for table in export_reader_module._SOURCE_SQL_TABLES
+        }
+        run_columns = columns["run"]
+        row = database.execute_sql(
+            f"SELECT {export_reader_module._column_list(run_columns)} "
+            "FROM run WHERE run_id = ?",
+            (selected_id,),
+        ).fetchone()
+    return schemas, columns, row
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        "source:run:schema:before",
+        "source:run:schema:after",
+        "source:audio:columns:before",
+        "source:audio:columns:after",
+        "source:analysis_attempt:rows:before",
+        "source:analysis_attempt:rows:after",
+    ],
+)
+def test_read_copy_database_can_cancel_at_table_query_boundaries(
+    prepared_database_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint: str,
+) -> None:
+    import app.service.run_persistence.export_reader as export_reader_module
+
+    runtime = _ready_runtime(prepared_database_path)
+    selected_id = _insert_active(runtime)
+    _finish(runtime, selected_id)
+    real_check = export_reader_module._check_cancel
+    active_stage = ""
+
+    def inject(cancel_check, stage):
+        nonlocal active_stage
+        active_stage = stage
+        real_check(cancel_check, stage)
+
+    def cancel():
+        if active_stage == checkpoint:
+            raise RuntimeError(f"canceled at {active_stage}")
+
+    monkeypatch.setattr(export_reader_module, "_check_cancel", inject)
+
+    with pytest.raises(RuntimeError, match="canceled at"):
+        RunExportReader(runtime).read_copy_database(
+            (selected_id,),
+            cancel_check=cancel,
+        )
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    ["copy:run:rows:500", "serialize:before", "serialize:after"],
+)
+def test_copy_database_can_cancel_after_500_rows_and_around_serialization(
+    prepared_database_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    checkpoint: str,
+) -> None:
+    import app.service.run_persistence.export_reader as export_reader_module
+
+    runtime = _ready_runtime(prepared_database_path)
+    selected_id = _insert_active(runtime)
+    _finish(runtime, selected_id)
+    schemas, columns, source_row = _database_copy_inputs(runtime, selected_id)
+    run_id_index = columns["run"].index("run_id")
+    rows = []
+    for index in range(501):
+        row = list(source_row)
+        row[run_id_index] = f"00000000-0000-4000-8000-{index + 1:012d}"
+        rows.append(tuple(row))
+    table_rows = {"run": rows, "audio": [], "analysis_attempt": []}
+    real_check = export_reader_module._check_cancel
+    active_stage = ""
+
+    def inject(cancel_check, stage):
+        nonlocal active_stage
+        active_stage = stage
+        real_check(cancel_check, stage)
+
+    def cancel():
+        if active_stage == checkpoint:
+            raise RuntimeError(f"canceled at {active_stage}")
+
+    monkeypatch.setattr(export_reader_module, "_check_cancel", inject)
+
+    with pytest.raises(RuntimeError, match="canceled at"):
+        export_reader_module._copy_sqlite_database(
+            schemas,
+            columns,
+            table_rows,
+            cancel_check=cancel,
+        )
+
+
+def test_copy_database_more_than_500_rows_keeps_all_rows(
+    prepared_database_path: Path,
+) -> None:
+    import app.service.run_persistence.export_reader as export_reader_module
+
+    runtime = _ready_runtime(prepared_database_path)
+    selected_id = _insert_active(runtime)
+    _finish(runtime, selected_id)
+    schemas, columns, source_row = _database_copy_inputs(runtime, selected_id)
+    run_id_index = columns["run"].index("run_id")
+    rows = []
+    for index in range(501):
+        row = list(source_row)
+        row[run_id_index] = f"00000000-0000-4000-8000-{index + 1:012d}"
+        rows.append(tuple(row))
+
+    payload = export_reader_module._copy_sqlite_database(
+        schemas,
+        columns,
+        {"run": rows, "audio": [], "analysis_attempt": []},
+    )
+
+    copied = sqlite3.connect(":memory:")
+    try:
+        copied.deserialize(payload)
+        assert copied.execute("SELECT COUNT(*) FROM run").fetchone() == (501,)
     finally:
         copied.close()
 
@@ -716,3 +1279,52 @@ def test_read_many_rejects_invalid_selection_and_malformed_facts_before_file_io(
             reader.read_many(selection)
 
     assert calls == []
+
+
+def test_pending_enrichment_reads_latest_durable_attempt_payload(
+    prepared_database_path: Path,
+    tmp_path: Path,
+) -> None:
+    runtime = _ready_runtime(prepared_database_path)
+    run_id = _insert_active(runtime)
+    _finish(runtime, run_id)
+    audio_id = _insert_audio(runtime, run_id, tmp_path / "pending.wav")
+    attempt_id = _insert_attempt(runtime, run_id, audio_id)
+    artifact_store = AnalysisResultArtifactStore(tmp_path / "run_results")
+    artifact_store.ensure_ready()
+    reader = RunExportReader(
+        runtime,
+        result_artifact_store=artifact_store,
+    )
+    lightweight = {
+        "judgment": "PASS",
+        "result": {
+            "chart_payload": {},
+            "summary_payload": {"overall_status": "pass", "rows": []},
+        },
+    }
+    _set_attempt_result_payload(runtime, attempt_id, lightweight)
+
+    assert reader.pending_enrichment_run_ids((run_id,)) == (run_id,)
+
+    full = json.loads(json.dumps(lightweight))
+    full["result"]["chart_payload"] = {
+        "0": {"fft": {"frequencies_hz": [100.0], "levels_db": [-3.0]}}
+    }
+    full_json = json.dumps(
+        full,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    published = artifact_store.publish(attempt_id, "PASS", full_json)
+    with runtime.operation() as database:
+        database.execute_sql(
+            "UPDATE analysis_attempt SET result_payload_json = ? "
+            "WHERE attempt_id = ?",
+            (published.reference_json, attempt_id),
+        )
+    artifact_store.settle_publication(published, retain=True)
+
+    assert reader.pending_enrichment_run_ids((run_id,)) == ()

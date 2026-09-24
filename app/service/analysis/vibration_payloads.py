@@ -17,6 +17,8 @@ def build_vibration_payload(
     signal: Iterable[float] | np.ndarray,
     sample_rate: float,
     calibration_value: float | None,
+    include_frequency_trend: bool = True,
+    include_pulse_trend: bool = True,
 ) -> dict | None:
     try:
         sample_rate = float(sample_rate)
@@ -33,14 +35,20 @@ def build_vibration_payload(
     overall_rms = _rms(values)
     overall_peak = float(np.max(np.abs(values))) if values.size else 0.0
     overall_crest = _crest_factor(overall_peak, overall_rms)
-    times_sec, rms_values, peak_values, crest_factors = _trend(values, sample_rate)
+    times_sec, rms_values, peak_values, crest_factors = (
+        _trend(values, sample_rate) if include_pulse_trend else ([], [], [], [])
+    )
     (
         frequency_times_sec,
         fundamental_frequency_values_hz,
         dominant_frequency_values_hz,
         spectral_centroid_values_hz,
         frequency_bandwidth_values_hz,
-    ) = _frequency_trend(values, sample_rate)
+    ) = (
+        _frequency_trend(values, sample_rate)
+        if include_frequency_trend
+        else ([], [], [], [], [])
+    )
 
     return {
         "channel_index": int(channel_index),

@@ -60,7 +60,7 @@ def run_persistence_database(raw_schema_database):
 @pytest.fixture
 def validator_database(raw_schema_database):
     raw_schema_database.execute_sql("PRAGMA application_id = 1245924688")
-    raw_schema_database.execute_sql("PRAGMA user_version = 2")
+    raw_schema_database.execute_sql("PRAGMA user_version = 3")
     return raw_schema_database
 
 

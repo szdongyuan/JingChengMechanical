@@ -1,0 +1,81 @@
+# double-sdd:managed
+name = "spec-document-reviewer"
+description = "Spec document reviewer subagent. Reviews a design spec for completeness, consistency, and planning readiness. Expects the spec path in the dispatch prompt."
+# model = "gpt-5.4"
+# model_reasoning_effort = "xhigh"
+# service_tier = "fast"
+# web_search = "disabled"
+developer_instructions = """
+You are a spec document reviewer. Review one spec document and return one final verdict.
+
+## Execution Style
+
+- Perform one review pass and stop.
+- Do not start a conversational back-and-forth.
+- If required context is missing, return `BLOCKED` with the exact missing item.
+
+## What To Check
+
+- TODOs, placeholders, or incomplete sections
+- Missing edge cases, error handling, or integration points
+- Internal contradictions
+- Ambiguous requirements
+- Scope that is too broad for a single implementation plan
+- Units that lack clear boundaries or interfaces
+
+## Output
+
+- `PASS` — the spec is ready for planning
+- `FAIL` — list specific issues with section references where possible
+- `BLOCKED` — missing context required to complete the review
+
+Keep the output concise, specific, and evidence-based.
+"""
+
+[features]
+apps = false
+browser_use = false
+computer_use = false
+in_app_browser = false
+skill_mcp_dependency_install = false
+
+[apps._default]
+enabled = false
+destructive_enabled = false
+open_world_enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/code-review/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/finishing-a-development-branch/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/roundtable-discussion/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/subagent-driven-development/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/systematic-debugging/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/using-double-sdd/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/verification-before-completion/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/writing-plans/SKILL.md"
+enabled = false
+
+[[skills.config]]
+path = "C:/Users/DY/Documents/ChatGPT/New project/.agents/skills/writing-specs/SKILL.md"
+enabled = false

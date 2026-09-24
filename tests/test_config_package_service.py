@@ -494,6 +494,103 @@ def test_export_writes_manifest_and_single_config_payload(tmp_path: Path, servic
     }
 
 
+def test_export_writes_manual_judgment_buttons_visible(
+    tmp_path: Path,
+    services: SimpleNamespace,
+) -> None:
+    config_id = services.config_service.create_config("Manual buttons export")
+    payload = _config_payload(config_id, config_name="Manual buttons export")
+    payload["manual_judgment_buttons_visible"] = True
+    services.config_service.save_config(payload)
+    target = tmp_path / "manual-buttons.dy"
+
+    services.config_package_service.export_package(
+        config_id=config_id,
+        target_path=str(target),
+        options=ConfigPackageExportOptions(),
+    )
+
+    with zipfile.ZipFile(target) as zf:
+        manifest = json.loads(zf.read("manifest.json"))
+        package_payload = json.loads(zf.read("config/config.json"))
+
+    assert manifest["format_version"] == 2
+    assert package_payload["config"]["manual_judgment_buttons_visible"] is True
+
+
+def test_import_round_trips_manual_judgment_buttons_visible(
+    tmp_path: Path,
+    services: SimpleNamespace,
+) -> None:
+    imported_config = _config_payload(999, config_name="Imported visible")
+    imported_config["manual_judgment_buttons_visible"] = True
+    path = _write_package(
+        tmp_path / "manual-buttons-import.dy",
+        _package_entries(config_payload=imported_config),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    assert services.config_service.load_config(result.config_id)[
+        "manual_judgment_buttons_visible"
+    ] is True
+
+
+def test_import_legacy_package_missing_manual_judgment_buttons_visible_defaults_false(
+    tmp_path: Path,
+    services: SimpleNamespace,
+) -> None:
+    legacy_config = _config_payload(999, config_name="Legacy hidden")
+    assert "manual_judgment_buttons_visible" not in legacy_config
+    entries = _package_entries(config_payload=legacy_config)
+    assert entries["manifest.json"]["format_version"] == 2
+    path = _write_package(tmp_path / "legacy-hidden.dy", entries)
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    assert services.config_service.load_config(result.config_id)[
+        "manual_judgment_buttons_visible"
+    ] is False
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None])
+def test_import_rejects_non_bool_manual_judgment_buttons_visible_before_side_effects(
+    tmp_path: Path,
+    services: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    value,
+) -> None:
+    config = _config_payload(999, config_name="Invalid manual visibility")
+    config["manual_judgment_buttons_visible"] = value
+    path = _write_package(
+        tmp_path / "invalid-manual-visibility.dy",
+        _package_entries(config_payload=config),
+    )
+    reserve = MagicMock(side_effect=AssertionError("database side effect"))
+    monkeypatch.setattr(
+        services.config_service,
+        "reserve_import_config_id",
+        reserve,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="manual_judgment_buttons_visible must be a boolean",
+    ):
+        services.config_package_service.import_package(
+            str(path),
+            ConfigPackageImportDecision(),
+        )
+
+    reserve.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "fault_types",
     [
@@ -2159,3 +2256,18 @@ def test_import_package_without_ai_metadata_clears_binding_without_mutating_loca
     assert binding["toolchain_id"] is None
     assert toolchain.package_dir == str(local_package_dir)
     assert toolchain.updated_time == original.updated_time
+
+def test_threshold_params_package_roundtrip(tmp_path, services, monkeypatch):
+    monkeypatch.setattr(config_package_module, 'base_dir', str(tmp_path))
+    params = {'decision_threshold': 0.12345678901234568, 'mode': 'keep'}
+    path = _write_package(tmp_path / 'threshold.dy', _package_entries(
+        include_ai_metadata=True, include_ai_package=True,
+        toolchain_overrides={'params_json': json.dumps(params)}))
+    imported = services.config_package_service.import_package(str(path), ConfigPackageImportDecision())
+    assert json.loads(services.ai_service.resolve_binding(imported.config_id)['params_json']) == params
+    exported = tmp_path / 'threshold-export.dy'
+    services.config_package_service.export_package(
+        config_id=imported.config_id, target_path=str(exported),
+        options=ConfigPackageExportOptions(include_ai_toolchain=True, include_ai_package=True))
+    with zipfile.ZipFile(exported) as archive:
+        assert json.loads(json.loads(archive.read('ai/toolchain.json'))['params_json']) == params

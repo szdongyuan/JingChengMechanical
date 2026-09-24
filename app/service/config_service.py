@@ -207,11 +207,23 @@ _CONFIG_LOAD_FIELD_NAMES = (
     "output_device_samplerate",
     "selected_channels",
     "fault_types_json",
+    "manual_judgment_buttons_visible",
     "vibration_view_channel_index",
     "result_dashboard_layout",
     *_MONITOR_CONFIG_FIELDS,
     *_CURRENT_METER_CONFIG_FIELDS,
 )
+
+
+def _normalize_manual_judgment_buttons_visible(data: dict) -> bool:
+    if "manual_judgment_buttons_visible" in data:
+        value = data["manual_judgment_buttons_visible"]
+        if type(value) is not bool:
+            raise ValueError(
+                "manual_judgment_buttons_visible must be a boolean"
+            )
+        return value
+    return False
 
 
 @dataclass(frozen=True)
@@ -295,6 +307,13 @@ class ConfigService:
 
         selected_channels = self._parse_json(cfg.get("selected_channels"), [])
         fault_types = decode_fault_types_json(cfg["fault_types_json"])
+        manual_judgment_buttons_visible = (
+            cfg.get("manual_judgment_buttons_visible", False)
+        )
+        if type(manual_judgment_buttons_visible) is not bool:
+            raise ValueError(
+                "manual_judgment_buttons_visible must be a boolean"
+            )
         result = {
             "config_id": cfg["config_id"],
             "config_name": cfg["config_name"],
@@ -314,6 +333,7 @@ class ConfigService:
             "output_device_samplerate": cfg.get("output_device_samplerate"),
             "selected_channels": selected_channels,
             "fault_types": list(fault_types),
+            "manual_judgment_buttons_visible": manual_judgment_buttons_visible,
             "vibration_view_channel_index": cfg.get("vibration_view_channel_index"),
             "monitor_channel_index": None,
             "monitor_gain_db": self._normalize_monitor_gain(
@@ -593,6 +613,7 @@ class ConfigService:
                     "scan_triggers_test": False,
                     "selected_channels": "[]",
                     "fault_types_json": "[]",
+                    "manual_judgment_buttons_visible": False,
                     "result_dashboard_layout": serialize_result_dashboard_layout(
                         DEFAULT_RESULT_DASHBOARD_LAYOUT
                     ),
@@ -713,6 +734,9 @@ class ConfigService:
         if "fault_types" not in source:
             raise ValueError("fault_types is required")
         fault_types = normalize_fault_types(source["fault_types"])
+        manual_judgment_buttons_visible = (
+            _normalize_manual_judgment_buttons_visible(source)
+        )
         channels = source.get("channels", [])
         if not isinstance(channels, list):
             channels = []
@@ -765,6 +789,7 @@ class ConfigService:
             "scan_triggers_test": source.get("scan_triggers_test", False),
             "plc_id": None,
             "fault_types": list(fault_types),
+            "manual_judgment_buttons_visible": manual_judgment_buttons_visible,
             "input_hardware_device_id": source.get("input_hardware_device_id"),
             "input_device_name": source.get("input_device_name"),
             "input_device_hostapi": source.get("input_device_hostapi"),
@@ -933,6 +958,10 @@ class ConfigService:
 
     def validate(self, data: dict) -> list[str]:
         errors = []
+        try:
+            _normalize_manual_judgment_buttons_visible(data)
+        except ValueError as exc:
+            errors.append(str(exc))
         if "fault_types" not in data:
             errors.append("fault_types is required")
         else:
@@ -1780,6 +1809,9 @@ class ConfigService:
 
     def _config_row_values(self, data: dict) -> dict:
         analysis_window_offset_ms = int(data.get("analysis_window_offset_ms", 0))
+        manual_judgment_buttons_visible = (
+            _normalize_manual_judgment_buttons_visible(data)
+        )
         values = {
             "config_name": data["config_name"].strip(),
             "record_duration": data["record_duration"],
@@ -1802,6 +1834,13 @@ class ConfigService:
         available_columns = self._config_table_columns()
         if "fault_types_json" not in available_columns:
             raise ValueError("test_config_table is missing fault_types_json")
+        if self._config_field_exists(
+            "manual_judgment_buttons_visible",
+            available_columns,
+        ):
+            values["manual_judgment_buttons_visible"] = (
+                manual_judgment_buttons_visible
+            )
         if self._config_field_exists(
             "input_hardware_device_id", available_columns
         ):

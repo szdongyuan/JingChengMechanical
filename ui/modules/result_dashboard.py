@@ -8,7 +8,7 @@ from math import isfinite
 from types import SimpleNamespace
 from typing import Any
 
-from PyQt6.QtCore import QObject, QThread, Qt, pyqtSignal
+from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
 from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
@@ -73,6 +73,7 @@ from app.services_container import FactoryControllerState
 from ui.modules.loudness import LoudnessModule
 from ui.modules.octave import OctaveModule
 from ui.modules.result_history import ResultHistoryModule
+from ui.widgets.result_card_replay import ResultCardReplay
 from ui.modules.spectrum import SpectrumModule
 from ui.modules.spl import SplModule
 from ui.modules.stft import StftModule
@@ -192,6 +193,7 @@ class ResultDashboardModule(QWidget):
     reanalysis_cancel_requested = pyqtSignal(object)
     history_diagnostic = pyqtSignal(object)
     preview_projected = pyqtSignal(str, object)
+    decisionPainted = pyqtSignal(object, object)
 
     def __init__(
         self,
@@ -220,6 +222,18 @@ class ResultDashboardModule(QWidget):
         self._row_count = 0
         self._column_count = 0
         self._source_bus_connections: list[tuple[object, object]] = []
+        self._decision_binding_by_run: dict[str, tuple[str, str]] = {}
+        self._decision_origin_revision_by_run: dict[str, int] = {}
+        self._applied_enrichment_keys: set[tuple[str, str, str]] = set()
+        self._enriched_payload_by_binding: dict[
+            tuple[str, str, str], ReviewDisplayPayload
+        ] = {}
+        self._current_decision_key: tuple[str, str, str, int] | None = None
+        self._last_acknowledged_decision_by_run: dict[
+            str, tuple[str, str, str, int]
+        ] = {}
+        self._projection_refresh_scheduled = False
+        self._projection_closed = False
 
         self._projection_bus = _ProjectionBus(self)
         self._factory_display = _FactoryDisplayProxy(self.request_reanalysis)
@@ -235,13 +249,28 @@ class ResultDashboardModule(QWidget):
 
         self._history_module = ResultHistoryModule(
             self,
-            payload_provider=self._history_store.display_payload,
+            payload_provider=self._display_payload_for_run,
             config_provider=self._load_history_config,
             manual_judgment_widget=manual_judgment_widget,
         )
+        def current_playback():
+            playback = getattr(services, "historical_playback", None)
+            if playback is None:
+                playback = getattr(getattr(services, "final_composition", None),
+                                   "playback", None)
+            return playback
+        self._card_replay = ResultCardReplay(
+            getattr(services, "historical_analysis_reader", None), parent=self,
+            playback_provider=current_playback,
+        )
+        self._card_replay.state_changed.connect(self._history_module.set_replay_state)
+        self._history_module.replay_requested.connect(self._card_replay.play)
         self._history_module.run_selected.connect(self.select_run)
         self._history_module.follow_latest_requested.connect(
             self.set_follow_latest
+        )
+        self._history_module.decisionPainted.connect(
+            self._on_decision_history_painted
         )
         root.addWidget(self._history_module)
 
@@ -330,8 +359,84 @@ class ResultDashboardModule(QWidget):
         if type(event) not in _EVENT_TYPES:
             raise ResultHistoryError("dashboard accepts only exact history events")
         transition = self._history_store.apply(event)
+        if type(event) is ReanalysisStarted:
+            self._purge_staged_projection_run(event.run_id)
         self._project_committed_transition(transition)
         return transition
+
+    def apply_enrichment_projection(self, event: object) -> bool:
+        """Refresh matching terminal display data without changing history."""
+
+        self._require_dashboard_thread()
+        run_id = getattr(event, "run_id", None)
+        attempt_id = getattr(event, "attempt_id", None)
+        terminal_revision = getattr(event, "terminal_revision", None)
+        expected_revision = getattr(event, "expected_revision", None)
+        payload = getattr(event, "review_payload", None)
+        if (
+            type(run_id) is not str
+            or type(attempt_id) is not str
+            or type(terminal_revision) is not str
+            or type(expected_revision) is not int
+            or type(payload) is not ReviewDisplayPayload
+        ):
+            return False
+        if self._projection_closed:
+            return False
+        snapshot = self._history_store.snapshot()
+        target = next(
+            (
+                card
+                for card in snapshot.terminal_cards
+                if card.run_id == run_id
+            ),
+            None,
+        )
+        base_payload = (
+            self._history_store.display_payload(run_id)
+            if target is not None
+            else None
+        )
+        identity = (
+            self._projection_identity(base_payload.review, target)
+            if type(base_payload) is ReviewDisplayPayload
+            else None
+        )
+        if identity is not None:
+            self._set_decision_binding(run_id, identity)
+        binding = self._decision_binding_by_run.get(run_id)
+        origin_revision = self._decision_origin_revision_by_run.get(run_id)
+        key = (run_id, attempt_id, terminal_revision)
+        exact_revision = (
+            target is not None
+            and target.revision == expected_revision
+            and origin_revision == expected_revision
+        )
+        manual_only_revision = (
+            target is not None
+            and origin_revision is not None
+            and target.manual_judgment_revision == target.revision
+            and target.revision >= origin_revision
+            and target.revision >= expected_revision
+        )
+        if (
+            target is None
+            or target.is_active_run
+            or target.phase is not ResultPhase.TERMINAL
+            or binding != (attempt_id, terminal_revision)
+            or not (exact_revision or manual_only_revision)
+            or key in self._applied_enrichment_keys
+        ):
+            return False
+        self._applied_enrichment_keys.add(key)
+        self._enriched_payload_by_binding[key] = payload
+        overlay = self._display_payload_for_run(run_id)
+        if type(overlay) is ReviewDisplayPayload:
+            self._history_module.refresh_terminal_payload(run_id, overlay)
+        if snapshot.selected_run_id == run_id:
+            if type(overlay) is ReviewDisplayPayload:
+                self._show_review(target, overlay)
+        return True
 
     def project_history_transition(
         self,
@@ -364,6 +469,9 @@ class ResultDashboardModule(QWidget):
         self.refresh_history_projection()
 
     def refresh_history_projection(self) -> None:
+        self._refresh_history_projection(diagnose_failure=True)
+
+    def _refresh_history_projection(self, *, diagnose_failure: bool) -> None:
         self._require_dashboard_thread()
         snapshot = self._history_store.snapshot()
         payload = self._payload_for_snapshot(snapshot)
@@ -386,7 +494,8 @@ class ResultDashboardModule(QWidget):
         except Exception as exc:
             self._history_projection_actionable = False
             self._clear_manual_judgment_target()
-            self._diagnose_projection_failure(snapshot, exc)
+            if diagnose_failure:
+                self._diagnose_projection_failure(snapshot, exc)
             return
         self._history_projection_actionable = True
         self._publish_manual_judgment_target(snapshot)
@@ -395,15 +504,30 @@ class ResultDashboardModule(QWidget):
         self,
         transition: ResultHistoryTransition,
     ) -> None:
+        if transition.evicted_run_id is not None:
+            self._purge_staged_projection_run(transition.evicted_run_id)
         self._history_projection_actionable = False
         try:
             self._project_coherent_transition(transition)
         except Exception as exc:
             self._clear_manual_judgment_target()
             self._diagnose_projection_failure(transition.snapshot, exc)
+            self._schedule_projection_refresh_once()
             return
         self._history_projection_actionable = True
         self._publish_manual_judgment_target(self._history_store.snapshot())
+
+    def _schedule_projection_refresh_once(self) -> None:
+        if self._projection_closed or self._projection_refresh_scheduled:
+            return
+        self._projection_refresh_scheduled = True
+        QTimer.singleShot(0, self._run_scheduled_projection_refresh)
+
+    def _run_scheduled_projection_refresh(self) -> None:
+        self._projection_refresh_scheduled = False
+        if self._projection_closed:
+            return
+        self._refresh_history_projection(diagnose_failure=False)
 
     def _project_coherent_transition(
         self,
@@ -452,7 +576,103 @@ class ResultDashboardModule(QWidget):
             return None
         if any(card.run_id == run_id for card in snapshot.active_cards):
             return None
-        return self._history_store.display_payload(run_id)
+        return self._display_payload_for_run(run_id)
+
+    def _display_payload_for_run(self, run_id: str):
+        base_payload = self._history_store.display_payload(run_id)
+        snapshot = self._history_store.snapshot()
+        selected = next(
+            (
+                card
+                for card in snapshot.terminal_cards
+                if card.run_id == run_id
+            ),
+            None,
+        )
+        binding = self._decision_binding_by_run.get(run_id)
+        if (
+            selected is None
+            or selected.is_active_run
+            or selected.phase is not ResultPhase.TERMINAL
+            or binding is None
+            or type(base_payload) is not ReviewDisplayPayload
+        ):
+            return base_payload
+        origin_revision = self._decision_origin_revision_by_run.get(run_id)
+        compatible_revision = (
+            origin_revision is not None
+            and (
+                selected.revision == origin_revision
+                or (
+                    selected.manual_judgment_revision == selected.revision
+                    and selected.revision >= origin_revision
+                )
+            )
+        )
+        if not compatible_revision:
+            return base_payload
+        attempt_id, terminal_revision = binding
+        enriched = self._enriched_payload_by_binding.get(
+            (run_id, attempt_id, terminal_revision)
+        )
+        if enriched is None:
+            return base_payload
+        return self._merge_enrichment_display_overlay(base_payload, enriched)
+
+    @staticmethod
+    def _merge_enrichment_display_overlay(
+        current: ReviewDisplayPayload,
+        enrichment: ReviewDisplayPayload,
+    ) -> ReviewDisplayPayload:
+        current_review = deepcopy(current.review)
+        enrichment_review = enrichment.review
+        if not isinstance(current_review, dict) or not isinstance(
+            enrichment_review,
+            dict,
+        ):
+            return current
+        chart_payload = enrichment_review.get("chart_payload")
+        summary_payload = enrichment_review.get("summary_payload")
+        overlay_applied = False
+        if isinstance(chart_payload, dict):
+            current_review["chart_payload"] = deepcopy(chart_payload)
+            overlay_applied = True
+        current_summary = current_review.get("summary_payload")
+        if isinstance(current_summary, dict) and isinstance(
+            summary_payload,
+            dict,
+        ):
+            enrichment_rows = summary_payload.get("rows")
+            current_rows = current_summary.get("rows")
+            if isinstance(enrichment_rows, list) and isinstance(
+                current_rows,
+                list,
+            ):
+                rows_by_key = {
+                    row["item_key"]: deepcopy(row)
+                    for row in current_rows
+                    if isinstance(row, dict)
+                    and isinstance(row.get("item_key"), str)
+                    and row["item_key"].strip()
+                }
+                enrichment_rows_by_key = {
+                    row["item_key"]: deepcopy(row)
+                    for row in enrichment_rows
+                    if isinstance(row, dict)
+                    and isinstance(row.get("item_key"), str)
+                    and row["item_key"].strip()
+                    and row["item_key"] != "ai"
+                }
+                if enrichment_rows_by_key:
+                    rows_by_key.update(enrichment_rows_by_key)
+                    current_summary["rows"] = list(rows_by_key.values())
+                    overlay_applied = True
+        if not overlay_applied:
+            return current
+        return ReviewDisplayPayload(
+            review=current_review,
+            dashboard_config=deepcopy(current.dashboard_config),
+        )
 
     def _project_snapshot(
         self,
@@ -461,8 +681,20 @@ class ResultDashboardModule(QWidget):
         *,
         render_history: bool = True,
     ) -> None:
+        retained_run_ids = {
+            card.run_id
+            for card in (*snapshot.active_cards, *snapshot.terminal_cards)
+        }
+        self._last_acknowledged_decision_by_run = {
+            run_id: identity
+            for run_id, identity in (
+                self._last_acknowledged_decision_by_run.items()
+            )
+            if run_id in retained_run_ids
+        }
         if render_history:
             self._history_module.render_snapshot(snapshot)
+        self._card_replay.sync((*snapshot.active_cards, *snapshot.terminal_cards))
         self._projected_snapshot = snapshot
         self._update_preview_target(snapshot)
         selected = self._find_selected_card(snapshot)
@@ -495,6 +727,10 @@ class ResultDashboardModule(QWidget):
             )
             return
         if type(payload) is ReviewDisplayPayload:
+            self._history_module.refresh_terminal_payload(
+                selected.run_id,
+                payload,
+            )
             self._show_review(selected, payload)
             return
         if type(payload) is ErrorDisplayPayload:
@@ -660,9 +896,13 @@ class ResultDashboardModule(QWidget):
         self._clear_grid()
 
     def closeEvent(self, event) -> None:
+        self._card_replay.shutdown()
+        self._projection_closed = True
+        self._projection_refresh_scheduled = False
         self._history_projection_actionable = False
         self._clear_manual_judgment_target()
         self._teardown_review_projection()
+        self._clear_staged_projection_state()
         self._disconnect_source_live_bus()
         self._history_module.clear_metric_view_state()
         self._disconnect_projection_bus()
@@ -775,10 +1015,29 @@ class ResultDashboardModule(QWidget):
         card: ResultHistoryCardSnapshot,
         payload: ReviewDisplayPayload,
     ) -> None:
+        identity = self._projection_identity(payload.review, card)
+        decision_to_project = None
+        if identity is not None:
+            attempt_id, terminal_revision, history_revision = identity
+            self._set_decision_binding(card.run_id, identity)
+            decision_key = (
+                card.run_id,
+                attempt_id,
+                terminal_revision,
+                history_revision,
+            )
+            self._current_decision_key = decision_key
+            if (
+                decision_key
+                != self._last_acknowledged_decision_by_run.get(card.run_id)
+            ):
+                decision_to_project = decision_key
         display_config = self._normalize_display_config(payload.dashboard_config)
         layout = self._layout_for_display_config(display_config)
         signature = self._layout_structure_signature(layout)
         review = self._normalize_review(payload.review, card)
+        if not isinstance(review.config_payload, dict):
+            review = replace(review, config_payload=deepcopy(display_config))
         state = FactoryControllerState(
             selected_config_ids=(
                 (card.config.config_id,)
@@ -804,6 +1063,115 @@ class ResultDashboardModule(QWidget):
         self._projection_bus.factory_state_changed.emit(state)
         self._projection_bus.factory_review_changed.emit(review)
         self._display_stack.setCurrentWidget(self._review_page)
+        if decision_to_project is not None:
+            self._history_module.project_decision_revision(
+                decision_to_project[0],
+                decision_to_project[1],
+                decision_to_project[2],
+                decision_to_project[3],
+            )
+        self.update()
+
+    def _set_decision_binding(
+        self,
+        run_id: str,
+        identity: tuple[str, str, int],
+    ) -> None:
+        immutable_identity = identity[:2]
+        previous_identity = self._decision_binding_by_run.get(run_id)
+        if previous_identity == immutable_identity:
+            return
+        self._decision_binding_by_run[run_id] = immutable_identity
+        self._decision_origin_revision_by_run[run_id] = identity[2]
+        self._applied_enrichment_keys = {
+            key for key in self._applied_enrichment_keys if key[0] != run_id
+        }
+        self._enriched_payload_by_binding = {
+            key: value
+            for key, value in self._enriched_payload_by_binding.items()
+            if key[0] != run_id
+        }
+
+    def _purge_staged_projection_run(self, run_id: str) -> None:
+        self._decision_binding_by_run.pop(run_id, None)
+        self._decision_origin_revision_by_run.pop(run_id, None)
+        self._applied_enrichment_keys = {
+            key for key in self._applied_enrichment_keys if key[0] != run_id
+        }
+        self._enriched_payload_by_binding = {
+            key: value
+            for key, value in self._enriched_payload_by_binding.items()
+            if key[0] != run_id
+        }
+        if self._current_decision_key is not None:
+            if self._current_decision_key[0] == run_id:
+                self._current_decision_key = None
+        self._last_acknowledged_decision_by_run.pop(run_id, None)
+
+    def _clear_staged_projection_state(self) -> None:
+        self._decision_binding_by_run.clear()
+        self._decision_origin_revision_by_run.clear()
+        self._applied_enrichment_keys.clear()
+        self._enriched_payload_by_binding.clear()
+        self._current_decision_key = None
+        self._last_acknowledged_decision_by_run.clear()
+
+    def _on_decision_history_painted(
+        self,
+        revision: object,
+        painted_at: object,
+    ) -> None:
+        current = self._current_decision_key
+        if (
+            type(revision) is not tuple
+            or len(revision) != 4
+            or current is None
+            or revision != current
+            or current
+            == self._last_acknowledged_decision_by_run.get(current[0])
+            or self._projected_run_id != current[0]
+        ):
+            return
+        binding = self._decision_binding_by_run.get(current[0])
+        if (
+            binding != current[1:3]
+            or self._decision_origin_revision_by_run.get(current[0])
+            != current[3]
+        ):
+            return
+        selected = self._find_selected_card(self._history_store.snapshot())
+        if (
+            selected is None
+            or selected.run_id != current[0]
+            or selected.is_active_run
+            or selected.phase is not ResultPhase.TERMINAL
+            or selected.revision != current[3]
+        ):
+            return
+        self._last_acknowledged_decision_by_run[current[0]] = current
+        self.decisionPainted.emit(current[2], painted_at)
+
+    @staticmethod
+    def _projection_identity(
+        review: object,
+        card: ResultHistoryCardSnapshot,
+    ) -> tuple[str, str, int] | None:
+        if type(review) is not dict:
+            return None
+        value = review.get("_projection_identity")
+        if type(value) is not dict:
+            return None
+        attempt_id = value.get("attempt_id")
+        terminal_revision = value.get("terminal_revision")
+        history_revision = value.get("history_revision")
+        if (
+            type(attempt_id) is not str
+            or type(terminal_revision) is not str
+            or type(history_revision) is not int
+            or history_revision != card.revision
+        ):
+            return None
+        return attempt_id, terminal_revision, history_revision
 
     @staticmethod
     def _normalize_display_config(value: object) -> dict[str, Any]:
@@ -1002,16 +1370,22 @@ class ResultDashboardModule(QWidget):
     ) -> None:
         if panel_type not in {PANEL_STFT, PANEL_VIBRATION_STFT}:
             return
+
+        def update_score(text):
+            if panel_widget.current_score_visible():
+                self._set_stft_card_score_metric(card, text)
+            else:
+                card.set_title_metric("", "")
+
         current = getattr(panel_widget, "current_score_title", None)
         if callable(current):
-            self._set_stft_card_score_metric(card, current())
+            update_score(current())
         changed = getattr(panel_widget, "score_title_changed", None)
         if hasattr(changed, "connect"):
-            changed.connect(
-                lambda text, dashboard_card=card: (
-                    self._set_stft_card_score_metric(dashboard_card, text)
-                )
-            )
+            changed.connect(update_score)
+        panel_widget.score_visibility_changed.connect(
+            lambda _visible: update_score(panel_widget.current_score_title())
+        )
 
     @staticmethod
     def _set_stft_card_score_metric(card: Card, text: str) -> None:
@@ -1382,7 +1756,11 @@ class ResultDashboardModule(QWidget):
                 fault_types=selected.config.fault_types,
                 manual_judgment_allowed=selected.manual_judgment_allowed,
             )
-            if selected is not None and not selected.is_active_run
+            if (
+                selected is not None
+                and not selected.is_active_run
+                and selected.config.manual_judgment_buttons_visible
+            )
             else None
         )
         if target == self._manual_judgment_target:

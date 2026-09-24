@@ -380,3 +380,27 @@ def test_committed_statistics_observer_runs_once_and_never_gates_history():
     ]
     assert len(diagnostics) == 1
     assert "statistics refresh exploded" in diagnostics[0]
+
+
+def test_committed_enrichment_forwards_only_to_primary_history_adapter():
+    primary_calls = []
+    observer_calls = []
+
+    class Primary:
+        def publish(self, _event) -> None:
+            raise AssertionError("terminal publish path was used")
+
+        def publish_enrichment(self, event) -> None:
+            primary_calls.append(event)
+
+    sink = services_module._PostDurableHistorySink(
+        Primary(),
+        observer_calls.append,
+        lambda _message: None,
+    )
+    enrichment = object()
+
+    sink.publish_enrichment(enrichment)
+
+    assert primary_calls == [enrichment]
+    assert observer_calls == []

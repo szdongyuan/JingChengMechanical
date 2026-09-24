@@ -706,9 +706,17 @@ class StftImageChartWidget(_BasePlotChart):
         reset_levels: bool = True,
         levels_db: tuple[float, float] | None = None,
         snap_initial_to_zero: bool = False,
+        time_bounds_sec: Iterable[tuple[float, float]] | None = None,
     ) -> None:
         fixed_levels = self._validated_levels(levels_db)
         normalized_times = _normalize_vector(times_sec, name="times_sec")
+        time_centers = np.asarray(normalized_times, dtype=float)
+        if (
+            time_centers.size == 0
+            or not np.all(np.isfinite(time_centers))
+            or np.any(time_centers[1:] <= time_centers[:-1])
+        ):
+            raise ValueError("times_sec must be finite and strictly increasing")
         normalized_frequencies = _normalize_vector(
             frequencies_hz, name="frequencies_hz"
         )
@@ -721,20 +729,38 @@ class StftImageChartWidget(_BasePlotChart):
                 f"(len(frequencies_hz), len(times_sec)); got {normalized_image.shape}"
             )
 
+        bounds = None if time_bounds_sec is None else self._validated_time_bounds(
+            time_centers, time_bounds_sec
+        )
+
         self._snap_initial_to_zero = bool(snap_initial_to_zero)
         self._image_payload = {
             "times_sec": normalized_times,
             "frequencies_hz": normalized_frequencies,
             "magnitude_db": normalized_image.copy(),
         }
+        if bounds is not None:
+            self._image_payload["time_bounds_sec"] = [tuple(pair) for pair in bounds]
+        image_rect = self._image_rect()
+        display_image = (
+            self._timestamp_raster(time_centers, normalized_image, image_rect)
+            if bounds is None else self._interval_raster(bounds, normalized_image, image_rect)
+        )
 
         if fixed_levels is not None:
             self._cached_levels = None
-            self._image_item.setImage(normalized_image, autoLevels=False)
+            self._image_item.setImage(display_image, autoLevels=False)
             self._image_item.setLevels(fixed_levels)
         else:
             should_reset_levels = bool(reset_levels) or self._cached_levels is None
-            self._image_item.setImage(normalized_image, autoLevels=should_reset_levels)
+            if should_reset_levels and display_image is not normalized_image:
+                # Raster gaps can hide measured extrema from ImageItem's strided
+                # auto-level sampling. Scan the source only when resetting levels.
+                source_levels = self._source_auto_levels(normalized_image)
+                self._image_item.setImage(display_image, autoLevels=False)
+                self._image_item.setLevels(source_levels)
+            else:
+                self._image_item.setImage(display_image, autoLevels=should_reset_levels)
             if should_reset_levels:
                 levels = self._image_item.getLevels()
                 if levels is None:
@@ -743,7 +769,7 @@ class StftImageChartWidget(_BasePlotChart):
                     self._cached_levels = (float(levels[0]), float(levels[1]))
             elif self._cached_levels is not None:
                 self._image_item.setLevels(self._cached_levels)
-        self._image_item.setRect(self._image_rect())
+        self._image_item.setRect(image_rect)
         rendered_rect = self._rendered_image_rect()
         if rendered_rect is None:
             x_axis_values = normalized_times
@@ -791,6 +817,8 @@ class StftImageChartWidget(_BasePlotChart):
         payload["times_sec"] = list(self._image_payload["times_sec"])
         payload["frequencies_hz"] = list(self._image_payload["frequencies_hz"])
         payload["magnitude_db"] = self._image_payload["magnitude_db"].copy()
+        if "time_bounds_sec" in payload:
+            payload["time_bounds_sec"] = list(payload["time_bounds_sec"])
         return payload
 
     def image_levels(self) -> tuple[float, float] | None:
@@ -879,7 +907,11 @@ class StftImageChartWidget(_BasePlotChart):
         times_sec = self._image_payload["times_sec"]
         frequencies_hz = self._image_payload["frequencies_hz"]
         step = self._time_step(times_sec)
-        if len(times_sec) == 1:
+        bounds = self._image_payload.get("time_bounds_sec")
+        if bounds is not None:
+            x_min = bounds[0][0]
+            x_width = bounds[-1][1] - x_min
+        elif len(times_sec) == 1:
             x_min = float(times_sec[0]) - 0.5
             if self._snap_initial_to_zero:
                 x_min = max(0.0, x_min)
@@ -903,6 +935,97 @@ class StftImageChartWidget(_BasePlotChart):
             else frequencies_hz[0] + 1.0
         )
         return QRectF(x_min, y_min, x_width, y_max - y_min)
+
+    @staticmethod
+    def _validated_time_bounds(times: np.ndarray, values) -> np.ndarray:
+        try:
+            bounds = np.asarray(values, dtype=float)
+        except (ValueError, TypeError):
+            raise ValueError("time_bounds_sec must contain start/end pairs") from None
+        if (bounds.shape != (times.size, 2) or not np.all(np.isfinite(bounds))
+                or np.any(bounds[:, 0] >= bounds[:, 1])
+                or np.any(times < bounds[:, 0]) or np.any(times > bounds[:, 1])):
+            raise ValueError("time_bounds_sec must be finite, positive, nonoverlapping intervals containing their centers")
+        # Independently computed center +/- half-hop edges can overlap by a few
+        # floating-point ULPs. Preserve those exact edges without treating that
+        # arithmetic roundoff as duplicate observed coverage.
+        adjacent_scale = np.maximum(np.abs(bounds[1:, 0]), np.abs(bounds[:-1, 1]))
+        widths = bounds[:, 1] - bounds[:, 0]
+        tolerance = np.minimum(
+            4 * np.spacing(adjacent_scale),
+            np.minimum(widths[1:], widths[:-1]) * 1e-7,
+        )
+        if np.any(bounds[1:, 0] < bounds[:-1, 1] - tolerance):
+            raise ValueError("time_bounds_sec intervals must not overlap")
+        extent = float(bounds[-1, 1]) - float(bounds[0, 0])
+        if not np.isfinite(extent) or extent <= 0:
+            raise ValueError("time_bounds_sec must have a finite positive extent")
+        return bounds
+
+    @staticmethod
+    def _interval_raster(bounds: np.ndarray, source: np.ndarray, rect: QRectF) -> np.ndarray:
+        """Sample only explicit observed intervals, including one/two columns.
+
+        Clamp before allocating, independently of the number/range of inputs.
+        Subpixel intervals may disappear at this finite display resolution;
+        source columns and their exact support remain in the image payload.
+        """
+        max_columns = min(8192, max(1, 2_097_152 // source.shape[0]))
+        smallest = float(np.min(bounds[:, 1] - bounds[:, 0]))
+        columns = max(1, int(math.ceil(min(max_columns, rect.width() / smallest * 2))))
+        centers = rect.left() + (np.arange(columns) + .5) * (rect.width() / columns)
+        index = np.clip(np.searchsorted(bounds[:, 0], centers, side="right") - 1, 0, len(bounds) - 1)
+        covered = (centers >= bounds[index, 0]) & (centers < bounds[index, 1])
+        raster = np.full((source.shape[0], columns), np.nan, dtype=float)
+        raster[:, covered] = source[:, index[covered]]
+        return raster
+
+    @staticmethod
+    def _source_auto_levels(source: np.ndarray) -> tuple[float, float]:
+        # Match ImageItem's NaN handling and constant/all-NaN fallback without
+        # warnings for an all-NaN source. Infinities retain ImageItem semantics.
+        lower = float(np.fmin.reduce(source, axis=None, initial=np.nan))
+        upper = float(np.fmax.reduce(source, axis=None, initial=np.nan))
+        if lower == upper or np.isnan(lower) or np.isnan(upper):
+            return (0.0, 255.0)
+        return (lower, upper)
+
+    @staticmethod
+    def _timestamp_raster(
+        times: np.ndarray, source: np.ndarray, rect: QRectF
+    ) -> np.ndarray:
+        """Rasterize irregular column centers without stretching data across gaps.
+
+        Each pixel samples its nearest source center within half the median hop.
+        When capped pixels are wider than that hop, also retain measurements in
+        their containing pixel. Boundary error stays within one raster pixel.
+        Keep the established affine rendering for regular grids/single columns.
+        """
+        if times.size < 3:
+            return source
+        deltas = np.diff(times)
+        step = float(np.median(deltas))
+        if np.allclose(deltas, step, rtol=1e-7, atol=0.0):
+            return source
+
+        max_columns = max(8192, times.size)
+        # Clamp the ratio before converting/allocating: even huge time gaps must
+        # not create a proportionally huge intermediate array.
+        columns = int(math.ceil(min(max_columns, rect.width() / step * 2.0)))
+        columns = max(1, columns)
+        pixel_width = rect.width() / columns
+        centers = rect.left() + (np.arange(columns) + 0.5) * pixel_width
+        right = np.clip(np.searchsorted(times, centers), 0, times.size - 1)
+        left = np.maximum(0, right - 1)
+        nearest = np.where(
+            np.abs(centers - times[left]) <= np.abs(centers - times[right]),
+            left,
+            right,
+        )
+        covered = np.abs(centers - times[nearest]) <= max(step, pixel_width) * 0.5
+        raster = np.full((source.shape[0], columns), np.nan, dtype=float)
+        raster[:, covered] = source[:, nearest[covered]]
+        return raster
 
     @staticmethod
     def _time_step(values: list[float]) -> float:

@@ -13,7 +13,8 @@ MAX_FAULT_TYPES_JSON_UTF8_BYTES = 4096
 MAX_FAULT_TYPES_EDITOR_CODE_POINTS = 4096
 
 _RUN_CONFIG_SCHEMA = "jingcheng-run-config/v1"
-_HISTORY_LABELS_SCHEMA = "jingcheng-history-labels/v1"
+_HISTORY_LABELS_LEGACY_SCHEMA = "jingcheng-history-labels/v1"
+_HISTORY_LABELS_SCHEMA = "jingcheng-history-labels/v2"
 _HISTORY_TRIGGER_SOURCES = frozenset({"plc", "manual", "scan", "import_audio"})
 _FORBIDDEN_NAME_CATEGORIES = frozenset({"Cc", "Cs", "Zl", "Zp"})
 
@@ -130,6 +131,7 @@ def encode_history_labels_payload(
     config_id: object,
     name: object,
     fault_types: object,
+    manual_judgment_buttons_visible: object,
     details: object,
     sn: object,
     trigger_source: object,
@@ -142,6 +144,9 @@ def encode_history_labels_payload(
                     "config_id": config_id,
                     "name": name,
                     "fault_types": fault_types,
+                    "manual_judgment_buttons_visible": (
+                        manual_judgment_buttons_visible
+                    ),
                     "details": details,
                 },
                 "sn": sn,
@@ -236,15 +241,22 @@ def _normalize_history_labels(
         "trigger_source",
     }:
         raise ValueError("history labels payload has an invalid root shape")
-    if value["schema"] != _HISTORY_LABELS_SCHEMA:
+    schema = value["schema"]
+    if schema not in {
+        _HISTORY_LABELS_LEGACY_SCHEMA,
+        _HISTORY_LABELS_SCHEMA,
+    }:
         raise ValueError("history labels payload has an unsupported schema")
     config = value["config"]
-    if type(config) is not dict or set(config) != {
+    expected_config_fields = {
         "config_id",
         "name",
         "fault_types",
         "details",
-    }:
+    }
+    if schema == _HISTORY_LABELS_SCHEMA:
+        expected_config_fields.add("manual_judgment_buttons_visible")
+    if type(config) is not dict or set(config) != expected_config_fields:
         raise ValueError("history labels config has an invalid shape")
 
     config_id = config["config_id"]
@@ -254,6 +266,18 @@ def _normalize_history_labels(
     fault_types = normalize_fault_types(config["fault_types"])
     if config_id is None and fault_types:
         raise ValueError("unresolved history labels must have no fault types")
+    if schema == _HISTORY_LABELS_SCHEMA:
+        manual_judgment_buttons_visible = config[
+            "manual_judgment_buttons_visible"
+        ]
+        if type(manual_judgment_buttons_visible) is not bool:
+            raise ValueError(
+                "manual_judgment_buttons_visible must be a boolean"
+            )
+        if config_id is None and manual_judgment_buttons_visible:
+            raise ValueError(
+                "unresolved history labels must hide manual judgment buttons"
+            )
     details = _normalize_details(
         config["details"],
         allow_tuple=allow_tuple_details,
@@ -263,14 +287,19 @@ def _normalize_history_labels(
     if type(trigger_source) is not str or trigger_source not in _HISTORY_TRIGGER_SOURCES:
         raise ValueError("history labels trigger_source is invalid")
 
+    normalized_config = {
+        "config_id": config_id,
+        "name": name,
+        "fault_types": fault_types,
+        "details": details,
+    }
+    if schema == _HISTORY_LABELS_SCHEMA:
+        normalized_config["manual_judgment_buttons_visible"] = (
+            manual_judgment_buttons_visible
+        )
     return {
-        "schema": _HISTORY_LABELS_SCHEMA,
-        "config": {
-            "config_id": config_id,
-            "name": name,
-            "fault_types": fault_types,
-            "details": details,
-        },
+        "schema": schema,
+        "config": normalized_config,
         "sn": sn,
         "trigger_source": trigger_source,
     }

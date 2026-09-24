@@ -5,6 +5,7 @@ from collections import deque
 from dataclasses import dataclass, field
 import inspect
 import math
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 import threading
@@ -563,6 +564,7 @@ def _normal_completion_subject(live_display, events):
             close=lambda: events.append("analysis")
         ),
         live_display=live_display,
+        current_history=None,
     )
     graph = SimpleNamespace(
         complete_ordered_shutdown=lambda: real_complete(real_graph)
@@ -710,6 +712,7 @@ def test_zero_ready_prepare_preserves_original_error_when_diagnostics_fail() -> 
         "_LOGGER": SimpleNamespace(
             exception=lambda *args: diagnostic_failures.append(args),
         ),
+        "sys": sys,
         "np": np,
     }
     exec(_load_prepare_upstream(), namespace)

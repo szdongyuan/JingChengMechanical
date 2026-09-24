@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import sqlite3
+from datetime import datetime
 from pathlib import Path
 
 from peewee import OperationalError
 
 from model.base_mode import DB_PATH, db
+from app.service.torque.migration import (
+    TorqueSchemaError,
+    apply_torque_migration,
+    needs_torque_migration,
+    validate_torque_schema,
+)
 
 
 class DatabaseStartupError(RuntimeError):
@@ -60,6 +68,7 @@ class DbConnectionService:
     _REQUIRED_TEST_CONFIG_COLUMNS = frozenset(
         {
             "fault_types_json",
+            "manual_judgment_buttons_visible",
             "vibration_view_channel_index",
             "input_hardware_device_id",
             "result_dashboard_layout",
@@ -184,7 +193,17 @@ class DbConnectionService:
             raise
         try:
             self._ensure_required_runtime_tables()
+            self._ensure_required_runtime_columns(
+                allow_missing_manual_judgment_visibility=True,
+            )
+            self._migrate_compatible_schema()
             self._ensure_required_runtime_columns()
+            if DB_PATH != ":memory:":
+                validate_torque_schema(db)
+        except TorqueSchemaError as exc:
+            if not db.is_closed():
+                db.close()
+            raise DatabaseStartupError(str(exc)) from exc
         except Exception:
             if not db.is_closed():
                 db.close()
@@ -208,6 +227,53 @@ class DbConnectionService:
                 "Copy a prepared database before starting the application."
             )
 
+    def _migrate_compatible_schema(self) -> None:
+        if DB_PATH == ":memory:":
+            return
+        column_name = "manual_judgment_buttons_visible"
+        needs_manual_column = column_name not in self._table_columns("test_config_table")
+        needs_torque_tables = needs_torque_migration(db)
+        if not needs_manual_column and not needs_torque_tables:
+            return
+
+        database_path = Path(DB_PATH).resolve()
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup_path = database_path.with_name(
+            f"{database_path.name}.backup-auto-{stamp}"
+        )
+        destination = None
+        try:
+            destination = sqlite3.connect(backup_path)
+            db.connection().backup(destination)
+        except Exception as exc:
+            if destination is not None:
+                destination.close()
+            backup_path.unlink(missing_ok=True)
+            raise DatabaseStartupError(
+                "Database compatibility backup failed before schema upgrade: "
+                f"{backup_path}."
+            ) from exc
+        else:
+            destination.close()
+
+        try:
+            with db.atomic():
+                if needs_manual_column:
+                    db.execute_sql(
+                        'ALTER TABLE "test_config_table" '
+                        'ADD COLUMN "manual_judgment_buttons_visible" '
+                        "INTEGER NOT NULL DEFAULT 0"
+                    )
+                if needs_torque_tables:
+                    apply_torque_migration(db)
+                self._ensure_required_runtime_columns()
+                validate_torque_schema(db)
+        except Exception as exc:
+            raise DatabaseStartupError(
+                "Database compatibility upgrade failed; the original backup "
+                f"is available at: {backup_path}."
+            ) from exc
+
     def _ensure_required_runtime_tables(self) -> None:
         if DB_PATH == ":memory:":
             return
@@ -221,7 +287,11 @@ class DbConnectionService:
                 "Copy a prepared database before starting the application."
             )
 
-    def _ensure_required_runtime_columns(self) -> None:
+    def _ensure_required_runtime_columns(
+        self,
+        *,
+        allow_missing_manual_judgment_visibility: bool = False,
+    ) -> None:
         if DB_PATH == ":memory:":
             return
 
@@ -231,9 +301,19 @@ class DbConnectionService:
         )
         self._ensure_required_table_columns(
             "test_config_table",
-            self._REQUIRED_TEST_CONFIG_COLUMNS,
+            self._REQUIRED_TEST_CONFIG_COLUMNS
+            - (
+                {"manual_judgment_buttons_visible"}
+                if allow_missing_manual_judgment_visibility
+                else set()
+            ),
         )
         self._ensure_fault_types_column_definition()
+        if (
+            not allow_missing_manual_judgment_visibility
+            or "manual_judgment_buttons_visible" in self._table_columns("test_config_table")
+        ):
+            self._ensure_manual_judgment_visibility_column_definition()
         self._ensure_required_table_columns(
             "managed_audio_input_table",
             self._REQUIRED_MANAGED_AUDIO_INPUT_COLUMNS,
@@ -302,6 +382,28 @@ class DbConnectionService:
             raise DatabaseStartupError(
                 "Database schema is incomplete: invalid test_config_table "
                 "column definition: fault_types_json. "
+                "Copy a prepared database before starting the application."
+            )
+
+    def _ensure_manual_judgment_visibility_column_definition(self) -> None:
+        cursor = db.execute_sql("PRAGMA table_info(test_config_table)")
+        row = next(
+            (
+                candidate
+                for candidate in cursor.fetchall()
+                if candidate[1] == "manual_judgment_buttons_visible"
+            ),
+            None,
+        )
+        actual = (
+            None
+            if row is None
+            else (row[2].upper(), bool(row[3]), row[4], int(row[5]))
+        )
+        if actual != ("INTEGER", True, "0", 0):
+            raise DatabaseStartupError(
+                "Database schema is incomplete: invalid test_config_table "
+                "column definition: manual_judgment_buttons_visible. "
                 "Copy a prepared database before starting the application."
             )
 

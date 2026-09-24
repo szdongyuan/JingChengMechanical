@@ -628,7 +628,7 @@ def test_old_export_is_definition_only_and_simple_export_has_no_side_path() -> N
         "SqliteDatabase",
     }
     forbidden_export_mechanisms = re.compile(
-        r"(?:^|_)(?:resume|repair|retry|recovery|progress_callback|"
+        r"(?:^|_)(?:resume|repair|retry|recovery|"
         r"partial_success|delivery_receipt|history_card)(?:_|$)",
         re.IGNORECASE,
     )

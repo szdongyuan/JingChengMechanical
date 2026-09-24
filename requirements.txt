@@ -4,6 +4,7 @@ matplotlib==3.11.1
 mosqito==1.2.1
 numpy==2.4.2
 opencv-python==4.13.0.92
+openpyxl==3.1.5
 peewee==4.0.1
 portalocker==3.2.0
 pymodbus>=3.8,<4.0

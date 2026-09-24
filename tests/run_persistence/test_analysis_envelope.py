@@ -18,6 +18,19 @@ from app.service.run_persistence.analysis_envelope import (
 from tests.run_persistence.conftest import make_analysis_envelope
 
 
+def test_import_mapping_exposes_original_replay_order_and_rejects_duplicates():
+    mapping = {'schema': 'audio-import-map/v2', 'source_channel_count': 3, 'assignments': [
+        {'wav_channel_index': 2, 'mode': 'config', 'channel_index': 7},
+        {'wav_channel_index': 0, 'mode': 'chart', 'channel_index': None}]}
+    envelope = make_analysis_envelope(config={'selected_channels': [7]}, channel_mapping=mapping)
+    decoded = decode_analysis_envelope(freeze_analysis_envelope(envelope))
+    assert decoded.is_import
+    assert decoded.replay_channel_order == (0, 1, 2)
+    mapping['assignments'].append({'wav_channel_index': 1, 'mode': 'config', 'channel_index': 7})
+    with pytest.raises(AnalysisEnvelopeError, match='duplicate'):
+        freeze_analysis_envelope(envelope)
+
+
 def _toolchain() -> dict[str, object]:
     return {
         "toolchain_id": "toolchain",

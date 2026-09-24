@@ -78,14 +78,27 @@ def test_six_by_six_concurrent_callbacks_finish_without_permit_or_record_leak(
         )
     barrier = threading.Barrier(7)
     callback_time_ns = backend.clock() + 10_000_000
+    expected_samples = {
+        number: (
+            np.arange(10, dtype=np.float32)[:, None]
+            + np.array(
+                [number * 100.0, number * 100.0 + 1_000.0],
+                dtype=np.float32,
+            )[None, :]
+        )
+        for number in range(1, 7)
+    }
     threads = [
         threading.Thread(
-            target=lambda handle=backend.handles[f"mic-{number}"]: (
-                barrier.wait(),
-                handle.emit(
-                    np.ones((10, 2), dtype=np.float32),
-                    callback_monotonic_ns=callback_time_ns,
-                ),
+            target=(
+                lambda handle=backend.handles[f"mic-{number}"],
+                samples=expected_samples[number]: (
+                    barrier.wait(),
+                    handle.emit(
+                        samples.copy(),
+                        callback_monotonic_ns=callback_time_ns,
+                    ),
+                )
             )
         )
         for number in range(1, 7)
@@ -105,6 +118,17 @@ def test_six_by_six_concurrent_callbacks_finish_without_permit_or_record_leak(
         and not outcome.audio.samples.flags.writeable
         for outcome in outcomes
     )
+    for number, outcome in enumerate(outcomes, start=1):
+        audio = outcome.audio
+        assert audio is not None
+        assert audio.frame_count == 10
+        assert audio.sample_rate_hz == 1_000
+        assert audio.channel_indices == (0, 1)
+        assert audio.samples.dtype == np.dtype(np.float32)
+        assert audio.samples.tobytes(order="C") == expected_samples[
+            number
+        ].tobytes(order="C")
+        assert np.array_equal(audio.samples, expected_samples[number])
     assert pool._capture_permits == 0
     assert pool._bindings == {}
     assert pool._run_ids == {}

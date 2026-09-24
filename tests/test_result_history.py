@@ -244,11 +244,16 @@ class MutableHistoryTransition(ResultHistoryTransition):
     mutable_state: object = None
 
 
-def config_summary(config_id: int | None = 7) -> FrozenConfigSummary:
+def config_summary(
+    config_id: int | None = 7,
+    *,
+    manual_judgment_buttons_visible: bool = False,
+) -> FrozenConfigSummary:
     return FrozenConfigSummary(
         config_id=config_id,
         name="配置 A",
         fault_types=("异响", "漏装"),
+        manual_judgment_buttons_visible=manual_judgment_buttons_visible,
         details=(
             ConfigSummaryField("硬件", "麦克风 1"),
             ConfigSummaryField("窗口", "0.0–2.0 s"),
@@ -853,6 +858,7 @@ def test_config_and_card_snapshots_use_only_immutable_public_fields():
     assert isinstance(summary.details, tuple)
     assert all(isinstance(item, ConfigSummaryField) for item in summary.details)
     assert summary.fault_types == ("异响", "漏装")
+    assert summary.manual_judgment_buttons_visible is False
     assert {item.name for item in fields(snapshot_card)} == {
         "run_id",
         "config",
@@ -877,6 +883,81 @@ def test_config_and_card_snapshots_use_only_immutable_public_fields():
         snapshot_card.phase = ResultPhase.ANALYZING
     with pytest.raises(ResultHistoryError):
         FrozenConfigSummary(config_id=1, name="bad", details=[])  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("invalid", [0, 1, "false", None, np.bool_(True)])
+def test_frozen_config_summary_requires_exact_manual_button_boolean(invalid):
+    with pytest.raises(ResultHistoryError, match="manual_judgment_buttons_visible"):
+        FrozenConfigSummary(
+            config_id=1,
+            name="bad",
+            manual_judgment_buttons_visible=invalid,
+        )
+
+
+def test_frozen_manual_judgment_buttons_visibility_survives_all_history_transitions():
+    store = ResultHistoryStore()
+    frozen_config = config_summary(manual_judgment_buttons_visible=True)
+    active = replace(card("run-visible"), config=frozen_config)
+    active_transition = store.apply(ActiveRunChanged(active))
+    assert (
+        active_transition.snapshot.active_cards[0]
+        .config.manual_judgment_buttons_visible
+        is True
+    )
+
+    terminal = replace(finished_card("run-visible"), config=frozen_config)
+    terminal_transition = store.apply(
+        RunTerminated(terminal, review_payload=review_payload())
+    )
+    assert (
+        terminal_transition.snapshot.terminal_cards[0]
+        .config.manual_judgment_buttons_visible
+        is True
+    )
+
+    manual_card = replace(terminal, conclusion=ResultConclusion.NG)
+    manual_transition = store.apply(
+        TerminalResultReplaced(
+            "run-visible",
+            0,
+            manual_card,
+            review_payload=review_payload(2.0),
+        )
+    )
+    assert (
+        manual_transition.snapshot.terminal_cards[0]
+        .config.manual_judgment_buttons_visible
+        is True
+    )
+
+    reanalyzing = store.apply(
+        ReanalysisStarted("run-visible", "operation-1", expected_revision=1)
+    )
+    assert (
+        reanalyzing.snapshot.terminal_cards[0]
+        .config.manual_judgment_buttons_visible
+        is True
+    )
+    completed_card = replace(
+        terminal,
+        revision=2,
+        sn="SN-REANALYZED",
+    )
+    completed = store.apply(
+        ReanalysisCompleted(
+            "run-visible",
+            "operation-1",
+            2,
+            completed_card,
+            review_payload=review_payload(3.0),
+        )
+    )
+    assert (
+        completed.snapshot.terminal_cards[0]
+        .config.manual_judgment_buttons_visible
+        is True
+    )
 
 
 @pytest.mark.parametrize(

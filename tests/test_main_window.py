@@ -15,6 +15,7 @@ sys.modules.setdefault("cv2", SimpleNamespace())
 if "snap7" not in sys.modules:
     snap7_module = ModuleType("snap7")
     snap7_client_module = ModuleType("snap7.client")
+    snap7_error_module = ModuleType("snap7.error")
     snap7_util_module = ModuleType("snap7.util")
 
     class _Client:
@@ -25,17 +26,26 @@ if "snap7" not in sys.modules:
             return None
 
     snap7_client_module.Client = _Client
+    snap7_error_module.S7Error = RuntimeError
     snap7_util_module.get_bool = lambda *_args, **_kwargs: False
     snap7_util_module.set_bool = lambda *_args, **_kwargs: None
     snap7_module.client = snap7_client_module
     snap7_module.util = snap7_util_module
     sys.modules["snap7"] = snap7_module
     sys.modules["snap7.client"] = snap7_client_module
+    sys.modules["snap7.error"] = snap7_error_module
     sys.modules["snap7.util"] = snap7_util_module
 
 from PyQt6 import sip
 from PyQt6.QtCore import QCoreApplication, QEvent, Qt
-from PyQt6.QtWidgets import QApplication, QLabel, QWidget
+from PyQt6.QtWidgets import (
+    QApplication,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QToolButton,
+    QWidget,
+)
 
 try:
     from pyqtgraph.widgets.GraphicsView import GraphicsView
@@ -585,6 +595,43 @@ def test_operator_can_activate_data_management_but_not_admin_pages():
     assert not window._can_activate_main_tab(2)
     assert not window._can_activate_main_tab(3)
     assert not window._can_activate_main_tab(4)
+
+
+def _role_projection_window(main_window, role: str):
+    window = main_window.MainWindow.__new__(main_window.MainWindow)
+    QMainWindow.__init__(window)
+    window.current_user_name = "operator" if role == "操作员" else "privileged-user"
+    window.current_user_role = role
+    window.top_button_dict = {
+        name: QToolButton()
+        for name in ("测试", "数据管理", "配置", "AI管理", "硬件")
+    }
+    window.workorder = SimpleNamespace()
+    window.config_module = SimpleNamespace(
+        btn_select_active_configs=QPushButton("选择使用配置")
+    )
+    return window
+
+
+def test_operator_has_no_factory_selection_entry_on_test_page(qapp):
+    import app.main_window as main_window
+
+    window = _role_projection_window(main_window, "操作员")
+    window.set_role()
+
+    assert window.top_button_dict["配置"].isEnabled() is False
+    assert hasattr(window.workorder, "config_selector") is False
+
+
+@pytest.mark.parametrize("role", ["管理员", "工程师"])
+def test_privileged_roles_can_access_factory_selection_entry(qapp, role):
+    import app.main_window as main_window
+
+    window = _role_projection_window(main_window, role)
+    window.set_role()
+
+    assert window.top_button_dict["配置"].isEnabled() is True
+    assert window.config_module.btn_select_active_configs.isEnabled() is True
 
 
 def _disable_updates_and_remove_events(widget: QWidget) -> None:

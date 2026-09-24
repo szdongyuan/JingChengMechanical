@@ -724,7 +724,7 @@ def test_schema_validation_rejects_missing_or_wrong_application_id(
     assert result.failure.actual == actual
 
 
-@pytest.mark.parametrize("actual", [0, 1, 3])
+@pytest.mark.parametrize("actual", [0, 1, 2, 4])
 def test_schema_validation_rejects_missing_or_wrong_user_version(
     validator_database, actual: int
 ) -> None:
@@ -735,7 +735,7 @@ def test_schema_validation_rejects_missing_or_wrong_user_version(
     assert result.valid is False
     assert result.failure is not None
     assert result.failure.code.value == "DATABASE_USER_VERSION_MISMATCH"
-    assert result.failure.expected == 2
+    assert result.failure.expected == 3
     assert result.failure.actual == actual
 
 
@@ -841,7 +841,7 @@ def _cloned_schema_database(
     for statement in statements:
         database.execute_sql(statement)
     database.execute_sql("PRAGMA application_id = 1245924688")
-    database.execute_sql("PRAGMA user_version = 2")
+    database.execute_sql("PRAGMA user_version = 3")
     return database
 
 
@@ -1486,7 +1486,7 @@ def test_fresh_v2_schema_matches_all_markers_column_tuples_checks_indexes_and_fo
     ).fetchone()[0] == 1245924688
     assert validator_database.execute_sql(
         "PRAGMA user_version"
-    ).fetchone()[0] == 2
+    ).fetchone()[0] == 3
     assert validator_database.execute_sql(
         "PRAGMA foreign_keys"
     ).fetchone()[0] == 1

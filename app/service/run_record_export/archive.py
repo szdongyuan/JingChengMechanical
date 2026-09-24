@@ -4,17 +4,24 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from io import BytesIO
 import json
 import math
 import os
 from pathlib import Path
 import sqlite3
 import tempfile
-import wave
+import time
 import zipfile
 
+from app.service.run_record_export.attachments import (
+    serialize_current_csv,
+    split_pcm16_wav,
+)
+
 from app.service.run_record_export.contracts import (
+    AiExportReaderPort,
+    RunDataExportOptions,
+    RunDataExportResult,
     RunExportReaderPort,
     RunExportRecord,
 )
@@ -25,6 +32,15 @@ class RunArchiveError(RuntimeError):
 
 
 ProgressCallback = Callable[[int, int, str], None]
+CancelCheck = Callable[[], None]
+
+
+def write_configurable_package(*args, **kwargs):
+    """Load the v2 kernel lazily so its legacy error import stays acyclic."""
+
+    from app.service.run_record_export.package import write_run_data_export
+
+    return write_run_data_export(*args, **kwargs)
 
 
 @dataclass(frozen=True)
@@ -117,57 +133,12 @@ def _reject_target_source_aliases(
             raise RunArchiveError("target aliases selected source WAV")
 
 
-def _mono_wav(
-    payload: bytes,
-    *,
-    channel_index: int,
-    channel_count: int,
-    sample_rate_hz: int,
-    frame_count: int,
-) -> bytes:
-    mono_payload = bytearray(frame_count * 2)
-    for frame_index in range(frame_count):
-        source_offset = (frame_index * channel_count + channel_index) * 2
-        target_offset = frame_index * 2
-        mono_payload[target_offset : target_offset + 2] = payload[
-            source_offset : source_offset + 2
-        ]
-
-    output = BytesIO()
-    with wave.open(output, "wb") as writer:
-        writer.setnchannels(1)
-        writer.setsampwidth(2)
-        writer.setframerate(sample_rate_hz)
-        writer.writeframes(mono_payload)
-    return output.getvalue()
-
-
 def _current_csv(
     samples: tuple[tuple[float, float], ...] | None,
 ) -> bytes | None:
     if samples is None:
         return None
-    if not samples:
-        raise ValueError("current samples must be nonempty when present")
-
-    rows = ["time_sec,current_a"]
-    previous_time: float | None = None
-    for sample in samples:
-        if len(sample) != 2:
-            raise ValueError("current sample must contain exactly two values")
-        time_sec, current_a = sample
-        if (
-            isinstance(time_sec, bool)
-            or isinstance(current_a, bool)
-            or not math.isfinite(time_sec)
-            or not math.isfinite(current_a)
-            or time_sec < 0
-            or (previous_time is not None and time_sec <= previous_time)
-        ):
-            raise ValueError("current samples are not finite and strictly ordered")
-        rows.append(f"{time_sec},{current_a}")
-        previous_time = time_sec
-    return ("\n".join(rows) + "\n").encode("utf-8")
+    return serialize_current_csv(samples)
 
 
 def _prepare_record(record: RunExportRecord) -> _PreparedRecord:
@@ -182,37 +153,11 @@ def _prepare_record(record: RunExportRecord) -> _PreparedRecord:
     if len(record.channel_order) != record.channel_count:
         raise ValueError("channel order length does not match channel count")
 
-    try:
-        with wave.open(record.source_wav_path, "rb") as reader:
-            if reader.getcomptype() != "NONE":
-                raise ValueError("source WAV compression is not PCM")
-            if reader.getsampwidth() != 2:
-                raise ValueError("source WAV is not PCM16")
-            if reader.getframerate() != record.sample_rate_hz:
-                raise ValueError("source WAV sample rate does not match")
-            if reader.getnchannels() != record.channel_count:
-                raise ValueError("source WAV channel count does not match")
-            if reader.getnframes() != record.frame_count:
-                raise ValueError("source WAV frame count does not match")
-            payload = reader.readframes(record.frame_count)
-            if reader.readframes(1) != b"":
-                raise ValueError("source WAV contains undeclared frames")
-    except (EOFError, wave.Error, OSError) as exc:
-        raise ValueError(f"invalid source WAV: {exc}") from None
-
-    expected_bytes = record.frame_count * record.channel_count * 2
-    if len(payload) != expected_bytes:
-        raise ValueError("source WAV PCM payload is truncated")
-
-    channel_wavs = tuple(
-        _mono_wav(
-            payload,
-            channel_index=channel_index,
-            channel_count=record.channel_count,
-            sample_rate_hz=record.sample_rate_hz,
-            frame_count=record.frame_count,
-        )
-        for channel_index in range(record.channel_count)
+    channel_wavs = split_pcm16_wav(
+        record.source_wav_path,
+        sample_rate_hz=record.sample_rate_hz,
+        channel_count=record.channel_count,
+        frame_count=record.frame_count,
     )
     return _PreparedRecord(
         record=record,
@@ -596,8 +541,65 @@ def write_run_archive(
 class RunArchiveService:
     """Read one durable selection and publish it through the pure kernel."""
 
-    def __init__(self, reader: RunExportReaderPort) -> None:
+    def __init__(
+        self,
+        reader: RunExportReaderPort,
+        ai_reader: AiExportReaderPort | None = None,
+        *,
+        enrichment_wait_timeout_seconds: float = 2.0,
+        enrichment_poll_seconds: float = 0.05,
+        monotonic: Callable[[], float] = time.monotonic,
+        wait: Callable[[float], None] = time.sleep,
+    ) -> None:
+        for value, name in (
+            (enrichment_wait_timeout_seconds, "enrichment_wait_timeout_seconds"),
+            (enrichment_poll_seconds, "enrichment_poll_seconds"),
+        ):
+            if (
+                type(value) is not float
+                or not math.isfinite(value)
+                or value <= 0.0
+            ):
+                raise ValueError(f"{name} must be a finite positive float")
+        if not callable(monotonic) or not callable(wait):
+            raise TypeError("monotonic and wait must be callable")
         self._reader = reader
+        self._ai_reader = ai_reader
+        self._enrichment_wait_timeout_seconds = enrichment_wait_timeout_seconds
+        self._enrichment_poll_seconds = enrichment_poll_seconds
+        self._monotonic = monotonic
+        self._wait = wait
+
+    def _await_enrichment(self, run_ids: tuple[str, ...]) -> None:
+        pending_reader = getattr(
+            self._reader,
+            "pending_enrichment_run_ids",
+            None,
+        )
+        if not callable(pending_reader):
+            return
+        try:
+            deadline = (
+                float(self._monotonic())
+                + self._enrichment_wait_timeout_seconds
+            )
+            while True:
+                pending = tuple(pending_reader(run_ids))
+                if not pending:
+                    return
+                remaining = deadline - float(self._monotonic())
+                if remaining <= 0.0:
+                    raise RunArchiveError(
+                        "analysis result artifact unavailable before export timeout"
+                    )
+                self._wait(min(self._enrichment_poll_seconds, remaining))
+        except RunArchiveError:
+            raise
+        except Exception as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            raise RunArchiveError(
+                f"analysis result artifact unavailable: {detail}"
+            ) from None
 
     def inspect_selection(
         self,
@@ -630,28 +632,70 @@ class RunArchiveService:
         run_ids: tuple[str, ...],
         target_path: str,
         *,
+        options: RunDataExportOptions,
         progress_callback: ProgressCallback | None = None,
-    ) -> str:
+        cancel_check: CancelCheck | None = None,
+    ) -> RunDataExportResult:
+        if type(options) is not RunDataExportOptions:
+            raise TypeError("options must be RunDataExportOptions")
+        if cancel_check is not None and not callable(cancel_check):
+            raise TypeError("cancel_check must be callable")
+        if self._ai_reader is None:
+            raise RuntimeError("AI export reader is unavailable")
+
+        def check_cancel() -> None:
+            if cancel_check is not None:
+                cancel_check()
+
+        check_cancel()
         _emit_progress(
             progress_callback,
             0,
             0,
             f"正在读取 {len(run_ids)} 条导出数据...",
         )
-        records = self._reader.read_many(run_ids)
-        copy_database = None
-        read_copy_database = getattr(self._reader, "read_copy_database", None)
-        if callable(read_copy_database):
+        check_cancel()
+        report = self._reader.read_configurable_report(
+            run_ids,
+            cancel_check=cancel_check,
+        )
+        check_cancel()
+
+        ai_values = {}
+        if options.include_excel or options.output_kind == "zip":
+            _emit_progress(
+                progress_callback,
+                0,
+                0,
+                "正在读取 AI 导出数据...",
+            )
+            check_cancel()
+            ai_values = self._ai_reader.get_current_effective_export_values(
+                report.selected_run_ids
+            )
+            check_cancel()
+
+        database_bytes = None
+        if options.include_database:
             _emit_progress(
                 progress_callback,
                 0,
                 0,
                 "正在生成数据库副本...",
             )
-            copy_database = read_copy_database(run_ids)
-        return write_run_archive(
-            records,
+            check_cancel()
+            database_bytes = self._reader.read_copy_database(
+                report.selected_run_ids,
+                cancel_check=cancel_check,
+            )
+            check_cancel()
+
+        return write_configurable_package(
+            report,
             target_path,
-            copy_database=copy_database,
+            ai_values=ai_values,
+            options=options,
+            database_bytes=database_bytes,
             progress_callback=progress_callback,
+            cancel_check=cancel_check,
         )

@@ -10,6 +10,7 @@ import uuid
 
 import numpy as np
 import pytest
+import app.service.multi_run_coordinator_mvp.coordinator as coordinator_module
 
 from app.service.analysis.resident_audio_mvp import (
     CancelResult,
@@ -25,6 +26,7 @@ from app.service.analysis.resident_audio_mvp import (
     ResidentStreamSpec,
     ShutdownStatus,
 )
+from app.service.current_meter_service import CurrentSample
 from app.service.managed_input_contracts import (
     ManagedHardwareId,
     ResidentStreamGenerationStamp,
@@ -49,6 +51,7 @@ from tests.multi_run_coordinator_mvp._support import (
     captured_request,
     completed_capture,
     frozen_captured,
+    saved_outcome,
 )
 
 
@@ -101,37 +104,112 @@ def test_every_capture_terminal_stops_and_samples_its_collector_once() -> None:
             "current_samples"
         )
 
-    for index, stage in enumerate(("stop", "samples", "validate"), start=8):
-        harness = Harness()
-        collector = FakeCurrentCollector(harness.trace)
-        if stage == "stop":
-            collector.stop_exception = TimeoutError("stop timed out")
-        elif stage == "samples":
-            collector.samples_exception = RuntimeError("samples failed")
-        else:
-            collector.sample_values = [object()]
-        harness.current_factory.collectors.append(collector)
-        harness.captured_freezer.result_factory = lambda request: frozen_captured(
-            request,
-            current_enabled=True,
-        )
-        coordinator = harness.coordinator()
-        assert coordinator.start_captured(captured_request(RUN_IDS[index])).accepted
-        reservation = harness.resident.register_calls[0]
+@pytest.mark.parametrize("stage", ("stop", "samples"))
+def test_current_settlement_failure_is_diagnostic_and_audio_path_continues(
+    stage: str,
+) -> None:
+    harness = Harness()
+    harness.save_dispatcher.synchronous_outcome = saved_outcome
+    collector = FakeCurrentCollector(
+        harness.trace,
+        samples=[CurrentSample(0.0, 1.25)],
+    )
+    if stage == "stop":
+        collector.stop_exception = TimeoutError("stop timed out")
+    else:
+        collector.samples_exception = RuntimeError("samples failed")
+    harness.current_factory.collectors.append(collector)
+    harness.captured_freezer.result_factory = lambda request: frozen_captured(
+        request,
+        current_enabled=True,
+    )
+    coordinator = harness.coordinator()
+    assert coordinator.start_captured(captured_request()).accepted
 
-        harness.resident.complete(completed_capture(reservation))
+    harness.resident.complete(
+        completed_capture(harness.resident.register_calls[0])
+    )
 
-        terminal = harness.persistence.terminal_calls[-1]
-        assert (
-            terminal.error_category
-            is TerminalErrorCategory.CURRENT_TRACE_INVALID
-        )
-        assert stage in terminal.reason
-        assert len(collector.stop_calls) == 1
-        assert collector.samples_calls == 1
-        assert harness.persistence.current_calls == []
-        assert harness.save_dispatcher.calls == []
-        assert harness.scheduler.initial_calls == []
+    assert len(collector.stop_calls) == 1
+    assert collector.samples_calls == 1
+    assert len(harness.persistence.current_calls) == (1 if stage == "stop" else 0)
+    assert harness.persistence.terminal_calls == []
+    assert len(harness.save_dispatcher.calls) == 1
+    assert len(harness.scheduler.initial_calls) == 1
+    diagnostics = [
+        fact
+        for fact in harness.diagnostics.calls
+        if fact.stage == f"current {stage}"
+    ]
+    assert len(diagnostics) == 1
+    assert diagnostics[0].run_id == RUN_IDS[0]
+
+
+def test_unusable_current_sample_is_skipped_without_a_terminal_or_diagnostic() -> None:
+    harness = Harness()
+    harness.save_dispatcher.synchronous_outcome = saved_outcome
+    collector = FakeCurrentCollector(harness.trace)
+    collector.sample_values = [object()]
+    harness.current_factory.collectors.append(collector)
+    harness.captured_freezer.result_factory = lambda request: frozen_captured(
+        request,
+        current_enabled=True,
+    )
+    coordinator = harness.coordinator()
+    assert coordinator.start_captured(captured_request()).accepted
+
+    harness.resident.complete(
+        completed_capture(harness.resident.register_calls[0])
+    )
+
+    assert harness.persistence.current_calls == []
+    assert harness.persistence.terminal_calls == []
+    assert len(harness.save_dispatcher.calls) == 1
+    assert len(harness.scheduler.initial_calls) == 1
+    assert harness.diagnostics.calls == []
+
+
+def test_unexpected_current_conversion_failure_is_diagnostic_and_nonblocking(
+    monkeypatch,
+) -> None:
+    harness = Harness()
+    harness.save_dispatcher.synchronous_outcome = saved_outcome
+    collector = FakeCurrentCollector(
+        harness.trace,
+        samples=[CurrentSample(0.0, 1.25)],
+    )
+    harness.current_factory.collectors.append(collector)
+    harness.captured_freezer.result_factory = lambda request: frozen_captured(
+        request,
+        current_enabled=True,
+    )
+
+    def fail_conversion(_samples):
+        raise RuntimeError("conversion failed")
+
+    monkeypatch.setattr(
+        coordinator_module,
+        "current_samples_to_trace",
+        fail_conversion,
+    )
+    coordinator = harness.coordinator()
+    assert coordinator.start_captured(captured_request()).accepted
+
+    harness.resident.complete(
+        completed_capture(harness.resident.register_calls[0])
+    )
+
+    assert harness.persistence.current_calls == []
+    assert harness.persistence.terminal_calls == []
+    assert len(harness.save_dispatcher.calls) == 1
+    assert len(harness.scheduler.initial_calls) == 1
+    diagnostics = [
+        fact
+        for fact in harness.diagnostics.calls
+        if fact.stage == "current conversion"
+    ]
+    assert len(diagnostics) == 1
+    assert diagnostics[0].run_id == RUN_IDS[0]
 
 
 def _binding(
@@ -828,6 +906,63 @@ def test_synchronous_completion_maps_all_owned_audio_fields() -> None:
         dtype=np.float32,
     ).tobytes(order="C")
     assert type(outcome.audio.interleaved_bytes) is bytes
+
+
+@pytest.mark.parametrize("failure_stage", ("lookup", "output"))
+def test_mapping_diagnostic_failure_preserves_completed_audio_publication(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    from types import SimpleNamespace
+    import app.service.multi_run_coordinator_mvp.managed_resident_capture_port as adapter
+
+    port, _, pools = _port()
+    pool = pools[0]
+    run_id, reservation = _reserve_one(port)
+    pool.start_outcome_factory = _resident_completed
+    delivered: list[CaptureOutcome] = []
+    delivered_event = threading.Event()
+    attempted: list[str] = []
+    logger = adapter.logging.getLogger(adapter.__name__)
+
+    def fail_output(message: str) -> None:
+        attempted.append("output")
+        assert message.startswith("capture mapped ")
+        raise RuntimeError("diagnostic output unavailable")
+
+    def lookup_logger(name: str) -> object:
+        assert name == adapter.__name__
+        if failure_stage == "lookup":
+            attempted.append("lookup")
+            raise RuntimeError("diagnostic logger unavailable")
+        return logger
+
+    monkeypatch.setattr(logger, "info", fail_output)
+    monkeypatch.setattr(adapter, "logging", SimpleNamespace(getLogger=lookup_logger))
+
+    def sink(outcome: CaptureOutcome) -> None:
+        delivered.append(outcome)
+        delivered_event.set()
+
+    try:
+        port.register_completion(reservation, sink)
+        port.start(reservation, 11, 3)
+
+        assert delivered_event.wait(1)
+        assert attempted == [failure_stage]
+        assert len(delivered) == 1
+        outcome = delivered[0]
+        assert outcome.status is CaptureOutcomeStatus.COMPLETED
+        assert outcome.error_category is None
+        assert outcome.run_id == run_id
+        assert outcome.reservation is reservation
+        assert outcome.audio is not None
+        assert outcome.audio.source_identity == "binding-1"
+        assert outcome.audio.frame_count == 3
+        assert outcome.audio.channel_count == 2
+        assert outcome.audio.interleaved_bytes == np.arange(6, dtype=np.float32).tobytes()
+    finally:
+        assert port.close_and_join(1.0).status is ManagedResidentCaptureCloseStatus.CLOSED
 
 
 def test_trusted_private_resident_values_are_not_reconstructed(

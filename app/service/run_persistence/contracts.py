@@ -221,6 +221,13 @@ class CurrentTrace:
 def _validate_channel_mapping(snapshot_json: str) -> None:
     envelope = decode_analysis_envelope(snapshot_json)
     mapping = envelope.channel_mapping
+    from app.service.analysis.import_mapping import is_import_mapping, validate_import_mapping
+    if is_import_mapping(mapping):
+        try:
+            validate_import_mapping(mapping, selected_channels=envelope.config.get("selected_channels", ()))
+        except ValueError as exc:
+            raise ContractValidationError(str(exc)) from None
+        return
     if set(mapping) != {"schema", "channel_order"}:
         raise ContractValidationError(
             "channel_mapping must have exact audio-channel-map/v1 shape"
@@ -314,6 +321,8 @@ class RunInsert:
         ):
             raise ContractValidationError("captured run cannot use IMPORT trigger")
         if self.ingress_kind is IngressKind.CAPTURED:
+            if decode_analysis_envelope(self.snapshots.config_snapshot_json).is_import:
+                raise ContractValidationError("captured run forbids explicit import mapping")
             if any(
                 value is not None
                 for value in (
@@ -392,8 +401,8 @@ class VerifiedAudioFact:
         validate_uuid4(self.run_id)
         validate_utc_timestamp(self.closed_verified_at)
         validate_utc_timestamp(self.created_at)
-        if self.container_format != "WAV_PCM":
-            raise ContractValidationError("container_format must be WAV_PCM")
+        if self.container_format not in {"WAV_PCM", "WAV_IEEE_FLOAT"}:
+            raise ContractValidationError("container_format must be WAV_PCM or WAV_IEEE_FLOAT")
         if not isinstance(self.final_path, str) or not self.final_path:
             raise ContractValidationError("final_path must be a non-empty string")
         if self.source_kind not in {"CAPTURED_AUDIO", "IMPORTED_SOURCE"}:

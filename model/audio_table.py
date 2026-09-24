@@ -41,7 +41,7 @@ class AudioTable(BaseModel):
                 "CHECK (typeof(content_revision) = 'integer' "
                 "AND content_revision > 0)"
             ),
-            SQL("CHECK (container_format = 'WAV_PCM')"),
+            SQL("CHECK (container_format IN ('WAV_PCM', 'WAV_IEEE_FLOAT'))"),
             SQL("CHECK (sample_rate_hz > 0)"),
             SQL("CHECK (channel_count > 0)"),
             SQL("CHECK (frame_count > 0)"),

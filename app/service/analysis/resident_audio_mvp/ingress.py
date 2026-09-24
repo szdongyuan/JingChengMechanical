@@ -131,6 +131,11 @@ class _SpscIngress:
     def has_pending(self) -> bool:
         return self._read_sequence < self._write_sequence
 
+    @property
+    def can_accept(self) -> bool:
+        """Readiness for a buffered sole producer, without counting overflow."""
+        return self._write_sequence - self._read_sequence < self._capacity_blocks
+
     def try_push(
         self,
         samples: np.ndarray,

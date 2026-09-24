@@ -1,16 +1,24 @@
 from __future__ import annotations
 
-from PyQt6.QtWidgets import QGridLayout, QLabel, QLineEdit, QVBoxLayout, QWidget
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import (
+    QFrame,
+    QGridLayout,
+    QLabel,
+    QLineEdit,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
 
 from app.services_container import FactoryControllerState
+from app.service.torque.types import TorqueConfig, TorqueConfigApplied, TorqueStatus
 from model.plc_table import PlcTable
-from ui.widgets.factory_config_list import FactoryConfigListWidget
+from ui.popups.torque_table_dialog import format_torque
 
 
 class WorkOrderModule(QWidget):
     module_id = "workorder"
-    _LOCKED_SELECTION_PHASES = frozenset({"running", "analyzing", "reanalyzing"})
-    _PENDING_START_REASON = "启动请求处理中"
     _PHASE_LABELS = {
         "not_ready": "未就绪",
         "armed": "待启动",
@@ -25,13 +33,18 @@ class WorkOrderModule(QWidget):
         super().__init__()
         self.services = services
         self._factory_state = getattr(services.factory_mode, "state", FactoryControllerState())
-        self._config_rows: list[dict] = []
         self._last_workorder_payload: dict | None = None
         self._plc_sn_values: dict[int, str] = {}
         self._plc_sn_edits: dict[int, QLineEdit] = {}
         self._plc_model_values: dict[int, str] = {}
         self._plc_model_edits: dict[int, QLineEdit] = {}
-        self._rendered_plc_ids: tuple[int, ...] = ()
+        self._plc_torque_edits: dict[int, QLineEdit] = {}
+        self._plc_torque_statuses: dict[int, TorqueStatus] = {}
+        self._plc_torque_cycles: dict[int, int] = {}
+        self._torque_plc_ids: set[int] = set()
+        self._plc_names: dict[int, str] = {}
+        self._plc_labels: dict[int, tuple[QLabel, ...]] = {}
+        self._rendered_plc_ids: tuple[int, ...] | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -42,96 +55,56 @@ class WorkOrderModule(QWidget):
         self.plc_sn_layout.setContentsMargins(0, 0, 2, 0)
         self.plc_sn_layout.setHorizontalSpacing(8)
         self.plc_sn_layout.setVerticalSpacing(6)
+        self.plc_sn_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.plc_sn_layout.setColumnStretch(0, 1)
-        self.plc_sn_layout.setColumnStretch(1, 1)
+        self.plc_sn_layout.setColumnStretch(1, 0)
 
-        self.config_selector = FactoryConfigListWidget()
-        self.config_selector.setMinimumHeight(180)
-        self.lbl_factory_configs = QLabel("配置选择")
+        self.plc_workorder_scroll_area = QScrollArea()
+        self.plc_workorder_scroll_area.setObjectName("plc_workorder_scroll_area")
+        self.plc_workorder_scroll_area.setWidgetResizable(True)
+        self.plc_workorder_scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.plc_workorder_scroll_area.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+        )
+        self.plc_workorder_scroll_area.setWidget(self.plc_sn_widget)
 
-        self.lbl_persistence_notice = QLabel()
-        self.lbl_persistence_notice.setWordWrap(True)
-        self.lbl_persistence_notice.setStyleSheet("color: #b45309;")
-        self.lbl_persistence_notice.setVisible(False)
-        self.lbl_selection_status = QLabel()
-        self.lbl_selection_status.setWordWrap(True)
-        self.lbl_selection_status.setVisible(False)
         self.lbl_phase_summary = QLabel()
         self.lbl_phase_summary.setWordWrap(True)
 
-        layout.addWidget(self.plc_sn_widget)
-
-        self.factory_config_section = QWidget()
-        factory_config_layout = QVBoxLayout(self.factory_config_section)
-        factory_config_layout.setContentsMargins(0, 0, 0, 0)
-        factory_config_layout.setSpacing(6)
-        factory_config_layout.addWidget(self.lbl_factory_configs)
-        factory_config_layout.addWidget(self.config_selector)
-        layout.addWidget(self.factory_config_section)
-
-        layout.addWidget(self.lbl_persistence_notice)
-        layout.addWidget(self.lbl_selection_status)
+        layout.addWidget(self.plc_workorder_scroll_area, 1)
         layout.addWidget(self.lbl_phase_summary)
 
-        self.config_selector.enabled_order_changed.connect(self._on_config_selection_changed)
-        if hasattr(self.services.bus, "config_changed"):
-            self.services.bus.config_changed.connect(self._reload_config_options)
         if hasattr(self.services.bus, "plc_changed"):
             self.services.bus.plc_changed.connect(self._refresh_plc_sn_rows)
         if hasattr(self.services.bus, "factory_state_changed"):
             self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
-        if hasattr(self.services.bus, "factory_selection_notice"):
-            self.services.bus.factory_selection_notice.connect(self._on_factory_selection_notice)
         if hasattr(self.services.bus, "factory_display_reset"):
             self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
         if hasattr(self.services.bus, "plc_workorder_changed"):
             self.services.bus.plc_workorder_changed.connect(self._on_plc_workorder_changed)
+        if hasattr(self.services.bus, "plc_torque_changed"):
+            self.services.bus.plc_torque_changed.connect(self._on_plc_torque_changed)
+        for signal_name in ("plc_torque_config_saved", "plc_torque_config_applied"):
+            signal = getattr(self.services.bus, signal_name, None)
+            if signal is not None:
+                signal.connect(self._on_plc_torque_config_changed)
 
-        self._reload_config_options()
         self._refresh_plc_sn_rows()
-        self._restore_startup_selection()
+        self._update_phase_trigger_summary()
         initial_payload = self.value()
         self._last_workorder_payload = dict(initial_payload)
         self._cache_current_workorder_payload(initial_payload)
 
     def value(self) -> dict:
+        state = getattr(self.services.factory_mode, "state", FactoryControllerState())
         return {
             "sn": "",
             "model": "",
-            "selected_config_ids": self.config_selector.enabled_config_ids(),
+            "selected_config_ids": tuple(state.selected_config_ids),
         }
 
     def apply(self):
         self._publish_workorder(force=True, log=True)
-
-    def _on_config_selection_changed(self, selected_config_ids: tuple[int, ...]) -> None:
-        previous_selected = set(self._factory_state.selected_config_ids)
-        added_config_ids = tuple(
-            config_id
-            for config_id in selected_config_ids
-            if config_id not in previous_selected
-        )
-        request_resets = getattr(
-            self.services,
-            "request_plc_start_signal_resets_for_configs",
-            None,
-        )
-        if added_config_ids and callable(request_resets):
-            request_resets(added_config_ids)
-
-        next_state = None
-        factory_mode = getattr(self.services, "factory_mode", None)
-        set_selection = getattr(factory_mode, "set_selection", None)
-        if callable(set_selection):
-            next_state = set_selection(selected_config_ids)
-        if isinstance(next_state, FactoryControllerState):
-            self._sync_factory_state(next_state, publish_workorder=False)
-        else:
-            self._update_selection_status()
-            self._update_phase_trigger_summary()
-            self._sync_selector_lock_state()
-        self._publish_workorder()
-        self._persist_selected_config_ids(selected_config_ids)
 
     def _on_factory_state_changed(self, state) -> None:
         if isinstance(state, FactoryControllerState):
@@ -150,12 +123,83 @@ class WorkOrderModule(QWidget):
             return
         self._plc_sn_values[plc_id] = sn
         self._plc_model_values[plc_id] = model
+        # A disabled next cycle has no TorqueStatus. Keep its predecessor's
+        # watermark, but retire its result (including any queued final status).
+        self._plc_torque_statuses.pop(plc_id, None)
         self._refresh_plc_sn_rows()
         for other_edit in self._plc_sn_edits.values():
             other_edit.setStyleSheet("")
         edit = self._plc_sn_edits.get(plc_id)
         if edit is not None and sn:
             edit.setStyleSheet("color: #2563eb; font-weight: 600;")
+
+    def _on_plc_torque_changed(self, status: TorqueStatus) -> None:
+        if not isinstance(status, TorqueStatus) or status.plc_id not in self._torque_plc_ids:
+            return
+        # Real PLC events carry a process-unique ID, even when their acoustic
+        # timestamps coincide. Legacy status producers retain timestamp ordering.
+        cycle_id = status.cycle_id if status.cycle_id is not None else status.trigger_ns
+        latest = self._plc_torque_cycles.get(status.plc_id)
+        if latest is not None:
+            if cycle_id < latest:
+                return
+            if cycle_id == latest and status.plc_id not in self._plc_torque_statuses:
+                return
+        # All states register the cycle: config_error may be the only event.
+        self._plc_torque_cycles[status.plc_id] = cycle_id
+        self._plc_torque_statuses[status.plc_id] = status
+        self._render_plc_torque(status.plc_id)
+
+    def _on_plc_torque_config_changed(self, event: TorqueConfig | TorqueConfigApplied) -> None:
+        if isinstance(event, (TorqueConfig, TorqueConfigApplied)) and event.plc_id in self._torque_plc_ids:
+            self._render_plc_torque(event.plc_id)
+
+    def _render_plc_torque(self, plc_id: int) -> None:
+        edit = self._plc_torque_edits.get(plc_id)
+        if edit is None:
+            return
+        status = self._plc_torque_statuses.get(plc_id)
+        tooltip = ["与 PLC 单位一致"]
+        if status is None:
+            store = getattr(self.services, "torque_store", None)
+            enabled = (
+                plc_id in self._torque_plc_ids
+                and store is not None
+                and store.get_config(plc_id).enabled
+            )
+            text = "待读取" if enabled else "未启用"
+        else:
+            text = self._torque_status_text(status)
+            kind = "SN" if status.match_type == "sn" else "型号"
+            tooltip.append(f"{kind}：{status.match_key}" if status.match_key else f"{kind}为空")
+            if status.detail:
+                tooltip.append(status.detail)
+        edit.setText(text)
+        edit.setCursorPosition(0)
+        edit.setToolTip("\n".join([text, *tooltip]))
+
+    @staticmethod
+    def _torque_status_text(status: TorqueStatus) -> str:
+        labels = {
+            "reading": "读取中",
+            "read_error": "读取失败",
+            "invalid_value": "PLC 扭矩无效",
+            "config_error": "扭矩配置错误",
+        }
+        if status.state in labels:
+            return labels[status.state]
+        if status.state == "unmatched":
+            kind = "SN" if status.match_type == "sn" else "型号"
+            match = f"{kind}：{status.match_key}" if status.match_key else f"{kind}为空"
+            return f"未匹配（{match}）"
+        source = {"plc": "PLC", "table": "软件表"}.get(status.source, "")
+        outcome = {
+            "table_pending": "回传中", "table_sent": "已回传", "write_error": "回传失败",
+        }.get(status.state)
+        if outcome:
+            source = f"{source}，{outcome}"
+        value = format_torque(status.value) if status.value is not None else "—"
+        return f"{value}（{source}）"
 
     def _sync_factory_state(
         self,
@@ -164,117 +208,9 @@ class WorkOrderModule(QWidget):
         publish_workorder: bool = True,
     ) -> None:
         self._factory_state = state
-        self.config_selector.sync_enabled_config_ids(state.selected_config_ids)
-        self._update_selection_status()
         self._update_phase_trigger_summary()
-        self._sync_selector_lock_state()
         if publish_workorder:
             self._publish_workorder()
-
-    def _restore_startup_selection(self) -> None:
-        startup_selection = self._load_startup_selection()
-        available_ids = self._available_config_ids()
-        restored_selection = tuple(
-            config_id for config_id in startup_selection if config_id in available_ids
-        )
-        had_missing_configs = restored_selection != startup_selection
-        restored_selection = self._dedupe_config_ids(restored_selection)
-
-        self.config_selector.sync_enabled_config_ids(restored_selection)
-
-        factory_mode = getattr(self.services, "factory_mode", None)
-        next_state = None
-        restore_selection = getattr(factory_mode, "restore_selection", None)
-        if callable(restore_selection):
-            next_state = restore_selection(
-                restored_selection,
-                had_missing_configs=had_missing_configs,
-            )
-        else:
-            set_selection = getattr(factory_mode, "set_selection", None)
-            if callable(set_selection):
-                next_state = set_selection(restored_selection)
-        request_resets = getattr(
-            self.services,
-            "request_plc_start_signal_resets_for_configs",
-            None,
-        )
-        if callable(request_resets):
-            request_resets(restored_selection)
-        if isinstance(next_state, FactoryControllerState):
-            self._sync_factory_state(next_state, publish_workorder=False)
-        else:
-            self._update_selection_status()
-            self._update_phase_trigger_summary()
-            self._sync_selector_lock_state()
-
-    def _load_startup_selection(self) -> tuple[int, ...]:
-        selection_settings = getattr(self.services, "factory_selection_settings", None)
-        load_selected_config_ids = getattr(selection_settings, "load_selected_config_ids", None)
-        if callable(load_selected_config_ids):
-            try:
-                return tuple(load_selected_config_ids())
-            except Exception:
-                return ()
-        return tuple(self._factory_state.selected_config_ids)
-
-    @staticmethod
-    def _dedupe_config_ids(config_ids: tuple[int, ...] | list[int]) -> tuple[int, ...]:
-        seen: set[int] = set()
-        deduped: list[int] = []
-        for config_id in config_ids:
-            if not isinstance(config_id, int) or config_id in seen:
-                continue
-            seen.add(config_id)
-            deduped.append(config_id)
-        return tuple(deduped)
-
-    def _persist_selected_config_ids(self, selected_config_ids: tuple[int, ...]) -> None:
-        if tuple(self._factory_state.selected_config_ids) != tuple(
-            selected_config_ids
-        ):
-            return
-        if bool(
-            getattr(
-                getattr(self.services, "factory_mode", None),
-                "selection_restart_required",
-                False,
-            )
-        ):
-            return
-        selection_settings = getattr(self.services, "factory_selection_settings", None)
-        save_selected_config_ids = getattr(selection_settings, "save_selected_config_ids", None)
-        error_message = None
-        if callable(save_selected_config_ids):
-            error_message = save_selected_config_ids(tuple(selected_config_ids))
-        self._emit_selection_notice(error_message or "")
-
-    def _emit_selection_notice(self, message: str) -> None:
-        notice_signal = getattr(self.services.bus, "factory_selection_notice", None)
-        emit = getattr(notice_signal, "emit", None)
-        if callable(emit):
-            emit(message)
-            return
-        self._on_factory_selection_notice(message)
-
-    def _on_factory_selection_notice(self, message: str) -> None:
-        self.lbl_persistence_notice.setText(message)
-        self.lbl_persistence_notice.setVisible(bool(message))
-
-    def _reload_config_options(self) -> None:
-        self._config_rows = self._list_config_rows()
-        visible_selection = self.config_selector.enabled_config_ids()
-        if not visible_selection:
-            visible_selection = tuple(self._factory_state.selected_config_ids)
-        available_ids = self._available_config_ids()
-        self.config_selector.set_rows(
-            rows=self._config_rows,
-            enabled_config_ids=tuple(
-                config_id for config_id in visible_selection if config_id in available_ids
-            ),
-        )
-        self._sync_selector_lock_state()
-        self._refresh_plc_sn_rows()
 
     def _payload_plc_id(self, payload: dict) -> int | None:
         raw_plc_id = payload.get("plc_id")
@@ -289,16 +225,26 @@ class WorkOrderModule(QWidget):
         return plc_id if plc_id > 0 else None
 
     def _refresh_plc_sn_rows(self) -> None:
+        self._torque_plc_ids = self._known_plc_ids()
+        for plc_id in self._plc_torque_cycles.keys() - self._torque_plc_ids:
+            self._plc_torque_cycles.pop(plc_id, None)
+            self._plc_torque_statuses.pop(plc_id, None)
         plc_ids = self._plc_ids_for_display()
         if plc_ids != self._rendered_plc_ids:
             self._rebuild_plc_sn_rows(plc_ids)
+        for plc_id, labels in self._plc_labels.items():
+            name = self._plc_names.get(plc_id) or f"PLC{plc_id}"
+            for label, field in zip(labels, ("SN码", "型号", "扭矩")):
+                label.setText(f"{name} {field}")
         for plc_id, edit in self._plc_sn_edits.items():
             edit.setText(self._plc_sn_values.get(plc_id, ""))
         for plc_id, edit in self._plc_model_edits.items():
             edit.setText(self._plc_model_values.get(plc_id, ""))
+        for plc_id in self._plc_torque_edits:
+            self._render_plc_torque(plc_id)
 
     def _plc_ids_for_display(self) -> tuple[int, ...]:
-        plc_ids = self._known_plc_ids()
+        plc_ids = self._torque_plc_ids
         if plc_ids:
             self._plc_sn_values = {
                 plc_id: sn
@@ -315,6 +261,7 @@ class WorkOrderModule(QWidget):
 
     def _known_plc_ids(self) -> set[int]:
         plc_ids: set[int] = set()
+        self._plc_names = {}
         for attr_name in ("plc_services", "plc_threads", "plc_state"):
             mapping = getattr(self.services, attr_name, None)
             keys = getattr(mapping, "keys", None)
@@ -327,11 +274,12 @@ class WorkOrderModule(QWidget):
                     plc_ids.add(raw_id)
 
         try:
-            rows = PlcTable.select(PlcTable.id).order_by(PlcTable.id)
+            rows = PlcTable.select(PlcTable.id, PlcTable.plc_name).order_by(PlcTable.id)
             for row in rows:
                 plc_id = getattr(row, "id", None)
                 if isinstance(plc_id, int) and plc_id > 0:
                     plc_ids.add(plc_id)
+                    self._plc_names[plc_id] = (getattr(row, "plc_name", None) or "").strip()
         except Exception:
             pass
 
@@ -344,27 +292,47 @@ class WorkOrderModule(QWidget):
             if widget is not None:
                 widget.deleteLater()
 
+        self._plc_labels = {}
         self._plc_sn_edits = {}
         self._plc_model_edits = {}
+        self._plc_torque_edits = {}
         self._rendered_plc_ids = tuple(plc_ids)
         if not plc_ids:
             empty_label = QLabel("未配置 PLC")
             empty_label.setObjectName("Muted")
-            self.plc_sn_layout.addWidget(empty_label, 0, 0, 1, 2)
+            self.plc_sn_layout.addWidget(empty_label, 0, 0, 1, 1)
+            self._update_plc_scroll_policy(plc_ids)
             return
 
+        outer_row = 0
         for index, plc_id in enumerate(plc_ids):
+            if index:
+                separator = QFrame()
+                separator.setObjectName("plc_group_separator")
+                separator.setFrameShape(QFrame.Shape.HLine)
+                separator.setFrameShadow(QFrame.Shadow.Plain)
+                separator.setLineWidth(1)
+                separator.setFixedHeight(13)
+                separator.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                separator.setStyleSheet(
+                    "QFrame#plc_group_separator { color: #e2e8f0; }"
+                )
+                self.plc_sn_layout.addWidget(separator, outer_row, 0, 1, 1)
+                outer_row += 1
+
             row_widget = QWidget()
             row_layout = QGridLayout(row_widget)
             row_layout.setContentsMargins(0, 1, 2, 1)
             row_layout.setSpacing(6)
 
             sn_label = QLabel(f"PLC{plc_id} SN码")
-            sn_label.setFixedWidth(72)
             model_label = QLabel(f"PLC{plc_id} 型号")
-            model_label.setFixedWidth(72)
+            torque_label = QLabel(f"PLC{plc_id} 扭矩")
+
+            self._plc_labels[plc_id] = (sn_label, model_label, torque_label)
 
             sn_edit = QLineEdit()
+            sn_edit.setObjectName("PlcField")
             sn_edit.setReadOnly(True)
             sn_edit.setPlaceholderText("未读取")
             sn_edit.setMinimumWidth(0)
@@ -372,49 +340,47 @@ class WorkOrderModule(QWidget):
             sn_edit.setMaximumHeight(30)
 
             model_edit = QLineEdit()
+            model_edit.setObjectName("PlcField")
             model_edit.setReadOnly(True)
             model_edit.setPlaceholderText("未读取")
             model_edit.setMinimumWidth(0)
             model_edit.setMinimumHeight(28)
             model_edit.setMaximumHeight(30)
 
+            torque_edit = QLineEdit()
+            torque_edit.setObjectName("PlcField")
+            torque_edit.setReadOnly(True)
+            torque_edit.setMinimumWidth(0)
+            torque_edit.setMinimumHeight(28)
+            torque_edit.setMaximumHeight(30)
+
             row_layout.addWidget(sn_label, 0, 0)
             row_layout.addWidget(sn_edit, 0, 1)
             row_layout.addWidget(model_label, 1, 0)
             row_layout.addWidget(model_edit, 1, 1)
+            row_layout.addWidget(torque_label, 2, 0)
+            row_layout.addWidget(torque_edit, 2, 1)
             row_layout.setColumnStretch(1, 1)
-            self.plc_sn_layout.addWidget(row_widget, index // 2, index % 2)
+            self.plc_sn_layout.addWidget(row_widget, outer_row, 0, 1, 1)
+            outer_row += 1
             self._plc_sn_edits[plc_id] = sn_edit
             self._plc_model_edits[plc_id] = model_edit
+            self._plc_torque_edits[plc_id] = torque_edit
 
-    def _available_config_ids(self) -> set[int]:
-        return {
-            row.get("config_id")
-            for row in self._config_rows
-            if isinstance(row.get("config_id"), int)
-        }
+        self._update_plc_scroll_policy(plc_ids)
 
-    def _list_config_rows(self) -> list[dict]:
-        config_service = getattr(self.services, "config_service", None)
-        list_configs = getattr(config_service, "list_configs", None)
-        if not callable(list_configs):
-            return []
-        try:
-            return list(list_configs())
-        except Exception:
-            return []
-
-    def _sync_selector_lock_state(self) -> None:
-        is_locked = (
-            self._factory_state.run_phase in self._LOCKED_SELECTION_PHASES
-            or self._factory_state.start_ready_reason == self._PENDING_START_REASON
-        )
-        self.config_selector.set_locked(is_locked)
-
-    def _update_selection_status(self) -> None:
-        # ControlModule owns controller blocking feedback near the start button.
-        self.lbl_selection_status.clear()
-        self.lbl_selection_status.setVisible(False)
+    def _update_plc_scroll_policy(self, plc_ids: tuple[int, ...]) -> None:
+        self.plc_sn_layout.activate()
+        self.plc_sn_widget.adjustSize()
+        if len(plc_ids) <= 2:
+            policy = Qt.ScrollBarPolicy.ScrollBarAlwaysOff
+            self.plc_workorder_scroll_area.setMinimumHeight(
+                self.plc_sn_widget.sizeHint().height()
+            )
+        else:
+            policy = Qt.ScrollBarPolicy.ScrollBarAsNeeded
+            self.plc_workorder_scroll_area.setMinimumHeight(0)
+        self.plc_workorder_scroll_area.setVerticalScrollBarPolicy(policy)
 
     def _update_phase_trigger_summary(self) -> None:
         display_phase = self._display_phase(self._factory_state.run_phase)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import os
 import threading
 import time
 
@@ -25,6 +27,8 @@ from app.service.managed_input_contracts import (
 
 
 PYTHON_SYSTEM_MONOTONIC_DOMAIN = "python/system-monotonic"
+CALLBACK_TIMESTAMP_JITTER_TOLERANCE_NS = 20_000_000
+ADC_CONTINUITY_WINDOW_NS = 10_000_000_000
 
 
 class PythonSystemMonotonicAuthority:
@@ -69,12 +73,49 @@ class _MonotonicAuthorityInputHandle(_resident._SoundDeviceInputHandle):
         super().__init__(sounddevice_module, spec, callback, on_fault)
         self._monotonic_authority = monotonic_authority
         self._portaudio_clock_offset_ns: int | None = None
+        self._last_callback_audio_end_ns: int | None = None
+        self._audio_origin_end_ns: int | None = None
+        self._audio_frames_since_origin = 0
+        self._raw_adc_anchor_end_ns: int | None = None
+        self._raw_adc_frames_since_anchor = 0
+        self._native_input_latency = 0.0
+
+    def _create_stream(self, **kwargs):
+        if os.name != 'nt' or getattr(self._sounddevice, '__name__', None) != 'sounddevice':
+            return super()._create_stream(**kwargs)
+        from app.service.native_capture_stream import NativeCaptureStream
+        return NativeCaptureStream(self._sounddevice, self._spec,
+            self._sounddevice_callback, self._report_fault,
+            getattr(self._callback, 'native_ready', lambda: True),
+            self._set_native_latency)
+
+    def _set_native_latency(self, latency):
+        if not math.isfinite(latency) or latency < 0:
+            raise ValueError('Native input latency must be finite and nonnegative')
+        self._native_input_latency = latency
+
+    def _open_stream(self, native):
+        from app.service.native_capture_stream import NativeCaptureStream
+        if isinstance(native, NativeCaptureStream):
+            native.open_native()
+
+    def native_producer_snapshot(self):
+        native = self._native
+        snapshot = getattr(native, 'producer_snapshot', None)
+        return snapshot() if snapshot is not None else None
 
     def _now_ns(self) -> int:
         value = self._monotonic_authority.monotonic_ns()
         if type(value) is not int or value < 0:
             raise ValueError("monotonic authority returned an invalid value")
         return value
+
+    def _uses_native_frame_timeline(self, time_info: object) -> bool:
+        # These hosts report estimated ADC times, not sample-loss evidence.
+        hostapi = self._spec.hostapi_name.lower()
+        return hasattr(time_info, 'native_entry_ns') and (
+            'wasapi' in hostapi or 'directsound' in hostapi
+        )
 
     def _native_callback(
         self,
@@ -83,7 +124,7 @@ class _MonotonicAuthorityInputHandle(_resident._SoundDeviceInputHandle):
         time_info: object,
         native_status: object,
     ) -> BackendCallbackDirective:
-        if not self._callback_priority_applied:
+        if not self._callback_priority_applied and not hasattr(time_info, 'native_entry_ns'):
             from app.service.analysis.thread_priority import (
                 THREAD_PRIORITY_HIGHEST,
                 set_current_thread_priority,
@@ -91,12 +132,23 @@ class _MonotonicAuthorityInputHandle(_resident._SoundDeviceInputHandle):
 
             set_current_thread_priority(THREAD_PRIORITY_HIGHEST)
             self._callback_priority_applied = True
-        entry_ns = self._now_ns()
-        callback_audio_end_ns = self._audio_block_end_ns(
-            time_info,
-            frame_count,
-            entry_ns,
-        )
+        entry_ns = getattr(time_info, 'native_entry_ns', None)
+        if entry_ns is None:
+            entry_ns = self._now_ns()
+        elif not self._uses_native_frame_timeline(time_info):
+            entry_ns = max(0, entry_ns - time_info.clock_uncertainty_ns)
+        try:
+            callback_audio_end_ns = self._audio_block_end_ns(
+                time_info, frame_count, entry_ns,
+            )
+        except Exception as exc:
+            self._report_fault(
+                BackendCallbackStatus.BACKEND_FAULT,
+                f"audio timing hardware={self._spec.hardware_id} "
+                f"entry_ns={entry_ns} frames={frame_count} "
+                f"{_resident._safe_message(exc)}",
+            )
+            return BackendCallbackDirective.STOP
         try:
             status = self._map_status(native_status)
         except Exception as exc:
@@ -139,28 +191,110 @@ class _MonotonicAuthorityInputHandle(_resident._SoundDeviceInputHandle):
         frame_count: int,
         entry_ns: int,
     ) -> int:
-        """Map PortAudio's ADC clock to the application's monotonic clock."""
+        """Validate raw capture time, then map frames onto one monotonic timeline.
 
+        Native WASAPI/DirectSound use entry, reported latency and exact frames;
+        their estimated ADC time cannot establish loss. For other paths,
+        ADC/currentTime establish the first origin only. Missing driver timing
+        uses frame continuity and overflow protection: it cannot prove hardware
+        losslessness. In particular it never switches back to delivery time.
+        The raw anchor spans ten seconds to catch accumulating skips while
+        allowing small long-term clock skew; no individual error may exceed
+        max(20 ms, two current blocks). Neither path inserts or drops samples.
+        """
+        block_duration_ns = round(frame_count * 1_000_000_000 / self._spec.sample_rate_hz)
+        if self._uses_native_frame_timeline(time_info):
+            if self._audio_origin_end_ns is None:
+                uncertainty = time_info.clock_uncertainty_ns
+                self._audio_origin_end_ns = max(0, min(entry_ns,
+                    entry_ns - round(self._native_input_latency * 1_000_000_000)
+                    + block_duration_ns) - uncertainty)
+                candidate_end_ns = self._audio_origin_end_ns
+            else:
+                self._audio_frames_since_origin += frame_count
+                candidate_end_ns = self._audio_origin_end_ns + round(
+                    self._audio_frames_since_origin * 1_000_000_000 / self._spec.sample_rate_hz)
+                # Keep the fixed clock-domain margin even after correction.
+                ceiling = entry_ns - time_info.clock_uncertainty_ns
+                if candidate_end_ns > ceiling:
+                    corrected = max(self._last_callback_audio_end_ns, ceiling)
+                    self._audio_origin_end_ns += corrected - candidate_end_ns
+                    candidate_end_ns = corrected
+            self._last_callback_audio_end_ns = candidate_end_ns
+            return candidate_end_ns
+        tolerance_ns = max(CALLBACK_TIMESTAMP_JITTER_TOLERANCE_NS, 2 * block_duration_ns)
+        raw_adc_end_ns = None
+        refresh_mapping = False
         try:
-            current_time = float(getattr(time_info, "currentTime"))
             adc_start = float(getattr(time_info, "inputBufferAdcTime"))
-            if self._portaudio_clock_offset_ns is None:
-                self._portaudio_clock_offset_ns = entry_ns - round(
-                    current_time * 1_000_000_000
-                )
-            adc_end_ns = (
-                round(
-                    (
-                        adc_start
-                        + frame_count / float(self._spec.sample_rate_hz)
-                    )
-                    * 1_000_000_000
-                )
-                + self._portaudio_clock_offset_ns
-            )
-            return min(entry_ns, max(0, adc_end_ns))
+            if math.isfinite(adc_start) and adc_start > 0:
+                raw_adc_end_ns = round(adc_start * 1_000_000_000) + block_duration_ns
         except (AttributeError, TypeError, ValueError, OverflowError):
-            return entry_ns
+            pass
+
+        if self._raw_adc_anchor_end_ns is not None:
+            self._raw_adc_frames_since_anchor += frame_count
+            elapsed_ns = round(self._raw_adc_frames_since_anchor * 1_000_000_000
+                               / self._spec.sample_rate_hz)
+            expected_raw_end_ns = self._raw_adc_anchor_end_ns + elapsed_ns
+            if raw_adc_end_ns is not None:
+                error_ns = raw_adc_end_ns - expected_raw_end_ns
+                if abs(error_ns) > tolerance_ns:
+                    raise ValueError(
+                        f"ADC discontinuity raw_end_ns={raw_adc_end_ns} "
+                        f"expected_end_ns={expected_raw_end_ns} delta_ns={error_ns} "
+                        f"tolerance_ns={tolerance_ns}"
+                    )
+                if elapsed_ns >= ADC_CONTINUITY_WINDOW_NS:
+                    self._raw_adc_anchor_end_ns = raw_adc_end_ns
+                    self._raw_adc_frames_since_anchor = 0
+                    refresh_mapping = True
+        elif raw_adc_end_ns is not None:
+            self._raw_adc_anchor_end_ns = raw_adc_end_ns
+            self._raw_adc_frames_since_anchor = 0
+
+        if self._audio_origin_end_ns is None:
+            candidate_end_ns = entry_ns
+            if raw_adc_end_ns is not None:
+                try:
+                    current_time = float(getattr(time_info, "currentTime"))
+                    if math.isfinite(current_time) and current_time > 0:
+                        self._portaudio_clock_offset_ns = entry_ns - round(current_time * 1_000_000_000)
+                        candidate_end_ns = min(entry_ns, max(0, raw_adc_end_ns + self._portaudio_clock_offset_ns))
+                except (AttributeError, TypeError, ValueError, OverflowError):
+                    pass
+            self._audio_origin_end_ns = candidate_end_ns
+        else:
+            self._audio_frames_since_origin += frame_count
+            candidate_end_ns = self._audio_origin_end_ns + round(
+                self._audio_frames_since_origin * 1_000_000_000 / self._spec.sample_rate_hz
+            )
+            if refresh_mapping and self._portaudio_clock_offset_ns is not None:
+                # Correct only validated clock skew, keeping delivery jitter out
+                # of the mapping and never moving a block end backwards.
+                corrected_end_ns = max(
+                    self._last_callback_audio_end_ns + 1,
+                    raw_adc_end_ns + self._portaudio_clock_offset_ns,
+                )
+                self._audio_origin_end_ns += corrected_end_ns - candidate_end_ns
+                candidate_end_ns = corrected_end_ns
+            if candidate_end_ns > entry_ns:
+                # The Resident ingress rejects future timestamps. A driver
+                # running slightly faster than its nominal sample rate can
+                # deliver a contiguous block just before its predicted end.
+                self._audio_origin_end_ns += entry_ns - candidate_end_ns
+                candidate_end_ns = entry_ns
+        self._last_callback_audio_end_ns = candidate_end_ns
+        return candidate_end_ns
+
+    def _before_native_restart(self) -> None:
+        self._portaudio_clock_offset_ns = None
+        self._last_callback_audio_end_ns = None
+        self._audio_origin_end_ns = None
+        self._audio_frames_since_origin = 0
+        self._raw_adc_anchor_end_ns = None
+        self._raw_adc_frames_since_anchor = 0
+
 
 class MonotonicSoundDeviceAudioBackend(_resident.SoundDeviceAudioBackend):
     """Existing stream lifecycle in the Python/system monotonic domain."""

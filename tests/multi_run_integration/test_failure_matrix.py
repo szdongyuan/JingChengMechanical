@@ -15,6 +15,7 @@ from app.service.multi_run_coordinator_mvp import (
     CaptureOutcome,
     CaptureOutcomeStatus,
     CommitResult,
+    CoordinatorLifecycle,
     HistoryFactKind,
     OperationStatus,
     PersistedAudioFormat,
@@ -146,8 +147,8 @@ def test_cross_aggregate_one_attempt_failure_matrix_is_isolated():
     assert second_reservation not in capture.resident.cancel_calls
     assert RUN_IDS[1] in capture_coordinator.snapshot().accepted_active_run_ids
 
-    # Failed-capture current cleanup latches restart without changing the claimed
-    # terminal or touching the other run's collector.
+    # Failed-capture current cleanup is diagnostic-only without changing the
+    # claimed terminal or touching the other run's collector.
     cleanup = Harness()
     bad_collector = FakeCurrentCollector(
         cleanup.trace,
@@ -176,15 +177,37 @@ def test_cross_aggregate_one_attempt_failure_matrix_is_isolated():
         )
     )
     cleanup_terminal = cleanup.persistence.terminal_calls[0]
+    assert cleanup_terminal.run_id == RUN_IDS[0]
     assert cleanup_terminal.error_category is TerminalErrorCategory.CAPTURE_FAILED
     assert cleanup_terminal.reason == "claimed capture failure"
     assert len(bad_collector.stop_calls) == bad_collector.samples_calls == 1
     assert sibling_collector.stop_calls == []
     assert sibling_collector.samples_calls == 0
-    assert cleanup_coordinator.snapshot().restart_required is True
-    assert cleanup_coordinator.start_captured(
-        captured_request(RUN_IDS[2])
-    ).status is StartStatus.INGRESS_CLOSED
+    cleanup_diagnostics = [
+        fact
+        for fact in cleanup.diagnostics.calls
+        if fact.stage == "current cleanup stop"
+    ]
+    assert len(cleanup_diagnostics) == 1
+    assert cleanup_diagnostics[0].run_id == RUN_IDS[0]
+    assert (
+        cleanup_diagnostics[0].category
+        is TerminalErrorCategory.CURRENT_TRACE_INVALID
+    )
+    assert "current stop timed out" in cleanup_diagnostics[0].message
+    cleanup_snapshot = cleanup_coordinator.snapshot()
+    assert cleanup_snapshot.lifecycle is CoordinatorLifecycle.OPEN
+    assert cleanup_snapshot.restart_required is False
+    assert RUN_IDS[1] in cleanup_snapshot.accepted_active_run_ids
+
+    cleanup.current_factory.collectors.append(
+        FakeCurrentCollector(
+            cleanup.trace,
+            samples=[CurrentSample(0.0, 3.0)],
+        )
+    )
+    later = cleanup_coordinator.start_captured(captured_request(RUN_IDS[2]))
+    assert later.status is StartStatus.ACCEPTED_ACTIVE
 
     # Channel identity mismatch fails before current attach, audio, or analysis.
     channel = Harness()

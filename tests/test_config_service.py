@@ -356,6 +356,99 @@ def test_create_config_explicitly_stores_empty_fault_types() -> None:
     assert svc.load_config(config_id)["fault_types"] == []
 
 
+def test_create_config_defaults_manual_judgment_buttons_visible_to_false() -> None:
+    svc = _service()
+
+    config_id = svc.create_config("Manual judgment default")
+
+    stored = ConfigTable.get_by_id(config_id)
+    loaded = svc.load_config(config_id)
+    assert stored.manual_judgment_buttons_visible is False
+    assert loaded["manual_judgment_buttons_visible"] is False
+    assert type(loaded["manual_judgment_buttons_visible"]) is bool
+
+
+def test_manual_judgment_buttons_visible_save_load_and_copy_round_trip() -> None:
+    svc = _service()
+    source_id = svc.create_config("Source")
+    source_payload = _config_payload(
+        source_id,
+        config_name="Source",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    source_payload["manual_judgment_buttons_visible"] = True
+
+    svc.save_config(source_payload)
+
+    source_loaded = svc.load_config(source_id)
+    raw_value = ConfigTable._meta.database.execute_sql(
+        "SELECT manual_judgment_buttons_visible FROM test_config_table WHERE config_id = ?",
+        (source_id,),
+    ).fetchone()[0]
+    assert source_loaded["manual_judgment_buttons_visible"] is True
+    assert raw_value == 1
+
+    copied_payload = dict(source_loaded)
+    copied_payload["config_name"] = "Copied"
+    copied_id = svc.create_imported_config(
+        copied_payload,
+        reserved_config_id=svc.reserve_import_config_id(),
+    )
+
+    assert svc.load_config(copied_id)["manual_judgment_buttons_visible"] is True
+
+
+def test_save_legacy_input_missing_manual_judgment_buttons_visible_defaults_false() -> None:
+    svc = _service()
+    config_id = svc.create_config("Legacy input")
+    ConfigTable.update(manual_judgment_buttons_visible=True).where(
+        ConfigTable.config_id == config_id
+    ).execute()
+    legacy_payload = _config_payload(
+        config_id,
+        config_name="Legacy input",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+
+    svc.save_config(legacy_payload)
+
+    assert svc.load_config(config_id)["manual_judgment_buttons_visible"] is False
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None])
+def test_save_rejects_non_bool_manual_judgment_buttons_visible(value) -> None:
+    svc = _service()
+    config_id = svc.create_config("Invalid manual judgment visibility")
+    payload = _config_payload(
+        config_id,
+        config_name="Invalid manual judgment visibility",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    payload["manual_judgment_buttons_visible"] = value
+
+    with pytest.raises(
+        ValueError,
+        match="manual_judgment_buttons_visible must be a boolean",
+    ):
+        svc.save_config(payload)
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None])
+def test_prepare_import_rejects_non_bool_manual_judgment_buttons_visible(value) -> None:
+    svc = _service()
+    payload = _config_payload(999, config_name="Imported")
+    payload["manual_judgment_buttons_visible"] = value
+
+    with pytest.raises(
+        ValueError,
+        match="manual_judgment_buttons_visible must be a boolean",
+    ):
+        svc.prepare_import_payload(payload)
+
+
 def test_fault_types_save_load_dashboard_and_fresh_list_round_trip() -> None:
     svc = _service()
     cfg = ConfigTable.create(config_name="Cfg1")
@@ -623,6 +716,7 @@ def test_load_config_returns_hardware_fields_with_cleaned_trigger_model():
         "output_device_samplerate",
         "selected_channels",
         "fault_types",
+        "manual_judgment_buttons_visible",
         "monitor_channel_index",
         "monitor_gain_db",
         "vibration_view_channel_index",
@@ -673,6 +767,7 @@ def test_load_config_returns_plc_id_and_not_legacy_plc_text_fields():
         "output_device_samplerate",
         "selected_channels",
         "fault_types",
+        "manual_judgment_buttons_visible",
         "monitor_channel_index",
         "monitor_gain_db",
         "vibration_view_channel_index",
@@ -732,6 +827,7 @@ def test_save_config_persists_hardware_fields():
             "input_hardware_device_id",
             "selected_channels",
             "fault_types",
+            "manual_judgment_buttons_visible",
         "monitor_channel_index",
         "monitor_gain_db",
         "vibration_view_channel_index",

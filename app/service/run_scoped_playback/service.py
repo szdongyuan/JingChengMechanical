@@ -145,9 +145,13 @@ class RunScopedPlaybackService:
         self._current_run_id: str | None = None
         self._owned_run_id: str | None = None
         self._generation_owned = False
+        self._playback_owner: object | None = None
         self._stop_requested = False
 
-    def play(self, request: RunPlaybackRequest) -> PlaybackResult:
+    def play(
+        self, request: RunPlaybackRequest, *, owner: object | None = None
+    ) -> PlaybackResult:
+        """Start playback, optionally associating its generation with a caller token."""
         if type(request) is not RunPlaybackRequest:
             raise TypeError("request must be an exact RunPlaybackRequest")
         if not self._operation_gate.acquire(blocking=False):
@@ -155,7 +159,7 @@ class RunScopedPlaybackService:
         try:
             if self._closed:
                 return _result(PlaybackCode.SERVICE_CLOSED, request.run_id)
-            return self._play_owned(request)
+            return self._play_owned(request, owner)
         finally:
             self._operation_gate.release()
 
@@ -164,6 +168,22 @@ class RunScopedPlaybackService:
         if not self._operation_gate.acquire(blocking=False):
             return _lifecycle_result(PlaybackLifecycleCode.BUSY)
         try:
+            if self._shutdown_report is not None:
+                return self._shutdown_report
+            return self._finish_generation(timeout, request_stop=True)
+        finally:
+            self._operation_gate.release()
+
+    def stop_if_owner(
+        self, owner: object, timeout_seconds: float
+    ) -> PlaybackLifecycleReport:
+        """Stop only the generation belonging to this exact non-None caller token."""
+        timeout = _validate_timeout_seconds(timeout_seconds)
+        if not self._operation_gate.acquire(blocking=False):
+            return _lifecycle_result(PlaybackLifecycleCode.BUSY)
+        try:
+            if owner is None or self._playback_owner is not owner:
+                return _lifecycle_result(PlaybackLifecycleCode.CLEAN)
             if self._shutdown_report is not None:
                 return self._shutdown_report
             return self._finish_generation(timeout, request_stop=True)
@@ -195,7 +215,9 @@ class RunScopedPlaybackService:
         finally:
             self._operation_gate.release()
 
-    def _play_owned(self, request: RunPlaybackRequest) -> PlaybackResult:
+    def _play_owned(
+        self, request: RunPlaybackRequest, owner: object | None
+    ) -> PlaybackResult:
         run_resolution = self._resolve_run(request)
         if type(run_resolution) is PlaybackResult:
             return run_resolution
@@ -235,6 +257,7 @@ class RunScopedPlaybackService:
             output_host_api,
             gain_db,
             replaced_run_id,
+            owner,
         )
 
     def _start_generation(
@@ -246,11 +269,13 @@ class RunScopedPlaybackService:
         output_host_api: str,
         gain_db: float,
         replaced_run_id: str | None,
+        owner: object | None,
     ) -> PlaybackResult:
         remaining = self._startup_remaining()
         if remaining is None:
             return _result(PlaybackCode.DEADLINE_CLOCK_FAILED, run_id)
 
+        self._playback_owner = owner
         try:
             report = self._backend.start(
                 segment,
@@ -378,7 +403,7 @@ class RunScopedPlaybackService:
                 raise ValueError
             if (
                 type(audio.container_format) is not str
-                or audio.container_format != "WAV_PCM"
+                or audio.container_format not in {"WAV_PCM", "WAV_IEEE_FLOAT"}
             ):
                 raise ValueError
             for value in (
@@ -405,7 +430,8 @@ class RunScopedPlaybackService:
                 sample_rate_hz=audio.sample_rate_hz,
                 channel_count=audio.channel_count,
                 frame_count=audio.frame_count,
-                dtype="<i2",
+                dtype="<f8" if storage_kind is AudioStorageKind.IMPORTED_FINAL_AUDIO else "<i2",
+                source_container_format=audio.container_format if storage_kind is AudioStorageKind.IMPORTED_FINAL_AUDIO else None,
                 content_revision=f"{audio.audio_id}:{audio.byte_size}",
             )
         except Exception:
@@ -419,6 +445,10 @@ class RunScopedPlaybackService:
             envelope = decode_analysis_envelope(run.config_snapshot_json)
             config = envelope.config
             selected_channels = config["selected_channels"]
+            if envelope.is_import:
+                if run.ingress_kind != "IMPORTED":
+                    raise ValueError("explicit import map requires imported audio")
+                selected_channels = envelope.replay_channel_order
             if type(selected_channels) is not tuple or not selected_channels:
                 raise ValueError
             if len(selected_channels) != audio.channel_count:
@@ -527,7 +557,8 @@ class RunScopedPlaybackService:
         samples = loaded.samples
         if (
             type(samples) is not numpy.ndarray
-            or samples.dtype != numpy.dtype("<i2")
+            or samples.dtype not in (numpy.dtype("<i2"), numpy.dtype("<f8"))
+            or (audio.source_kind != "IMPORTED_SOURCE" and samples.dtype != numpy.dtype("<i2"))
             or not samples.flags.owndata
             or not samples.flags.c_contiguous
             or samples.shape != (audio.frame_count, audio.channel_count)
@@ -562,7 +593,8 @@ class RunScopedPlaybackService:
             order="C",
             copy=True,
         )
-        segment /= numpy.float32(32768.0)
+        if samples.dtype == numpy.dtype("<i2"):
+            segment /= numpy.float32(32768.0)
         if (
             type(segment) is not numpy.ndarray
             or not segment.flags.owndata
@@ -678,6 +710,7 @@ class RunScopedPlaybackService:
 
     def _clear_generation(self) -> None:
         self._generation_owned = False
+        self._playback_owner = None
         self._owned_run_id = None
         self._current_run_id = None
         self._stop_requested = False

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 
 from app.service.run_persistence.analysis_result_artifact import (
+    AnalysisResultReadLease,
     AnalysisResultArtifactStore,
     PublishedAnalysisResult,
 )
@@ -268,6 +269,119 @@ class AttemptRepository:
             now,
         )
 
+    def replace_succeeded_result(
+        self,
+        *,
+        attempt_id: str,
+        run_id: str,
+        judgment: Judgment,
+        expected_payload_revision: str,
+        result_payload_json: str,
+        result_payload_zlib: bytes,
+        now: str,
+    ) -> TransactionResult[bool]:
+        """Replace one committed lightweight payload without a new terminal."""
+
+        validate_uuid4(attempt_id)
+        validate_uuid4(run_id)
+        if type(judgment) is not Judgment:
+            raise TypeError("judgment must be an exact Judgment")
+        if (
+            type(expected_payload_revision) is not str
+            or len(expected_payload_revision) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in expected_payload_revision
+            )
+        ):
+            raise ValueError(
+                "expected_payload_revision must be a lowercase sha256 digest"
+            )
+        if type(result_payload_json) is not str or not result_payload_json:
+            raise TypeError("result_payload_json must be a nonempty exact string")
+        if type(result_payload_zlib) is not bytes or not result_payload_zlib:
+            raise TypeError("result_payload_zlib must be nonempty exact bytes")
+        validate_utc_timestamp(now)
+        store = self._result_artifact_store
+        if store is None:
+            raise RuntimeError("result artifact store is required for replacement")
+
+        published = store.publish(
+            attempt_id,
+            judgment.value,
+            result_payload_json,
+            precompressed_zlib=result_payload_zlib,
+            prevalidated_json=True,
+        )
+        replaced_reference: str | None = None
+
+        def replace(database):
+            nonlocal replaced_reference
+            row = database.execute_sql(
+                """
+                SELECT result_payload_json
+                FROM analysis_attempt
+                WHERE attempt_id = ? AND run_id = ?
+                  AND state = 'SUCCEEDED' AND judgment = ?
+                """,
+                (attempt_id, run_id, judgment.value),
+            ).fetchone()
+            if row is None:
+                return False
+            current_reference = row[0]
+            if current_reference == published.reference_json:
+                return False
+            try:
+                current_revision = store.reference_payload_revision(
+                    current_reference
+                )
+            except (TypeError, ValueError, RuntimeError):
+                return False
+            if current_revision != expected_payload_revision:
+                return False
+            cursor = database.execute_sql(
+                """
+                UPDATE analysis_attempt
+                SET result_payload_json = ?, updated_at = ?
+                WHERE attempt_id = ? AND run_id = ?
+                  AND state = 'SUCCEEDED' AND judgment = ?
+                  AND result_payload_json = ?
+                """,
+                (
+                    published.reference_json,
+                    now,
+                    attempt_id,
+                    run_id,
+                    judgment.value,
+                    current_reference,
+                ),
+            )
+            if cursor.rowcount != 1:
+                return False
+            replaced_reference = current_reference
+            return True
+
+        try:
+            result = self._write(replace)
+        except Exception:
+            self._settle_artifact(published, retain=False)
+            raise
+        retain = result.state is TransactionState.UNKNOWN or (
+            result.state is TransactionState.COMMITTED
+            and result.value is True
+        )
+        self._settle_artifact(published, retain=retain)
+        if (
+            result.state is TransactionState.COMMITTED
+            and result.value is True
+            and replaced_reference is not None
+        ):
+            try:
+                store.delete_reference(replaced_reference)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                pass
+        return result
+
     def _finish_and_project(
         self,
         expected_state: AttemptState,
@@ -406,7 +520,8 @@ class AttemptRepository:
                 """,
                 (run_id,),
             ).fetchall()
-        return tuple(self._record(row) for row in rows)
+            leased = self._lease_records(rows)
+        return self._hydrate_records(leased)
 
     def latest_for_run(self, run_id: str) -> AttemptRecord | None:
         validate_uuid4(run_id)
@@ -421,7 +536,12 @@ class AttemptRepository:
                 """,
                 (run_id,),
             ).fetchone()
-        return None if row is None else self._record(row)
+            leased = self._lease_records(() if row is None else (row,))
+        return (
+            None
+            if not leased
+            else self._hydrate_record(*leased[0])
+        )
 
     def latest_successful_for_run(self, run_id: str) -> AttemptRecord | None:
         validate_uuid4(run_id)
@@ -436,21 +556,80 @@ class AttemptRepository:
                 """,
                 (run_id,),
             ).fetchone()
-        return None if row is None else self._record(row)
-
-    def _record(self, row) -> AttemptRecord:
-        record = AttemptRecord(*row)
-        payload = record.result_payload_json
-        if (
-            self._result_artifact_store is None
-            or not self._result_artifact_store.is_reference(payload)
-        ):
-            return record
-        assert payload is not None
-        hydrated = self._result_artifact_store.load_reference(
-            payload,
-            expected_judgment=record.judgment,
+            leased = self._lease_records(() if row is None else (row,))
+        return (
+            None
+            if not leased
+            else self._hydrate_record(*leased[0])
         )
+
+    def _lease_records(
+        self,
+        rows,
+    ) -> tuple[tuple[AttemptRecord, AnalysisResultReadLease | None], ...]:
+        leased: list[tuple[AttemptRecord, AnalysisResultReadLease | None]] = []
+        try:
+            for row in rows:
+                record = AttemptRecord(*row)
+                payload = record.result_payload_json
+                store = self._result_artifact_store
+                lease = None
+                if store is not None and store.is_reference(payload):
+                    assert payload is not None
+                    lease = store.acquire_read_lease(
+                        payload,
+                        expected_judgment=record.judgment,
+                    )
+                leased.append((record, lease))
+        except Exception:
+            store = self._result_artifact_store
+            if store is not None:
+                for _record, lease in leased:
+                    if lease is not None:
+                        try:
+                            store.release_read_lease(lease)
+                        except (OSError, RuntimeError, TypeError, ValueError):
+                            pass
+            raise
+        return tuple(leased)
+
+    def _hydrate_records(
+        self,
+        leased: tuple[
+            tuple[AttemptRecord, AnalysisResultReadLease | None],
+            ...,
+        ],
+    ) -> tuple[AttemptRecord, ...]:
+        hydrated: list[AttemptRecord] = []
+        for index, (record, lease) in enumerate(leased):
+            try:
+                hydrated.append(self._hydrate_record(record, lease))
+            except Exception:
+                store = self._result_artifact_store
+                if store is not None:
+                    for _pending_record, pending_lease in leased[index + 1 :]:
+                        if pending_lease is not None:
+                            try:
+                                store.release_read_lease(pending_lease)
+                            except (OSError, RuntimeError, TypeError, ValueError):
+                                pass
+                raise
+        return tuple(hydrated)
+
+    def _hydrate_record(
+        self,
+        record: AttemptRecord,
+        lease: AnalysisResultReadLease | None,
+    ) -> AttemptRecord:
+        if lease is None:
+            return record
+        store = self._result_artifact_store
+        if store is None:
+            raise RuntimeError("result artifact store changed during hydration")
+        try:
+            hydrated = store.load_read_lease(lease)
+        finally:
+            store.release_read_lease(lease)
         return AttemptRecord(
             attempt_id=record.attempt_id,
             run_id=record.run_id,

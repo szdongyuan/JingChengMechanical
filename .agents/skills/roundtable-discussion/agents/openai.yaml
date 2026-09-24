@@ -1,0 +1,4 @@
+interface:
+  display_name: "Roundtable Discussion"
+  short_description: "Facilitate subagent roundtables for hard decisions."
+  default_prompt: "Use the roundtable discussion skill to examine this uncertain decision from multiple perspectives."
