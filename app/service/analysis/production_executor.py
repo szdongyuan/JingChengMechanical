@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from app.service.ai_threshold import coerce_probability, resolve_effective_decision_threshold
+from app.service.analysis.import_mapping import is_import_mapping, shape_import_config, import_calibration
+
 import hashlib
 import json
 import math
@@ -18,6 +21,7 @@ import numpy as np
 from app.service.analysis import dsp
 from app.service.analysis.golden_reference import FrozenGoldenArtifact
 from app.service.analysis.judgment import JudgmentEngine, _runtime_channel_defaults
+from app.service.analysis.vibration_requirements import configured_vibration_channel
 from app.service.ai_resident_runtime import ResidentToolchainRuntime
 from app.service.analysis.review_payloads import (
     build_chart_payload,
@@ -58,6 +62,7 @@ _TERMINAL_STFT_MAX_TIME_COLUMNS = 512
 _TERMINAL_STFT_MAX_FREQUENCY_ROWS = 1025
 _BUNDLE_METADATA_MAX_BYTES = 256 * 1024
 _DEFERRED_FEATURE = "deferred-to-enrichment"
+_INAPPLICABLE_VIBRATION_FEATURE = "not-applicable-to-vibration"
 
 
 def _enabled(channel: dict, *keys: str) -> bool:
@@ -387,6 +392,34 @@ def _restore_dsp_sample_scale(
     return np.where(pcm >= 0.0, pcm / 32767.0, pcm / 32768.0)
 
 
+def _compress_terminal_stft_time(
+    times: np.ndarray,
+    magnitudes: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Retain continuous-source peaks in uniform display cells, preserving gaps."""
+
+    limit = _TERMINAL_STFT_MAX_TIME_COLUMNS
+    if times.size <= limit:
+        return times, magnitudes
+
+    deltas = np.diff(times)
+    if np.all(np.isfinite(times)) and np.all(deltas > 0.0):
+        hop = float(np.median(deltas))
+        if np.allclose(deltas, hop, rtol=1e-7, atol=0.0):
+            # Consecutive nonempty groups cover every source column exactly once.
+            # Their rounded boundaries differ from ideal cell edges by < one hop.
+            starts = np.arange(limit) * times.size // limit
+            peaks = np.maximum.reduceat(magnitudes, starts, axis=1)
+            left_edge = times[0] - hop / 2
+            width = (times[-1] - times[0] + hop) / limit
+            centers = left_edge + (np.arange(limit) + 0.5) * width
+            return centers, peaks
+
+    # Preserve existing timestamps for genuinely sparse or invalid source axes.
+    indexes = np.linspace(0, times.size - 1, limit, dtype=int)
+    return times[indexes], magnitudes[:, indexes]
+
+
 def _attach_stft_payload(
     *,
     chart_payload: dict,
@@ -456,28 +489,21 @@ def _attach_stft_payload(
         ):
             continue
 
-        # Keep the terminal image bounded without visibly coarsening the
-        # configured STFT.  The default 1024-point STFT now keeps all 513
-        # frequency bins, matching the live image; longer recordings are only
-        # thinned once they exceed the display-oriented time-column budget.
-        time_indexes = np.linspace(
-            0,
-            times.size - 1,
-            min(times.size, _TERMINAL_STFT_MAX_TIME_COLUMNS),
-            dtype=int,
-        )
+        # Keep the configured frequency detail within the existing row budget.
+        # Continuous time compression must not look like missing observations.
         frequency_indexes = np.linspace(
             0,
             frequencies.size - 1,
             min(frequencies.size, _TERMINAL_STFT_MAX_FREQUENCY_ROWS),
             dtype=int,
         )
+        display_times, display_magnitudes = _compress_terminal_stft_time(
+            times, magnitudes[frequency_indexes, :]
+        )
         chart_payload.setdefault(channel_index, {})["stft"] = {
-            "times_sec": times[time_indexes].tolist(),
+            "times_sec": display_times.tolist(),
             "frequencies_hz": frequencies[frequency_indexes].tolist(),
-            "magnitude_db": magnitudes[
-                np.ix_(frequency_indexes, time_indexes)
-            ].tolist(),
+            "magnitude_db": display_magnitudes.tolist(),
             "stft_color_scale_enabled": bool(
                 channel_config.get("stft_color_scale_enabled", False)
             ),
@@ -787,9 +813,10 @@ class ProductionAnalysisExecutor:
             "octave_centers",
             "octave_levels",
         }
-        if {name.split(".")[-1] for name, _array in inventory} != (
-            allowed_array_names
-        ):
+        expected_arrays = allowed_array_names
+        if not bundle.features and is_import_mapping(json.loads(bundle.channel_mapping_json)):
+            expected_arrays = {"source_audio"}
+        if {name.split(".")[-1] for name, _array in inventory} != expected_arrays:
             raise ValueError("analysis bundle ndarray inventory is not closed")
         if any(array.flags.writeable for _name, array in inventory):
             raise ValueError("analysis bundle arrays must be read-only")
@@ -994,6 +1021,7 @@ class ProductionAnalysisExecutor:
         }
         result: list[_ChannelDspFeatures] = []
         empty = lambda: _readonly_array(np.empty(0, dtype=np.float64))
+        vibration_channel = configured_vibration_channel(config)
 
         for channel_index in config.get("selected_channels", []):
             previous = (
@@ -1118,7 +1146,9 @@ class ProductionAnalysisExecutor:
             calls = {}
             for name, call in available_calls.items():
                 previous_value = previous_values.get(name)
-                if (
+                if channel_index == vibration_channel and name in ("spl", "spl_average", "loudness"):
+                    completed[name] = (None, _INAPPLICABLE_VIBRATION_FEATURE)
+                elif (
                     previous_value is not None
                     and previous_value[1] != _DEFERRED_FEATURE
                 ):
@@ -1171,9 +1201,13 @@ class ProductionAnalysisExecutor:
             fft_raw, fft_error = completed["fft"]
             if fft_error is None:
                 fft_frequencies = _readonly_array(fft_raw[0], copy=True)
+                fft_levels = np.asarray(fft_raw[1], dtype=np.float64)
+                if "fft" in calls:
+                    # Fresh DSP values need the pressure reference; cached
+                    # features already contain absolute dB.
+                    fft_levels = fft_levels - 20.0 * math.log10(20e-6)
                 fft_magnitudes = _readonly_array(
-                    np.asarray(fft_raw[1], dtype=np.float64)
-                    - 20.0 * math.log10(20e-6),
+                    fft_levels,
                     copy=True,
                 )
 
@@ -1193,9 +1227,11 @@ class ProductionAnalysisExecutor:
             octave_raw, octave_error = completed["octave"]
             if octave_error is None:
                 octave_centers = _readonly_array(octave_raw[0], copy=True)
+                octave_db = np.asarray(octave_raw[1], dtype=np.float64)
+                if "octave" in calls:
+                    octave_db = octave_db - 20.0 * math.log10(20e-6)
                 octave_levels = _readonly_array(
-                    np.asarray(octave_raw[1], dtype=np.float64)
-                    - 20.0 * math.log10(20e-6),
+                    octave_db,
                     copy=True,
                 )
 
@@ -1254,8 +1290,11 @@ class ProductionAnalysisExecutor:
         config: dict,
         workorder: dict,
         channel_order: list[int],
+        channel_columns: list[int] | None = None,
     ) -> dict:
         toolchain = job.snapshot.ai_toolchain
+        if channel_columns == []:
+            return {"status": "skipped", "reason": "no mapped judgment channels"}
         if toolchain is None:
             return {"status": "skipped"}
         if toolchain.execution_mode != "resident_process":
@@ -1265,6 +1304,10 @@ class ProductionAnalysisExecutor:
             }
 
         params = _decode_object(toolchain.params_json, "AI params")
+        try:
+            resolve_effective_decision_threshold({}, params)
+        except ValueError as exc:
+            return {"status": "configuration_error", "error_message": str(exc)}
         request_id = job.analysis_attempt_id
         duration_ms = int(
             round(
@@ -1296,14 +1339,14 @@ class ProductionAnalysisExecutor:
                     ),
                     "role": "device_1",
                     "audio_path": job.audio.absolute_path,
-                    "channels": list(range(job.audio.channel_count)),
+                    "channels": channel_columns if channel_columns is not None else list(range(job.audio.channel_count)),
                     "source_channels": list(channel_order),
                     "channel_map": [
                         {
                             "logical_channel": column,
                             "source_channel": source,
                         }
-                        for column, source in enumerate(channel_order)
+                        for column, source in zip(channel_columns if channel_columns is not None else range(len(channel_order)), channel_order)
                     ],
                     "duration_ms": duration_ms,
                     "sample_rate": job.audio.sample_rate_hz,
@@ -1392,8 +1435,9 @@ class ProductionAnalysisExecutor:
                 "_diagnostic_request_json": request_json,
                 "_diagnostic_response_json": response_json,
             }
+        threshold, threshold_source = resolve_effective_decision_threshold(ai_result, params)
         score_value = ai_result.get("score")
-        score = (
+        score = coerce_probability(score_value) if threshold_source == "request_params" else (
             float(score_value)
             if type(score_value) in (int, float)
             and math.isfinite(float(score_value))
@@ -1401,20 +1445,18 @@ class ProductionAnalysisExecutor:
         )
         extra = ai_result.get("extra")
         extra = extra if isinstance(extra, dict) else {}
-        threshold_value = extra.get(
-            "decision_threshold",
-            params.get("decision_threshold", 0.5),
-        )
-        threshold = (
-            float(threshold_value)
-            if type(threshold_value) in (int, float)
-            and math.isfinite(float(threshold_value))
-            else 0.5
-        )
         raw_label = ai_result.get("ai_label")
         label = raw_label if isinstance(raw_label, str) else None
         normalized_label = (label or "").strip().upper()
-        if normalized_label in {"PASS", "OK"}:
+        error_message = None
+        status = "success"
+        if threshold_source == "request_params":
+            passed = None if score is None else score >= threshold
+            label = None if passed is None else "PASS" if passed else "FAIL"
+            if score is None:
+                status = "missing_score"
+                error_message = "AI score must be a finite number between 0 and 1 for decision_threshold override"
+        elif normalized_label in {"PASS", "OK"}:
             passed = True
         elif normalized_label in {"FAIL", "NG"}:
             passed = False
@@ -1422,19 +1464,22 @@ class ProductionAnalysisExecutor:
             passed = score is not None and score >= threshold
         reported_channel = extra.get("channel_index")
         channel_index = None
-        if (
+        if channel_columns is not None and type(reported_channel) is int and reported_channel in channel_columns:
+            channel_index = channel_order[channel_columns.index(reported_channel)]
+        elif channel_columns is None and (
             type(reported_channel) is int
             and 0 <= reported_channel < len(channel_order)
         ):
             channel_index = channel_order[reported_channel]
         return {
-            "status": "success",
+            "status": status,
             "threshold": threshold,
+            "decision_threshold_source": threshold_source,
             "score": score,
             "passed": passed,
             "ai_label": label,
             "channel_index": channel_index,
-            "error_message": None,
+            "error_message": error_message,
             "summary": ai_result.get("summary"),
             "_diagnostic_work_dir": work_dir,
             "_diagnostic_request_json": request_json,
@@ -1482,11 +1527,20 @@ class ProductionAnalysisExecutor:
                 job.snapshot.channel_mapping_json,
                 "channel mapping",
             )
+            imported = is_import_mapping(mapping_raw)
+            shaped = None
+            if imported:
+                if job.audio.storage_kind.value != "imported_final_audio":
+                    raise ValueError("explicit import map requires imported audio")
+                shaped = shape_import_config(config, mapping_raw, audio.sample_rate_hz, audio.channel_count,
+                    frozen_golden_channels=frozenset(index for config_id, index in self._golden if config_id == config.get("config_id")))
+                config = shaped["judgment_config"]
+                calibration = import_calibration(calibration, config["selected_channels"])
             selected = config.get("selected_channels")
             channels = config.get("channels")
             if (
                 type(selected) is not list
-                or not selected
+                or (not selected and not imported)
                 or any(type(index) is not int or index < 0 for index in selected)
                 or len(set(selected)) != len(selected)
                 or type(channels) is not list
@@ -1522,15 +1576,15 @@ class ProductionAnalysisExecutor:
                 for index in selected
             ):
                 raise ValueError("SPL weighting must be A, C, or Z")
-            if (
+            if not imported and (
                 set(mapping_raw) != {"schema", "channel_order"}
                 or mapping_raw.get("schema") != "audio-channel-map/v1"
                 or type(mapping_raw.get("channel_order")) is not list
             ):
                 raise ValueError("channel mapping is invalid")
-            channel_order = mapping_raw["channel_order"]
+            channel_order = list(selected) if imported else mapping_raw["channel_order"]
             if (
-                not channel_order
+                (not channel_order and not imported)
                 or any(
                     type(channel_index) is not int or channel_index < 0
                     for channel_index in channel_order
@@ -1542,6 +1596,8 @@ class ProductionAnalysisExecutor:
                 channel_index: column_index
                 for column_index, channel_index in enumerate(channel_order)
             }
+            if imported:
+                mapping = shaped["judgment_channel_column_map"]
             if (
                 set(mapping) != set(selected)
                 or len(set(mapping.values())) != len(mapping)
@@ -1615,7 +1671,7 @@ class ProductionAnalysisExecutor:
                 loudness_trace_cache=loudness_trace_cache,
                 channel_features=feature_map,
                 run_ai=False,
-                allow_golden_runtime_resample=False,
+                allow_golden_runtime_resample=imported,
             )
             _validate_legacy_result(
                 result,
@@ -1643,6 +1699,7 @@ class ProductionAnalysisExecutor:
                 config=config,
                 workorder=workorder,
                 channel_order=channel_order,
+                channel_columns=[mapping[index] for index in channel_order] if imported else None,
             )
             stage_timer.finish(AnalysisTimingBoundary.RESIDENT_AI_RESPONSE)
             stage_timer.start(AnalysisTimingBoundary.DECISION_PROJECTION)
@@ -1659,6 +1716,8 @@ class ProductionAnalysisExecutor:
             result.ai_score = (
                 float(ai_score) if type(ai_score) is float else None
             )
+            if shaped and shaped["forced_no_results"]:
+                result.limit_pass = False
             result.overall = (
                 "合格"
                 if result.limit_pass and result.ai_pass is not False
@@ -1666,6 +1725,9 @@ class ProductionAnalysisExecutor:
             )
             judgment = "PASS" if result.overall == "合格" else "FAIL"
             judgment_payload = _plain_result(result)
+            if shaped:
+                from app.service.analysis.imported_audio import _apply_forced_no_results
+                _apply_forced_no_results(judgment_payload, forced_no_results=shaped["forced_no_results"])
             current_trace_payload = None
             if job.snapshot.current_trace_json:
                 stored_trace = _decode_object(
@@ -1700,13 +1762,17 @@ class ProductionAnalysisExecutor:
                 ai_review=ai_review,
                 chart_payload=summary_chart_payload,
             )
-            if _has_deferred_features(features):
+            if _has_deferred_features(features) and not (shaped and shaped["forced_no_results"]):
                 summary_payload["overall_status"] = (
                     "pass" if judgment == "PASS" else "fail"
                 )
                 summary_payload["overall_label"] = judgment
                 summary_payload["error_message"] = None
+            if shaped:
+                from app.service.analysis.imported_audio import _mark_forced_no_result_summary_rows
+                _mark_forced_no_result_summary_rows(summary_payload, forced_no_results=shaped["forced_no_results"])
             duration_sec = float(audio.frame_count) / float(audio.sample_rate_hz)
+            display_config = shaped["chart_config"] if shaped else config
             result_without_charts = _plain_result(
                 {
                     "legacy_overall": str(result.overall),
@@ -1730,7 +1796,13 @@ class ProductionAnalysisExecutor:
                         "workorder": workorder,
                     },
                     "displayed_config_id": config_id,
-                    "config_payload": config,
+                    "config_payload": {
+                        **display_config,
+                        "channels": [
+                            {key: value for key, value in channel.items() if key != "_frozen_golden_artifact"}
+                            for channel in display_config.get("channels", [])
+                        ],
+                    },
                     "captured_duration_sec": duration_sec,
                     "default_window": {
                         "start_sec": float(result.analysis_window[0]),
@@ -1746,6 +1818,13 @@ class ProductionAnalysisExecutor:
                     "chart_payload": {},
                 }
             )
+            if shaped:
+                result_without_charts["review"]["import"] = {
+                    "display_channel_labels": _plain_result(shaped["display_channel_labels"]),
+                    "warnings": _plain_result(shaped["warnings"]),
+                    "channel_mapping": mapping_raw,
+                    "current_available": False,
+                }
             token = AnalysisBundleToken(
                 slot_id=0,
                 bundle_id=uuid.uuid4().hex,
@@ -1852,12 +1931,20 @@ class ProductionAnalysisExecutor:
                 bundle.channel_mapping_json.decode("utf-8"),
                 "channel mapping",
             )
+            imported = is_import_mapping(mapping_raw)
+            shaped = shape_import_config(config, mapping_raw, bundle.sample_rate_hz, bundle.channel_count,
+                frozen_golden_channels=frozenset(index for config_id, index in self._golden if config_id == config.get("config_id"))) if imported else None
+            if imported:
+                config = shaped["judgment_config"]
+                calibration = import_calibration(calibration, config["selected_channels"])
             channel_mapping = {
                 channel_index: column_index
                 for column_index, channel_index in enumerate(
-                    mapping_raw["channel_order"]
+                    mapping_raw.get("channel_order", [])
                 )
             }
+            if imported:
+                channel_mapping = shaped["judgment_channel_column_map"]
             config_id = config.get("config_id")
             for channel in config.get("channels", []):
                 channel_index = channel.get("channel_index")
@@ -1906,7 +1993,7 @@ class ProductionAnalysisExecutor:
                     loudness_trace_cache={},
                     channel_features=feature_map,
                     run_ai=False,
-                    allow_golden_runtime_resample=False,
+                    allow_golden_runtime_resample=imported,
                 )
                 selected = config.get("selected_channels", [])
                 by_index = {
@@ -1928,6 +2015,8 @@ class ProductionAnalysisExecutor:
                 )
                 full_judgment.ai_pass = result_without_charts["ai_pass"]
                 full_judgment.ai_score = result_without_charts["ai_score"]
+                if shaped and shaped["forced_no_results"]:
+                    full_judgment.limit_pass = False
                 full_judgment.overall = (
                     "合格"
                     if full_judgment.limit_pass
@@ -1939,6 +2028,9 @@ class ProductionAnalysisExecutor:
                 ) != bundle.judgment:
                     raise ValueError("enrichment changed the Decision judgment")
                 judgment_payload = _plain_result(full_judgment)
+                if shaped:
+                    from app.service.analysis.imported_audio import _apply_forced_no_results
+                    _apply_forced_no_results(judgment_payload, forced_no_results=shaped["forced_no_results"])
             else:
                 judgment_payload = result_without_charts["judgment_payload"]
             ai_review = _decode_object(
@@ -1997,8 +2089,31 @@ class ProductionAnalysisExecutor:
                     ai_review=ai_review,
                     chart_payload=summary_chart_payload,
                 )
+                if imported:
+                    # The full judgment was checked above. Optional measurements
+                    # must not replace the already committed import verdict.
+                    for key in ("overall_status", "overall_label"):
+                        summary_payload[key] = result_without_charts["summary_payload"][key]
             else:
                 summary_payload = result_without_charts["summary_payload"]
+            if shaped:
+                from app.service.analysis.imported_audio import _mark_forced_no_result_summary_rows
+                _mark_forced_no_result_summary_rows(summary_payload, forced_no_results=shaped["forced_no_results"])
+            if imported:
+                # Chart-only channels receive features without entering judgment or AI.
+                config = shaped["chart_config"]
+                for channel in config["channels"]:
+                    artifact = self._golden.get((config.get("config_id"), channel["channel_index"]))
+                    if artifact is not None:
+                        channel["_frozen_golden_artifact"] = artifact
+                channel_mapping = shaped["chart_channel_column_map"]
+                full_features = self._build_channel_features(
+                    samples=restored_samples, sample_rate=bundle.sample_rate_hz, config=config,
+                    calibration=calibration, mapping=channel_mapping,
+                    start_sec=bundle.token.identity.window_start_seconds,
+                    end_sec=bundle.token.identity.window_end_seconds,
+                    existing_features=feature_map)
+                feature_map = self._feature_map(full_features)
             chart_payload = build_chart_payload(
                 buffer=bundle.source_audio,
                 config=config,
@@ -2012,7 +2127,7 @@ class ProductionAnalysisExecutor:
                 channel_column_map=channel_mapping,
                 loudness_trace_cache=loudness_trace_cache,
                 channel_features=feature_map,
-                allow_golden_runtime_resample=False,
+                allow_golden_runtime_resample=imported,
                 current_trace_payload=current_trace_payload,
             )
             _attach_stft_payload(

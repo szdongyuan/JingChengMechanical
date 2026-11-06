@@ -2256,3 +2256,18 @@ def test_import_package_without_ai_metadata_clears_binding_without_mutating_loca
     assert binding["toolchain_id"] is None
     assert toolchain.package_dir == str(local_package_dir)
     assert toolchain.updated_time == original.updated_time
+
+def test_threshold_params_package_roundtrip(tmp_path, services, monkeypatch):
+    monkeypatch.setattr(config_package_module, 'base_dir', str(tmp_path))
+    params = {'decision_threshold': 0.12345678901234568, 'mode': 'keep'}
+    path = _write_package(tmp_path / 'threshold.dy', _package_entries(
+        include_ai_metadata=True, include_ai_package=True,
+        toolchain_overrides={'params_json': json.dumps(params)}))
+    imported = services.config_package_service.import_package(str(path), ConfigPackageImportDecision())
+    assert json.loads(services.ai_service.resolve_binding(imported.config_id)['params_json']) == params
+    exported = tmp_path / 'threshold-export.dy'
+    services.config_package_service.export_package(
+        config_id=imported.config_id, target_path=str(exported),
+        options=ConfigPackageExportOptions(include_ai_toolchain=True, include_ai_package=True))
+    with zipfile.ZipFile(exported) as archive:
+        assert json.loads(json.loads(archive.read('ai/toolchain.json'))['params_json']) == params

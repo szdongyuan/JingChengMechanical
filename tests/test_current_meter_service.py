@@ -919,3 +919,174 @@ def test_plc_current_collector_logs_repeated_callback_error_once():
 
     assert [sample.current_a for sample in collector.samples()] == [1.0, 2.0]
     assert logs == ["PLC 电流样本回调失败: callback boom"]
+
+
+def test_delayed_plc_collector_replays_original_trigger_then_live_exactly_once():
+    from app.service.plc_current_history import PlcCurrentHistory
+
+    bus = EventBus()
+    history = PlcCurrentHistory(bus=bus, plc_ids=(7, 8), monotonic=lambda: 10.5)
+    bus.plc_current_sampled.emit(7, 9.9, 99.0)
+    bus.plc_current_sampled.emit(7, 10.0, 0.0)
+    bus.plc_current_sampled.emit(8, 10.1, 88.0)
+    bus.plc_current_sampled.emit(7, 10.2, 2.0)
+    callbacks = []
+    collector = PlcCurrentCollector(
+        {"enabled": True, "source": "plc"}, bus=bus, plc_id=7,
+        time_origin=10.0, time_func=lambda: 10.5, history=history,
+        sample_callback=lambda sample, snapshot: callbacks.append(sample),
+    )
+    try:
+        assert collector.start() is True
+        assert collector.start() is True
+        bus.plc_current_sampled.emit(7, 10.5, 5.0)
+        collector.stop()
+        bus.plc_current_sampled.emit(7, 10.6, 6.0)
+        assert [(s.time_sec, s.current_a) for s in collector.samples()] == [
+            (0.0, 0.0), (pytest.approx(0.2), 2.0), (0.5, 5.0)]
+        assert callbacks == collector.samples()
+    finally:
+        collector.stop()
+        history.close()
+
+
+@pytest.mark.parametrize("expiry", ["time", "capacity"])
+def test_current_history_rejects_evicted_trigger_and_clears_on_close(expiry):
+    from app.service.plc_current_history import PlcCurrentHistory, CurrentHistoryUnavailable
+    bus = EventBus()
+    now = [10.0]
+    history = PlcCurrentHistory(bus=bus, plc_ids=(7,), monotonic=lambda: now[0])
+    bus.plc_current_sampled.emit(7, 10.0, 1.0)
+    if expiry == "time":
+        now[0] = 20.1
+    else:
+        for i in range(4096):
+            bus.plc_current_sampled.emit(7, 10.1 + i / 10000, float(i))
+    with pytest.raises(CurrentHistoryUnavailable, match="evicted"):
+        history.subscribe(7, 10.0, lambda *_args: None)
+    assert len(history._samples[7]) <= 4096
+    history.close()
+    history.close()
+    bus.plc_current_sampled.emit(7, 12.2, 3.0)
+    assert not history._samples[7]
+    assert not history._evicted_through
+    with pytest.raises(CurrentHistoryUnavailable, match="not armed"):
+        history.subscribe(7, 12.2, lambda *_args: None)
+
+
+def test_current_history_empty_arm_invalid_samples_and_new_trigger():
+    from app.service.plc_current_history import PlcCurrentHistory
+    bus = EventBus()
+    history = PlcCurrentHistory(bus=bus, plc_ids=(7,), monotonic=lambda: 10.5)
+    received = []
+    subscriber = history.subscribe(7, 10.0, lambda *args: received.append(args))
+    subscriber.drain()
+    assert received == []
+    for stamp, value in [(float("nan"), 1.0), (10.2, float("inf"))]:
+        bus.plc_current_sampled.emit(7, stamp, value)
+    bus.plc_current_sampled.emit(8, 10.2, 88.0)
+    bus.plc_current_sampled.emit(7, 10.1, 1.0)
+    subscriber.close()
+    bus.plc_current_sampled.emit(7, 10.3, 3.0)
+    assert received == [(7, 10.1, 1.0)]
+    received.clear()
+    new = history.subscribe(7, 10.2, lambda *args: received.append(args))
+    new.drain()
+    assert received == [(7, 10.3, 3.0)]
+    history.close()
+
+
+def test_history_concurrent_live_waits_behind_replay_without_blocking_other_plc():
+    from app.service.plc_current_history import PlcCurrentHistory
+    bus = EventBus()
+    history = PlcCurrentHistory(bus=bus, plc_ids=(7, 8), monotonic=lambda: 10.5)
+    bus.plc_current_sampled.emit(7, 10.1, 1.0)
+    bus.plc_current_sampled.emit(7, 10.2, 2.0)
+    replay_entered, release, live_queued = (threading.Event() for _ in range(3))
+    received, other = [], []
+    def callback(_plc, _stamp, value):
+        received.append(value)
+        if value == 1.0:
+            replay_entered.set()
+            assert release.wait(2.0)
+    subscriber = history.subscribe(7, 10.0, callback)
+    second = history.subscribe(8, 10.0, lambda *args: other.append(args))
+    original_drain = subscriber.drain
+    def drain():
+        live_queued.set()
+        original_drain()
+    replay = threading.Thread(target=original_drain)
+    replay.start()
+    assert replay_entered.wait(2.0)
+    subscriber.drain = drain
+    live = threading.Thread(target=lambda: bus.plc_current_sampled.emit(7, 10.3, 3.0))
+    live.start()
+    try:
+        assert live_queued.wait(2.0)
+        bus.plc_current_sampled.emit(8, 10.3, 8.0)
+        assert other == [(8, 10.3, 8.0)]
+        assert received == [1.0]
+    finally:
+        release.set()
+        replay.join(2.0)
+        live.join(2.0)
+        history.close()
+    assert not replay.is_alive() and not live.is_alive()
+    assert received == [1.0, 2.0, 3.0]
+
+
+@pytest.mark.parametrize("with_history", [False, True])
+def test_plc_stop_waits_for_callback_and_prevents_later_callbacks(with_history):
+    from app.service.plc_current_history import PlcCurrentHistory
+    bus = EventBus()
+    history = PlcCurrentHistory(bus=bus, plc_ids=(7,), monotonic=lambda: 10.5) if with_history else None
+    entered, release, stopping, stopped = (threading.Event() for _ in range(4))
+    callbacks = []
+    def callback(sample, _snapshot):
+        entered.set()
+        assert release.wait(2.0)
+        callbacks.append(sample)
+    collector = PlcCurrentCollector(
+        {"enabled": True, "source": "plc"}, bus=bus, plc_id=7,
+        time_origin=10.0, history=history, sample_callback=callback)
+    assert collector.start()
+    publisher = threading.Thread(target=lambda: bus.plc_current_sampled.emit(7, 10.1, 1.0))
+    def stop():
+        stopping.set()
+        collector.stop()
+        stopped.set()
+    stopper = threading.Thread(target=stop)
+    publisher.start()
+    assert entered.wait(2.0)
+    stopper.start()
+    assert stopping.wait(2.0)
+    try:
+        assert not stopped.wait(0.1)
+    finally:
+        release.set()
+        publisher.join(2.0)
+        stopper.join(2.0)
+    assert stopped.is_set()
+    bus.plc_current_sampled.emit(7, 10.2, 2.0)
+    assert len(callbacks) == len(collector.samples()) == 1
+    if history:
+        history.close()
+
+
+def test_expired_history_collector_start_fails_without_replaying_partial_tail():
+    from app.service.plc_current_history import PlcCurrentHistory
+    bus = EventBus()
+    now = [10.0]
+    history = PlcCurrentHistory(bus=bus, plc_ids=(7,), monotonic=lambda: now[0])
+    bus.plc_current_sampled.emit(7, 10.0, 1.0)
+    now[0] = 20.1
+    bus.plc_current_sampled.emit(7, 20.1, 2.0)
+    logs = []
+    collector = PlcCurrentCollector({"enabled": True, "source": "plc"},
+        bus=bus, plc_id=7, time_origin=10.0, history=history, log_callback=logs.append)
+    assert collector.start() is False
+    bus.plc_current_sampled.emit(7, 20.2, 3.0)
+    assert collector.samples() == []
+    assert any("evicted" in message for message in logs)
+    collector.stop()
+    history.close()

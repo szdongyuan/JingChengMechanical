@@ -13,6 +13,7 @@ from uuid import uuid4
 import wave
 
 import numpy
+from app.service.audio_wav import decode_wav, probe_wav
 
 from app.service.analysis.scheduler import (
     AnalysisError,
@@ -177,7 +178,8 @@ def _reference_matches_fact(
         and reference.sample_rate_hz == fact.sample_rate_hz
         and reference.channel_count == fact.channel_count
         and reference.frame_count == fact.frame_count
-        and reference.dtype == "<i2"
+        and reference.dtype == ("<f8" if fact.source_kind == "IMPORTED_SOURCE" else "<i2")
+        and (reference.source_container_format is None or reference.source_container_format == fact.container_format)
         and reference.content_revision == f"{fact.audio_id}:{fact.byte_size}"
     )
 
@@ -286,7 +288,8 @@ def _build_reference(
         sample_rate_hz=fact.sample_rate_hz,
         channel_count=fact.channel_count,
         frame_count=fact.frame_count,
-        dtype="<i2",
+        dtype="<f8" if storage_kind is AudioStorageKind.IMPORTED_FINAL_AUDIO else "<i2",
+        source_container_format=fact.container_format if storage_kind is AudioStorageKind.IMPORTED_FINAL_AUDIO else None,
         content_revision=f"{fact.audio_id}:{fact.byte_size}",
     )
 
@@ -724,7 +727,7 @@ class ProductionRunAudioAdapter:
             final_path=request.final_path,
             sample_rate_hz=request.expected_sample_rate_hz,
             channel_count=request.expected_channel_count,
-            sample_width_bytes=2,
+            sample_width_bytes=probe_wav(request.source_path).sample_width_bytes,
             expected_frame_count=request.expected_frame_count,
             source_frame_count=request.expected_frame_count,
             now=request.now,
@@ -743,7 +746,8 @@ class ProductionRunAudioAdapter:
                 AnalysisErrorCategory.AUDIO_FORMAT_MISMATCH,
                 "audio reference is invalid",
             )
-        if reference.dtype != "<i2":
+        imported_float = (reference.storage_kind is AudioStorageKind.IMPORTED_FINAL_AUDIO and reference.dtype == "<f8")
+        if reference.dtype != "<i2" and not imported_float:
             _raise_load_error(
                 AnalysisErrorCategory.AUDIO_FORMAT_MISMATCH,
                 "audio dtype is not little-endian PCM16",
@@ -781,6 +785,22 @@ class ProductionRunAudioAdapter:
                 AnalysisErrorCategory.AUDIO_REFERENCE_CHANGED,
                 "audio reference byte size changed",
             )
+
+        if imported_float:
+            try:
+                decoded = decode_wav(path)
+            except (OSError, ValueError) as exc:
+                _raise_load_error(AnalysisErrorCategory.AUDIO_FORMAT_MISMATCH, str(exc))
+            metadata = decoded.metadata
+            if reference.source_container_format is not None and metadata.container_format != reference.source_container_format:
+                _raise_load_error(AnalysisErrorCategory.AUDIO_REFERENCE_CHANGED, "audio container format changed")
+            if (metadata.sample_rate_hz, metadata.channel_count, metadata.frame_count) != (
+                reference.sample_rate_hz, reference.channel_count, reference.frame_count
+            ):
+                _raise_load_error(AnalysisErrorCategory.AUDIO_REFERENCE_CHANGED, "audio metadata changed")
+            _check_cancel(cancel_token)
+            return _OwnedLoadedAudio(decoded.samples.copy(order="C"), metadata.sample_rate_hz,
+                                     metadata.channel_count, metadata.frame_count)
 
         try:
             reader = wave.open(str(path), "rb")

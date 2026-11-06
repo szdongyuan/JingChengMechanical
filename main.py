@@ -12,14 +12,22 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
 os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-from PyQt6.QtGui import QIcon
-from PyQt6.QtWidgets import QApplication, QMessageBox
+# Source spawn re-imports this file as __mp_main__. Keep that path free of
+# GUI, database and analysis initialization. Named seams remain injectable.
+QIcon = QApplication = QMessageBox = MainWindow = None
+DatabaseStartupError = ServiceContainer = asset_path = LoginWindow = None
 
-from app.main_window import MainWindow
-from app.service.db_connection_service import DatabaseStartupError
-from app.services_container import ServiceContainer
-from base.utils import asset_path
-from ui.modules.login import LoginWindow
+
+def _load_gui_dependencies():
+    global QIcon, QApplication, QMessageBox, MainWindow
+    global DatabaseStartupError, ServiceContainer, asset_path, LoginWindow
+    from PyQt6.QtGui import QIcon
+    from PyQt6.QtWidgets import QApplication, QMessageBox
+    from app.main_window import MainWindow
+    from app.service.db_connection_service import DatabaseStartupError
+    from app.services_container import ServiceContainer
+    from base.utils import asset_path
+    from ui.modules.login import LoginWindow
 
 
 DATABASE_STARTUP_ERROR_TITLE = "数据库启动失败"
@@ -35,6 +43,7 @@ def _database_startup_error_message(error: Exception) -> str:
 
 
 def run_app(argv=None) -> int:
+    _load_gui_dependencies()
     app = QApplication(sys.argv if argv is None else argv)
 
     icon_path = asset_path("logo.ico")

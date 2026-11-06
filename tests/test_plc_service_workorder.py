@@ -116,3 +116,46 @@ def test_rising_edge_start_callback_receives_plc_product_model():
         "rotation_speed": 1500,
     }
     assert type(callbacks[0][2]) is int
+
+
+def test_start_workorder_reads_only_business_fields_without_slow_result_diagnostics():
+    callbacks = []
+    service = _polling_service(start_values=[False, True], workorder_values={},
+        on_start=lambda *args: callbacks.append(args))
+    service.logger.warning = lambda message: None
+    service._field_offsets_dict = {
+        "sn_code_offset": 10, "product_model_offset": 20,
+        "rotation_speed_offset": 30, "res_score_offset": 40,
+        "start_signal_offset": "0.0", "current_value_offset": 50,
+    }
+    service.read_plc_values = PlcService.read_plc_values.__get__(service)
+    reads = []
+    def read(offset, value_type, string_size=254):
+        reads.append(offset)
+        if offset == 40:
+            raise TimeoutError("unavailable diagnostic register")
+        return {10: "SN-7", 20: "MODEL-X", 30: 1500}.get(offset)
+    service.read_offset_value = read
+    service.poll_once()
+    service.poll_once()
+    assert reads == [10, 20, 30]
+    assert callbacks[0][1] == {"sn": "SN-7", "model": "MODEL-X", "rotation_speed": 1500}
+
+
+def test_start_reset_failure_is_logged_without_escaping_poll():
+    callbacks, errors = [], []
+    service = _polling_service(start_values=[False, True], workorder_values={},
+        on_start=lambda *args: callbacks.append(args))
+    service._auto_reset_bit = True
+    service._field_offsets_dict = {"start_signal_offset": "0.0"}
+    service.logger.error = errors.append
+    attempts = []
+    def reset(*args):
+        attempts.append(args)
+        raise OSError('reset offline')
+    service.write_plc_value = reset
+    service.poll_once()
+    service.poll_once()
+    assert len(callbacks) == 1
+    assert attempts == [('0.0', 'bool', False)]
+    assert any('reset offline' in error for error in errors)

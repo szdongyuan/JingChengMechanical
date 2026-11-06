@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import re
+from uuid import uuid4
 
-from PyQt6.QtCore import QMetaObject, QThread, Qt
+from PyQt6.QtCore import QMetaObject, QThread, Qt, pyqtSlot
 from PyQt6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -24,6 +26,7 @@ from app.service.plc_service import PlcService
 from model.plc_field_offset_table import PlcFieldOffsetTable
 from model.plc_process_param_offset_table import PlcProcessParamOffsetTable
 from model.plc_table import PlcTable
+from ui.popups.torque_settings_dialog import TorqueSettingsDialog
 
 PLC_FIELD_OFFSETS = [
     ("start_signal_offset", "启动信号 StartSignal"),
@@ -304,6 +307,10 @@ class PlcSettingsModule(QWidget):
         super().__init__()
         self.logger = LogManager.set_log_handler("core")
         self.services = services
+        self._torque_delete_requests = {}
+        self._disconnecting_threads = set()
+        if getattr(services, 'torque_jobs', None) is not None:
+            services.torque_jobs.finished.connect(self._on_torque_job_finished)
         # plc_services 是挂在ServiceContainer 容器对象上的一个属性
         self.services.plc_services = {}
         self.services.plc_threads = {}
@@ -312,6 +319,7 @@ class PlcSettingsModule(QWidget):
         self.services.process_plc_thread = None
         self.services.process_plc_state = "未连接"
         self.process_param_dialog = None
+        self.torque_dialog = None
 
         self.init_ui()
         self.init_fun()
@@ -325,7 +333,7 @@ class PlcSettingsModule(QWidget):
 
         # 顶部下拉框只显示 PLC 的 id。
         self.combo_plc = QComboBox()
-        self.combo_plc.setMinimumWidth(220)
+        self.combo_plc.setMinimumWidth(160)
         # 新增/删除 PLC：只处理数据库里的 PLC 配置和对应偏移配置。
         self.btn_add_plc = QPushButton("新增 PLC")
         self.btn_add_plc.setObjectName("Primary")
@@ -382,37 +390,32 @@ class PlcSettingsModule(QWidget):
         form.addRow("连接状态：", self.lb_connect_state)
         root.addLayout(form)
 
-        btn_row = QHBoxLayout()
+        btn_row = QGridLayout()
         btn_row.setContentsMargins(0, 0, 0, 0)
-        btn_row.setSpacing(20)
+        btn_row.setSpacing(10)
 
         self.btn_field_offset = QPushButton("偏移设置")
         self.btn_field_offset.setObjectName("Primary")
-        self.btn_field_offset.setFixedWidth(96)
 
         self.btn_process_param_offset = QPushButton("工艺")
         self.btn_process_param_offset.setObjectName("Primary")
-        self.btn_process_param_offset.setFixedWidth(96)
+
+        self.btn_torque = QPushButton("扭矩")
+        self.btn_torque.setObjectName("Primary")
 
         self.btn_save = QPushButton("保存")
         self.btn_save.setObjectName("Primary")
-        self.btn_save.setFixedWidth(96)
 
         self.btn_toggle = QPushButton("开启")
         self.btn_toggle.setObjectName("Primary")
-        self.btn_toggle.setFixedWidth(96)
 
         self.btn_connect = QPushButton("连接")
         self.btn_connect.setObjectName("Primary")
-        self.btn_connect.setFixedWidth(96)
 
-        btn_row.addStretch(1)
-        btn_row.addWidget(self.btn_field_offset)
-        btn_row.addWidget(self.btn_process_param_offset)
-        btn_row.addWidget(self.btn_save)
-        btn_row.addWidget(self.btn_toggle)
-        btn_row.addWidget(self.btn_connect)
-        btn_row.addStretch(1)
+        for index, button in enumerate((self.btn_field_offset, self.btn_process_param_offset,
+                                        self.btn_torque, self.btn_save, self.btn_toggle,
+                                        self.btn_connect)):
+            btn_row.addWidget(button, index // 3, index % 3)
         root.addLayout(btn_row)
         root.addStretch(1)
 
@@ -426,6 +429,7 @@ class PlcSettingsModule(QWidget):
         self.btn_connect.clicked.connect(self.connect_plc)
         self.btn_field_offset.clicked.connect(self.open_field_offset_dialog)
         self.btn_process_param_offset.clicked.connect(self.open_process_param_offset_dialog)
+        self.btn_torque.clicked.connect(self.open_torque_dialog)
         for edit in (
                 self.ed_name,
                 self.ed_ip,
@@ -472,6 +476,7 @@ class PlcSettingsModule(QWidget):
         self.btn_connect.setEnabled(has_rows)
         self.btn_field_offset.setEnabled(has_rows)
         self.btn_process_param_offset.setEnabled(has_rows)
+        self.btn_torque.setEnabled(has_rows)
         self._set_fields_enabled(has_rows)
 
         if has_rows:
@@ -554,6 +559,7 @@ class PlcSettingsModule(QWidget):
         self.btn_delete_plc.setEnabled(False)
         self.btn_field_offset.setEnabled(False)
         self.btn_process_param_offset.setEnabled(False)
+        self.btn_torque.setEnabled(False)
 
     def add_plc(self):
         try:
@@ -600,26 +606,38 @@ class PlcSettingsModule(QWidget):
 
         row_id = row.id
         try:
+            self.services.torque_jobs.cancel_pending_config(row_id)
             # 删除前先断开当前 PLC，避免后台线程还在读写这条配置。
             self.disconnect_row(row_id)
-            # 先删偏移配置，再删 PLC 主配置。
-            PlcFieldOffsetTable.delete().where(
-                PlcFieldOffsetTable.plc_id == row_id
-            ).execute()
-            deleted = PlcTable.delete().where(PlcTable.id == row_id).execute()
-            if deleted == 0:
-                QMessageBox.warning(self, "提示", f"PLC {row_id} 删除失败")
-                return
-            # 清掉顶部状态栏使用的状态缓存。
-            self.services.plc_state.pop(row_id, None)
-            self.reload_rows()
-            self._emit_plc_changed()
-            refresh_plc_labels = getattr(self.window(), "_refresh_plc_state_labels", None)
-            if callable(refresh_plc_labels):
-                refresh_plc_labels()
-            QMessageBox.information(self, "成功", f"PLC {row_id} 删除成功!")
+            thread = self.services.plc_threads.get(row_id)
+            if (self.services.plc_services.get(row_id) is not None
+                    or (thread is not None and thread.isRunning())):
+                raise RuntimeError('PLC 尚未完成断开，请稍后重试')
+            request_id = self.services.torque_jobs.submit('delete_plc', row_id)
+            self._torque_delete_requests[request_id] = row_id
+            self.btn_delete_plc.setEnabled(False)
         except Exception as exc:
             QMessageBox.warning(self, "提示", f"删除 PLC 失败: {exc}")
+
+    @pyqtSlot(object)
+    def _on_torque_job_finished(self, result):
+        row_id = self._torque_delete_requests.pop(result.request_id, None)
+        if row_id is None:
+            return
+        if result.cancelled:
+            self.reload_rows()
+            return
+        if result.error is not None:
+            self.reload_rows()
+            QMessageBox.warning(self, "提示", f"删除 PLC 失败: {result.error}")
+            return
+        self.services.plc_state.pop(row_id, None)
+        self.reload_rows()
+        self._emit_plc_changed()
+        refresh_plc_labels = getattr(self.window(), "_refresh_plc_state_labels", None)
+        if callable(refresh_plc_labels):
+            refresh_plc_labels()
+        QMessageBox.information(self, "成功", f"PLC {row_id} 删除成功!")
 
     def open_field_offset_dialog(self):
         row = self.get_current_row()
@@ -805,6 +823,25 @@ class PlcSettingsModule(QWidget):
             self.services.bus.log.emit(f"读取工艺参数失败: {exc}")
         return result
 
+    def _torque_inherited_db(self, plc_id):
+        service = self.services.plc_services.get(plc_id)
+        if service is not None and self.get_plc_state(plc_id) == '已连接':
+            return service._db_number
+        row = PlcTable.get_or_none(PlcTable.id == plc_id)
+        if row is None:
+            raise ValueError('PLC 已删除或不存在')
+        return row.plc_db_number
+
+    def open_torque_dialog(self):
+        row = self.get_current_row()
+        if row is None:
+            return
+        if self.torque_dialog is not None:
+            self.torque_dialog.close()
+        self.torque_dialog = TorqueSettingsDialog(
+            self.services, row.id, lambda plc_id=row.id: self._torque_inherited_db(plc_id), self)
+        self.torque_dialog.show()
+
     def get_field_offsets(self, plc_id):
         offset_row = (
             PlcFieldOffsetTable
@@ -852,6 +889,7 @@ class PlcSettingsModule(QWidget):
             self.btn_save.setText("保存")
             self.logger.info(f"PLC {row.id} 保存成功")
             self.services.bus.log.emit(f"PLC {row.id} 保存成功")
+            self._emit_plc_changed()
             QMessageBox.information(self, "成功", f"PLC {row.id}      配置保存成功!")
         except Exception as exc:
             self.logger.error(f"保存 PLC 配置失败: {exc}")
@@ -909,6 +947,8 @@ class PlcSettingsModule(QWidget):
         self.start_connect(row)
 
     def start_connect(self, row):
+        if row.id in getattr(self, '_torque_delete_requests', {}).values():
+            return
         if self.get_plc_state(row.id) != "未连接":
             return
         old_service = self.services.plc_services.get(row.id)
@@ -933,6 +973,10 @@ class PlcSettingsModule(QWidget):
             auto_reset_bit=True,
             field_offsets_dict=field_offsets_dict,
             plc_id=row.id,
+            torque_store=getattr(self.services, 'torque_store', None),
+            torque_config=(self.services.torque_store.get_config(row.id)
+                           if getattr(self.services, 'torque_store', None) is not None else None),
+            service_generation=uuid4().hex,
         )
 
         connect_thread = QThread(self)
@@ -945,15 +989,19 @@ class PlcSettingsModule(QWidget):
             self.btn_connect.setEnabled(False)
         self.services.plc_services[row.id] = plc_service
         self.services.plc_threads[row.id] = connect_thread
+        coordinator = getattr(self.services, 'torque_config_coordinator', None)
+        if coordinator is not None:
+            coordinator.bind_service(row.id, plc_service)
 
         def on_connect_finished(success, message):
             self._on_connect_finished(row.id, plc_service, success)
 
         def on_connect_thread_stopped():
-            self._on_connect_thread_stopped(row.id)
+            self._on_connect_thread_stopped(row.id, connect_thread)
 
         def on_state_changed(state, plc_id=row.id):
-            self.on_plc_state_changed(plc_id, state)
+            if self.services.plc_services.get(plc_id) is plc_service:
+                self.on_plc_state_changed(plc_id, state)
 
         # 连接结束后，把这次对应的 plc_id 和 plc_service 一起传回处理函数。
         plc_service.connect_result.connect(on_connect_finished)
@@ -966,16 +1014,28 @@ class PlcSettingsModule(QWidget):
         connect_thread.start()
 
     def _on_connect_finished(self, plc_id, plc_service, success):
+        if self.services.plc_services.get(plc_id) is not plc_service:
+            return
         row = self.get_current_row()
         # 连接成功后保留最近一次成功连接的服务；具体状态由 PlcService 的状态信号回传。
         if success and plc_service is not None:
             self.services.plc = plc_service
             self.services.bus.log.emit(f"连接成功: {plc_id}")
 
-    def _on_connect_thread_stopped(self, plc_id):
+    def _on_connect_thread_stopped(self, plc_id, stopped_thread=None):
+        if stopped_thread is not None and self.services.plc_threads.get(plc_id) is not stopped_thread:
+            return
+        current_thread = self.services.plc_threads.get(plc_id)
+        if current_thread is not None and current_thread.isRunning():
+            return
         self.logger.info(f"plc {plc_id} 线程已停止")
         self.services.plc_threads.pop(plc_id, None)
         self.services.plc_services.pop(plc_id, None)
+        self._disconnecting_threads.discard(current_thread)
+        # A blocking join can finish before the queued service state signal is
+        # delivered. Publish the confirmed owner's final state here on the UI
+        # thread; stale callbacks above must not change a replacement's state.
+        self.on_plc_state_changed(plc_id, "未连接")
         self.logger.info(f"plc {plc_id} 后台plc_services：{getattr(self.services, "plc_services", {}).get(plc_id)}, "
                          f"后台线程{getattr(self.services, "plc_threads", {}).get(plc_id)}")
 
@@ -984,20 +1044,27 @@ class PlcSettingsModule(QWidget):
         plc_service = getattr(self.services, "plc_services", {}).get(row_id)
         plc_thread = getattr(self.services, "plc_threads", {}).get(row_id)
         self.logger.info(f"断开前正在运行的plc_services:{plc_service} , 线程{plc_thread}")
-        if plc_service:
+        if plc_thread is not None and not plc_thread.isRunning():
+            self._on_connect_thread_stopped(row_id, plc_thread)
+            return
+        if plc_service and plc_thread not in self._disconnecting_threads:
             try:
                 QMetaObject.invokeMethod(
                     plc_service,
                     "stop_plc_service",
                     Qt.ConnectionType.BlockingQueuedConnection,
                 )
-                self.services.plc_services.pop(row_id, None)
             except Exception as exc:
                 self.services.bus.log.emit(f"plc{row_id}断开失败: {exc}")
                 self.logger.error(f"plc{row_id}断开失败: {exc}")
+                return
         if plc_thread is not None:
+            self._disconnecting_threads.add(plc_thread)
             plc_thread.quit()
-            plc_thread.wait(2000)
+            if plc_thread.wait(2000):
+                self._on_connect_thread_stopped(row_id, plc_thread)
+            else:
+                self.services.bus.log.emit(f"plc{row_id}线程尚未停止，请稍后重试")
 
     def set_lb_text(self, row_id):
         state = self.get_plc_state(row_id)
@@ -1028,6 +1095,9 @@ class PlcSettingsModule(QWidget):
 
     def on_plc_state_changed(self, plc_id, state):
         self.set_plc_state(plc_id, state)
+        dialog = getattr(self, 'torque_dialog', None)
+        if dialog is not None and dialog.plc_id == plc_id:
+            dialog.refresh_status()
         row = self.get_current_row()
         if row is None or row.id != plc_id:
             return
@@ -1089,6 +1159,7 @@ class PlcSettingsModule(QWidget):
                 self.btn_connect,
                 self.btn_field_offset,
                 self.btn_process_param_offset,
+                self.btn_torque,
         ):
             widget.setEnabled(allowed)
         self.combo_plc.setEnabled(True)

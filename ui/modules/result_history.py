@@ -42,6 +42,7 @@ class _MetricViewState:
 class ResultHistoryModule(QWidget):
     """Fixed history column that projects immutable result-history values."""
 
+    replay_requested = pyqtSignal(str, int)
     run_selected = pyqtSignal(str)
     follow_latest_requested = pyqtSignal(bool)
     decisionPainted = pyqtSignal(object, object)
@@ -59,6 +60,7 @@ class ResultHistoryModule(QWidget):
         self._config_provider = config_provider
         self._metric_view_state_by_run: dict[str, _MetricViewState] = {}
         self._follow_latest = True
+        self._replay_states = {}
         self._cards: list[ResultHistoryCard] = []
         self._card_entries: dict[
             str,
@@ -179,6 +181,13 @@ class ResultHistoryModule(QWidget):
             heading.setAccessibleName(f"{title}区域标题")
             layout.addWidget(heading)
         return section, layout
+
+    def set_replay_state(self, run_id, channels, selected, enabled, message) -> None:
+        state = (channels, selected, enabled, message)
+        self._replay_states[run_id] = state
+        entry = self._card_entries.get(run_id)
+        if entry is not None:
+            entry[1].set_replay_state(*state)
 
     def render_snapshot(self, snapshot: ResultHistorySnapshot) -> None:
         self.setUpdatesEnabled(False)
@@ -373,6 +382,7 @@ class ResultHistoryModule(QWidget):
                         payload=payload,
                     )
                     card.activated.connect(self.run_selected)
+                    card.replay_requested.connect(self.replay_requested)
                 self._place_card(
                     card, section, layout, index + first_index
                 )
@@ -380,6 +390,8 @@ class ResultHistoryModule(QWidget):
                     card_snapshot.run_id == snapshot.selected_run_id
                 )
                 card.set_selection_enabled(True)
+                if card_snapshot.run_id in self._replay_states:
+                    card.set_replay_state(*self._replay_states[card_snapshot.run_id])
                 self._replay_metric_view(card_snapshot, card, payload)
                 card.show()
                 next_entries[card_snapshot.run_id] = (
@@ -392,6 +404,10 @@ class ResultHistoryModule(QWidget):
             if run_id not in next_entries:
                 self._retire_card(card)
 
+        self._replay_states = {
+            run: state for run, state in self._replay_states.items()
+            if run in next_entries
+        }
         self._card_entries = next_entries
         self._cards = next_cards
         manual_judgment_card = None

@@ -120,16 +120,47 @@ class _StftCacheEntry:
     magnitude_db: np.ndarray | None = None
     snap_initial_to_zero: bool = True
     render_revision: int = 0
+    time_bounds_sec: list[tuple[float, float]] | None = None
+    terminal_seeded: bool = False
     _magnitude_storage: np.ndarray | None = field(default=None, init=False, repr=False)
     _column_capacity: int = field(default=0, init=False, repr=False)
 
     def append_frame(self, frame: StftFrame) -> bool:
+        raw_bounds = getattr(frame, "time_bounds", None)
+        if raw_bounds is not None and self.terminal_seeded:
+            return False
+        time_sec = float(getattr(frame, "time", 0.0))
+        # Queued live frames can arrive after a complete review payload seeded
+        # this cache. Reject them before changing storage or render revision.
+        if not np.isfinite(time_sec) or (self.times_sec and time_sec <= self.times_sec[-1]):
+            return False
         frequencies = np.asarray(getattr(frame, "frequencies", ()), dtype=float)
         magnitudes = np.asarray(getattr(frame, "magnitudes", ()), dtype=float)
         if frequencies.ndim != 1 or magnitudes.ndim != 1:
             return False
         if frequencies.shape != magnitudes.shape or frequencies.size == 0:
             return False
+
+        bounds = None
+        if self.times_sec and (raw_bounds is None) != (self.time_bounds_sec is None):
+            return False
+        if raw_bounds is not None:
+            times = [time_sec]
+            ranges = [raw_bounds]
+            if self.time_bounds_sec:
+                times.insert(0, self.times_sec[-1])
+                ranges.insert(0, self.time_bounds_sec[-1])
+            try:
+                validated = StftImageChartWidget._validated_time_bounds(
+                    np.asarray(times), ranges
+                )
+            except ValueError:
+                return False
+            bounds = tuple(validated[-1])
+            if self.time_bounds_sec and not np.isfinite(
+                bounds[1] - self.time_bounds_sec[0][0]
+            ):
+                return False
 
         if self.frequencies_hz:
             cached_frequencies = np.asarray(self.frequencies_hz, dtype=float)
@@ -142,7 +173,11 @@ class _StftCacheEntry:
             self.frequencies_hz = frequencies.tolist()
 
         self._append_magnitude_column(magnitudes)
-        self.times_sec.append(float(getattr(frame, "time", 0.0)))
+        self.times_sec.append(time_sec)
+        if bounds is not None:
+            if self.time_bounds_sec is None:
+                self.time_bounds_sec = []
+            self.time_bounds_sec.append(bounds)
         self.render_revision += 1
         return True
 
@@ -157,11 +192,14 @@ class _StftCacheEntry:
     def image_payload(self) -> dict | None:
         if not self.has_data():
             return None
-        return {
+        payload = {
             "times_sec": list(self.times_sec),
             "frequencies_hz": list(self.frequencies_hz),
             "magnitude_db": self.magnitude_db,
         }
+        if self.time_bounds_sec is not None:
+            payload["time_bounds_sec"] = list(self.time_bounds_sec)
+        return payload
 
     def _append_magnitude_column(self, magnitudes: np.ndarray) -> None:
         column_count = 0 if self.magnitude_db is None else self.magnitude_db.shape[1]
@@ -381,6 +419,7 @@ class _HeatmapCanvas(QWidget):
 class StftModule(QWidget):
     module_id = "stft"
     score_title_changed = pyqtSignal(str)
+    score_visibility_changed = pyqtSignal(bool)
     _DISPLAY_PHASES = frozenset(
         {"running", "analyzing", "reviewing", "reanalyzing", "stopped"}
     )
@@ -414,6 +453,7 @@ class StftModule(QWidget):
         self._current_trace_payload_by_channel: dict[int, dict] = {}
         self._live_current_trace_payload_by_run: dict[tuple[int, str], dict] = {}
         self._current_score_text = self._SCORE_TITLE_PLACEHOLDER
+        self._current_score_visible = False
         self._score_times_sec: list[float] = []
         self._score_values: list[float] = []
         self._score_time_lookup_sec: list[float | None] = []
@@ -426,6 +466,7 @@ class StftModule(QWidget):
             tuple[tuple[int, str, int], int, tuple[float, float] | None, bool] | None
         ) = None
         self._stft_cache: dict[tuple[int, str, int], _StftCacheEntry] = {}
+        self._retired_coarse_runs: set[tuple[int, str]] = set()
         self._pending_live_flush_key: tuple[int, str, int] | None = None
         self._live_flush_generation = 0
 
@@ -498,6 +539,8 @@ class StftModule(QWidget):
             self._on_heatmap_view_range_changed
         )
 
+        if hasattr(self.services.bus, "config_changed"):
+            self.services.bus.config_changed.connect(self._refresh_score_title)
         if hasattr(self.services.bus, "factory_state_changed"):
             self.services.bus.factory_state_changed.connect(
                 self._on_factory_state_changed
@@ -568,6 +611,9 @@ class StftModule(QWidget):
 
     def current_score_title(self) -> str:
         return self._current_score_text
+
+    def current_score_visible(self) -> bool:
+        return self._current_score_visible
 
     def hover_score_text(self) -> str | None:
         return self._score_text_for_index(self._hover_score_index)
@@ -980,6 +1026,13 @@ class StftModule(QWidget):
         self._refresh_score_title()
 
     def _on_factory_display_reset(self, _reason: str):
+        # Reset can race with already queued coarse tails. Remember their run
+        # identities so they cannot claim an empty display before the next run.
+        self._retired_coarse_runs.update(key[:2] for key in self._stft_cache)
+        if self._display_run_id is not None:
+            self._retired_coarse_runs.add(
+                (self._factory_state.displayed_config_id, self._display_run_id)
+            )
         self._set_analysis_selection_mode(False)
         self._review_payload = FactoryReviewPayload()
         self._selected_window = None
@@ -999,6 +1052,7 @@ class StftModule(QWidget):
         self._clear_rendering()
         self._update_overlay_geometry()
         self._set_score_title(self._SCORE_TITLE_PLACEHOLDER)
+        self._set_score_visible(False)
 
     def _on_factory_runtime_context(self, payload) -> None:
         config_id = getattr(payload, "config_id", None)
@@ -1086,6 +1140,9 @@ class StftModule(QWidget):
         except (TypeError, ValueError):
             return
 
+        if (getattr(frame, "time_bounds", None) is not None
+                and (normalized_config_id, run_id) in self._retired_coarse_runs):
+            return
         cache_entry = self._stft_cache.setdefault(
             (normalized_config_id, run_id, normalized_channel_idx),
             _StftCacheEntry(),
@@ -1194,6 +1251,7 @@ class StftModule(QWidget):
                     )
                 )
             if cache_entry.has_data():
+                cache_entry.terminal_seeded = True
                 self._stft_cache[(config_id, run_id, channel_index)] = cache_entry
                 seeded_channels.add(channel_index)
 
@@ -1227,6 +1285,7 @@ class StftModule(QWidget):
             times_sec.ndim != 1
             or times_sec.size == 0
             or not np.all(np.isfinite(times_sec))
+            or np.any(times_sec[1:] <= times_sec[:-1])
             or frequencies_hz.ndim != 1
             or frequencies_hz.size == 0
             or not np.all(np.isfinite(frequencies_hz))
@@ -1356,6 +1415,44 @@ class StftModule(QWidget):
 
     def _refresh_score_title(self) -> None:
         self._set_score_title(self._score_title_for_current_context())
+        self._set_score_visible(self._score_visible_for_current_context())
+
+    def _set_score_visible(self, visible: bool) -> None:
+        if visible == self._current_score_visible:
+            return
+        self._current_score_visible = visible
+        self.score_visibility_changed.emit(visible)
+
+    def _score_visible_for_current_context(self) -> bool:
+        selected_channel = self._selected_display_channel()
+        if selected_channel is None or self._factory_state.displayed_config_id is None:
+            return False
+
+        config = None
+        if self._review_payload_matches_score_context(self._review_payload):
+            config = self._review_payload.config_payload
+            if not isinstance(config, dict):
+                score_payload = self._score_payload_by_channel.get(selected_channel)
+                if isinstance(score_payload, dict):
+                    if "enabled" in score_payload:
+                        return bool(score_payload["enabled"])
+                    if self._score_title_from_payload(score_payload) != self._SCORE_TITLE_PLACEHOLDER:
+                        return True
+
+        if not isinstance(config, dict):
+            try:
+                config = self._load_displayed_config()
+            except Exception:
+                return False
+        if not isinstance(config, dict):
+            return False
+        channels = config.get("channels", [])
+        if not isinstance(channels, list):
+            return False
+        for channel in channels:
+            if isinstance(channel, dict) and channel.get("channel_index") == selected_channel:
+                return bool(channel.get("stft_score_enabled", False))
+        return False
 
     def _set_score_title(self, text: str) -> None:
         normalized = str(text)
@@ -2388,6 +2485,9 @@ class StftModule(QWidget):
 
         reset_levels = cache_key != self._render_cache_key or not has_image
         self._render_cache_key = cache_key
+        preview_options = {}
+        if "time_bounds_sec" in payload:
+            preview_options["time_bounds_sec"] = payload["time_bounds_sec"]
         self.canvas.heatmap.set_image(
             times_sec=payload["times_sec"],
             frequencies_hz=payload["frequencies_hz"],
@@ -2395,6 +2495,7 @@ class StftModule(QWidget):
             reset_levels=reset_levels,
             levels_db=levels_db,
             snap_initial_to_zero=cache_entry.snap_initial_to_zero,
+            **preview_options,
         )
         self.canvas.heatmap.set_current_trace(current_trace)
         self._last_render_signature = render_signature

@@ -53,7 +53,7 @@ def test_preparer_publishes_closed_valid_exact_schema(
         )
         assert objects == EXPECTED_SCHEMA_OBJECTS
         assert database.execute_sql("PRAGMA application_id").fetchone()[0] == 1245924688
-        assert database.execute_sql("PRAGMA user_version").fetchone()[0] == 2
+        assert database.execute_sql("PRAGMA user_version").fetchone()[0] == 3
     finally:
         database.close()
 

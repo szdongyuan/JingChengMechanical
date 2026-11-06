@@ -14,6 +14,13 @@ from model.malfunction_type_table import GOOD_MALFUNCTION_TYPE_NAME, BAD_MALFUNC
 _ACTIVE_READERS = set()
 
 
+def historical_playback(services):
+    """Resolve hardware-independent playback, retaining older embedding fakes."""
+    if hasattr(services, "historical_playback"):
+        return services.historical_playback
+    return getattr(getattr(services, "final_composition", None), "playback", None)
+
+
 class _ReadWorker(QThread):
     completed = pyqtSignal(int, object, object)
 
@@ -50,8 +57,18 @@ class HistoricalAnalysisDialog(QDialog):
         self._closed = False
         self._pending_saved = False
         self._save_error = None
+        self.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.CustomizeWindowHint
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowSystemMenuHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
         self.setWindowTitle("历史分析结果")
         self.setModal(False)
+        # Qt 6.10.2 on Windows adds maximize for an unrestricted maximum size,
+        # even with custom flags. Stay one pixel below that limit to keep resizing.
+        self.setMaximumSize(self.maximumWidth() - 1, self.maximumHeight() - 1)
         self.resize(1100, 820)
         root = QVBoxLayout(self)
         self.metadata_label = QLabel()
@@ -75,9 +92,6 @@ class HistoricalAnalysisDialog(QDialog):
         self.save_label_button.setEnabled(False)
         controls.addWidget(self.save_label_button)
         controls.addStretch()
-        self.close_button = QPushButton("关闭")
-        self.close_button.clicked.connect(self.close)
-        controls.addWidget(self.close_button)
         root.addLayout(controls)
         self.audio_layout = QVBoxLayout()
         root.addLayout(self.audio_layout)
@@ -95,11 +109,15 @@ class HistoricalAnalysisDialog(QDialog):
     def run_id(self):
         return self._run_id
 
-    def refresh(self, *, _save_error=None):
+    def refresh_enrichment(self):
+        self.refresh(_preserve_audio=True)
+
+    def refresh(self, *, _save_error=None, _preserve_audio=False):
         if self._closed:
             return
         self._generation += 1
-        self._clear_audio()
+        if not _preserve_audio:
+            self._clear_audio()
         self._save_error = _save_error
         self.status_label.setText("正在加载历史分析结果…")
         self.save_label_button.setEnabled(False)
@@ -114,12 +132,14 @@ class HistoricalAnalysisDialog(QDialog):
         if self._closed or generation != self._generation:
             return
         if error is not None:
+            self._clear_audio()
             self.snapshot = None
             self._clear_result()
             self.current_label.setText("当前记录不可用")
             self.status_label.setText(f"历史记录不可用：{error}")
             self._emit_saved()
             return
+        previous_audio = self.snapshot.audio if self.snapshot is not None else None
         self.snapshot = snapshot
         run = snapshot.run
         workorder = snapshot.workorder
@@ -128,6 +148,8 @@ class HistoricalAnalysisDialog(QDialog):
             f"型号：{workorder.get('model', workorder.get('product_model', ''))}    "
             f"配置：{snapshot.config.get('name', snapshot.config.get('config_name', run.config_id))}\n"
             f"记录时间：{run.accepted_at}    记录编号：{run.run_id}")
+        if run.ingress_kind == "IMPORTED":
+            self.metadata_label.setText(self.metadata_label.text() + "    来源：导入 · 无电流数据")
         self.current_label.setText(f"当前标记：{run.judgment or '未判定'}    判定来源：{run.judgment_source}    故障类型：{run.fault_type or '—'}")
         self.original_label.setText(f"原始已保存分析结果 · 原始判定：{snapshot.original_analysis_judgment or '未保存'}")
         self.result_message_label.setText("\n".join(filter(None, [snapshot.result_message, snapshot.charts_message])))
@@ -135,10 +157,11 @@ class HistoricalAnalysisDialog(QDialog):
         self.result_view = HistoricalAnalysisView(snapshot) if snapshot.review is not None else None
         if self.result_view is not None:
             self.result_scroll.setWidget(self.result_view)
-        playback = getattr(getattr(self.services, "final_composition", None), "playback", None)
-        self.replay_panel = RunAudioReplayControls(record=snapshot.audio, playback=playback,
-            parent=self, unavailable_message=snapshot.audio_message)
-        self.audio_layout.addWidget(self.replay_panel)
+        if self.replay_panel is None or previous_audio != snapshot.audio:
+            self._clear_audio()
+            self.replay_panel = RunAudioReplayControls(record=snapshot.audio, playback=historical_playback(self.services),
+                parent=self, unavailable_message=snapshot.audio_message)
+            self.audio_layout.addWidget(self.replay_panel)
         self._populate_labels()
         editable = run.state != "ACTIVE"
         self.label_combo.setEnabled(editable)

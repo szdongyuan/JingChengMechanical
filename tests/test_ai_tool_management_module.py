@@ -1398,3 +1398,79 @@ def test_save_failure_during_unsaved_prompt_blocks_pending_action_and_keeps_edit
     assert module._current_toolchain_id == "a"
     assert _current_toolchain_item_id(module) == "a"
     assert module.ed_display_name.text() == ""
+
+@pytest.mark.parametrize('value', [None, 0, 1, 0.12345678901234568])
+def test_optional_threshold_load_save_clear(qapp, value):
+    import json
+    row = _toolchain('tc', params_json=json.dumps({'decision_threshold': value, 'mode': 'keep'}))
+    module, service, _ = _make_module(toolchains=[row])
+    module._load_toolchain(row)
+    assert module.ed_decision_threshold.text() == ('' if value is None else str(value))
+    assert json.loads(module.txt_params_json.toPlainText()) == {'mode': 'keep'}
+    assert not module._is_dirty()
+    module.ed_decision_threshold.setText('0.12345678901234568')
+    assert module._is_dirty() is (value != 0.12345678901234568)
+    assert module._save_current_editor()
+    assert json.loads(service.saved_requests[-1][1]['params_json']) == {'mode': 'keep', 'decision_threshold': 0.12345678901234568}
+    assert not module._is_dirty()
+    module.ed_decision_threshold.clear()
+    assert module._save_current_editor()
+    assert json.loads(service.saved_requests[-1][1]['params_json']) == {'mode': 'keep'}
+
+@pytest.mark.parametrize('text', ['bad', 'true', 'NaN', 'Infinity', '-0.1', '1.1'])
+def test_optional_threshold_invalid_save_is_warning(qapp, monkeypatch, text):
+    warnings = []
+    monkeypatch.setattr(QMessageBox, 'warning', lambda *args: warnings.append(args[-1]))
+    row = _toolchain('tc')
+    module, service, _ = _make_module(toolchains=[row])
+    module._load_toolchain(row)
+    module.ed_decision_threshold.setText(text)
+    assert not module._save_current_editor()
+    assert not service.saved_requests
+    assert 'decision_threshold' in warnings[-1]
+    module._restore_snapshot()
+    assert module.ed_decision_threshold.text() == ''
+    assert not module._is_dirty()
+
+def test_threshold_raw_json_conflict(qapp, monkeypatch):
+    warnings = []
+    monkeypatch.setattr(QMessageBox, 'warning', lambda *args: warnings.append(args[-1]))
+    row = _toolchain('tc')
+    module, service, _ = _make_module(toolchains=[row])
+    module._load_toolchain(row)
+    module.txt_params_json.setPlainText('{"decision_threshold":0.6}')
+    assert not module._save_current_editor()
+    assert not service.saved_requests
+    assert '专用' in warnings[-1]
+
+@pytest.mark.parametrize('value', ['0.5', True, [0.5]])
+def test_invalid_loaded_threshold_requires_correction(qapp, monkeypatch, value):
+    import json
+    monkeypatch.setattr(QMessageBox, 'warning', lambda *args: None)
+    row = _toolchain('tc', params_json=json.dumps({'decision_threshold': value}))
+    module, service, _ = _make_module(toolchains=[row])
+    module._load_toolchain(row)
+    assert not module._save_current_editor()
+    assert not service.saved_requests
+
+@pytest.mark.parametrize('choice', ['save', 'discard', 'cancel'])
+def test_threshold_switch_preserves_unsaved_choice(qapp, monkeypatch, choice):
+    import json
+    module, service, _ = _make_module(toolchains=[_toolchain('a'), _toolchain('b')])
+    _show(module, qapp)
+    module._select_toolchain('a')
+    module.ed_decision_threshold.setText('0.6')
+    monkeypatch.setattr(module, '_prompt_unsaved_changes', lambda action: choice)
+    module._select_toolchain('b')
+    qapp.processEvents()
+    if choice == 'cancel':
+        assert module._current_toolchain_id == 'a'
+        assert module.ed_decision_threshold.text() == '0.6'
+        assert module._is_dirty()
+    else:
+        assert module._current_toolchain_id == 'b'
+        assert module.ed_decision_threshold.text() == ''
+        module._select_toolchain('a')
+        assert module.ed_decision_threshold.text() == ('0.6' if choice == 'save' else '')
+        assert not module._is_dirty()
+    assert bool(service.saved_requests) is (choice == 'save')

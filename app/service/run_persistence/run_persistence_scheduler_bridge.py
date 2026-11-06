@@ -1,6 +1,7 @@
 """Pure contracts and mappings for the run-persistence Scheduler bridge."""
 
 from __future__ import annotations
+from app.service.analysis.import_mapping import is_import_mapping, shape_import_config, validate_import_mapping
 
 import base64
 from collections import OrderedDict
@@ -148,6 +149,12 @@ def _expected_chart_manifest_for_job(
     except (TypeError, ValueError, RecursionError):
         return None
     if type(config) is not dict:
+        return None
+    try:
+        mapping = json.loads(job.snapshot.channel_mapping_json)
+        if is_import_mapping(mapping):
+            config = shape_import_config(config, mapping, job.audio.sample_rate_hz, job.audio.channel_count)["chart_config"]
+    except (TypeError, ValueError):
         return None
     selected = config.get("selected_channels")
     if (
@@ -2989,7 +2996,8 @@ def _audio_reference_matches_record(
         and reference.sample_rate_hz == record.sample_rate_hz
         and reference.channel_count == record.channel_count
         and reference.frame_count == record.frame_count
-        and reference.dtype == "<i2"
+        and reference.dtype == ("<f8" if ingress_kind == "IMPORTED" else "<i2")
+        and (reference.source_container_format is None or reference.source_container_format == record.container_format)
         and reference.content_revision
         == f"{record.audio_id}:{record.byte_size}"
     )
@@ -3132,8 +3140,10 @@ def prepare_analysis_facts(
     _require_uuid4(audio_record.run_id, "audio_record.run_id")
     if audio_record.run_id != run_record.run_id:
         raise ValueError("audio record does not belong to run")
-    if audio_record.container_format != "WAV_PCM":
-        raise ValueError("audio record must be WAV_PCM")
+    if audio_record.container_format not in {"WAV_PCM", "WAV_IEEE_FLOAT"}:
+        raise ValueError("audio record must be supported WAV")
+    if run_record.ingress_kind == "CAPTURED" and audio_record.container_format != "WAV_PCM":
+        raise ValueError("captured audio record must be WAV_PCM")
     if attempt_kind is AttemptKind.INITIAL:
         if (
             analysis_window_start_sec is not None
@@ -3151,6 +3161,11 @@ def prepare_analysis_facts(
         attempt_kind,
     )
     envelope = decode_analysis_envelope(run_record.config_snapshot_json)
+    if is_import_mapping(envelope.channel_mapping):
+        if run_record.ingress_kind != "IMPORTED":
+            raise ValueError("explicit import map requires imported audio")
+        validate_import_mapping(envelope.channel_mapping,
+            selected_channels=envelope.config.get("selected_channels", ()), channel_count=audio_record.channel_count)
     calibration = _decode_json_object(
         run_record.calibration_snapshot_json,
         "calibration_snapshot",
@@ -3210,7 +3225,8 @@ def prepare_analysis_facts(
         sample_rate_hz=audio_record.sample_rate_hz,
         channel_count=audio_record.channel_count,
         frame_count=audio_record.frame_count,
-        dtype="<i2",
+        dtype="<f8" if storage_kind is AudioStorageKind.IMPORTED_FINAL_AUDIO else "<i2",
+        source_container_format=audio_record.container_format if storage_kind is AudioStorageKind.IMPORTED_FINAL_AUDIO else None,
         content_revision=f"{audio_record.audio_id}:{audio_record.byte_size}",
         audio_data_id=audio_record.audio_id,
     )

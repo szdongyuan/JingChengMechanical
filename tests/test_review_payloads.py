@@ -464,6 +464,61 @@ def test_build_chart_payload_adds_selected_window_axis_range_to_acoustic_time_se
     assert "x_axis_range_sec" not in payload[0].get("current_trace", {})
 
 
+@pytest.mark.parametrize("panel_types,expected_calls", [
+    (["vibration_stft"], (0, 0)),
+    (["vibration_pulse"], (0, 1)),
+    (["vibration_frequency_stability"], (1, 0)),
+    (["vibration_frequency_stability", "vibration_pulse"], (1, 1)),
+    (["vibration_frequency_stability", "vibration_frequency_stability",
+      "vibration_pulse", "vibration_pulse"], (1, 1)),
+    ([], (0, 0)),
+])
+def test_chart_layout_suppresses_unrequested_trends_and_preserves_window(
+    monkeypatch, panel_types, expected_calls,
+):
+    from app.service.analysis import vibration_payloads
+
+    _patch_basic_chart_backends(monkeypatch)
+    config = _make_single_channel_config()
+    config["vibration_view_channel_index"] = 0
+    config["result_dashboard_layout"] = {
+        "version": 2, "columns": 1, "rows": max(1, len(panel_types)),
+        "panels": [
+            {"id": f"panel-{i}", "type": kind, "channel": "vibration",
+             "row": i, "column": 0, "row_span": 1, "column_span": 1}
+            for i, kind in enumerate(panel_types)
+        ],
+    }
+    signal = np.sin(2 * np.pi * 60 * np.arange(2000) / 1000)
+    legacy = vibration_payloads.build_vibration_payload(
+        channel_index=0, signal=signal[500:1500], sample_rate=1000,
+        calibration_value=None,
+    )
+    calls = {"_frequency_trend": 0, "_trend": 0}
+    for name, expected in zip(calls, expected_calls):
+        original = getattr(vibration_payloads, name)
+
+        def counted(*args, _name=name, _expected=expected, _original=original):
+            calls[_name] += 1
+            assert _expected, f"unrequested {_name} was called"
+            return _original(*args)
+
+        monkeypatch.setattr(vibration_payloads, name, counted)
+    charts = build_chart_payload(
+        buffer=signal.reshape(-1, 1), config=config, sample_rate=1000,
+        mic_cal={}, analysis_window=(0.5, 1.5),
+    )
+    # Check outside the builder's exception guard as well.
+    assert tuple(calls.values()) == expected_calls
+    payload = charts[0]["vibration"]
+    for key in ("overall_rms", "overall_peak", "overall_crest_factor",
+                "dominant_frequency_hz", "low_frequency_energy_share"):
+        assert payload[key] == legacy[key]
+    for key, enabled in [("frequency_times_sec", expected_calls[0]), ("times_sec", expected_calls[1])]:
+        assert payload[key] == ([value + 0.5 for value in legacy[key]] if enabled else [])
+    assert payload["x_axis_range_sec"] == [0.5, 1.5]
+
+
 def test_build_chart_payload_adds_selected_window_axis_range_to_vibration_payload():
     sample_rate = 1000.0
     times = np.arange(0, 2.0, 1.0 / sample_rate)

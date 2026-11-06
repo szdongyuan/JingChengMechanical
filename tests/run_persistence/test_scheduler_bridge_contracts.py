@@ -1442,7 +1442,8 @@ def test_prepare_analysis_facts_maps_closed_durable_kind_and_audio_reference(
         sample_rate_hz=48_000,
         channel_count=2,
         frame_count=144_000,
-        dtype="<i2",
+        dtype="<f8" if ingress == "IMPORTED" else "<i2",
+        source_container_format="WAV_PCM" if ingress == "IMPORTED" else None,
         content_revision=f"{AUDIO_ID}:576044",
         audio_data_id=AUDIO_ID,
     )

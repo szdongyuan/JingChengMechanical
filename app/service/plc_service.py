@@ -1,16 +1,30 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import count
 import math
 import struct
 import time
+from uuid import uuid4
 
-from PyQt6.QtCore import QObject, QTimer, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QObject, QTimer, Qt, pyqtSignal, pyqtSlot
 import snap7
 import snap7.util
 from snap7.error import S7Error
 
 from app.service.log_manager import LogManager
+from app.service.torque.runtime import TorqueRuntime
+from app.service.torque.types import RuleSnapshot, TorqueConfig, TorqueConfigApplied, TorqueCycle
+from app.service.torque.validation import resolve_addresses, validate_torque
+from app.service.analysis.thread_priority import (
+    THREAD_PRIORITY_ABOVE_NORMAL,
+    set_current_thread_priority,
+)
+
+
+# Independent of clock resolution and PLC service recreation. Keep the original
+# acoustic timestamp untouched while giving every torque event its own identity.
+_torque_cycle_ids = count(1)
 
 
 @dataclass(frozen=True)
@@ -33,6 +47,10 @@ class PlcService(QObject):
     # 连接状态通知界面信号
     state_changed = pyqtSignal(str)
     plc_dispatch_requested = pyqtSignal(object)
+    torque_status = pyqtSignal(object)
+    torque_config_applied = pyqtSignal(object)
+    # Older minimal polling fixtures and callers have torque disabled by default.
+    _torque_config = None
     read_time_ms = 60000
     limit_field = (
         "res_product_model_offset",
@@ -57,6 +75,9 @@ class PlcService(QObject):
         auto_reset_bit = True,
         field_offsets_dict = None,
         plc_id = None,
+        torque_store = None,
+        torque_config = None,
+        service_generation = None,
     ):
         # 初始化 PLC 服务，保存连接参数、轮询参数和运行时状态。
         super().__init__()
@@ -73,6 +94,12 @@ class PlcService(QObject):
 
         # 数据块号DB
         self._db_number = int(db_number)
+        self._torque_store = torque_store
+        self._torque_config = torque_config if torque_config is not None else (
+            torque_store.get_config(plc_id) if torque_store is not None else TorqueConfig(plc_id)
+        )
+        self.service_generation = str(service_generation) if service_generation is not None else uuid4().hex
+        self._torque_runtime = TorqueRuntime()
         # 轮询周期
         self._poll_interval_ms = int(poll_interval_ms)
         # 重连周期
@@ -106,12 +133,14 @@ class PlcService(QObject):
         self.logger.info(f"启动 PLC{self._plc_id} 服务")
         if self.timer is not None:
             return
+        set_current_thread_priority(THREAD_PRIORITY_ABOVE_NORMAL)
         self.state_changed.emit("连接中")
         # 启动定时器前 先尝试连一次 PLC；失败也启动定时器，后面继续自动重连。
         self._connect_once()
 
         # 创建轮询定时器，按固定周期读取 PLC 开始位。
         self.timer = QTimer(self)
+        self.timer.setTimerType(Qt.TimerType.PreciseTimer)
         self.timer.setInterval(self._poll_interval_ms)
         self.timer.timeout.connect(self.poll_once)
         self.timer.start()
@@ -182,6 +211,7 @@ class PlcService(QObject):
             self.logger.info(f"PLC{self._plc_id}连接成功: {self._ip}")
             self.bus.log.emit(f"PLC{self._plc_id}连接成功: {self._ip}")
             self.connect_result.emit(True, "")
+            self.apply_torque_config(self._torque_config)
         except Exception as exc:
             self.plc_client = None
             self._last_connect_error = str(exc)
@@ -496,54 +526,18 @@ class PlcService(QObject):
 
     def _emit_plc_workorder(self):
         payload = {}
+        # Only business workorder data belongs on the start-dispatch path.
+        # Result/limit diagnostics are unrelated PLC I/O and can delay capture.
         values = self.read_plc_values(
             "sn_code_offset",
             "product_model_offset",
-            "start_signal_offset",
-            "current_value_offset",
             "rotation_speed_offset",
-            "res_finish_signal_offset",
-            "res_result_offset",
-            "res_score_offset",
-            "res_spl_offset",
-            "res_loudness_offset",
-            "res_vibrate_data_offset",
-            "res_ai_score_offset",
-            "res_spl_limit_up_offset",
-            "res_spl_limit_down_offset",
-            "res_loudness_limit_up_offset",
-            "res_loudness_limit_down_offset",
-            "res_vibrate_limit_up_offset",
-            "res_vibrate_limit_down_offset",
-            "res_ai_score_limit_down_offset",
-            "res_error_code_offset",
-            "res_sn_code_offset",
-            "res_product_model_offset",
         )
         self.logger.info(
-            f"PLC {self._plc_id} 读取数据汇总: "
+            f"PLC {self._plc_id} 读取工单汇总: "
             f"SN={values.get('sn_code_offset')}, "
             f"产品型号={values.get('product_model_offset')}, "
-            f"启动信号={values.get('start_signal_offset')}, "
-            f"电流值={values.get('current_value_offset')}, "
-            f"转速值={values.get('rotation_speed_offset')}, "
-            f"返回结束信号={values.get('res_finish_signal_offset')}, "
-            f"返回测试结果={values.get('res_result_offset')}, "
-            f"返回评分={values.get('res_score_offset')}, "
-            f"返回平均声压级={values.get('res_spl_offset')}, "
-            f"返回响度={values.get('res_loudness_offset')}, "
-            f"返回中场振动={values.get('res_vibrate_data_offset')}, "
-            f"返回AI评分={values.get('res_ai_score_offset')}, "
-            f"声压阈值上限={values.get('res_spl_limit_up_offset')}, "
-            f"声压阈值下限={values.get('res_spl_limit_down_offset')}, "
-            f"响度阈值上限={values.get('res_loudness_limit_up_offset')}, "
-            f"响度阈值下限={values.get('res_loudness_limit_down_offset')}, "
-            f"振动阈值上限={values.get('res_vibrate_limit_up_offset')}, "
-            f"振动阈值下限={values.get('res_vibrate_limit_down_offset')}, "
-            f"AI评分下限={values.get('res_ai_score_limit_down_offset')}, "
-            f"返回异常代码={values.get('res_error_code_offset')}, "
-            f"返回SN={values.get('res_sn_code_offset')}, "
-            f"返回机种={values.get('res_product_model_offset')}"
+            f"转速值={values.get('rotation_speed_offset')}"
         )
         if values.get("sn_code_offset"):
             payload["sn"] = values["sn_code_offset"]
@@ -567,6 +561,66 @@ class PlcService(QObject):
         self._last_current_read_error = message
         self.bus.log.emit(message)
         self.logger.error(message)
+
+    @pyqtSlot(object)
+    def apply_torque_config(self, config):
+        """Apply via a queued connection on this service's PLC owner thread."""
+        if config.plc_id != self._plc_id:
+            return
+        if self._torque_config is not None and config.revision < self._torque_config.revision:
+            return
+        # Keep an invalid applied configuration visible to subsequent cycles;
+        # never continue silently using a previous successful configuration.
+        self._torque_config = config
+        try:
+            resolve_addresses(config, self._db_number)
+        except ValueError as exc:
+            receipt = TorqueConfigApplied(self._plc_id, self.service_generation, config.revision, False, str(exc))
+        else:
+            receipt = TorqueConfigApplied(self._plc_id, self.service_generation, config.revision, True)
+        self.torque_config_applied.emit(receipt)
+
+    def _torque_cycle(self, trigger_ns, workorder):
+        config = self._torque_config
+        if config is None or not config.enabled:
+            return None
+        rules = self._torque_store.snapshot() if self._torque_store is not None else RuleSnapshot(0, {})
+        return TorqueCycle(self._plc_id, trigger_ns, workorder.get('sn', ''),
+                           workorder.get('model', ''), config, rules, self._db_number,
+                           cycle_id=next(_torque_cycle_ids))
+
+    def _read_torque_real(self, db_number, offset):
+        if self.plc_client is None:
+            raise RuntimeError('PLC target is not connected')
+        data = self.plc_client.db_read(db_number, offset, 4)
+        if len(data) != 4:
+            raise ValueError(f'PLC REAL expected 4 bytes, received {len(data)}')
+        return snap7.util.get_real(data, 0)
+
+    def _write_torque_real(self, db_number, offset, value):
+        if self.plc_client is None:
+            raise RuntimeError('PLC target is not connected')
+        data = bytearray(4)
+        snap7.util.set_real(data, 0, validate_torque(value))
+        self.plc_client.db_write(db_number, offset, data)
+
+    def _publish_torque_status(self, cycle, status):
+        self.torque_status.emit(status)
+        if status.state in ('reading', 'table_pending'):
+            return
+        write_value = status.value if status.source == 'table' else None
+        message = (
+            f'Torque plc_id={cycle.plc_id} trigger_ns={cycle.trigger_ns} cycle_id={cycle.cycle_id} '
+            f'sn={cycle.sn!r} model={cycle.model!r} rules_revision={cycle.rules.revision} '
+            f'read_value={status.read_value!r} source={status.source!r} '
+            f'target_db={status.target_db!r} target_byte_offset={status.target_byte_offset!r} '
+            f'write_value={write_value!r} state={status.state} error={status.detail!r}'
+        )
+        if status.state in ('read_error', 'invalid_value', 'write_error', 'config_error'):
+            self.logger.error(message)
+            self.bus.log.emit(message)
+        else:
+            self.logger.info(message)
 
     def _poll_current_value(self) -> None:
         if self.plc_client is None:
@@ -611,6 +665,8 @@ class PlcService(QObject):
         if v is None:
             return
 
+        rising = (self._last_value is False) and (v is True)
+        trigger_monotonic_ns = time.monotonic_ns() if rising else None
         self._poll_current_value()
 
         if self._last_value is None:
@@ -619,7 +675,6 @@ class PlcService(QObject):
             return
 
         # 只在 0 -> 1 时触发一次，避免 PLC 保持 1 时重复触发。
-        rising = (self._last_value is False) and (v is True)
         self._last_value = v
 
         if not rising:
@@ -630,7 +685,6 @@ class PlcService(QObject):
         self.logger.info(f"PLC {self._plc_id} 写入测试中信号开始")
         self._write_testing_signal(True)
         self.logger.info(f"PLC {self._plc_id} 写入测试中信号完成")
-        trigger_monotonic_ns = time.monotonic_ns()
         self.logger.info(f"PLC {self._plc_id} 读取工单数据开始")
         try:
             workorder = self._emit_plc_workorder()
@@ -642,19 +696,33 @@ class PlcService(QObject):
             f"PLC {self._plc_id} 开始信号详情: "
             f"触发时间戳={trigger_monotonic_ns}, 读取数据={workorder}"
         )
+        torque_cycle = self._torque_cycle(trigger_monotonic_ns, workorder)
+        start_submitted = False
         try:
             self._on_start_requested(
                 self._plc_id,
                 workorder,
                 trigger_monotonic_ns,
             )
+            start_submitted = True
         except Exception as exc:
             self.bus.log.emit(f"PLC{self._plc_id}开始回调失败: {exc}")
             self.logger.error(f"PLC{self._plc_id}开始回调失败: {exc}")
 
         # 如果需要，触发后自动清零，方便 PLC 下次再次置 1 触发。
         if self._auto_reset_bit:
-            self.write_plc_value(self._field_offsets_dict["start_signal_offset"],"bool",False)
+            try:
+                self.write_plc_value(self._field_offsets_dict["start_signal_offset"],"bool",False)
+            except Exception as exc:
+                message = f"PLC{self._plc_id}开始位复位失败: {exc}"
+                self.bus.log.emit(message)
+                self.logger.error(message)
+
+        if start_submitted and torque_cycle is not None:
+            self._torque_runtime.process(
+                torque_cycle, read_real=self._read_torque_real, write_real=self._write_torque_real,
+                publish=lambda status: self._publish_torque_status(torque_cycle, status),
+            )
 
     def parse_bit_offset(self, offset):
         byte_text, bit_text = str(offset).split(".", 1)

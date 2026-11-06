@@ -30,7 +30,7 @@ PANEL_FAMILY_VIBRATION = "vibration"
 
 PANEL_TITLES = {
     PANEL_STFT: "时频图（频率Hz，幅值dB）",
-    PANEL_SPECTRUM: "频谱（dB）",
+    PANEL_SPECTRUM: "频谱图（音频）",
     PANEL_OCTAVE: "倍频程（dB）",
     PANEL_SPL: "声压级（dB）",
     PANEL_LOUDNESS: "响度",

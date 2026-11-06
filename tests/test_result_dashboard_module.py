@@ -391,6 +391,10 @@ def test_stft_card_retains_score_metric_and_compact_heatmap(
         [_panel("stft", panel_type, channel=channel)],
         vibration_channel=vibration_channel,
     )
+    config["channels"] = [
+        {"channel_index": index, "stft_score_enabled": True}
+        for index in config["selected_channels"]
+    ]
     module = ResultDashboardModule(_services())
     module.apply_history_event(_event("run-1", config, chart_payload={}))
     panel = module.panel_widget("stft")
@@ -746,3 +750,154 @@ def test_reselecting_unchanged_painted_run_does_not_acknowledge_twice(qapp):
         qapp.processEvents()
 
     assert [item[0] for item in painted] == ["hash-a", "hash-b"]
+
+
+@pytest.mark.parametrize('service_path', ['historical_playback', 'final_composition'])
+def test_card_replay_targets_nonselected_run_and_survives_recreation(qapp, qtbot, service_path):
+    from dataclasses import replace
+    from uuid import uuid4
+    from tests.test_result_card_replay import Reader, Playback
+    services = _services()
+    reader, playback = Reader({'selected_channels': [7]}), Playback()
+    services.historical_analysis_reader = reader
+    if service_path == 'historical_playback':
+        services.historical_playback = playback
+    else:
+        services.final_composition = SimpleNamespace(playback=playback)
+    module = ResultDashboardModule(services)
+    run, selected_run = str(uuid4()), str(uuid4())
+    config = _config([])
+    event = _event(run, config)
+    module.apply_history_event(event)
+    module.apply_history_event(_event(selected_run, config))
+    before = module.history_snapshot()
+    card = module._history_module._card_entries[run][1]
+    qtbot.waitUntil(card.replay_button.isEnabled)
+    card.replay_button.menu().actions()[0].trigger()
+    qtbot.waitUntil(lambda: len(playback.requests) == 1 and card.replay_button.isEnabled())
+    assert playback.requests[0][0].run_id == run
+    assert playback.requests[0][0].display_channel_index == 3
+    assert module.history_snapshot() == before
+    snapshot = replace(before, terminal_cards=tuple(
+        replace(c, sn='force recreation') if c.run_id == run else c
+        for c in before.terminal_cards))
+    module._history_module.render_snapshot(snapshot)
+    recreated = module._history_module._card_entries[run][1]
+    assert recreated is not card
+    recreated.replay_button.click()
+    qtbot.waitUntil(lambda: len(playback.requests) == 2 and recreated.replay_button.isEnabled())
+    assert playback.requests[1][0].display_channel_index == 3
+    assert module.history_snapshot() == before
+    module.close()
+    qtbot.waitUntil(lambda: playback.owner is None)
+
+
+@pytest.mark.parametrize('in_flight', [False, True])
+def test_card_replay_resolves_active_service_lazily_and_cleans_original(qapp, qtbot, in_flight):
+    import threading
+    from uuid import uuid4
+    from tests.test_result_card_replay import Reader, Playback
+    independent, shared, replacement = Playback(), Playback(), Playback()
+    class Services(SimpleNamespace):
+        @property
+        def historical_playback(self):
+            self.lookups.append(threading.get_ident())
+            return self.current
+    services = Services(**vars(_services()), current=independent, lookups=[],
+                        historical_analysis_reader=Reader())
+    module = ResultDashboardModule(services)
+    assert services.lookups == []
+    services.current = shared  # production attaches after dashboard construction
+    run = str(uuid4())
+    module.apply_history_event(_event(run, _config([])))
+    card = module._history_module._card_entries[run][1]
+    qtbot.waitUntil(card.replay_button.isEnabled)
+    assert services.lookups == []
+    if in_flight:
+        shared.release = threading.Event()
+    try:
+        card.replay_button.click()
+        qtbot.waitUntil(shared.entered.is_set)
+        if not in_flight:
+            qtbot.waitUntil(card.replay_button.isEnabled)
+        owner = module._card_replay._entries[run].operation.owner
+        services.current = replacement
+        module.close()
+    finally:
+        if shared.release:
+            shared.release.set()
+    from ui.popups.run_audio_replay_dialog import _ACTIVE_WORKERS
+    qtbot.waitUntil(lambda: not _ACTIVE_WORKERS)
+    assert shared.owner is None
+    assert owner in shared.stops
+    assert independent.requests == independent.stops == []
+    assert replacement.requests == replacement.stops == []
+    assert services.lookups == [threading.get_ident()]
+
+
+def test_card_replay_open_menu_survives_unrelated_terminal_event(qapp, qtbot):
+    from uuid import uuid4
+    from tests.test_result_card_replay import Reader, Playback
+    services = _services()
+    services.historical_analysis_reader = Reader()
+    services.historical_playback = playback = Playback()
+    module = ResultDashboardModule(services)
+    module.show()
+    run = str(uuid4())
+    module.apply_history_event(_event(run, _config([])))
+    card = module._history_module._card_entries[run][1]
+    qtbot.waitUntil(card.replay_button.isEnabled)
+    menu = card.replay_button.menu()
+    actions = menu.actions()
+    menu.popup(card.replay_button.mapToGlobal(card.replay_button.rect().bottomLeft()))
+    qtbot.waitUntil(menu.isVisible)
+    module.apply_history_event(_event(str(uuid4()), _config([])))
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    qapp.processEvents()
+    assert module._history_module._card_entries[run][1] is card
+    assert card.replay_button.menu() is menu
+    assert menu.isVisible()
+    assert menu.actions() == actions
+    actions[1].trigger()
+    qtbot.waitUntil(lambda: len(playback.requests) == 1 and card.replay_button.isEnabled())
+    assert playback.requests[0][0].run_id == run
+    assert playback.requests[0][0].display_channel_index == 7
+    assert actions[1].isChecked() and not actions[0].isChecked()
+    module.close()
+
+
+@pytest.mark.parametrize('failure', ['none', 'exception'])
+def test_card_replay_remembers_menu_channel_when_provider_unavailable(qapp, qtbot, failure):
+    from uuid import uuid4
+    from tests.test_result_card_replay import Reader, Playback
+    playback = Playback()
+    class Services(SimpleNamespace):
+        @property
+        def historical_playback(self):
+            if self.current is None and failure == 'exception':
+                raise RuntimeError('not active')
+            return self.current
+    services = Services(**vars(_services()), current=playback,
+                        historical_analysis_reader=Reader())
+    module = ResultDashboardModule(services)
+    run = str(uuid4())
+    module.apply_history_event(_event(run, _config([])))
+    card = module._history_module._card_entries[run][1]
+    qtbot.waitUntil(card.replay_button.isEnabled)
+    actions = card.replay_button.menu().actions()
+    assert actions[0].isChecked()
+    services.current = None
+    actions[1].trigger()
+    assert not card.replay_button.isEnabled()
+    assert '播放服务未就绪' in card.replay_button.toolTip()
+    assert actions[1].isChecked() and not actions[0].isChecked()
+    assert playback.requests == []
+    services.current = playback
+    module.apply_history_event(_event(str(uuid4()), _config([])))
+    assert card.replay_button.isEnabled()
+    assert playback.requests == []
+    card.replay_button.click()
+    qtbot.waitUntil(lambda: len(playback.requests) == 1 and card.replay_button.isEnabled())
+    assert playback.requests[0][0].run_id == run
+    assert playback.requests[0][0].display_channel_index == 7
+    module.close()

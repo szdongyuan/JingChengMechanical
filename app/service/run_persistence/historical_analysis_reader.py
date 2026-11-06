@@ -1,6 +1,8 @@
 """Read saved analysis independently from optional replay audio, without writes."""
 
 from __future__ import annotations
+from app.service.analysis.import_mapping import replay_channel_order
+from app.service.audio_wav import probe_wav
 
 from dataclasses import dataclass
 import json
@@ -38,6 +40,14 @@ class HistoricalReplayAudio:
     channel_count: int
     frame_count: int
     channel_order: tuple[int, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class HistoricalReplaySnapshot:
+    run_id: str
+    config: dict[str, object]
+    audio: HistoricalReplayAudio | None
+    audio_message: str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,6 +90,23 @@ class HistoricalAnalysisReader:
             )
         self._runtime = runtime
         self._result_artifact_store = result_artifact_store
+
+    def read_replay(self, run_id: str) -> HistoricalReplaySnapshot:
+        """Read frozen replay facts without loading analysis/chart artifacts."""
+        try:
+            validate_uuid4(run_id)
+        except ContractValidationError as exc:
+            raise HistoricalAnalysisReadError("记录编号无效") from exc
+        run = RunRepository(self._runtime).get(run_id)
+        if run is None:
+            raise HistoricalAnalysisReadError("记录不存在或已删除")
+        try:
+            envelope = decode_analysis_envelope(run.config_snapshot_json)
+            config = json.loads(canonicalize_json_object(envelope.config, "config"))
+        except (ValueError, TypeError) as exc:
+            raise HistoricalAnalysisReadError("记录冻结配置不可用") from exc
+        audio, message = self._read_audio(run)
+        return HistoricalReplaySnapshot(run_id, config, audio, message)
 
     def read(self, run_id: str) -> HistoricalAnalysisSnapshot:
         try:
@@ -158,10 +185,10 @@ class HistoricalAnalysisReader:
         try:
             _validate_channel_mapping(run.config_snapshot_json)
             envelope = decode_analysis_envelope(run.config_snapshot_json)
-            channel_order = envelope.channel_mapping["channel_order"]
+            channel_order = replay_channel_order(envelope.channel_mapping)
             path = Path(record.final_path)
             if (
-                record.container_format != "WAV_PCM"
+                record.container_format not in {"WAV_PCM", "WAV_IEEE_FLOAT"}
                 or record.sample_rate_hz <= 0
                 or record.frame_count <= 0
                 or record.channel_count != len(channel_order)
@@ -169,6 +196,14 @@ class HistoricalAnalysisReader:
                 or path.stat().st_size != record.byte_size
             ):
                 raise ValueError("invalid saved audio")
+            if run.ingress_kind == "IMPORTED":
+                metadata = probe_wav(path)
+                if (metadata.container_format, metadata.sample_rate_hz,
+                    metadata.channel_count, metadata.frame_count) != (
+                    record.container_format, record.sample_rate_hz,
+                    record.channel_count, record.frame_count
+                ):
+                    raise ValueError("imported WAV header differs from saved facts")
             return HistoricalReplayAudio(
                 run_id=run.run_id,
                 source_wav_path=path,

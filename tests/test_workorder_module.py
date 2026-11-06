@@ -356,14 +356,15 @@ def test_plc_groups_render_full_width_in_one_column(qapp):
     assert module.plc_sn_layout.columnStretch(0) == 1
     assert module.plc_sn_layout.columnStretch(1) == 0
     assert [label.text() for label in first_group.findChildren(QLabel)] == [
-        f"PLC{first.id} SN码",
-        f"PLC{first.id} 型号",
+        "PLC A SN码",
+        "PLC A 型号",
+        "PLC A 扭矩",
     ]
 
     first_layout = first_group.layout()
-    assert first_layout.itemAtPosition(0, 0).widget().text() == f"PLC{first.id} SN码"
+    assert first_layout.itemAtPosition(0, 0).widget().text() == "PLC A SN码"
     assert first_layout.itemAtPosition(0, 1).widget() is module._plc_sn_edits[first.id]
-    assert first_layout.itemAtPosition(1, 0).widget().text() == f"PLC{first.id} 型号"
+    assert first_layout.itemAtPosition(1, 0).widget().text() == "PLC A 型号"
     assert first_layout.itemAtPosition(1, 1).widget() is module._plc_model_edits[first.id]
 
 
@@ -592,7 +593,8 @@ def test_plc_workorder_display_follows_plc_add_delete_and_updates_by_plc_id(qapp
     )
     first_card = module.plc_sn_layout.itemAtPosition(0, 0).widget()
     first_labels = [label.text() for label in first_card.findChildren(QLabel)]
-    assert first_labels == [f"PLC{first.id} SN码", f"PLC{first.id} 型号"]
+    assert first_labels == ["PLC A SN码", "PLC A 型号", "PLC A 扭矩"]
+    assert module._plc_torque_edits[first.id].text() == "未启用"
     assert first_card.isAncestorOf(module._plc_model_edits[first.id])
     assert module._plc_model_edits[first.id].isReadOnly() is True
     assert module._plc_model_edits[first.id].placeholderText() == "未读取"
@@ -677,3 +679,84 @@ def test_workorder_summary_preserves_unknown_non_empty_values(qapp):
 
     assert module.lbl_phase_summary.text() == "当前阶段：future_phase"
     assert "最近触发方式" not in _workorder_rendered_text(module)
+
+
+@pytest.mark.parametrize("name", [None, "", "  ", "  工位一  "])
+def test_plc_name_uses_trimmed_configuration_or_id_fallback(qapp, name):
+    row = PlcTable.create(plc_name=name)
+    module, services = _make_module()
+    expected = (name or "").strip() or f"PLC{row.id}"
+    group = module._plc_sn_edits[row.id].parentWidget()
+    assert [label.text() for label in group.findChildren(QLabel)] == [
+        f"{expected} {field}" for field in ("SN码", "型号", "扭矩")
+    ]
+
+
+def test_same_id_rename_retains_fields_and_fits_chinese_labels(qapp):
+    from app.service.torque.types import TorqueStatus
+
+    row = PlcTable.create(plc_name="old")
+    module, services = _make_module()
+    services.bus.plc_workorder_changed.emit({"plc_id": row.id, "sn": "SN1", "model": "M1"})
+    module._on_plc_torque_changed(TorqueStatus(row.id, 100, "plc", 3.0, "plc", "model", "M1", 1))
+    edits = (module._plc_sn_edits[row.id], module._plc_model_edits[row.id], module._plc_torque_edits[row.id])
+    row.plc_name = "  装配检测工位一  "
+    row.save()
+    services.bus.plc_changed.emit()
+    assert tuple(edit.text() for edit in edits) == ("SN1", "M1", "3（PLC）")
+    assert edits == (module._plc_sn_edits[row.id], module._plc_model_edits[row.id], module._plc_torque_edits[row.id])
+    module.setStyleSheet(APP_QSS)
+    module.resize(420, 260)
+    module.show()
+    qapp.processEvents()
+    labels = edits[0].parentWidget().findChildren(QLabel)
+    assert [label.text() for label in labels] == [f"装配检测工位一 {field}" for field in ("SN码", "型号", "扭矩")]
+    for label in labels:
+        assert label.width() >= label.sizeHint().width()
+        assert label.contentsRect().width() >= label.fontMetrics().horizontalAdvance(label.text())
+    services.bus.plc_workorder_changed.emit({"plc_id": row.id, "sn": "SN2", "model": "M2"})
+    assert module._plc_sn_edits[row.id] is edits[0]
+    assert edits[0].text() == "SN2"
+    row.plc_name = " "
+    row.save()
+    services.bus.plc_changed.emit()
+    assert labels[0].text() == f"PLC{row.id} SN码"
+    assert edits[1].text() == "M2"
+    module.close()
+
+
+def test_runtime_only_plc_uses_id_fallback(qapp):
+    module, services = _make_module()
+    services.plc_services[42] = object()
+    services.bus.plc_changed.emit()
+    group = module._plc_sn_edits[42].parentWidget()
+    assert [label.text() for label in group.findChildren(QLabel)] == [f"PLC42 {field}" for field in ("SN码", "型号", "扭矩")]
+
+
+@pytest.mark.parametrize("valid", [True, False])
+def test_settings_save_refreshes_workorder_only_after_success(qapp, monkeypatch, valid):
+    from PyQt6.QtWidgets import QMessageBox
+    from ui.modules.plc_settings import PlcSettingsModule
+
+    monkeypatch.setattr(PlcSettingsModule, "start_process_param_service", lambda self: None)
+    monkeypatch.setattr(QMessageBox, "information", lambda *args: None)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args: None)
+    row = PlcTable.create(plc_name="原工位", plc_open_state=0)
+    module, services = _make_module()
+    settings = PlcSettingsModule(services)
+    services.bus.plc_workorder_changed.emit({"plc_id": row.id, "sn": "SN1", "model": "M1"})
+    edit = module._plc_sn_edits[row.id]
+    settings.ed_name.setText("  工位一  ")
+    if not valid:
+        settings.ed_rack.setText("invalid")
+    services.bus.plc_changed.emissions.clear()
+    settings.save_current()
+    assert len(services.bus.plc_changed.emissions) == int(valid)
+    expected = "工位一" if valid else "原工位"
+    assert PlcTable.get_by_id(row.id).plc_name == expected
+    assert edit.parentWidget().layout().itemAtPosition(0, 0).widget().text() == f"{expected} SN码"
+    assert edit is module._plc_sn_edits[row.id]
+    assert edit.text() == "SN1"
+    assert module._plc_model_edits[row.id].text() == "M1"
+    settings.close()
+    module.close()

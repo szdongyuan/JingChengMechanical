@@ -460,7 +460,7 @@ def test_six_terminal_cards_are_scrollable(qapp):
 
 
 def test_reused_long_result_card_refits_when_scrollbar_narrows_it(qapp):
-    long_ai_result = "FANS FAN\nFANS FAN\nFANS FAN"
+    long_ai_result = "FAN FAN\nFAN FAN\nFAN FAN"
     payload = ReviewDisplayPayload(
         review={
             "summary_payload": {
@@ -501,7 +501,7 @@ def test_reused_long_result_card_refits_when_scrollbar_narrows_it(qapp):
         "result_history_card_summary_table",
     )
     initial_result_width = table.columnWidth(3)
-    initial_row_height = table.rowHeight(5)
+    initial_row_height = table.rowHeight(3)
     assert scroll.verticalScrollBar().maximum() == 0
 
     additional = tuple(
@@ -537,9 +537,9 @@ def test_reused_long_result_card_refits_when_scrollbar_narrows_it(qapp):
     assert scroll.verticalScrollBar().maximum() > 0
     assert table.columnWidth(3) < initial_result_width
     assert required_height > initial_row_height
-    assert table.rowHeight(5) >= required_height
+    assert table.rowHeight(3) >= required_height
     assert (
-        sum(table.rowHeight(row) for row in range(6))
+        sum(table.rowHeight(row) for row in range(table.rowCount()))
         <= table.viewport().height()
     )
     assert not table.horizontalScrollBar().isVisible()
@@ -837,11 +837,9 @@ def test_refresh_terminal_payload_updates_one_card_in_place_without_side_effects
         QTableWidget,
         "result_history_card_summary_table",
     )
-    assert tuple(table.item(row, 1).text() for row in range(6)) == (
+    assert tuple(table.item(row, 1).text() for row in range(4)) == (
         "58.14 dB",
-        "53.71 dB",
         "11.10 sone",
-        "8.08 sone",
         "0.83",
         "97.50 %",
     )
@@ -859,18 +857,17 @@ def test_refresh_terminal_payload_updates_one_card_in_place_without_side_effects
     assert module.refresh_terminal_payload(
         "terminal-3", _complete_review_payload(loudness_unit="phon")
     ) is True
-    assert tuple(table.item(row, 1).text() for row in range(6))[2:4] == (
+    assert tuple(table.item(row, 1).text() for row in range(4))[1:2] == (
         "84.20 phon",
-        "79.40 phon",
     )
     assert _metric(module, "terminal-3", "loudness") == "79.40 phon"
-    before_invalid = tuple(table.item(row, 1).text() for row in range(6))
+    before_invalid = tuple(table.item(row, 1).text() for row in range(4))
     assert module.refresh_terminal_payload("missing", _complete_review_payload()) is False
     assert module.refresh_terminal_payload("active", _complete_review_payload()) is False
     assert module.refresh_terminal_payload(
         "reanalyzing", _complete_review_payload()
     ) is False
-    assert tuple(table.item(row, 1).text() for row in range(6)) == before_invalid
+    assert tuple(table.item(row, 1).text() for row in range(4)) == before_invalid
 
     module.render_snapshot(
         _snapshot(
@@ -1368,3 +1365,20 @@ def test_long_manual_fault_text_keeps_card_height_and_preserves_scroll(qapp):
     assert geometry_after[4] == geometry_before[4]
     assert geometry_after[5] == geometry_before[5]
     assert geometry_after[6] == geometry_before[6]
+
+
+def test_replay_forwarding_and_recreation_preserve_state_without_selection(qapp):
+    module = ResultHistoryModule()
+    first, other = _card('first'), _card('other', index=1)
+    snapshot = _snapshot(terminal_cards=(first, other))
+    module.render_snapshot(snapshot)
+    played, selected = [], []
+    module.replay_requested.connect(lambda run, channel: played.append((run, channel)))
+    module.run_selected.connect(selected.append)
+    module.set_replay_state('other', (3, 7), 7, True, '')
+    _card_for(module, 'other').replay_button.click()
+    replacement = replace(other, sn='changed')
+    module.render_snapshot(replace(snapshot, terminal_cards=(first, replacement), revision=2))
+    _card_for(module, 'other').replay_button.click()
+    assert played == [('other', 7), ('other', 7)]
+    assert selected == []

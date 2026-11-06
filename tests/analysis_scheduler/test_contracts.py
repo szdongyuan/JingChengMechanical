@@ -282,6 +282,7 @@ def test_contract_dataclass_fields_and_defaults_are_exact():
         ("dtype", None),
         ("content_revision", None),
         ("audio_data_id", None),
+        ("source_container_format", None),
     ]
     assert [f.name for f in dataclasses.fields(AiToolchainSnapshot)] == [
         "toolchain_id",

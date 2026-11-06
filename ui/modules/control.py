@@ -3,7 +3,6 @@ from __future__ import annotations
 from PyQt6.QtCore import QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QButtonGroup,
-    QDialog,
     QGridLayout,
     QHBoxLayout,
     QLabel,
@@ -19,7 +18,6 @@ from app.service.factory_selection_settings import (
 from app.service.multi_run_coordinator_mvp import OperationResult, OperationStatus
 from app.service.result_history_contracts import ManualJudgmentTarget
 from app.services_container import FactoryControllerState
-from ui.popups.import_audio_analysis_dialog import ImportAudioAnalysisDialog
 
 
 class ControlModule(QWidget):
@@ -102,12 +100,11 @@ class ControlModule(QWidget):
         self.manual_judgment_widget.hide()
 
         row3 = QHBoxLayout()
-        self.btn_import_audio = QPushButton("导入音频分析")
-        self.btn_import_audio.setMinimumHeight(36)
         self.btn_restart = QPushButton("重启软件")
         self.btn_restart.setMinimumHeight(36)
-        row3.addWidget(self.btn_import_audio)
+        row3.addStretch(1)
         row3.addWidget(self.btn_restart)
+        row3.setStretch(1, 1)
         lay.addLayout(row3)
 
         self.lbl_production_unavailable_reason = QLabel()
@@ -131,7 +128,6 @@ class ControlModule(QWidget):
         self.btn_fail.clicked.connect(
             lambda: self._emit_manual_judgment_intent("NG")
         )
-        self.btn_import_audio.clicked.connect(self._import_audio)
         self.btn_restart.clicked.connect(self._request_restart)
         self._render_manual_fault_buttons()
         self._sync_manual_judgment_controls()
@@ -184,50 +180,6 @@ class ControlModule(QWidget):
     def set_restart_pending(self, pending: bool) -> None:
         self._restart_pending = bool(pending)
         self.btn_restart.setEnabled(not self._restart_pending)
-
-    def _import_audio(self) -> None:
-        if self._import_audio_disabled():
-            return
-
-        factory_mode = getattr(self.services, "factory_mode", None)
-        state = getattr(factory_mode, "state", self._factory_state)
-        selected_config_ids = tuple(getattr(state, "selected_config_ids", ()) or ())
-        if not selected_config_ids:
-            QMessageBox.warning(self, "导入音频分析", "请先启用一个配置")
-            return
-
-        try:
-            configs = [
-                self.services.config_service.load_config(config_id)
-                for config_id in selected_config_ids
-            ]
-        except Exception:
-            QMessageBox.warning(self, "导入音频分析", "配置加载失败，无法导入音频分析")
-            return
-
-        default_config_id = (
-            selected_config_ids[0] if len(selected_config_ids) == 1 else None
-        )
-        dialog = ImportAudioAnalysisDialog(
-            configs=configs,
-            default_config_id=default_config_id,
-            parent=self,
-        )
-        result = dialog.exec()
-        if result not in (QDialog.DialogCode.Accepted, int(QDialog.DialogCode.Accepted)):
-            return
-
-        request = dialog.current_request()
-        if request is None:
-            return
-
-        analyze_imported_audio = getattr(factory_mode, "analyze_imported_audio", None)
-        if not callable(analyze_imported_audio) or not analyze_imported_audio(request):
-            QMessageBox.warning(
-                self,
-                "导入音频分析",
-                "导入音频分析失败，请查看结果区域或日志",
-            )
 
     @property
     def manual_fault_buttons(self) -> tuple[QPushButton, ...]:
@@ -475,7 +427,6 @@ class ControlModule(QWidget):
         )
         self.btn_start.setEnabled(not self._start_click_disabled())
         self.btn_stop.setEnabled(self._factory_state.run_phase in self._STOP_ENABLED_PHASES)
-        self.btn_import_audio.setEnabled(not self._import_audio_disabled())
 
     def _start_disabled_reason(self) -> str | None:
         production_reason = self._production_unavailable_reason()
@@ -486,13 +437,6 @@ class ControlModule(QWidget):
         return self._factory_state.start_ready_reason
 
     def _start_click_disabled(self) -> bool:
-        return (
-            self._production_unavailable_reason() is not None
-            or self._factory_state.run_phase in self._BUSY_RUN_PHASES
-            or self._factory_state.start_ready_reason in self._BUSY_START_READY_REASONS
-        )
-
-    def _import_audio_disabled(self) -> bool:
         return (
             self._production_unavailable_reason() is not None
             or self._factory_state.run_phase in self._BUSY_RUN_PHASES

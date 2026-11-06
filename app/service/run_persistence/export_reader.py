@@ -1,6 +1,7 @@
 """Read-only projection of durable run facts into export values."""
 
 from __future__ import annotations
+from app.service.analysis.import_mapping import replay_channel_order
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -736,7 +737,7 @@ def _configurable_audio_facts(
             raise ContractValidationError("audio source path is invalid")
         if not Path(facts.final_path).is_file():
             raise ContractValidationError("audio source file is unavailable")
-        if facts.container_format != "WAV_PCM":
+        if facts.container_format not in {"WAV_PCM", "WAV_IEEE_FLOAT"}:
             raise ContractValidationError("audio container is invalid")
         for name in (
             "sample_rate_hz",
@@ -754,7 +755,7 @@ def _configurable_audio_facts(
         validate_utc_timestamp(facts.created_at)
         _validate_channel_mapping(config_snapshot_json)
         envelope = decode_analysis_envelope(config_snapshot_json)
-        channel_order = envelope.channel_mapping["channel_order"]
+        channel_order = replay_channel_order(envelope.channel_mapping)
         if type(channel_order) is not tuple:
             raise ContractValidationError("channel order is invalid")
         if facts.channel_count != len(channel_order):
@@ -919,7 +920,7 @@ def _decode_config_facts(
 ) -> tuple[tuple[int, ...], tuple[str, ...], str, str]:
     _validate_channel_mapping(config_snapshot_json)
     envelope = decode_analysis_envelope(config_snapshot_json)
-    channel_order = envelope.channel_mapping["channel_order"]
+    channel_order = replay_channel_order(envelope.channel_mapping)
     if type(channel_order) is not tuple:
         raise ContractValidationError("channel order is invalid")
 
@@ -1030,7 +1031,7 @@ def _validate_audio_facts(
         or not Path(facts.final_path).is_absolute()
     ):
         raise ContractValidationError("audio source path is invalid")
-    if facts.container_format != "WAV_PCM":
+    if facts.container_format not in {"WAV_PCM", "WAV_IEEE_FLOAT"}:
         raise ContractValidationError("audio container is invalid")
     for name in (
         "sample_rate_hz",

@@ -112,7 +112,9 @@ def test_decision_and_enrichment_preserve_raw_ai_snapshot(tmp_path, raw_label):
 
     audio = _Audio(sample_rate=8_000, channel_count=1)
     executor = ProductionAnalysisExecutor(ai_runtime=LabelRuntime())
-    decision = executor.execute_decision(_job(tmp_path, audio, ai=True), audio, _Token())
+    job = _job(tmp_path, audio, ai=True)
+    job = replace(job, snapshot=replace(job.snapshot, ai_toolchain=replace(job.snapshot.ai_toolchain, params_json="{}")))
+    decision = executor.execute_decision(job, audio, _Token())
     decision_result = json.loads(decision.canonical_result_json)["result"]
     assert decision_result["review"]["ai_result"] == {
         "status": "success", "score": 0.875, "ai_label": raw_label,
@@ -777,6 +779,69 @@ def test_decision_defers_unconstrained_chart_dsp_then_enrichment_restores_oracle
         )
 
 
+@pytest.mark.parametrize("eager", [False, True])
+@pytest.mark.parametrize("window_start", [0.0, 0.125])
+def test_vibration_acoustic_dsp_is_inapplicable_in_decision_and_enrichment(
+    tmp_path, monkeypatch, eager, window_start,
+):
+    audio = _Audio(sample_rate=8_000, channel_count=2, duration=0.5)
+    # Distinct amplitudes identify the physical channel in every real DSP call.
+    times = np.arange(audio.frame_count) / audio.sample_rate_hz
+    audio._samples[:, 1] = 0.2 * np.sin(2 * np.pi * 60 * times)
+    base = _job(tmp_path, audio, window=(window_start, 0.5))
+    config = json.loads(base.snapshot.config_snapshot_json)
+    config["vibration_view_channel_index"] = 1
+    # Default layout requests both vibration trend groups. Deliberately retain
+    # stale enabled acoustic limits on the vibration channel.
+    for channel in config["channels"]:
+        channel.update({
+            "spl_average_lower_enabled": True, "spl_average_lower_limit": 0.0,
+            "loudness_lower_enabled": True, "loudness_lower_limit": 0.0,
+            "loudness_average_lower_enabled": True, "loudness_average_lower_limit": 0.0,
+        })
+    job = replace(base, snapshot=replace(base.snapshot, config_snapshot_json=json.dumps(config)))
+    oracle = _legacy_oracle(job, audio, ai=False)
+    names = ("compute_spl_trace", "compute_spl_leq", "compute_loudness_trace",
+             "compute_loudness_trace_for_window")
+    calls = {name: [0, 0] for name in names}
+    for name in names:
+        original = getattr(dsp, name)
+
+        def counted(signal, *args, _name=name, _original=original, **kwargs):
+            channel = int(np.max(np.abs(signal)) > 0.1)
+            calls[_name][channel] += 1
+            return _original(signal, *args, **kwargs)
+
+        monkeypatch.setattr(dsp, name, counted)
+    executor = ProductionAnalysisExecutor()
+    decision = executor.execute_decision(job, audio, _Token(), eager_features=eager)
+    decision_counts = deepcopy(calls)
+    bundle = executor._require_bundle(decision.bundle_token)
+    vibration_feature = bundle.features[1]
+    enriched = executor.execute_enrichment(decision.bundle_token)
+    root = json.loads(enriched.canonical_result_json)
+    # Counts must be asserted outside DSP capture wrappers; failures there could
+    # otherwise be swallowed and mistaken for successful suppression.
+    assert all(count[1] == 0 for count in decision_counts.values())
+    assert all(count[1] == 0 for count in calls.values())
+    assert calls["compute_spl_trace"][0] == 1
+    assert calls["compute_spl_leq"][0] == 1
+    assert sum(calls[name][0] for name in names if "loudness" in name) >= 1
+    for name in ("spl_error", "spl_average_error", "loudness_error"):
+        assert getattr(vibration_feature, name) == "not-applicable-to-vibration"
+    assert vibration_feature.spl_values.size == vibration_feature.loudness_values.size == 0
+    assert vibration_feature.spl_average_db is None
+    assert root["judgment"] == decision.judgment == oracle["judgment"]
+    assert root["result"]["judgment_payload"] == oracle["judgment_payload"]
+    charts = root["result"]["chart_payload"]["1"]
+    assert {"fft", "octave", "stft", "vibration"} <= charts.keys()
+    assert "spl" not in charts and "loudness" not in charts
+    _assert_spec_close(charts, oracle["chart_payload"]["1"], "vibration_charts")
+    assert charts["vibration"]["rms_values"]
+    assert charts["vibration"]["fundamental_frequency_values_hz"]
+    assert zlib.decompress(enriched.result_payload_zlib).decode() == enriched.canonical_result_json
+
+
 def test_enabled_spl_limit_is_computed_once_in_decision_and_reused_in_enrichment(
     tmp_path,
     monkeypatch,
@@ -1129,3 +1194,40 @@ def test_compatibility_execute_releases_private_bundle_on_enrichment_failure(
         executor.execute(_job(tmp_path, audio), audio, _Token())
 
     assert executor._bundles == {}
+
+@pytest.mark.parametrize('score,threshold,label,passed', [
+    (.7, .6, 'FAIL', True), (.7, .8, 'PASS', False),
+    (.7, .6, '不合格', True), (.7, .8, '合格', False),
+    (.7, .7, 'NG', True), (0, 0, 'FAIL', True), (1, 1, 'NG', True),
+    *[(value, .5, 'PASS', None) for value in [None, True, '0.9', float('nan'), float('inf'), -1, 2, 10**400]],
+])
+def test_frozen_override_controls_decision(tmp_path, score, threshold, label, passed):
+    class Runtime(_Runtime):
+        def analyze(self, **kwargs):
+            result = super().analyze(**kwargs)
+            result['response_payload']['ai_result'].update(score=score, ai_label=label, extra={'decision_threshold': 1-threshold})
+            return result
+    audio = _Audio(sample_rate=8000, channel_count=1)
+    runtime = Runtime()
+    executor = ProductionAnalysisExecutor(ai_runtime=runtime)
+    job = _job(tmp_path, audio, ai=True)
+    job = replace(job, snapshot=replace(job.snapshot, ai_toolchain=replace(job.snapshot.ai_toolchain, params_json=json.dumps({'decision_threshold': threshold}))))
+    decision = executor.execute_decision(job, audio, _Token())
+    result = json.loads(decision.canonical_result_json)['result']
+    assert result['ai_pass'] is passed
+    review = result['review']['ai_result']
+    assert review['ai_label'] == (None if passed is None else 'PASS' if passed else 'FAIL')
+    assert runtime.response['response_payload']['ai_result']['ai_label'] == label
+
+@pytest.mark.parametrize('value', [True, '0.5', -1, 2])
+def test_invalid_frozen_threshold_does_not_execute(tmp_path, value):
+    audio = _Audio(sample_rate=8000, channel_count=1)
+    runtime = _Runtime()
+    executor = ProductionAnalysisExecutor(ai_runtime=runtime)
+    job = _job(tmp_path, audio, ai=True)
+    job = replace(job, snapshot=replace(job.snapshot, ai_toolchain=replace(job.snapshot.ai_toolchain, params_json=json.dumps({'decision_threshold': value}))))
+    decision = executor.execute_decision(job, audio, _Token())
+    result = json.loads(decision.canonical_result_json)['result']
+    assert result['ai_pass'] is None
+    assert result['review']['ai_result']['status'] == 'configuration_error'
+    assert not runtime.calls

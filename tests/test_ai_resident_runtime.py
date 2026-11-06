@@ -13,6 +13,7 @@ from types import SimpleNamespace
 import pytest
 
 import app.service.ai_resident_runtime as ai_resident_runtime
+import app.service.ai_subprocess as ai_subprocess_module
 from app.service.ai_resident_runtime import ResidentToolchainRuntime
 from app.service.analysis.scheduler import (
     AiToolchainSnapshot,
@@ -408,6 +409,9 @@ def test_start_process_preserves_pipes_and_uses_no_console_flags(
     runtime, monkeypatch
 ):
     captured = {}
+    monkeypatch.setattr(ai_subprocess_module, "os", SimpleNamespace(environ={
+        "PATH": "test-bin", "CUSTOM_AI": "keep", "OMP_NUM_THREADS": "8",
+    }))
 
     def _popen(cmd, **kwargs):
         captured["cmd"] = cmd
@@ -426,7 +430,7 @@ def test_start_process_preserves_pipes_and_uses_no_console_flags(
     monkeypatch.setattr(
         ai_resident_runtime,
         "ai_subprocess_creation_flags",
-        lambda: 0x08000000,
+        lambda: 0x08000040,
     )
 
     runtime._start_process("tc-1", "tool.exe --serve", package_dir="C:/AI")
@@ -440,7 +444,12 @@ def test_start_process_preserves_pipes_and_uses_no_console_flags(
         "errors": "replace",
         "bufsize": 1,
         "cwd": "C:/AI",
-        "creationflags": 0x08000000,
+        "creationflags": 0x08000040,
+        "env": {
+            "PATH": "test-bin", "CUSTOM_AI": "keep",
+            "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1",
+        },
     }
 
 
@@ -1003,12 +1012,28 @@ def test_post_response_discard_honors_request_deadline_and_duration(
     tmp_path: Path, runtime, behavior: str, error_fragment: str
 ):
     script_path = _write_fake_resident_script(tmp_path)
+    # Make cold startup exceed the request budget independently of machine load.
+    script_path.write_text(
+        script_path.read_text(encoding="utf-8").replace(
+            "for raw_line in sys.stdin:",
+            "time.sleep(0.2)\nfor raw_line in sys.stdin:",
+        ),
+        encoding="utf-8",
+    )
     entrypoint = _entrypoint(script_path, "ignore-shutdown")
+
+    # Only response handling and discard belong to the short measured deadline.
+    snapshot = _toolchain_snapshot(tmp_path, entrypoint)
+    instance_id = runtime.prewarm(snapshot)
+    assert runtime.readiness(snapshot) is True
 
     started = time.monotonic()
     result = runtime.analyze(
-        toolchain_id="tc-1",
-        entrypoint=entrypoint,
+        toolchain_id=snapshot.toolchain_id,
+        entrypoint=snapshot.entrypoint,
+        package_dir=snapshot.package_dir,
+        execution_revision=snapshot.execution_revision,
+        required_instance_id=instance_id,
         request_id="req-1",
         request_payload=_request_payload("req-1", behavior=behavior),
         artifacts_dir=str(tmp_path / "artifacts"),
@@ -1018,6 +1043,7 @@ def test_post_response_discard_honors_request_deadline_and_duration(
 
     assert result["module_status"] == "protocol_error"
     assert error_fragment in result["error_summary"]
+    assert result["process_instance_id"] == instance_id
     assert elapsed_ms < 1000
     assert abs(result["duration_ms"] - elapsed_ms) < 300
     assert runtime.has_cached_process("tc-1") is False

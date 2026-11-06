@@ -119,10 +119,8 @@ _REMOVED_OPERATOR_FIELDS = (
 
 
 _SUMMARY_LABELS = [
-    "声压峰值",
-    "声压平均",
-    "响度峰值",
-    "响度平均",
+    "峰值声压级",
+    "峰值响度",
     "频谱得分",
     "AI 分析",
 ]
@@ -131,8 +129,8 @@ _SUMMARY_LABELS = [
 def _summary_table(card):
     table = card.findChild(QTableWidget, "result_history_card_summary_table")
     assert table is not None
-    assert table.rowCount() == 6
-    assert [table.item(row, 0).text() for row in range(6)] == _SUMMARY_LABELS
+    assert table.rowCount() == 4
+    assert [table.item(row, 0).text() for row in range(4)] == _SUMMARY_LABELS
     return table
 
 
@@ -209,16 +207,14 @@ def test_summary_table_fits_without_scrollbars_and_uses_current_only_compatibili
     assert not table.horizontalScrollBar().isVisible()
     assert not table.verticalScrollBar().isVisible()
     assert table.horizontalHeaderItem(2).text() == "电流"
-    assert [table.item(row, 2).text() for row in range(6)] == [
+    assert [table.item(row, 2).text() for row in range(4)] == [
         "1.20 A",
-        "2.00 mA",
-        "-",
         "-",
         "-",
         "--",
     ]
     assert sum(table.columnWidth(column) for column in range(4)) <= table.viewport().width()
-    assert sum(table.rowHeight(row) for row in range(6)) <= table.viewport().height()
+    assert sum(table.rowHeight(row) for row in range(4)) <= table.viewport().height()
 
 
 def test_summary_table_keeps_compact_non_wrapped_rows_and_grows_wrapped_rows(
@@ -261,16 +257,16 @@ def test_summary_table_keeps_compact_non_wrapped_rows_and_grows_wrapped_rows(
     assert table.verticalScrollBarPolicy() is Qt.ScrollBarPolicy.ScrollBarAlwaysOff
     assert not table.horizontalScrollBar().isVisible()
     assert not table.verticalScrollBar().isVisible()
-    assert all(table.rowHeight(row) >= 23 for row in range(5))
+    assert all(table.rowHeight(row) >= 23 for row in range(3))
     required_height = _required_wrapped_result_height(table, long_ai_result)
     assert required_height > 23
-    assert table.rowHeight(5) >= required_height
-    assert table.item(5, 3).text() == long_ai_result
-    assert table.item(5, 3).toolTip() == long_ai_result
-    assert [table.item(row, 2).text() for row in range(6)] == [
+    assert table.rowHeight(3) >= required_height
+    assert table.item(3, 3).text() == long_ai_result
+    assert table.item(3, 3).toolTip() == long_ai_result
+    assert [table.item(row, 2).text() for row in range(4)] == [
         "12.35 mA"
-    ] * 6
-    assert sum(table.rowHeight(row) for row in range(6)) <= table.viewport().height()
+    ] * 4
+    assert sum(table.rowHeight(row) for row in range(4)) <= table.viewport().height()
 
 
 def test_summary_table_preserves_and_fits_long_ai_result(qapp):
@@ -300,19 +296,19 @@ def test_summary_table_preserves_and_fits_long_ai_result(qapp):
     qapp.processEvents()
     table = _summary_table(card)
 
-    assert table.item(5, 3).text() == long_ai_result
-    assert table.item(5, 3).toolTip() == long_ai_result
+    assert table.item(3, 3).text() == long_ai_result
+    assert table.item(3, 3).toolTip() == long_ai_result
     assert table.wordWrap() is True
     assert table.columnWidth(3) > table.columnWidth(2)
     required_height = _required_wrapped_result_height(table, long_ai_result)
     assert required_height > 23
-    assert table.rowHeight(5) >= required_height
+    assert table.rowHeight(3) >= required_height
     assert (
         table.horizontalHeader().height()
-        + sum(table.rowHeight(row) for row in range(6))
+        + sum(table.rowHeight(row) for row in range(4))
         <= table.height()
     )
-    assert sum(table.rowHeight(row) for row in range(6)) <= table.viewport().height()
+    assert sum(table.rowHeight(row) for row in range(4)) <= table.viewport().height()
     assert not table.horizontalScrollBar().isVisible()
     assert not table.verticalScrollBar().isVisible()
 
@@ -339,7 +335,7 @@ def test_in_place_update_refits_long_ai_result(qapp):
     qapp.processEvents()
     qapp.processEvents()
     table = _summary_table(card)
-    initial_row_height = table.rowHeight(5)
+    initial_row_height = table.rowHeight(3)
     initial_table_height = table.height()
 
     long_ai_result = "不通过（FAN BLADE INSTALLATION ABNORMAL）"
@@ -362,20 +358,20 @@ def test_in_place_update_refits_long_ai_result(qapp):
     qapp.processEvents()
 
     assert _summary_table(card) is table
-    assert table.item(5, 3).text() == long_ai_result
-    assert table.item(5, 3).toolTip() == long_ai_result
+    assert table.item(3, 3).text() == long_ai_result
+    assert table.item(3, 3).toolTip() == long_ai_result
     assert table.wordWrap() is True
     assert table.columnWidth(3) > table.columnWidth(2)
     required_height = _required_wrapped_result_height(table, long_ai_result)
     assert required_height > initial_row_height
-    assert table.rowHeight(5) >= required_height
+    assert table.rowHeight(3) >= required_height
     assert table.height() > initial_table_height
     assert (
         table.horizontalHeader().height()
-        + sum(table.rowHeight(row) for row in range(6))
+        + sum(table.rowHeight(row) for row in range(4))
         <= table.height()
     )
-    assert sum(table.rowHeight(row) for row in range(6)) <= table.viewport().height()
+    assert sum(table.rowHeight(row) for row in range(4)) <= table.viewport().height()
     assert not table.horizontalScrollBar().isVisible()
     assert not table.verticalScrollBar().isVisible()
 
@@ -468,8 +464,8 @@ def test_active_card_always_renders_fixed_summary_skeleton(qapp, phase):
     assert card.findChild(QLabel, "result_history_card_metric_spl").text() == "--"
     assert card.findChild(QLabel, "result_history_card_metric_loudness").text() == "--"
     table = _summary_table(card)
-    assert [table.item(row, 1).text() for row in range(6)] == ["-"] * 6
-    assert [table.item(row, 3).text() for row in range(6)] == ["-"] * 6
+    assert [table.item(row, 1).text() for row in range(4)] == ["-"] * 4
+    assert [table.item(row, 3).text() for row in range(4)] == ["-"] * 4
 
 
 @pytest.mark.parametrize(
@@ -597,7 +593,7 @@ def test_single_line_four_character_fault_stays_complete_at_default_size(qapp):
     assert card.width() == 360
     assert overall is not None
     assert overall.text() == full_status
-    assert overall.toolTip() == f"结果摘要：{full_status}"
+    assert overall.toolTip() == ""
     assert full_status in overall.accessibleDescription()
     assert overall.wordWrap() is False
     assert overall.height() == 48
@@ -650,13 +646,15 @@ def test_adaptive_status_shrinks_to_keep_long_fault_complete(qapp):
         full_status,
     )
     assert 18 <= chosen_size <= 31
-    assert overall.toolTip() == f"结果摘要：{full_status}"
+    assert overall.toolTip() == ""
     assert full_status in overall.accessibleDescription()
 
 
-def test_adaptive_status_elides_at_minimum_size_but_keeps_full_metadata(qapp):
-    fault_type = "风扇叶片安装方向和固定状态异常需要立即停机进行人工复核"
-    assert len(fault_type.encode("utf-8")) <= 128
+@pytest.mark.parametrize("fault_type", [
+    "风扇叶片安装方向和固定状态异常需要立即停机进行人工复核",
+    "FANBLADEINSTALLATIONABNORMAL" * 4,
+])
+def test_adaptive_status_wraps_at_minimum_size_and_restores_short_height(qapp, fault_type):
     full_status = f"不通过：{fault_type}"
     card = ResultHistoryCard(
         _snapshot(
@@ -678,14 +676,24 @@ def test_adaptive_status_elides_at_minimum_size_but_keeps_full_metadata(qapp):
     assert available_width > 0
     assert _status_font_size(overall) == 18
     assert _status_text_width(overall, full_status, 18) > available_width
-    assert overall.text() != full_status
-    assert overall.text().endswith("…")
-    assert full_status.startswith(overall.text()[:-1])
-    assert _status_text_width(overall, overall.text(), 18) <= available_width
-    assert overall.wordWrap() is False
-    assert overall.height() == 48
-    assert overall.toolTip() == f"结果摘要：{full_status}"
+    assert overall.text() == full_status
+    assert overall.wordWrap() is True
+    assert overall.height() >= overall.fontMetrics().boundingRect(
+        QRect(0, 0, available_width, 10_000),
+        Qt.TextFlag.TextWrapAnywhere, full_status,
+    ).height()
+    assert overall.height() > 48
+    assert overall.toolTip() == ""
     assert full_status in overall.accessibleDescription()
+    assert overall.width() <= card.width()
+
+    card.preview_manual_judgment("OK", None)
+    qapp.processEvents()
+    qapp.processEvents()
+    assert overall.text() == "通过"
+    assert overall.height() == 48
+    assert _status_font_size(overall) == 32
+    assert overall.wordWrap() is False
 
 
 def test_adaptive_status_refits_on_in_place_summary_update(qapp):
@@ -730,7 +738,7 @@ def test_adaptive_status_refits_on_in_place_summary_update(qapp):
     assert 18 <= chosen_size <= 31
     assert overall.height() == 48
     assert card.height() == initial_card_height
-    assert overall.toolTip() == f"结果摘要：{full_status}"
+    assert overall.toolTip() == ""
     assert full_status in overall.accessibleDescription()
 
 
@@ -775,7 +783,7 @@ def test_manual_preview_refits_ng_then_restores_ok_default_size(qapp):
     assert 18 <= chosen_size <= 31
     assert overall.height() == 48
     assert card.height() == initial_card_height
-    assert overall.toolTip() == f"结果摘要：{full_status}"
+    assert overall.toolTip() == ""
     assert full_status in overall.accessibleDescription()
 
     card.preview_manual_judgment("OK", None)
@@ -857,11 +865,9 @@ def test_measurement_summary_refresh_preserves_pending_manual_preview(qapp):
     card.refresh_measurement_summary(payload)
 
     table = _summary_table(card)
-    assert tuple(table.item(row, 1).text() for row in range(6)) == (
+    assert tuple(table.item(row, 1).text() for row in range(4)) == (
         "58.14 dB",
-        "53.71 dB",
         "11.10 sone",
-        "8.08 sone",
         "0.83",
         "97.50 %",
     )
@@ -908,22 +914,14 @@ def test_adaptive_status_refits_same_label_when_card_narrows_then_widens(qapp):
     assert available_width > 0
     chosen_size = _status_font_size(overall)
     assert chosen_size < 32
-    assert (
-        _status_text_width(overall, overall.text(), chosen_size)
-        <= available_width
-    )
-    if overall.text() == full_status:
-        assert (
-            _status_text_width(overall, full_status, chosen_size + 1)
-            > available_width
-        )
+    assert overall.text() == full_status
+    if _status_text_width(overall, full_status, chosen_size) <= available_width:
+        assert overall.height() == 48
     else:
         assert chosen_size == 18
-        assert _status_text_width(overall, full_status, 18) > available_width
-        assert overall.text().endswith("…")
-    assert overall.height() == 48
-    assert card.height() == initial_card_height
-    assert overall.toolTip() == f"结果摘要：{full_status}"
+        assert overall.wordWrap() is True
+        assert overall.height() >= overall.heightForWidth(available_width)
+    assert overall.toolTip() == ""
     assert full_status in overall.accessibleDescription()
 
     card.setFixedWidth(360)
@@ -996,15 +994,19 @@ def test_operator_card_omits_duplicate_metadata_and_selection_text(qapp):
     text = _visible_text(card)
     assert "配置：轴承终检" in text
     assert "SN：SN-007" in text
-    assert "触发：PLC" in text
+    assert "触发：" not in text
+    assert card.findChild(QLabel, "result_history_card_trigger_source") is None
     for duplicate in _REMOVED_OPERATOR_FIELDS:
         assert duplicate not in text
 
 
-def test_card_compacts_long_sn_and_shows_sn_with_trigger_on_one_row(qapp):
-    full_sn = "ABCDEF-1234567890-UVWXYZ"
+@pytest.mark.parametrize("width", [330, 344, 360])
+def test_card_wraps_complete_metadata_within_card_width(qapp, width):
+    full_sn = "ABCDEF1234567890UVWXYZ" * 5
+    config_name = "轴承终检配置与工位详细名称" * 4
+    trigger_source = "CUSTOMTRIGGERSOURCE" * 5
     card = ResultHistoryCard(
-        _snapshot(sn=full_sn, trigger_source="plc")
+        _snapshot(sn=full_sn, config_name=config_name, trigger_source=trigger_source)
     )
 
     sn_label = card.findChild(QLabel, "result_history_card_sn")
@@ -1012,10 +1014,28 @@ def test_card_compacts_long_sn_and_shows_sn_with_trigger_on_one_row(qapp):
         QLabel,
         "result_history_card_trigger_source",
     )
-    assert sn_label.text() == "SN：ABCDEF...UVWXYZ"
+    card.setFixedWidth(width)
+    card.show()
+    for _ in range(4):
+        qapp.processEvents()
+    card.adjustSize()
+    qapp.processEvents()
+    config_label = card.findChild(QLabel, "result_history_card_config_name")
+    assert card.width() == width
+    for label, expected in (
+        (sn_label, f"SN：{full_sn}"),
+        (config_label, f"配置：{config_name}"),
+    ):
+        assert label.text() == expected
+        assert label.wordWrap()
+        assert label.width() <= width - 20
+        assert label.height() >= label.fontMetrics().boundingRect(
+            QRect(0, 0, label.contentsRect().width(), 10_000),
+            Qt.TextFlag.TextWrapAnywhere, expected,
+        ).height()
+        assert label.height() > label.fontMetrics().height()
     assert sn_label.toolTip() == full_sn
-    assert trigger_label.text() == "触发：PLC"
-    assert sn_label.parentWidget() is trigger_label.parentWidget()
+    assert trigger_label is None
 
 
 def test_card_renders_compact_legacy_result_summary_payload(qapp):
@@ -1060,10 +1080,10 @@ def test_card_renders_compact_legacy_result_summary_payload(qapp):
     assert caption.text() == "结果摘要"
     assert overall.text() == "不通过"
     assert table is not None
-    assert table.rowCount() == 6
-    assert table.item(0, 0).text() == "声压峰值"
+    assert table.rowCount() == 4
+    assert table.item(0, 0).text() == "峰值声压级"
     assert table.item(0, 1).text() == "81.25 dB"
-    assert table.item(4, 2).text() == "1.20 A"
+    assert table.item(2, 2).text() == "1.20 A"
     for duplicate in _REMOVED_OPERATOR_FIELDS:
         assert duplicate not in _visible_text(card)
 
@@ -1286,7 +1306,7 @@ def test_card_participates_in_normal_tab_focus_traversal(qapp):
     assert second.hasFocus()
 
 
-def test_card_treats_config_name_sn_and_trigger_source_as_plain_text(qapp):
+def test_card_treats_config_name_and_sn_as_plain_text_and_omits_trigger(qapp):
     config_name = "<b>配置 &amp; 名称</b>"
     detail_label = "<img src=x onerror=alert(1)>"
     detail_value = "值 &lt;仍为文本&gt;"
@@ -1314,7 +1334,8 @@ def test_card_treats_config_name_sn_and_trigger_source_as_plain_text(qapp):
     literal_text = "\n".join(label.text() for label in labels)
     assert config_name in literal_text
     assert "<b>SN" in literal_text
-    assert "<img src='missing'>PLC" in literal_text
+    assert source not in literal_text
+    assert card.findChild(QLabel, "result_history_card_trigger_source") is None
     for omitted in (
         detail_label,
         detail_value,
@@ -1405,3 +1426,81 @@ def test_card_exposes_stable_object_and_accessible_names(qapp):
     assert all(
         unsafe_run_id not in widget.accessibleName() for widget in objects
     )
+
+
+@pytest.mark.parametrize("width", (360, 720))
+def test_summary_caption_stays_centered_without_visible_replay(qapp, width):
+    snapshot = _snapshot()
+    updated = replace(snapshot, conclusion=ResultConclusion.NG, revision=4)
+    card = ResultHistoryCard(snapshot)
+    for current in (card, ResultHistoryCard(updated)):
+        current.setFixedWidth(width)
+        current.show()
+        for refreshed in (False, True):
+            if refreshed:
+                current.update_snapshot(updated, None)
+                current.set_replay_state((0, 1), 1, True, "")
+            qapp.processEvents()
+            caption = current.findChild(
+                QLabel, "result_history_card_summary_caption"
+            )
+            overall = current.findChild(
+                QLabel, "result_history_card_summary_overall"
+            )
+            caption_center = caption.mapTo(current, caption.rect().center()).x()
+            summary_center = overall.mapTo(current, overall.rect().center()).x()
+            assert abs(caption_center - summary_center) <= 1
+            assert caption.width() == overall.width()
+            assert not current.replay_button.isVisible()
+            assert current.replay_button.isHidden()
+
+
+def test_replay_split_button_plays_without_selecting_card(qapp):
+    from PyQt6.QtWidgets import QToolButton
+    card = ResultHistoryCard(_snapshot())
+    played, selected = [], []
+    card.replay_requested.connect(lambda run, channel: played.append((run, channel)))
+    card.activated.connect(selected.append)
+    card.set_replay_state((3, 7), 7, True, '')
+    card.show()
+    button = card.replay_button
+    assert button.popupMode() == QToolButton.ToolButtonPopupMode.MenuButtonPopup
+    assert [a.text() for a in button.menu().actions()] == ['CH4', 'CH8']
+    QTest.mouseClick(button, Qt.MouseButton.LeftButton, pos=button.rect().center())
+    assert played == [(card._run_id, 7)]
+    button.menu().actions()[0].trigger()
+    button.click()
+    assert played == [(card._run_id, 7), (card._run_id, 3), (card._run_id, 3)]
+    assert selected == []
+    assert button.menu().actions()[0].isChecked()
+    card.set_replay_state((3,), 3, True, '')
+    assert button.menu() is None
+    card.set_replay_state((3,), 3, False, '正在启动重放…')
+    assert not button.isEnabled()
+    assert button.toolTip() == '正在启动重放…'
+
+
+def test_replay_uses_standard_icon_instead_of_font_glyph(qapp):
+    from PyQt6.QtWidgets import QStyle
+    card = ResultHistoryCard(_snapshot())
+    assert card.replay_button.text() == '重放'
+    expected = card.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+    assert not card.replay_button.icon().isNull()
+    assert card.replay_button.icon().pixmap(16, 16).toImage() == expected.pixmap(16, 16).toImage()
+
+
+def test_replay_menu_updates_actions_in_place_until_channels_change(qapp):
+    card = ResultHistoryCard(_snapshot())
+    card.set_replay_state((3, 7), 3, True, '')
+    menu = card.replay_button.menu()
+    actions = menu.actions()
+    card.set_replay_state((3, 7), 7, False, '正在启动重放…')
+    assert card.replay_button.menu() is menu
+    assert menu.actions() == actions
+    assert [action.isChecked() for action in actions] == [False, True]
+    assert not any(action.isEnabled() for action in actions)
+    card.set_replay_state((3, 7), 7, True, '')
+    assert all(action.isEnabled() for action in actions)
+    card.set_replay_state((3, 9), 9, True, '')
+    assert card.replay_button.menu() is not menu
+    assert [action.data() for action in card.replay_button.menu().actions()] == [3, 9]

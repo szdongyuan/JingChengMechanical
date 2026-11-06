@@ -258,7 +258,7 @@ def test_package_cancellation_cleans_partially_streamed_audio_stage(
 
     monkeypatch.setattr(
         package_module,
-        "write_pcm16_wav_channels",
+        "write_wav_channels",
         canceling_stream,
         raising=False,
     )
@@ -513,7 +513,7 @@ def test_cancellation_during_multichunk_member_write_cleans_temp_and_preserves_t
 
     monkeypatch.setattr(
         package_module,
-        "write_pcm16_wav_channels",
+        "write_wav_channels",
         write_large_staged_channels,
     )
 
@@ -569,7 +569,7 @@ def test_cancellation_during_multichunk_zip_validation_cleans_all_temporary_stat
 
     monkeypatch.setattr(
         package_module,
-        "write_pcm16_wav_channels",
+        "write_wav_channels",
         write_large_staged_channels,
     )
 

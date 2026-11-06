@@ -105,7 +105,10 @@ class AudioPersistenceService:
                 code="AUDIO_REQUEST_MISMATCH",
                 reason="first immutable audio content revision must be exactly 1",
             )
-        if sample_width_bytes != 2 or source_frame_count != expected_frame_count:
+        if (
+            (source_kind == "CAPTURED_AUDIO" and sample_width_bytes != 2)
+            or source_frame_count != expected_frame_count
+        ):
             return AudioPersistenceResult(
                 initial_attempt_permitted=False,
                 code="AUDIO_REQUEST_MISMATCH",

@@ -218,3 +218,56 @@ def test_container_wires_reader_to_shared_runtime_and_artifact_store(saved_run, 
     assert reader._result_artifact_store is services.analysis_result_artifact_store
     assert reader._result_artifact_store is services.run_export_reader._result_artifact_store
     assert reader.read(saved_run[1]).workorder["sn"] == "SN-history"
+
+
+def test_replay_only_read_never_hydrates_results(saved_run, monkeypatch):
+    reader = _reader(saved_run)
+    def forbidden(*args):
+        pytest.fail('replay metadata must not hydrate charts')
+    monkeypatch.setattr(reader, '_read_result', forbidden)
+    snapshot = reader.read_replay(saved_run[1])
+    assert snapshot.run_id == saved_run[1]
+    assert snapshot.audio.channel_order == (3, 1)
+    assert snapshot.config['config_id'] == 7
+    assert snapshot.audio_message is None
+    saved_run[3].unlink()
+    assert reader.read_replay(saved_run[1]).audio is None
+    with pytest.raises(HistoricalAnalysisReadError):
+        reader.read_replay('invalid')
+
+
+def test_replay_only_import_uses_original_wav_columns(prepared_database_path, tmp_path):
+    from app.service.run_persistence.contracts import IngressKind
+    from tests.run_persistence.test_export_reader import _analysis_envelope
+    runtime = _ready_runtime(prepared_database_path)
+    try:
+        run = _insert_active(runtime, ingress_kind=IngressKind.IMPORTED, channel_order=(7, 3))
+        envelope = _analysis_envelope()
+        envelope['config']['selected_channels'] = [7]
+        envelope['channel_mapping'] = {
+            'schema': 'audio-import-map/v2', 'source_channel_count': 2,
+            'assignments': [
+                {'wav_channel_index': 1, 'mode': 'config', 'channel_index': 7},
+                {'wav_channel_index': 0, 'mode': 'chart', 'channel_index': None},
+            ],
+        }
+        path = tmp_path / 'imported.wav'
+        with wave.open(str(path), 'wb') as wav:
+            wav.setnchannels(2)
+            wav.setsampwidth(2)
+            wav.setframerate(8000)
+            wav.writeframes(b'\x00\x00\x01\x00' * 16)
+        _insert_audio(runtime, run, path, channel_count=2, source_kind='IMPORTED_SOURCE')
+        with runtime.operation() as database:
+            database.execute_sql('UPDATE run SET config_snapshot_json=? WHERE run_id=?', (json.dumps(envelope), run))
+            database.execute_sql('UPDATE audio SET byte_size=? WHERE run_id=?', (path.stat().st_size, run))
+        reader = HistoricalAnalysisReader(runtime)
+        snapshot = reader.read_replay(run)
+        assert snapshot.audio.channel_order == (0, 1)
+        assert snapshot.audio.frame_count / snapshot.audio.sample_rate_hz == 0.002
+        assert snapshot.config['selected_channels'] == [7]
+        with runtime.operation() as database:
+            database.execute_sql('UPDATE audio SET sample_rate_hz=16000 WHERE run_id=?', (run,))
+        assert reader.read_replay(run).audio is None
+    finally:
+        runtime.close_after_upstream_stopped()

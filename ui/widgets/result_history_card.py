@@ -8,19 +8,23 @@ from PyQt6.QtCore import (
     QEvent,
     QPropertyAnimation,
     QRect,
+    QSize,
     QTimer,
     Qt,
     pyqtSignal,
 )
-from PyQt6.QtGui import QColor, QFont, QFontMetrics, QKeyEvent, QMouseEvent
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QKeyEvent, QMouseEvent, QPainter
 from PyQt6.QtWidgets import (
     QFrame,
     QHeaderView,
     QHBoxLayout,
     QLabel,
+    QMenu,
     QSizePolicy,
+    QStyle,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -100,10 +104,8 @@ def _card_style_sheet() -> str:
 
 _CARD_STYLE_SHEET = _card_style_sheet()
 _SUMMARY_ROWS = (
-    ("spl", "声压峰值"),
-    ("spl_average", "声压平均"),
-    ("loudness", "响度峰值"),
-    ("loudness_average", "响度平均"),
+    ("spl", "峰值声压级"),
+    ("loudness", "峰值响度"),
     ("stft_score", "频谱得分"),
     ("ai", "AI 分析"),
 )
@@ -130,13 +132,13 @@ def _result_state(snapshot: ResultHistoryCardSnapshot) -> str:
 
 
 class _FittedSummaryTable(QTableWidget):
-    """Fit wrapped result text while keeping the summary free of scrollbars."""
+    """Fit all wrapped cells while keeping the summary free of scrollbars."""
 
-    _ROW_HEIGHT = 23
+    _ROW_HEIGHT = 28
 
     def __init__(self, rows: int, columns: int, parent=None) -> None:
         super().__init__(rows, columns, parent)
-        self._last_fitted_result_width = -1
+        self._last_fitted_column_widths = ()
         self._width_refit_timer = QTimer(self)
         self._width_refit_timer.setSingleShot(True)
         self._width_refit_timer.timeout.connect(self._run_width_refit)
@@ -155,10 +157,15 @@ class _FittedSummaryTable(QTableWidget):
             self._width_refit_timer.start(0)
 
     def _run_width_refit(self) -> None:
-        if self.columnWidth(3) != self._last_fitted_result_width:
+        if self._column_widths() != self._last_fitted_column_widths:
             self._fit_rows()
 
+    def _column_widths(self) -> tuple[int, ...]:
+        return tuple(self.columnWidth(column) for column in range(self.columnCount()))
+
     def _fit_rows(self) -> None:
+        self.resizeRowsToContents()
+        # Preserve the result column's established wrapping margin and padding.
         available_width = max(1, self.columnWidth(3) - 12)
         for row in range(self.rowCount()):
             item = self.item(row, 3)
@@ -170,7 +177,7 @@ class _FittedSummaryTable(QTableWidget):
             )
             self.setRowHeight(
                 row,
-                max(self._ROW_HEIGHT, bounds.height() + 8),
+                max(self._ROW_HEIGHT, self.rowHeight(row), bounds.height() + 8),
             )
         self.setFixedHeight(
             self.horizontalHeader().height()
@@ -178,11 +185,48 @@ class _FittedSummaryTable(QTableWidget):
             + self.frameWidth() * 2
             + 2
         )
-        self._last_fitted_result_width = self.columnWidth(3)
+        self._last_fitted_column_widths = self._column_widths()
 
 
-class _FittedStatusLabel(QLabel):
-    """Keep the complete status on one line at the largest readable size."""
+class _WrappingLabel(QLabel):
+    """Measure and paint complete plain text, including unbroken identifiers."""
+
+    def heightForWidth(self, width: int) -> int:
+        if not self.wordWrap():
+            return super().heightForWidth(width)
+        return self.fontMetrics().boundingRect(
+            QRect(0, 0, max(1, width), 100_000),
+            self.alignment() | Qt.TextFlag.TextWrapAnywhere,
+            self.text(),
+        ).height() + 4
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(0, self.fontMetrics().height() + 4)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self.wordWrap():
+            self.setFixedHeight(self.heightForWidth(self.contentsRect().width()))
+
+    def paintEvent(self, event) -> None:
+        if not self.wordWrap():
+            super().paintEvent(event)
+            return
+        QFrame.paintEvent(self, event)
+        painter = QPainter(self)
+        self.style().drawItemText(
+            painter,
+            self.contentsRect(),
+            self.alignment() | Qt.TextFlag.TextWrapAnywhere,
+            self.palette(),
+            self.isEnabled(),
+            self.text(),
+            self.foregroundRole(),
+        )
+
+
+class _FittedStatusLabel(_WrappingLabel):
+    """Fit short statuses on one line and wrap longer text without elision."""
 
     _MAX_PIXEL_SIZE = 32
     _MIN_PIXEL_SIZE = 18
@@ -199,14 +243,13 @@ class _FittedStatusLabel(QLabel):
         self._full_text = text
         self._color = color
         self.setText(text)
-        self.setToolTip(f"结果摘要：{text}")
         self.setAccessibleDescription(f"结果摘要：{text}")
         self._apply_style(self._MAX_PIXEL_SIZE)
         self._fit_text()
         self._schedule_fit()
 
     def resizeEvent(self, event) -> None:
-        super().resizeEvent(event)
+        QLabel.resizeEvent(self, event)
         if event.oldSize().width() != event.size().width():
             self._schedule_fit()
 
@@ -233,16 +276,13 @@ class _FittedStatusLabel(QLabel):
                 break
 
         self._apply_style(chosen_size)
-        if complete_text_fits:
-            visible_text = self._full_text
-        else:
-            metrics = QFontMetrics(self._font_at_size(chosen_size))
-            visible_text = metrics.elidedText(
-                self._full_text,
-                Qt.TextElideMode.ElideRight,
-                available_width,
-            )
-        self.setText(visible_text)
+        self.setWordWrap(not complete_text_fits)
+        self.setText(self._full_text)
+        self.setMinimumWidth(0)
+        self.setFixedHeight(
+            48 if complete_text_fits
+            else max(52, self.heightForWidth(self.contentsRect().width()) + 4)
+        )
 
     def _font_at_size(self, pixel_size: int) -> QFont:
         font = self.font()
@@ -261,6 +301,7 @@ class ResultHistoryCard(QFrame):
     """Compact, store-independent projection of one history card snapshot."""
 
     activated = pyqtSignal(str)
+    replay_requested = pyqtSignal(str, int)
 
     def __init__(
         self,
@@ -295,36 +336,50 @@ class ResultHistoryCard(QFrame):
         self._manual_judgment_widget: QWidget | None = None
         self._manual_action_animation: QPropertyAnimation | None = None
         layout.setContentsMargins(10, 8, 10, 8)
-        layout.setSpacing(3)
+        layout.setSpacing(5)
 
+        self.replay_button = QToolButton(self)
+        self.replay_button.setText("重放")
+        self.replay_button.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+        )
+        self.replay_button.setToolButtonStyle(
+            Qt.ToolButtonStyle.ToolButtonTextBesideIcon
+        )
+        self.replay_button.setObjectName("result_history_card_replay")
+        self.replay_button.setAccessibleName("重放此记录录音")
+        self.replay_button.clicked.connect(self._request_replay)
+        # Retain the playback API for compatibility without a card UI entry.
+        self.replay_button.hide()
+        self._replay_channel = None
+        self.set_replay_state((), None, False, "正在读取录音信息…")
         config_label = self._add_label(
             layout,
             f"配置：{snapshot.config.name or '—'}",
             "result_history_card_config_name",
             "结果配置名称",
         )
-        config_label.setWordWrap(False)
+        config_label.setStyleSheet("font-size: 16px; font-weight: 600;")
+        config_label.setMinimumWidth(0)
+        config_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred,
+        )
         config_label.setToolTip(config_label.text())
-        metadata_layout = QHBoxLayout()
+        metadata_layout = QVBoxLayout()
         metadata_layout.setContentsMargins(0, 0, 0, 0)
-        metadata_layout.setSpacing(8)
+        metadata_layout.setSpacing(2)
         sn_label = self._add_label(
             metadata_layout,
-            f"SN：{self._compact_sn(snapshot.sn)}",
+            f"SN：{snapshot.sn or '—'}",
             "result_history_card_sn",
             "序列号",
         )
-        sn_label.setWordWrap(False)
-        sn_label.setToolTip(snapshot.sn or "—")
-        trigger_label = self._add_label(
-            metadata_layout,
-            f"触发：{self._trigger_display(snapshot.trigger_source)}",
-            "result_history_card_trigger_source",
-            "触发来源",
+        sn_label.setStyleSheet("font-size: 13px;")
+        sn_label.setMinimumWidth(0)
+        sn_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred,
         )
-        trigger_label.setWordWrap(False)
-        trigger_label.setToolTip(snapshot.trigger_source or "—")
-        metadata_layout.addStretch(1)
+        sn_label.setToolTip(snapshot.sn or "—")
         layout.addLayout(metadata_layout)
         self._add_summary(layout, payload)
         self._manual_judgment_slot = QWidget(self)
@@ -340,6 +395,60 @@ class ResultHistoryCard(QFrame):
         self._manual_judgment_slot.hide()
         self._manual_judgment_slot.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         layout.addWidget(self._manual_judgment_slot)
+
+    def set_replay_state(
+        self, channels: tuple[int, ...], selected: int | None,
+        enabled: bool, message: str,
+    ) -> None:
+        self._replay_channel = selected
+        menu = self.replay_button.menu()
+        if getattr(self, '_replay_channels', None) != tuple(channels):
+            self._replay_channels = tuple(channels)
+            self.replay_button.setMenu(None)
+            if menu is not None:
+                menu.deleteLater()
+            menu = None
+            if len(channels) > 1:
+                menu = QMenu(self.replay_button)
+                for channel in channels:
+                    action = menu.addAction(f"CH{channel + 1}")
+                    action.setCheckable(True)
+                    action.triggered.connect(
+                        lambda checked=False, channel=channel: (
+                            self._choose_replay_channel(channel)
+                        )
+                    )
+                    action.setData(channel)
+                self.replay_button.setMenu(menu)
+                self.replay_button.setPopupMode(
+                    QToolButton.ToolButtonPopupMode.MenuButtonPopup
+                )
+            else:
+                self.replay_button.setPopupMode(
+                    QToolButton.ToolButtonPopupMode.DelayedPopup
+                )
+        if menu is not None:
+            for action in menu.actions():
+                action.setChecked(action.data() == selected)
+                action.setEnabled(enabled)
+        self.replay_button.setEnabled(enabled)
+        tooltip = message
+        if not tooltip and selected is not None:
+            tooltip = f"从头重放 CH{selected + 1}"
+        self.replay_button.setToolTip(tooltip)
+        self.replay_button.setAccessibleDescription(self.replay_button.toolTip())
+
+    def _choose_replay_channel(self, channel) -> None:
+        if not self.replay_button.isEnabled():
+            return
+        self._replay_channel = channel
+        for action in self.replay_button.menu().actions():
+            action.setChecked(action.data() == channel)
+        self._request_replay()
+
+    def _request_replay(self) -> None:
+        if self.replay_button.isEnabled() and self._replay_channel is not None:
+            self.replay_requested.emit(self._run_id, self._replay_channel)
 
     def _add_summary(
         self,
@@ -425,9 +534,11 @@ class ResultHistoryCard(QFrame):
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         table.setWordWrap(True)
+        table.setTextElideMode(Qt.TextElideMode.ElideNone)
         table.setStyleSheet(
-            "QTableWidget { font-size: 12px; }"
-            "QHeaderView::section { padding: 1px; font-size: 12px; }"
+            "QTableWidget { font-size: 13px; }"
+            "QTableWidget::item { padding: 0px; }"
+            "QHeaderView::section { padding: 1px; font-size: 13px; }"
         )
         table.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
@@ -449,9 +560,10 @@ class ResultHistoryCard(QFrame):
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         header.setStretchLastSection(False)
-        table.setColumnWidth(0, 76)
-        table.setColumnWidth(1, 70)
-        table.setColumnWidth(2, 54)
+        table.setColumnWidth(0, 78)
+        # Keep the full two-decimal loudness and unit on one ordinary line.
+        table.setColumnWidth(1, 84)
+        table.setColumnWidth(2, 48)
         for row_index, (item_key, label) in enumerate(_SUMMARY_ROWS):
             row = rows_by_key.get(item_key, {})
             values = (
@@ -950,27 +1062,6 @@ class ResultHistoryCard(QFrame):
         return f"{number} {suffix}".rstrip()
 
     @staticmethod
-    def _compact_sn(sn: str) -> str:
-        text = sn.strip()
-        if not text:
-            return "—"
-        if len(text) <= 15:
-            return text
-        return f"{text[:6]}...{text[-6:]}"
-
-    @staticmethod
-    def _trigger_display(trigger_source: str) -> str:
-        text = trigger_source.strip()
-        return {
-            "plc": "PLC",
-            "manual": "手动",
-            "scan": "扫码",
-            "scanner": "扫码",
-            "import": "导入",
-            "import_audio": "导入",
-        }.get(text.lower(), text or "—")
-
-    @staticmethod
     def _summary_result_text(
         value: object,
         *,
@@ -995,7 +1086,10 @@ class ResultHistoryCard(QFrame):
         object_name: str,
         accessible_name: str,
     ) -> QLabel:
-        label = QLabel()
+        label = _WrappingLabel() if object_name in {
+            "result_history_card_config_name",
+            "result_history_card_sn",
+        } else QLabel()
         label.setTextFormat(Qt.TextFormat.PlainText)
         label.setText(text)
         label.setObjectName(object_name)

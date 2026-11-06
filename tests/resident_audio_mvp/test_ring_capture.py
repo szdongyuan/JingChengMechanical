@@ -6,6 +6,7 @@ import threading
 import time
 import weakref
 from dataclasses import fields
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -535,7 +536,62 @@ def test_delayed_production_callbacks_map_one_continuous_frame_timeline() -> Non
         for item in ring.block_metadata
     ] == [(0, 2), (2, 4), (4, 6)]
     assert mapped.status is not _MappingStatus.TIMELINE_GAP
-    assert mapped.status is _MappingStatus.AVAILABLE
+    # Six frames end at 1.4 s; late delivery does not create later audio.
+    assert mapped.status is _MappingStatus.NOT_YET_AVAILABLE
+    assert ring.map_trigger(1_300_000_000).cursor == 5
+
+
+def test_production_timestamp_rollback_faults_before_ring_append() -> None:
+    class Clock:
+        monotonic_domain = "python/system-monotonic"
+
+        def __init__(self) -> None:
+            self.now_ns = 2_000_000_000
+
+        def monotonic(self) -> float:
+            return self.now_ns / 1_000_000_000
+
+        def monotonic_ns(self) -> int:
+            return self.now_ns
+
+    class SoundDevice:
+        @staticmethod
+        def InputStream(**_kwargs):
+            raise AssertionError("native stream need not open")
+
+    clock = Clock()
+    ring = make_ring(sample_rate_hz=100, frames_per_buffer=10)
+    backend = MonotonicSoundDeviceAudioBackend(SoundDevice(), clock)
+    handle = backend.create_input(
+        stream_spec(sample_rate_hz=100, frames_per_buffer=10),
+        lambda samples, _frames, timestamp, _status: (
+            ring.append(samples, callback_monotonic_ns=timestamp)
+            or BackendCallbackDirective.CONTINUE
+        ),
+        lambda _fault: None,
+    )
+    samples = np.zeros((10, 1), dtype=np.float32)
+
+    first = handle._native_callback(
+        samples,
+        10,
+        SimpleNamespace(currentTime=2.0, inputBufferAdcTime=1.9),
+        BackendCallbackStatus.OK,
+    )
+    clock.now_ns = 2_100_000_000
+    second = handle._native_callback(
+        samples,
+        10,
+        SimpleNamespace(currentTime=2.1, inputBufferAdcTime=0.9),
+        BackendCallbackStatus.OK,
+    )
+
+    assert first is BackendCallbackDirective.CONTINUE
+    assert second is BackendCallbackDirective.STOP
+    assert ring.write_cursor == 10
+    assert [
+        item.callback_monotonic_ns for item in ring.block_metadata
+    ] == [2_000_000_000]
 
 
 def test_large_timeline_overlap_still_faults_without_partial_append() -> None:

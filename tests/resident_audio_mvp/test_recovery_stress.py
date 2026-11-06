@@ -546,6 +546,10 @@ def test_healthy_resident_reserve_latency_survives_five_second_parked_recovery(
         fault_close_timeout_s=1.0,
         shutdown_timeout_s=2.0,
         drain_observer=workloads.accept_display,
+        # This fake emits one startup block. Keep its intended healthy state
+        # on the same controlled clock; latency and the five-second recovery
+        # park still use real perf_counter/monotonic time and unchanged limits.
+        monotonic_ns=backend.clock,
     )
     assert opened.ready_count == 1
     pool = opened.pool

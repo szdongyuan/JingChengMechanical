@@ -18,9 +18,40 @@
 - Create `tests/test_video_preview_integration.py`: focused test-page composition and camera-lifecycle integration coverage.
 - Do not modify `ui/modules/video.py`, `ui/widgets/cards.py`, `main.spec`, or unrelated existing files.
 
+## Execution clarifications (2026-09-08)
+
+- Use the existing main-worktree Python interpreter by absolute path when running from the isolated worktree: `C:/Users/DY/Documents/ChatGPT/New project/.venv/Scripts/python.exe`.
+- The reset control is labeled `恢复默认`, as approved in the current user-facing design summary; it has the same reset semantics specified below.
+- Task 1 must handle default geometry separately from custom geometry on small supported pages. Use the anchor/page intersection for default/reset geometry when that intersection is usable; if the anchor is entirely outside the page or the intersection cannot contain the title controls, constrain the default rectangle into the page so the header remains operable. Below 200×80, fill the page. Preserve default-follow mode so expansion restores the full anchor geometry. Add reset-on-small-page then expansion coverage.
+- Task 1 must prevent body minimum sizes from imposing an overlay minimum. Use a non-constraining outer layout (`QLayout.SetNoConstraint`) and a body container that clips its child, or an equivalent Qt layout approach verified with the real `VideoModule` and its 220 px minimum label. Verify overlay containment at 200×80 and below. Verify title-control accessibility in Task 2 after implementing the header. Do not change `VideoModule` or the shared `Card`.
+- Task 3 must additionally exercise the real `VideoModule` with a fake camera and temporary settings: after changing overlay size, deliver another frame and verify proportional scaling; switch the containing stacked page away and back and verify the same camera instance with no additional starts/stops; emit disconnect, activate retry, and explicitly stop, checking old-thread stop/wait and new-thread start counts. Use the application stylesheet to validate header layout at the supported minimum. These tests complement the stub-based composition test.
+
+## Current execution task: port and complete the existing implementation
+
+Repository inspection found all three historical tasks below already implemented in the isolated `codex/movable-video-preview` branch through checkpoint `8794976`, but absent from the current main checkout. Execute one bounded port/completion task rather than recreating those tasks. The earlier task sections remain the behavioral and verification reference.
+
+- [x] Inspect `8794976` and port only the new overlay widget and its two test files into the new isolated worktree. Apply only the video import and test-page composition hunk to the current `app/main_window.py`; preserve all newer main-window behavior. Do not alter the old worktree or its uncommitted spec changes.
+- [x] Review existing behavior against the approved spec and the execution clarifications above. Use focused failing tests before fixing any gap, including the `恢复默认` label.
+- [x] Verify default/reset geometry on small pages and expansion, with an operable header when the anchor is outside the page.
+- [x] Verify containment with the real video body at 200×80 and smaller sizes, and header controls with the application stylesheet after the header exists.
+- [x] Add any missing real-video integration coverage for proportional rendering after resizing, tab switching, disconnect/retry, and shutdown. Expected: no camera restarts during geometry or tab changes; retry replaces the camera once; explicit stop stops/waits the current camera.
+- [x] Run overlay, integration, and video tests; expect all to pass. Run main-window regression tests; expect only the recorded pre-existing PLC failure and no new failures.
+- [x] Commit temporary checkpoints, pass paired spec/quality reviews and the final full-range quality audit, and verify the integrated file result.
+
+### Completion evidence (2026-09-08)
+
+- Port baseline: 63 feature/video tests passed. Focused RED/GREEN cycles corrected the reset wording, default/reset intersection, stylesheet button padding, INI boolean decoding across a real process restart, and fixed-edge resize release on small pages (including a header minimum regression check).
+- The existing direct-child Qt layout is the permitted equivalent clipping approach: the real `VideoModule` stays within the body allocation and clips its unchanged 220 px label. Tests cover default/custom geometry at 200×80, 150×70, 150×100, and 250×70, followed by expansion. No body/container or camera implementation changes were needed.
+- Small-page custom normalization preserves usable partial rectangles that fit the title controls, instead of inflating them and moving the fixed left/bottom edges on release or restart. Normal-size pages still enforce the normal minimum.
+- Review follow-up fixed queued layout synchronization overwriting active drag/resize geometry during live frames. Active gestures now retain their in-flight geometry while respecting page bounds; persistence still happens on release. Mouse-event regressions cover move/resize from default/custom state with frames between pointer events.
+- Final feature/video verification: 93 passed. Main-window regression: 25 passed and the recorded PLC failure. Combined verification in both the isolated and current project workspaces: 118 passed and that same failure; no additional failures.
+- Real-video characterization tests verify proportional QPixmap sizes after another frame, stacked-page visibility and shrink/grow behavior without camera replacement, initial failure/disconnect retry, and explicit idempotent stop/wait. A composition hit test confirms the overlay actually covers the right column.
+- Offscreen default and 200×80 PNGs were inspected. Loading existing Windows Microsoft YaHei fonts in the screenshot harness resolved missing Chinese glyphs; the harness alone overrides the font family. Application font configuration is unchanged. Artifacts are in `outputs/` and excluded from the checkpoint.
+- Temporary checkpoints: `9ab7876` (port/completion) and `96c8837` (interaction fixes). Independent paired spec/quality reviews and the final full-range quality audit passed for `3e92a7d..96c8837`. The four implementation/test files have been applied as a flattened diff to the current project checkout. Its concurrent `af00bca` AI-console fix and all six pre-existing modified files were preserved; their hashes were verified. Temporary commits were not added to main-branch history.
+
 ## Preflight Baseline
 
-- [ ] **Record the baseline before implementation**
+- [x] **Record the baseline before implementation** (supplied by the dispatch for both main and destination)
 
 Run:
 
@@ -377,7 +408,7 @@ git commit -m "tmp/sdd: integrate floating video preview"
 
 ## Final Review Notes
 
-- [ ] Review Task 1 and Task 2 changes against the spec even though they share the new widget and test files.
-- [ ] Verify no implementation change appears in `ui/modules/video.py`, `ui/widgets/cards.py`, `main.spec`, or unrelated user-owned files.
-- [ ] Confirm the final full-range quality review explicitly compares test output to the recorded baseline failure.
-- [ ] Squash temporary `tmp/sdd:` commits onto the recorded main-worktree base during final integration as required by `subagent-driven-development`.
+- [x] Review Task 1 and Task 2 changes against the spec even though they share the new widget and test files. Independent paired reviewers passed the complete range including integration and follow-up fixes.
+- [x] Verify no implementation change appears in `ui/modules/video.py`, `ui/widgets/cards.py`, `main.spec`, or unrelated user-owned files.
+- [x] Confirm the final full-range quality review explicitly compares test output to the recorded baseline failure.
+- [x] Apply the flattened final file diff without retaining temporary commits in main history. The main branch advanced independently after the recorded base, so integration preserved its current history and left the feature changes in the current checkout for review.

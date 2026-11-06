@@ -430,7 +430,7 @@ class TestRunAiAnalysis:
 
         assert request_payload["window_info"] == window_info
 
-    def test_run_ai_analysis_uses_response_threshold_when_present(
+    def test_run_ai_analysis_software_threshold_wins_when_present(
         self, ai_service, fake_audio_file, tmp_path
     ):
         result = _run_threshold_analysis(
@@ -442,8 +442,8 @@ class TestRunAiAnalysis:
         )
 
         assert result["module_status"] == "success"
-        assert result["decision_threshold"] == pytest.approx(0.8)
-        assert result["decision_threshold_source"] == "response_extra"
+        assert result["decision_threshold"] == pytest.approx(0.6)
+        assert result["decision_threshold_source"] == "request_params"
 
     def test_run_ai_analysis_falls_back_to_request_threshold_when_response_threshold_invalid(
         self, ai_service, fake_audio_file, tmp_path
@@ -463,8 +463,8 @@ class TestRunAiAnalysis:
     @pytest.mark.parametrize(
         ("response_extra", "request_params"),
         [
-            ({"decision_threshold": 1.2}, {"decision_threshold": -0.1}),
-            ({}, {"decision_threshold": "bad"}),
+            ({"decision_threshold": 1.2}, {"decision_threshold": None}),
+            ({}, {}),
         ],
     )
     def test_run_ai_analysis_falls_back_to_default_point_five_when_no_valid_threshold_exists(

@@ -12,7 +12,9 @@ from PyQt6.QtWidgets import (
 )
 
 from app.services_container import FactoryControllerState
+from app.service.torque.types import TorqueConfig, TorqueConfigApplied, TorqueStatus
 from model.plc_table import PlcTable
+from ui.popups.torque_table_dialog import format_torque
 
 
 class WorkOrderModule(QWidget):
@@ -36,6 +38,12 @@ class WorkOrderModule(QWidget):
         self._plc_sn_edits: dict[int, QLineEdit] = {}
         self._plc_model_values: dict[int, str] = {}
         self._plc_model_edits: dict[int, QLineEdit] = {}
+        self._plc_torque_edits: dict[int, QLineEdit] = {}
+        self._plc_torque_statuses: dict[int, TorqueStatus] = {}
+        self._plc_torque_cycles: dict[int, int] = {}
+        self._torque_plc_ids: set[int] = set()
+        self._plc_names: dict[int, str] = {}
+        self._plc_labels: dict[int, tuple[QLabel, ...]] = {}
         self._rendered_plc_ids: tuple[int, ...] | None = None
 
         layout = QVBoxLayout(self)
@@ -74,6 +82,12 @@ class WorkOrderModule(QWidget):
             self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
         if hasattr(self.services.bus, "plc_workorder_changed"):
             self.services.bus.plc_workorder_changed.connect(self._on_plc_workorder_changed)
+        if hasattr(self.services.bus, "plc_torque_changed"):
+            self.services.bus.plc_torque_changed.connect(self._on_plc_torque_changed)
+        for signal_name in ("plc_torque_config_saved", "plc_torque_config_applied"):
+            signal = getattr(self.services.bus, signal_name, None)
+            if signal is not None:
+                signal.connect(self._on_plc_torque_config_changed)
 
         self._refresh_plc_sn_rows()
         self._update_phase_trigger_summary()
@@ -109,12 +123,83 @@ class WorkOrderModule(QWidget):
             return
         self._plc_sn_values[plc_id] = sn
         self._plc_model_values[plc_id] = model
+        # A disabled next cycle has no TorqueStatus. Keep its predecessor's
+        # watermark, but retire its result (including any queued final status).
+        self._plc_torque_statuses.pop(plc_id, None)
         self._refresh_plc_sn_rows()
         for other_edit in self._plc_sn_edits.values():
             other_edit.setStyleSheet("")
         edit = self._plc_sn_edits.get(plc_id)
         if edit is not None and sn:
             edit.setStyleSheet("color: #2563eb; font-weight: 600;")
+
+    def _on_plc_torque_changed(self, status: TorqueStatus) -> None:
+        if not isinstance(status, TorqueStatus) or status.plc_id not in self._torque_plc_ids:
+            return
+        # Real PLC events carry a process-unique ID, even when their acoustic
+        # timestamps coincide. Legacy status producers retain timestamp ordering.
+        cycle_id = status.cycle_id if status.cycle_id is not None else status.trigger_ns
+        latest = self._plc_torque_cycles.get(status.plc_id)
+        if latest is not None:
+            if cycle_id < latest:
+                return
+            if cycle_id == latest and status.plc_id not in self._plc_torque_statuses:
+                return
+        # All states register the cycle: config_error may be the only event.
+        self._plc_torque_cycles[status.plc_id] = cycle_id
+        self._plc_torque_statuses[status.plc_id] = status
+        self._render_plc_torque(status.plc_id)
+
+    def _on_plc_torque_config_changed(self, event: TorqueConfig | TorqueConfigApplied) -> None:
+        if isinstance(event, (TorqueConfig, TorqueConfigApplied)) and event.plc_id in self._torque_plc_ids:
+            self._render_plc_torque(event.plc_id)
+
+    def _render_plc_torque(self, plc_id: int) -> None:
+        edit = self._plc_torque_edits.get(plc_id)
+        if edit is None:
+            return
+        status = self._plc_torque_statuses.get(plc_id)
+        tooltip = ["与 PLC 单位一致"]
+        if status is None:
+            store = getattr(self.services, "torque_store", None)
+            enabled = (
+                plc_id in self._torque_plc_ids
+                and store is not None
+                and store.get_config(plc_id).enabled
+            )
+            text = "待读取" if enabled else "未启用"
+        else:
+            text = self._torque_status_text(status)
+            kind = "SN" if status.match_type == "sn" else "型号"
+            tooltip.append(f"{kind}：{status.match_key}" if status.match_key else f"{kind}为空")
+            if status.detail:
+                tooltip.append(status.detail)
+        edit.setText(text)
+        edit.setCursorPosition(0)
+        edit.setToolTip("\n".join([text, *tooltip]))
+
+    @staticmethod
+    def _torque_status_text(status: TorqueStatus) -> str:
+        labels = {
+            "reading": "读取中",
+            "read_error": "读取失败",
+            "invalid_value": "PLC 扭矩无效",
+            "config_error": "扭矩配置错误",
+        }
+        if status.state in labels:
+            return labels[status.state]
+        if status.state == "unmatched":
+            kind = "SN" if status.match_type == "sn" else "型号"
+            match = f"{kind}：{status.match_key}" if status.match_key else f"{kind}为空"
+            return f"未匹配（{match}）"
+        source = {"plc": "PLC", "table": "软件表"}.get(status.source, "")
+        outcome = {
+            "table_pending": "回传中", "table_sent": "已回传", "write_error": "回传失败",
+        }.get(status.state)
+        if outcome:
+            source = f"{source}，{outcome}"
+        value = format_torque(status.value) if status.value is not None else "—"
+        return f"{value}（{source}）"
 
     def _sync_factory_state(
         self,
@@ -140,16 +225,26 @@ class WorkOrderModule(QWidget):
         return plc_id if plc_id > 0 else None
 
     def _refresh_plc_sn_rows(self) -> None:
+        self._torque_plc_ids = self._known_plc_ids()
+        for plc_id in self._plc_torque_cycles.keys() - self._torque_plc_ids:
+            self._plc_torque_cycles.pop(plc_id, None)
+            self._plc_torque_statuses.pop(plc_id, None)
         plc_ids = self._plc_ids_for_display()
         if plc_ids != self._rendered_plc_ids:
             self._rebuild_plc_sn_rows(plc_ids)
+        for plc_id, labels in self._plc_labels.items():
+            name = self._plc_names.get(plc_id) or f"PLC{plc_id}"
+            for label, field in zip(labels, ("SN码", "型号", "扭矩")):
+                label.setText(f"{name} {field}")
         for plc_id, edit in self._plc_sn_edits.items():
             edit.setText(self._plc_sn_values.get(plc_id, ""))
         for plc_id, edit in self._plc_model_edits.items():
             edit.setText(self._plc_model_values.get(plc_id, ""))
+        for plc_id in self._plc_torque_edits:
+            self._render_plc_torque(plc_id)
 
     def _plc_ids_for_display(self) -> tuple[int, ...]:
-        plc_ids = self._known_plc_ids()
+        plc_ids = self._torque_plc_ids
         if plc_ids:
             self._plc_sn_values = {
                 plc_id: sn
@@ -166,6 +261,7 @@ class WorkOrderModule(QWidget):
 
     def _known_plc_ids(self) -> set[int]:
         plc_ids: set[int] = set()
+        self._plc_names = {}
         for attr_name in ("plc_services", "plc_threads", "plc_state"):
             mapping = getattr(self.services, attr_name, None)
             keys = getattr(mapping, "keys", None)
@@ -178,11 +274,12 @@ class WorkOrderModule(QWidget):
                     plc_ids.add(raw_id)
 
         try:
-            rows = PlcTable.select(PlcTable.id).order_by(PlcTable.id)
+            rows = PlcTable.select(PlcTable.id, PlcTable.plc_name).order_by(PlcTable.id)
             for row in rows:
                 plc_id = getattr(row, "id", None)
                 if isinstance(plc_id, int) and plc_id > 0:
                     plc_ids.add(plc_id)
+                    self._plc_names[plc_id] = (getattr(row, "plc_name", None) or "").strip()
         except Exception:
             pass
 
@@ -195,8 +292,10 @@ class WorkOrderModule(QWidget):
             if widget is not None:
                 widget.deleteLater()
 
+        self._plc_labels = {}
         self._plc_sn_edits = {}
         self._plc_model_edits = {}
+        self._plc_torque_edits = {}
         self._rendered_plc_ids = tuple(plc_ids)
         if not plc_ids:
             empty_label = QLabel("未配置 PLC")
@@ -227,9 +326,10 @@ class WorkOrderModule(QWidget):
             row_layout.setSpacing(6)
 
             sn_label = QLabel(f"PLC{plc_id} SN码")
-            sn_label.setFixedWidth(72)
             model_label = QLabel(f"PLC{plc_id} 型号")
-            model_label.setFixedWidth(72)
+            torque_label = QLabel(f"PLC{plc_id} 扭矩")
+
+            self._plc_labels[plc_id] = (sn_label, model_label, torque_label)
 
             sn_edit = QLineEdit()
             sn_edit.setObjectName("PlcField")
@@ -247,15 +347,25 @@ class WorkOrderModule(QWidget):
             model_edit.setMinimumHeight(28)
             model_edit.setMaximumHeight(30)
 
+            torque_edit = QLineEdit()
+            torque_edit.setObjectName("PlcField")
+            torque_edit.setReadOnly(True)
+            torque_edit.setMinimumWidth(0)
+            torque_edit.setMinimumHeight(28)
+            torque_edit.setMaximumHeight(30)
+
             row_layout.addWidget(sn_label, 0, 0)
             row_layout.addWidget(sn_edit, 0, 1)
             row_layout.addWidget(model_label, 1, 0)
             row_layout.addWidget(model_edit, 1, 1)
+            row_layout.addWidget(torque_label, 2, 0)
+            row_layout.addWidget(torque_edit, 2, 1)
             row_layout.setColumnStretch(1, 1)
             self.plc_sn_layout.addWidget(row_widget, outer_row, 0, 1, 1)
             outer_row += 1
             self._plc_sn_edits[plc_id] = sn_edit
             self._plc_model_edits[plc_id] = model_edit
+            self._plc_torque_edits[plc_id] = torque_edit
 
         self._update_plc_scroll_policy(plc_ids)
 

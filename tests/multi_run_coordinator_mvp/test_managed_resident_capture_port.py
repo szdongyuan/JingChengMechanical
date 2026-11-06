@@ -908,6 +908,63 @@ def test_synchronous_completion_maps_all_owned_audio_fields() -> None:
     assert type(outcome.audio.interleaved_bytes) is bytes
 
 
+@pytest.mark.parametrize("failure_stage", ("lookup", "output"))
+def test_mapping_diagnostic_failure_preserves_completed_audio_publication(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    from types import SimpleNamespace
+    import app.service.multi_run_coordinator_mvp.managed_resident_capture_port as adapter
+
+    port, _, pools = _port()
+    pool = pools[0]
+    run_id, reservation = _reserve_one(port)
+    pool.start_outcome_factory = _resident_completed
+    delivered: list[CaptureOutcome] = []
+    delivered_event = threading.Event()
+    attempted: list[str] = []
+    logger = adapter.logging.getLogger(adapter.__name__)
+
+    def fail_output(message: str) -> None:
+        attempted.append("output")
+        assert message.startswith("capture mapped ")
+        raise RuntimeError("diagnostic output unavailable")
+
+    def lookup_logger(name: str) -> object:
+        assert name == adapter.__name__
+        if failure_stage == "lookup":
+            attempted.append("lookup")
+            raise RuntimeError("diagnostic logger unavailable")
+        return logger
+
+    monkeypatch.setattr(logger, "info", fail_output)
+    monkeypatch.setattr(adapter, "logging", SimpleNamespace(getLogger=lookup_logger))
+
+    def sink(outcome: CaptureOutcome) -> None:
+        delivered.append(outcome)
+        delivered_event.set()
+
+    try:
+        port.register_completion(reservation, sink)
+        port.start(reservation, 11, 3)
+
+        assert delivered_event.wait(1)
+        assert attempted == [failure_stage]
+        assert len(delivered) == 1
+        outcome = delivered[0]
+        assert outcome.status is CaptureOutcomeStatus.COMPLETED
+        assert outcome.error_category is None
+        assert outcome.run_id == run_id
+        assert outcome.reservation is reservation
+        assert outcome.audio is not None
+        assert outcome.audio.source_identity == "binding-1"
+        assert outcome.audio.frame_count == 3
+        assert outcome.audio.channel_count == 2
+        assert outcome.audio.interleaved_bytes == np.arange(6, dtype=np.float32).tobytes()
+    finally:
+        assert port.close_and_join(1.0).status is ManagedResidentCaptureCloseStatus.CLOSED
+
+
 def test_trusted_private_resident_values_are_not_reconstructed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

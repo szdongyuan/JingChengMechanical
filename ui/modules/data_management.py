@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 import os
 from threading import Event
@@ -14,6 +14,7 @@ from PyQt6.QtCore import (
     QThread,
     QTimer,
     pyqtSignal,
+    pyqtSlot,
 )
 from PyQt6.QtWidgets import (
     QApplication,
@@ -58,7 +59,9 @@ from model.malfunction_type_table import (
     ensure_builtin_malfunction_type,
 )
 from ui.popups.historical_metric_report_dialog import HistoricalMetricReportDialog
-from ui.popups.historical_analysis_dialog import HistoricalAnalysisDialog
+from ui.popups.historical_analysis_dialog import HistoricalAnalysisDialog, historical_playback
+from ui.popups.import_audio_analysis_dialog import ImportAudioAnalysisDialog
+from app.service.offline_audio_import import ImportRequest, ImportPhase, ImportStatus
 from ui.popups.run_audio_replay_dialog import RunAudioReplayDialog
 from ui.popups.run_record_export_dialog import (
     choose_run_export_options,
@@ -185,6 +188,9 @@ class DataManagementModule(QWidget):
         self._report_dialog = None
         self._replay_dialogs: dict[str, RunAudioReplayDialog] = {}
         self._analysis_dialogs: dict[str, HistoricalAnalysisDialog] = {}
+        self._import_dialog = None
+        self._import_generation = 0
+        self._import_results_seen: set[str] = set()
         self._initial_column_widths_applied = False
         self._fault_type_options_cache: tuple[
             tuple[str, str | None],
@@ -194,6 +200,12 @@ class DataManagementModule(QWidget):
 
         self._build_ui()
         self.refresh_table()
+        signal = getattr(getattr(services, "bus", None), "offline_import_status", None)
+        if signal is not None:
+            signal.connect(self._on_import_status, Qt.ConnectionType.QueuedConnection)
+        service = getattr(services, "offline_audio_import_service", None)
+        self.btn_import_audio.setEnabled(service is not None)
+        self._on_import_status(getattr(service, "status", None))
 
     def _build_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -206,6 +218,8 @@ class DataManagementModule(QWidget):
         toolbar_layout.setSpacing(8)
 
         self.btn_refresh = QPushButton("刷新")
+        self.btn_import_audio = QPushButton("导入音频分析")
+        self.btn_import_audio.clicked.connect(self._import_audio)
         self.btn_statistics_report = QPushButton("统计报告")
         self.btn_select_all = QPushButton("全选")
         self.btn_select_all.setCheckable(True)
@@ -217,6 +231,7 @@ class DataManagementModule(QWidget):
         self.lb_selected = QLabel("已选 0 条")
 
         toolbar_layout.addWidget(self.btn_refresh)
+        toolbar_layout.addWidget(self.btn_import_audio)
         toolbar_layout.addWidget(self.btn_statistics_report)
         toolbar_layout.addWidget(self.btn_select_all)
         toolbar_layout.addWidget(self.btn_select_page)
@@ -226,6 +241,9 @@ class DataManagementModule(QWidget):
         toolbar_layout.addStretch(1)
         toolbar_layout.addWidget(self.lb_selected)
         layout.addWidget(toolbar)
+        self.import_status_label = QLabel("")
+        self.import_status_label.setWordWrap(True)
+        layout.addWidget(self.import_status_label)
 
         filters = QWidget(self)
         filter_layout = QHBoxLayout(filters)
@@ -1006,6 +1024,75 @@ class DataManagementModule(QWidget):
             float(frame_count) / float(sample_rate_hz),
         )
 
+    def _import_audio(self) -> None:
+        service = getattr(self.services, "offline_audio_import_service", None)
+        if service is None or (service.status is not None and not service.status.finished):
+            return
+        if self._import_dialog is not None:
+            self._import_dialog.raise_()
+            return
+        try:
+            config_service = self.services.config_service
+            configs = [config_service.load_config(row["config_id"]) for row in config_service.list_configs()]
+            if not configs:
+                self.import_status_label.setText("请先保存一个配置")
+                return
+            dialog = ImportAudioAnalysisDialog(configs=configs,
+                default_config_id=configs[0]["config_id"] if len(configs) == 1 else None, parent=self)
+        except Exception as exc:
+            self.import_status_label.setText(f"配置加载失败：{exc}")
+            return
+        self._import_dialog = dialog
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.accepted.connect(self._submit_import)
+        dialog.finished.connect(self._import_setup_finished)
+        dialog.open()
+
+    def _import_setup_finished(self, _result):
+        self._import_dialog = None
+
+    def _submit_import(self):
+        request = self._import_dialog.current_request()
+        if request is None:
+            return
+        service = self.services.offline_audio_import_service
+        receipt = service.submit(ImportRequest(source_path=request.wav_path,
+            config_id=request.config_id, assignments=tuple(asdict(item) for item in request.assignments),
+            start_seconds=request.start_sec, duration_seconds=request.duration_sec,
+            use_mic_calibration=request.use_mic_calibration))
+        if not receipt.accepted:
+            self.import_status_label.setText(f"导入失败：{receipt.error}")
+            return
+        self._on_import_status(service.status)
+
+    @pyqtSlot(object)
+    def _on_import_status(self, status):
+        if not isinstance(status, ImportStatus):
+            return
+        # The worker may have retired/deleted a run before queued Qt delivery.
+        latest = getattr(getattr(self.services, "offline_audio_import_service", None), "status", None)
+        if isinstance(latest, ImportStatus) and latest.generation > status.generation:
+            status = latest
+        if status.generation <= self._import_generation:
+            return
+        self._import_generation = status.generation
+        self.btn_import_audio.setEnabled(status.finished)
+        phases = {ImportPhase.ACCEPTED: "已接受导入", ImportPhase.WAITING: "等待生产任务完成",
+            ImportPhase.PREPARING: "正在准备导入", ImportPhase.SAVING: "正在保存音频",
+            ImportPhase.ANALYZING: "正在分析", ImportPhase.COMPLETING_CHARTS: "分析结果已保存，正在完成图表",
+            ImportPhase.COMPLETED: "导入完成", ImportPhase.FAILED: "导入失败", ImportPhase.CANCELED: "导入已取消"}
+        self.import_status_label.setText(" · ".join(filter(None,
+            [phases[status.phase], status.error, *status.warnings])))
+        if status.result_ready:
+            if not self._operation_active and self._applied_query is not None:
+                self._query_and_render(self._applied_query)
+            dialog = self._analysis_dialogs.get(status.run_id)
+            if dialog is not None:
+                dialog.refresh_enrichment()
+            if status.run_id not in self._import_results_seen:
+                self._import_results_seen.add(status.run_id)
+                self._show_analysis(status.run_id)
+
     def _show_analysis(self, run_id: str) -> None:
         dialog = self._analysis_dialogs.get(run_id)
         if dialog is None:
@@ -1035,8 +1122,7 @@ class DataManagementModule(QWidget):
             )
         except Exception:
             record = None
-        composition = getattr(self.services, "final_composition", None)
-        playback = getattr(composition, "playback", None)
+        playback = historical_playback(self.services)
         if (
             record is not None
             and isinstance(getattr(record, "source_wav_path", None), str)

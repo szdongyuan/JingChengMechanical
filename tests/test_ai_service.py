@@ -11,6 +11,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import app.service.ai_service as ai_service_module
+import app.service.ai_subprocess as ai_subprocess_module
 from model.ai_execution_table import AiExecutionTable
 from model.test_config_table import TestConfigTable as ConfigTable
 from model.ai_toolchain_table import AiToolchainTable
@@ -1250,7 +1251,10 @@ class TestRunAiAnalysisRouting:
         package_dir = tmp_path / "pkg"
         package_dir.mkdir()
         captured = {}
-        expected_flags = 0x08000000
+        expected_flags = 0x08000040
+        monkeypatch.setattr(ai_subprocess_module, "os", SimpleNamespace(environ={
+            "PATH": "test-bin", "CUSTOM_AI": "keep", "OMP_NUM_THREADS": "8",
+        }))
 
         monkeypatch.setattr(
             ai_service_module,
@@ -1280,6 +1284,11 @@ class TestRunAiAnalysisRouting:
             "timeout": 30.0,
             "cwd": str(package_dir),
             "creationflags": expected_flags,
+            "env": {
+                "PATH": "test-bin", "CUSTOM_AI": "keep",
+                "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
+                "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1",
+            },
         }
         assert result["exit_code"] == 7
         assert result["stdout_excerpt"] == "out"
@@ -1810,3 +1819,27 @@ class TestBindingCrud:
                 "enabled": True,
                 "score_threshold": 0.5,
             })
+
+def test_threshold_save_next_snapshot_and_clear(ai_service, toolchain, config):
+    AiBindingTable.create(config=config, toolchain=toolchain, enabled=True)
+    ai_service.save_toolchain('motor-ai', _toolchain_payload(params_json={'mode': 'keep', 'decision_threshold': .6}))
+    frozen = ai_service.freeze_bound_toolchain(config.config_id)
+    assert frozen['params'] == {'mode': 'keep', 'decision_threshold': .6}
+    ai_service.save_toolchain('motor-ai', _toolchain_payload(params_json={'mode': 'keep', 'decision_threshold': .8}))
+    next_run = ai_service.freeze_bound_toolchain(config.config_id)
+    assert next_run['params']['decision_threshold'] == .8
+    assert next_run['execution_revision'] != frozen['execution_revision']
+    assert frozen['params']['decision_threshold'] == .6
+    ai_service.save_toolchain('motor-ai', _toolchain_payload(params_json={'mode': 'keep'}))
+    assert ai_service.freeze_bound_toolchain(config.config_id)['params'] == {'mode': 'keep'}
+
+@pytest.mark.parametrize('value', [True, '0.5', -1, 2, float('nan'), float('inf')])
+def test_invalid_threshold_save_and_preflight(ai_service, toolchain, config, tmp_path, value):
+    with pytest.raises(ValueError, match='decision_threshold'):
+        ai_service.save_toolchain('motor-ai', _toolchain_payload(params_json={'decision_threshold': value}))
+    toolchain.params_json = json.dumps({'decision_threshold': value})
+    toolchain.save()
+    AiBindingTable.create(config=config, toolchain=toolchain, enabled=True)
+    result = ai_service.preflight_check(config.config_id, _analysis_segments(tmp_path))
+    assert result['status'] != 'ready'
+    assert 'decision_threshold' in result['error']

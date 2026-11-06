@@ -376,6 +376,7 @@ class PersistedAudioReference:
     dtype: str
     content_revision: str
     audio_data_id: str | None = None
+    source_container_format: str | None = None
 
     def __post_init__(self) -> None:
         _require_non_empty_str(self.reference_id, "reference_id")
@@ -385,6 +386,8 @@ class PersistedAudioReference:
         _require_positive_int(self.channel_count, "channel_count")
         _require_positive_int(self.frame_count, "frame_count")
         _require_non_empty_str(self.dtype, "dtype")
+        if self.source_container_format not in (None, "WAV_PCM", "WAV_IEEE_FLOAT"):
+            raise ValueError("unsupported source WAV container format")
         _require_non_empty_str(self.content_revision, "content_revision")
         _require_optional_non_empty_str(self.audio_data_id, "audio_data_id")
 

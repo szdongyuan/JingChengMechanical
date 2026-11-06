@@ -7,6 +7,47 @@ import pytest
 from app.service.analysis.vibration_payloads import build_vibration_payload
 
 
+@pytest.mark.parametrize("include_frequency,include_pulse", [(False, False), (True, False), (False, True), (True, True)])
+@pytest.mark.parametrize("signal", [
+    np.sin(2 * np.pi * 60 * np.arange(300) / 1000),
+    np.zeros(100), np.array([0.25]), np.array([np.nan, 0.25, np.inf, -0.5]),
+    np.array([np.nan, np.inf]),
+])
+def test_disabled_trends_are_not_called_and_preserve_legacy_values(
+    monkeypatch, include_frequency, include_pulse, signal,
+):
+    from app.service.analysis import vibration_payloads
+
+    kwargs = dict(channel_index=2, signal=signal, sample_rate=1000, calibration_value=3.5)
+    legacy = build_vibration_payload(**kwargs)
+    frequency_keys = {"frequency_times_sec", "fundamental_frequency_values_hz",
+                      "dominant_frequency_values_hz", "spectral_centroid_values_hz",
+                      "frequency_bandwidth_values_hz"}
+    pulse_keys = {"times_sec", "rms_values", "peak_values", "crest_factors"}
+    calls = {"_frequency_trend": 0, "_trend": 0}
+    for name, enabled in [("_frequency_trend", include_frequency), ("_trend", include_pulse)]:
+        original = getattr(vibration_payloads, name)
+
+        def counted(*args, _name=name, _enabled=enabled, _original=original):
+            calls[_name] += 1
+            assert _enabled, f"disabled {_name} was called"
+            return _original(*args)
+
+        monkeypatch.setattr(vibration_payloads, name, counted)
+    payload = build_vibration_payload(
+        **kwargs, include_frequency_trend=include_frequency, include_pulse_trend=include_pulse,
+    )
+    if legacy is None:
+        assert payload is None
+        assert calls == {"_frequency_trend": 0, "_trend": 0}
+        return
+    assert calls == {"_frequency_trend": int(include_frequency), "_trend": int(include_pulse)}
+    for key, value in legacy.items():
+        disabled = (key in frequency_keys and not include_frequency) or (key in pulse_keys and not include_pulse)
+        assert payload[key] == ([] if disabled else value)
+    json.dumps(payload, allow_nan=False)
+
+
 def test_build_vibration_payload_reports_overall_metrics_and_low_frequency_share():
     sample_rate = 1000.0
     times = np.arange(0, 1.0, 1.0 / sample_rate)

@@ -621,17 +621,6 @@ class FactoryModeController(QObject):
             config_id=config_id,
         )
 
-    def analyze_imported_audio(self, request) -> bool:
-        coordinator = getattr(self.services, "multi_run_coordinator", None)
-        start = getattr(coordinator, "start_imported", None)
-        if not callable(start):
-            return False
-        try:
-            result = start(request)
-        except Exception:
-            return False
-        return getattr(result, "status", None) in _ACCEPTED_STARTS
-
     def apply_manual_judgment(self, _label: str) -> ManualLabelUpdateResult:
         return ManualLabelUpdateResult(
             False,

@@ -5,11 +5,13 @@ from __future__ import annotations
 import threading
 import time
 from collections.abc import Callable
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from enum import Enum
 
 import numpy as np
 
+from ..windows_com import com_apartment
 from .contracts import (
     MAX_BOUNDED_TEXT_CHARS,
     AudioInputCallback,
@@ -309,9 +311,26 @@ class _SoundDeviceInputHandle:
             return timed_out
 
     def _control(self) -> None:
+        with ExitStack() as owner_resources:
+            self._control_stream(owner_resources)
+        # Publish final close only after the owner's COM reference is released.
+        with self._lock:
+            self._native_call_active = None
+            self._close_requested = False
+            self._close_result = BackendCloseResult(BackendCloseStatus.CLOSED)
+            self._close_attempt_result = self._close_result
+            self._lifecycle_state = _NativeLifecycleState.CLOSED
+            self._lifecycle_settled.set()
+            self._control_done.set()
+            if self._close_waiter is not None:
+                self._close_waiter.set()
+
+    def _control_stream(self, owner_resources: ExitStack) -> None:
         native: object | None = None
         try:
-            native = self._sounddevice.InputStream(
+            if "wasapi" in self._spec.hostapi_name.casefold():
+                owner_resources.enter_context(com_apartment())
+            native = self._create_stream(
                 device=self._spec.device_index,
                 samplerate=self._spec.sample_rate_hz,
                 channels=self._spec.input_channel_count,
@@ -320,6 +339,7 @@ class _SoundDeviceInputHandle:
                 latency="high",
                 callback=self._sounddevice_callback,
             )
+            self._open_stream(native)
         except Exception as exc:
             with self._lock:
                 self._start_error = exc
@@ -328,13 +348,6 @@ class _SoundDeviceInputHandle:
                 self._native_call_active = None
             self._start_done.set()
             if native is None:
-                with self._lock:
-                    self._close_result = BackendCloseResult(
-                        BackendCloseStatus.CLOSED
-                    )
-                    self._lifecycle_state = _NativeLifecycleState.CLOSED
-                    self._lifecycle_settled.set()
-                self._control_done.set()
                 return
         else:
             with self._lock:
@@ -418,22 +431,14 @@ class _SoundDeviceInputHandle:
                         )
                         closed_evidence = True
                     if closed_evidence:
-                        result = BackendCloseResult(BackendCloseStatus.CLOSED)
-                        settled_state = _NativeLifecycleState.CLOSED
-                    else:
-                        settled_state = _NativeLifecycleState.CLOSE_RETRYABLE
-                    self._finish_native_call(settled_state)
+                        return
+                    self._finish_native_call(_NativeLifecycleState.CLOSE_RETRYABLE)
                     with self._lock:
                         self._close_requested = False
                         self._close_attempt_result = result
                         waiter = self._close_waiter
-                        if settled_state is _NativeLifecycleState.CLOSED:
-                            self._close_result = result
                         if waiter is not None:
                             waiter.set()
-                    if settled_state is _NativeLifecycleState.CLOSED:
-                        self._control_done.set()
-                        return
                     break
                 if stop_requested or fault_reported:
                     break
@@ -442,6 +447,13 @@ class _SoundDeviceInputHandle:
                 restart_stopped = self._execute_restart(native, request)
                 if restart_stopped is not None:
                     stopped = restart_stopped
+
+    def _create_stream(self, **kwargs):
+        return self._sounddevice.InputStream(**kwargs)
+
+    def _open_stream(self, native):
+        """Optional separate open after the lifecycle owns its resources."""
+        pass
 
     def _execute_restart(
         self,

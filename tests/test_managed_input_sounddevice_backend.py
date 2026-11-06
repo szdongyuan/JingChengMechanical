@@ -291,9 +291,126 @@ def test_production_callback_accepts_300_and_500_ms_scheduling_delays():
 
     assert timestamps == [
         1_000_000_000,
-        1_300_000_000,
-        1_800_000_000,
+        1_010_666_667,
+        1_021_333_333,
     ]
+
+
+def test_production_callback_rejects_one_second_adc_rollback():
+    class Clock:
+        monotonic_domain = "python/system-monotonic"
+
+        def __init__(self):
+            self.now_ns = 2_000_000_000
+
+        def monotonic(self):
+            return self.now_ns / 1_000_000_000
+
+        def monotonic_ns(self):
+            return self.now_ns
+
+    clock = Clock()
+    timestamps = []
+    backend = MonotonicSoundDeviceAudioBackend(_SoundDevice(), clock)
+    handle = backend.create_input(
+        ResidentStreamSpec(
+            hardware_id="managed-input-1",
+            device_index=1,
+            device_name="Exact Input",
+            hostapi_index=1,
+            hostapi_name="ASIO",
+            sample_rate_hz=48_000,
+            input_channel_count=1,
+            capture_channel_indices=(0,),
+            sample_format="float32",
+            frames_per_buffer=480,
+        ),
+        lambda _samples, _frames, timestamp, _status: (
+            timestamps.append(timestamp)
+            or BackendCallbackDirective.CONTINUE
+        ),
+        lambda _fault: None,
+    )
+    block = np.zeros((480, 1), dtype=np.float32)
+
+    handle._native_callback(
+        block,
+        480,
+        SimpleNamespace(currentTime=2.0, inputBufferAdcTime=1.99),
+        BackendCallbackStatus.OK,
+    )
+    clock.now_ns = 2_010_000_000
+    directive = handle._native_callback(
+        block,
+        480,
+        SimpleNamespace(currentTime=2.01, inputBufferAdcTime=0.99),
+        BackendCallbackStatus.OK,
+    )
+
+    assert directive is BackendCallbackDirective.STOP
+    assert timestamps == [2_000_000_000]
+
+
+def test_production_callback_rejects_large_adc_rollback_without_rebasing():
+    class Clock:
+        monotonic_domain = "python/system-monotonic"
+
+        def __init__(self):
+            self.now_ns = 2_000_000_000
+
+        def monotonic(self):
+            return self.now_ns / 1_000_000_000
+
+        def monotonic_ns(self):
+            return self.now_ns
+
+    clock = Clock()
+    timestamps = []
+    backend = MonotonicSoundDeviceAudioBackend(_SoundDevice(), clock)
+    handle = backend.create_input(
+        ResidentStreamSpec(
+            hardware_id="managed-input-1",
+            device_index=1,
+            device_name="Exact Input",
+            hostapi_index=1,
+            hostapi_name="ASIO",
+            sample_rate_hz=48_000,
+            input_channel_count=1,
+            capture_channel_indices=(0,),
+            sample_format="float32",
+            frames_per_buffer=480,
+        ),
+        lambda _samples, _frames, timestamp, _status: (
+            timestamps.append(timestamp)
+            or BackendCallbackDirective.CONTINUE
+        ),
+        lambda _fault: None,
+    )
+    block = np.zeros((480, 1), dtype=np.float32)
+
+    handle._native_callback(
+        block,
+        480,
+        SimpleNamespace(currentTime=2.0, inputBufferAdcTime=1.99),
+        BackendCallbackStatus.OK,
+    )
+    clock.now_ns = 3_200_000_000
+    handle._native_callback(
+        block,
+        480,
+        SimpleNamespace(currentTime=0.2, inputBufferAdcTime=0.19),
+        BackendCallbackStatus.OK,
+    )
+    clock.now_ns = 3_210_000_000
+    directive = handle._native_callback(
+        block,
+        480,
+        SimpleNamespace(currentTime=0.21, inputBufferAdcTime=0.2),
+        BackendCallbackStatus.OK,
+    )
+
+    assert directive is BackendCallbackDirective.STOP
+    assert timestamps == [2_000_000_000]
 
 
 def test_restart_resets_production_callback_timeline_to_new_observed_time():
@@ -356,7 +473,10 @@ def test_restart_resets_production_callback_timeline_to_new_observed_time():
     handle._native_callback(
         block,
         512,
-        object(),
+        SimpleNamespace(
+            currentTime=1.0,
+            inputBufferAdcTime=1.0 - 512 / 48_000,
+        ),
         BackendCallbackStatus.OK,
     )
 
@@ -365,7 +485,10 @@ def test_restart_resets_production_callback_timeline_to_new_observed_time():
     handle._native_callback(
         block,
         512,
-        object(),
+        SimpleNamespace(
+            currentTime=1.0,
+            inputBufferAdcTime=1.0 - 512 / 48_000,
+        ),
         BackendCallbackStatus.OK,
     )
 

@@ -509,6 +509,7 @@ class PlcCurrentCollector:
         *,
         bus,
         plc_id: int,
+        history=None,
         time_func: Callable[[], float] | None = None,
         time_origin: float | None = None,
         log_callback: Callable[[str], None] | None = None,
@@ -517,6 +518,8 @@ class PlcCurrentCollector:
         self._config = normalize_current_meter_config(config)
         self._bus = bus
         self._plc_id = int(plc_id)
+        self._history = history
+        self._subscription = None
         self._time = time_func or time.monotonic
         self._time_origin = (
             None if time_origin is None else float(time_origin)
@@ -525,7 +528,7 @@ class PlcCurrentCollector:
         self._sample_callback = sample_callback
         self._samples: list[CurrentSample] = []
         self._samples_lock = threading.Lock()
-        self._state_lock = threading.Lock()
+        self._state_lock = threading.RLock()
         self._running = False
         self._start_time = 0.0
         self._last_callback_error = ""
@@ -548,15 +551,24 @@ class PlcCurrentCollector:
                 if self._time_origin is None
                 else self._time_origin
             )
+            self._running = True
             try:
-                signal.connect(
-                    self._signal_handler,
-                    Qt.ConnectionType.DirectConnection,
-                )
+                if self._history is not None:
+                    self._subscription = self._history.subscribe(
+                        self._plc_id, self._start_time, self._signal_handler,
+                    )
+                else:
+                    signal.connect(
+                        self._signal_handler,
+                        Qt.ConnectionType.DirectConnection,
+                    )
             except Exception as exc:
+                self._running = False
                 self._log_message(f"PLC 电流采集启动失败: {exc}")
                 return False
-            self._running = True
+            subscription = self._subscription
+        if subscription is not None:
+            subscription.drain()
         return True
 
     def stop(self, timeout: float | None = None) -> None:
@@ -565,12 +577,20 @@ class PlcCurrentCollector:
             if not self._running:
                 return
             self._running = False
+            subscription = self._subscription
+            self._subscription = None
             signal = getattr(self._bus, "plc_current_sampled", None)
-            if signal is not None and callable(getattr(signal, "disconnect", None)):
+            if (
+                subscription is None
+                and signal is not None
+                and callable(getattr(signal, "disconnect", None))
+            ):
                 try:
                     signal.disconnect(self._signal_handler)
                 except (TypeError, RuntimeError):
                     pass
+        if subscription is not None:
+            subscription.close()
 
     def samples(self) -> list[CurrentSample]:
         with self._samples_lock:
@@ -613,8 +633,9 @@ class PlcCurrentCollector:
                 self._samples.append(sample)
                 if has_sample_callback:
                     samples_snapshot = tuple(self._samples)
-        if has_sample_callback:
-            self._notify_sample_callback(sample, samples_snapshot)
+            # Stop also waits for notification, not only sample storage.
+            if has_sample_callback:
+                self._notify_sample_callback(sample, samples_snapshot)
 
     def _notify_sample_callback(
         self,

@@ -273,6 +273,21 @@ def _harness(*, overrides=None):
     return trace, calls, resources
 
 
+@pytest.mark.parametrize("failed_stage", ["begin", "bridge_a", "finish", "capture"])
+def test_owned_child_is_reaped_even_when_higher_level_shutdown_fails(failed_stage):
+    trace, calls, resources = _harness(overrides={failed_stage: RuntimeError("blocked owner")})
+    reaped = []
+    resources.managed_resident.reap_owned_capture_process = lambda timeout: reaped.append(timeout) or True
+    owner = ApplicationShutdownOwner(resources, timeout_seconds=1.0)
+    report = owner.shutdown()
+    assert report.clean is False
+    assert any("blocked owner" in detail for detail in report.errors)
+    assert len(reaped) == 1
+    assert 0.0 <= reaped[0] <= 1.0
+    assert owner.shutdown() is report
+    assert len(reaped) == 1
+
+
 def test_global_shutdown_uses_one_deadline_and_exact_run_skip_matrix():
     trace, calls, resources = _harness()
     clock = _Clock()
@@ -697,6 +712,47 @@ def test_prepared_only_shutdown_closes_owned_graph_lease_and_run_database_last()
         "config_db.close",
         "run_db.close",
     ]
+
+
+def test_torque_job_writer_is_joined_before_application_database_closes(tmp_path, qapp):
+    import threading
+    import time
+    from peewee import SqliteDatabase
+    from app.service.torque.jobs import TorqueJobs
+    from app.service.torque.migration import apply_torque_migration
+    from app.service.torque.store import TorqueStore
+    db = SqliteDatabase(tmp_path / 'shutdown-torque.db')
+    db.connect()
+    apply_torque_migration(db)
+    jobs = TorqueJobs(TorqueStore(db))
+    entered, release = threading.Event(), threading.Event()
+    def pause(value):
+        entered.set()
+        assert release.wait(3)
+        return value
+    db.register_function(pause, 'pause_write', 1)
+    db.execute_sql('CREATE TRIGGER wait_write BEFORE INSERT ON torque_rule_table BEGIN SELECT pause_write(NEW.torque_value); END')
+    def close_database():
+        assert not jobs.worker_thread.isRunning()
+        assert db.execute_sql('SELECT torque_value FROM torque_rule_table').fetchone()[0] == 2.5
+        db.close()
+    owner = ApplicationShutdownOwner(ApplicationShutdownResources(
+        application_config_writers=(jobs,),
+        application_config_database=SimpleNamespace(close=close_database),
+        run_persistence_database=SimpleNamespace(close_after_upstream_stopped=lambda: None),
+    ), monotonic=time.monotonic, timeout_seconds=5)
+    jobs.submit('create_rule', 'sn', '000123', 2.5)
+    assert entered.wait(3)
+    timer = threading.Timer(.05, release.set)
+    timer.start()
+    try:
+        assert owner.shutdown().clean
+        assert db.is_closed()
+    finally:
+        release.set()
+        timer.join()
+        jobs.close()
+        db.close()
 
 
 def test_missing_required_active_owner_is_non_clean_and_never_closes_run_database():

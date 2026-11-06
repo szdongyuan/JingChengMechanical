@@ -253,7 +253,20 @@ class ApplicationShutdownOwner:
             except Exception as exc:
                 self._record_non_clean("resources", exc)
                 resources = ApplicationShutdownResources()
-            self._run(resources)
+            try:
+                self._run(resources)
+            finally:
+                # A child process is an independently owned resource. Earlier
+                # fail-closed gates still protect in-process consumers and DBs,
+                # but must never leave this owner's capture child alive.
+                if callable(getattr(resources.managed_resident, "reap_owned_capture_process", None)):
+                    self._call(
+                        "capture_process.reap",
+                        resources.managed_resident,
+                        ("reap_owned_capture_process",),
+                        (self._remaining(),),
+                        lambda result: result is True,
+                    )
             clean = not self._errors and not any(
                 stage.status is ApplicationShutdownStageStatus.NON_CLEAN
                 for stage in self._stages

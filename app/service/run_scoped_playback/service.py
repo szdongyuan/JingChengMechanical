@@ -403,7 +403,7 @@ class RunScopedPlaybackService:
                 raise ValueError
             if (
                 type(audio.container_format) is not str
-                or audio.container_format != "WAV_PCM"
+                or audio.container_format not in {"WAV_PCM", "WAV_IEEE_FLOAT"}
             ):
                 raise ValueError
             for value in (
@@ -430,7 +430,8 @@ class RunScopedPlaybackService:
                 sample_rate_hz=audio.sample_rate_hz,
                 channel_count=audio.channel_count,
                 frame_count=audio.frame_count,
-                dtype="<i2",
+                dtype="<f8" if storage_kind is AudioStorageKind.IMPORTED_FINAL_AUDIO else "<i2",
+                source_container_format=audio.container_format if storage_kind is AudioStorageKind.IMPORTED_FINAL_AUDIO else None,
                 content_revision=f"{audio.audio_id}:{audio.byte_size}",
             )
         except Exception:
@@ -444,6 +445,10 @@ class RunScopedPlaybackService:
             envelope = decode_analysis_envelope(run.config_snapshot_json)
             config = envelope.config
             selected_channels = config["selected_channels"]
+            if envelope.is_import:
+                if run.ingress_kind != "IMPORTED":
+                    raise ValueError("explicit import map requires imported audio")
+                selected_channels = envelope.replay_channel_order
             if type(selected_channels) is not tuple or not selected_channels:
                 raise ValueError
             if len(selected_channels) != audio.channel_count:
@@ -552,7 +557,8 @@ class RunScopedPlaybackService:
         samples = loaded.samples
         if (
             type(samples) is not numpy.ndarray
-            or samples.dtype != numpy.dtype("<i2")
+            or samples.dtype not in (numpy.dtype("<i2"), numpy.dtype("<f8"))
+            or (audio.source_kind != "IMPORTED_SOURCE" and samples.dtype != numpy.dtype("<i2"))
             or not samples.flags.owndata
             or not samples.flags.c_contiguous
             or samples.shape != (audio.frame_count, audio.channel_count)
@@ -587,7 +593,8 @@ class RunScopedPlaybackService:
             order="C",
             copy=True,
         )
-        segment /= numpy.float32(32768.0)
+        if samples.dtype == numpy.dtype("<i2"):
+            segment /= numpy.float32(32768.0)
         if (
             type(segment) is not numpy.ndarray
             or not segment.flags.owndata

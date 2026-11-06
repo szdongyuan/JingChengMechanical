@@ -1171,15 +1171,14 @@ def test_blocked_plc_and_scanner_do_not_submit_requests():
     assert coordinator.requests == []
 
 
-def test_imported_request_delegates_directly_without_review_state():
+def test_import_route_is_owned_by_offline_service():
     events = []
     services, coordinator = _services(events)
-    request = SimpleNamespace(run_id="imported")
     controller = FactoryModeController(EventBus(), services)
 
-    assert controller.analyze_imported_audio(request) is True
+    assert not hasattr(controller, "analyze_imported_audio")
     assert coordinator.requests == []
-    assert coordinator.imported_requests == [request]
+    assert coordinator.imported_requests == []
 
 
 def test_result_operations_are_not_reacquired_by_ui_readiness_adapter():

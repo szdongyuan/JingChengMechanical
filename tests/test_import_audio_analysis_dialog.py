@@ -175,6 +175,19 @@ def _mapping_combo(dialog: ImportAudioAnalysisDialog, channel_index: int) -> QCo
     return combo
 
 
+def test_shared_probe_displays_source_format(qapp, tmp_path, monkeypatch):
+    from app.service import audio_wav
+    calls = []
+    probe = audio_wav.probe_wav
+    monkeypatch.setattr(audio_wav, 'probe_wav', lambda path: (calls.append(path), probe(path))[1])
+    widget = _dialog()
+    path = _write_wav(tmp_path / 'float.wav')
+    widget.load_wav_path(str(path))
+    assert calls == [str(path)]
+    assert '32' in widget.findChild(QLabel, 'wav_format_value').text()
+    assert 'IEEE' in widget.findChild(QLabel, 'wav_format_value').text()
+
+
 def _select_mapping(
     dialog: ImportAudioAnalysisDialog,
     wav_channel_index: int,
@@ -435,3 +448,23 @@ def test_import_dialog_calibration_toggle_is_reflected_in_request(qapp, tmp_path
     request = dialog.current_request()
     assert request is not None
     assert request.use_mic_calibration is False
+
+
+def test_overlong_window_has_visible_warning_and_effective_request(qapp, tmp_path):
+    widget = _dialog()
+    widget.load_wav_path(str(_write_wav(tmp_path / 'short.wav', duration_sec=1.0)))
+    widget._start_sec_spin.setValue(0.25)
+    widget._duration_sec_spin.setValue(2.0)
+    assert widget.current_request().duration_sec == pytest.approx(0.75)
+    assert '裁剪到 WAV 文件末尾' in widget._validation_message.text()
+
+
+@pytest.mark.parametrize('start,duration', [(0., 0.), (2., 1.)])
+def test_empty_window_cannot_be_submitted(qapp, tmp_path, start, duration):
+    widget = _dialog()
+    widget.load_wav_path(str(_write_wav(tmp_path / 'short.wav', duration_sec=2.)))
+    widget._start_sec_spin.setValue(start)
+    widget._duration_sec_spin.setValue(duration)
+    assert widget.current_request() is None
+    assert not widget._buttons.button(QDialogButtonBox.StandardButton.Ok).isEnabled()
+    assert widget._validation_message.text()

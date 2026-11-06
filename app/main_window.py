@@ -40,6 +40,7 @@ from app.service.result_history_contracts import (
 from app.services_container import FactoryControllerState
 from consts.style import APP_QSS
 from ui.widgets.cards import Card
+from ui.widgets.video_preview_overlay import VideoPreviewOverlay
 from ui.modules.workorder import WorkOrderModule
 from ui.modules.control import ControlModule
 from ui.modules.result_dashboard import ResultDashboardModule
@@ -353,9 +354,9 @@ class MainWindow(QMainWindow):
         self.services.register_independent_shutdown_resource(
             self.video.stop_camera
         )
-        self.video_card = Card("视频预览", self.video)
-        self.video_card.setMinimumHeight(270)
-        left_lay.addWidget(self.video_card)
+        self.video_placeholder = QWidget()
+        self.video_placeholder.setFixedHeight(270)
+        left_lay.addWidget(self.video_placeholder)
 
         content_lay.addWidget(left)
 
@@ -379,6 +380,13 @@ class MainWindow(QMainWindow):
         self._wire_run_scoped_result_operations()
         main_lay.addWidget(self.result_dashboard, 1)
         content_lay.addWidget(main, 1)
+
+        self.video_card = VideoPreviewOverlay(
+            page,
+            self.video,
+            self.video_placeholder,
+        )
+        QTimer.singleShot(0, self.video_card.sync_geometry)
         return page
 
     def _wire_run_scoped_result_operations(self) -> None:

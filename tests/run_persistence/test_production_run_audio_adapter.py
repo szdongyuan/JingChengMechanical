@@ -676,7 +676,7 @@ def test_imported_publication_uses_width_two_and_builds_imported_reference(
     assert result.status is ProductionAudioStatus.PERSISTED
     assert result.reference is not None
     assert result.reference.storage_kind is AudioStorageKind.IMPORTED_FINAL_AUDIO
-    assert result.reference.dtype == "<i2"
+    assert result.reference.dtype == "<f8"
     assert result.reference.absolute_path == normalize_absolute_path(str(final))
     assert _counts(runtime) == (1, 0)
 

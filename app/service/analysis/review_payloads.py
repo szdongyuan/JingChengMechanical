@@ -16,6 +16,10 @@ from app.service.analysis.limit_tables import (
     normalize_limit_tables,
 )
 from app.service.analysis.vibration_payloads import build_vibration_payload
+from app.service.analysis.vibration_requirements import (
+    configured_vibration_channel as _configured_vibration_view_channel,
+    resolve_vibration_requirements,
+)
 from app.service.current_meter_service import current_trace_display_at_time
 
 _SUMMARY_ROW_DEFS = (
@@ -216,6 +220,7 @@ def build_chart_payload(
     configured_input_sample_rate = config.get("input_device_samplerate")
     payload: dict[int, dict] = {}
     vibration_channel_index = _configured_vibration_view_channel(config)
+    include_frequency_trend, include_pulse_trend = resolve_vibration_requirements(config)
     for channel_index in _selected_chart_channels(config, buffer):
         precomputed = (
             channel_features.get(channel_index)
@@ -355,6 +360,8 @@ def build_chart_payload(
                     signal=calibrated,
                     sample_rate=sample_rate,
                     calibration_value=mic_sensitivity,
+                    include_frequency_trend=include_frequency_trend,
+                    include_pulse_trend=include_pulse_trend,
                 )
             except Exception as exc:
                 _log_chart_warning(
@@ -444,18 +451,6 @@ def build_summary_feature_chart_payload(
             channel_payload["current_trace"] = deepcopy(current_trace_payload)
         payload[channel_index] = channel_payload
     return payload
-
-
-def _configured_vibration_view_channel(config: dict) -> int | None:
-    value = config.get("vibration_view_channel_index")
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        return None
-    selected = {
-        int(channel)
-        for channel in config.get("selected_channels", [])
-        if isinstance(channel, int) and not isinstance(channel, bool) and channel >= 0
-    }
-    return value if value in selected else None
 
 
 def _selected_channels(config: dict, judgment_payload: dict) -> tuple[int, ...]:

@@ -10,6 +10,8 @@ from typing import Protocol, final
 
 import numpy as np
 
+from app.service.startup_diagnostics import bounded_startup_text
+
 from app.service.analysis.resident_audio_mvp import (
     MAX_ALLOCATABLE_FRAMES,
     MAX_CAPTURE_BUFFER_BYTES,
@@ -63,6 +65,51 @@ class ResidentCaptureTarget:
     pool: ResidentAudioPool
     resident_hardware_id: str
     generation: ResidentStreamGenerationStamp
+
+
+def resident_stream_spec_for_endpoint(
+    endpoint: HardwareEndpointIdentity,
+    resident_hardware_id: str,
+    *,
+    frames_per_buffer: int,
+    max_capture_frames: int,
+) -> ResidentStreamSpec | str:
+    """Pure stream eligibility shared by Resident and its process transport."""
+    rate = endpoint.sample_rate_hz
+    if (
+        type(rate) is not float
+        or not math.isfinite(rate)
+        or rate <= 0.0
+        or not rate.is_integer()
+        or rate > MAX_SAMPLE_RATE_HZ
+    ):
+        return "unsupported_sample_rate"
+    if not 1 <= endpoint.input_channels <= MAX_INPUT_CHANNELS:
+        return "unsupported_channel_count"
+    channel_count = endpoint.input_channels
+    bytes_per_frame = channel_count * np.dtype(np.float32).itemsize
+    # The Ring keeps a two-second logical mapping window inside a larger
+    # ten-second physical buffer used to isolate downstream scheduling.
+    ring_frames = int(rate) * 10 + frames_per_buffer
+    if (
+        ring_frames > MAX_ALLOCATABLE_FRAMES
+        or ring_frames > MAX_RING_BYTES_PER_STREAM // bytes_per_frame
+    ):
+        return "unsupported_ring_layout"
+    if max_capture_frames > MAX_CAPTURE_BUFFER_BYTES // bytes_per_frame:
+        return "unsupported_capture_layout"
+    return ResidentStreamSpec(
+        hardware_id=resident_hardware_id,
+        device_index=endpoint.device_index,
+        device_name=endpoint.device_name,
+        hostapi_index=endpoint.hostapi_index,
+        hostapi_name=endpoint.hostapi_name,
+        sample_rate_hz=int(rate),
+        input_channel_count=channel_count,
+        capture_channel_indices=tuple(range(channel_count)),
+        sample_format="float32",
+        frames_per_buffer=frames_per_buffer,
+    )
 
 
 def _require_exact_int(
@@ -208,6 +255,7 @@ class ResidentManagedInputAdapter:
 
             pool: ResidentAudioPool | None
             stream_status_by_managed = {}
+            stream_detail_by_managed = {}
             try:
                 open_result = ResidentAudioPool.open(
                     tuple(specs),
@@ -224,18 +272,22 @@ class ResidentManagedInputAdapter:
                     endpoint_resolver=self._endpoint_resolver,
                     drain_observer=self._drain_observer,
                 )
-            except Exception:
+            except Exception as exc:
                 pool = None
+                detail = bounded_startup_text(exc)
                 for spec in specs:
-                    stream_status_by_managed[
-                        managed_id_by_resident[spec.hardware_id]
-                    ] = StreamOpenStatus.FAULTED
+                    hardware_id = managed_id_by_resident[spec.hardware_id]
+                    stream_status_by_managed[hardware_id] = StreamOpenStatus.FAULTED
+                    stream_detail_by_managed[hardware_id] = detail
             else:
                 pool = open_result.pool
                 for stream in open_result.streams:
-                    stream_status_by_managed[
-                        managed_id_by_resident[stream.hardware_id]
-                    ] = stream.status
+                    hardware_id = managed_id_by_resident[stream.hardware_id]
+                    stream_status_by_managed[hardware_id] = stream.status
+                    if stream.error is not None:
+                        stream_detail_by_managed[hardware_id] = bounded_startup_text(
+                            stream.error.summary
+                        )
 
             ready_streams: list[ResidentReadyStream] = []
             failures: list[ResidentOpenFailure] = []
@@ -256,6 +308,7 @@ class ResidentManagedInputAdapter:
                         ResidentOpenFailure(
                             hardware_id,
                             "resident_open_failed",
+                            detail=stream_detail_by_managed.get(hardware_id, ""),
                         )
                     )
                     continue
@@ -469,43 +522,11 @@ class ResidentManagedInputAdapter:
         endpoint: HardwareEndpointIdentity,
         resident_hardware_id: str,
     ) -> ResidentStreamSpec | str:
-        rate = endpoint.sample_rate_hz
-        if (
-            type(rate) is not float
-            or not math.isfinite(rate)
-            or rate <= 0.0
-            or not rate.is_integer()
-            or rate > MAX_SAMPLE_RATE_HZ
-        ):
-            return "unsupported_sample_rate"
-        if not 1 <= endpoint.input_channels <= MAX_INPUT_CHANNELS:
-            return "unsupported_channel_count"
-        channel_count = endpoint.input_channels
-        bytes_per_frame = channel_count * np.dtype(np.float32).itemsize
-        # The Ring keeps a two-second logical mapping window inside a larger
-        # ten-second physical buffer used to isolate downstream scheduling.
-        ring_frames = int(rate) * 10 + self._frames_per_buffer
-        if (
-            ring_frames > MAX_ALLOCATABLE_FRAMES
-            or ring_frames > MAX_RING_BYTES_PER_STREAM // bytes_per_frame
-        ):
-            return "unsupported_ring_layout"
-        if (
-            self._max_capture_frames
-            > MAX_CAPTURE_BUFFER_BYTES // bytes_per_frame
-        ):
-            return "unsupported_capture_layout"
-        return ResidentStreamSpec(
-            hardware_id=resident_hardware_id,
-            device_index=endpoint.device_index,
-            device_name=endpoint.device_name,
-            hostapi_index=endpoint.hostapi_index,
-            hostapi_name=endpoint.hostapi_name,
-            sample_rate_hz=int(rate),
-            input_channel_count=channel_count,
-            capture_channel_indices=tuple(range(channel_count)),
-            sample_format="float32",
+        return resident_stream_spec_for_endpoint(
+            endpoint,
+            resident_hardware_id,
             frames_per_buffer=self._frames_per_buffer,
+            max_capture_frames=self._max_capture_frames,
         )
 
     def capture_target(

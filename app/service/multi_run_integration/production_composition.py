@@ -7,6 +7,7 @@ import json
 import logging
 import math
 import os
+import sys
 import threading
 import time
 import wave
@@ -42,16 +43,19 @@ from app.service.current_meter_service import (
     build_current_trace_payload,
     normalize_current_meter_config,
 )
+from app.service.plc_current_history import PlcCurrentHistory
 from app.service.fault_types import (
     decode_fault_types_json,
     encode_history_labels_payload,
     encode_run_config_payload,
 )
 from app.service.log_manager import LogManager
+from app.service.startup_diagnostics import bounded_startup_text
 from app.service.managed_input_contracts import (
     BackendScanId,
     HardwareEndpointIdentity,
     ManagedHardwareId,
+    ResidentOpenFailure,
 )
 from app.service.managed_input_endpoint_resolver import (
     ManagedInputEndpointResolver,
@@ -150,6 +154,21 @@ _WINDOWS_RESERVED_FILENAMES = {
 
 class ProductionCompositionError(RuntimeError):
     """Production composition could not be prepared or activated."""
+
+
+def _startup_failure_summary(
+    failure: ResidentOpenFailure, endpoint: HardwareEndpointIdentity,
+) -> str:
+    # Put the reason ahead of metadata so the UI's final 512-character limit
+    # cannot hide it behind a long device name or several failing inputs.
+    return bounded_startup_text(
+        f"managed input {failure.hardware_id.value} Resident stream "
+        f"open failed ({failure.error_code}): {failure.detail or failure.error_code}; "
+        f"requested={endpoint.sample_rate_hz:g} Hz, channels={endpoint.input_channels}; "
+        f"name={bounded_startup_text(endpoint.device_name, 48)}, "
+        f"hostapi={bounded_startup_text(endpoint.hostapi_name, 32)}; skipped",
+        640,
+    )
 
 
 def _utc_now_text() -> str:
@@ -352,10 +371,11 @@ class _Diagnostics:
 class ProductionCurrentCollectorFactory:
     """Build run-owned collectors solely from the frozen run snapshot."""
 
-    def __init__(self, *, bus: object, monotonic, log_callback=None) -> None:
+    def __init__(self, *, bus: object, monotonic, log_callback=None, history=None) -> None:
         if not callable(monotonic):
             raise ValueError("current collector monotonic clock must be callable")
         self._bus = bus
+        self._history = history
         self._monotonic = monotonic
         self._log = log_callback
 
@@ -395,6 +415,8 @@ class ProductionCurrentCollectorFactory:
                 raise ValueError(
                     "enabled frozen PLC current requires a positive PLC ID"
                 )
+            if self._history is not None:
+                common["history"] = self._history
             return PlcCurrentCollector(
                 current,
                 bus=self._bus,
@@ -442,6 +464,11 @@ class _LiveRun:
     monitor: object | None = None
     processed_frames: int = 0
     monitor_processed_frames: int = 0
+    preview_generation: str | None = None
+    preview_sequence: int | None = None
+    preview_next_sample: int | None = None
+    preview_origin_sample: int = 0
+    preview_continuity: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -452,12 +479,16 @@ class _QueuedLiveBlock:
     callback_monotonic_ns: int
     sample_rate_hz: int
     status: BackendCallbackStatus
+    first_sample: int | None = None
+    sequence: int | None = None
+    generation_id: str | None = None
 
 
 class _ProductionLiveDisplayManager:
     """Best-effort live analysis tap; capture never depends on this path."""
 
     _QUEUE_CAPACITY_BLOCKS = 4
+    _SETUP_CAPACITY_RUNS = 6
 
     def __init__(self, *, bus: object, diagnostic_callback=None) -> None:
         self._bus = bus
@@ -470,6 +501,8 @@ class _ProductionLiveDisplayManager:
         self._drain_cleanup_clean = True
         self._drain_settlements_inflight = 0
         self._registrations_inflight = 0
+        self._setup_queue = deque()
+        self._pending_setup = {}
         self._closed = False
         self._close_deadline: float | None = None
         self._block_condition = threading.Condition()
@@ -479,12 +512,48 @@ class _ProductionLiveDisplayManager:
         self._dropped_block_count = 0
         self._drop_diagnostic_pending = False
         self._close_result: bool | None = None
-        self._block_thread = threading.Thread(
-            target=self._run_block_dispatch,
-            name="production-monitor-display-fanout",
-            daemon=True,
-        )
-        self._block_thread.start()
+        self._preview_pump = None
+        self._block_thread = None
+        self._setup_thread = None
+        try:
+            self._block_thread = threading.Thread(
+                target=self._run_block_dispatch,
+                name="production-monitor-display-fanout",
+                daemon=True,
+            )
+            self._block_thread.start()
+            self._setup_thread = threading.Thread(
+                target=self._run_setup,
+                name="production-live-display-setup",
+                daemon=True,
+            )
+            self._setup_thread.start()
+        except BaseException:
+            # Construction has not returned an owner yet. Signal both empty
+            # workers before joining, including a start that raised afterward.
+            with self._lifecycle_condition:
+                self._closed = True
+                self._lifecycle_condition.notify_all()
+            with self._block_condition:
+                self._block_stopping = True
+                self._block_condition.notify_all()
+            deadline = time.monotonic() + 1.0
+            for worker in (self._block_thread, self._setup_thread):
+                try:
+                    if worker is not None and worker.ident is not None:
+                        worker.join(max(0.0, deadline - time.monotonic()))
+                except BaseException:
+                    # Continue cleanup without replacing the startup failure.
+                    pass
+            raise
+
+    def attach_capture_client(self, client) -> None:
+        from app.service.multi_run_integration.capture_preview import CapturePreviewPump
+
+        with self._lock:
+            if self._closed or self._preview_pump is not None:
+                raise RuntimeError("capture preview owner already attached or closed")
+            self._preview_pump = CapturePreviewPump(client, self.accept_preview, self._diagnose)
 
     def register_frozen(self, frozen: FrozenCapturedRun) -> None:
         if self._bus is None:
@@ -492,9 +561,36 @@ class _ProductionLiveDisplayManager:
         with self._lifecycle_condition:
             if self._closed:
                 return
+            if frozen.run_id in self._pending_setup:
+                return
+            if self._registrations_inflight >= self._SETUP_CAPACITY_RUNS:
+                return
+            self._pending_setup[frozen.run_id] = frozen
+            self._setup_queue.append(frozen)
             self._registrations_inflight += 1
+            self._lifecycle_condition.notify_all()
+
+    def _run_setup(self) -> None:
+        while True:
+            with self._lifecycle_condition:
+                self._lifecycle_condition.wait_for(lambda: self._setup_queue or self._closed)
+                if self._closed:
+                    return
+                frozen = self._setup_queue.popleft()
+            self._register_frozen(frozen)
+
+    def wait_until_setup_idle(self, timeout: float) -> bool:
+        with self._lifecycle_condition:
+            return self._lifecycle_condition.wait_for(
+                lambda: self._registrations_inflight == 0, max(0.0, timeout))
+
+    def _register_frozen(self, frozen: FrozenCapturedRun) -> None:
         run = None
+        dispatcher = None
         try:
+            with self._lock:
+                if self._closed or self._pending_setup.get(frozen.run_id) is not frozen:
+                    return
             config = _decode_payload(frozen.config_payload).get("config")
             if not isinstance(config, dict):
                 return
@@ -536,8 +632,10 @@ class _ProductionLiveDisplayManager:
                 pipelines=pipelines,
                 bus=self._bus,
                 config_id=config_id,
-                coalesce_pending=True,
+                max_queue_size=self._QUEUE_CAPACITY_BLOCKS,
+                coalesce_pending=False,
                 stft_emit_interval_sec=0.1,
+                coarse_stft=True,
             )
             dispatcher.start()
             monitor = self._create_monitor(
@@ -569,16 +667,26 @@ class _ProductionLiveDisplayManager:
         except Exception as exc:
             self._diagnose(f"live display setup failed: {exc}")
         finally:
+            if run is None and dispatcher is not None:
+                try:
+                    if dispatcher.stop(1.0) is False:
+                        with self._lock:
+                            self._drain_cleanup_clean = False
+                except Exception as exc:
+                    with self._lock:
+                        self._drain_cleanup_clean = False
+                    self._diagnose(f"partial live display setup cleanup failed: {exc}")
             settle_after_close = False
             deadline = None
             with self._lifecycle_condition:
-                if run is not None and not self._closed:
+                wanted = self._pending_setup.pop(frozen.run_id, None) is frozen
+                if run is not None and not self._closed and wanted:
                     self._runs_by_hardware.setdefault(run.hardware_id, {})[
                         run.run_id
                     ] = run
                 elif run is not None:
                     settle_after_close = True
-                    deadline = self._close_deadline
+                    deadline = self._close_deadline or (time.monotonic() + 1.0)
                 if not settle_after_close:
                     self._registrations_inflight -= 1
                     self._lifecycle_condition.notify_all()
@@ -591,6 +699,15 @@ class _ProductionLiveDisplayManager:
                     self._registrations_inflight -= 1
                     self._lifecycle_condition.notify_all()
 
+    def accept_preview(self, block) -> None:
+        """Transport timestamps locate the first frame; legacy callbacks the end."""
+        self.accept_block(
+            block.hardware_id, block.pcm, len(block.pcm),
+            block.monotonic_ns + round(len(block.pcm) * 1_000_000_000 / block.sample_rate_hz),
+            block.sample_rate_hz, first_sample=block.first_sample,
+            sequence=block.sequence, generation_id=block.generation_id,
+        )
+
     def accept_block(
         self,
         hardware_id: str,
@@ -599,6 +716,10 @@ class _ProductionLiveDisplayManager:
         callback_monotonic_ns: int,
         sample_rate_hz: int,
         status: BackendCallbackStatus = BackendCallbackStatus.OK,
+        *,
+        first_sample: int | None = None,
+        sequence: int | None = None,
+        generation_id: str | None = None,
     ) -> None:
         if status is not BackendCallbackStatus.OK or frame_count <= 0:
             return
@@ -626,6 +747,9 @@ class _ProductionLiveDisplayManager:
                     callback_monotonic_ns=callback_monotonic_ns,
                     sample_rate_hz=sample_rate_hz,
                     status=status,
+                    first_sample=first_sample,
+                    sequence=sequence,
+                    generation_id=generation_id,
                 )
             )
             self._block_condition.notify()
@@ -666,7 +790,7 @@ class _ProductionLiveDisplayManager:
         callback_monotonic_ns = block.callback_monotonic_ns
         sample_rate_hz = block.sample_rate_hz
         completed: list[_LiveRun] = []
-        submissions: list[tuple[_LiveRun, np.ndarray, int, int]] = []
+        submissions = []
         monitor_submissions: list[tuple[object, np.ndarray]] = []
         with self._lock:
             if self._closed:
@@ -680,26 +804,30 @@ class _ProductionLiveDisplayManager:
                 block_start_ns = callback_monotonic_ns - round(
                     frame_count * 1_000_000_000 / sample_rate_hz
                 )
-                if callback_monotonic_ns <= run.trigger_monotonic_ns:
+                relative_start = round(
+                    (block_start_ns - run.trigger_monotonic_ns) * sample_rate_hz / 1_000_000_000)
+                continuity_id = None
+                if block.first_sample is not None:
+                    if run.preview_generation != block.generation_id:
+                        run.preview_origin_sample = block.first_sample - relative_start
+                        run.preview_continuity += 1
+                    elif (block.sequence != run.preview_sequence + 1
+                          or block.first_sample != run.preview_next_sample):
+                        run.preview_continuity += 1
+                    run.preview_generation = block.generation_id
+                    run.preview_sequence = block.sequence
+                    run.preview_next_sample = block.first_sample + frame_count
+                    relative_start = block.first_sample - run.preview_origin_sample
+                    continuity_id = str(run.preview_continuity)
+                skip = min(frame_count, max(0, -relative_start))
+                sample_start = relative_start + skip
+                remaining = run.target_frame_count - sample_start
+                if remaining <= 0:
+                    completed.append(run)
                     continue
-                skip = max(
-                    0,
-                    min(
-                        frame_count,
-                        math.ceil(
-                            (
-                                run.trigger_monotonic_ns - block_start_ns
-                            )
-                            * sample_rate_hz
-                            / 1_000_000_000
-                        ),
-                    ),
-                )
-                remaining = run.target_frame_count - run.processed_frames
                 take = min(frame_count - skip, remaining)
                 if take <= 0:
                     continue
-                sample_start = run.processed_frames
                 sample_end = sample_start + take
                 run.processed_frames = sample_end
                 submissions.append(
@@ -708,14 +836,12 @@ class _ProductionLiveDisplayManager:
                         np.asarray(array[skip : skip + take]),
                         sample_start,
                         sample_end,
+                        continuity_id,
                     )
                 )
                 monitor = getattr(run, "monitor", None)
                 if monitor is not None:
-                    monitor_remaining = (
-                        run.target_frame_count - run.monitor_processed_frames
-                    )
-                    monitor_take = min(frame_count - skip, monitor_remaining)
+                    monitor_take = take
                     if monitor_take > 0:
                         run.monitor_processed_frames += monitor_take
                         monitor_submissions.append(
@@ -733,7 +859,7 @@ class _ProductionLiveDisplayManager:
                 monitor.feed(chunk)
             except Exception as exc:
                 self._diagnose(f"monitor feed failed: {exc}")
-        for run, chunk, sample_start, sample_end in submissions:
+        for run, chunk, sample_start, sample_end, continuity_id in submissions:
             try:
                 run.dispatcher.submit(
                     chunk,
@@ -744,6 +870,7 @@ class _ProductionLiveDisplayManager:
                     ),
                     sample_start=sample_start,
                     sample_end=sample_end,
+                    **({"source_continuity": continuity_id} if continuity_id is not None else {}),
                 )
             except Exception as exc:
                 self._diagnose(f"live display submission failed: {exc}")
@@ -762,6 +889,7 @@ class _ProductionLiveDisplayManager:
 
     def finish(self, run_id: str) -> None:
         with self._lifecycle_condition:
+            self._pending_setup.pop(run_id, None)
             for hardware_runs in self._runs_by_hardware.values():
                 found = hardware_runs.get(run_id)
                 if found is not None:
@@ -769,9 +897,17 @@ class _ProductionLiveDisplayManager:
                     self._start_drain_locked(found)
                     break
 
+    def finish_all(self) -> None:
+        with self._lock:
+            run_ids = set(self._pending_setup)
+            for hardware_runs in self._runs_by_hardware.values():
+                run_ids.update(hardware_runs)
+        for run_id in run_ids:
+            self.finish(run_id)
+
     def has_active_runs(self) -> bool:
         with self._lock:
-            return any(self._runs_by_hardware.values())
+            return bool(self._pending_setup) or any(self._runs_by_hardware.values())
 
     def close(self, timeout_seconds: float = 1.0) -> bool:
         deadline = time.monotonic() + max(0.0, float(timeout_seconds))
@@ -787,6 +923,10 @@ class _ProductionLiveDisplayManager:
                 return self._close_result
             self._closed = True
             self._close_deadline = deadline
+            self._registrations_inflight -= len(self._setup_queue)
+            self._setup_queue.clear()
+            self._pending_setup.clear()
+            self._lifecycle_condition.notify_all()
             runs = [
                 run
                 for hardware_runs in self._runs_by_hardware.values()
@@ -800,6 +940,8 @@ class _ProductionLiveDisplayManager:
             self._block_condition.notify_all()
 
         clean = True
+        if self._preview_pump is not None:
+            clean = self._preview_pump.close(max(0.0, deadline - time.monotonic()))
         for run in runs:
             monitor = run.monitor
             if monitor is not None:
@@ -827,6 +969,11 @@ class _ProductionLiveDisplayManager:
             remaining = max(0.0, deadline - time.monotonic())
             self._block_thread.join(remaining)
             if self._block_thread.is_alive():
+                clean = False
+
+        if self._setup_thread is not threading.current_thread():
+            self._setup_thread.join(max(0.0, deadline - time.monotonic()))
+            if self._setup_thread.is_alive():
                 clean = False
 
         for run in runs:
@@ -910,6 +1057,7 @@ class _ProductionLiveDisplayManager:
             gain_db = float(gain_db)
         except (TypeError, ValueError):
             gain_db = 0.0
+        monitor = None
         try:
             monitor = AudioMonitor(
                 device_name=output_name,
@@ -927,6 +1075,16 @@ class _ProductionLiveDisplayManager:
             self.logger.info(f"开始播放: run_id={run_id}, 设备={output_name}")
             return monitor
         except Exception as exc:
+            if monitor is not None:
+                try:
+                    monitor.stop()
+                    if monitor.wait(1_000) is False:
+                        with self._lock:
+                            self._drain_cleanup_clean = False
+                except Exception as cleanup_error:
+                    with self._lock:
+                        self._drain_cleanup_clean = False
+                    self._diagnose(f"partial monitor setup cleanup failed: {cleanup_error}")
             self.logger.error(f"实时播放启动失败: run_id={run_id}, error={exc}")
             self._diagnose(f"monitor setup failed: {exc}")
             return None
@@ -1134,7 +1292,6 @@ class _FrozenRunFreezer:
         prerequisites,
         output_directory: Path,
         *,
-        live_display: _ProductionLiveDisplayManager | None = None,
         dashboard_config_loader=None,
         calibration_loader=None,
         ai_toolchain_loader=None,
@@ -1156,7 +1313,6 @@ class _FrozenRunFreezer:
             int(item.config_id): item for item in prerequisites.configs
         }
         self._output_directory = output_directory.resolve()
-        self._live_display = live_display
         self._dashboard_config_loader = dashboard_config_loader
         self._calibration_loader = calibration_loader
         self._ai_toolchain_loader = ai_toolchain_loader
@@ -1567,8 +1723,6 @@ class _FrozenRunFreezer:
                 format=PersistedAudioFormat.PCM16_WAV,
             ),
         )
-        if self._live_display is not None:
-            self._live_display.register_frozen(frozen)
         return frozen
 
 
@@ -1635,6 +1789,7 @@ class _CoordinatorPersistence:
         runtime,
         result_artifact_store=None,
         capture_lifecycle: _CaptureSaveLifecycleAuthority | None = None,
+        live_display: _ProductionLiveDisplayManager | None = None,
     ) -> None:
         self._runs = RunRepository(runtime)
         self._audio = AudioRepository(runtime)
@@ -1643,6 +1798,7 @@ class _CoordinatorPersistence:
             result_artifact_store=result_artifact_store,
         )
         self._capture_lifecycle = capture_lifecycle
+        self._live_display = live_display
 
     @staticmethod
     def _committed(result) -> CommitResult:
@@ -1697,6 +1853,11 @@ class _CoordinatorPersistence:
             and self._capture_lifecycle is not None
         ):
             self._capture_lifecycle.begin(frozen_run.run_id)
+        if captured and committed is CommitResult.COMMITTED and self._live_display is not None:
+            try:
+                self._live_display.register_frozen(frozen_run)
+            except Exception:
+                _LOGGER.exception("optional live display registration failed")
         return committed
 
     def commit_initial_terminal(self, fact) -> CommitResult:
@@ -1733,6 +1894,12 @@ class _CoordinatorPersistence:
         finally:
             if self._capture_lifecycle is not None:
                 self._capture_lifecycle.settle(fact.run_id)
+            live_display = getattr(self, "_live_display", None)
+            if live_display is not None:
+                try:
+                    live_display.finish(fact.run_id)
+                except Exception:
+                    _LOGGER.exception("optional terminal live display cleanup failed")
 
     def apply_manual_judgment(self, request, facts) -> ManualProjectionResult:
         config = _decode_payload(facts.config_payload)["config"]
@@ -1980,6 +2147,7 @@ class _RealGraph:
     shared_backend: object | None
     live_display: object
     monotonic: object
+    current_history: object | None = None
     _closed: bool = field(default=False, init=False)
     _ordered_shutdown_attempted: bool = field(default=False, init=False)
     _ordered_shutdown_failure: Exception | None = field(
@@ -1991,6 +2159,8 @@ class _RealGraph:
         if self._closed:
             return
         self._closed = True
+        if self.current_history is not None:
+            self.current_history.close()
         try:
             self.playback.shutdown(5.0)
         except Exception:
@@ -2020,6 +2190,8 @@ class _RealGraph:
                 raise self._ordered_shutdown_failure
             return
         self._ordered_shutdown_attempted = True
+        if self.current_history is not None:
+            self.current_history.close()
         try:
             self.analysis_executor.close()
         except Exception:
@@ -2052,6 +2224,7 @@ class ProductionGraphFactory:
         calibration_loader=None,
         ai_toolchain_loader=None,
         result_artifact_store: AnalysisResultArtifactStore | None = None,
+        capture_process_factory=None,
     ) -> None:
         if ai_toolchain_loader is not None and not callable(ai_toolchain_loader):
             raise TypeError("ai_toolchain_loader must be callable or None")
@@ -2066,6 +2239,7 @@ class ProductionGraphFactory:
         self._calibration_loader = calibration_loader
         self._ai_toolchain_loader = ai_toolchain_loader
         self._result_artifact_store = result_artifact_store
+        self._capture_process_factory = capture_process_factory
 
     def prepare_upstream(self, prerequisites):
         self._prepare_output_directory()
@@ -2126,34 +2300,55 @@ class ProductionGraphFactory:
         )
         resident = None
         try:
-            audio_backend = prerequisites.build_sounddevice_audio_backend(
-                self._sounddevice_module
+            sounddevice_module = self._sounddevice_module
+            if sounddevice_module is None:
+                sounddevice_module = getattr(raw_backend, "_sounddevice", None)
+            process_capture = (
+                sys.platform == "win32"
+                and getattr(sounddevice_module, "__name__", None) == "sounddevice"
             )
-            endpoint_resolver = ManagedInputEndpointResolver(raw_backend)
-            resident = prerequisites.build_resident_adapter(
-                backend=audio_backend,
-                level_meter=lambda samples, _rate: float(
-                    20.0
-                    * np.log10(
-                        max(
-                            float(np.sqrt(np.mean(np.square(samples)))),
-                            1e-12,
-                        )
-                    )
-                ),
-                max_capture_frames=max_frames,
-                endpoint_resolver=endpoint_resolver,
-                drain_observer=live_display.accept_block,
-            )
-            startup = resident.open_startup_streams(tuple(endpoints))
-            for failure in startup.failures:
-                self._emit_startup_diagnostic(
-                    f"managed input {failure.hardware_id.value} Resident stream "
-                    f"open failed ({failure.error_code}); skipped"
+            if process_capture:
+                from app.service.capture_process.adapter import CaptureProcessManagedInputAdapter
+                from app.service.capture_process.protocol import WorkerConfig
+
+                factory = self._capture_process_factory or CaptureProcessManagedInputAdapter
+                resident = factory(config=WorkerConfig(
+                    frames_per_buffer=512,
+                    max_capture_frames=max_frames,
+                    startup_stream_timeout_s=5.0,
+                    fault_close_timeout_s=5.0,
+                    shutdown_timeout_s=5.0,
+                ))
+            else:
+                audio_backend = prerequisites.build_sounddevice_audio_backend(
+                    self._sounddevice_module
                 )
+                endpoint_resolver = ManagedInputEndpointResolver(raw_backend)
+                resident = prerequisites.build_resident_adapter(
+                    backend=audio_backend,
+                    level_meter=lambda samples, _rate: float(
+                        20.0 * np.log10(
+                            max(float(np.sqrt(np.mean(np.square(samples)))), 1e-12)
+                        )
+                    ),
+                    max_capture_frames=max_frames,
+                    endpoint_resolver=endpoint_resolver,
+                    drain_observer=live_display.accept_block,
+                )
+            startup = resident.open_startup_streams(tuple(endpoints))
+            endpoint_by_id = {item.hardware_id: item for item in endpoints}
+            failure_summaries = tuple(
+                _startup_failure_summary(failure, endpoint_by_id[failure.hardware_id])
+                for failure in startup.failures
+            )
+            for summary in failure_summaries:
+                self._emit_startup_diagnostic(summary)
+            if process_capture and getattr(resident, "client", None) is not None:
+                live_display.attach_capture_client(resident.client)
             if not startup.ready_streams:
+                detail = f"; {failure_summaries[0]}" if failure_summaries else ""
                 raise ProductionCompositionError(
-                    "production has zero ready Resident streams"
+                    ("production has zero ready Resident streams" + detail)[:512]
                 )
             routes = tuple(
                 ManagedResidentCaptureRoute(
@@ -2165,7 +2360,10 @@ class ProductionGraphFactory:
                 )
                 for item in startup.ready_streams
             )
-            capture = ManagedResidentCapturePort(resident, routes)
+            from app.service.multi_run_integration.capture_preview import PreviewCapturePort
+
+            capture = PreviewCapturePort(
+                ManagedResidentCapturePort(resident, routes), live_display)
             return _PreparedRealUpstream(
                 resident,
                 capture,
@@ -2177,31 +2375,17 @@ class ProductionGraphFactory:
                 try:
                     resident.close_all(5.0)
                 except Exception as close_exc:
-                    try:
-                        self._emit_startup_diagnostic(
-                            "shutdown_cleanup/resident_close_failed: "
-                            f"{type(close_exc).__name__}: {close_exc}"
-                        )
-                    except Exception as diagnostic_exc:
-                        _LOGGER.exception(
-                            "shutdown_cleanup/diagnostic_sink_failed %s: %s",
-                            type(diagnostic_exc).__name__,
-                            diagnostic_exc,
-                        )
+                    self._emit_startup_diagnostic(
+                        "shutdown_cleanup/resident_close_failed: "
+                        f"{bounded_startup_text(close_exc)}"
+                    )
             try:
                 live_display.close()
             except Exception as close_exc:
-                try:
-                    self._emit_startup_diagnostic(
-                        "shutdown_cleanup/live_display_close_failed: "
-                        f"{type(close_exc).__name__}: {close_exc}"
-                    )
-                except Exception as diagnostic_exc:
-                    _LOGGER.exception(
-                        "shutdown_cleanup/diagnostic_sink_failed %s: %s",
-                        type(diagnostic_exc).__name__,
-                        diagnostic_exc,
-                    )
+                self._emit_startup_diagnostic(
+                    "shutdown_cleanup/live_display_close_failed: "
+                    f"{bounded_startup_text(close_exc)}"
+                )
             raise
 
     def _prepare_output_directory(self) -> None:
@@ -2242,14 +2426,45 @@ class ProductionGraphFactory:
             ) from failure
 
     def _emit_startup_diagnostic(self, detail: str) -> None:
+        detail = bounded_startup_text(detail, 640)
+        try:
+            # The parent core logger owns log/main.log before the UI subscribes.
+            LogManager.set_log_handler("core").warning(detail)
+        except Exception:
+            pass
         if callable(self._diagnostic_callback):
-            self._diagnostic_callback(detail)
+            try:
+                self._diagnostic_callback(detail)
+            except Exception:
+                pass
 
     def activate(self, prerequisites, upstream, history_sink):
         save_dispatcher = None
         scheduler = None
         analysis_executor = None
+        current_history = None
         try:
+            plc_ids = set()
+            for config in prerequisites.configs:
+                current = normalize_current_meter_config(
+                    {
+                        key: config.values.get(f"current_meter_{key}")
+                        for key in ("enabled", "source")
+                    }
+                )
+                plc_id = config.values.get("plc_id")
+                if (
+                    current["enabled"]
+                    and current["source"] == "plc"
+                    and type(plc_id) is int
+                    and plc_id > 0
+                ):
+                    plc_ids.add(plc_id)
+            current_history = PlcCurrentHistory(
+                bus=self._event_bus,
+                plc_ids=plc_ids,
+                monotonic=prerequisites.monotonic_authority.monotonic,
+            )
             runs = RunRepository(self._runtime)
             audio = AudioRepository(self._runtime)
             attempts = AttemptRepository(
@@ -2330,7 +2545,6 @@ class ProductionGraphFactory:
             captured_freezer = _FrozenRunFreezer(
                 prerequisites,
                 self._output_directory,
-                live_display=upstream.live_display,
                 dashboard_config_loader=self._dashboard_config_loader,
                 calibration_loader=self._calibration_loader,
                 ai_toolchain_loader=self._ai_toolchain_loader,
@@ -2360,6 +2574,7 @@ class ProductionGraphFactory:
                     self._runtime,
                     self._result_artifact_store,
                     capture_lifecycle,
+                    live_display=upstream.live_display,
                 ),
                 save_dispatcher=save_dispatcher,
                 scheduler=bridge,
@@ -2371,6 +2586,7 @@ class ProductionGraphFactory:
                 wall_clock=lambda: datetime.now(timezone.utc),
                 monotonic_clock=prerequisites.monotonic_authority.monotonic,
                 current_collector_factory=ProductionCurrentCollectorFactory(
+                    history=current_history,
                     bus=self._event_bus,
                     monotonic=prerequisites.monotonic_authority.monotonic,
                     log_callback=self._diagnostic_callback,
@@ -2386,6 +2602,7 @@ class ProductionGraphFactory:
                 monotonic=prerequisites.monotonic_authority.monotonic,
             )
             return _RealGraph(
+                current_history=current_history,
                 coordinator=coordinator,
                 scheduler_bridge=bridge,
                 save_dispatcher=save_dispatcher,
@@ -2405,6 +2622,8 @@ class ProductionGraphFactory:
                 monotonic=prerequisites.monotonic_authority.monotonic,
             )
         except Exception:
+            if current_history is not None:
+                current_history.close()
             if scheduler is not None:
                 try:
                     scheduler.shutdown(5.0)

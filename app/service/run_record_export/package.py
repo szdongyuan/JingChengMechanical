@@ -17,7 +17,7 @@ import openpyxl
 from app.service.run_record_export.archive import RunArchiveError
 from app.service.run_record_export.attachments import (
     serialize_current_csv,
-    write_pcm16_wav_channels,
+    write_wav_channels,
 )
 from app.service.run_record_export.contracts import (
     AiExportValue,
@@ -203,7 +203,7 @@ def _prepare_audio(record, directory: str, cancel_check, staging: _StageStore):
     staged_paths = staging.reserve_audio_paths(len(paths))
     try:
         _check(cancel_check)
-        write_pcm16_wav_channels(
+        write_wav_channels(
             facts.source_wav_path,
             output_paths=staged_paths,
             sample_rate_hz=facts.sample_rate_hz,

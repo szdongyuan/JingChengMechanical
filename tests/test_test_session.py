@@ -2824,3 +2824,24 @@ class TestScoreThresholdDecision:
         assert session.last_ai_review["threshold"] is None
         assert session.last_ai_review["score"] == 0.9
         assert session.last_ai_review["error_message"] == "AI decision threshold unavailable"
+
+@pytest.mark.parametrize('score,threshold,label,passed', [
+    (.7, .6, '不合格', True), (.7, .8, '合格', False),
+    (.7, .7, 'FAIL', True), (0, 0, 'NG', True), (1, 1, 'FAIL', True),
+    *[(value, .5, 'PASS', None) for value in [None, True, '0.9', float('nan'), float('inf'), -1, 2, 10**400]],
+])
+def test_explicit_override_controls_legacy_decision(tmp_path, score, threshold, label, passed):
+    helper = TestScoreThresholdDecision()
+    ai = MagicMock()
+    ai.run_ai_analysis.return_value = helper._make_success_envelope(
+        score=score, decision_threshold=threshold, ai_label=label,
+        decision_threshold_source='request_params')
+    session = helper._make_session(tmp_path, ai, {'enabled': True})
+    result = session._run_ai(helper._make_base_result())
+    assert result.ai_pass is passed
+    assert session.last_ai_review['threshold'] == threshold
+    if passed is None:
+        assert session.last_ai_review['error_message']
+        assert session.last_ai_review['ai_label'] != 'PASS'
+    else:
+        assert session.last_ai_review['ai_label'] == ('PASS' if passed else 'FAIL')

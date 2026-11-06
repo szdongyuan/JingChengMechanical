@@ -73,6 +73,7 @@ from app.services_container import FactoryControllerState
 from ui.modules.loudness import LoudnessModule
 from ui.modules.octave import OctaveModule
 from ui.modules.result_history import ResultHistoryModule
+from ui.widgets.result_card_replay import ResultCardReplay
 from ui.modules.spectrum import SpectrumModule
 from ui.modules.spl import SplModule
 from ui.modules.stft import StftModule
@@ -252,6 +253,18 @@ class ResultDashboardModule(QWidget):
             config_provider=self._load_history_config,
             manual_judgment_widget=manual_judgment_widget,
         )
+        def current_playback():
+            playback = getattr(services, "historical_playback", None)
+            if playback is None:
+                playback = getattr(getattr(services, "final_composition", None),
+                                   "playback", None)
+            return playback
+        self._card_replay = ResultCardReplay(
+            getattr(services, "historical_analysis_reader", None), parent=self,
+            playback_provider=current_playback,
+        )
+        self._card_replay.state_changed.connect(self._history_module.set_replay_state)
+        self._history_module.replay_requested.connect(self._card_replay.play)
         self._history_module.run_selected.connect(self.select_run)
         self._history_module.follow_latest_requested.connect(
             self.set_follow_latest
@@ -681,6 +694,7 @@ class ResultDashboardModule(QWidget):
         }
         if render_history:
             self._history_module.render_snapshot(snapshot)
+        self._card_replay.sync((*snapshot.active_cards, *snapshot.terminal_cards))
         self._projected_snapshot = snapshot
         self._update_preview_target(snapshot)
         selected = self._find_selected_card(snapshot)
@@ -882,6 +896,7 @@ class ResultDashboardModule(QWidget):
         self._clear_grid()
 
     def closeEvent(self, event) -> None:
+        self._card_replay.shutdown()
         self._projection_closed = True
         self._projection_refresh_scheduled = False
         self._history_projection_actionable = False
@@ -1021,6 +1036,8 @@ class ResultDashboardModule(QWidget):
         layout = self._layout_for_display_config(display_config)
         signature = self._layout_structure_signature(layout)
         review = self._normalize_review(payload.review, card)
+        if not isinstance(review.config_payload, dict):
+            review = replace(review, config_payload=deepcopy(display_config))
         state = FactoryControllerState(
             selected_config_ids=(
                 (card.config.config_id,)
@@ -1353,16 +1370,22 @@ class ResultDashboardModule(QWidget):
     ) -> None:
         if panel_type not in {PANEL_STFT, PANEL_VIBRATION_STFT}:
             return
+
+        def update_score(text):
+            if panel_widget.current_score_visible():
+                self._set_stft_card_score_metric(card, text)
+            else:
+                card.set_title_metric("", "")
+
         current = getattr(panel_widget, "current_score_title", None)
         if callable(current):
-            self._set_stft_card_score_metric(card, current())
+            update_score(current())
         changed = getattr(panel_widget, "score_title_changed", None)
         if hasattr(changed, "connect"):
-            changed.connect(
-                lambda text, dashboard_card=card: (
-                    self._set_stft_card_score_metric(dashboard_card, text)
-                )
-            )
+            changed.connect(update_score)
+        panel_widget.score_visibility_changed.connect(
+            lambda _visible: update_score(panel_widget.current_score_title())
+        )
 
     @staticmethod
     def _set_stft_card_score_metric(card: Card, text: str) -> None:

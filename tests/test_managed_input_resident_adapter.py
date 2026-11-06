@@ -474,6 +474,49 @@ def test_startup_returns_original_endpoint_and_fixed_generation() -> None:
     assert ready.generation.stream_generation == 1
 
 
+class UnprintableStartupError(Exception):
+    def __str__(self):
+        raise RuntimeError("broken exception string conversion")
+
+
+@pytest.mark.parametrize("pool_wide", [False, True])
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (RuntimeError("synthetic open failure"), "RuntimeError: synthetic open failure"),
+        (RuntimeError("driver\0failed\r\nretry\tdenied " + "x" * 1000), "driver failed retry denied"),
+        (UnprintableStartupError(), "UnprintableStartupError"),
+        (RuntimeError("invalid \ud800 driver message"), "invalid ? driver message"),
+    ],
+)
+def test_startup_failure_preserves_safe_bounded_detail(monkeypatch, pool_wide, error, expected):
+    backend = FakeBackend(create_errors={"managed-input-1": error})
+    if pool_wide:
+        def fail_open(*_args, **_kwargs):
+            raise error
+        monkeypatch.setattr(ResidentAudioPool, "open", fail_open)
+    adapter = make_adapter(backend)
+    try:
+        result = adapter.open_startup_streams((endpoint(1), endpoint(2)))
+        assert ready_ids(result) == (() if pool_wide else (2,))
+        assert failure_codes(result) == (
+            {1: "resident_open_failed", 2: "resident_open_failed"}
+            if pool_wide else {1: "resident_open_failed"}
+        )
+        for failure in result.failures:
+            detail = getattr(failure, "detail", "")
+            assert expected in detail
+            assert 0 < len(detail) <= 256
+            assert all(character not in detail for character in "\0\r\n\t")
+            detail.encode("utf-8")
+        if not pool_wide:
+            ready = result.ready_streams[0]
+            assert adapter.capture_target(ready.endpoint.hardware_id, ready.generation)
+    finally:
+        closed = adapter.close_all(1.0)
+    assert close_statuses(closed)[1] is ManagedInputCloseStatus.NOT_OPEN
+
+
 def test_startup_partition_is_unique_and_numeric_stable_sorted() -> None:
     backend = FakeBackend(
         create_errors={

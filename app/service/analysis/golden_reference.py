@@ -221,8 +221,8 @@ class GoldenReferenceCache:
                 frozen.channel_index != channel_index
                 or frozen.rehash() != frozen.sha256
                 or configured_rate != float(frozen.sample_rate_hz)
-                or runtime_rate != float(frozen.sample_rate_hz)
-                or allow_runtime_resample
+                or runtime_rate is None
+                or (not allow_runtime_resample and runtime_rate != float(frozen.sample_rate_hz))
             ):
                 raise GoldenReferenceError(
                     "frozen golden artifact facts do not match execution"
@@ -231,9 +231,12 @@ class GoldenReferenceCache:
                 frozen.signal,
                 mic_sensitivity,
             )
+            if allow_runtime_resample:
+                calibrated = _resample_signal(calibrated, source_rate=float(frozen.sample_rate_hz),
+                                              target_rate=runtime_rate)
             bundle = GoldenReferenceBundle(
                 signal=np.asarray(calibrated, dtype=np.float64).reshape(-1),
-                sample_rate=float(frozen.sample_rate_hz),
+                sample_rate=runtime_rate,
             )
             self._bundles[channel_index] = bundle
             return bundle

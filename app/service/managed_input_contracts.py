@@ -8,6 +8,8 @@ import re
 import unicodedata
 from typing import Protocol, final
 
+from app.service.startup_diagnostics import MAX_STARTUP_DETAIL_CHARS
+
 
 SIGNED63_MAX = 2**63 - 1
 MAX_MANAGED_AUDIO_INPUTS = 6
@@ -254,10 +256,18 @@ class ResidentInputFailureNotice:
 class ResidentOpenFailure:
     hardware_id: ManagedHardwareId
     error_code: str
+    detail: str = ""
 
     def __post_init__(self) -> None:
         _require_exact(self.hardware_id, ManagedHardwareId, "hardware_id")
         _require_error_code_text(self.error_code, "error_code")
+        _require_exact(self.detail, str, "detail")
+        _utf8_size(self.detail, "detail")
+        if len(self.detail) > MAX_STARTUP_DETAIL_CHARS or any(
+            unicodedata.category(character) in {"Cc", "Zl", "Zp"}
+            for character in self.detail
+        ):
+            raise ValueError("detail must be bounded single-line text")
 
 
 @final

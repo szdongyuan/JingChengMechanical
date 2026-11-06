@@ -20,8 +20,8 @@ Spec: `docs/double-sdd/specs/2026-09-10-plc-torque-table-design.md`
 
 ### 执行准备：保证 worktree 包含当前代码
 
-- [ ] 在开始执行时重新读取 `git status --short`、`git rev-parse HEAD`、`git branch --show-current`，将其保存到 `.worktrees/plc-torque-table.meta.json`，并记录执行路径、源文件哈希清单和随后创建的快照提交。不要把计划编写时的 HEAD 当作执行时集成基点。
-- [ ] 使用分支 `codex/plc-torque-table`、目录 `.worktrees/plc-torque-table`。若同名已存在，先检查其状态后复用本任务记录，不覆盖别人的 worktree。
+- [x] 在开始执行时重新读取 `git status --short`、`git rev-parse HEAD`、`git branch --show-current`，将其保存到 `.worktrees/plc-torque-table.meta.json`，并记录执行路径、源文件哈希清单和随后创建的快照提交。不要把计划编写时的 HEAD 当作执行时集成基点。
+- [x] 使用分支 `codex/plc-torque-table`、目录 `.worktrees/plc-torque-table`。若同名已存在，先检查其状态后复用本任务记录，不覆盖别人的 worktree。
 
 ```powershell
 $torqueMainBase = git rev-parse HEAD
@@ -32,10 +32,10 @@ git -C .worktrees/plc-torque-table apply ../plc-torque-baseline.patch
 git ls-files --others --exclude-standard -- app base consts model ui tests scripts native
 ```
 
-- [ ] 将上一步实际列出的未跟踪源码、测试及所依赖的本地运行资产按原相对路径复制到 worktree，记录清单和哈希；禁止复制生产数据库、录音、模型训练产物和打包输出。`app/service/plc_current_history.py`、`app/service/startup_diagnostics.py`、`app/service/capture_process/` 等当前未跟踪模块可能已被现有代码导入，应按实际导入闭包保留，不能仅复制扭矩相关文件。Python 源码所需 native DLL 只作为已有运行资产复制，不重编译。
-- [ ] 把 `.agents/skills` 及所需 `.codex/agents` 工作流文件按原相对路径复制到 worktree 作为本地工作流支持；不混入功能提交。确认 spec 和本 plan 在 worktree 中可读；若 plan 尚未提交则复制该文档。
-- [ ] 在隔离 worktree 内对源码快照建立 `tmp/sdd: preserve existing workspace baseline` 临时提交，保存其 ID 为 `FEATURE_BASE`。该提交只能用作实现前状态；后续功能差异、最终评审和集成均使用 `FEATURE_BASE..HEAD`。不得把它或其他临时提交直接合并到主分支。
-- [ ] 核对依赖，并运行下述现有回归基线。已存在的失败先记录和定位，不能通过删除断言把它们变成通过；使用 `systematic-debugging` 处理会阻断本功能的失败。
+- [x] 将上一步实际列出的未跟踪源码、测试及所依赖的本地运行资产按原相对路径复制到 worktree，记录清单和哈希；禁止复制生产数据库、录音、模型训练产物和打包输出。`app/service/plc_current_history.py`、`app/service/startup_diagnostics.py`、`app/service/capture_process/` 等当前未跟踪模块可能已被现有代码导入，应按实际导入闭包保留，不能仅复制扭矩相关文件。Python 源码所需 native DLL 只作为已有运行资产复制，不重编译。
+- [x] 把 `.agents/skills` 及所需 `.codex/agents` 工作流文件按原相对路径复制到 worktree 作为本地工作流支持；不混入功能提交。确认 spec 和本 plan 在 worktree 中可读；若 plan 尚未提交则复制该文档。
+- [x] 在隔离 worktree 内对源码快照建立 `tmp/sdd: preserve existing workspace baseline` 临时提交，保存其 ID 为 `FEATURE_BASE`。该提交只能用作实现前状态；后续功能差异、最终评审和集成均使用 `FEATURE_BASE..HEAD`。不得把它或其他临时提交直接合并到主分支。
+- [x] 核对依赖，并运行下述现有回归基线。已存在的失败先记录和定位，不能通过删除断言把它们变成通过；使用 `systematic-debugging` 处理会阻断本功能的失败。
 
 所有以下命令在 worktree 根目录运行。当前工作区已有可用 `.venv`，在标准 worktree 路径下：
 
@@ -50,6 +50,8 @@ $env:APP_DB_PATH = ':memory:'
 基线必须使用临时数据库和假 PLC；禁止运行生产 `main.py` 来替代验证。不要更新依赖或修改 Snap7 版本。每个 exec 会话按需重新设置以上任务变量，不依赖先前 shell 的变量。
 
 2026-09-10 计划阶段已在主工作区以上述环境变量运行相同的六个现有测试文件，结果为 **109 passed, 1 skipped**。这只证明规划时的现有基线；执行时仍需在隔离 worktree 重新确认基线，不能用它宣称新功能已经通过测试。
+
+执行准备补充：隔离 worktree 的六文件基线同样为 109 passed, 1 skipped。扩展基线（shutdown_order、production_composition、hardware_module、main_startup）为 168 passed, 2 errors；两个错误均为原有 hardware_module 测试请求未定义的 qapp fixture。已确认环境未安装 pytest-qt，现有 workorder 测试自行定义局部 qapp，而共享 conftest 未提供。Task 2 在已拥有的 tests/conftest.py 中补充复用 QApplication.instance() 的 session qapp fixture，以运行既有硬件回归，不改变硬件生产行为或新增依赖。
 
 ## 文件职责与接口边界
 
@@ -102,6 +104,7 @@ class TorqueCycle:
     config: TorqueConfig
     rules: RuleSnapshot
     inherited_db: int
+    cycle_id: int | None = None
 
 @dataclass(frozen=True)
 class TorqueStatus:
@@ -117,6 +120,7 @@ class TorqueStatus:
     read_value: float | None = None
     target_db: int | None = None
     target_byte_offset: int | None = None
+    cycle_id: int | None = None
 ```
 
 未启用 / 待读取由配置及当前 UI 状态表示，不伪造一个测试触发时间戳。应用配置回执是另一种数据结构，至少包含 plc_id、service_generation、config_revision、成功标志和详情；不能与测试处理结果混用。
@@ -129,7 +133,7 @@ class TorqueStatus:
 - Create: `app/service/torque/validation.py`
 - Test: `tests/torque/test_validation.py`
 
-- [ ] **Step 1: 写失败测试。** 覆盖精确匹配键去首尾空白、保留前导零 / 大小写、非法匹配类型；REAL 普通数 / 零 / 负数 / NaN / Infinity / 布尔值 / 超范围 / 非零下溢；字节偏移和 DB 继承后的重叠。使用参数化测试验证行为，不测试数据类 repr。
+- [x] **Step 1: 写失败测试。** 覆盖精确匹配键去首尾空白、保留前导零 / 大小写、非法匹配类型；REAL 普通数 / 零 / 负数 / NaN / Infinity / 布尔值 / 超范围 / 非零下溢；字节偏移和 DB 继承后的重叠。使用参数化测试验证行为，不测试数据类 repr。
 
 ```python
 def test_real_keeps_zero_and_negative_but_rejects_nonzero_underflow():
@@ -149,8 +153,8 @@ def test_addresses_are_validated_after_db_inheritance():
     assert resolve_addresses(cfg, inherited_db=2) == ((2, 20), (1, 22))
 ```
 
-- [ ] **Step 2: 跑 RED。** `& $torquePython -m pytest tests/torque/test_validation.py -q`；应因新增模块 / 行为不存在失败。
-- [ ] **Step 3: 实现纯函数和完整类型。** `normalize_key(value)` 只接受非空 str 并 strip；`parse_offset(value)` 接受 `N` 和 `N.0`，拒绝 bool、负数及非零位；DB 校验为正整数或 None。`resolve_addresses` 要求启用配置的两个偏移完整，并校验相同 DB 下 `[offset, offset+4)` 区间不重叠。关闭配置允许地址为空，但已填写内容仍须语法有效。
+- [x] **Step 2: 跑 RED。** `& $torquePython -m pytest tests/torque/test_validation.py -q`；应因新增模块 / 行为不存在失败。
+- [x] **Step 3: 实现纯函数和完整类型。** `normalize_key(value)` 只接受非空 str 并 strip；`parse_offset(value)` 接受 `N` 和 `N.0`，拒绝 bool、负数及非零位；DB 校验为正整数或 None。`resolve_addresses` 要求启用配置的两个偏移完整，并校验相同 DB 下 `[offset, offset+4)` 区间不重叠。关闭配置允许地址为空，但已填写内容仍须语法有效。
 
 REAL 转换核心必须保留以下语义，返回可真正写入 PLC 的 float32 数值：
 
@@ -173,8 +177,8 @@ def validate_torque(value):
 
 从标准库 `decimal` 导入 Decimal / InvalidOperation；保留原始数值是否为零的信息，防止文本在转换成 Python float 时已下溢而绕过 REAL 校验。
 
-- [ ] **Step 4: 跑 GREEN。** 重复该测试文件，应全部 PASS；新增模块不得导入 Qt、Snap7 或连接数据库。
-- [ ] **Step 5: 建立任务 checkpoint。** 精确 stage 本任务四个文件，commit message `tmp/sdd: torque contracts and validation`，按任务前 HEAD 进行双评审。
+- [x] **Step 4: 跑 GREEN。** 重复该测试文件，应全部 PASS；新增模块不得导入 Qt、Snap7 或连接数据库。
+- [x] **Step 5: 建立任务 checkpoint。** 精确 stage 本任务四个文件，commit message `tmp/sdd: torque contracts and validation`，按任务前 HEAD 进行双评审。
 
 ## Task 2: 扭矩表与配置的兼容数据库迁移
 
@@ -183,13 +187,15 @@ def validate_torque(value):
 - Create: `model/torque_rule_table.py`
 - Create: `app/service/torque/migration.py`
 - Modify: `app/service/db_connection_service.py` (`connect`, `_migrate_compatible_schema`)
-- Modify: `tests/conftest.py` (`ALL_TABLES`)
+- Modify: `tests/conftest.py` (`ALL_TABLES` 和缺失的共享 qapp fixture)
 - Modify: `tests/test_db_connection_service.py` (兼容新增可选表的成功用例断言)
 - Test: `tests/torque/test_migration.py`
 
-- [ ] **Step 1: 写失败测试。** 在临时磁盘数据库中建原始必需表，运行 connect 后断言新增两个表、唯一索引、旧业务行保持、已有人工判定字段升级仍有效。覆盖“旧人工判定字段已存在但扭矩表缺失”、第二次启动不再备份 / 重建、备份失败不改结构、DDL 中途失败回滚，以及原有文件 / 必需表缺失仍报错。
-- [ ] **Step 2: 跑 RED。** `& $torquePython -m pytest tests/torque/test_migration.py tests/test_db_connection_service.py -q`；失败应定位到未创建的新表，而非真实数据库访问。
-- [ ] **Step 3: 实现两表 ORM 和迁移。** `plc_id` 用 IntegerField 主键；共享表 id 为 AutoField，match_type / match_key 为文本且非空，torque_value 为 DoubleField，复合唯一索引。配置列及缺省与 spec 一致；配置 revision 为进程内发布元数据，不添加未批准的持久化业务字段。
+- [x] **Step 1: 写失败测试。** 在临时磁盘数据库中建原始必需表，运行 connect 后断言新增两个表、唯一索引、旧业务行保持、已有人工判定字段升级仍有效。覆盖“旧人工判定字段已存在但扭矩表缺失”、第二次启动不再备份 / 重建、备份失败不改结构、DDL 中途失败回滚，以及原有文件 / 必需表缺失仍报错。
+
+先单独运行 tests/test_hardware_module.py 记录缺失 qapp 的既有 RED；在 tests/conftest.py 以 session fixture 提供 QApplication.instance() or QApplication([])，使用离屏环境，保留应用引用供整轮测试使用。不删除 / skip 现有测试，不安装新插件。修正后运行该文件与 tests/test_workorder_module.py 验证两个入口兼容。
+- [x] **Step 2: 跑 RED。** `& $torquePython -m pytest tests/torque/test_migration.py tests/test_db_connection_service.py -q`；失败应定位到未创建的新表，而非真实数据库访问。
+- [x] **Step 3: 实现两表 ORM 和迁移。** `plc_id` 用 IntegerField 主键；共享表 id 为 AutoField，match_type / match_key 为文本且非空，torque_value 为 DoubleField，复合唯一索引。配置列及缺省与 spec 一致；配置 revision 为进程内发布元数据，不添加未批准的持久化业务字段。
 
 迁移必须按如下顺序，不能把新表提前加入原始必需表集合导致旧库无法升级：
 
@@ -203,8 +209,8 @@ validate original final schema and both torque schemas/indexes
 
 `migration.py` 提供 `needs_torque_migration(db)`, `apply_torque_migration(db)`, `validate_torque_schema(db)`；缺表可新增，已有表结构错误须明确报错，不丢表重建。保留现有所有非扭矩兼容逻辑，移除的只能是会导致遗漏本次升级的过早 return。`:memory:` 测试由显式建表 fixture 管理，不能连接真实配置库。
 
-- [ ] **Step 4: 跑 GREEN。** 重复 Step 2；核对已有失败结构检查仍 PASS。把两个新 ORM 加入测试 fixture，并正确保持创建 / 删除顺序。
-- [ ] **Step 5: Commit。** 仅本任务列出的文件，`tmp/sdd: torque schema compatibility migration`；双评审重点检查备份与旧库保护。
+- [x] **Step 4: 跑 GREEN。** 重复 Step 2；核对已有失败结构检查仍 PASS。把两个新 ORM 加入测试 fixture，并正确保持创建 / 删除顺序。
+- [x] **Step 5: Commit。** 仅本任务列出的文件，`tmp/sdd: torque schema compatibility migration`；双评审重点检查备份与旧库保护。
 
 ## Task 3: 原子规则服务与 Excel 解析 / 预览
 
@@ -215,7 +221,7 @@ validate original final schema and both torque schemas/indexes
 - Test: `tests/torque/test_store.py`
 - Test: `tests/torque/test_excel.py`
 
-- [ ] **Step 1: 写失败测试。** store 的配置缺省关闭、规则唯一键、精确匹配、增删改、PLC 配置删除保留共享规则、提交失败数据库和内存快照均保持旧版本。测试导入时新增 / 覆盖预览、未包含行保留、重复行与错误阻止整批提交、预览后版本冲突。
+- [x] **Step 1: 写失败测试。** store 的配置缺省关闭、规则唯一键、精确匹配、增删改、PLC 配置删除保留共享规则、提交失败数据库和内存快照均保持旧版本。测试导入时新增 / 覆盖预览、未包含行保留、重复行与错误阻止整批提交、预览后版本冲突。
 
 Excel 使用 `tmp_path` 生成实际 xlsx：重排表头、文本 SN `000123`、数值型 SN 拒绝、长数字字符串保留、首尾空格、公式拒绝、布尔扭矩拒绝、无效 REAL、空行、半空行、重复键、读取第一个工作表、模板列 B 文本格式。固定 Excel 行号为 1 起始，表头为第 1 行。
 
@@ -228,8 +234,8 @@ def test_preview_cannot_overwrite_unreviewed_changes(store):
     assert store.snapshot().values[("model", "M100")] == 3.0
 ```
 
-- [ ] **Step 2: 跑 RED。** `& $torquePython -m pytest tests/torque/test_store.py tests/torque/test_excel.py -q`。
-- [ ] **Step 3: 实现 store 和 Excel。** store 接受明确 database 依赖，不偷偷创建库；启动加载配置与规则。用写入锁串行化事务及版本比较，构造新不可变 snapshot 后在短独立锁内发布；PLC 读 snapshot 只持短读锁，不能等待整个导入事务。数据库事务成功前不得发布新版本；准备 snapshot 出错也必须使事务回滚。
+- [x] **Step 2: 跑 RED。** `& $torquePython -m pytest tests/torque/test_store.py tests/torque/test_excel.py -q`。
+- [x] **Step 3: 实现 store 和 Excel。** store 接受明确 database 依赖，不偷偷创建库；启动加载配置与规则。用写入锁串行化事务及版本比较，构造新不可变 snapshot 后在短独立锁内发布；PLC 读 snapshot 只持短读锁，不能等待整个导入事务。数据库事务成功前不得发布新版本；准备 snapshot 出错也必须使事务回滚。
 
 核心提交顺序：
 
@@ -247,8 +253,8 @@ notify caller after success
 
 Excel `parse_workbook(path)` 用 `load_workbook(read_only=True, data_only=False)`，finally 关闭 workbook；拒绝公式而不使用缓存。接受 .xlsx 后缀，坏 zip / 无表 / 错表头产生可显示错误，不提交任何内容。`write_template(path)` 写首行及设计例子、列 B number_format `@`、单位说明，模板可被同一个 parser 正常导入。不要新增依赖或提供 XLS 转换。
 
-- [ ] **Step 4: 跑 GREEN。** `& $torquePython -m pytest tests/torque/test_validation.py tests/torque/test_store.py tests/torque/test_excel.py -q`；事务回滚和版本冲突必须有实际文件 SQLite 测试，不只 mock commit。
-- [ ] **Step 5: Commit。** 精确 stage 本任务文件，`tmp/sdd: torque store and Excel import`，双评审。
+- [x] **Step 4: 跑 GREEN。** `& $torquePython -m pytest tests/torque/test_validation.py tests/torque/test_store.py tests/torque/test_excel.py -q`；事务回滚和版本冲突必须有实际文件 SQLite 测试，不只 mock commit。
+- [x] **Step 5: Commit。** 精确 stage 本任务文件，`tmp/sdd: torque store and Excel import`，双评审。
 
 ## Task 4: 独立扭矩处理器与 PLC 开始链路
 
@@ -259,7 +265,7 @@ Excel `parse_workbook(path)` 用 `load_workbook(read_only=True, data_only=False)
 - Test: `tests/torque/test_plc_ingress.py`
 - Modify: `tests/test_plc_service_workorder.py` (开始复位异常边界断言，保留现有工单断言)
 
-- [ ] **Step 1: 写失败测试。** 假 I/O 记录顺序，要求开始提交、复位尝试发生在扭矩读取之前；读 0 命中 2.5 时，仅回传地址写一次正确 4 字节；读非零 3.0 时表有 / 无记录都不写，连续两台读取同样 3.0 都有效。
+- [x] **Step 1: 写失败测试。** 假 I/O 记录顺序，要求开始提交、复位尝试发生在扭矩读取之前；读 0 命中 2.5 时，仅回传地址写一次正确 4 字节；读非零 3.0 时表有 / 无记录都不写，连续两台读取同样 3.0 都有效。
 
 ```python
 def test_nonzero_plc_value_remains_authoritative_across_starts(runtime, cycle):
@@ -278,8 +284,8 @@ def test_nonzero_plc_value_remains_authoritative_across_starts(runtime, cycle):
 
 其他用例：负非零、微小非零、正负零、表值零；读异常 / 短字节 / NaN / Inf 不回退；匹配空键 / miss；写异常显示已查到值但失败；启用地址冲突不 I/O；功能关闭不新增网络调用。初始高位 / 持续高位不触发，开始回调抛异常不写扭矩，复位异常但开始成功仍执行扭矩边界。
 
-- [ ] **Step 2: 跑 RED。** `& $torquePython -m pytest tests/torque/test_runtime.py tests/torque/test_plc_ingress.py -q`。
-- [ ] **Step 3: 实现完整处理算法。** `TorqueRuntime.process(cycle, *, read_real, write_real, publish)` 返回最终 TorqueStatus，中间发布 reading / table_pending；函数只操作固定 cycle。主要分支如下，每个外部失败转为对应具体状态：
+- [x] **Step 2: 跑 RED。** `& $torquePython -m pytest tests/torque/test_runtime.py tests/torque/test_plc_ingress.py -q`。
+- [x] **Step 3: 实现完整处理算法。** `TorqueRuntime.process(cycle, *, read_real, write_real, publish)` 返回最终 TorqueStatus，中间发布 reading / table_pending；函数只操作固定 cycle。主要分支如下，每个外部失败转为对应具体状态：
 
 ```text
 resolve config addresses, or publish config_error
@@ -305,40 +311,48 @@ PlcService 添加可选 `torque_store=None`、`torque_config=None`、`service_ge
 
 日志由 PlcService 的状态发布包装函数集中记录；纯 runtime 提供状态和诊断数据，不依赖全局 logger。每次最终状态记录 plc_id、trigger_ns、cycle 的型号 / SN、规则 revision、实际读取值（未读到用 None）、最终来源、已解析回传 DB / 偏移、待写或已写值、状态及错误原因。非零 PLC 分支也记录读取值和来源，未发写请求时回传值为 None；读失败不能把读取值记成 0。错误状态既发 UI 信号也发已有日志通道，不弹模态框。用日志捕获测试核对 PLC 优先、表成功、未匹配、读取失败、写失败和配置错误六个最终分支具备上述上下文，不只断言调用过 logger。
 
-- [ ] **Step 4: 跑 GREEN 和 PLC 回归。**
+- [x] **Step 4: 跑 GREEN 和 PLC 回归。**
 
 ```powershell
 & $torquePython -m pytest tests/torque/test_runtime.py tests/torque/test_plc_ingress.py tests/test_plc_service_workorder.py tests/test_plc_service_current.py tests/test_plc_service_shutdown.py tests/test_plc_service_scheduling.py -q
 ```
 
-- [ ] **Step 5: Commit。** `tmp/sdd: PLC torque processing after test start`，双评审明确核对现有 dirty baseline 中的电流和调度代码仍在。
+- [x] **Step 5: Commit。** `tmp/sdd: PLC torque processing after test start`，双评审明确核对现有 dirty baseline 中的电流和调度代码仍在。
 
 ## Task 5: 后台作业、运行配置应用与应用装配
 
 **Files:**
 - Create: `app/service/torque/jobs.py`
+- Modify: `app/service/torque/store.py` (PLC 与扭矩配置的协调删除事务)
+- Modify: `app/service/plc_service.py` (配置应用入口拒绝迟到的较旧 revision)
+- Modify: `tests/torque/test_plc_ingress.py` (关闭功能用例使用新保存配置的递增 revision，保留原断言)
 - Modify: `app/services_container.py` (初始化、bus 信号、shutdown)
 - Modify: `ui/modules/plc_settings.py` (`start_connect`, PLC 删除 / 断开)
 - Modify: `tests/multi_run_integration/test_shutdown_order.py` (新增后台作业关闭的必要断言)
 - Test: `tests/torque/test_jobs.py`
 - Test: `tests/torque/test_composition.py`
 - Test: `tests/torque/test_threading.py`
+- Modify: `tests/torque/test_store.py` (协调删除回滚与缓存发布)
 
-- [ ] **Step 1: 写失败测试。** 用实际 QThread + 假 PLC 验证：配置保存和 Excel 解析不在 UI 线程、Snap7 调用仅在 PLC 所属线程；新 store 规则成功提交后无需重连，下个 cycle 用新 revision，已固定 cycle 保留旧 snapshot；配置排队应用有回执，断开时保存显示待应用，连接时带入最新配置。
+- [x] **Step 1: 写失败测试。** 用实际 QThread + 假 PLC 验证：配置保存和 Excel 解析不在 UI 线程、Snap7 调用仅在 PLC 所属线程；新 store 规则成功提交后无需重连，下个 cycle 用新 revision，已固定 cycle 保留旧 snapshot；配置排队应用有回执，断开时保存显示待应用，连接时带入最新配置。
 
 测试并发提交冲突、后台出错清理连接、窗口关闭后 job 完成、应用关闭等待 / 取消作业但不销毁运行线程、删除 PLC 后不残留配置。文件型临时 SQLite 供跨线程访问，不使用每线程独立的 `:memory:` 数据库伪造成功。
 
-- [ ] **Step 2: 跑 RED。** `& $torquePython -m pytest tests/torque/test_jobs.py tests/torque/test_composition.py tests/torque/test_threading.py -q`。
-- [ ] **Step 3: 实现应用持有的作业控制器。** 单个专用 QThread 和 worker QObject 串行处理 store 变更 / Excel / 模板文件 I/O，使用显式 Qt 排队信号发送请求和结果，每个请求有 ID，UI 按请求 ID 关联。解析和预览不提交数据；写入提交是另一个明确请求。worker 使用 Peewee 的线程本地 connection_context，作业结束关闭该线程连接，不关闭主线程连接。
+- [x] **Step 2: 跑 RED。** `& $torquePython -m pytest tests/torque/test_jobs.py tests/torque/test_composition.py tests/torque/test_threading.py -q`。
+- [x] **Step 3: 实现应用持有的作业控制器。** 单个专用 QThread 和 worker QObject 串行处理 store 变更 / Excel / 模板文件 I/O，使用显式 Qt 排队信号发送请求和结果，每个请求有 ID，UI 按请求 ID 关联。解析和预览不提交数据；写入提交是另一个明确请求。worker 使用 Peewee 的线程本地 connection_context，作业结束关闭该线程连接，不关闭主线程连接。
 
 应用容器在数据库兼容初始化后构造 store 和 jobs，不要求 PLC 已连接。关闭时停止接受新请求；未执行的可取消，已进入事务的操作须完成提交或回滚，再退出 worker / 关闭数据库；不能 terminate QThread。解析 workbook 的循环响应取消。界面关闭仅解除该界面的回调，jobs 由容器持有，防止 QThread 仍运行却被弹窗析构。
 
 初始化时加载 store；每次 `start_connect` 给 PlcService 传最新 config、共享 store 和新的 generation。将 service torque result 转发到 bus 的 `plc_torque_changed`（object），把 `torque_config_applied` 转发到 UI 状态。store 配置持久化成功后向对应仍存在的 service 排队应用；断开则只记待应用，重连应用最新配置。退出 / 重连后迟到的旧 generation 回执不得标记新实例已应用。
 
+已确认的评审修正：较早 save_config 的完成通知若晚于较新配置持久化或重连，不能把旧配置派发到新实例。coordinator 需过滤已过期的保存完成通知；PlcService 所属线程的 apply_torque_config 也拒绝比当前已应用 revision 更小的配置，保留同 revision 的连接回执。用“新实例已加载 revision 2，迟到 revision 1 完成通知 / 已排队应用到达”的实际 Qt 测试证明运行配置不会倒退，而非仅过滤显示回执。
+
 PLC 删除复用原来的断开 / 删除流程，在同一数据库删除边界删除扭矩配置；共享规则保持。若已排队该 PLC 的配置作业，作业必须重新验证 PlcTable 记录存在，不重新创建已删除 PLC 的扭矩设置。删除时清除其配置缓存并通知界面。
 
-- [ ] **Step 4: 跑 GREEN。** 重复 Step 2，再运行 `tests/test_plc_service_shutdown.py` 及 `tests/multi_run_integration/test_shutdown_order.py`；只调整与新增关闭作业相关的预期，保留现有资源关闭语义。
-- [ ] **Step 5: Commit。** `tmp/sdd: torque jobs and PLC configuration lifecycle`，双评审。
+实现衔接说明：Task 3 的 store mutation 必须拥有外层事务，因此不能在 UI 开启事务后嵌套调用 delete_config。Task 5 在 store 增加协调删除操作，将原 PLC 偏移行、扭矩配置行、PLC 行的删除放在同一 mutation lock 和外层事务中，提交后发布失效配置缓存；由后台 job 调用，错误回滚全部删除。删除开始后取消尚未执行的该 PLC 配置请求，防止删除完成后旧请求仍尝试保存。该调整用于落实既有原子删除需求，不扩展业务范围。
+
+- [x] **Step 4: 跑 GREEN。** 重复 Step 2，再运行 `tests/test_plc_service_shutdown.py` 及 `tests/multi_run_integration/test_shutdown_order.py`；只调整与新增关闭作业相关的预期，保留现有资源关闭语义。
+- [x] **Step 5: Commit。** `tmp/sdd: torque jobs and PLC configuration lifecycle`，双评审。
 
 ## Task 6: 扭矩设置、规则管理与 Excel 导入界面
 
@@ -349,16 +363,16 @@ PLC 删除复用原来的断开 / 删除流程，在同一数据库删除边界�
 - Test: `tests/torque/test_settings_dialog.py`
 - Test: `tests/torque/test_table_dialog.py`
 
-- [ ] **Step 1: 写失败测试。** 使用真实 QWidget + 假 jobs 请求记录器，覆盖每个 PLC 的开关 / 匹配依据 / 两地址、关闭允许空地址、启用缺地址 / 重叠拒绝、无倍率字段、保存不发 PLC 写入。覆盖管理表 CRUD / 搜索、模板下载路径、导入预览新增 / 覆盖新旧值 / 错误行、错误阻止提交、取消不变、冲突要求重新预览。
-- [ ] **Step 2: 跑 RED。** `& $torquePython -m pytest tests/torque/test_settings_dialog.py tests/torque/test_table_dialog.py -q`。
-- [ ] **Step 3: 实现两个弹窗。** 扭矩设置包含启用、型号 / SN、两个 DB 和偏移（继承 DB 的提示）、REAL 固定说明、“与 PLC 单位一致”、管理表入口及保存 / 应用状态。保存按钮先做纯校验再提交 job，持久化成功与工作线程应用成功分别显示，生产流程不需要打开弹窗。
+- [x] **Step 1: 写失败测试。** 使用真实 QWidget + 假 jobs 请求记录器，覆盖每个 PLC 的开关 / 匹配依据 / 两地址、关闭允许空地址、启用缺地址 / 重叠拒绝、无倍率字段、保存不发 PLC 写入。覆盖管理表 CRUD / 搜索、模板下载路径、导入预览新增 / 覆盖新旧值 / 错误行、错误阻止提交、取消不变、冲突要求重新预览。
+- [x] **Step 2: 跑 RED。** `& $torquePython -m pytest tests/torque/test_settings_dialog.py tests/torque/test_table_dialog.py -q`。
+- [x] **Step 3: 实现两个弹窗。** 扭矩设置包含启用、型号 / SN、两个 DB 和偏移（继承 DB 的提示）、REAL 固定说明、“与 PLC 单位一致”、管理表入口及保存 / 应用状态。保存按钮先做纯校验再提交 job，持久化成功与工作线程应用成功分别显示，生产流程不需要打开弹窗。
 
 共享表用 QTableWidget / QTableView 按现有 Qt 样式实现，不引入新 UI 框架。界面仅提交后台请求，解析、保存模板和 DB mutation 不在 UI 主线程执行。预览用独立表格展示行号、匹配类型、键、旧值、新值、动作 / 错误；存在任一错误或预览已失效时禁用确认导入。窗口关闭可以取消未提交预览；已提交事务最终成功 / 失败由 jobs 统一管理。
 
 PLC 设置按钮区改为可容纳新增“扭矩”按钮的布局（必要时两行），避免沿用固定宽度导致窄窗口挤出。访问沿用硬件页现有权限边界，不另建用户角色或生产弹窗。
 
-- [ ] **Step 4: 跑 GREEN。** 重复 Step 2；用离屏窗口检查最小尺寸下输入框和按钮可见、导入长错误列表可滚动。断言可观察的字段 / 按钮行为，不给颜色或像素位置编写脆弱测试。
-- [ ] **Step 5: Commit。** `tmp/sdd: torque configuration and Excel import dialogs`，双评审。
+- [x] **Step 4: 跑 GREEN。** 重复 Step 2；用离屏窗口检查最小尺寸下输入框和按钮可见、导入长错误列表可滚动。断言可观察的字段 / 按钮行为，不给颜色或像素位置编写脆弱测试。
+- [x] **Step 5: Commit。** `tmp/sdd: torque configuration and Excel import dialogs`，双评审。
 
 ## Task 7: 工单区域扭矩显示与多 PLC 事件关联
 
@@ -367,7 +381,7 @@ PLC 设置按钮区改为可容纳新增“扭矩”按钮的布局（必要时�
 - Test: `tests/torque/test_workorder_torque.py`
 - Modify: `tests/test_workorder_module.py` (必要时扩展 bus fixture)
 
-- [ ] **Step 1: 写失败测试。** 每个 PLC 的型号下新增只读扭矩行；未配置关闭 / 开启等待读取；PLC 非零显示来源；软件表已回传 / 回传失败显示本次匹配值；读取失败、无效数值、配置错误与未匹配显示文字且无旧成功值。
+- [x] **Step 1: 写失败测试。** 每个 PLC 的型号下新增只读扭矩行；未配置关闭 / 开启等待读取；PLC 非零显示来源；软件表已回传 / 回传失败显示本次匹配值；读取失败、无效数值、配置错误与未匹配显示文字且无旧成功值。
 
 ```python
 def test_late_outcome_cannot_replace_newer_plc_cycle(module, emit_status):
@@ -383,15 +397,19 @@ def test_late_outcome_cannot_replace_newer_plc_cycle(module, emit_status):
 
 另外从上一事件 `table_sent` 开始，直接投递较新事件的 `config_error`（该分支不经过 reading），必须显示新配置错误且清除旧成功值；随后较旧 reading / table_sent 均不能覆盖它。
 
-- [ ] **Step 2: 跑 RED。** `& $torquePython -m pytest tests/torque/test_workorder_torque.py tests/test_workorder_module.py -q`。
-- [ ] **Step 3: 接入现有工单布局。** 增加 `_plc_torque_edits`、每个 PLC 最新状态缓存及最新触发标识。每一种 TorqueStatus 都参与标识登记：旧于该 PLC 最新 trigger_ns 的消息丢弃；新于最新标识则先清除旧显示并登记，再渲染该消息；相同标识继续渲染。不能只由 reading 登记，因为 config_error 可作为本次首个且唯一事件。只接受当前列表存在的 PLC；不能把 UI 事件过滤条件用于否定 PLC 的非零值。
+- [x] **Step 2: 跑 RED。** `& $torquePython -m pytest tests/torque/test_workorder_torque.py tests/test_workorder_module.py -q`。
+- [x] **Step 3: 接入现有工单布局。** 增加 `_plc_torque_edits`、每个 PLC 最新状态缓存及最新事件标识。每一种 TorqueStatus 都参与标识登记：旧于该 PLC 最新 cycle_id 的消息丢弃；新于最新标识则先清除旧显示并登记，再渲染该消息；相同标识继续渲染。旧直接构造测试未提供 cycle_id 时才回退 trigger_ns，真实路径使用 Task 8 修正后的独立 ID。不能只由 reading 登记，因为 config_error 可作为本次首个且唯一事件。只接受当前列表存在的 PLC；不能把 UI 事件过滤条件用于否定 PLC 的非零值。
+
+新工单到来时清除上一轮显示结果；即使功能已关闭、不会再发 TorqueStatus，也应显示未启用。保存配置本身不改写已有当前 cycle 的结果。新工单重置后保留上一事件标识水位，拒绝小于或等于该水位的旧状态，直到接到严格更新的事件；接受新事件后允许该事件的中间 / 最终状态。保留既有 SN / 型号区域处理删除 PLC 的兼容行为，但独立忽略实际已不存在 PLC 的扭矩更新并清除对应扭矩缓存。
 
 数值格式只影响显示，不在显示层重新参与 PLC 写入。按 spec 显示状态、来源及必要匹配详情，不假定 N·m；详细错误留 tooltip / 日志。增加行后复用 `_update_plc_scroll_policy`，两台以内完整显示，更多 PLC 可滚动。配置状态更新只影响未开始或已关闭显示，不用普通页面刷新发出扭矩请求。
 
-- [ ] **Step 4: 跑 GREEN。** 重复 Step 2，检查所有原工单字段和多 PLC 排列测试仍 PASS。
-- [ ] **Step 5: Commit。** `tmp/sdd: display torque source and outcome per PLC`，双评审。
+- [x] **Step 4: 跑 GREEN。** 重复 Step 2，检查所有原工单字段和多 PLC 排列测试仍 PASS。
+- [x] **Step 5: Commit。** `tmp/sdd: display torque source and outcome per PLC`，双评审。
 
 ## Task 8: 完整流程验收、回归与交付说明
+
+端到端验收确认的相关修正：本地 Windows Python 3.12 的 monotonic 使用 GetTickCount64，分辨率 15.625 ms，且 PLC 轮询配置未禁止更短间隔。不能把 trigger_ns 唯一性作为扭矩显示去重前提。为 TorqueCycle / TorqueStatus 添加独立 cycle_id，由 PlcService 的进程内共享单调计数器在每次扭矩开始时分配，跨 PLC 实例重建不重置；运行消息使用该 ID 做工单 UI 关联，原始 trigger_ns 完全保持。可提供默认 None 以兼容既有直接构造测试，None 时才使用旧 trigger_ns 关联；真实 PLC 路径必须提供独立 ID。Task 8 负责 types.py、runtime.py、plc_service.py、workorder.py 和对应回归的最小修正，并加入连续真实处理使用相同 monotonic 时间戳仍正确显示的端到端用例，不能仅修改测试时钟掩盖问题。
 
 **Files:**
 - Create: `tests/torque/test_end_to_end.py`
@@ -399,10 +417,10 @@ def test_late_outcome_cannot_replace_newer_plc_cycle(module, emit_status):
 - Modify: 本计划（完成状态与验证证据）
 - Fix only if proven necessary: 任务 1–7 声明的相关生产文件；发现缺陷时走 implementer / 双评审，不由 orchestrator 自行改代码。
 
-- [ ] **Step 1: 写端到端失败测试。** 使用临时旧库升级、真实 xlsx 导入、store、假 PLC client、实际 Qt 信号和工单控件贯通：表 M100=2.5 + PLC 0 → 正确地址 REAL 写入并显示成功；PLC 3.0 → 不写且多台持续有效；读取失败 / 未匹配 / 写失败 → 原开始事件仍已提交，状态明确；测试运行期间导入新值仅影响下次 cycle。
-- [ ] **Step 2: 跑测试并确认失败理由。** `& $torquePython -m pytest tests/torque/test_end_to_end.py -q`。若实现已正确而测试直接 PASS，保留集成验证结果，不人为制造生产缺陷来凑 RED；只有暴露缺陷时补针对性 RED 并最小修复。
-- [ ] **Step 3: 完成必要修复与用户说明。** 说明两个地址、读取零 / 非零规则、Excel 模板列、导入覆盖预览、状态含义、现场单位一致、异常不阻断声学测试；不得写“必须每台清零”或“软件判断上一台残留”。说明已回传为通讯成功而非 PLC 执行动作确认。
-- [ ] **Step 4: 完整验收和适当回归。**
+- [x] **Step 1: 写端到端失败测试。** 使用临时旧库升级、真实 xlsx 导入、store、假 PLC client、实际 Qt 信号和工单控件贯通：表 M100=2.5 + PLC 0 → 正确地址 REAL 写入并显示成功；PLC 3.0 → 不写且多台持续有效；读取失败 / 未匹配 / 写失败 → 原开始事件仍已提交，状态明确；测试运行期间导入新值仅影响下次 cycle。
+- [x] **Step 2: 跑测试并确认失败理由。** `& $torquePython -m pytest tests/torque/test_end_to_end.py -q`。若实现已正确而测试直接 PASS，保留集成验证结果，不人为制造生产缺陷来凑 RED；只有暴露缺陷时补针对性 RED 并最小修复。
+- [x] **Step 3: 完成必要修复与用户说明。** 说明两个地址、读取零 / 非零规则、Excel 模板列、导入覆盖预览、状态含义、现场单位一致、异常不阻断声学测试；不得写“必须每台清零”或“软件判断上一台残留”。说明已回传为通讯成功而非 PLC 执行动作确认。
+- [x] **Step 4: 完整验收和适当回归。**
 
 ```powershell
 & $torquePython -m pytest tests/torque tests/test_plc_service_workorder.py tests/test_plc_service_current.py tests/test_plc_service_shutdown.py tests/test_plc_service_scheduling.py tests/test_db_connection_service.py tests/test_workorder_module.py tests/multi_run_integration/test_shutdown_order.py -q
@@ -412,7 +430,7 @@ git diff --check
 
 测试须报告准确结果和与执行准备基线的差异，不能把预先存在的失败宣称为本功能通过。对新增任务做无真实 PLC 的界面检查；若使用截图，只以临时数据库和 fake services 打开专门窗口，不启动完整生产应用。本任务不要求重新打包整套带 native 音频环境的发布程序；现有 openpyxl 显式导入可由打包工具发现，只有实际出现打包依赖缺失证据才改 `main.spec`。
 
-- [ ] **Step 5: Commit 与全范围评审。** `tmp/sdd: torque end-to-end verification and usage guide`；文档在 .gitignore 中，需要对本次文档显式 `git add -f -- <exact-path>`。完成任务双评审后，再对 `FEATURE_BASE..HEAD` 发起完整质量评审，运行 `verification-before-completion`，记录未连接真实 PLC 的验证边界。
+- [x] **Step 5: Commit 与全范围评审。** `tmp/sdd: torque end-to-end verification and usage guide`；文档在 .gitignore 中，需要对本次文档显式 `git add -f -- <exact-path>`。完成任务双评审后，再对 `FEATURE_BASE..HEAD` 发起完整质量评审，运行 `verification-before-completion`，记录未连接真实 PLC 的验证边界。
 
 ## 最终集成保护
 
@@ -444,3 +462,17 @@ git -C <main-worktree> apply --check <feature-patch-path>
 | 无 UI / 录音线程网络访问，后台导入 | 4、5、6 |
 
 完成计划编写及 plan-document-reviewer 评审后，按 writing-plans 的执行交接规则请用户确认是否开始执行；获得执行授权后连续推进所有任务，不在每个任务之间反复要求确认。
+
+## 执行记录（2026-09-10）
+
+- 用户已确认开始实施；Task 1–8 均完成，并分别通过 spec-code-reviewer 和 quality-code-reviewer。
+- 主分支：master_0811；执行前 MAIN_BASE：f50391cb0076496154ca0a845863a3dcacf7b3ea。
+- 功能分支：codex/plc-torque-table；隔离目录：.worktrees/plc-torque-table。
+- 90 个已有改动及未跟踪源码的保存基线 FEATURE_BASE：a720ade12fd884aab2f7523c2c9aa497c8114855。它只用于保留现场，不能作为功能提交集成。
+- 最终代码范围：a720ade12fd884aab2f7523c2c9aa497c8114855..2a276619c911e7f0786d5010d4fb542e59ba9479；全范围质量审查 PASS，无待修问题。
+- 根代理使用 Task 8 列出的全部测试文件进行一次合并运行：575 passed, 1 skipped，退出码 0；全范围 git diff --check 通过。完整质量审查另行运行 tests/torque：294 passed。
+- 8 项端到端测试贯通临时旧库升级、真实 xlsx、后台任务、PLC 字节传输和工单 UI；其中覆盖相同原始时间戳和重连后的独立事件 ID。
+- 扭矩设置、共享表、导入预览、双 PLC 工单行截图均已检查；主工作区 outputs/plc-torque-table 保存截图及经过回读验证的 torque-template.xlsx。
+- 操作说明：docs/torque-table-operator-guide.md。
+- 2026-09-11 用户同意合并回主分支，38 个功能文件已应用到 master_0811 工作区。整合后完整验收为 575 passed, 1 skipped；87 个无关已有文件哈希保持不变。
+- 6 个共享文件原有的未提交改动与功能重叠，涉及 PLC / 数据库服务、容器及其测试（186 行新增、47 行删除）。按本计划的集成保护规则暂未创建 Git 提交，等待确认这些已有改动是否一并纳入。功能分支和 worktree 保留，生产数据库未修改，实际 PLC 联调和发布打包未执行。

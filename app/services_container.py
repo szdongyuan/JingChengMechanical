@@ -55,6 +55,9 @@ from app.service.plc_result_sequencer import (
     PlcResultSequencer,
 )
 from app.service.plc_service import PlcDisconnectAcknowledgement
+from app.service.torque.jobs import TorqueConfigCoordinator, TorqueJobs
+from app.service.torque.store import TorqueStore
+from model.plc_table import PlcTable
 from app.service.run_persistence.database import RunPersistenceDatabase
 from app.service.run_persistence.analysis_result_artifact import (
     AnalysisResultArtifactStore,
@@ -391,6 +394,7 @@ class EventBus(QObject):
 
     # 输出日志
     log = pyqtSignal(str)
+    offline_import_status = pyqtSignal(object)
 
     # 状态栏文本
     status = pyqtSignal(str)
@@ -416,6 +420,9 @@ class EventBus(QObject):
     config_changed = pyqtSignal()
     plc_changed = pyqtSignal()
     plc_workorder_changed = pyqtSignal(dict)
+    plc_torque_changed = pyqtSignal(object)
+    plc_torque_config_saved = pyqtSignal(object)
+    plc_torque_config_applied = pyqtSignal(object)
     ai_toolchains_changed = pyqtSignal()
 
     # ── Analysis kernel real-time signals ──
@@ -530,6 +537,10 @@ class ServiceContainer:
         self.db = DbConnectionService()
         try:
             self.db.connect()
+            self.torque_store = TorqueStore(PlcTable._meta.database)
+            self.torque_jobs = TorqueJobs(self.torque_store)
+            self.torque_config_coordinator = TorqueConfigCoordinator(
+                self.torque_store, self.torque_jobs, self.bus, self.plc_services)
         except Exception as exc:
             self._fail_startup(f"application configuration database: {exc}")
             return
@@ -584,6 +595,7 @@ class ServiceContainer:
         # 配置服务
         self.config_service = ConfigService(self.bus)
         self.audio_data_service = AudioDataService()
+        self._initialize_offline_import()
 
         # 把 plc工艺表里的读取方法，挂到 services 上
         self.get_process_param_values = None
@@ -704,6 +716,69 @@ class ServiceContainer:
     @property
     def production_composition_state(self) -> str:
         return self._production_composition_state
+
+    def _initialize_offline_import(self) -> None:
+        from app.service.offline_audio_import.service import OfflineAudioImportService, ImportShutdownOwner
+        from app.service.offline_audio_import.snapshot import SnapshotPreparer
+        from app.service.offline_audio_import.runtime import OfflineImportRuntime
+
+        def calibration(config):
+            hardware_id = config.get("input_hardware_device_id")
+            if hardware_id is None:
+                return {}
+            hardware = self.hss_service.get_input_hardware(int(hardware_id))
+            return (hardware or {}).get("mic_cal", {})
+
+        preparer = SnapshotPreparer(
+            config_service=self.config_service,
+            calibration_loader=calibration,
+            toolchain_loader=lambda config_id: self.ai_service.freeze_bound_toolchain(config_id),
+            golden_root=lambda: self.config_service.golden_sample_service.managed_root(),
+        )
+
+        self.offline_audio_import_service = OfflineAudioImportService(
+            freeze=preparer.freeze, prepare=preparer.prepare,
+            runtime_factory=lambda busy: OfflineImportRuntime(
+                database=self.run_persistence_database,
+                artifact_store=self.analysis_result_artifact_store,
+                output_directory=self.run_persistence_database.path.parent / "run_audio",
+                production_busy=busy,
+            ),
+            production_busy=lambda: self.production_busy,
+            status_sink=self.bus.offline_import_status.emit,
+        )
+        self._independent_playback = None
+        self.register_independent_shutdown_resource(ImportShutdownOwner(self.offline_audio_import_service))
+
+    @property
+    def production_busy(self) -> bool:
+        coordinator = getattr(self, "multi_run_coordinator", None)
+        if coordinator is None:
+            return False
+        snapshot = coordinator.snapshot()
+        return any((snapshot.ingress_run_ids, snapshot.accepted_active_run_ids,
+                    snapshot.analysis_attempt_ids, snapshot.result_operation_attempt_ids,
+                    snapshot.pending_publication_run_ids))
+
+    @property
+    def historical_playback(self):
+        active = getattr(self, "final_composition", None)
+        playback = getattr(active, "playback", None)
+        if playback is not None:
+            return playback
+        if self._independent_playback is None:
+            from app.service.run_persistence import RunRepository, AudioRepository, ProductionRunAudioAdapter
+            from app.service.run_scoped_playback.backend import SoundDevicePlaybackBackend
+            from app.service.run_scoped_playback.service import RunScopedPlaybackService
+            from app.service.offline_audio_import.runtime import PlaybackShutdownOwner
+            self._independent_playback = RunScopedPlaybackService(
+                run_repository=RunRepository(self.run_persistence_database),
+                audio_repository=AudioRepository(self.run_persistence_database),
+                audio_loader=ProductionRunAudioAdapter(None),
+                backend=SoundDevicePlaybackBackend(), monotonic=time.monotonic,
+            )
+            self.register_independent_shutdown_resource(PlaybackShutdownOwner(self._independent_playback))
+        return self._independent_playback
 
     @property
     def production_selection_locked(self) -> bool:
@@ -1156,8 +1231,10 @@ class ServiceContainer:
         if not self.ingress_open or dispatcher is None or not callable(start):
             return False
         captured_workorder = dict(workorder or {})
+        queued_ns = time.monotonic_ns()
 
         def start_captured() -> object:
+            worker_ns = time.monotonic_ns()
             request = self.build_captured_start_request(
                 source=source,
                 trigger_monotonic_ns=trigger_monotonic_ns,
@@ -1165,6 +1242,14 @@ class ServiceContainer:
                 plc_id=plc_id,
                 config_id=config_id,
             )
+            try:
+                self.bus.log.emit(
+                    (f"capture start run={request.run_id} plc={plc_id} config={config_id} "
+                     f"trigger_ns={trigger_monotonic_ns} queued_ns={queued_ns} "
+                     f"worker_ns={worker_ns}")[:512]
+                )
+            except Exception:
+                pass  # Diagnostic delivery must not prevent capture admission.
             return start(request)
 
         route_plc_id = next(
@@ -1285,6 +1370,7 @@ class ServiceContainer:
                     if item is not None
                 ),
                 application_config_database=getattr(self, "db", None),
+                application_config_writers=tuple(filter(None, (getattr(self, "torque_jobs", None),))),
                 shared_audio_backend=getattr(active, "shared_backend", None),
                 active_completion=active,
                 run_persistence_database=getattr(
@@ -1306,6 +1392,7 @@ class ServiceContainer:
                 if item is not None
             ),
             application_config_database=getattr(self, "db", None),
+            application_config_writers=tuple(filter(None, (getattr(self, "torque_jobs", None),))),
             prepared_composition=getattr(
                 self,
                 "prepared_production_composition",

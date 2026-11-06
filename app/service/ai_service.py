@@ -23,8 +23,15 @@ from datetime import datetime, timedelta, timezone
 
 from peewee import DoesNotExist, IntegrityError
 
+from app.service.ai_threshold import (
+    coerce_probability as _coerce_probability,
+    resolve_effective_decision_threshold as _resolve_effective_decision_threshold,
+)
 from app.service.ai_resident_runtime import ResidentToolchainRuntime
-from app.service.ai_subprocess import ai_subprocess_creation_flags
+from app.service.ai_subprocess import (
+    ai_subprocess_creation_flags,
+    ai_subprocess_environment,
+)
 from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable
 from model.ai_execution_table import AiExecutionTable
@@ -52,40 +59,6 @@ def _gen_request_id() -> str:
     ts = datetime.now(_TZ8).strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:8]
     return f"req_{ts}_{short}"
-
-
-def _coerce_probability(value) -> float | None:
-    if isinstance(value, bool):
-        return None
-    if not isinstance(value, (int, float)):
-        return None
-    probability = float(value)
-    if not math.isfinite(probability):
-        return None
-    if 0.0 <= probability <= 1.0:
-        return probability
-    return None
-
-
-def _resolve_effective_decision_threshold(
-    ai_result: dict, request_params: dict
-) -> tuple[float, str]:
-    extra = ai_result.get("extra")
-    response_threshold = None
-    if isinstance(extra, dict):
-        response_threshold = _coerce_probability(extra.get("decision_threshold"))
-    if response_threshold is not None:
-        return response_threshold, "response_extra"
-
-    request_threshold = None
-    if isinstance(request_params, dict):
-        request_threshold = _coerce_probability(
-            request_params.get("decision_threshold")
-        )
-    if request_threshold is not None:
-        return request_threshold, "request_params"
-
-    return 0.5, "default"
 
 
 class AiService:
@@ -201,6 +174,7 @@ class AiService:
             raise ValueError("params_json must be valid JSON") from exc
         if not isinstance(parsed, dict):
             raise ValueError("params_json must be a JSON object")
+        _resolve_effective_decision_threshold({}, parsed)
         return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
 
     def _normalize_toolchain_payload(
@@ -693,6 +667,7 @@ class AiService:
                 timeout=timeout_ms / 1000.0,
                 cwd=package_dir or None,
                 creationflags=ai_subprocess_creation_flags(),
+                env=ai_subprocess_environment(),
             )
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             finished_at = _now_iso()

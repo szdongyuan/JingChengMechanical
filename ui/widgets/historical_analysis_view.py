@@ -48,9 +48,19 @@ _PANELS = {
 }
 
 
+def _display_config(snapshot):
+    if snapshot.run.ingress_kind == "IMPORTED":
+        return (snapshot.review or {}).get("config_payload") or snapshot.config
+    return snapshot.config
+
+
 def _review(snapshot):
     names = {field.name for field in fields(FactoryReviewPayload)}
     values = {key: deepcopy(value) for key, value in (snapshot.review or {}).items() if key in names}
+    if snapshot.run.ingress_kind == "IMPORTED":
+        metadata = (snapshot.review or {}).get("review", {}).get("import", {})
+        if "display_channel_labels" in metadata:
+            values["display_channel_labels"] = deepcopy(metadata["display_channel_labels"])
     for key in ("default_window", "fallback_window"):
         window = values.get(key)
         if isinstance(window, dict):
@@ -60,7 +70,7 @@ def _review(snapshot):
             values[key] = {int(channel): value for channel, value in values[key].items()
                            if str(channel).lstrip("-").isdigit()}
     values.update(displayed_config_id=snapshot.run.config_id, run_id=snapshot.run.run_id,
-                  trigger_source=snapshot.run.trigger_source, config_payload=deepcopy(snapshot.config),
+                  trigger_source=snapshot.run.trigger_source, config_payload=deepcopy(_display_config(snapshot)),
                   manual_reanalysis_allowed=False)
     return FactoryReviewPayload(**values)
 
@@ -68,7 +78,7 @@ def _review(snapshot):
 class HistoricalAnalysisView(QWidget):
     def __init__(self, snapshot, parent=None):
         super().__init__(parent)
-        config = snapshot.config
+        config = _display_config(snapshot)
         channels = []
         for value in config.get("selected_channels", []):
             try:
@@ -76,6 +86,12 @@ class HistoricalAnalysisView(QWidget):
                     channels.append(int(value))
             except (TypeError, ValueError):
                 continue
+        if snapshot.run.ingress_kind == "IMPORTED":
+            # File-column ordering may put chart-only channels first. Preserve
+            # the saved configuration's mapped channel priority for dashboards.
+            mapped = [channel for channel in snapshot.config.get("selected_channels", [])
+                      if type(channel) is int and channel in channels]
+            channels = list(dict.fromkeys(mapped + channels))
         vibration = config.get("vibration_view_channel_index")
         if type(vibration) is not int or vibration not in channels:
             vibration = None
@@ -120,10 +136,16 @@ class HistoricalAnalysisView(QWidget):
             card.set_compact_dashboard_mode(True)
             card.setMinimumHeight(230)
             if isinstance(panel, StftModule):
-                def score(text, target=card):
-                    target.set_title_metric("频谱最低得分：", str(text).replace(":", "：").split("：")[-1].strip() or "--")
+                def score(text, target=card, source=panel):
+                    if source.current_score_visible():
+                        target.set_title_metric("频谱最低得分：", str(text).replace(":", "：").split("：")[-1].strip() or "--")
+                    else:
+                        target.set_title_metric("", "")
                 score(panel.current_score_title())
                 panel.score_title_changed.connect(score)
+                panel.score_visibility_changed.connect(
+                    lambda _visible, source=panel, update=score: update(source.current_score_title())
+                )
             grid.addWidget(card, spec["row"], spec["column"], spec["row_span"], spec["column_span"])
             self.panel_widgets[spec["id"]] = panel
             self.cards[spec["id"]] = card

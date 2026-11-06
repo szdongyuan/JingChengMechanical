@@ -229,6 +229,62 @@ class Playback:
             self.owner = None
 
 
+def test_import_uses_persisted_display_config_and_provenance(qtbot):
+    value = snapshot()
+    display = dict(value.config, selected_channels=[2], channels=[{'channel_index': 2}])
+    payload = dict(value.review, config_payload=display, chart_payload={'2': value.review['chart_payload']['7']},
+        review={'import': {'display_channel_labels': {'2': 'WAV 通道 1（仅图表）'}, 'current_available': False}})
+    value = replace(value, run=replace(value.run, ingress_kind='IMPORTED', trigger_source='IMPORT'), review=payload)
+    widget, _ = dialog(qtbot, value)
+    review = widget.result_view.display_services.factory_mode.review_payload
+    assert review.config_payload['selected_channels'] == [2]
+    assert review.display_channel_labels == {2: 'WAV 通道 1（仅图表）'}
+    assert widget.result_view.panel_widgets['saved_spl'].current_render_channel() == 2
+    assert '导入' in widget.metadata_label.text()
+    assert '无电流数据' in widget.metadata_label.text()
+
+
+def test_import_keeps_explicit_layout_and_original_selected_channel_meaning(qtbot):
+    value = snapshot()
+    display = dict(value.config, selected_channels=[8, 7],
+        channels=[{'channel_index': 8}, {'channel_index': 7}])
+    payload = dict(value.review, config_payload=display,
+        chart_payload={'7': value.review['chart_payload']['7'], '8': value.review['chart_payload']['7']})
+    value = replace(value, run=replace(value.run, ingress_kind='IMPORTED'), review=payload)
+    widget, _ = dialog(qtbot, value)
+    assert widget.result_view.dashboard_layout == display['result_dashboard_layout']
+    assert widget.result_view.panel_widgets['saved_spl'].current_render_channel() == 7
+    assert widget.result_view.result_module._metric_selected_channel_index == 7
+
+
+def test_automatic_enrichment_preserves_active_replay_and_choices(qtbot, audio_snapshot):
+    playback = Playback()
+    widget, reader = dialog(qtbot, audio_snapshot, playback=playback)
+    panel = widget.replay_panel
+    panel.channel_combo.setCurrentIndex(1)
+    panel.gain_spin.setValue(-7.0)
+    panel.play_button.click()
+    qtbot.waitUntil(lambda: bool(playback.requests))
+    reader.value = replace(audio_snapshot, charts_message='enriched')
+    widget.refresh_enrichment()
+    qtbot.waitUntil(lambda: widget.snapshot.charts_message == 'enriched')
+    assert widget.replay_panel is panel
+    assert panel.channel_combo.currentIndex() == 1
+    assert panel.gain_spin.value() == -7.0
+    assert playback.stops == []
+
+
+def test_historical_playback_available_without_production_composition(qtbot, audio_snapshot):
+    playback = Playback()
+    services = SimpleNamespace(historical_analysis_reader=Reader(audio_snapshot), historical_playback=playback)
+    widget = HistoricalAnalysisDialog(run_id=audio_snapshot.run.run_id, services=services)
+    qtbot.addWidget(widget)
+    qtbot.waitUntil(lambda: widget.replay_panel is not None and widget.replay_panel.play_button.isEnabled())
+    widget.replay_panel.play_button.click()
+    qtbot.waitUntil(lambda: bool(playback.requests))
+    assert playback.requests[0].run_id == audio_snapshot.run.run_id
+
+
 def ready(qtbot, widget):
     qtbot.waitUntil(lambda: widget.replay_panel is not None and widget.replay_panel.play_button.isEnabled())
     return widget.replay_panel

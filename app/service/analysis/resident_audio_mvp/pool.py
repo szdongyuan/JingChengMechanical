@@ -767,6 +767,11 @@ class ResidentAudioPool:
                         observed_sequence,
                         remaining_s,
                     )
+                # The native producer can progress while both Python queues
+                # are backlogged. Drain delivery is not producer liveness.
+                continuity_proven = continuity_proven or slot.native_producer_is_live(
+                    self._monotonic_ns(), HEARTBEAT_FRESH_NS,
+                )
                 with self._lock:
                     fault, _ = slot.fault_details_under_decision_lock()
                     if (

@@ -14,16 +14,11 @@ from PyQt6.QtCore import QPoint, Qt
 from PyQt6.QtTest import QTest
 from PyQt6.QtWidgets import (
     QApplication,
-    QDialog,
     QScrollArea,
     QTableWidget,
     QWidget,
 )
 
-from app.service.analysis.imported_audio import (
-    ImportedAudioAnalysisRequest,
-    ImportedChannelAssignment,
-)
 from app.service.multi_run_coordinator_mvp import OperationResult, OperationStatus
 from app.service.result_history import (
     FrozenConfigSummary,
@@ -136,7 +131,6 @@ class _FactoryModeStub:
         self.state = initial_state or FactoryControllerState()
         self.start_manual = MagicMock(return_value=True)
         self.stop_active_run = MagicMock(return_value=True)
-        self.analyze_imported_audio = MagicMock(return_value=True)
         self.apply_manual_judgment = MagicMock(
             return_value=SimpleNamespace(success=True, message="")
         )
@@ -302,27 +296,6 @@ def _make_shared_modules(
     return WorkOrderModule(services), ControlModule(services), services
 
 
-def _import_request() -> ImportedAudioAnalysisRequest:
-    return ImportedAudioAnalysisRequest(
-        config_id=101,
-        wav_path="import.wav",
-        assignments=(ImportedChannelAssignment(0, "config", 0),),
-    )
-
-
-class _FakeDialogReturningRequest:
-    def __init__(self, *, configs, default_config_id, parent=None):
-        self.configs = configs
-        self.default_config_id = default_config_id
-        self.parent = parent
-
-    def exec(self):
-        return int(QDialog.DialogCode.Accepted)
-
-    def current_request(self):
-        return _import_request()
-
-
 def _make_module_with_message_box_spy(
     monkeypatch,
     *,
@@ -347,7 +320,7 @@ def test_control_panel_renders_three_button_rows_with_updated_spacing_and_button
     assert module.btn_stop.text() == "停止测试"
     assert module.btn_pass.minimumHeight() == 36
     assert module.btn_fail.minimumHeight() == 36
-    assert module.btn_import_audio.minimumHeight() == 36
+    assert module.btn_restart.minimumHeight() == 36
 
 
 def test_manual_actions_are_one_shared_widget_outside_left_control_layout(qapp):
@@ -363,7 +336,7 @@ def test_manual_actions_are_one_shared_widget_outside_left_control_layout(qapp):
     assert all(actions.isAncestorOf(button) for button in module.manual_fault_buttons)
     assert module.btn_start.parentWidget() is module
     assert module.btn_stop.parentWidget() is module
-    assert module.btn_import_audio.parentWidget() is module
+    assert module.btn_restart.parentWidget() is module
 
 
 def test_real_five_fault_ng_submission_keeps_history_geometry_and_focus(qapp):
@@ -547,10 +520,17 @@ def test_unchanged_manual_target_setter_is_a_complete_no_op(qapp, monkeypatch):
     assert sync_calls == []
 
 
-def test_control_module_has_import_audio_button(qapp):
+def test_control_import_entry_and_route_are_removed(qapp):
     module, _ = _make_module()
 
-    assert module.btn_import_audio.text() == "导入音频分析"
+    assert not hasattr(module, "btn_import_audio")
+    assert not hasattr(module, "_import_audio")
+    from app.service.factory_mode_controller import FactoryModeController
+    assert not hasattr(FactoryModeController, "analyze_imported_audio")
+    row = module.layout().itemAt(1).layout()
+    assert row.itemAt(0).spacerItem() is not None
+    assert row.itemAt(1).widget() is module.btn_restart
+    assert row.stretch(0) == row.stretch(1) == 1
 
 
 def test_restart_control_is_always_available_and_emits_only_one_pending_intent(qapp):
@@ -607,177 +587,6 @@ def test_stop_button_exposes_one_intent_without_legacy_write(qapp, run_phase):
     services.factory_mode.stop_active_run.assert_not_called()
 
 
-@pytest.mark.parametrize("run_phase", ["running", "analyzing", "reanalyzing"])
-def test_import_audio_button_is_disabled_for_busy_run_phases(qapp, run_phase):
-    module, _ = _make_module(
-        initial_state=FactoryControllerState(
-            selected_config_ids=(101,),
-            run_phase=run_phase,
-        )
-    )
-
-    assert module.btn_import_audio.isEnabled() is False
-
-
-@pytest.mark.parametrize("busy_reason", ["当前测试运行中", "启动请求处理中"])
-def test_import_audio_button_is_disabled_for_controller_busy_start_reasons(
-    qapp,
-    monkeypatch,
-    busy_reason,
-):
-    module, services = _make_module(
-        initial_state=FactoryControllerState(
-            selected_config_ids=(101,),
-            run_phase="armed",
-            selection_ready=True,
-            start_ready=False,
-            start_ready_reason=busy_reason,
-        )
-    )
-    dialog_created = []
-    warnings = []
-
-    class FakeDialog:
-        def __init__(self, *args, **kwargs):
-            dialog_created.append((args, kwargs))
-
-    monkeypatch.setattr("ui.modules.control.ImportAudioAnalysisDialog", FakeDialog)
-    monkeypatch.setattr(
-        "ui.modules.control.QMessageBox.warning",
-        lambda parent, title, text: warnings.append((title, text)),
-    )
-
-    assert module.btn_import_audio.isEnabled() is False
-
-    module.btn_import_audio.click()
-
-    assert dialog_created == []
-    assert warnings == []
-    services.factory_mode.analyze_imported_audio.assert_not_called()
-
-
-def test_import_audio_requires_selected_config(qapp, monkeypatch):
-    module, services = _make_module(
-        initial_state=FactoryControllerState(selected_config_ids=())
-    )
-    warnings = []
-    monkeypatch.setattr(
-        "ui.modules.control.QMessageBox.warning",
-        lambda parent, title, text: warnings.append((title, text)),
-    )
-
-    module.btn_import_audio.click()
-
-    services.factory_mode.analyze_imported_audio.assert_not_called()
-    assert warnings == [("导入音频分析", "请先启用一个配置")]
-
-
-def test_import_audio_no_selection_prompt_still_works_when_not_busy(
-    qapp,
-    monkeypatch,
-):
-    module, services = _make_module(
-        initial_state=FactoryControllerState(selected_config_ids=())
-    )
-    warnings = []
-    monkeypatch.setattr(
-        "ui.modules.control.QMessageBox.warning",
-        lambda parent, title, text: warnings.append((title, text)),
-    )
-
-    assert module.btn_import_audio.isEnabled() is True
-
-    module.btn_import_audio.click()
-
-    services.factory_mode.analyze_imported_audio.assert_not_called()
-    assert warnings == [("导入音频分析", "请先启用一个配置")]
-
-
-def test_import_audio_config_load_failure_shows_warning(qapp, monkeypatch):
-    module, services = _make_module(
-        initial_state=FactoryControllerState(selected_config_ids=(101,))
-    )
-    services.config_service.load_config = MagicMock(side_effect=RuntimeError("missing"))
-    dialog_created = []
-    warnings = []
-
-    class FakeDialog:
-        def __init__(self, *args, **kwargs):
-            dialog_created.append((args, kwargs))
-
-    monkeypatch.setattr("ui.modules.control.ImportAudioAnalysisDialog", FakeDialog)
-    monkeypatch.setattr(
-        "ui.modules.control.QMessageBox.warning",
-        lambda parent, title, text: warnings.append((title, text)),
-    )
-
-    module.btn_import_audio.click()
-
-    assert dialog_created == []
-    services.factory_mode.analyze_imported_audio.assert_not_called()
-    assert warnings == [("导入音频分析", "配置加载失败，无法导入音频分析")]
-
-
-def test_import_audio_with_multiple_configs_requires_dialog_choice(qapp, monkeypatch):
-    module, services = _make_module(
-        initial_state=FactoryControllerState(selected_config_ids=(101, 202))
-    )
-    created = {}
-
-    class FakeDialog:
-        def __init__(self, *, configs, default_config_id, parent=None):
-            created["configs"] = configs
-            created["default_config_id"] = default_config_id
-            created["parent"] = parent
-
-        def exec(self):
-            return int(QDialog.DialogCode.Rejected)
-
-    monkeypatch.setattr("ui.modules.control.ImportAudioAnalysisDialog", FakeDialog)
-
-    module.btn_import_audio.click()
-
-    assert [cfg["config_id"] for cfg in created["configs"]] == [101, 202]
-    assert created["default_config_id"] is None
-    assert created["parent"] is module
-
-
-def test_import_audio_dialog_success_calls_controller(qapp, monkeypatch):
-    module, services = _make_module(
-        initial_state=FactoryControllerState(selected_config_ids=(101,))
-    )
-    monkeypatch.setattr(
-        "ui.modules.control.ImportAudioAnalysisDialog",
-        _FakeDialogReturningRequest,
-    )
-
-    module.btn_import_audio.click()
-
-    services.factory_mode.analyze_imported_audio.assert_called_once_with(
-        _import_request()
-    )
-
-
-def test_import_audio_dialog_controller_rejection_shows_warning(qapp, monkeypatch):
-    module, services = _make_module(
-        initial_state=FactoryControllerState(selected_config_ids=(101,))
-    )
-    services.factory_mode.analyze_imported_audio.return_value = False
-    warnings = []
-    monkeypatch.setattr(
-        "ui.modules.control.ImportAudioAnalysisDialog",
-        _FakeDialogReturningRequest,
-    )
-    monkeypatch.setattr(
-        "ui.modules.control.QMessageBox.warning",
-        lambda parent, title, text: warnings.append((title, text)),
-    )
-
-    module.btn_import_audio.click()
-
-    assert warnings == [("导入音频分析", "导入音频分析失败，请查看结果区域或日志")]
-
-
 def test_manual_fault_button_click_submits_typed_request_and_manual_ng_retries(qapp):
     module, services = _make_module()
     run_id = "00000000-0000-4000-8000-000000000001"
@@ -815,7 +624,6 @@ def test_manual_fault_button_click_submits_typed_request_and_manual_ng_retries(q
     services.factory_mode.apply_manual_judgment.assert_not_called()
     services.factory_mode.start_manual.assert_not_called()
     services.factory_mode.stop_active_run.assert_not_called()
-    services.factory_mode.analyze_imported_audio.assert_not_called()
     assert services.bus.log.emissions == []
 
     module.manual_fault_buttons[1].click()
@@ -1207,7 +1015,7 @@ def test_configuration_restart_required_disables_start_and_import(qapp):
     )
 
     assert module.btn_start.isEnabled() is False
-    assert module.btn_import_audio.isEnabled() is False
+    assert not hasattr(module, "btn_import_audio")
 
 
 def test_production_unavailable_reason_is_shown_once_and_disables_only_ingress(
@@ -1231,7 +1039,7 @@ def test_production_unavailable_reason_is_shown_once_and_disables_only_ingress(
     )
 
     assert module.btn_start.isEnabled() is False
-    assert module.btn_import_audio.isEnabled() is False
+    assert not hasattr(module, "btn_import_audio")
     assert module.btn_stop.isEnabled() is False
     assert module.btn_restart.isEnabled() is True
     assert module.lbl_production_unavailable_reason.text() == reason

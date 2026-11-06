@@ -11,6 +11,8 @@ from typing import Iterator
 
 from peewee import SqliteDatabase
 
+from app.service.run_persistence.audio_format_migration import migrate_known_v2
+
 from app.service.run_persistence.contracts import (
     TransactionResult,
     TransactionState,
@@ -100,6 +102,7 @@ class RunPersistenceDatabase:
             try:
                 database = _open_existing_database(self._path)
                 database.execute_sql("PRAGMA foreign_keys = ON")
+                migrate_known_v2(database, self._path)
                 validation = validate_run_persistence_schema(database)
             except Exception as exc:
                 self.close_startup_failed()

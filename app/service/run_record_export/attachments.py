@@ -7,7 +7,10 @@ from contextlib import ExitStack
 from io import BytesIO
 import math
 from pathlib import Path
+import struct
 import wave
+
+from app.service.audio_wav import probe_wav
 
 _AUDIO_FRAME_CHUNK = 4096
 
@@ -154,6 +157,91 @@ def write_pcm16_wav_channels(
                 raise ValueError("source WAV contains undeclared frames")
     except (EOFError, wave.Error, OSError) as exc:
         raise ValueError(f"invalid source WAV: {exc}") from None
+
+
+def write_wav_channels(
+    source_wav_path: str,
+    *,
+    output_paths: tuple[Path, ...],
+    sample_rate_hz: int,
+    channel_count: int,
+    frame_count: int,
+    cancel_check: Callable[[], None] | None = None,
+) -> None:
+    """Stream original sample bytes into mono WAVs, preserving format/valid bits.
+
+    Shared probing owns format validation. The RIFF walk below only locates
+    the original format and data chunks; it never converts sample values.
+    """
+    _check(cancel_check)
+    metadata = probe_wav(source_wav_path)
+    if (metadata.sample_rate_hz, metadata.channel_count, metadata.frame_count) != (
+        sample_rate_hz, channel_count, frame_count
+    ):
+        raise ValueError("source WAV sampling facts do not match")
+    if type(output_paths) is not tuple or len(output_paths) != channel_count:
+        raise ValueError("audio output path count does not match channel count")
+    paths = tuple(Path(path) for path in output_paths)
+    if len(set(paths)) != len(paths):
+        raise ValueError("audio output paths must be unique")
+    with open(metadata.path, 'rb') as source:
+        riff_end = 8 + struct.unpack_from('<I', source.read(12), 4)[0]
+        fmt = None
+        data_offset = None
+        while source.tell() + 8 <= riff_end:
+            _check(cancel_check)
+            name, size = struct.unpack('<4sI', source.read(8))
+            start = source.tell()
+            if name == b'fmt ':
+                fmt = bytearray(source.read(min(size, 65553)))
+            elif name == b'data':
+                data_offset = start
+            source.seek(start + size + size % 2)
+        if fmt is None or data_offset is None:
+            raise ValueError("source WAV requires fmt and data chunks")
+        tag = struct.unpack_from('<H', fmt)[0]
+        if tag == 1 and metadata.bits_per_sample == 16:
+            # Preserve the existing captured PCM16 writer and cancellation path.
+            return write_pcm16_wav_channels(source_wav_path, output_paths=paths,
+                sample_rate_hz=sample_rate_hz, channel_count=channel_count,
+                frame_count=frame_count, cancel_check=cancel_check)
+        width = metadata.sample_width_bytes
+        struct.pack_into('<H', fmt, 2, 1)
+        struct.pack_into('<I', fmt, 8, sample_rate_hz * width)
+        struct.pack_into('<H', fmt, 12, width)
+        if tag == 65534:
+            struct.pack_into('<I', fmt, 20, 0)  # Mono column has no speaker assignment.
+        fmt_chunk = b'fmt ' + struct.pack('<I', len(fmt)) + fmt + b'\0' * (len(fmt) % 2)
+        fact_chunk = (b'fact' + struct.pack('<II', 4, frame_count)
+            if metadata.container_format == 'WAV_IEEE_FLOAT' else b'')
+        data_size = frame_count * width
+        header = (b'RIFF' + struct.pack('<I', 4 + len(fmt_chunk) + len(fact_chunk) + 8 + data_size + data_size % 2)
+            + b'WAVE' + fmt_chunk + fact_chunk + b'data' + struct.pack('<I', data_size))
+        with ExitStack() as stack:
+            writers = tuple(stack.enter_context(path.open('wb')) for path in paths)
+            for writer in writers:
+                writer.write(header)
+            source.seek(data_offset)
+            remaining = frame_count
+            frame_width = channel_count * width
+            while remaining:
+                count = min(_AUDIO_FRAME_CHUNK, remaining)
+                _check(cancel_check)
+                payload = source.read(count * frame_width)
+                _check(cancel_check)
+                if len(payload) != count * frame_width:
+                    raise ValueError("source WAV sample payload is truncated")
+                for channel, writer in enumerate(writers):
+                    mono = bytearray(count * width)
+                    for frame in range(count):
+                        start = frame * frame_width + channel * width
+                        mono[frame * width:(frame + 1) * width] = payload[start:start + width]
+                    writer.write(mono)
+                    _check(cancel_check)
+                remaining -= count
+            if data_size % 2:
+                for writer in writers:
+                    writer.write(b'\0')
 
 
 def serialize_current_csv(samples: tuple[tuple[float, float], ...]) -> bytes:

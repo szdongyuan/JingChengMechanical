@@ -61,6 +61,10 @@ class _DrainOwner:
         stop_event = threading.Event()
 
         def drain() -> None:
+            from app.service.analysis.thread_priority import (
+                THREAD_PRIORITY_ABOVE_NORMAL, set_current_thread_priority,
+            )
+            set_current_thread_priority(THREAD_PRIORITY_ABOVE_NORMAL)
             while True:
                 control_event.wait()
                 control_event.clear()
@@ -188,6 +192,12 @@ class _ResidentStreamSlot:
         def on_fault(fault: BackendFault) -> None:
             self._on_fault_for_generation(generation, fault)
 
+        # Only buffered native pumps consult readiness. Ordinary callbacks
+        # continue to exercise try_push's explicit overflow fault contract.
+        callback.native_ready = lambda: (
+            generation is not self._generation or not self._accepting
+            or self._ingress.can_accept
+        )
         return callback, on_fault
 
     def publish_drain_owner(
@@ -440,7 +450,26 @@ class _ResidentStreamSlot:
 
     @property
     def callback_heartbeat_monotonic_ns(self) -> int | None:
+        stats = self.native_producer_snapshot()
+        if stats is not None:
+            return (int(stats.heartbeat_ns) if stats.sequence and not stats.error
+                    and stats.armed and not stats.stop_requested else None)
         return self._ingress.heartbeat_monotonic_ns
+
+    def native_producer_snapshot(self):
+        snapshot = getattr(self._handle, 'native_producer_snapshot', None)
+        return snapshot() if snapshot is not None else None
+
+    @property
+    def native_producer_sequence(self) -> int | None:
+        stats = self.native_producer_snapshot()
+        return None if stats is None else int(stats.sequence)
+
+    def native_producer_is_live(self, now_ns: int, max_age_ns: int) -> bool:
+        stats = self.native_producer_snapshot()
+        return bool(stats is not None and stats.sequence and not stats.error
+                    and stats.armed and not stats.stop_requested
+                    and now_ns - stats.heartbeat_ns <= max_age_ns)
 
     def wait_for_callback_after(
         self,

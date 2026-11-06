@@ -1,4 +1,4 @@
-"""Close, verify, and atomically publish one completed WAV/PCM file."""
+"""Close, verify, and atomically publish one completed uncompressed WAV."""
 
 from __future__ import annotations
 
@@ -10,7 +10,8 @@ import shutil
 import stat
 from typing import BinaryIO, Callable
 from uuid import uuid4
-import wave
+
+from app.service.audio_wav import probe_wav
 
 from app.service.run_persistence.contracts import (
     ContractValidationError,
@@ -58,52 +59,41 @@ def verify_wav_pcm(
     expected_sample_width_bytes: int,
     expected_frame_count: int | None = None,
 ) -> PublishedAudioMetadata:
-    """Reopen a closed WAV and deterministically verify its declared PCM payload."""
+    """Keep the PCM-only verification contract for legacy capture callers."""
+    metadata = verify_wav(
+        path, expected_sample_rate_hz, expected_channel_count,
+        expected_sample_width_bytes, expected_frame_count,
+    )
+    if metadata.container_format != "WAV_PCM":
+        raise ValueError("WAV sample format is not PCM")
+    return metadata
 
-    verified_path = Path(path).resolve(strict=False)
-    try:
-        with wave.open(str(verified_path), "rb") as reader:
-            if reader.getcomptype() != "NONE":
-                raise ValueError("WAV compression is not PCM")
-            if reader.getframerate() != expected_sample_rate_hz:
-                raise ValueError("WAV sample rate does not match")
-            if reader.getnchannels() != expected_channel_count:
-                raise ValueError("WAV channel count does not match")
-            if reader.getsampwidth() != expected_sample_width_bytes:
-                raise ValueError("WAV sample width does not match")
-            frame_count = reader.getnframes()
-            if frame_count <= 0:
-                raise ValueError("WAV contains no frames")
-            if (
-                expected_frame_count is not None
-                and frame_count != expected_frame_count
-            ):
-                raise ValueError("WAV frame count does not match")
-            expected_payload = (
-                frame_count * expected_channel_count * expected_sample_width_bytes
-            )
-            payload = reader.readframes(frame_count)
-            if len(payload) != expected_payload:
-                raise ValueError("WAV PCM payload is truncated")
-            if reader.readframes(1) != b"":
-                raise ValueError("WAV contains frames beyond its declared count")
-    except (EOFError, wave.Error, OSError) as exc:
-        raise ValueError(f"invalid or incomplete WAV: {exc}") from None
 
-    byte_size = verified_path.stat().st_size
-    duration_ms = (
-        frame_count * 1000 + expected_sample_rate_hz - 1
-    ) // expected_sample_rate_hz
-    if byte_size <= 0 or duration_ms <= 0:
-        raise ValueError("WAV metadata must be positive")
+def verify_wav(
+    path: str | Path,
+    expected_sample_rate_hz: int,
+    expected_channel_count: int,
+    expected_sample_width_bytes: int,
+    expected_frame_count: int | None = None,
+) -> PublishedAudioMetadata:
+    """Verify shared header facts and the complete declared payload, without encoding."""
+    wav = probe_wav(path)
+    for name, actual, expected in (
+        ("sample rate", wav.sample_rate_hz, expected_sample_rate_hz),
+        ("channel count", wav.channel_count, expected_channel_count),
+        ("sample width", wav.sample_width_bytes, expected_sample_width_bytes),
+        ("frame count", wav.frame_count, expected_frame_count),
+    ):
+        if expected is not None and actual != expected:
+            raise ValueError(f"WAV {name} does not match")
     return PublishedAudioMetadata(
-        final_path=str(verified_path),
-        container_format="WAV_PCM",
-        sample_rate_hz=expected_sample_rate_hz,
-        channel_count=expected_channel_count,
-        frame_count=frame_count,
-        duration_ms=duration_ms,
-        byte_size=byte_size,
+        final_path=wav.path,
+        container_format=wav.container_format,
+        sample_rate_hz=wav.sample_rate_hz,
+        channel_count=wav.channel_count,
+        frame_count=wav.frame_count,
+        duration_ms=(wav.frame_count * 1000 + wav.sample_rate_hz - 1) // wav.sample_rate_hz,
+        byte_size=wav.byte_size,
     )
 
 
@@ -132,7 +122,7 @@ class AudioPublication:
         width: int,
         frames: int | None,
     ) -> PublishedAudioMetadata:
-        return verify_wav_pcm(path, rate, channels, width, frames)
+        return verify_wav(path, rate, channels, width, frames)
 
     def _finalize(self, temporary: Path, final: Path) -> None:
         # Hard-link creation is atomic, same-filesystem, and fails if final exists.

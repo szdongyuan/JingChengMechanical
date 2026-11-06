@@ -199,6 +199,47 @@ def _select_all_rows(module: DataManagementModule) -> None:
         module.table.item(row_index, 0).setCheckState(Qt.CheckState.Checked)
 
 
+def test_import_notification_preserves_applied_query_and_selection(qapp, monkeypatch):
+    from app.service.offline_audio_import import ImportPhase, ImportStatus
+    module, management, _ = _module(qapp)
+    module.edit_sn.setText('applied')
+    module.btn_search.click()
+    query = module._applied_query
+    module._selected_run_id_set.add(RUN_A)
+    module.edit_sn.setText('unfinished edit')
+    opened = []
+    monkeypatch.setattr(module, '_show_analysis', opened.append)
+    module._on_import_status(ImportStatus(RUN_A, 1, ImportPhase.COMPLETING_CHARTS, result_ready=True))
+    assert module._applied_query == query
+    assert RUN_A in module._selected_run_id_set
+    assert opened == [RUN_A]
+
+
+def test_import_entry_lists_all_saved_configs_with_no_production_selection(qapp, qtbot):
+    module, _, _ = _module(qapp)
+    qtbot.addWidget(module)
+    module.services.offline_audio_import_service = SimpleNamespace(status=None)
+    module.services.config_service = SimpleNamespace(
+        list_configs=lambda: [{'config_id': 101}, {'config_id': 202}],
+        load_config=lambda config_id: {'config_id': config_id, 'selected_channels': [0], 'analysis_duration': 1.})
+    module.btn_import_audio.setEnabled(True)
+    module.btn_import_audio.click()
+    dialog = module._import_dialog
+    assert dialog._config_selector.currentData() is None
+    assert [dialog._config_selector.itemData(i) for i in range(1, 3)] == [101, 202]
+    dialog.close()
+
+
+def test_first_persisted_result_refreshes_an_already_open_history(qapp, monkeypatch):
+    from app.service.offline_audio_import import ImportPhase, ImportStatus
+    module, _, _ = _module(qapp)
+    history = SimpleNamespace(refresh_enrichment=MagicMock())
+    module._analysis_dialogs[RUN_A] = history
+    monkeypatch.setattr(module, '_show_analysis', lambda run_id: None)
+    module._on_import_status(ImportStatus(RUN_A, 1, ImportPhase.COMPLETING_CHARTS, result_ready=True))
+    history.refresh_enrichment.assert_called_once_with()
+
+
 def _analysis_button(module, row=0):
     buttons = module.table.findChildren(QPushButton)
     assert any(button.text() == "查看分析结果" for button in buttons)
