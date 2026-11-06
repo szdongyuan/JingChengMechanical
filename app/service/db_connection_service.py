@@ -1,18 +1,22 @@
 from __future__ import annotations
 
-from consts.time_consts import now_str
-from model.ai_execution_table import AiExecutionTable
-from model.ai_toolchain_table import AiToolchainTable
-from model.audio_data_table import AudioDataTable
-from model.base_mode import db
-from model.channel_config_table import ChannelConfigTable
-from model.device_table import DeviceTable
-from model.plc_table import PlcTable
-from model.system_info_table import SystemInfoTable
-from model.test_config_ai_binding_table import TestConfigAiBindingTable
-from model.test_config_table import TestConfigTable
-from model.training_model_table import TrainingModelTable
-from model.users_table import UsersTable
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+from peewee import OperationalError
+
+from model.base_mode import DB_PATH, db
+from app.service.torque.migration import (
+    TorqueSchemaError,
+    apply_torque_migration,
+    needs_torque_migration,
+    validate_torque_schema,
+)
+
+
+class DatabaseStartupError(RuntimeError):
+    """Raised when the prepared startup database is missing or incomplete."""
 
 
 class DbConnectionService:
@@ -25,410 +29,433 @@ class DbConnectionService:
     - 业务代码/CRUD 不需要每次手动 connect/close
     """
 
-    BOOTSTRAP_MODELS = (
-        TestConfigTable,
-        ChannelConfigTable,
-        AiToolchainTable,
-        TestConfigAiBindingTable,
-        AiExecutionTable,
-        DeviceTable,
-        AudioDataTable,
-        UsersTable,
-        SystemInfoTable,
-        TrainingModelTable,
-        PlcTable,
+    REQUIRED_RUNTIME_TABLES = frozenset(
+        {
+            "test_config_table",
+            "channel_config_table",
+            "ai_toolchain_table",
+            "test_config_ai_binding_table",
+            "ai_execution_table",
+            "device_table",
+            "managed_audio_input_table",
+            "audio_data_table",
+            "users_table",
+            "system_info_table",
+            "training_model_table",
+            "plc_table",
+            "plc_field_offset_table",
+            "historical_metric_cache_table",
+        }
     )
+    _REQUIRED_CHANNEL_CONFIG_COLUMNS = frozenset(
+        {
+            "fft_weighting",
+            "fft_x_axis_scale",
+            "stft_color_scale_enabled",
+            "stft_color_scale_min_db",
+            "stft_color_scale_max_db",
+            "stft_score_enabled",
+            "stft_score_summary_mode",
+            "stft_score_percentile",
+            "stft_score_loudness_reference_sone",
+            "stft_score_modulation_reference",
+            "stft_score_harmonic_ratio_reference",
+            "stft_score_frequency_instability_reference",
+            "stft_score_harmonic_start_order",
+            "stft_score_harmonic_end_order",
+        }
+    )
+    _REQUIRED_TEST_CONFIG_COLUMNS = frozenset(
+        {
+            "fault_types_json",
+            "manual_judgment_buttons_visible",
+            "vibration_view_channel_index",
+            "input_hardware_device_id",
+            "result_dashboard_layout",
+            "current_meter_enabled",
+            "current_meter_source",
+            "current_meter_host",
+            "current_meter_port",
+            "current_meter_unit_id",
+            "current_meter_register_type",
+            "current_meter_register_address",
+            "current_meter_register_count",
+            "current_meter_data_type",
+            "current_meter_byte_order",
+            "current_meter_word_order",
+            "current_meter_scale",
+            "current_meter_offset",
+            "current_meter_poll_interval_ms",
+            "current_meter_timeout_ms",
+        }
+    )
+    _REQUIRED_MANAGED_AUDIO_INPUT_COLUMNS = frozenset(
+        {
+            "hardware_id",
+            "alias",
+            "hardware_revision",
+            "stable_backend_uid",
+            "descriptor_device_name",
+            "descriptor_hostapi_name",
+            "descriptor_sample_rate_hz",
+            "descriptor_input_channels",
+            "calibration_revision",
+            "calibration_json",
+            "created_time",
+            "updated_time",
+        }
+    )
+    _REQUIRED_PLC_FIELD_OFFSET_COLUMNS = frozenset(
+        {
+            "current_value_offset",
+            "rotation_speed_offset",
+            "res_testing_signal_offset",
+        }
+    )
+    _REQUIRED_HISTORICAL_METRIC_CACHE_COLUMNS = frozenset(
+        {
+            "cache_id",
+            "audio_data_id",
+            "file_path",
+            "file_size",
+            "file_mtime_ns",
+            "record_date",
+            "product_model",
+            "barcode",
+            "label",
+            "label_source",
+            "analyse_config",
+            "config_hash",
+            "calibration_hash",
+            "algorithm_version",
+            "channel_index",
+            "channel_label",
+            "metric_key",
+            "metric_label",
+            "metric_value",
+            "metric_unit",
+            "status",
+            "error_message",
+            "computed_at",
+        }
+    )
+    _REQUIRED_HISTORICAL_METRIC_CACHE_INDEXES = {
+        (
+            (
+                "audio_data_id",
+                "config_hash",
+                "algorithm_version",
+                "channel_index",
+                "metric_key",
+            ),
+            True,
+        ),
+        (("audio_data_id",), False),
+        (("product_model", "record_date"), False),
+        (("metric_key", "status"), False),
+    }
+    _REQUIRED_HISTORICAL_METRIC_CACHE_COLUMN_DEFINITIONS = {
+        "cache_id": ("INTEGER", True, True),
+        "audio_data_id": ("TEXT", True, False),
+        "file_path": ("TEXT", True, False),
+        "file_size": ("INTEGER", True, False),
+        "file_mtime_ns": ("INTEGER", True, False),
+        "record_date": ("TEXT", True, False),
+        "product_model": ("TEXT", True, False),
+        "barcode": ("TEXT", False, False),
+        "label": ("TEXT", False, False),
+        "label_source": ("TEXT", False, False),
+        "analyse_config": ("TEXT", False, False),
+        "config_hash": ("TEXT", True, False),
+        "calibration_hash": ("TEXT", True, False),
+        "algorithm_version": ("TEXT", True, False),
+        "channel_index": ("INTEGER", True, False),
+        "channel_label": ("TEXT", True, False),
+        "metric_key": ("TEXT", True, False),
+        "metric_label": ("TEXT", True, False),
+        "metric_value": ("REAL", False, False),
+        "metric_unit": ("TEXT", True, False),
+        "status": ("TEXT", True, False),
+        "error_message": ("TEXT", False, False),
+        "computed_at": ("TEXT", True, False),
+    }
 
     def connect(self):
-        db.connect(reuse_if_open=True)
-        db.create_tables(self.BOOTSTRAP_MODELS, safe=True)
-        self._migrate()
-        self._seed_device_row()
-        self._seed_default_admin_if_empty()
-
-    def _migrate(self):
-        self._ensure_columns(
-            "test_config_table",
-            [
-                ("input_device_name", "TEXT"),
-                ("input_device_hostapi", "TEXT"),
-                ("input_device_samplerate", "REAL"),
-                ("output_device_name", "TEXT"),
-                ("output_device_hostapi", "TEXT"),
-                ("output_device_samplerate", "REAL"),
-                ("selected_channels", "TEXT DEFAULT '[]'"),
-                ("plc_device_key", "TEXT"),
-                ("plc_device_label", "TEXT"),
-                ("analysis_window_offset_ms", "INTEGER NOT NULL DEFAULT 0"),
-                ("allow_incomplete_recording_analysis", "INTEGER NOT NULL DEFAULT 0"),
-            ],
-        )
-        self._ensure_test_config_table_plc_fk()
-        self._ensure_columns(
-            "channel_config_table",
-            [
-                ("fft_nfft", "INTEGER NOT NULL DEFAULT 4096"),
-                ("spl_lower_enabled", "INTEGER NOT NULL DEFAULT 0"),
-                ("spl_upper_enabled", "INTEGER NOT NULL DEFAULT 0"),
-                ("spl_average_lower_enabled", "INTEGER NOT NULL DEFAULT 0"),
-                ("spl_average_lower_limit", "REAL NOT NULL DEFAULT 40"),
-                ("spl_average_upper_enabled", "INTEGER NOT NULL DEFAULT 0"),
-                ("spl_average_upper_limit", "REAL NOT NULL DEFAULT 85"),
-                ("loudness_unit", "TEXT DEFAULT 'sone'"),
-                ("loudness_lower_enabled", "INTEGER NOT NULL DEFAULT 0"),
-                ("loudness_upper_enabled", "INTEGER NOT NULL DEFAULT 0"),
-                ("loudness_lower_limit", "REAL DEFAULT 0"),
-                ("loudness_upper_limit", "REAL DEFAULT 60"),
-                ("loudness_average_lower_enabled", "INTEGER NOT NULL DEFAULT 0"),
-                ("loudness_average_lower_limit", "REAL NOT NULL DEFAULT 0"),
-                ("loudness_average_upper_enabled", "INTEGER NOT NULL DEFAULT 0"),
-                ("loudness_average_upper_limit", "REAL NOT NULL DEFAULT 60"),
-                ("golden_sample_path", "TEXT DEFAULT NULL"),
-                ("golden_sample_label", "TEXT DEFAULT NULL"),
-                ("golden_sample_source_channel", "INTEGER DEFAULT NULL"),
-                ("golden_sample_start_sample", "INTEGER DEFAULT NULL"),
-                ("golden_sample_num_samples", "INTEGER DEFAULT NULL"),
-                ("golden_sample_start_ms", "INTEGER DEFAULT NULL"),
-                ("golden_sample_duration_ms", "INTEGER DEFAULT NULL"),
-                ("golden_sample_sample_rate", "REAL DEFAULT NULL"),
-                ("fft_golden_mode", "TEXT DEFAULT 'off'"),
-                ("fft_show_golden_overlay", "INTEGER NOT NULL DEFAULT 0"),
-                ("oct_golden_mode", "TEXT DEFAULT 'off'"),
-                ("oct_show_golden_overlay", "INTEGER NOT NULL DEFAULT 0"),
-            ],
-        )
-        self._remove_obsolete_ai_binding_score_threshold()
-        self._ensure_columns(
-            "ai_toolchain_table",
-            [
-                ("protocol_version", "INTEGER NOT NULL DEFAULT 1"),
-                ("execution_mode", "TEXT NOT NULL DEFAULT 'resident_process'"),
-                ("description", "TEXT NOT NULL DEFAULT ''"),
-                ("package_dir", "TEXT NOT NULL DEFAULT ''"),
-                ("params_json", "TEXT NOT NULL DEFAULT '{}'"),
-            ],
-        )
-        self._ensure_columns(
-            "ai_execution_table",
-            [
-                ("toolchain_name", "TEXT"),
-                ("toolchain_version", "TEXT"),
-                ("protocol_version", "INTEGER NOT NULL DEFAULT 1"),
-                ("window_overridden", "INTEGER NOT NULL DEFAULT 0"),
-                ("default_window_offset_ms", "INTEGER NOT NULL DEFAULT 0"),
-                ("default_window_duration_ms", "INTEGER NOT NULL DEFAULT 0"),
-                ("final_window_offset_ms", "INTEGER NOT NULL DEFAULT 0"),
-                ("final_window_duration_ms", "INTEGER NOT NULL DEFAULT 0"),
-                ("is_current_effective", "INTEGER NOT NULL DEFAULT 0"),
-                ("request_json_path", "TEXT"),
-                ("response_json_path", "TEXT"),
-                ("artifacts_dir", "TEXT"),
-            ],
-        )
-        self._ensure_columns(
-            "audio_data_table",
-            [
-                ("analyse_config", "TEXT"),
-                ("config_content", "TEXT"),
-            ],
-        )
-        self._backfill_channel_fft_defaults()
-        self._backfill_channel_loudness_defaults()
-        self._backfill_channel_limit_switch_defaults()
-        self._ensure_ai_binding_indexes()
-
-    def _ensure_columns(self, table_name: str, columns: list[tuple[str, str]]):
-        existing_columns = self._get_table_columns(table_name)
-        for column_name, type_spec in columns:
-            if column_name in existing_columns:
-                continue
-            db.execute_sql(
-                f"ALTER TABLE {table_name} ADD COLUMN {column_name} {type_spec}"
+        self._ensure_database_file_exists()
+        try:
+            db.connect(reuse_if_open=True)
+        except OperationalError as exc:
+            if self._is_sqlite_file_open_error(exc):
+                raise DatabaseStartupError(
+                    f"Database file cannot be opened: {DB_PATH}. "
+                    "Copy a prepared database before starting the application."
+                ) from exc
+            raise
+        try:
+            self._ensure_required_runtime_tables()
+            self._ensure_required_runtime_columns(
+                allow_missing_manual_judgment_visibility=True,
             )
+            self._migrate_compatible_schema()
+            self._ensure_required_runtime_columns()
+            if DB_PATH != ":memory:":
+                validate_torque_schema(db)
+        except TorqueSchemaError as exc:
+            if not db.is_closed():
+                db.close()
+            raise DatabaseStartupError(str(exc)) from exc
+        except Exception:
+            if not db.is_closed():
+                db.close()
+            raise
 
-    def _get_table_columns(self, table_name: str) -> set[str]:
-        return {row[1] for row in self._get_table_column_rows(table_name)}
-
-    def _get_table_column_rows(self, table_name: str) -> list[tuple]:
-        cursor = db.execute_sql(f"PRAGMA table_info({table_name})")
-        return cursor.fetchall()
-
-    def _get_table_foreign_keys(self, table_name: str) -> list[tuple]:
-        cursor = db.execute_sql(f"PRAGMA foreign_key_list({table_name})")
-        return cursor.fetchall()
-
-    def _ensure_test_config_table_plc_fk(self):
-        if not self._test_config_table_requires_plc_fk_rebuild():
-            self._ensure_test_config_table_indexes()
+    def _ensure_database_file_exists(self) -> None:
+        if DB_PATH == ":memory:":
             return
 
-        existing_columns = self._get_table_column_rows("test_config_table")
-        retained_columns = [row for row in existing_columns if row[1] != "plc_id"]
-        column_definitions = [
-            self._build_test_config_column_definition(row) for row in retained_columns
-        ]
-        column_definitions.append(
-            '"plc_id" INTEGER REFERENCES "plc_table" ("id") ON DELETE SET NULL'
+        try:
+            exists = Path(DB_PATH).is_file()
+        except OSError as exc:
+            raise DatabaseStartupError(
+                f"Database file does not exist: {DB_PATH}. "
+                "Copy a prepared database before starting the application."
+            ) from exc
+
+        if not exists:
+            raise DatabaseStartupError(
+                f"Database file does not exist: {DB_PATH}. "
+                "Copy a prepared database before starting the application."
+            )
+
+    def _migrate_compatible_schema(self) -> None:
+        if DB_PATH == ":memory:":
+            return
+        column_name = "manual_judgment_buttons_visible"
+        needs_manual_column = column_name not in self._table_columns("test_config_table")
+        needs_torque_tables = needs_torque_migration(db)
+        if not needs_manual_column and not needs_torque_tables:
+            return
+
+        database_path = Path(DB_PATH).resolve()
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        backup_path = database_path.with_name(
+            f"{database_path.name}.backup-auto-{stamp}"
         )
+        destination = None
+        try:
+            destination = sqlite3.connect(backup_path)
+            db.connection().backup(destination)
+        except Exception as exc:
+            if destination is not None:
+                destination.close()
+            backup_path.unlink(missing_ok=True)
+            raise DatabaseStartupError(
+                "Database compatibility backup failed before schema upgrade: "
+                f"{backup_path}."
+            ) from exc
+        else:
+            destination.close()
 
-        insert_columns = [row[1] for row in retained_columns] + ["plc_id"]
-        select_columns = [self._quote_identifier(row[1]) for row in retained_columns]
-        select_columns.append('NULL AS "plc_id"')
-
-        db.execute_sql("PRAGMA foreign_keys = OFF")
         try:
             with db.atomic():
-                db.execute_sql(
-                    """
-                    CREATE TABLE test_config_table__plc_rebuild (
-                        {}
+                if needs_manual_column:
+                    db.execute_sql(
+                        'ALTER TABLE "test_config_table" '
+                        'ADD COLUMN "manual_judgment_buttons_visible" '
+                        "INTEGER NOT NULL DEFAULT 0"
                     )
-                    """.format(",\n                        ".join(column_definitions))
-                )
-                db.execute_sql(
-                    """
-                    INSERT INTO test_config_table__plc_rebuild ({})
-                    SELECT {}
-                    FROM test_config_table
-                    """.format(
-                        ", ".join(
-                            self._quote_identifier(column_name)
-                            for column_name in insert_columns
-                        ),
-                        ", ".join(select_columns),
-                    )
-                )
-                db.execute_sql("DROP TABLE test_config_table")
-                db.execute_sql(
-                    """
-                    ALTER TABLE test_config_table__plc_rebuild
-                    RENAME TO test_config_table
-                    """
-                )
-                db.execute_sql(
-                    """
-                    CREATE UNIQUE INDEX IF NOT EXISTS testconfigtable_config_name
-                    ON test_config_table (config_name)
-                    """
-                )
-                db.execute_sql(
-                    """
-                    CREATE INDEX IF NOT EXISTS testconfigtable_plc_id
-                    ON test_config_table (plc_id)
-                    """
-                )
-        finally:
-            db.execute_sql("PRAGMA foreign_keys = ON")
+                if needs_torque_tables:
+                    apply_torque_migration(db)
+                self._ensure_required_runtime_columns()
+                validate_torque_schema(db)
+        except Exception as exc:
+            raise DatabaseStartupError(
+                "Database compatibility upgrade failed; the original backup "
+                f"is available at: {backup_path}."
+            ) from exc
 
-    def _test_config_table_requires_plc_fk_rebuild(self) -> bool:
-        columns = {row[1]: row for row in self._get_table_column_rows("test_config_table")}
-        plc_column = columns.get("plc_id")
-        if plc_column is None:
-            return True
-        if plc_column[3]:
-            return True
+    def _ensure_required_runtime_tables(self) -> None:
+        if DB_PATH == ":memory:":
+            return
 
-        return not any(
-            row[2] == "plc_table"
-            and row[3] == "plc_id"
-            and row[4] == "id"
-            and row[6].upper() == "SET NULL"
-            for row in self._get_table_foreign_keys("test_config_table")
+        existing_tables = self._runtime_table_names()
+        missing_tables = sorted(self.REQUIRED_RUNTIME_TABLES - existing_tables)
+        if missing_tables:
+            raise DatabaseStartupError(
+                "Database schema is incomplete: missing required runtime tables: "
+                f"{', '.join(missing_tables)}. "
+                "Copy a prepared database before starting the application."
+            )
+
+    def _ensure_required_runtime_columns(
+        self,
+        *,
+        allow_missing_manual_judgment_visibility: bool = False,
+    ) -> None:
+        if DB_PATH == ":memory:":
+            return
+
+        self._ensure_required_table_columns(
+            "channel_config_table",
+            self._REQUIRED_CHANNEL_CONFIG_COLUMNS,
         )
+        self._ensure_required_table_columns(
+            "test_config_table",
+            self._REQUIRED_TEST_CONFIG_COLUMNS
+            - (
+                {"manual_judgment_buttons_visible"}
+                if allow_missing_manual_judgment_visibility
+                else set()
+            ),
+        )
+        self._ensure_fault_types_column_definition()
+        if (
+            not allow_missing_manual_judgment_visibility
+            or "manual_judgment_buttons_visible" in self._table_columns("test_config_table")
+        ):
+            self._ensure_manual_judgment_visibility_column_definition()
+        self._ensure_required_table_columns(
+            "managed_audio_input_table",
+            self._REQUIRED_MANAGED_AUDIO_INPUT_COLUMNS,
+        )
+        self._ensure_required_table_columns(
+            "plc_field_offset_table",
+            self._REQUIRED_PLC_FIELD_OFFSET_COLUMNS,
+        )
+        self._ensure_required_table_columns(
+            "historical_metric_cache_table",
+            self._REQUIRED_HISTORICAL_METRIC_CACHE_COLUMNS,
+        )
+        self._ensure_historical_metric_cache_column_definitions()
+        self._ensure_historical_metric_cache_indexes()
 
-    def _build_test_config_column_definition(self, column_row: tuple) -> str:
-        _, column_name, column_type, not_null, default_value, primary_key = column_row
-        definition = [self._quote_identifier(column_name)]
-        if column_type:
-            definition.append(column_type)
-        if primary_key:
-            definition.append("PRIMARY KEY")
-        if not_null and not primary_key:
-            definition.append("NOT NULL")
-        if default_value is not None:
-            definition.append(f"DEFAULT {default_value}")
-        return " ".join(definition)
+    def _ensure_required_table_columns(
+        self,
+        table_name: str,
+        required_columns: frozenset[str],
+    ) -> None:
+        missing_columns = sorted(required_columns - self._table_columns(table_name))
+        if missing_columns:
+            raise DatabaseStartupError(
+                "Database schema is incomplete: missing required "
+                f"{table_name} columns: "
+                f"{', '.join(missing_columns)}. "
+                "Copy a prepared database before starting the application."
+            )
 
-    def _quote_identifier(self, identifier: str) -> str:
-        escaped = identifier.replace('"', '""')
-        return f'"{escaped}"'
+    def _table_columns(self, table_name: str) -> set[str]:
+        cursor = db.execute_sql(f"PRAGMA table_info({table_name})")
+        return {row[1] for row in cursor.fetchall()}
 
-    def _ensure_test_config_table_indexes(self):
-        existing_indexes = {
-            (columns, unique)
-            for columns, unique in self._get_table_index_definitions("test_config_table")
+    def _ensure_historical_metric_cache_column_definitions(self) -> None:
+        actual_definitions = self._table_column_definitions(
+            "historical_metric_cache_table"
+        )
+        expected_definitions = (
+            self._REQUIRED_HISTORICAL_METRIC_CACHE_COLUMN_DEFINITIONS
+        )
+        invalid_columns = sorted(
+            column_name
+            for column_name, expected in expected_definitions.items()
+            if actual_definitions.get(column_name) != expected
+        )
+        if invalid_columns:
+            raise DatabaseStartupError(
+                "Database schema is incomplete: invalid "
+                "historical_metric_cache_table column definitions: "
+                f"{', '.join(invalid_columns)}. "
+                "Copy a prepared database before starting the application."
+            )
+
+    def _ensure_fault_types_column_definition(self) -> None:
+        cursor = db.execute_sql("PRAGMA table_info(test_config_table)")
+        row = next(
+            (candidate for candidate in cursor.fetchall() if candidate[1] == "fault_types_json"),
+            None,
+        )
+        actual = (
+            None
+            if row is None
+            else (row[2].upper(), bool(row[3]), row[4], int(row[5]))
+        )
+        if actual != ("TEXT", True, "'[]'", 0):
+            raise DatabaseStartupError(
+                "Database schema is incomplete: invalid test_config_table "
+                "column definition: fault_types_json. "
+                "Copy a prepared database before starting the application."
+            )
+
+    def _ensure_manual_judgment_visibility_column_definition(self) -> None:
+        cursor = db.execute_sql("PRAGMA table_info(test_config_table)")
+        row = next(
+            (
+                candidate
+                for candidate in cursor.fetchall()
+                if candidate[1] == "manual_judgment_buttons_visible"
+            ),
+            None,
+        )
+        actual = (
+            None
+            if row is None
+            else (row[2].upper(), bool(row[3]), row[4], int(row[5]))
+        )
+        if actual != ("INTEGER", True, "0", 0):
+            raise DatabaseStartupError(
+                "Database schema is incomplete: invalid test_config_table "
+                "column definition: manual_judgment_buttons_visible. "
+                "Copy a prepared database before starting the application."
+            )
+
+    def _table_column_definitions(
+        self,
+        table_name: str,
+    ) -> dict[str, tuple[str, bool, bool]]:
+        cursor = db.execute_sql(f"PRAGMA table_info({table_name})")
+        return {
+            row[1]: (row[2].upper(), bool(row[3]), bool(row[5]))
+            for row in cursor.fetchall()
         }
-        if (("config_name",), True) not in existing_indexes:
-            db.execute_sql(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS testconfigtable_config_name
-                ON test_config_table (config_name)
-                """
-            )
-        if (("plc_id",), False) not in existing_indexes:
-            db.execute_sql(
-                """
-                CREATE INDEX IF NOT EXISTS testconfigtable_plc_id
-                ON test_config_table (plc_id)
-                """
+
+    def _ensure_historical_metric_cache_indexes(self) -> None:
+        existing_indexes = self._table_index_definitions(
+            "historical_metric_cache_table"
+        )
+        missing_indexes = (
+            self._REQUIRED_HISTORICAL_METRIC_CACHE_INDEXES - existing_indexes
+        )
+        if missing_indexes:
+            raise DatabaseStartupError(
+                "Database schema is incomplete: missing required "
+                "historical_metric_cache_table indexes. "
+                "Copy a prepared database before starting the application."
             )
 
-    def _get_table_index_definitions(self, table_name: str) -> list[tuple[tuple[str, ...], bool]]:
+    def _table_index_definitions(
+        self,
+        table_name: str,
+    ) -> set[tuple[tuple[str, ...], bool]]:
         cursor = db.execute_sql(f"PRAGMA index_list({table_name})")
-        definitions = []
+        definitions = set()
         for _, index_name, unique, *_ in cursor.fetchall():
             info = db.execute_sql(f"PRAGMA index_info({index_name})").fetchall()
-            definitions.append((tuple(row[2] for row in info), bool(unique)))
+            definitions.add((tuple(row[2] for row in info), bool(unique)))
         return definitions
 
-    def _remove_obsolete_ai_binding_score_threshold(self):
-        columns = self._get_table_columns("test_config_ai_binding_table")
-        if "score_threshold" not in columns:
-            return
+    def _is_sqlite_file_open_error(self, error: OperationalError) -> bool:
+        if DB_PATH == ":memory:":
+            return False
+        return "unable to open database file" in str(error).lower()
 
-        column_definitions = [
-            "binding_id INTEGER PRIMARY KEY",
-            "config_id INTEGER NOT NULL UNIQUE REFERENCES test_config_table(config_id) ON DELETE CASCADE",
-            "enabled INTEGER NOT NULL DEFAULT 0",
-            "toolchain_id TEXT REFERENCES ai_toolchain_table(toolchain_id) ON DELETE SET NULL",
-            "timeout_ms INTEGER",
-        ]
-        copy_columns = [
-            "binding_id",
-            "config_id",
-            "enabled",
-            "toolchain_id",
-            "timeout_ms",
-        ]
-        if "analysis_window_offset_ms" in columns:
-            column_definitions.append(
-                "analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0"
-            )
-            copy_columns.append("analysis_window_offset_ms")
-        column_definitions.extend(
-            [
-                "params_json TEXT NOT NULL DEFAULT '{}'",
-                "updated_time TEXT NOT NULL DEFAULT ''",
-            ]
-        )
-        copy_columns.extend(["params_json", "updated_time"])
-        column_list_sql = ", ".join(copy_columns)
-
-        with db.atomic():
-            db.execute_sql(
-                """
-                ALTER TABLE test_config_ai_binding_table
-                RENAME TO test_config_ai_binding_table_old
-                """
-            )
-            db.execute_sql(
-                """
-                CREATE TABLE test_config_ai_binding_table (
-                    {}
-                )
-                """.format(",\n                    ".join(column_definitions))
-            )
-            db.execute_sql(
-                f"""
-                INSERT INTO test_config_ai_binding_table ({column_list_sql})
-                SELECT {column_list_sql}
-                FROM test_config_ai_binding_table_old
-                """
-            )
-            db.execute_sql("DROP TABLE test_config_ai_binding_table_old")
-            self._ensure_ai_binding_indexes()
-
-    def _backfill_channel_loudness_defaults(self):
-        channel_columns = self._get_table_columns("channel_config_table")
-        required = {
-            "loudness_unit",
-            "loudness_lower_limit",
-            "loudness_upper_limit",
-        }
-        if not required.issubset(channel_columns):
-            return
-        db.execute_sql(
+    def _runtime_table_names(self) -> set[str]:
+        cursor = db.execute_sql(
             """
-            UPDATE channel_config_table
-            SET
-                loudness_unit = COALESCE(loudness_unit, 'sone'),
-                loudness_lower_limit = COALESCE(loudness_lower_limit, 0),
-                loudness_upper_limit = COALESCE(loudness_upper_limit, 60)
-            WHERE
-                loudness_unit IS NULL
-                OR loudness_lower_limit IS NULL
-                OR loudness_upper_limit IS NULL
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
             """
         )
-
-    def _backfill_channel_limit_switch_defaults(self):
-        channel_columns = self._get_table_columns("channel_config_table")
-        assignments = []
-        conditions = []
-        defaults = {
-            "spl_lower_enabled": 0,
-            "spl_upper_enabled": 0,
-            "spl_average_lower_enabled": 0,
-            "spl_average_lower_limit": 40,
-            "spl_average_upper_enabled": 0,
-            "spl_average_upper_limit": 85,
-            "loudness_lower_enabled": 0,
-            "loudness_upper_enabled": 0,
-            "loudness_average_lower_enabled": 0,
-            "loudness_average_lower_limit": 0,
-            "loudness_average_upper_enabled": 0,
-            "loudness_average_upper_limit": 60,
-        }
-        for column_name, default_value in defaults.items():
-            if column_name not in channel_columns:
-                continue
-            assignments.append(f"{column_name} = COALESCE({column_name}, {default_value})")
-            conditions.append(f"{column_name} IS NULL")
-        if not assignments:
-            return
-        db.execute_sql(
-            f"""
-            UPDATE channel_config_table
-            SET {", ".join(assignments)}
-            WHERE {" OR ".join(conditions)}
-            """
-        )
-
-    def _backfill_channel_fft_defaults(self):
-        if "fft_nfft" not in self._get_table_columns("channel_config_table"):
-            return
-        db.execute_sql(
-            """
-            UPDATE channel_config_table
-            SET fft_nfft = COALESCE(fft_nfft, 4096)
-            WHERE fft_nfft IS NULL
-            """
-        )
-
-    def _ensure_ai_binding_indexes(self):
-        db.execute_sql(
-            """
-            CREATE INDEX IF NOT EXISTS testconfigaibindingtable_toolchain_id
-            ON test_config_ai_binding_table (toolchain_id)
-            """
-        )
-
-    def _seed_device_row(self):
-        db.execute_sql("INSERT OR IGNORE INTO device_table (id) VALUES (1)")
-
-    def _seed_default_admin_if_empty(self):
-        if UsersTable.select().limit(1).exists():
-            return
-        from ui.modules.login import encrypt_password
-
-        timestamp = now_str()
-        UsersTable.create(
-            user_name="admin",
-            password=encrypt_password("admin", "admin"),
-            access_level="Admin",
-            user_created_time=timestamp,
-            user_updated_time=timestamp,
-        )
+        return {row[0] for row in cursor.fetchall()}
 
     def close(self):
         if not db.is_closed():

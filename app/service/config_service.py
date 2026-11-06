@@ -2,26 +2,67 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from copy import deepcopy
 from dataclasses import dataclass
 from decimal import Decimal
 
 from peewee import IntegrityError
 
+from app.service.analysis.limit_tables import (
+    normalize_limit_tables_for_storage,
+    validate_limit_tables,
+)
+from app.service.current_meter_service import (
+    normalize_current_meter_config,
+    validate_current_meter_config,
+)
+from app.service.fault_types import (
+    decode_fault_types_json,
+    encode_fault_types_json,
+    normalize_fault_types,
+)
 from app.service.golden_sample_service import GoldenSampleService, StagedGoldenSample
+from app.service.result_dashboard_layout import (
+    DEFAULT_RESULT_DASHBOARD_LAYOUT,
+    ResultDashboardLayoutError,
+    normalize_result_dashboard_layout,
+    normalize_result_dashboard_layout_for_display,
+    serialize_result_dashboard_layout,
+)
 from consts.time_consts import now_str
 from model.channel_config_table import ChannelConfigTable
-from model.device_table import DeviceTable
+from model.input_hardware_table import InputHardwareTable
 from model.plc_table import PlcTable
 from model.test_config_table import TestConfigTable
 
 logger = logging.getLogger(__name__)
+
+_INVALID_INPUT_HARDWARE_ERROR = (
+    "\u5fc5\u987b\u9009\u62e9\u6709\u6548\u7684\u8f93\u5165\u786c\u4ef6\u8bbe\u5907"
+)
+_UNAVAILABLE_INPUT_HARDWARE_ERROR = (
+    "\u6240\u9009\u8f93\u5165\u786c\u4ef6\u8bbe\u5907\u4e0d\u53ef\u7528"
+)
+_UNRESOLVED_MANAGED_COUNT = object()
 
 # Default values for new channel configs
 _CHANNEL_DEFAULTS = {
     "stft_nfft": 1024,
     "fft_nfft": 4096,
     "stft_overlap": 0.5,
+    "stft_color_scale_enabled": False,
+    "stft_color_scale_min_db": -120.0,
+    "stft_color_scale_max_db": 0.0,
+    "stft_score_enabled": True,
+    "stft_score_summary_mode": "percentile",
+    "stft_score_percentile": 10.0,
+    "stft_score_loudness_reference_sone": 10.0,
+    "stft_score_modulation_reference": 0.20,
+    "stft_score_harmonic_ratio_reference": 0.25,
+    "stft_score_frequency_instability_reference": 0.05,
+    "stft_score_harmonic_start_order": 2,
+    "stft_score_harmonic_end_order": 100,
     "spl_weighting": "A",
     "spl_time_constant": 0.125,
     "spl_lower_enabled": False,
@@ -41,6 +82,8 @@ _CHANNEL_DEFAULTS = {
     "loudness_average_lower_limit": 0.0,
     "loudness_average_upper_enabled": False,
     "loudness_average_upper_limit": 60.0,
+    "fft_x_axis_scale": "linear",
+    "fft_weighting": "Z",
     "fft_band_limits": "[]",
     "oct_weighting": "A",
     "oct_band_limits": "[]",
@@ -122,6 +165,65 @@ _VALID_OVERLAP = [0.25, 0.5, 0.75]
 _VALID_WEIGHTING = ["A", "C", "Z"]
 _VALID_LOUDNESS_UNITS = ["sone", "phon"]
 _VALID_GOLDEN_MODES = {"off", "absolute", "delta"}
+_VALID_FFT_X_AXIS_SCALES = {"linear", "log"}
+_VALID_STFT_SCORE_SUMMARY_MODES = {"percentile", "mean", "min"}
+MONITOR_GAIN_DEFAULT_DB = 0.0
+MONITOR_GAIN_MIN_DB = -60.0
+MONITOR_GAIN_MAX_DB = 35.0
+_MONITOR_CONFIG_FIELDS = ("monitor_channel_index", "monitor_gain_db")
+_CURRENT_METER_SOURCES = frozenset({"modbus_tcp", "plc"})
+_CURRENT_METER_CONFIG_FIELDS = (
+    "current_meter_enabled",
+    "current_meter_source",
+    "current_meter_host",
+    "current_meter_port",
+    "current_meter_unit_id",
+    "current_meter_register_type",
+    "current_meter_register_address",
+    "current_meter_register_count",
+    "current_meter_data_type",
+    "current_meter_byte_order",
+    "current_meter_word_order",
+    "current_meter_scale",
+    "current_meter_offset",
+    "current_meter_poll_interval_ms",
+    "current_meter_timeout_ms",
+)
+_CONFIG_LOAD_FIELD_NAMES = (
+    "config_id",
+    "config_name",
+    "record_duration",
+    "analysis_duration",
+    "analysis_window_offset_ms",
+    "allow_incomplete_recording_analysis",
+    "scan_triggers_test",
+    "plc",
+    "input_hardware_device_id",
+    "input_device_name",
+    "input_device_hostapi",
+    "input_device_samplerate",
+    "output_device_name",
+    "output_device_hostapi",
+    "output_device_samplerate",
+    "selected_channels",
+    "fault_types_json",
+    "manual_judgment_buttons_visible",
+    "vibration_view_channel_index",
+    "result_dashboard_layout",
+    *_MONITOR_CONFIG_FIELDS,
+    *_CURRENT_METER_CONFIG_FIELDS,
+)
+
+
+def _normalize_manual_judgment_buttons_visible(data: dict) -> bool:
+    if "manual_judgment_buttons_visible" in data:
+        value = data["manual_judgment_buttons_visible"]
+        if type(value) is not bool:
+            raise ValueError(
+                "manual_judgment_buttons_visible must be a boolean"
+            )
+        return value
+    return False
 
 
 @dataclass(frozen=True)
@@ -131,6 +233,16 @@ class PendingConfigSave:
     old_paths: tuple[str, ...] = ()
     staged_paths: tuple[str, ...] = ()
     golden_bindings_by_channel: tuple[tuple[int, dict], ...] = ()
+
+
+def _normalize_current_meter_with_source(config: dict | None) -> dict:
+    source_config = config if isinstance(config, dict) else {}
+    source = str(source_config.get("source") or "").strip().lower()
+    if source not in _CURRENT_METER_SOURCES:
+        source = "modbus_tcp"
+    normalized = normalize_current_meter_config(source_config)
+    normalized["source"] = source
+    return normalized
 
 
 class ConfigService:
@@ -177,27 +289,63 @@ class ConfigService:
         return list(rows)
 
     def load_config(self, config_id: int) -> dict:
-        cfg = TestConfigTable.get_by_id(config_id)
+        available_columns = self._config_table_columns()
+        fields = [
+            TestConfigTable._meta.fields[field_name]
+            for field_name in _CONFIG_LOAD_FIELD_NAMES
+            if field_name == "fault_types_json"
+            or self._config_field_exists(field_name, available_columns)
+        ]
+        cfg = (
+            TestConfigTable.select(*fields)
+            .where(TestConfigTable.config_id == config_id)
+            .dicts()
+            .first()
+        )
+        if cfg is None:
+            raise TestConfigTable.DoesNotExist
+
+        selected_channels = self._parse_json(cfg.get("selected_channels"), [])
+        fault_types = decode_fault_types_json(cfg["fault_types_json"])
+        manual_judgment_buttons_visible = (
+            cfg.get("manual_judgment_buttons_visible", False)
+        )
+        if type(manual_judgment_buttons_visible) is not bool:
+            raise ValueError(
+                "manual_judgment_buttons_visible must be a boolean"
+            )
         result = {
-            "config_id": cfg.config_id,
-            "config_name": cfg.config_name,
-            "record_duration": cfg.record_duration,
-            "analysis_duration": cfg.analysis_duration,
-            "analysis_window_offset_ms": cfg.analysis_window_offset_ms,
+            "config_id": cfg["config_id"],
+            "config_name": cfg["config_name"],
+            "record_duration": cfg.get("record_duration", 5.0),
+            "analysis_duration": cfg.get("analysis_duration", 3.0),
+            "analysis_window_offset_ms": cfg.get("analysis_window_offset_ms", 0),
             "allow_incomplete_recording_analysis": bool(
-                getattr(cfg, "allow_incomplete_recording_analysis", False)
+                cfg.get("allow_incomplete_recording_analysis", False)
             ),
-            "scan_triggers_test": bool(cfg.scan_triggers_test),
-            "plc_id": cfg.plc_id,
-            "input_device_name": cfg.input_device_name,
-            "input_device_hostapi": cfg.input_device_hostapi,
-            "input_device_samplerate": cfg.input_device_samplerate,
-            "output_device_name": cfg.output_device_name,
-            "output_device_hostapi": cfg.output_device_hostapi,
-            "output_device_samplerate": cfg.output_device_samplerate,
-            "selected_channels": self._parse_json(cfg.selected_channels, []),
+            "scan_triggers_test": bool(cfg.get("scan_triggers_test", False)),
+            "plc_id": cfg.get("plc"),
+            "input_device_name": cfg.get("input_device_name"),
+            "input_device_hostapi": cfg.get("input_device_hostapi"),
+            "input_device_samplerate": cfg.get("input_device_samplerate"),
+            "output_device_name": cfg.get("output_device_name"),
+            "output_device_hostapi": cfg.get("output_device_hostapi"),
+            "output_device_samplerate": cfg.get("output_device_samplerate"),
+            "selected_channels": selected_channels,
+            "fault_types": list(fault_types),
+            "manual_judgment_buttons_visible": manual_judgment_buttons_visible,
+            "vibration_view_channel_index": cfg.get("vibration_view_channel_index"),
+            "monitor_channel_index": None,
+            "monitor_gain_db": self._normalize_monitor_gain(
+                cfg.get("monitor_gain_db")
+            ),
+            "current_meter": self._normalize_current_meter_from_row(cfg),
             "channels": [],
         }
+        if cfg.get("input_hardware_device_id") is not None:
+            result["input_hardware_device_id"] = cfg.get(
+                "input_hardware_device_id"
+            )
         ch_rows = (
             ChannelConfigTable.select()
             .where(ChannelConfigTable.config == config_id)
@@ -214,6 +362,69 @@ class ConfigService:
                         else _CHANNEL_DEFAULTS["fft_nfft"]
                     ),
                     "stft_overlap": ch.stft_overlap,
+                    "stft_color_scale_enabled": bool(
+                        getattr(
+                            ch,
+                            "stft_color_scale_enabled",
+                            _CHANNEL_DEFAULTS["stft_color_scale_enabled"],
+                        )
+                    ),
+                    "stft_color_scale_min_db": self._finite_float_or_default(
+                        getattr(ch, "stft_color_scale_min_db", None),
+                        _CHANNEL_DEFAULTS["stft_color_scale_min_db"],
+                    ),
+                    "stft_color_scale_max_db": self._finite_float_or_default(
+                        getattr(ch, "stft_color_scale_max_db", None),
+                        _CHANNEL_DEFAULTS["stft_color_scale_max_db"],
+                    ),
+                    "stft_score_enabled": bool(
+                        getattr(
+                            ch,
+                            "stft_score_enabled",
+                            _CHANNEL_DEFAULTS["stft_score_enabled"],
+                        )
+                    ),
+                    "stft_score_summary_mode": self._normalize_stft_score_summary_mode(
+                        getattr(
+                            ch,
+                            "stft_score_summary_mode",
+                            _CHANNEL_DEFAULTS["stft_score_summary_mode"],
+                        )
+                    ),
+                    "stft_score_percentile": self._finite_float_or_default(
+                        getattr(ch, "stft_score_percentile", None),
+                        _CHANNEL_DEFAULTS["stft_score_percentile"],
+                    ),
+                    "stft_score_loudness_reference_sone": self._finite_float_or_default(
+                        getattr(ch, "stft_score_loudness_reference_sone", None),
+                        _CHANNEL_DEFAULTS["stft_score_loudness_reference_sone"],
+                    ),
+                    "stft_score_modulation_reference": self._finite_float_or_default(
+                        getattr(ch, "stft_score_modulation_reference", None),
+                        _CHANNEL_DEFAULTS["stft_score_modulation_reference"],
+                    ),
+                    "stft_score_harmonic_ratio_reference": self._finite_float_or_default(
+                        getattr(ch, "stft_score_harmonic_ratio_reference", None),
+                        _CHANNEL_DEFAULTS["stft_score_harmonic_ratio_reference"],
+                    ),
+                    "stft_score_frequency_instability_reference": self._finite_float_or_default(
+                        getattr(
+                            ch,
+                            "stft_score_frequency_instability_reference",
+                            None,
+                        ),
+                        _CHANNEL_DEFAULTS[
+                            "stft_score_frequency_instability_reference"
+                        ],
+                    ),
+                    "stft_score_harmonic_start_order": self._int_or_default(
+                        getattr(ch, "stft_score_harmonic_start_order", None),
+                        _CHANNEL_DEFAULTS["stft_score_harmonic_start_order"],
+                    ),
+                    "stft_score_harmonic_end_order": self._int_or_default(
+                        getattr(ch, "stft_score_harmonic_end_order", None),
+                        _CHANNEL_DEFAULTS["stft_score_harmonic_end_order"],
+                    ),
                     "spl_weighting": ch.spl_weighting,
                     "spl_time_constant": ch.spl_time_constant,
                     "spl_lower_enabled": bool(
@@ -290,6 +501,20 @@ class ConfigService:
                         "loudness_average_upper_limit",
                         _CHANNEL_DEFAULTS["loudness_average_upper_limit"],
                     ),
+                    "fft_x_axis_scale": self._normalize_fft_x_axis_scale(
+                        getattr(
+                            ch,
+                            "fft_x_axis_scale",
+                            _CHANNEL_DEFAULTS["fft_x_axis_scale"],
+                        )
+                    ),
+                    "fft_weighting": self._normalize_weighting(
+                        getattr(
+                            ch,
+                            "fft_weighting",
+                            _CHANNEL_DEFAULTS["fft_weighting"],
+                        )
+                    ),
                     "fft_band_limits": self._parse_json(ch.fft_band_limits, []),
                     "oct_weighting": ch.oct_weighting,
                     "oct_band_limits": self._parse_json(ch.oct_band_limits, []),
@@ -319,7 +544,58 @@ class ConfigService:
             result["selected_channels"] = [
                 ch["channel_index"] for ch in result["channels"]
             ]
+        (
+            result["result_dashboard_layout"],
+            result_dashboard_layout_error,
+        ) = self._normalize_loaded_result_dashboard_layout(
+            cfg.get("result_dashboard_layout"),
+            selected_channels=result["selected_channels"],
+        )
+        if result_dashboard_layout_error is not None:
+            result["_result_dashboard_layout_error"] = result_dashboard_layout_error
+        managed_channel_count, _ = self._resolve_managed_channel_count(result)
+        result["monitor_channel_index"] = self._resolve_monitor_channel_index(
+            cfg.get("monitor_channel_index"),
+            selected_channels=result["selected_channels"],
+            managed_channel_count=managed_channel_count,
+        )
         return result
+
+    def load_config_for_result_dashboard(self, config_id: int) -> dict:
+        result = self.load_config(config_id)
+        result["result_dashboard_layout"] = normalize_result_dashboard_layout_for_display(
+            result.get("result_dashboard_layout"),
+            selected_channels=result.get("selected_channels", []),
+        )
+        result.pop("_result_dashboard_layout_error", None)
+        return result
+
+    def _normalize_loaded_result_dashboard_layout(
+        self,
+        raw_layout,
+        *,
+        selected_channels: list,
+    ) -> tuple[object, str | None]:
+        try:
+            return (
+                normalize_result_dashboard_layout(
+                    raw_layout,
+                    selected_channels=selected_channels,
+                ),
+                None,
+            )
+        except ResultDashboardLayoutError as exc:
+            return raw_layout, f"结果展示布局：{exc}"
+
+    @staticmethod
+    def _selected_channels_for_layout_validation(selected_channels) -> list[int]:
+        if not isinstance(selected_channels, (list, tuple)):
+            return []
+        normalized = []
+        for channel in selected_channels:
+            if isinstance(channel, int) and not isinstance(channel, bool):
+                normalized.append(channel)
+        return normalized
 
     def create_config(self, config_name: str) -> int:
         name = config_name.strip()
@@ -329,15 +605,32 @@ class ConfigService:
             raise ValueError(f"配置名称「{name}」已存在")
         try:
             with TestConfigTable._meta.database.atomic():
-                cfg = TestConfigTable.create(
-                    config_name=name,
-                    created_time=now_str(),
-                    updated_time=now_str(),
+                row_values = {
+                    "config_name": name,
+                    "record_duration": 5.0,
+                    "analysis_duration": 3.0,
+                    "allow_incomplete_recording_analysis": False,
+                    "scan_triggers_test": False,
+                    "selected_channels": "[]",
+                    "fault_types_json": "[]",
+                    "manual_judgment_buttons_visible": False,
+                    "result_dashboard_layout": serialize_result_dashboard_layout(
+                        DEFAULT_RESULT_DASHBOARD_LAYOUT
+                    ),
+                    "analysis_window_offset_ms": 0,
+                    "created_time": now_str(),
+                    "updated_time": now_str(),
+                }
+                self._add_current_meter_row_values(
+                    row_values,
+                    current_meter=_normalize_current_meter_with_source(None),
+                    available_columns=self._config_table_columns(),
                 )
+                config_id = self._insert_config_row_values(row_values)
         except IntegrityError:
             raise ValueError(f"配置名称「{name}」已存在")
         self.bus.config_changed.emit()
-        return cfg.config_id
+        return int(config_id)
 
     def save_config(self, data: dict) -> int:
         pending = self.begin_save_config(data)
@@ -386,12 +679,15 @@ class ConfigService:
                 raise ValueError("导入配置 ID 已被占用")
 
             with TestConfigTable._meta.database.atomic():
-                TestConfigTable.create(
-                    config_id=reserved_config_id,
-                    created_time=now_str(),
-                    updated_time=now_str(),
-                    **self._config_row_values(prepared),
+                row_values = self._config_row_values(prepared)
+                row_values.update(
+                    {
+                        "config_id": reserved_config_id,
+                        "created_time": now_str(),
+                        "updated_time": now_str(),
+                    }
                 )
+                self._insert_config_row_values(row_values)
                 self._replace_channel_rows(
                     config_id=reserved_config_id,
                     channels=prepared["channels"],
@@ -435,6 +731,12 @@ class ConfigService:
         golden_asset_paths_by_channel: dict[int, dict] | None = None,
     ) -> dict:
         source = deepcopy(payload or {})
+        if "fault_types" not in source:
+            raise ValueError("fault_types is required")
+        fault_types = normalize_fault_types(source["fault_types"])
+        manual_judgment_buttons_visible = (
+            _normalize_manual_judgment_buttons_visible(source)
+        )
         channels = source.get("channels", [])
         if not isinstance(channels, list):
             channels = []
@@ -464,6 +766,16 @@ class ConfigService:
                 and isinstance(channel.get("channel_index"), int)
                 and not isinstance(channel.get("channel_index"), bool)
             ]
+        monitor_gain_db = source.get("monitor_gain_db", MONITOR_GAIN_DEFAULT_DB)
+        if monitor_gain_db is None:
+            monitor_gain_db = MONITOR_GAIN_DEFAULT_DB
+        try:
+            result_dashboard_layout = normalize_result_dashboard_layout(
+                source.get("result_dashboard_layout"),
+                selected_channels=selected_channels,
+            )
+        except ResultDashboardLayoutError as exc:
+            raise ValueError(f"结果展示布局：{exc}") from exc
 
         return {
             "config_name": str(source.get("config_name", "")).strip(),
@@ -476,6 +788,9 @@ class ConfigService:
             ),
             "scan_triggers_test": source.get("scan_triggers_test", False),
             "plc_id": None,
+            "fault_types": list(fault_types),
+            "manual_judgment_buttons_visible": manual_judgment_buttons_visible,
+            "input_hardware_device_id": source.get("input_hardware_device_id"),
             "input_device_name": source.get("input_device_name"),
             "input_device_hostapi": source.get("input_device_hostapi"),
             "input_device_samplerate": source.get("input_device_samplerate"),
@@ -483,6 +798,15 @@ class ConfigService:
             "output_device_hostapi": source.get("output_device_hostapi"),
             "output_device_samplerate": source.get("output_device_samplerate"),
             "selected_channels": selected_channels,
+            "vibration_view_channel_index": source.get(
+                "vibration_view_channel_index"
+            ),
+            "monitor_channel_index": source.get("monitor_channel_index"),
+            "monitor_gain_db": monitor_gain_db,
+            "result_dashboard_layout": result_dashboard_layout,
+            "current_meter": _normalize_current_meter_with_source(
+                source.get("current_meter")
+            ),
             "channels": prepared_channels,
         }
 
@@ -616,15 +940,35 @@ class ConfigService:
             return True
         return False
 
-    def get_channel_count(self) -> int:
+    @staticmethod
+    def _resolve_managed_channel_count(
+        data: dict,
+    ) -> tuple[int | None, str | None]:
+        hardware_id = data.get("input_hardware_device_id")
+        if type(hardware_id) is not int or hardware_id <= 0:
+            return None, _INVALID_INPUT_HARDWARE_ERROR
         try:
-            row = DeviceTable.get_by_id(1)
-            return int(row.input_channel_count)
+            row = InputHardwareTable.get_by_id(hardware_id)
         except Exception:
-            return 0
+            return None, _UNAVAILABLE_INPUT_HARDWARE_ERROR
+        channel_count = row.channel_count
+        if type(channel_count) is not int or channel_count <= 0:
+            return None, _UNAVAILABLE_INPUT_HARDWARE_ERROR
+        return channel_count, None
 
     def validate(self, data: dict) -> list[str]:
         errors = []
+        try:
+            _normalize_manual_judgment_buttons_visible(data)
+        except ValueError as exc:
+            errors.append(str(exc))
+        if "fault_types" not in data:
+            errors.append("fault_types is required")
+        else:
+            try:
+                normalize_fault_types(data["fault_types"])
+            except ValueError as exc:
+                errors.append(str(exc))
         name = data.get("config_name", "").strip()
         if not name:
             errors.append("配置名称不能为空")
@@ -658,13 +1002,63 @@ class ConfigService:
             elif not PlcTable.select().where(PlcTable.id == plc_id).exists():
                 errors.append("PLC 不存在或已被删除")
 
-        errors.extend(self.validate_factory_runtime(data))
+        managed_count_result = self._resolve_managed_channel_count(data)
+        managed_channel_count, managed_input_error = managed_count_result
+        if managed_input_error is not None:
+            errors.append(managed_input_error)
+        errors.extend(
+            self.validate_factory_runtime(
+                data,
+                _managed_count_result=managed_count_result,
+            )
+        )
+        current_meter = _normalize_current_meter_with_source(data.get("current_meter"))
+        if current_meter["enabled"] and current_meter["source"] == "plc":
+            if plc_id is None:
+                errors.append("PLC 电流源需要绑定有效 PLC")
+        else:
+            errors.extend(validate_current_meter_config(current_meter))
+
+        selected_channels_for_layout = self._selected_channels_for_layout_validation(
+            data.get("selected_channels", [])
+        )
+        try:
+            normalize_result_dashboard_layout(
+                data.get("result_dashboard_layout"),
+                selected_channels=selected_channels_for_layout,
+            )
+        except ResultDashboardLayoutError as exc:
+            errors.append(f"结果展示布局：{exc}")
 
         input_dev = data.get("input_device_name")
         sel_ch = data.get("selected_channels", [])
         if input_dev and not sel_ch:
             errors.append("已选择输入设备但未选择任何通道")
 
+        monitor_channel = data.get("monitor_channel_index")
+        if monitor_channel is not None:
+            if (
+                not isinstance(monitor_channel, int)
+                or isinstance(monitor_channel, bool)
+                or monitor_channel < 0
+            ):
+                errors.append("监听通道必须为不小于 0 的整数")
+            else:
+                if (
+                    managed_channel_count is not None
+                    and monitor_channel >= managed_channel_count
+                ):
+                    errors.append("监听通道必须小于输入通道数")
+
+        monitor_gain = data.get("monitor_gain_db", MONITOR_GAIN_DEFAULT_DB)
+        if monitor_gain is None:
+            monitor_gain = MONITOR_GAIN_DEFAULT_DB
+        if not self._is_numeric(monitor_gain) or not math.isfinite(float(monitor_gain)):
+            errors.append("监听增益必须为有限数值")
+        elif not MONITOR_GAIN_MIN_DB <= float(monitor_gain) <= MONITOR_GAIN_MAX_DB:
+            errors.append(
+                f"监听增益必须在 {MONITOR_GAIN_MIN_DB:g} 到 {MONITOR_GAIN_MAX_DB:g} dB 之间"
+            )
         channels = data.get("channels", [])
         if not isinstance(channels, list):
             errors.append("通道数据格式无效")
@@ -695,8 +1089,42 @@ class ConfigService:
                 errors.append(f"{prefix}: STFT FFT 点数无效")
             if ch.get("fft_nfft", _CHANNEL_DEFAULTS["fft_nfft"]) not in _VALID_FFT_NFFT:
                 errors.append(f"{prefix}: FFT 分辨率无效")
+            if (
+                ch.get(
+                    "fft_x_axis_scale",
+                    _CHANNEL_DEFAULTS["fft_x_axis_scale"],
+                )
+                not in _VALID_FFT_X_AXIS_SCALES
+            ):
+                errors.append(f"{prefix}: FFT 横轴模式无效")
+            if (
+                ch.get("fft_weighting", _CHANNEL_DEFAULTS["fft_weighting"])
+                not in _VALID_WEIGHTING
+            ):
+                errors.append(f"{prefix}: FFT 计权模式无效")
             if ch.get("stft_overlap") not in _VALID_OVERLAP:
                 errors.append(f"{prefix}: STFT 重叠率无效")
+            fixed_color_scale_enabled = ch.get(
+                "stft_color_scale_enabled",
+                _CHANNEL_DEFAULTS["stft_color_scale_enabled"],
+            )
+            if "stft_color_scale_enabled" in ch and not isinstance(
+                fixed_color_scale_enabled,
+                bool,
+            ):
+                errors.append(f"{prefix}: STFT 固定色阶开关必须为布尔值")
+            elif fixed_color_scale_enabled:
+                min_db = self._finite_float_or_none(
+                    ch.get("stft_color_scale_min_db")
+                )
+                max_db = self._finite_float_or_none(
+                    ch.get("stft_color_scale_max_db")
+                )
+                if min_db is None or max_db is None:
+                    errors.append(f"{prefix}: STFT 色阶上下限必须为有限数值")
+                elif min_db >= max_db:
+                    errors.append(f"{prefix}: STFT 色阶下限必须小于上限")
+            errors.extend(self._validate_stft_score_fields(prefix, ch))
             if ch.get("spl_weighting") not in _VALID_WEIGHTING:
                 errors.append(f"{prefix}: SPL 计权模式无效")
             tc = ch.get("spl_time_constant", 0)
@@ -712,25 +1140,13 @@ class ConfigService:
                 errors.append(f"{prefix}: 倍频程计权模式无效")
 
             for label, key in [("FFT", "fft_band_limits"), ("倍频程", "oct_band_limits")]:
-                bands = ch.get(key, [])
-                if not isinstance(bands, list):
-                    errors.append(f"{prefix}: {label} 频带数据格式无效")
-                    continue
-                for j, band in enumerate(bands):
-                    if not isinstance(band, dict):
-                        errors.append(f"{prefix}: {label} 第 {j+1} 行格式无效")
-                        continue
-                    freq = band.get("freq", 0)
-                    lo = band.get("lower", 0)
-                    hi = band.get("upper", 0)
-                    if not isinstance(freq, (int, float)) or isinstance(freq, bool) or freq <= 0:
-                        errors.append(f"{prefix}: {label} 第 {j+1} 行频率必须为正数")
-                    if not isinstance(lo, (int, float)) or isinstance(lo, bool):
-                        errors.append(f"{prefix}: {label} 第 {j+1} 行下限必须为数值")
-                    elif not isinstance(hi, (int, float)) or isinstance(hi, bool):
-                        errors.append(f"{prefix}: {label} 第 {j+1} 行上限必须为数值")
-                    elif lo >= hi:
-                        errors.append(f"{prefix}: {label} 第 {j+1} 行下限必须小于上限")
+                errors.extend(
+                    f"{prefix}: {message}"
+                    for message in self._validate_channel_limit_tables(
+                        ch.get(key, []),
+                        label=label,
+                    )
+                )
 
             errors.extend(
                 self._validate_golden_channel(
@@ -749,8 +1165,48 @@ class ConfigService:
         )
         return errors
 
-    def validate_factory_runtime(self, data: dict) -> list[str]:
+    def _validate_vibration_view_channel(
+        self,
+        data: dict,
+        *,
+        managed_channel_count: int | None,
+    ) -> list[str]:
+        vibration_channel = data.get("vibration_view_channel_index")
+        if vibration_channel is None:
+            return []
+        if (
+            not isinstance(vibration_channel, int)
+            or isinstance(vibration_channel, bool)
+            or vibration_channel < 0
+        ):
+            return ["振动视图通道必须为不小于 0 的整数"]
+
+        if (
+            managed_channel_count is not None
+            and vibration_channel >= managed_channel_count
+        ):
+            return ["振动视图通道必须小于输入通道数"]
+
+        selected_channels = data.get("selected_channels", [])
+        if isinstance(selected_channels, list) and vibration_channel not in selected_channels:
+            return ["振动视图通道必须来自已选择通道"]
+        return []
+
+    def validate_factory_runtime(
+        self,
+        data: dict,
+        *,
+        _managed_count_result=_UNRESOLVED_MANAGED_COUNT,
+    ) -> list[str]:
         errors = []
+        if _managed_count_result is _UNRESOLVED_MANAGED_COUNT:
+            _managed_count_result = self._resolve_managed_channel_count(data)
+            if _managed_count_result[1] is not None:
+                errors.append(_managed_count_result[1])
+        managed_channel_count = _managed_count_result[0]
+        selected_channels = data.get("selected_channels", [])
+        if isinstance(selected_channels, (list, tuple)) and len(selected_channels) > 2:
+            errors.append("最多选择两个通道")
         offset = data.get("analysis_window_offset_ms", 0)
         if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
             errors.append("分析窗起始偏移必须为不小于 0 的整数")
@@ -769,6 +1225,77 @@ class ConfigService:
                 if window_end_ms > record_duration_ms:
                     errors.append("分析窗起始偏移加分析时长不能超过录音时长")
 
+        errors.extend(
+            self._validate_vibration_view_channel(
+                data,
+                managed_channel_count=managed_channel_count,
+            )
+        )
+        return errors
+
+    def _validate_stft_score_fields(self, prefix: str, channel: dict) -> list[str]:
+        errors: list[str] = []
+        if "stft_score_enabled" in channel and not isinstance(
+            channel["stft_score_enabled"],
+            bool,
+        ):
+            errors.append(f"{prefix}: STFT 评分启用必须为布尔值")
+        summary_mode = channel.get(
+            "stft_score_summary_mode",
+            _CHANNEL_DEFAULTS["stft_score_summary_mode"],
+        )
+        if not (
+            isinstance(summary_mode, str)
+            and summary_mode in _VALID_STFT_SCORE_SUMMARY_MODES
+        ):
+            errors.append(f"{prefix}: STFT 评分汇总方式无效")
+
+        percentile = channel.get(
+            "stft_score_percentile",
+            _CHANNEL_DEFAULTS["stft_score_percentile"],
+        )
+        if not self._is_finite_number(percentile) or not (
+            0.0 < float(percentile) <= 100.0
+        ):
+            errors.append(f"{prefix}: STFT 评分分位数必须大于0且小于等于100")
+
+        for field, label in (
+            ("stft_score_loudness_reference_sone", "响度参考值"),
+            ("stft_score_modulation_reference", "响度变化参考值"),
+            ("stft_score_harmonic_ratio_reference", "谐波占比参考值"),
+            ("stft_score_frequency_instability_reference", "频率不稳定参考值"),
+        ):
+            if not self._is_positive_finite(
+                channel.get(field, _CHANNEL_DEFAULTS[field])
+            ):
+                errors.append(f"{prefix}: STFT 评分{label}必须为正数")
+
+        start_order = channel.get(
+            "stft_score_harmonic_start_order",
+            _CHANNEL_DEFAULTS["stft_score_harmonic_start_order"],
+        )
+        end_order = channel.get(
+            "stft_score_harmonic_end_order",
+            _CHANNEL_DEFAULTS["stft_score_harmonic_end_order"],
+        )
+        if not isinstance(start_order, int) or isinstance(start_order, bool):
+            errors.append(f"{prefix}: STFT 评分谐波起始阶次必须为整数")
+        if not isinstance(end_order, int) or isinstance(end_order, bool):
+            errors.append(f"{prefix}: STFT 评分谐波结束阶次必须为整数")
+        if (
+            isinstance(start_order, int)
+            and not isinstance(start_order, bool)
+            and start_order < 2
+        ):
+            errors.append(f"{prefix}: STFT 评分谐波起始阶次必须大于等于2")
+        if (
+            isinstance(start_order, int)
+            and not isinstance(start_order, bool)
+            and isinstance(end_order, int)
+            and not isinstance(end_order, bool)
+            and end_order < start_order
+        ):
+            errors.append(f"{prefix}: STFT 评分谐波结束阶次必须大于等于起始阶次")
         return errors
 
     def _validate_channel_limit_groups(self, prefix: str, channel: dict) -> list[str]:
@@ -816,6 +1343,19 @@ class ConfigService:
             ):
                 errors.append(f"{prefix}: {lower_label}必须小于上限")
         return errors
+
+    def _validate_channel_limit_tables(self, raw_limits, *, label: str) -> list[str]:
+        return [
+            self._channel_limit_table_validation_message(message)
+            for message in validate_limit_tables(raw_limits, label=label)
+        ]
+
+    @staticmethod
+    def _channel_limit_table_validation_message(message: str) -> str:
+        return (
+            message.replace("类型必须是 upper 或 lower", "类型必须是上限或下限")
+            .replace(" points 必须是列表", "频点列表必须是列表")
+        )
 
     @staticmethod
     def _limit_bound_label(label: str, bound: str) -> str:
@@ -1035,6 +1575,8 @@ class ConfigService:
                 "stft_overlap",
                 _CHANNEL_DEFAULTS["stft_overlap"],
             ),
+            **self._normalized_stft_color_scale_fields(channel),
+            **self._normalized_stft_score_fields(channel),
             "spl_weighting": channel.get(
                 "spl_weighting",
                 _CHANNEL_DEFAULTS["spl_weighting"],
@@ -1111,6 +1653,18 @@ class ConfigService:
                 "loudness_average_upper_limit",
                 _CHANNEL_DEFAULTS["loudness_average_upper_limit"],
             ),
+            "fft_x_axis_scale": self._normalize_fft_x_axis_scale(
+                channel.get(
+                    "fft_x_axis_scale",
+                    _CHANNEL_DEFAULTS["fft_x_axis_scale"],
+                )
+            ),
+            "fft_weighting": self._normalize_weighting(
+                channel.get(
+                    "fft_weighting",
+                    _CHANNEL_DEFAULTS["fft_weighting"],
+                )
+            ),
             "fft_band_limits": deepcopy(channel.get("fft_band_limits", [])),
             "oct_weighting": channel.get(
                 "oct_weighting",
@@ -1147,11 +1701,45 @@ class ConfigService:
     def _channel_db_values(self, channel: dict) -> dict:
         normalized_channel = dict(channel)
         self._normalize_channel_limit_storage(normalized_channel)
+        self._normalize_stft_color_scale_storage(normalized_channel)
+        self._normalize_stft_score_storage(normalized_channel)
         return {
             "channel_index": normalized_channel["channel_index"],
             "stft_nfft": normalized_channel["stft_nfft"],
             "fft_nfft": normalized_channel.get("fft_nfft", _CHANNEL_DEFAULTS["fft_nfft"]),
             "stft_overlap": normalized_channel["stft_overlap"],
+            "stft_color_scale_enabled": normalized_channel[
+                "stft_color_scale_enabled"
+            ],
+            "stft_color_scale_min_db": normalized_channel[
+                "stft_color_scale_min_db"
+            ],
+            "stft_color_scale_max_db": normalized_channel[
+                "stft_color_scale_max_db"
+            ],
+            "stft_score_enabled": normalized_channel["stft_score_enabled"],
+            "stft_score_summary_mode": normalized_channel[
+                "stft_score_summary_mode"
+            ],
+            "stft_score_percentile": normalized_channel["stft_score_percentile"],
+            "stft_score_loudness_reference_sone": normalized_channel[
+                "stft_score_loudness_reference_sone"
+            ],
+            "stft_score_modulation_reference": normalized_channel[
+                "stft_score_modulation_reference"
+            ],
+            "stft_score_harmonic_ratio_reference": normalized_channel[
+                "stft_score_harmonic_ratio_reference"
+            ],
+            "stft_score_frequency_instability_reference": normalized_channel[
+                "stft_score_frequency_instability_reference"
+            ],
+            "stft_score_harmonic_start_order": normalized_channel[
+                "stft_score_harmonic_start_order"
+            ],
+            "stft_score_harmonic_end_order": normalized_channel[
+                "stft_score_harmonic_end_order"
+            ],
             "spl_weighting": normalized_channel["spl_weighting"],
             "spl_time_constant": normalized_channel["spl_time_constant"],
             "spl_lower_enabled": normalized_channel["spl_lower_enabled"],
@@ -1173,6 +1761,18 @@ class ConfigService:
             "loudness_average_lower_limit": normalized_channel["loudness_average_lower_limit"],
             "loudness_average_upper_enabled": normalized_channel["loudness_average_upper_enabled"],
             "loudness_average_upper_limit": normalized_channel["loudness_average_upper_limit"],
+            "fft_x_axis_scale": self._normalize_fft_x_axis_scale(
+                normalized_channel.get(
+                    "fft_x_axis_scale",
+                    _CHANNEL_DEFAULTS["fft_x_axis_scale"],
+                )
+            ),
+            "fft_weighting": self._normalize_weighting(
+                normalized_channel.get(
+                    "fft_weighting",
+                    _CHANNEL_DEFAULTS["fft_weighting"],
+                )
+            ),
             "fft_band_limits": json.dumps(normalized_channel["fft_band_limits"]),
             "oct_weighting": normalized_channel["oct_weighting"],
             "oct_band_limits": json.dumps(normalized_channel["oct_band_limits"]),
@@ -1209,7 +1809,10 @@ class ConfigService:
 
     def _config_row_values(self, data: dict) -> dict:
         analysis_window_offset_ms = int(data.get("analysis_window_offset_ms", 0))
-        return {
+        manual_judgment_buttons_visible = (
+            _normalize_manual_judgment_buttons_visible(data)
+        )
+        values = {
             "config_name": data["config_name"].strip(),
             "record_duration": data["record_duration"],
             "analysis_duration": data["analysis_duration"],
@@ -1226,7 +1829,299 @@ class ConfigService:
             "output_device_hostapi": data.get("output_device_hostapi"),
             "output_device_samplerate": data.get("output_device_samplerate"),
             "selected_channels": json.dumps(data.get("selected_channels", [])),
+            "fault_types_json": encode_fault_types_json(data["fault_types"]),
         }
+        available_columns = self._config_table_columns()
+        if "fault_types_json" not in available_columns:
+            raise ValueError("test_config_table is missing fault_types_json")
+        if self._config_field_exists(
+            "manual_judgment_buttons_visible",
+            available_columns,
+        ):
+            values["manual_judgment_buttons_visible"] = (
+                manual_judgment_buttons_visible
+            )
+        if self._config_field_exists(
+            "input_hardware_device_id", available_columns
+        ):
+            values["input_hardware_device_id"] = data.get(
+                "input_hardware_device_id"
+            )
+        if self._config_field_exists("monitor_channel_index", available_columns):
+            values["monitor_channel_index"] = data.get("monitor_channel_index")
+        if self._config_field_exists("monitor_gain_db", available_columns):
+            values["monitor_gain_db"] = self._normalize_monitor_gain(
+                data.get("monitor_gain_db", MONITOR_GAIN_DEFAULT_DB)
+            )
+        if self._config_field_exists(
+            "vibration_view_channel_index",
+            available_columns,
+        ):
+            values["vibration_view_channel_index"] = data.get(
+                "vibration_view_channel_index"
+            )
+        if self._config_field_exists("result_dashboard_layout", available_columns):
+            values["result_dashboard_layout"] = serialize_result_dashboard_layout(
+                data.get("result_dashboard_layout")
+            )
+        current_meter = _normalize_current_meter_with_source(data.get("current_meter"))
+        self._add_current_meter_row_values(
+            values,
+            current_meter=current_meter,
+            available_columns=available_columns,
+        )
+        return values
+
+    def _add_current_meter_row_values(
+        self,
+        values: dict,
+        *,
+        current_meter: dict,
+        available_columns: set[str],
+    ) -> None:
+        field_map = {
+            "current_meter_enabled": "enabled",
+            "current_meter_source": "source",
+            "current_meter_host": "host",
+            "current_meter_port": "port",
+            "current_meter_unit_id": "unit_id",
+            "current_meter_register_type": "register_type",
+            "current_meter_register_address": "register_address",
+            "current_meter_register_count": "register_count",
+            "current_meter_data_type": "data_type",
+            "current_meter_byte_order": "byte_order",
+            "current_meter_word_order": "word_order",
+            "current_meter_scale": "scale",
+            "current_meter_offset": "offset",
+            "current_meter_poll_interval_ms": "poll_interval_ms",
+            "current_meter_timeout_ms": "timeout_ms",
+        }
+        for field_name, config_key in field_map.items():
+            if self._config_field_exists(field_name, available_columns):
+                values[field_name] = current_meter[config_key]
+
+    def _normalize_current_meter_from_row(self, row: dict) -> dict:
+        return _normalize_current_meter_with_source(
+            {
+                "enabled": row.get("current_meter_enabled", False),
+                "source": row.get("current_meter_source", "modbus_tcp"),
+                "host": row.get("current_meter_host"),
+                "port": row.get("current_meter_port"),
+                "unit_id": row.get("current_meter_unit_id"),
+                "register_type": row.get("current_meter_register_type"),
+                "register_address": row.get("current_meter_register_address"),
+                "register_count": row.get("current_meter_register_count"),
+                "data_type": row.get("current_meter_data_type"),
+                "byte_order": row.get("current_meter_byte_order"),
+                "word_order": row.get("current_meter_word_order"),
+                "scale": row.get("current_meter_scale"),
+                "offset": row.get("current_meter_offset"),
+                "poll_interval_ms": row.get("current_meter_poll_interval_ms"),
+                "timeout_ms": row.get("current_meter_timeout_ms"),
+            }
+        )
+
+    def _insert_config_row_values(self, values: dict) -> int:
+        available_columns = self._config_table_columns()
+        if (
+            "fault_types_json" in values
+            and "fault_types_json" not in available_columns
+        ):
+            raise ValueError("test_config_table is missing fault_types_json")
+        filtered_values = {
+            field_name: value
+            for field_name, value in values.items()
+            if self._config_field_exists(field_name, available_columns)
+        }
+        if not filtered_values:
+            raise ValueError("配置数据为空")
+
+        columns = []
+        params = []
+        for field_name, value in filtered_values.items():
+            field = TestConfigTable._meta.fields[field_name]
+            columns.append(field.column_name)
+            params.append(value)
+
+        table_name = TestConfigTable._meta.table_name
+        column_sql = ", ".join(f'"{column}"' for column in columns)
+        placeholder_sql = ", ".join("?" for _ in columns)
+        cursor = TestConfigTable._meta.database.execute_sql(
+            f'INSERT INTO "{table_name}" ({column_sql}) VALUES ({placeholder_sql})',
+            params,
+        )
+        config_id = filtered_values.get("config_id")
+        if config_id is not None:
+            return int(config_id)
+        return int(cursor.lastrowid)
+
+    @staticmethod
+    def _config_table_columns() -> set[str]:
+        cursor = TestConfigTable._meta.database.execute_sql(
+            f"PRAGMA table_info({TestConfigTable._meta.table_name})"
+        )
+        return {row[1] for row in cursor.fetchall()}
+
+    @staticmethod
+    def _config_field_exists(field_name: str, available_columns: set[str]) -> bool:
+        field = TestConfigTable._meta.fields[field_name]
+        return field.column_name in available_columns
+
+    def _resolve_monitor_channel_index(
+        self,
+        value,
+        *,
+        selected_channels: list,
+        managed_channel_count: int | None,
+    ) -> int | None:
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            return value
+        for channel_index in selected_channels:
+            if (
+                isinstance(channel_index, int)
+                and not isinstance(channel_index, bool)
+                and channel_index >= 0
+            ):
+                return channel_index
+        if managed_channel_count is not None:
+            return 0
+        return None
+
+    def _normalize_monitor_gain(self, value) -> float:
+        if value is None:
+            return MONITOR_GAIN_DEFAULT_DB
+        if self._is_numeric(value) and math.isfinite(float(value)):
+            return float(value)
+        return MONITOR_GAIN_DEFAULT_DB
+
+    @staticmethod
+    def _normalize_fft_x_axis_scale(value) -> str:
+        text = str(value or "").strip().lower()
+        return text if text in _VALID_FFT_X_AXIS_SCALES else "linear"
+
+    @staticmethod
+    def _normalize_weighting(value) -> str:
+        text = str(value or "").strip().upper()
+        return text if text in _VALID_WEIGHTING else "Z"
+
+    def _normalized_stft_color_scale_fields(self, channel: dict) -> dict:
+        enabled = channel.get(
+            "stft_color_scale_enabled",
+            _CHANNEL_DEFAULTS["stft_color_scale_enabled"],
+        )
+        if enabled is True:
+            return {
+                "stft_color_scale_enabled": True,
+                "stft_color_scale_min_db": channel.get(
+                    "stft_color_scale_min_db"
+                ),
+                "stft_color_scale_max_db": channel.get(
+                    "stft_color_scale_max_db"
+                ),
+            }
+        if enabled is not False:
+            return {
+                "stft_color_scale_enabled": enabled,
+                "stft_color_scale_min_db": channel.get(
+                    "stft_color_scale_min_db"
+                ),
+                "stft_color_scale_max_db": channel.get(
+                    "stft_color_scale_max_db"
+                ),
+            }
+        return {
+            "stft_color_scale_enabled": False,
+            "stft_color_scale_min_db": self._finite_float_or_default(
+                channel.get("stft_color_scale_min_db"),
+                _CHANNEL_DEFAULTS["stft_color_scale_min_db"],
+            ),
+            "stft_color_scale_max_db": self._finite_float_or_default(
+                channel.get("stft_color_scale_max_db"),
+                _CHANNEL_DEFAULTS["stft_color_scale_max_db"],
+            ),
+        }
+
+    def _normalize_stft_color_scale_storage(self, channel: dict) -> None:
+        normalized = self._normalized_stft_color_scale_fields(channel)
+        if normalized["stft_color_scale_enabled"]:
+            for field in (
+                "stft_color_scale_min_db",
+                "stft_color_scale_max_db",
+            ):
+                value = normalized[field]
+                if self._is_finite_number(value):
+                    normalized[field] = float(value)
+        channel.update(normalized)
+
+    @staticmethod
+    def _normalize_stft_score_summary_mode(value) -> str:
+        if isinstance(value, str) and value in _VALID_STFT_SCORE_SUMMARY_MODES:
+            return value
+        return _CHANNEL_DEFAULTS["stft_score_summary_mode"]
+
+    def _normalized_stft_score_fields(self, channel: dict) -> dict:
+        return {
+            field: channel[field] if field in channel else _CHANNEL_DEFAULTS[field]
+            for field in (
+                "stft_score_enabled",
+                "stft_score_summary_mode",
+                "stft_score_percentile",
+                "stft_score_loudness_reference_sone",
+                "stft_score_modulation_reference",
+                "stft_score_harmonic_ratio_reference",
+                "stft_score_frequency_instability_reference",
+                "stft_score_harmonic_start_order",
+                "stft_score_harmonic_end_order",
+            )
+        }
+
+    def _normalize_stft_score_storage(self, channel: dict) -> None:
+        normalized = self._normalized_stft_score_fields(channel)
+        normalized["stft_score_enabled"] = (
+            normalized["stft_score_enabled"] is True
+        )
+        normalized["stft_score_summary_mode"] = (
+            self._normalize_stft_score_summary_mode(
+                normalized["stft_score_summary_mode"]
+            )
+        )
+        for field in (
+            "stft_score_percentile",
+            "stft_score_loudness_reference_sone",
+            "stft_score_modulation_reference",
+            "stft_score_harmonic_ratio_reference",
+            "stft_score_frequency_instability_reference",
+        ):
+            normalized[field] = self._finite_float_or_default(
+                normalized[field],
+                _CHANNEL_DEFAULTS[field],
+            )
+        for field in (
+            "stft_score_harmonic_start_order",
+            "stft_score_harmonic_end_order",
+        ):
+            normalized[field] = self._int_or_default(
+                normalized[field],
+                _CHANNEL_DEFAULTS[field],
+            )
+        channel.update(normalized)
+
+    def _finite_float_or_default(self, value, default: float) -> float:
+        value = self._finite_float_or_none(value)
+        if value is None:
+            return float(default)
+        return value
+
+    def _finite_float_or_none(self, value) -> float | None:
+        if self._is_finite_number(value):
+            return float(value)
+        return None
+
+    @staticmethod
+    def _int_or_default(value, default: int) -> int:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return int(value)
+        return int(default)
 
     def _replace_channel_rows(self, *, config_id: int, channels: list[dict]) -> None:
         ChannelConfigTable.delete().where(ChannelConfigTable.config == config_id).execute()
@@ -1293,6 +2188,15 @@ class ConfigService:
                 channel[field] = float(value)
             else:
                 channel[field] = float(_CHANNEL_DEFAULTS[field])
+        for label, key in [("FFT", "fft_band_limits"), ("倍频程", "oct_band_limits")]:
+            raw_limits = channel.get(key, [])
+            if validate_limit_tables(raw_limits, label=label):
+                channel[key] = deepcopy(raw_limits)
+            else:
+                channel[key] = normalize_limit_tables_for_storage(
+                    raw_limits,
+                    label=label,
+                )
 
     @staticmethod
     def _parse_json(text: str, default):
@@ -1316,3 +2220,14 @@ class ConfigService:
     @staticmethod
     def _is_numeric(value) -> bool:
         return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    @staticmethod
+    def _is_finite_number(value) -> bool:
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and math.isfinite(float(value))
+        )
+
+    def _is_positive_finite(self, value) -> bool:
+        return self._is_finite_number(value) and float(value) > 0.0

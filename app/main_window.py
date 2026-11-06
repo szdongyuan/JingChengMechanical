@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 import os
+import sys
+from threading import Thread
 
-from PyQt6.QtCore import QMetaObject, QSize, Qt
+from PyQt6.QtCore import QProcess, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QIcon, QPainter, QPixmap
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QHBoxLayout,
-    QGridLayout,
     QLabel,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QStackedWidget,
     QToolButton,
     QVBoxLayout,
@@ -20,19 +23,29 @@ from PyQt6.QtWidgets import (
 
 from base.utils import asset_path
 
-from app.services_container import FactoryControllerState, FactoryReviewPayload
+from app.service.multi_run_coordinator_mvp import (
+    ManualJudgmentRequest as CompositeManualJudgmentRequest,
+    OperationResult,
+    OperationStatus,
+    ReanalysisCancelRequest as CompositeReanalysisCancelRequest,
+    ReanalysisRequest as CompositeReanalysisRequest,
+    TerminalConclusion,
+)
+from app.service.multi_run_integration.shutdown import ApplicationShutdownReport
+from app.service.result_history_contracts import (
+    ManualJudgmentRequest as UiManualJudgmentRequest,
+    ReanalysisCancelRequest as UiReanalysisCancelRequest,
+    ReanalysisRequest as UiReanalysisRequest,
+)
+from app.services_container import FactoryControllerState
 from consts.style import APP_QSS
 from ui.widgets.cards import Card
-from ui.widgets.analysis_channel_toolbar import AnalysisChannelToolbar
+from ui.widgets.video_preview_overlay import VideoPreviewOverlay
 from ui.modules.workorder import WorkOrderModule
 from ui.modules.control import ControlModule
-from ui.modules.spectrum import SpectrumModule
-from ui.modules.stft import StftModule
-from ui.modules.loudness import LoudnessModule
-from ui.modules.spl import SplModule
-from ui.modules.octave import OctaveModule
-from ui.modules.result import ResultModule
+from ui.modules.result_dashboard import ResultDashboardModule
 from ui.modules.video import VideoModule
+from ui.modules.today_statistics import TodayStatisticsModule
 from ui.modules.hardware import HardwareModule
 from ui.modules.data_management import DataManagementModule
 from ui.modules.input_calibration import InputCalibrationModule
@@ -47,28 +60,23 @@ from ui.modules.delete_user import DeleteUserWindow
 
 ROLE_PERMISSIONS = {
     "管理员": {
-        "tabs": {"测试", "数据管理", "配置", "AI工具管理", "硬件"},
+        "tabs": {"测试", "数据管理", "配置", "AI管理", "硬件"},
         "actions": {"切换用户", "添加用户", "删除用户", "修改密码"},
     },
     "工程师": {
-        "tabs": {"测试", "数据管理", "配置", "AI工具管理", "硬件"},
+        "tabs": {"测试", "数据管理", "配置", "AI管理", "硬件"},
         "actions": {"切换用户", "修改密码"},
     },
     "操作员": {
-        "tabs": {"测试"},
-        "actions": {"切换用户", "修改密码"},
+        "tabs": {"测试", "数据管理"},
+        "actions": {"切换用户"},
     },
 }
 
 
 class MainWindow(QMainWindow):
     _TEST_PAGE_INDEX = 0
-    _DISPLAY_CHANNEL_PHASES = frozenset(
-        {"running", "analyzing", "reviewing", "reanalyzing", "stopped"}
-    )
-    _COMMITTED_CHART_CHANNEL_PHASES = frozenset(
-        {"reviewing", "reanalyzing", "stopped"}
-    )
+    _manual_judgment_completed = pyqtSignal(object)
 
     def __init__(self, services):
         super().__init__()
@@ -81,15 +89,17 @@ class MainWindow(QMainWindow):
         self.change_password_window = None
         self.add_user_window = None
         self.delete_user_window = None
-        self.login_shown = False
         factory_mode = getattr(self.services, "factory_mode", None)
         self._factory_state = getattr(factory_mode, "state", FactoryControllerState())
-        self._review_payload = getattr(factory_mode, "review_payload", FactoryReviewPayload())
-        self.display_channel_by_config_id: dict[int, int] = {}
-        self._last_selected_display_channel: int | None = None
+        self._selected_plc_bindings: tuple[int, ...] = ()
+        self._selected_config_count = 0
+        self._selected_unbound_plc_count = 0
+        self._selected_config_load_error_count = 0
+        self._selected_plc_tooltip = ""
         self._current_main_tab_index = self._TEST_PAGE_INDEX
         self._pending_guarded_tab_index: int | None = None
         self._reverting_main_tab_change = False
+        self._restart_in_progress = False
 
         self.setWindowTitle("智能电机检测")
         icon_path = asset_path("logo.ico")
@@ -111,8 +121,10 @@ class MainWindow(QMainWindow):
         outer.addWidget(self.tab, 1)
 
         self._connect_bus_signals()
+        self._reload_selected_plc_bindings()
+        self._refresh_plc_state_labels()
 
-        # 页面：测试/数据管理/配置/AI工具管理/硬件
+        # 页面：测试/数据管理/配置/AI管理/硬件
         self.tab.addWidget(self.build_test_page())
         self.tab.addWidget(self.build_data_page())
         self.tab.addWidget(self.build_config_page())
@@ -121,15 +133,7 @@ class MainWindow(QMainWindow):
         self.tab.currentChanged.connect(self._on_main_tab_changed)
 
         self.services.bus.log.emit("[App] 启动程序")
-        self._sync_analysis_toolbar()
-        self._refresh_analysis_display_modules()
         self.set_role()
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        if not self.login_shown:
-            self.login_shown = True
-            self.show_login_window(close_main_window=True, window_title="登录")
 
     def show_login_window(self, close_main_window=False, window_title="登录"):
         def on_login_success(username: str, role: str):
@@ -218,7 +222,7 @@ class MainWindow(QMainWindow):
             group.addButton(b)
             lay.addWidget(b)
             return b
-        self.tab_names = ["测试", "数据管理", "配置", "AI工具管理", "硬件"]
+        self.tab_names = ["测试", "数据管理", "配置", "AI管理", "硬件"]
         for i, name in enumerate(self.tab_names):
             b = add_tab(name, checked=(i == 0))
             self.top_button_dict[name] = b
@@ -249,6 +253,27 @@ class MainWindow(QMainWindow):
         user_menu.addAction(self.action_change_pwd)
         self.user_btn.setMenu(user_menu)
         lay.addWidget(self.user_btn)
+
+        plc_state_bar = QWidget()
+        plc_state_lay = QHBoxLayout(plc_state_bar)
+        plc_state_lay.setContentsMargins(66, 0, 0, 0)
+        plc_state_lay.setSpacing(12)
+        self.selected_plc_state_label = QLabel("PLC：未选择配置")
+        self.process_plc_state_label = QLabel("工艺：未连接")
+        for label in (
+            self.selected_plc_state_label,
+            self.process_plc_state_label,
+        ):
+            label.setStyleSheet("color: #475569; font-size: 12px;")
+            plc_state_lay.addWidget(label)
+        lay.addWidget(plc_state_bar)
+
+        self.plc_state_timer = QTimer(self)
+        # 2秒刷一下
+        self.plc_state_timer.setInterval(2000)
+        self.plc_state_timer.timeout.connect(self._refresh_plc_state_labels)
+        self.plc_state_timer.start()
+        self._refresh_plc_state_labels()
 
         lay.addStretch(1)
         return topbar
@@ -313,64 +338,291 @@ class MainWindow(QMainWindow):
         left_lay.setSpacing(5)
 
         self.workorder = WorkOrderModule(self.services)
-        left_lay.addWidget(Card("工单输入", self.workorder), 2)
+        left_lay.addWidget(Card("工单", self.workorder), 1)
 
         self.control = ControlModule(self.services)
-        left_lay.addWidget(Card("控制面板", self.control), 1)
+        self.control.btn_stop.setText("停止测试")
+        self.control.restart_intent.connect(self._restart_application)
+        left_lay.addWidget(Card("控制面板", self.control))
+
+        self.today_statistics = TodayStatisticsModule(self.services)
+        self.today_statistics_card = Card("今日数据统计", self.today_statistics)
+        self.today_statistics_card.setFixedHeight(108)
+        left_lay.addWidget(self.today_statistics_card)
 
         self.video = VideoModule(self.services)
-        left_lay.addWidget(Card("视频预览", self.video))
+        self.services.register_independent_shutdown_resource(
+            self.video.stop_camera
+        )
+        self.video_placeholder = QWidget()
+        self.video_placeholder.setFixedHeight(270)
+        left_lay.addWidget(self.video_placeholder)
 
         content_lay.addWidget(left)
 
-        # 右侧主区域：3x2 网格（6 个卡片同尺寸）
+        # 右侧主区域：运行时结果展示面板
         main = QWidget()
         main_lay = QVBoxLayout(main)
         main_lay.setContentsMargins(0, 0, 0, 0)
         main_lay.setSpacing(12)
 
-        grid = QGridLayout()
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setSpacing(5)
-
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(2, 1)
-        grid.setRowStretch(0, 0)
-        grid.setRowStretch(1, 1)
-        grid.setRowStretch(2, 1)
-
-        self.result = ResultModule(self.services)
-        grid.addWidget(Card("结果摘要", self.result), 1, 0)
-
-        self.analysis_toolbar = AnalysisChannelToolbar()
-        self.analysis_toolbar.channel_changed.connect(self._on_analysis_channel_changed)
-        self.analysis_toolbar.hide()
-        grid.addWidget(self.analysis_toolbar, 0, 1, 1, 2)
-
-        self.spectrum = SpectrumModule(self.services)
-        grid.addWidget(Card("FFT频谱（dB）", self.spectrum), 1, 2)
-
-        self.stft = StftModule(self.services)
-        grid.addWidget(Card("STFT时频图（频率Hz，幅值dB）", self.stft), 1, 1)
-
-        self.loudness = LoudnessModule(self.services)
-        self.loudness_card = Card("响度", self.loudness)
-        self.loudness.title_changed.connect(self.loudness_card.set_title)
-        self.loudness_card.set_title(self.loudness.current_title())
-        grid.addWidget(self.loudness_card, 2, 0)
-
-        self.spl = SplModule(self.services)
-        grid.addWidget(Card("声压级（dB）", self.spl), 2, 1)
-
-        self.octave = OctaveModule(self.services)
-        grid.addWidget(Card("倍频程（dB）", self.octave), 2, 2)
-
-        self._attach_analysis_channel_providers()
-
-        main_lay.addLayout(grid, 1)
+        self.result_dashboard = ResultDashboardModule(
+            self.services,
+            self.services.result_history_store,
+            self.control.manual_judgment_widget,
+        )
+        self.services.attach_committed_history_observer(
+            self.today_statistics.on_committed_history_event
+        )
+        self.history_adapter = self.services.attach_result_dashboard(
+            self.result_dashboard
+        )
+        self._wire_run_scoped_result_operations()
+        main_lay.addWidget(self.result_dashboard, 1)
         content_lay.addWidget(main, 1)
+
+        self.video_card = VideoPreviewOverlay(
+            page,
+            self.video,
+            self.video_placeholder,
+        )
+        QTimer.singleShot(0, self.video_card.sync_geometry)
         return page
+
+    def _wire_run_scoped_result_operations(self) -> None:
+        completion_signal = getattr(
+            self,
+            "_manual_judgment_completed",
+            None,
+        )
+        if callable(getattr(completion_signal, "connect", None)):
+            completion_signal.connect(
+                self.control.handle_manual_judgment_result
+            )
+        self.result_dashboard.manual_judgment_target_changed.connect(
+            self.control.set_manual_judgment_target
+        )
+        self.control.manual_judgment_intent.connect(
+            self.result_dashboard.request_manual_judgment
+        )
+        self.result_dashboard.manual_judgment_requested.connect(
+            self._apply_manual_judgment_request
+        )
+        self.result_dashboard.reanalysis_requested.connect(
+            self._start_reanalysis_request
+        )
+        self.result_dashboard.reanalysis_cancel_requested.connect(
+            self._cancel_reanalysis_request
+        )
+        self.control.stop_intent.connect(self._stop_all_active_runs)
+
+    def _apply_manual_judgment_request(self, request: object) -> None:
+        if type(request) is not UiManualJudgmentRequest:
+            return
+        if request.label == "OK":
+            conclusion = TerminalConclusion.OK
+        elif request.label == "NG":
+            conclusion = TerminalConclusion.NG
+        else:
+            return
+        composite_request = CompositeManualJudgmentRequest(
+            run_id=request.run_id,
+            expected_revision=request.expected_revision,
+            conclusion=conclusion,
+            fault_type=request.fault_type,
+            bounded_note="",
+        )
+        completion_signal = getattr(
+            self,
+            "_manual_judgment_completed",
+            None,
+        )
+        if callable(getattr(completion_signal, "emit", None)):
+            Thread(
+                target=self._commit_manual_judgment,
+                args=(composite_request,),
+                name="manual-judgment-save",
+                daemon=True,
+            ).start()
+            return
+
+        result = self.services.multi_run_coordinator.apply_manual(
+            composite_request
+        )
+        self.control.handle_manual_judgment_result(result)
+
+    def _commit_manual_judgment(
+        self,
+        request: CompositeManualJudgmentRequest,
+    ) -> None:
+        try:
+            result = self.services.multi_run_coordinator.apply_manual(request)
+        except Exception as exc:
+            result = OperationResult(
+                run_id=request.run_id,
+                status=OperationStatus.PERSISTENCE_REJECTED,
+                attempt_id=None,
+                reason=str(exc).strip() or type(exc).__name__,
+            )
+        self._manual_judgment_completed.emit(result)
+
+    def _start_reanalysis_request(self, request: object) -> None:
+        if type(request) is not UiReanalysisRequest:
+            return
+        result = self.services.multi_run_coordinator.start_reanalysis(
+            CompositeReanalysisRequest(
+                run_id=request.run_id,
+                expected_revision=request.expected_revision,
+                start_sec=request.start_sec,
+                end_sec=request.end_sec,
+            )
+        )
+        if (
+            type(result) is OperationResult
+            and result.status is OperationStatus.NOT_FOUND
+        ):
+            self.services.bus.status.emit(
+                "重新分析失败：所选运行记录不存在，可能已被删除"
+            )
+
+    def _cancel_reanalysis_request(self, request: object) -> None:
+        if type(request) is not UiReanalysisCancelRequest:
+            return
+        self.services.multi_run_coordinator.cancel_reanalysis(
+            CompositeReanalysisCancelRequest(
+                run_id=request.run_id,
+                attempt_id=request.operation_id,
+                expected_revision=request.expected_revision,
+            )
+        )
+
+    def _stop_all_active_runs(self) -> None:
+        self.services.multi_run_coordinator.stop_all(5.0)
+
+    def _refresh_plc_state_labels(self):
+        plc_states = getattr(self.services, "plc_state", {})
+        if not isinstance(plc_states, dict):
+            plc_states = {}
+
+        process_state = getattr(self.services, "process_plc_state", "未连接")
+        self.selected_plc_state_label.setText(
+            self._plc_status_html(
+                self._visible_plc_ids(plc_states, self._selected_plc_bindings),
+                self._selected_plc_bindings,
+                plc_states,
+                selected_config_count=self._selected_config_count,
+                unbound_config_count=self._selected_unbound_plc_count,
+                load_error_count=self._selected_config_load_error_count,
+            )
+        )
+        self.selected_plc_state_label.setToolTip(self._selected_plc_tooltip)
+        self._set_plc_state_label(self.process_plc_state_label, "工艺", process_state)
+
+    def _reload_selected_plc_bindings(self) -> None:
+        selected_config_ids = tuple(self._factory_state.selected_config_ids)
+        config_service = getattr(self.services, "config_service", None)
+        load_config = getattr(config_service, "load_config", None)
+
+        plc_ids: list[int] = []
+        seen_plc_ids: set[int] = set()
+        unbound_count = 0
+        load_error_count = 0
+        tooltip_rows: list[str] = []
+        for config_id in selected_config_ids:
+            try:
+                config = load_config(config_id) if callable(load_config) else None
+            except Exception:
+                config = None
+            if not isinstance(config, dict):
+                load_error_count += 1
+                tooltip_rows.append(f"配置 {config_id}：加载失败")
+                continue
+
+            config_name = str(config.get("config_name") or f"配置 {config_id}")
+            plc_id = config.get("plc_id")
+            if not isinstance(plc_id, int) or isinstance(plc_id, bool):
+                unbound_count += 1
+                tooltip_rows.append(f"{config_name}：未绑定 PLC")
+                continue
+
+            tooltip_rows.append(f"{config_name}：PLC {plc_id}")
+            if plc_id not in seen_plc_ids:
+                seen_plc_ids.add(plc_id)
+                plc_ids.append(plc_id)
+
+        self._selected_plc_bindings = tuple(plc_ids)
+        self._selected_config_count = len(selected_config_ids)
+        self._selected_unbound_plc_count = unbound_count
+        self._selected_config_load_error_count = load_error_count
+        self._selected_plc_tooltip = "\n".join(tooltip_rows)
+
+    @classmethod
+    def _plc_status_html(
+        cls,
+        visible_plc_ids: tuple[int, ...],
+        plc_ids: tuple[int, ...],
+        plc_states: dict,
+        *,
+        selected_config_count: int,
+        unbound_config_count: int,
+        load_error_count: int,
+    ) -> str:
+        muted_color = "#64748b"
+        if visible_plc_ids:
+            parts = []
+            for plc_id in visible_plc_ids:
+                state = plc_states.get(plc_id, "未连接")
+                color = cls._plc_state_color(state)
+                parts.append(
+                    f"PLC {plc_id}：<span style='color: {color};'>{state}</span>"
+                )
+            return "　".join(parts)
+
+        if selected_config_count == 0:
+            return f"PLC：<span style='color: {muted_color};'>未选择配置</span>"
+
+        parts = []
+        for plc_id in plc_ids:
+            state = plc_states.get(plc_id, "未连接")
+            color = cls._plc_state_color(state)
+            parts.append(
+                f"PLC {plc_id}：<span style='color: {color};'>{state}</span>"
+            )
+        if unbound_config_count:
+            parts.append(
+                f"<span style='color: {muted_color};'>"
+                f"{unbound_config_count} 个配置未绑定 PLC</span>"
+            )
+        if load_error_count:
+            parts.append(
+                f"<span style='color: #dc2626;'>"
+                f"{load_error_count} 个配置加载失败</span>"
+            )
+        return "　".join(parts)
+
+    @staticmethod
+    def _visible_plc_ids(plc_states: dict, selected_plc_ids: tuple[int, ...]) -> tuple[int, ...]:
+        state_ids = sorted(
+            plc_id
+            for plc_id in plc_states
+            if type(plc_id) is int and plc_id > 0
+        )
+        if state_ids:
+            return tuple(state_ids)
+        return tuple(selected_plc_ids)
+
+    @staticmethod
+    def _plc_state_color(state: str) -> str:
+        if state == "已连接":
+            return "#16a34a"
+        if state in ("连接中", "重连中"):
+            return "#d97706"
+        return "#dc2626"
+
+    @staticmethod
+    def _set_plc_state_label(label, name, state):
+        color = MainWindow._plc_state_color(state)
+        label.setText(f"{name}：<span style='color: {color};'>{state}</span>")
 
     def build_placeholder_page(self, title: str) -> QWidget:
         page = QWidget()
@@ -412,7 +664,7 @@ class MainWindow(QMainWindow):
         lay.setSpacing(0)
 
         self.ai_tool_management_module = AiToolManagementModule(self.services)
-        lay.addWidget(Card("AI工具管理", self.ai_tool_management_module), 1)
+        lay.addWidget(Card("AI管理", self.ai_tool_management_module), 1)
         return page
 
     def build_hardware_page(self) -> QWidget:
@@ -432,7 +684,7 @@ class MainWindow(QMainWindow):
         left_lay.setSpacing(12)
 
         hw = HardwareModule(self.services)
-        left_lay.addWidget(Card("设备选择", hw), 1)
+        left_lay.addWidget(Card("输入硬件管理", hw), 1)
         content_lay.addWidget(left, 7)
 
         # 右侧主区域：通道选择 / 输入校准 / PLC 设置作为一个整体垂直排列。
@@ -445,9 +697,13 @@ class MainWindow(QMainWindow):
         cal_card = Card("麦克风输入校准", cal)
 
         channel = ChannelSelectModule(self.services)
-        channel_card = Card("通道选择", channel)
+        channel_card = Card("硬件通道启用", channel)
 
         self.plc_settings_module = PlcSettingsModule(self.services)
+        self.services.register_independent_shutdown_resource(
+            self.plc_settings_module.stop_process_param_service
+        )
+        self.services.get_process_param_values = self.plc_settings_module.get_process_param_values
         self.plc_settings_card = Card("PLC设置", self.plc_settings_module)
 
         main_lay.addWidget(channel_card, 1)
@@ -461,10 +717,14 @@ class MainWindow(QMainWindow):
             self.services.bus.log.connect(self._show_latest_log_line)
         if hasattr(self.services.bus, "factory_state_changed"):
             self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
-        if hasattr(self.services.bus, "factory_review_changed"):
-            self.services.bus.factory_review_changed.connect(self._on_factory_review_changed)
-        if hasattr(self.services.bus, "factory_display_reset"):
-            self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
+        if hasattr(self.services.bus, "config_changed"):
+            self.services.bus.config_changed.connect(self._on_plc_binding_data_changed)
+        if hasattr(self.services.bus, "plc_changed"):
+            self.services.bus.plc_changed.connect(self._on_plc_binding_data_changed)
+
+    def _on_plc_binding_data_changed(self) -> None:
+        self._reload_selected_plc_bindings()
+        self._refresh_plc_state_labels()
 
     def _show_latest_log_line(self, message) -> None:
         self.statusBar().showMessage(self._latest_non_empty_log_line(message))
@@ -478,35 +738,13 @@ class MainWindow(QMainWindow):
                 return normalized
         return ""
 
-    def current_display_channel_index(self) -> int | None:
-        config_id = self._factory_state.displayed_config_id
-        if config_id is None:
-            return None
-        return self.display_channel_by_config_id.get(config_id)
-
-    def _attach_analysis_channel_providers(self) -> None:
-        for module in (self.result, self.stft, self.loudness, self.spl, self.spectrum, self.octave):
-            module.selected_display_channel_provider = self.current_display_channel_index
-        for module in (self.loudness, self.spl, self.spectrum, self.octave):
-            module.selected_display_channel_sync = self._sync_selected_display_channel
-
     def _on_factory_state_changed(self, state) -> None:
         if isinstance(state, FactoryControllerState):
             self._factory_state = state
         else:
             self._factory_state = FactoryControllerState()
-        self._sync_analysis_toolbar()
-
-    def _on_factory_review_changed(self, review) -> None:
-        if isinstance(review, FactoryReviewPayload):
-            self._review_payload = review
-        else:
-            self._review_payload = FactoryReviewPayload()
-        self._sync_analysis_toolbar()
-
-    def _on_factory_display_reset(self, _reason: str) -> None:
-        self._review_payload = FactoryReviewPayload()
-        self._sync_analysis_toolbar()
+        self._reload_selected_plc_bindings()
+        self._refresh_plc_state_labels()
 
     def _on_topbar_tab_clicked(self, index: int) -> None:
         current_index = self.tab.currentIndex()
@@ -546,8 +784,6 @@ class MainWindow(QMainWindow):
     def _finalize_main_tab_change(self, index: int) -> None:
         self._current_main_tab_index = index
         self._sync_topbar_selection(index)
-        if index == self._TEST_PAGE_INDEX:
-            self._refresh_analysis_display_modules()
 
     def _revert_main_tab_change(self, previous_index: int) -> None:
         self._reverting_main_tab_change = True
@@ -606,11 +842,9 @@ class MainWindow(QMainWindow):
         return None
 
     def _can_leave_main_tab(self, index: int | None) -> bool:
-        if index != self._ai_tool_management_tab_index():
-            return True
-
+        guarded_module = self._guarded_main_tab_module(index)
         confirm_leave = getattr(
-            getattr(self, "ai_tool_management_module", None),
+            guarded_module,
             "confirm_leave",
             None,
         )
@@ -618,202 +852,109 @@ class MainWindow(QMainWindow):
             return bool(confirm_leave())
         return True
 
-    def _ai_tool_management_tab_index(self) -> int | None:
+    def _guarded_main_tab_module(self, index: int | None):
+        if index == self._config_tab_index():
+            return getattr(self, "config_module", None)
+        if index == self._ai_tool_management_tab_index():
+            return getattr(self, "ai_tool_management_module", None)
+        return None
+
+    def _config_tab_index(self) -> int | None:
         try:
-            return self.tab_names.index("AI工具管理")
+            return self.tab_names.index("配置")
         except ValueError:
             return None
 
-    def _on_analysis_channel_changed(self, channel_index: int) -> None:
-        self._sync_selected_display_channel(channel_index, refresh_modules=False)
-        self._refresh_analysis_display_modules()
-
-    def _sync_selected_display_channel(
-        self,
-        channel_index: int,
-        *,
-        refresh_modules: bool = True,
-    ) -> None:
-        config_id = self._factory_state.displayed_config_id
-        if config_id is None:
-            return
-
-        selected_channels = self._selected_channels_for_config(config_id)
-        if channel_index not in selected_channels:
-            return
-
-        self._last_selected_display_channel = channel_index
-        self.display_channel_by_config_id[config_id] = channel_index
-        self.analysis_toolbar.set_current_channel(channel_index)
-        self.analysis_toolbar.set_context_label_text(
-            self._build_analysis_toolbar_context(config_id, channel_index)
-        )
-        self._emit_factory_display_channel_changed(config_id, channel_index)
-
-        if refresh_modules:
-            self._refresh_analysis_display_modules()
-
-    def _refresh_analysis_display_modules(self) -> None:
-        for module in (self.stft, self.loudness, self.spl, self.spectrum, self.octave, self.result):
-            refresh = getattr(module, "refresh_selected_display_channel", None)
-            if callable(refresh):
-                refresh()
-
-    def _sync_analysis_toolbar(self) -> None:
-        if not hasattr(self, "analysis_toolbar"):
-            return
-
-        config_id = self._factory_state.displayed_config_id
-        if (
-            config_id is None
-            or self._factory_state.run_phase not in self._DISPLAY_CHANNEL_PHASES
-        ):
-            if config_id is not None:
-                self.display_channel_by_config_id.pop(config_id, None)
-            self.analysis_toolbar.set_available_channels([])
-            self.analysis_toolbar.set_context_label_text("")
-            self.analysis_toolbar.hide()
-            return
-
-        channels = self._resolve_display_channels(config_id)
-        if not channels:
-            self.display_channel_by_config_id.pop(config_id, None)
-            self.analysis_toolbar.set_available_channels([])
-            self.analysis_toolbar.set_context_label_text("")
-            self.analysis_toolbar.hide()
-            return
-
-        current_channel = self._resolve_current_display_channel(config_id, channels)
-        if current_channel is None:
-            self.display_channel_by_config_id.pop(config_id, None)
-            self.analysis_toolbar.set_available_channels([])
-            self.analysis_toolbar.set_context_label_text("")
-            self.analysis_toolbar.hide()
-            return
-
-        self.display_channel_by_config_id[config_id] = current_channel
-        self.analysis_toolbar.set_available_channels(channels)
-        self.analysis_toolbar.set_current_channel(current_channel)
-        self.analysis_toolbar.set_context_label_text(
-            self._build_analysis_toolbar_context(config_id, current_channel)
-        )
-        self.analysis_toolbar.show()
-        self._emit_factory_display_channel_changed(config_id, current_channel)
-
-    def _emit_factory_display_channel_changed(
-        self,
-        config_id: int,
-        channel_index: int,
-    ) -> None:
-        signal = getattr(self.services.bus, "factory_display_channel_changed", None)
-        emit = getattr(signal, "emit", None)
-        if callable(emit):
-            emit(config_id, channel_index)
-
-    def _resolve_display_channels(self, config_id: int) -> list[int]:
-        return self._selected_channels_for_config(config_id)
-
-    def _resolve_current_display_channel(
-        self,
-        config_id: int,
-        channels: list[int],
-    ) -> int | None:
-        if not channels:
-            return None
-
-        remembered_channel = self._last_selected_display_channel
-        review_channels = []
-        if self._factory_state.run_phase in self._COMMITTED_CHART_CHANNEL_PHASES:
-            review_channels = self._chart_payload_channels_for_config(config_id)
-
-        if remembered_channel in channels:
-            candidate_channel = remembered_channel
-        else:
-            candidate_channel = channels[0]
-
-        if review_channels and candidate_channel not in review_channels:
-            for channel in channels:
-                if channel in review_channels:
-                    return channel
-            return None
-
-        return candidate_channel
-
-    def _selected_channels_for_config(self, config_id: int) -> list[int]:
-        config_service = getattr(self.services, "config_service", None)
-        load_config = getattr(config_service, "load_config", None)
-        if not callable(load_config):
-            return []
-
+    def _ai_tool_management_tab_index(self) -> int | None:
         try:
-            config = load_config(config_id)
+            return self.tab_names.index("AI管理")
+        except ValueError:
+            return None
+
+    def _restart_application(self) -> None:
+        if self._restart_in_progress:
+            return
+
+        self._restart_in_progress = True
+        self.control.set_restart_pending(True)
+        if not self._can_leave_main_tab(self.tab.currentIndex()):
+            self._restore_restart_control()
+            return
+
+        self.services.bus.log.emit("[App] 重启程序")
+        shutdown_clean = True
+        try:
+            self.control.shutdown()
         except Exception:
-            return []
+            shutdown_clean = False
+        try:
+            shutdown_report = self.services.shutdown()
+            shutdown_clean = (
+                shutdown_clean
+                and type(shutdown_report) is ApplicationShutdownReport
+                and shutdown_report.clean is True
+            )
+        except Exception:
+            shutdown_clean = False
 
-        if not isinstance(config, dict):
-            return []
+        if not shutdown_clean:
+            QMessageBox.critical(
+                self,
+                "重启软件",
+                "软件关闭失败，未启动新实例。请重试或手动重启软件。",
+            )
+            self._restore_restart_control()
+            return
 
-        return self._normalize_channels(config.get("selected_channels", []))
+        program, arguments = self._restart_command()
+        try:
+            detached_result = QProcess.startDetached(program, arguments)
+            launched = (
+                bool(detached_result[0])
+                if isinstance(detached_result, tuple)
+                else bool(detached_result)
+            )
+        except Exception:
+            launched = False
 
-    def _chart_payload_channels_for_config(self, config_id: int) -> list[int]:
-        if self._review_payload.displayed_config_id != config_id:
-            return []
-        chart_payload = getattr(self._review_payload, "chart_payload", None)
-        if not isinstance(chart_payload, dict):
-            return []
-        return self._normalize_channels(chart_payload.keys())
+        if not launched:
+            QMessageBox.critical(
+                self,
+                "重启软件",
+                "软件重启失败，未启动新实例。请手动启动软件。",
+            )
+            self._restore_restart_control()
+            return
+
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def _restore_restart_control(self) -> None:
+        self._restart_in_progress = False
+        self.control.set_restart_pending(False)
 
     @staticmethod
-    def _normalize_channels(channels) -> list[int]:
-        normalized_channels: list[int] = []
-        for channel in channels or ():
-            try:
-                channel_index = int(channel)
-            except (TypeError, ValueError):
-                continue
-            if channel_index not in normalized_channels:
-                normalized_channels.append(channel_index)
-        return normalized_channels
-
-    @staticmethod
-    def _build_analysis_toolbar_context(config_id: int, channel_index: int) -> str:
-        return f"配置 {config_id} / 通道{channel_index + 1}"
+    def _restart_command() -> tuple[str, list[str]]:
+        arguments = list(sys.argv[1:])
+        if getattr(sys, "frozen", False):
+            return sys.executable, arguments
+        main_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), os.pardir, "main.py")
+        )
+        return sys.executable, [main_path, *arguments]
 
     def closeEvent(self, event: QCloseEvent):
-        if not self._can_leave_main_tab(self._ai_tool_management_tab_index()):
+        if not self._can_leave_main_tab(self.tab.currentIndex()):
             event.ignore()
             return
         self.services.bus.log.emit("[App] 关闭程序")
         try:
-            for plc_service in getattr(self.services, "plc_services", {}).values():
-                if plc_service is None:
-                    continue
-                try:
-                    QMetaObject.invokeMethod(
-                        plc_service,
-                        "stop_plc_service",
-                        Qt.ConnectionType.BlockingQueuedConnection,
-                    )
-                except Exception:
-                    pass
-            for plc_thread in getattr(self.services, "plc_threads", {}).values():
-                if plc_thread is None:
-                    continue
-                try:
-                    plc_thread.quit()
-                    plc_thread.wait(2000)
-                except Exception:
-                    pass
+            self.control.shutdown()
         except Exception:
             pass
         try:
             self.services.shutdown()
-        except Exception:
-            pass
-        try:
-            stop_camera = getattr(getattr(self, "video", None), "stop_camera", None)
-            if callable(stop_camera):
-                stop_camera()
         except Exception:
             pass
         super().closeEvent(event)

@@ -4,9 +4,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from app.service.analysis import dsp
 from app.service.analysis.pipeline import (
     _LIVE_LOUDNESS_THROTTLE_SEC,
-    _LIVE_LOUDNESS_WINDOW_SEC,
+    _LIVE_LOUDNESS_WINDOW_BACKEND_SAMPLES,
     AnalysisPipeline,
 )
 from app.service.analysis.frames import FftFrame, LoudnessFrame, OctaveFrame, SplFrame, StftFrame
@@ -31,6 +32,110 @@ def _make_config(**overrides) -> dict:
     return cfg
 
 
+def _stable_calibrator_signal(
+    *,
+    sample_rate: float = 44100.0,
+    duration_sec: float = 3.0,
+    freq_hz: float = 1000.0,
+    spl_db: float = 94.0,
+) -> tuple[np.ndarray, float]:
+    amplitude = np.sqrt(2.0) * 20e-6 * (10.0 ** (spl_db / 20.0))
+    times = np.arange(int(sample_rate * duration_sec), dtype=np.float64) / sample_rate
+    return amplitude * np.sin(2.0 * np.pi * freq_hz * times), sample_rate
+
+
+@pytest.mark.parametrize(
+    ("weighting", "frequency_hz"),
+    [("A", 31.5), ("A", 100.0), ("C", 31.5), ("C", 100.0), ("Z", 31.5)],
+)
+def test_live_spl_matches_post_run_trace_at_common_endpoints(
+    weighting,
+    frequency_hz,
+):
+    sample_rate = 48_000.0
+    signal, _ = _stable_calibrator_signal(
+        sample_rate=sample_rate,
+        duration_sec=2.037,
+        freq_hz=frequency_hz,
+    )
+    pipeline = AnalysisPipeline(
+        channel_index=0,
+        channel_config=_make_config(
+            spl_weighting=weighting,
+            spl_time_constant=0.125,
+        ),
+        sample_rate=sample_rate,
+    )
+
+    chunk_samples = int(0.05 * sample_rate)
+    live_times = []
+    live_values = []
+    for start in range(0, signal.size, chunk_samples):
+        end = min(start + chunk_samples, signal.size)
+        frame = pipeline.process_chunk(
+            signal[start:end],
+            elapsed_time=end / sample_rate,
+            compute_loudness=False,
+        )["spl"]
+        live_times.append(frame.time)
+        live_values.append(frame.spl_db)
+
+    post_times, post_values = dsp.compute_spl_trace(
+        signal,
+        sample_rate,
+        weighting,
+        0.125,
+        chunk_duration=0.05,
+    )
+
+    assert live_times == pytest.approx(post_times, abs=1e-12)
+    assert live_times[-1] == pytest.approx(signal.size / sample_rate, abs=1e-12)
+    np.testing.assert_allclose(live_values, post_values, atol=0.1, rtol=0.0)
+
+
+def test_live_multitone_spl_matches_post_run_trace_with_final_partial_block():
+    sample_rate = 48_000.0
+    sample_count = int(sample_rate * 2.0) + 733
+    times = np.arange(sample_count, dtype=np.float64) / sample_rate
+    signal = (
+        0.08 * np.sin(2.0 * np.pi * 31.5 * times)
+        + 0.03 * np.sin(2.0 * np.pi * 100.0 * times + 0.2)
+        + 0.01 * np.sin(2.0 * np.pi * 1000.0 * times + 0.7)
+    )
+    pipeline = AnalysisPipeline(
+        channel_index=0,
+        channel_config=_make_config(
+            spl_weighting="A",
+            spl_time_constant=0.125,
+        ),
+        sample_rate=sample_rate,
+    )
+
+    chunk_samples = 2400
+    live_values = []
+    for start in range(0, signal.size, chunk_samples):
+        end = min(start + chunk_samples, signal.size)
+        live_values.append(
+            pipeline.process_chunk(
+                signal[start:end],
+                elapsed_time=end / sample_rate,
+                compute_loudness=False,
+            )["spl"].spl_db
+        )
+
+    post_times, post_values = dsp.compute_spl_trace(
+        signal,
+        sample_rate,
+        "A",
+        0.125,
+        chunk_duration=0.05,
+    )
+
+    assert post_times[-1] == pytest.approx(signal.size / sample_rate, abs=1e-12)
+    assert len(post_values) == len(live_values)
+    np.testing.assert_allclose(live_values, post_values, atol=0.1, rtol=0.0)
+
+
 class TestAnalysisPipeline:
     def test_init(self):
         p = AnalysisPipeline(channel_index=0, channel_config=_make_config(),
@@ -51,6 +156,44 @@ class TestAnalysisPipeline:
         assert "octave" in result
         assert "fft" in result
 
+    def test_process_chunk_skips_octave_by_default(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_octave_bands",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("live processing should not compute octave bands by default")
+            ),
+        )
+        p = AnalysisPipeline(channel_index=0, channel_config=_make_config(), sample_rate=1000.0)
+
+        result = p.process_chunk(np.ones(512, dtype=np.float32), elapsed_time=0.512)
+
+        assert result["octave"] is None
+
+    def test_process_chunk_can_compute_octave_when_requested(self, monkeypatch):
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_octave_bands",
+            lambda signal, sample_rate, weighting: (
+                np.array([1000.0], dtype=np.float64),
+                np.array([42.0], dtype=np.float64),
+            ),
+        )
+        p = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(oct_weighting="Z"),
+            sample_rate=1000.0,
+        )
+
+        result = p.process_chunk(
+            np.ones(512, dtype=np.float32),
+            elapsed_time=0.512,
+            compute_octave=True,
+        )
+
+        assert isinstance(result["octave"], OctaveFrame)
+        np.testing.assert_array_equal(result["octave"].center_freqs, np.array([1000.0]))
+        np.testing.assert_array_equal(result["octave"].levels, np.array([42.0]))
+        assert result["octave"].weighting == "Z"
+
     def test_spl_frame_type(self):
         p = AnalysisPipeline(channel_index=0, channel_config=_make_config(),
                              sample_rate=44100.0)
@@ -58,6 +201,332 @@ class TestAnalysisPipeline:
         result = p.process_chunk(chunk, elapsed_time=1.0)
         assert isinstance(result["spl"], SplFrame)
         assert result["spl"].weighting == "A"
+
+    @pytest.mark.parametrize("weighting", ["A", "C", "Z"])
+    def test_process_chunk_live_spl_is_stable_for_1khz_calibrator(self, weighting):
+        sample_rate = 44100.0
+        signal, _ = _stable_calibrator_signal(sample_rate=sample_rate)
+        cfg = _make_config(
+            spl_weighting=weighting,
+            spl_time_constant=0.125,
+            stft_nfft=1024,
+            fft_nfft=4096,
+        )
+        pipeline = AnalysisPipeline(
+            channel_index=0,
+            channel_config=cfg,
+            sample_rate=sample_rate,
+        )
+
+        values = []
+        chunk_size = 4096
+        for start in range(0, len(signal) - chunk_size + 1, chunk_size):
+            elapsed = (start + chunk_size) / sample_rate
+            result = pipeline.process_chunk(
+                signal[start : start + chunk_size],
+                elapsed_time=elapsed,
+                compute_loudness=False,
+            )
+            values.append(result["spl"].spl_db)
+
+        stable_values = np.asarray(values[1:], dtype=np.float64)
+        assert float(stable_values.max() - stable_values.min()) <= 0.10
+
+    @pytest.mark.parametrize(
+        ("weighting", "expected_db"),
+        [("A", 54.47), ("C", 90.97)],
+    )
+    def test_live_spl_31_5_hz_uses_configured_weighting_numerically(
+        self,
+        weighting,
+        expected_db,
+    ):
+        sample_rate = 48000.0
+        signal, _ = _stable_calibrator_signal(
+            sample_rate=sample_rate,
+            duration_sec=2.0,
+            freq_hz=31.5,
+        )
+        pipeline = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(
+                spl_weighting=weighting,
+                spl_time_constant=0.125,
+            ),
+            sample_rate=sample_rate,
+        )
+
+        values = []
+        for start in range(0, signal.size, 2400):
+            result = pipeline.process_chunk(
+                signal[start : start + 2400],
+                elapsed_time=(start + 2400) / sample_rate,
+                compute_loudness=False,
+            )
+            values.append(result["spl"].spl_db)
+
+        assert float(np.mean(values[-5:])) == pytest.approx(expected_db, abs=1.0)
+
+    def test_live_spl_irregular_chunks_preserve_weighting_state(self):
+        sample_rate = 48000.0
+        signal, _ = _stable_calibrator_signal(
+            sample_rate=sample_rate,
+            duration_sec=2.0,
+            freq_hz=31.5,
+        )
+        cfg = _make_config(spl_weighting="A", spl_time_constant=0.125)
+        regular = AnalysisPipeline(0, cfg, sample_rate)
+        regular_value = -np.inf
+        for start in range(0, signal.size, 2400):
+            regular_value = regular.process_chunk(
+                signal[start : start + 2400],
+                elapsed_time=min(start + 2400, signal.size) / sample_rate,
+                compute_loudness=False,
+            )["spl"].spl_db
+
+        irregular = AnalysisPipeline(0, cfg, sample_rate)
+        irregular_value = -np.inf
+        sizes = (137, 2863, 511, 4099, 1201)
+        start = 0
+        index = 0
+        while start < signal.size:
+            stop = min(signal.size, start + sizes[index % len(sizes)])
+            irregular_value = irregular.process_chunk(
+                signal[start:stop],
+                elapsed_time=stop / sample_rate,
+                compute_loudness=False,
+            )["spl"].spl_db
+            start = stop
+            index += 1
+
+        assert irregular_value == pytest.approx(regular_value, abs=0.1)
+
+    def test_pipeline_reset_replays_frequency_and_time_detector_state(self):
+        sample_rate = 48000.0
+        signal, _ = _stable_calibrator_signal(
+            sample_rate=sample_rate,
+            duration_sec=0.4,
+            freq_hz=63.0,
+        )
+        pipeline = AnalysisPipeline(
+            0,
+            _make_config(spl_weighting="A", spl_time_constant=0.125),
+            sample_rate,
+        )
+        chunks = (signal[:137], signal[137:4000], signal[4000:])
+
+        first = [
+            pipeline.process_chunk(
+                chunk,
+                elapsed_time=(index + 1) * 0.1,
+                compute_loudness=False,
+            )["spl"].spl_db
+            for index, chunk in enumerate(chunks)
+        ]
+        pipeline.reset()
+        second = [
+            pipeline.process_chunk(
+                chunk,
+                elapsed_time=(index + 1) * 0.1,
+                compute_loudness=False,
+            )["spl"].spl_db
+            for index, chunk in enumerate(chunks)
+        ]
+
+        np.testing.assert_allclose(second, first, atol=1e-12, rtol=1e-12)
+
+    def test_simultaneous_channel_pipelines_do_not_share_weighting_state(self):
+        sample_rate = 48000.0
+        signal, _ = _stable_calibrator_signal(
+            sample_rate=sample_rate,
+            duration_sec=0.2,
+            freq_hz=31.5,
+        )
+        cfg = _make_config(spl_weighting="A", spl_time_constant=0.125)
+        first = AnalysisPipeline(0, cfg, sample_rate)
+        second = AnalysisPipeline(1, cfg, sample_rate)
+        pristine = AnalysisPipeline(2, cfg, sample_rate)
+        prefix = np.full(4000, 0.5, dtype=np.float64)
+
+        first.process_chunk(prefix, elapsed_time=0.1, compute_loudness=False)
+        second_value = second.process_chunk(
+            signal,
+            elapsed_time=0.2,
+            compute_loudness=False,
+        )["spl"].spl_db
+        pristine_value = pristine.process_chunk(
+            signal,
+            elapsed_time=0.2,
+            compute_loudness=False,
+        )["spl"].spl_db
+
+        assert first._spl_detector is not second._spl_detector
+        assert (
+            first._spl_detector._frequency_weighting
+            is not second._spl_detector._frequency_weighting
+        )
+        assert second_value == pytest.approx(pristine_value, abs=1e-12)
+
+    def test_live_stft_stable_tone_has_no_periodic_broadband_boundary_spikes(self):
+        sample_rate = 44100.0
+        nfft = 1024
+        chunk_size = 4096
+        signal, _ = _stable_calibrator_signal(
+            sample_rate=sample_rate,
+            duration_sec=4.5,
+        )
+        pipeline = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(
+                stft_nfft=nfft,
+                stft_overlap=0.5,
+                fft_nfft=4096,
+                spl_weighting="Z",
+                oct_weighting="Z",
+            ),
+            sample_rate=sample_rate,
+        )
+
+        frames = []
+        for start in range(0, len(signal) - chunk_size + 1, chunk_size):
+            result = pipeline.process_chunk(
+                signal[start : start + chunk_size],
+                elapsed_time=(start + chunk_size) / sample_rate,
+                compute_loudness=False,
+            )
+            frames.extend(result["stft_frames"])
+
+        assert len(frames) > 20
+        frame_times = [float(frame.time) for frame in frames]
+        assert frame_times == sorted(frame_times)
+        assert len(set(frame_times)) == len(frame_times)
+
+        high_frequency_means = []
+        tone_peaks = []
+        for frame in frames:
+            freqs = np.asarray(frame.frequencies, dtype=np.float64)
+            mags = np.asarray(frame.magnitudes, dtype=np.float64)
+            high_frequency_means.append(float(np.mean(mags[freqs > 5000.0])))
+            tone_peaks.append(float(np.max(mags[np.abs(freqs - 1000.0) < 100.0])))
+
+        assert max(high_frequency_means) < max(tone_peaks) - 80.0
+
+    def test_live_stft_preserves_unprocessed_tail_for_non_hop_aligned_chunks(self):
+        sample_rate = 44100.0
+        nfft = 1024
+        overlap = 0.5
+        chunk_size = int(sample_rate * 0.05)
+        signal, _ = _stable_calibrator_signal(
+            sample_rate=sample_rate,
+            duration_sec=1.0,
+        )
+        pipeline = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(
+                stft_nfft=nfft,
+                stft_overlap=overlap,
+                fft_nfft=4096,
+                spl_weighting="Z",
+                oct_weighting="Z",
+            ),
+            sample_rate=sample_rate,
+        )
+
+        frames = []
+        for start in range(0, len(signal) - chunk_size + 1, chunk_size):
+            result = pipeline.process_chunk(
+                signal[start : start + chunk_size],
+                elapsed_time=(start + chunk_size) / sample_rate,
+                compute_loudness=False,
+            )
+            frames.extend(result["stft_frames"])
+
+        frame_samples = [int(round(float(frame.time) * sample_rate)) for frame in frames]
+        assert len(frame_samples) > 20
+        assert frame_samples == sorted(frame_samples)
+        assert len(set(frame_samples)) == len(frame_samples)
+
+        hop_samples = nfft - int(nfft * overlap)
+        frame_deltas = np.diff(frame_samples)
+        assert frame_deltas.size > 0
+        assert np.all(frame_deltas == hop_samples)
+
+    def test_process_chunk_reuses_one_live_spl_detector(self, monkeypatch):
+        instances = []
+
+        class FakeDetector:
+            def __init__(self, sample_rate, weighting, time_constant):
+                self.calls = []
+                self.reset_count = 0
+                instances.append(self)
+
+            def process(self, signal):
+                self.calls.append(np.asarray(signal).copy())
+                return float(len(self.calls))
+
+            def reset(self):
+                self.reset_count += 1
+
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.SplDetector",
+            FakeDetector,
+        )
+        pipeline = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(spl_weighting="Z"),
+            sample_rate=100.0,
+        )
+
+        first = pipeline.process_chunk(
+            np.array([1.0, 2.0], dtype=np.float64),
+            elapsed_time=0.02,
+            compute_loudness=False,
+        )
+        second = pipeline.process_chunk(
+            np.array([3.0, 4.0], dtype=np.float64),
+            elapsed_time=0.04,
+            compute_loudness=False,
+        )
+
+        assert len(instances) == 1
+        assert len(instances[0].calls) == 2
+        assert first["spl"].spl_db == pytest.approx(1.0)
+        assert second["spl"].spl_db == pytest.approx(2.0)
+
+    def test_reset_clears_live_spl_detector_state(self):
+        sample_rate = 44100.0
+        chunk_size = 4096
+        high_signal, _ = _stable_calibrator_signal(
+            sample_rate=sample_rate,
+            duration_sec=chunk_size / sample_rate,
+            spl_db=94.0,
+        )
+        low_signal, _ = _stable_calibrator_signal(
+            sample_rate=sample_rate,
+            duration_sec=chunk_size / sample_rate,
+            spl_db=80.0,
+        )
+        cfg = _make_config(spl_weighting="Z", spl_time_constant=1.0)
+        pipeline = AnalysisPipeline(
+            channel_index=0,
+            channel_config=cfg,
+            sample_rate=sample_rate,
+        )
+
+        first = pipeline.process_chunk(
+            high_signal,
+            elapsed_time=chunk_size / sample_rate,
+            compute_loudness=False,
+        )
+        pipeline.reset()
+        second = pipeline.process_chunk(
+            low_signal,
+            elapsed_time=chunk_size / sample_rate,
+            compute_loudness=False,
+        )
+
+        assert first["spl"].spl_db == pytest.approx(94.0, abs=0.10)
+        assert second["spl"].spl_db == pytest.approx(80.0, abs=0.10)
 
     def test_stft_frame_when_enough_samples(self):
         cfg = _make_config(stft_nfft=512, stft_overlap=0.5)
@@ -116,13 +585,36 @@ class TestAnalysisPipeline:
         assert isinstance(second["fft"], FftFrame)
         assert second["fft"].frequencies.shape[0] == 4096 // 2 + 1
 
+    def test_live_fft_uses_channel_fft_weighting(self, monkeypatch):
+        calls = []
+
+        def fake_fft(signal, sample_rate, nfft, weighting="Z"):
+            calls.append(weighting)
+            return np.array([100.0]), np.array([42.0])
+
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_fft_spectrum",
+            fake_fft,
+        )
+        pipeline = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(fft_nfft=4, fft_weighting="A"),
+            sample_rate=1000.0,
+        )
+
+        result = pipeline.process_chunk(np.ones(4, dtype=np.float32), elapsed_time=0.004)
+
+        assert calls == ["A"]
+        assert isinstance(result["fft"], FftFrame)
+        assert result["fft"].weighting == "A"
+
     def test_live_fft_waits_for_rolling_buffer_then_emits_one_frame_per_chunk(
         self,
         monkeypatch,
     ):
         captured_fft_inputs: list[np.ndarray] = []
 
-        def fake_compute_fft_spectrum(signal, sample_rate, nfft):
+        def fake_compute_fft_spectrum(signal, sample_rate, nfft, weighting="Z"):
             captured_fft_inputs.append(np.asarray(signal, dtype=np.float64).copy())
             return (
                 np.arange(nfft // 2 + 1, dtype=np.float64),
@@ -159,13 +651,25 @@ class TestAnalysisPipeline:
     def test_process_chunk_returns_throttled_loudness_frame(self, monkeypatch):
         calls = []
 
-        def fake_compute_loudness_trace(signal, sample_rate):
+        def fake_compute_loudness_window_sone(signal, sample_rate):
             calls.append(np.asarray(signal, dtype=np.float64).copy())
-            return [0.0, 0.1], [1.25, 2.5], 2.5
+            return 2.5
 
         monkeypatch.setattr(
             "app.service.analysis.pipeline.dsp.compute_loudness_trace",
-            fake_compute_loudness_trace,
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("final trace helper must not be used live")
+            ),
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.downsample_loudness_trace_for_display",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("display trace helper must not be used live")
+            ),
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_loudness_window_sone",
+            fake_compute_loudness_window_sone,
         )
 
         p = AnalysisPipeline(
@@ -195,13 +699,19 @@ class TestAnalysisPipeline:
     ):
         calls = []
 
-        def fake_compute_loudness_trace(signal, sample_rate):
+        def fake_compute_loudness_window_sone(signal, sample_rate):
             calls.append(np.asarray(signal, dtype=np.float64).copy())
-            return [0.0], [1.0], 1.0
+            return 1.0
 
         monkeypatch.setattr(
             "app.service.analysis.pipeline.dsp.compute_loudness_trace",
-            fake_compute_loudness_trace,
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("final trace helper must not be used live")
+            ),
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_loudness_window_sone",
+            fake_compute_loudness_window_sone,
         )
 
         p = AnalysisPipeline(
@@ -224,26 +734,77 @@ class TestAnalysisPipeline:
         assert skipped["loudness"] is None
         assert isinstance(emitted["loudness"], LoudnessFrame)
         assert len(calls) == 1
-        assert p._loudness_buffer.size == 50
-        np.testing.assert_array_equal(calls[0], np.ones(50, dtype=np.float64))
+        assert p._loudness_buffer.size == 17
+        np.testing.assert_array_equal(calls[0], np.ones(17, dtype=np.float64))
 
-    def test_live_loudness_throttle_is_quarter_second_and_window_is_half_second(self):
+    def test_prepare_live_loudness_input_is_throttled_copy_without_backend_compute(
+        self,
+        monkeypatch,
+    ):
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_loudness_trace",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("backend should not run during preparation")
+            ),
+        )
+        p = AnalysisPipeline(
+            channel_index=0,
+            channel_config=_make_config(),
+            sample_rate=100.0,
+        )
+
+        p.process_chunk(
+            np.arange(75, dtype=np.float32),
+            elapsed_time=0.5,
+            compute_loudness=False,
+        )
+
+        prepared = p.prepare_live_loudness_input(0.5)
+        throttled = p.prepare_live_loudness_input(0.6)
+        prepared[0] = -1.0
+
+        assert throttled is None
+        np.testing.assert_array_equal(
+            prepared[1:],
+            np.arange(59, 75, dtype=np.float64),
+        )
+        assert p._loudness_buffer[0] == pytest.approx(58.0)
+        assert p._last_live_loudness_emit_time == pytest.approx(0.5)
+
+    def test_live_loudness_throttle_is_quarter_second_and_window_is_8192_backend_samples(self):
         assert _LIVE_LOUDNESS_THROTTLE_SEC == pytest.approx(0.25)
-        assert _LIVE_LOUDNESS_WINDOW_SEC == pytest.approx(0.5)
+        assert _LIVE_LOUDNESS_WINDOW_BACKEND_SAMPLES == 8192
 
     def test_process_chunk_suppresses_live_loudness_backend_errors(self, monkeypatch):
         monkeypatch.setattr(
             "app.service.analysis.pipeline.dsp.compute_loudness_trace",
-            lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("backend down")),
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("final trace helper must not be used live")
+            ),
         )
-        p = AnalysisPipeline(channel_index=0, channel_config=_make_config(), sample_rate=100.0)
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_loudness_window_sone",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("fast backend failed")
+            ),
+        )
+        p = AnalysisPipeline(channel_index=0, channel_config=_make_config(), sample_rate=1000.0)
         result = p.process_chunk(np.ones(100, dtype=np.float32), elapsed_time=1.0)
+
         assert result["loudness"] is None
+        assert isinstance(result["spl"], SplFrame)
+        assert set(result) == {"stft_frames", "stft", "spl", "loudness", "octave", "fft"}
 
     def test_reset_clears_live_loudness_buffer_and_throttle(self, monkeypatch):
         monkeypatch.setattr(
             "app.service.analysis.pipeline.dsp.compute_loudness_trace",
-            lambda signal, sample_rate: ([0.0], [3.0], 3.0),
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("final trace helper must not be used live")
+            ),
+        )
+        monkeypatch.setattr(
+            "app.service.analysis.pipeline.dsp.compute_loudness_window_sone",
+            lambda signal, sample_rate: 3.0,
         )
         p = AnalysisPipeline(channel_index=0, channel_config=_make_config(), sample_rate=100.0)
         p.process_chunk(np.ones(100, dtype=np.float32), elapsed_time=1.0)
@@ -338,7 +899,7 @@ class TestAnalysisPipeline:
 
         assert [frame.time for frame in result["stft_frames"]] == [0.0, 0.5, 1.0]
 
-    def test_process_chunk_keeps_leading_stft_frame_at_zero_for_small_and_large_windows(self):
+    def test_process_chunk_uses_complete_window_center_times_for_real_stft(self):
         chunk = np.random.randn(128).astype(np.float32)
 
         small = AnalysisPipeline(
@@ -355,8 +916,8 @@ class TestAnalysisPipeline:
         small_result = small.process_chunk(chunk, elapsed_time=1.28)
         large_result = large.process_chunk(chunk, elapsed_time=1.28)
 
-        assert small_result["stft_frames"][0].time == pytest.approx(0.0)
-        assert large_result["stft_frames"][0].time == pytest.approx(0.0)
+        assert small_result["stft_frames"][0].time == pytest.approx(8 / (2 * 100.0))
+        assert large_result["stft_frames"][0].time == pytest.approx(32 / (2 * 100.0))
 
     def test_reset_clears_stft_dedupe_state(self, monkeypatch):
         monkeypatch.setattr(

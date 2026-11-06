@@ -1,25 +1,86 @@
 from __future__ import annotations
 
+from threading import RLock
 from unittest.mock import MagicMock
 
 import numpy as np
 
+from app.service.analysis.selected_channels import project_selected_channels
+from app.service.analysis.session_capture import CaptureNotAcceptedError
 from app.service.analysis.test_manager import TestManager
 
 
 class _DummySignal:
     def __init__(self):
         self._callbacks = []
+        self._connection_types = {}
 
-    def connect(self, callback):
+    def connect(self, callback, connection_type=None):
         self._callbacks.append(callback)
+        self._connection_types[callback] = connection_type
 
     def disconnect(self, callback):
         self._callbacks.remove(callback)
+        self._connection_types.pop(callback, None)
 
     def emit(self, *args, **kwargs):
         for callback in list(self._callbacks):
             callback(*args, **kwargs)
+
+
+class _CaptureRecorderDoubleMixin:
+    """Exact-capture defaults for manager recorder doubles."""
+
+    def __getattr__(self, name):
+        if name == "captured_block_ready":
+            signal = _DummySignal()
+            self.__dict__[name] = signal
+            return signal
+        raise AttributeError(name)
+
+    def request_capture(self, *, record_duration):
+        with self._capture_owner_lock():
+            if not self.__dict__.setdefault("_accepting_captures", True):
+                raise CaptureNotAcceptedError("recorder stopped")
+            owner = object()
+            self.__dict__.setdefault("request_capture_calls", []).append(
+                record_duration
+            )
+            self.__dict__.setdefault("capture_owners", []).append(owner)
+            return owner
+
+    def get_capture_buffer(self, attachment, *, retained_frames):
+        self.__dict__.setdefault("get_capture_buffer_calls", []).append(
+            (attachment, retained_frames)
+        )
+        buffer = getattr(self, "_buffer", None)
+        if not isinstance(buffer, np.ndarray):
+            n_channels = int(getattr(self, "_n_channels", 0) or 0)
+            return np.empty((0, n_channels), dtype=np.float32)
+        return buffer[:retained_frames].copy()
+
+    def release_capture(self, attachment):
+        with self._capture_owner_lock():
+            self.__dict__.setdefault("release_capture_calls", []).append(attachment)
+            owners = self.__dict__.setdefault("capture_owners", [])
+            if attachment in owners:
+                owners.remove(attachment)
+
+    def has_capture_owners(self):
+        with self._capture_owner_lock():
+            return bool(self.__dict__.setdefault("capture_owners", []))
+
+    def stop_if_no_capture_owners(self):
+        with self._capture_owner_lock():
+            if self.__dict__.setdefault("capture_owners", []):
+                return False
+            self.__dict__["_accepting_captures"] = False
+            self.stop()
+            return True
+
+    def _capture_owner_lock(self):
+        return self.__dict__.setdefault("_capture_owners_lock", RLock())
+
 
 class _FakeSession:
     def __init__(self, config, bus, ai_service, mic_cal, workorder, audio_dir):
@@ -30,29 +91,79 @@ class _FakeSession:
         self._sample_rate = None
         self._audio_file_path = None
         self._audio_data_id = None
+        self._source_channels = ()
+        self._real_to_logical_channel = {}
         self.last_ai_review = None
         self._finished = False
-        self._attach_snapshot = None
-        self._attach_chunk_index = 0
+        self.capture_attachment = None
+        self._captured_frame_count = 0
+        self._source_token = None
+        self._monitor_feed = None
         self._on_session_done_cb = None
 
     def _setup_pipelines(self):
         return None
 
-    def attach_to_recorder(self, *, chunk_index, snapshot=None):
-        self._attach_chunk_index = chunk_index
-        self._attach_snapshot = snapshot
+    def prepare_for_attach(self, source_token):
+        self._source_token = source_token
+        self.capture_attachment = None
 
-    def _on_chunk(self, *args, **kwargs):
+    def attach_to_recorder(self, attachment, *, source_token):
+        assert source_token is self._source_token
+        self.capture_attachment = attachment
+
+    def _on_captured_block(self, *args, **kwargs):
         return None
+
+    def set_monitor_feed(self, callback):
+        self._monitor_feed = callback
+
+    @property
+    def captured_frame_count(self):
+        return self._captured_frame_count
+
+    def freeze_capture(self):
+        return self._captured_frame_count
 
     def _run_judgment(self):
         raise AssertionError("not used in this test")
+
+    def capture_recorder_buffer(self, hardware_buffer, sample_rate):
+        view = project_selected_channels(
+            hardware_buffer,
+            self._config.get("selected_channels", []),
+        )
+        self._buffer = view.buffer
+        self._source_channels = view.source_channels
+        self._real_to_logical_channel = view.real_to_logical
+        self._sample_rate = sample_rate
+        return self._buffer
 
     def _save_wav(self, *args, **kwargs):
         self._audio_file_path = "partial.wav"
         self._audio_data_id = "audio-123"
         return self._audio_file_path
+
+
+def _bind_manager_run_generation(manager, config_id: int, session):
+    """Give direct white-box manager setups the same explicit run identity as start()."""
+
+    generation = getattr(session, "__dict__", {}).get("_manager_generation_token")
+    if generation is None:
+        generation = object()
+        session._manager_generation_token = generation
+        manager._session_generations[config_id] = generation
+    return generation
+
+
+def _complete_current_session(manager, config_id: int):
+    session = manager._sessions[config_id]
+    generation = _bind_manager_run_generation(manager, config_id, session)
+    return manager._on_session_done(
+        config_id,
+        expected_session=session,
+        expected_generation=generation,
+    )
 
 def _factory_runtime_config(
     config_id: int = 1,
@@ -125,14 +236,19 @@ def _make_running_factory_manager(
             self._n_channels = n_channels
             self._record_duration = record_duration
             self._buffer = partial_buf
-            self.chunk_ready = _DummySignal()
+            self._n_channels = n_channels
+            self.captured_block_ready = _DummySignal()
             self.recording_done = _DummySignal()
             self.error_occurred = _DummySignal()
             self._running = False
             self.stop_calls = 0
             self.wait_calls = []
-            self.attach_calls = []
-            self.get_buffer_from_calls = []
+            self.request_capture_calls = []
+            self.get_capture_buffer_calls = []
+            self.release_capture_calls = []
+            self.capture_owners = []
+            self._capture_owners_lock = RLock()
+            self._accepting_captures = True
             FakeRecorder.instances.append(self)
 
         def isRunning(self):
@@ -149,22 +265,54 @@ def _make_running_factory_manager(
             self.wait_calls.append(timeout)
             return True
 
-        def attach_session(self, *, record_duration):
-            self.attach_calls.append(record_duration)
-            return MagicMock(chunk_index=0, sample_index=0)
+        def request_capture(self, *, record_duration):
+            with self._capture_owners_lock:
+                if not self._accepting_captures:
+                    raise CaptureNotAcceptedError("recorder stopped")
+                self.request_capture_calls.append(record_duration)
+                owner = object()
+                self.capture_owners.append(owner)
+                return owner
 
-        def get_buffer_from(self, snapshot):
-            self.get_buffer_from_calls.append(snapshot)
-            return self._buffer
+        def get_capture_buffer(self, attachment, *, retained_frames):
+            self.get_capture_buffer_calls.append((attachment, retained_frames))
+            return self._buffer[:retained_frames].copy()
+
+        def release_capture(self, attachment):
+            with self._capture_owners_lock:
+                self.release_capture_calls.append(attachment)
+                if attachment in self.capture_owners:
+                    self.capture_owners.remove(attachment)
+
+        def has_capture_owners(self):
+            with self._capture_owners_lock:
+                return bool(self.capture_owners)
+
+        def stop_if_no_capture_owners(self):
+            with self._capture_owners_lock:
+                if self.capture_owners:
+                    return False
+                self._accepting_captures = False
+                self.stop()
+                return True
 
     class FakeMonitor:
         instances = []
 
-        def __init__(self, *, device_name, hostapi, sample_rate, monitor_channel):
+        def __init__(
+            self,
+            *,
+            device_name,
+            hostapi,
+            sample_rate,
+            monitor_channel,
+            gain_db=0.0,
+        ):
             self.device_name = device_name
             self.hostapi = hostapi
             self.sample_rate = sample_rate
             self.monitor_channel = monitor_channel
+            self.gain_db = gain_db
             self.error_occurred = _DummySignal()
             self.stop_calls = 0
             self.wait_calls = []
@@ -189,6 +337,7 @@ def _make_running_factory_manager(
 
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
+            self._captured_frame_count = int(partial_buf.shape[0])
             self.saved_wavs = []
             FakeSession.instances.append(self)
 
@@ -236,6 +385,7 @@ def _mock_bus():
         "spl_updated",
         "octave_updated",
         "fft_updated",
+        "current_trace_updated",
         "recording_progress",
         "test_started",
         "test_finished",

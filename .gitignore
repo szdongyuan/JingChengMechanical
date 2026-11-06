@@ -8,3 +8,9 @@ docs/
 image.png
 .worktrees
 data/
+build/
+dist/
+.packaging-venv312/
+packaging/
+release/
+.test-temp-*/

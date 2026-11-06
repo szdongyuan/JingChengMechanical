@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import os
+import re
 from types import SimpleNamespace
 
 import numpy as np
@@ -15,9 +16,11 @@ from app.services_container import (
     FactoryControllerState,
     FactoryReviewPayload,
     FactoryReviewWindow,
+    ImportAudioWarning,
 )
 from app.service.analysis import dsp
 from app.service.analysis.judgment import JudgmentEngine
+from consts.style import APP_QSS
 import ui.modules.result as result_module_mod
 from ui.modules.result import ResultModule
 
@@ -73,8 +76,24 @@ def _table_value(module: ResultModule, row: int, column: int) -> str:
     return item.text()
 
 
+def _table_foreground(module: ResultModule, row: int, column: int) -> str:
+    item = module.table.item(row, column)
+    assert item is not None
+    return item.foreground().color().name()
+
+
 def _metric_text(module: ResultModule, attr: str) -> str:
     return getattr(module, attr).text()
+
+
+def _qss_block(selector: str) -> str:
+    return APP_QSS.split(selector, 1)[1].split("}", 1)[0]
+
+
+def _qss_px_value(block: str, property_name: str) -> int:
+    match = re.search(rf"{re.escape(property_name)}\s*:\s*(\d+)px\b", block)
+    assert match is not None
+    return int(match.group(1))
 
 
 def _set_selected_channel(module: ResultModule, channel_index: int | None) -> None:
@@ -175,12 +194,10 @@ def _state(
     run_phase: str,
     *,
     displayed_config_id: int | None = None,
-    active_config_id: int | None = None,
     selected_config_ids: tuple[int, ...] = (101, 202),
 ) -> FactoryControllerState:
     return FactoryControllerState(
         selected_config_ids=selected_config_ids,
-        active_config_id=active_config_id,
         displayed_config_id=displayed_config_id,
         run_phase=run_phase,
         trigger_source="manual" if displayed_config_id is not None else None,
@@ -211,18 +228,56 @@ def _make_review_payload(
 
 def _assert_placeholder(module: ResultModule, *, badge_text: str) -> None:
     assert module.lb_overall.text() == badge_text
-    assert module.table.rowCount() == 7
-    assert _table_value(module, 0, 0) == "声压级"
-    assert _table_value(module, 1, 0) == "平均声压级"
-    assert _table_value(module, 2, 0) == "响度"
-    assert _table_value(module, 3, 0) == "平均响度"
-    assert _table_value(module, 4, 0) == "FFT频谱"
-    assert _table_value(module, 5, 0) == "倍频程"
-    assert _table_value(module, 6, 0) == "AI分析"
+    assert module.table.rowCount() == 6
+    assert module.table.horizontalHeaderItem(1).text() == "实测值"
+    assert module.table.horizontalHeaderItem(2).text() == "电流"
+    assert _table_value(module, 0, 0) == "声压级（峰值）"
+    assert _table_value(module, 1, 0) == "声压级（平均）"
+    assert _table_value(module, 2, 0) == "响度（峰值）"
+    assert _table_value(module, 3, 0) == "响度（平均）"
+    assert _table_value(module, 4, 0) == "频谱最低得分"
+    assert _table_value(module, 5, 0) == "AI分析"
     assert _table_value(module, 0, 1) == "-"
     assert _table_value(module, 0, 2) == "-"
     assert _table_value(module, 0, 3) == "-"
     assert getattr(module, "error_label").isHidden() is True
+
+
+def test_result_module_placeholders_show_translated_visible_rows(qapp):
+    module = _make_module()
+
+    _assert_placeholder(module, badge_text="-")
+
+
+def test_result_module_uses_compact_summary_sizing(qapp):
+    module = _make_module()
+    metric_badge = module.lb_spl_metric_label.parentWidget()
+    metric_margins = metric_badge.layout().contentsMargins()
+
+    assert module.layout().spacing() == 3
+    assert module.lb_overall.parentWidget().layout().spacing() == 4
+    assert metric_badge.parentWidget().layout().spacing() == 4
+    assert module.lb_overall.minimumHeight() <= 28
+    assert metric_badge.minimumHeight() <= 40
+    assert metric_margins.top() <= 3
+    assert metric_margins.bottom() <= 3
+    assert module.table.rowHeight(0) <= 22
+    assert module.table.horizontalHeader().height() <= 22
+    expected_table_height = (
+        module.table.horizontalHeader().height()
+        + module.table.rowHeight(0) * module.table.rowCount()
+        + 6
+    )
+    assert module.table.height() == expected_table_height
+
+
+def test_result_module_compact_summary_qss_limits_badge_font_sizes():
+    result_badge_style = _qss_block("QLabel#ResultBadge")
+    metric_value_style = _qss_block("QLabel#ResultMetricValue")
+
+    assert _qss_px_value(result_badge_style, "font-size") <= 22
+    assert _qss_px_value(result_badge_style, "min-height") <= 28
+    assert _qss_px_value(metric_value_style, "font-size") <= 16
 
 
 def test_result_module_shows_metric_placeholders_before_config(qapp):
@@ -243,7 +298,7 @@ def test_result_module_updates_live_metrics_only_for_current_run_and_channel(qap
         "channels": [{"channel_index": 1, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -293,7 +348,7 @@ def test_result_module_live_metric_frames_use_cached_config_after_refresh(qapp, 
 
     module.services.config_service = SimpleNamespace(load_config=load_config)
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -340,7 +395,7 @@ def test_result_module_non_current_spl_frames_reuse_displayed_config_metadata(qa
 
     module.services.config_service = SimpleNamespace(load_config=load_config)
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -386,7 +441,7 @@ def test_result_module_throttles_only_spl_metric_repaint_while_updating_cache(
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -437,7 +492,7 @@ def test_result_module_spl_throttle_uses_finite_frame_time_over_wall_clock(
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -480,7 +535,7 @@ def test_result_module_spl_throttle_uses_one_clock_after_missing_frame_time(
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -531,7 +586,7 @@ def test_result_module_spl_throttle_uses_monotonic_fallback_for_nonfinite_frame_
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -569,7 +624,7 @@ def test_result_module_selected_channel_refresh_bypasses_spl_throttle(qapp):
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -603,7 +658,7 @@ def test_result_module_invalid_spl_clears_repaint_timestamp_and_next_valid_repai
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -642,7 +697,7 @@ def test_result_module_loudness_repaints_immediately_without_forcing_spl_repaint
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -680,7 +735,7 @@ def test_result_module_matching_invalid_spl_clears_only_spl_metric(qapp):
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -720,7 +775,7 @@ def test_result_module_matching_invalid_loudness_clears_only_loudness_metric(qap
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -788,7 +843,7 @@ def test_result_module_preserves_live_metric_caches_when_selected_channel_change
         ],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -937,7 +992,7 @@ def test_result_module_review_averages_render_only_in_reviewing_or_stopped(qapp,
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state(phase, displayed_config_id=101, active_config_id=101)
+        _state(phase, displayed_config_id=101)
     )
     module.services.bus.factory_review_changed.emit(
         _make_review_payload(
@@ -1034,7 +1089,7 @@ def test_result_module_renders_average_metrics_from_production_serialized_judgme
     }
     monkeypatch.setattr(
         dsp,
-        "compute_loudness_trace",
+        "compute_loudness_trace_for_window",
         lambda *args, **kwargs: ([0.0, 0.5], [1.0, 3.0], 3.0),
     )
     engine = JudgmentEngine(SimpleNamespace(resolve_binding=lambda _config_id: None))
@@ -1115,7 +1170,7 @@ def test_result_module_hides_metrics_when_provider_channel_is_not_selected(qapp)
     })
 
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -1154,7 +1209,7 @@ def test_result_module_hides_metrics_when_selected_channel_config_is_missing(qap
     })
 
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -1239,7 +1294,7 @@ def test_result_module_clears_live_run_when_displayed_config_changes(qapp):
     })
 
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -1250,7 +1305,7 @@ def test_result_module_clears_live_run_when_displayed_config_changes(qapp):
     assert module.lb_spl_metric_value.text() == "61.0 dB"
 
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=202, active_config_id=202)
+        _state("running", displayed_config_id=202)
     )
     assert module.lb_spl_metric_value.text() == "--"
     assert (101, "run-101", 0) not in module._live_spl_by_key
@@ -1271,7 +1326,7 @@ def test_result_module_new_matching_start_clears_prior_live_metrics_and_rejects_
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-1", trigger_source="manual")
@@ -1307,7 +1362,7 @@ def test_result_module_runtime_start_for_active_non_displayed_config_does_not_re
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=202, active_config_id=101)
+        _state("running", displayed_config_id=202)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=202, run_id="run-202", trigger_source="manual")
@@ -1332,7 +1387,7 @@ def test_result_module_preserves_latest_live_metrics_during_analyzing_until_revi
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -1341,7 +1396,7 @@ def test_result_module_preserves_latest_live_metrics_during_analyzing_until_revi
     module.services.bus.loudness_updated.emit(101, "run-101", 0, SimpleNamespace(loudness_sone=1.25))
 
     module.services.bus.factory_state_changed.emit(
-        _state("analyzing", displayed_config_id=101, active_config_id=101)
+        _state("analyzing", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_analyzing_entered.emit(
         SimpleNamespace(config_id=101, run_id="run-101")
@@ -1373,7 +1428,7 @@ def test_result_module_factory_display_reset_clears_metrics_and_live_run(qapp):
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -1412,6 +1467,7 @@ def test_result_module_renders_completed_summary_rows_from_summary_payload(qapp)
                         "label": "SPL",
                         "deviation_value": 6.0,
                         "deviation_display": "6 dB",
+                        "actual_display": "86 dB",
                         "channel_index": 1,
                         "channel_label": "CH2",
                         "status": "NG",
@@ -1452,6 +1508,7 @@ def test_result_module_renders_completed_summary_rows_from_summary_payload(qapp)
                         "label": "FFT",
                         "deviation_value": -3.0,
                         "deviation_display": "-3 dB",
+                        "actual_display": "57 dB @ 1000 Hz",
                         "channel_index": 0,
                         "channel_label": "CH1",
                         "status": "OK",
@@ -1482,36 +1539,128 @@ def test_result_module_renders_completed_summary_rows_from_summary_payload(qapp)
         )
     )
 
-    assert module.lb_overall.text() == "FAIL"
+    assert module.lb_overall.text() == "不通过"
     assert module.lb_overall.property("resultLevel") == "fail"
-    assert module.table.rowCount() == 7
-    assert _table_value(module, 0, 0) == "声压级"
-    assert _table_value(module, 0, 1) == "6 dB"
-    assert _table_value(module, 0, 2) == "通道2"
+    assert module.table.rowCount() == 6
+    assert module.table.horizontalHeaderItem(2).text() == "电流"
+    assert _table_value(module, 0, 0) == "声压级（峰值）"
+    assert _table_value(module, 0, 1) == "86 dB"
+    assert _table_value(module, 0, 2) == "-"
     assert _table_value(module, 0, 3) == "NG"
-    assert _table_value(module, 1, 0) == "平均声压级"
+    assert _table_value(module, 1, 0) == "声压级（平均）"
     assert _table_value(module, 1, 1) == "4 dB"
-    assert _table_value(module, 1, 2) == "通道2"
+    assert _table_value(module, 1, 2) == "-"
     assert _table_value(module, 1, 3) == "NG"
-    assert _table_value(module, 2, 0) == "响度"
+    assert _table_value(module, 2, 0) == "响度（峰值）"
     assert _table_value(module, 2, 1) == "4 sone"
-    assert _table_value(module, 2, 2) == "通道2"
+    assert _table_value(module, 2, 2) == "-"
     assert _table_value(module, 2, 3) == "NG"
-    assert _table_value(module, 3, 0) == "平均响度"
+    assert _table_value(module, 3, 0) == "响度（平均）"
     assert _table_value(module, 3, 1) == "-1 sone"
-    assert _table_value(module, 3, 2) == "通道2"
+    assert _table_value(module, 3, 2) == "-"
     assert _table_value(module, 3, 3) == "OK"
-    assert _table_value(module, 4, 0) == "FFT频谱"
-    assert _table_value(module, 4, 1) == "-3 dB"
-    assert _table_value(module, 4, 2) == "通道1"
-    assert _table_value(module, 4, 3) == "OK"
-    assert _table_value(module, 5, 0) == "倍频程"
-    assert _table_value(module, 5, 1) == "0 dB"
-    assert _table_value(module, 5, 2) == "通道1"
-    assert _table_value(module, 6, 0) == "AI分析"
-    assert _table_value(module, 6, 1) == "--"
-    assert _table_value(module, 6, 2) == "--"
-    assert _table_value(module, 6, 3) == "OK"
+    assert _table_value(module, 4, 0) == "频谱最低得分"
+    assert _table_value(module, 4, 1) == "-"
+    assert _table_value(module, 4, 2) == "-"
+    assert _table_value(module, 4, 3) == "-"
+    assert _table_value(module, 5, 0) == "AI分析"
+    assert _table_value(module, 5, 1) == "--"
+    assert _table_value(module, 5, 2) == "--"
+    assert _table_value(module, 5, 3) == "OK"
+
+
+def test_result_module_renders_current_value_channel_label_unchanged(qapp):
+    module = _make_module()
+    module.services.bus.factory_state_changed.emit(_state("reviewing", displayed_config_id=101))
+    payload = _summary_payload(overall_status="pass")
+    payload["rows"][0]["channel_label"] = "2.000 mA"
+
+    module.services.bus.factory_review_changed.emit(
+        _make_review_payload(summary_payload=payload)
+    )
+
+    assert _table_value(module, 0, 2) == "2.000 mA"
+
+
+def test_result_module_colors_only_judged_result_cells(qapp):
+    module = _make_module()
+    module.services.bus.factory_state_changed.emit(_state("reviewing", displayed_config_id=101))
+
+    module.services.bus.factory_review_changed.emit(
+        _make_review_payload(
+            judgment_payload={"overall": "不合格"},
+            summary_payload=_summary_payload(
+                overall_status="fail",
+                rows=[
+                    {
+                        "item_key": "spl",
+                        "label": "SPL",
+                        "actual_display": "86 dB",
+                        "channel_label": "CH1",
+                        "status": "NG",
+                        "constrained": True,
+                    },
+                    {
+                        "item_key": "spl_average",
+                        "label": "平均SPL",
+                        "actual_display": "70 dB",
+                        "channel_label": "CH1",
+                        "status": "OK",
+                        "constrained": True,
+                    },
+                    {
+                        "item_key": "stft_score",
+                        "label": "频谱平均评分",
+                        "actual_display": "86.50",
+                        "channel_label": "CH1",
+                        "status": "OK",
+                        "constrained": False,
+                    },
+                    {
+                        "item_key": "ai",
+                        "label": "AI分析",
+                        "deviation_display": "--",
+                        "channel_label": "--",
+                        "status": "OK",
+                        "constrained": False,
+                    },
+                ],
+            ),
+        )
+    )
+
+    assert _table_foreground(module, 0, 3) == "#d93025"
+    assert _table_foreground(module, 1, 3) == "#188038"
+    assert _table_foreground(module, 4, 3) == "#000000"
+    assert _table_foreground(module, 0, 0) == "#000000"
+    assert _table_foreground(module, 0, 1) == "#000000"
+    assert _table_foreground(module, 0, 2) == "#000000"
+
+
+def test_result_module_renders_ai_score_and_chinese_fault_label(qapp):
+    module = _make_module()
+    module.services.bus.factory_state_changed.emit(_state("reviewing", displayed_config_id=101))
+    payload = _summary_payload(overall_status="fail")
+    payload["rows"][-1].update(
+        {
+            "actual_display": "0.91",
+            "status": "NG",
+            "result_display": "NG（嗡嗡音）",
+            "failure_label": "嗡嗡音",
+            "constrained": True,
+        }
+    )
+
+    module.services.bus.factory_review_changed.emit(
+        _make_review_payload(summary_payload=payload)
+    )
+
+    assert _table_value(module, 5, 0) == "AI分析"
+    assert _table_value(module, 5, 1) == "0.91"
+    assert _table_value(module, 5, 2) == "--"
+    assert _table_value(module, 5, 3) == "NG（嗡嗡音）"
+    assert _table_foreground(module, 5, 3) == "#d93025"
+    assert module.lb_overall.text() == "不通过（嗡嗡音）"
 
 
 def test_result_module_preserves_approved_status_labels(qapp):
@@ -1521,7 +1670,7 @@ def test_result_module_preserves_approved_status_labels(qapp):
         _make_review_payload(summary_payload=_summary_payload(overall_status="fail"))
     )
 
-    assert module.lb_overall.text() == "FAIL"
+    assert module.lb_overall.text() == "不通过"
     assert _table_value(module, 0, 3) == "OK"
 
 
@@ -1536,21 +1685,32 @@ def test_result_module_translates_average_row_labels_at_ui_boundary(qapp):
         _make_review_payload(summary_payload=payload)
     )
 
-    assert _table_value(module, 1, 0) == "平均声压级"
-    assert _table_value(module, 3, 0) == "平均响度"
+    assert _table_value(module, 1, 0) == "声压级（平均）"
+    assert _table_value(module, 3, 0) == "响度（平均）"
 
 
-def test_result_module_translates_english_octave_row_label(qapp):
+def test_result_module_translates_legacy_stft_score_row_label(qapp):
     module = _make_module()
     module.services.bus.factory_state_changed.emit(_state("reviewing", displayed_config_id=101))
     payload = _summary_payload(overall_status="pass")
-    payload["rows"][5]["label"] = "Octave"
+    payload["rows"].insert(
+        6,
+        {
+            "item_key": "stft_score",
+            "label": "频谱平均评分",
+            "actual_display": "86.50",
+            "channel_label": "CH1",
+            "status": "OK",
+            "constrained": False,
+        },
+    )
 
     module.services.bus.factory_review_changed.emit(
         _make_review_payload(summary_payload=payload)
     )
 
-    assert _table_value(module, 5, 0) == "倍频程"
+    assert _table_value(module, 4, 0) == "频谱最低得分"
+    assert _table_value(module, 4, 1) == "86.50"
 
 
 @pytest.mark.parametrize("phase", ["analyzing", "reanalyzing"])
@@ -1561,7 +1721,6 @@ def test_result_module_shows_analysis_in_progress_when_summary_payload_is_missin
         _state(
             phase,
             displayed_config_id=101,
-            active_config_id=101 if phase == "analyzing" else None,
         )
     )
     module.services.bus.factory_review_changed.emit(
@@ -1578,7 +1737,7 @@ def test_result_module_keeps_in_progress_badge_when_plain_stopped_preserves_disp
     module = _make_module()
 
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
 
     assert module.lb_overall.text() == "分析中"
@@ -1595,14 +1754,143 @@ def test_result_module_preserves_existing_summary_card_when_plain_stop_enters_st
         _make_review_payload(summary_payload=_summary_payload(overall_status="pass"))
     )
 
-    assert module.lb_overall.text() == "PASS"
+    assert module.lb_overall.text() == "通过"
 
     module.services.bus.factory_state_changed.emit(_state("stopped", displayed_config_id=101))
 
-    assert module.lb_overall.text() == "PASS"
+    assert module.lb_overall.text() == "通过"
     assert module.lb_overall.property("resultLevel") == "pass"
-    assert _table_value(module, 0, 0) == "声压级"
-    assert _table_value(module, 6, 0) == "AI分析"
+    assert _table_value(module, 0, 0) == "声压级（峰值）"
+    assert _table_value(module, 4, 0) == "频谱最低得分"
+
+
+def test_result_module_shows_import_warnings(qapp):
+    warning = ImportAudioWarning(
+        code="nyquist_skipped",
+        message="FFT 超过 12800 Hz 的限制已跳过",
+        severity="warning",
+        metric="fft",
+    )
+    payload = FactoryReviewPayload(
+        displayed_config_id=101,
+        trigger_source="import_audio",
+        summary_payload={
+            "overall_status": "pass",
+            "overall_label": "通过",
+            "rows": [],
+        },
+        import_warnings=(warning,),
+    )
+    module = _make_module()
+    module.services.bus.factory_review_changed.emit(payload)
+
+    assert "12800" in module.lb_empty_text.text()
+    assert module.lb_overall.text() == "通过"
+    assert module.lb_overall.property("resultLevel") == "pass"
+
+
+def test_result_module_appends_import_warnings_below_no_result_error(qapp):
+    warning = ImportAudioWarning(
+        code="golden_unavailable",
+        message="黄金样本不可用，已跳过对比",
+        severity="warning",
+        metric="golden",
+    )
+    payload = _make_review_payload(
+        no_result=True,
+        error_message="MoSQITo unavailable",
+        summary_payload=_summary_payload(
+            overall_status="no_result",
+            error_message="MoSQITo unavailable",
+        ),
+    )
+    payload = FactoryReviewPayload(
+        displayed_config_id=payload.displayed_config_id,
+        run_id=payload.run_id,
+        trigger_source="import_audio",
+        captured_duration_sec=payload.captured_duration_sec,
+        default_window=payload.default_window,
+        fallback_window=payload.fallback_window,
+        manual_reanalysis_allowed=payload.manual_reanalysis_allowed,
+        no_result=payload.no_result,
+        error_message=payload.error_message,
+        judgment_payload=payload.judgment_payload,
+        summary_payload=payload.summary_payload,
+        import_warnings=(warning,),
+    )
+    module = _make_module()
+    module.services.bus.factory_review_changed.emit(payload)
+
+    message = module.lb_empty_text.text()
+    assert "MoSQITo unavailable" in message
+    assert "黄金样本不可用" in message
+
+
+def test_result_module_shows_imported_ai_as_not_run(qapp):
+    payload = FactoryReviewPayload(
+        displayed_config_id=101,
+        trigger_source="import_audio",
+        summary_payload={
+            "overall_status": "pass",
+            "overall_label": "通过",
+            "rows": [
+                {
+                    "item_key": "spl",
+                    "label": "SPL",
+                    "deviation_display": "-",
+                    "channel_label": "CH1",
+                    "status": "通过",
+                },
+                {
+                    "item_key": "spl_average",
+                    "label": "平均SPL",
+                    "deviation_display": "-",
+                    "channel_label": "CH1",
+                    "status": "通过",
+                },
+                {
+                    "item_key": "loudness",
+                    "label": "Loudness",
+                    "deviation_display": "-",
+                    "channel_label": "CH1",
+                    "status": "通过",
+                },
+                {
+                    "item_key": "loudness_average",
+                    "label": "平均Loudness",
+                    "deviation_display": "-",
+                    "channel_label": "CH1",
+                    "status": "通过",
+                },
+                {
+                    "item_key": "fft",
+                    "label": "FFT",
+                    "deviation_display": "-",
+                    "channel_label": "CH1",
+                    "status": "通过",
+                },
+                {
+                    "item_key": "octave",
+                    "label": "倍频程",
+                    "deviation_display": "-",
+                    "channel_label": "CH1",
+                    "status": "通过",
+                },
+                {
+                    "item_key": "ai",
+                    "label": "AI分析",
+                    "deviation_display": "--",
+                    "channel_label": "--",
+                    "status": "未运行",
+                    "constrained": False,
+                },
+            ],
+        },
+    )
+    module = _make_module()
+    module.services.bus.factory_review_changed.emit(payload)
+
+    assert _table_value(module, 4, 0) == "频谱最低得分"
 
 
 def test_result_module_shows_no_result_plus_error_text_from_summary_payload(qapp):
@@ -1694,25 +1982,20 @@ def test_result_module_shows_no_result_plus_error_text_from_summary_payload(qapp
     )
 
     assert module.lb_overall.text() == "无结果"
-    assert _table_value(module, 0, 0) == "声压级"
+    assert _table_value(module, 0, 0) == "声压级（峰值）"
     assert _table_value(module, 0, 1) == "-1 dB"
-    assert _table_value(module, 0, 2) == "通道1"
+    assert _table_value(module, 0, 2) == "-"
     assert _table_value(module, 0, 3) == "OK"
-    assert _table_value(module, 1, 0) == "平均声压级"
-    assert _table_value(module, 1, 2) == "通道1"
+    assert _table_value(module, 1, 0) == "声压级（平均）"
+    assert _table_value(module, 1, 2) == "-"
     assert _table_value(module, 1, 3) == "OK"
-    assert _table_value(module, 2, 0) == "响度"
-    assert _table_value(module, 2, 2) == "通道2"
+    assert _table_value(module, 2, 0) == "响度（峰值）"
+    assert _table_value(module, 2, 2) == "-"
     assert _table_value(module, 2, 3) == "无结果"
-    assert _table_value(module, 3, 0) == "平均响度"
-    assert _table_value(module, 3, 2) == "通道2"
+    assert _table_value(module, 3, 0) == "响度（平均）"
+    assert _table_value(module, 3, 2) == "-"
     assert _table_value(module, 3, 3) == "无结果"
-    assert _table_value(module, 4, 0) == "FFT频谱"
-    assert _table_value(module, 4, 2) == "通道1"
-    assert _table_value(module, 4, 3) == "OK"
-    assert _table_value(module, 5, 0) == "倍频程"
-    assert _table_value(module, 6, 0) == "AI分析"
-    assert _table_value(module, 6, 3) == "OK"
+    assert _table_value(module, 4, 0) == "频谱最低得分"
     assert getattr(module, "error_label").isHidden() is False
     assert getattr(module, "error_label").text() == "MoSQITo unavailable"
 
@@ -1724,7 +2007,7 @@ def test_factory_reset_still_clears_to_the_empty_badge_state(qapp):
         _make_review_payload(summary_payload=_summary_payload(overall_status="pass"))
     )
 
-    assert module.lb_overall.text() == "PASS"
+    assert module.lb_overall.text() == "通过"
 
     module.services.bus.factory_display_reset.emit("next_run_accepted")
     module.services.bus.factory_review_changed.emit(FactoryReviewPayload())

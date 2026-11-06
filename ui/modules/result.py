@@ -5,6 +5,7 @@ import re
 import time
 
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -19,29 +20,42 @@ from app.service.analysis import dsp
 from app.services_container import FactoryControllerState, FactoryReviewPayload
 
 
+_SPL_PEAK_LABEL = "声压级（峰值）"
+_LOUDNESS_PEAK_LABEL = "响度（峰值）"
+_SPL_LIVE_LABEL = "声压级"
+_LOUDNESS_LIVE_LABEL = "响度"
+
 _DISPLAY_LABEL_MAP = {
-    "SPL": "声压级",
-    "平均SPL": "平均声压级",
-    "Loudness": "响度",
-    "平均Loudness": "平均响度",
-    "FFT": "FFT频谱",
+    "SPL": _SPL_PEAK_LABEL,
+    "平均SPL": "声压级（平均）",
+    "Loudness": _LOUDNESS_PEAK_LABEL,
+    "平均Loudness": "响度（平均）",
+    "FFT": "频谱",
     "Octave": "倍频程",
+    "频谱平均评分": "频谱最低得分",
+}
+_RESULT_LABEL_MAP = {
+    "PASS": "通过",
+    "FAIL": "不通过",
 }
 _CHANNEL_LABEL_RE = re.compile(r"CH(\d+)", flags=re.IGNORECASE)
 _SPL_METRIC_UI_THROTTLE_SEC = 0.25
+_RESULT_OK_FOREGROUND = QColor("#188038")
+_RESULT_NG_FOREGROUND = QColor("#d93025")
+_RESULT_NEUTRAL_FOREGROUND = QColor("#000000")
 
 
 class ResultModule(QWidget):
     module_id = "result"
-    _ROW_LABELS = (
-        "声压级",
-        "平均声压级",
-        "响度",
-        "平均响度",
-        "FFT频谱",
-        "倍频程",
-        "AI分析",
+    _ROW_DEFS = (
+        ("spl", _SPL_PEAK_LABEL),
+        ("spl_average", "声压级（平均）"),
+        ("loudness", _LOUDNESS_PEAK_LABEL),
+        ("loudness_average", "响度（平均）"),
+        ("stft_score", "频谱最低得分"),
+        ("ai", "AI分析"),
     )
+    _ROW_LABELS = tuple(label for _item_key, label in _ROW_DEFS)
     _DISPLAY_PRESERVING_PHASES = frozenset(
         {"running", "analyzing", "reanalyzing", "stopped"}
     )
@@ -69,20 +83,20 @@ class ResultModule(QWidget):
 
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
-        lay.setSpacing(8)
+        lay.setSpacing(3)
 
         top = QWidget()
         top.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         top_lay = QHBoxLayout(top)
         top_lay.setContentsMargins(0, 0, 0, 0)
-        top_lay.setSpacing(8)
+        top_lay.setSpacing(4)
         top_lay.addWidget(QLabel("总结果："))
 
         self.lb_overall = QLabel("-")
         self.lb_overall.setObjectName("ResultBadge")
         self.lb_overall.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lb_overall.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        self.lb_overall.setMinimumHeight(36)
+        self.lb_overall.setMinimumHeight(28)
         self.lb_overall.setMinimumWidth(180)
         self.lb_overall.setProperty("resultLevel", "unknown")
         top_lay.addStretch(1)
@@ -92,14 +106,14 @@ class ResultModule(QWidget):
         metrics = QWidget()
         metrics_lay = QHBoxLayout(metrics)
         metrics_lay.setContentsMargins(0, 0, 0, 0)
-        metrics_lay.setSpacing(8)
+        metrics_lay.setSpacing(4)
 
-        spl_metric = self._create_metric_badge("声压级", "--")
+        spl_metric = self._create_metric_badge(_SPL_LIVE_LABEL, "--")
         self.lb_spl_metric_label = spl_metric["label"]
         self.lb_spl_metric_value = spl_metric["value"]
         metrics_lay.addWidget(spl_metric["widget"], 1)
 
-        loudness_metric = self._create_metric_badge("响度", "--")
+        loudness_metric = self._create_metric_badge(_LOUDNESS_LIVE_LABEL, "--")
         self.lb_loudness_metric_label = loudness_metric["label"]
         self.lb_loudness_metric_value = loudness_metric["value"]
         metrics_lay.addWidget(loudness_metric["widget"], 1)
@@ -128,7 +142,8 @@ class ResultModule(QWidget):
         lay.addWidget(self.empty_state)
 
         self.table = QTableWidget(len(self._ROW_LABELS), 4)
-        self.table.setHorizontalHeaderLabels(["项目", "偏差值", "通道", "结果"])
+        self.table.setObjectName("ResultSummaryTable")
+        self.table.setHorizontalHeaderLabels(["项目", "实测值", "电流", "结果"])
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
         self.table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
@@ -139,9 +154,15 @@ class ResultModule(QWidget):
         self.table.setColumnWidth(1, 110)
         self.table.setColumnWidth(2, 80)
         self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.horizontalHeader().setFixedHeight(22)
+        self.table.verticalHeader().setDefaultSectionSize(22)
+        for row in range(self.table.rowCount()):
+            self.table.setRowHeight(row, 22)
         self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.table.setFixedHeight(
-            self.table.horizontalHeader().height() + self.table.rowHeight(0) * len(self._ROW_LABELS) + 18
+            self.table.horizontalHeader().height()
+            + self.table.rowHeight(0) * len(self._ROW_LABELS)
+            + 6
         )
         lay.addWidget(self.table)
         lay.addStretch(1)
@@ -174,10 +195,10 @@ class ResultModule(QWidget):
         badge = QWidget()
         badge.setObjectName("ResultMetricBadge")
         badge.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        badge.setMinimumHeight(58)
+        badge.setMinimumHeight(40)
 
         lay = QVBoxLayout(badge)
-        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setContentsMargins(8, 3, 8, 3)
         lay.setSpacing(2)
 
         label = QLabel(label_text)
@@ -192,20 +213,38 @@ class ResultModule(QWidget):
 
         return {"widget": badge, "label": label, "value": value}
 
-    def _set_cell(self, row: int, column: int, text: str) -> None:
+    def _set_cell(
+        self,
+        row: int,
+        column: int,
+        text: str,
+        *,
+        foreground: QColor | None = None,
+    ) -> None:
         item = QTableWidgetItem(text)
         item.setFlags(Qt.ItemFlag.ItemIsEnabled)
         if column == 0:
             item.setTextAlignment(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft)
         else:
             item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+        if foreground is not None:
+            item.setForeground(foreground)
         self.table.setItem(row, column, item)
 
-    def _set_row(self, row: int, label: str, deviation: str, channel: str, status: str) -> None:
+    def _set_row(
+        self,
+        row: int,
+        label: str,
+        deviation: str,
+        channel: str,
+        status: str,
+        *,
+        result_foreground: QColor | None = None,
+    ) -> None:
         self._set_cell(row, 0, label)
         self._set_cell(row, 1, deviation)
         self._set_cell(row, 2, channel)
-        self._set_cell(row, 3, status)
+        self._set_cell(row, 3, status, foreground=result_foreground)
 
     def _set_badge(self, text: str, level: str) -> None:
         self.lb_overall.setText(text)
@@ -238,7 +277,17 @@ class ResultModule(QWidget):
 
     def _render_summary(self, summary_payload: dict) -> None:
         overall_status = summary_payload.get("overall_status")
-        overall_label = self._text_or_default(summary_payload.get("overall_label"), "-")
+        rows = summary_payload.get("rows")
+        if not isinstance(rows, list):
+            rows = []
+        overall_label = self._display_result_label(
+            self._text_or_default(summary_payload.get("overall_label"), "-")
+        )
+        overall_label = self._overall_label_with_failure_type(
+            overall_label,
+            overall_status=overall_status,
+            rows=rows,
+        )
         badge_level = {
             "pass": "pass",
             "fail": "fail",
@@ -248,21 +297,89 @@ class ResultModule(QWidget):
         error_message = None
         if overall_status == "no_result":
             error_message = self._text_or_default(summary_payload.get("error_message"), None)
+        warning_message = self._import_warning_message()
+        if warning_message:
+            error_message = (
+                f"{error_message}\n{warning_message}"
+                if error_message
+                else warning_message
+            )
         self._set_error_message(error_message)
 
-        rows = summary_payload.get("rows")
-        if not isinstance(rows, list):
-            rows = []
-        for row_index, default_label in enumerate(self._ROW_LABELS):
-            row_payload = rows[row_index] if row_index < len(rows) and isinstance(rows[row_index], dict) else {}
+        rows_by_key = {
+            row_payload.get("item_key"): row_payload
+            for row_payload in rows
+            if isinstance(row_payload, dict)
+            and isinstance(row_payload.get("item_key"), str)
+        }
+        matched_payload_ids = {id(row_payload) for row_payload in rows_by_key.values()}
+        for row_index, (item_key, default_label) in enumerate(self._ROW_DEFS):
+            row_payload = rows_by_key.get(item_key)
+            if row_payload is None:
+                candidate = (
+                    rows[row_index]
+                    if row_index < len(rows) and isinstance(rows[row_index], dict)
+                    else {}
+                )
+                row_payload = (
+                    candidate
+                    if isinstance(candidate, dict)
+                    and id(candidate) not in matched_payload_ids
+                    else {}
+                )
+            status = self._display_result_label(
+                self._text_or_default(
+                    row_payload.get("result_display", row_payload.get("status")),
+                    "-",
+                )
+            )
             self._set_row(
                 row_index,
                 self._display_label(row_payload.get("label"), default_label),
-                self._text_or_default(row_payload.get("deviation_display"), "-"),
-                self._display_channel(row_payload.get("channel_label"), "-"),
-                self._text_or_default(row_payload.get("status"), "-"),
+                self._summary_value_display(row_payload),
+                self._display_current(row_payload.get("channel_label"), "-"),
+                status,
+                result_foreground=self._summary_result_foreground(row_payload, status),
             )
         self._refresh_metric_display()
+
+    @classmethod
+    def _overall_label_with_failure_type(
+        cls,
+        overall_label: str | None,
+        *,
+        overall_status,
+        rows: list,
+    ) -> str | None:
+        if overall_status != "fail":
+            return overall_label
+        failure_label = cls._ai_failure_label(rows)
+        if not failure_label:
+            return overall_label
+        base_label = overall_label or "不通过"
+        return f"{base_label}（{failure_label}）"
+
+    @staticmethod
+    def _ai_failure_label(rows: list) -> str | None:
+        for row in rows:
+            if not isinstance(row, dict) or row.get("item_key") != "ai":
+                continue
+            label = row.get("failure_label")
+            if isinstance(label, str) and label.strip():
+                return label.strip()
+        return None
+
+    def _import_warning_message(self) -> str | None:
+        warnings = getattr(self._review_payload, "import_warnings", ()) or ()
+        messages = [
+            message
+            for message in (
+                getattr(warning, "message", "")
+                for warning in warnings
+            )
+            if isinstance(message, str) and message.strip()
+        ]
+        return "\n".join(message.strip() for message in messages[:5]) or None
 
     def _refresh_display(self) -> None:
         summary_payload = getattr(self._review_payload, "summary_payload", None)
@@ -391,7 +508,7 @@ class ResultModule(QWidget):
         if phase in self._LIVE_METRIC_PHASES:
             self._render_live_metrics()
             return
-        self._set_metric_values("声压级", "--", "响度", "--")
+        self._set_metric_values(_SPL_LIVE_LABEL, "--", _LOUDNESS_LIVE_LABEL, "--")
 
     def _render_live_metrics(self) -> None:
         key = self._current_metric_key()
@@ -404,14 +521,14 @@ class ResultModule(QWidget):
                 self._live_loudness_by_key.get(key),
                 unit,
             )
-        self._set_metric_values("声压级", spl_text, "响度", loudness_text)
+        self._set_metric_values(_SPL_LIVE_LABEL, spl_text, _LOUDNESS_LIVE_LABEL, loudness_text)
 
     def _render_live_spl_metric(self) -> None:
         key = self._current_metric_key()
         spl_text = "--"
         if key is not None:
             spl_text = self._format_spl_db(self._live_spl_by_key.get(key))
-        self.lb_spl_metric_label.setText("声压级")
+        self.lb_spl_metric_label.setText(_SPL_LIVE_LABEL)
         self.lb_spl_metric_value.setText(spl_text)
 
     def _render_live_loudness_metric(self) -> None:
@@ -423,7 +540,7 @@ class ResultModule(QWidget):
                 self._live_loudness_by_key.get(key),
                 unit,
             )
-        self.lb_loudness_metric_label.setText("响度")
+        self.lb_loudness_metric_label.setText(_LOUDNESS_LIVE_LABEL)
         self.lb_loudness_metric_value.setText(loudness_text)
 
     def _render_average_metrics(self) -> None:
@@ -762,11 +879,40 @@ class ResultModule(QWidget):
         return _DISPLAY_LABEL_MAP.get(text, text)
 
     @staticmethod
-    def _display_channel(value, default: str | None) -> str | None:
+    def _summary_value_display(row_payload: dict) -> str:
+        actual_display = ResultModule._text_or_default(
+            row_payload.get("actual_display"),
+            None,
+        )
+        if actual_display is not None:
+            return actual_display
+        return ResultModule._text_or_default(
+            row_payload.get("deviation_display"),
+            "-",
+        )
+
+    @staticmethod
+    def _summary_result_foreground(row_payload: dict, status: str | None) -> QColor:
+        if not isinstance(row_payload, dict) or row_payload.get("constrained") is not True:
+            return _RESULT_NEUTRAL_FOREGROUND
+        normalized_status = str(status or "").strip()
+        if normalized_status in {"OK", "PASS", "通过"}:
+            return _RESULT_OK_FOREGROUND
+        if normalized_status in {"", "-", "--"}:
+            return _RESULT_NEUTRAL_FOREGROUND
+        return _RESULT_NG_FOREGROUND
+
+    @staticmethod
+    def _display_result_label(value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _RESULT_LABEL_MAP.get(value, value)
+
+    @staticmethod
+    def _display_current(value, default: str | None) -> str | None:
         text = ResultModule._text_or_default(value, default)
         if text is None:
             return None
-        match = _CHANNEL_LABEL_RE.fullmatch(text.strip())
-        if match:
-            return f"通道{match.group(1)}"
+        if _CHANNEL_LABEL_RE.fullmatch(text.strip()):
+            return default
         return text

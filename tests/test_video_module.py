@@ -118,3 +118,23 @@ def test_manual_judgment_display_reset_preserves_live_preview_and_camera(
 
     module.deleteLater()
     qapp.processEvents()
+
+
+def test_camera_preview_failure_remains_local_and_keeps_module_usable(
+    qapp,
+    fake_video_dependencies,
+):
+    services = SimpleNamespace(bus=_BusStub())
+    module = VideoModule(services)
+    camera = fake_video_dependencies.instances[0]
+
+    camera.failed.emit("摄像头不可用")
+    qapp.processEvents()
+
+    assert "摄像头不可用" in module.lb.text()
+    assert camera.stop_count == 0
+    assert camera.start_count == 1
+    assert services.bus.log.emissions
+
+    module.deleteLater()
+    qapp.processEvents()

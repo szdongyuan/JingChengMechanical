@@ -27,6 +27,7 @@ class InputCalibrationModule(QWidget):
     def __init__(self, services):
         super().__init__()
         self.services = services
+        self._selected_hardware_id = None
         self.logger = LogManager.set_log_handler("输入校准")
 
         self.init_ui()
@@ -37,6 +38,12 @@ class InputCalibrationModule(QWidget):
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(8)
+
+        hardware_form = QFormLayout()
+        hardware_form.setContentsMargins(0, 0, 0, 0)
+        self.combo_hardware = QComboBox()
+        hardware_form.addRow("输入硬件", self.combo_hardware)
+        root.addLayout(hardware_form)
 
         # 标准声压
         gb_std = QGroupBox("标准声压")
@@ -158,27 +165,74 @@ class InputCalibrationModule(QWidget):
         bottom_lay.addStretch(1)
         root.addStretch(1)
         root.addWidget(bottom)
-        self.init_channel_combobox()
+        self.refresh_hardware_options()
 
     def init_fun(self):
         self.cal_button.clicked.connect(self.input_calibration)
         self.reset_button.clicked.connect(self.clicked_reset_button)
         self.save_button.clicked.connect(self.save_mic_deviation_value)
         self.services.bus.refresh_channels.connect(self.init_channel_combobox)
+        self.services.bus.input_hardware_changed.connect(
+            self.refresh_hardware_options
+        )
+        self.services.bus.input_hardware_selected.connect(
+            self.select_hardware
+        )
+        self.combo_hardware.currentIndexChanged.connect(
+            self._on_hardware_changed
+        )
         self.combo_channel.currentIndexChanged.connect(self.on_channel_changed)
 
+    def refresh_hardware_options(self):
+        preferred = self._selected_hardware_id
+        self.combo_hardware.blockSignals(True)
+        self.combo_hardware.clear()
+        for hardware in self.services.hss_service.list_input_hardware():
+            self.combo_hardware.addItem(
+                f"{hardware['alias']} · {hardware['channel_count']} 通道",
+                int(hardware["hardware_id"]),
+            )
+        self.combo_hardware.blockSignals(False)
+        if preferred is not None:
+            self.select_hardware(preferred)
+        elif self.combo_hardware.count():
+            self.combo_hardware.setCurrentIndex(0)
+            self._on_hardware_changed()
+        else:
+            self._selected_hardware_id = None
+            self.init_channel_combobox()
+
+    def select_hardware(self, hardware_id: int):
+        for index in range(self.combo_hardware.count()):
+            if self.combo_hardware.itemData(index) == int(hardware_id):
+                self.combo_hardware.setCurrentIndex(index)
+                self._on_hardware_changed()
+                return
+
+    def _on_hardware_changed(self, _index=None):
+        self._selected_hardware_id = self.combo_hardware.currentData()
+        self.init_channel_combobox()
+
+    def _hardware(self) -> dict:
+        if self._selected_hardware_id is None:
+            return {}
+        return (
+            self.services.hss_service.get_input_hardware(
+                self._selected_hardware_id
+            )
+            or {}
+        )
+
     def on_channel_changed(self):
-        device_info = self.services.hss_service.load_io_devices()
-        mic_cal = device_info.get("mic_cal") or {}
+        mic_cal = self._hardware().get("mic_cal") or {}
         channel_name = self.combo_channel.currentText()
         value = mic_cal.get(channel_name, {}).get("deviation_value", "")
         self.deviation_lineedit.setText(f"{value} Pa/V" if value != "" else "")
 
     def init_channel_combobox(self):
         self.combo_channel.clear()
-        device_info = self.services.hss_service.load_io_devices()
-        input_info = device_info.get("input", {})
-        raw = input_info.get("channel_count")
+        hardware = self._hardware()
+        raw = hardware.get("channel_count")
         if not raw:
             return
         channel_count = int(raw)
@@ -193,8 +247,13 @@ class InputCalibrationModule(QWidget):
             QMessageBox.warning(self, "警告", "请先校准Mic！")
             return
 
+        if self._selected_hardware_id is None:
+            QMessageBox.warning(self, "警告", "请先选择输入硬件！")
+            return
         flag, data = self.services.input_calibration_service.save_mic_cal_data(
-            selected_channel, deviation_lineedit_text
+            self._selected_hardware_id,
+            selected_channel,
+            deviation_lineedit_text,
         )
         if not flag:
             QMessageBox.warning(self, "错误", data)
@@ -214,9 +273,21 @@ class InputCalibrationModule(QWidget):
         QApplication.processEvents()
 
         prolong = 1
-        device_info = self.services.hss_service.load_io_devices()
-        samplerate = int(device_info["input"]["samplerate"])
-        channels_counts = int(device_info["input"]["channel_count"])
+        hardware = self._hardware()
+        if not hardware:
+            self.record_state.setText("待录制")
+            QMessageBox.warning(self, "提示", "请先选择输入硬件。")
+            return
+        try:
+            self.services.hss_service.activate_input_hardware(
+                hardware["hardware_id"]
+            )
+        except Exception as exc:
+            self.record_state.setText("待录制")
+            QMessageBox.warning(self, "设备不可用", str(exc))
+            return
+        samplerate = int(hardware["samplerate"])
+        channels_counts = int(hardware["channel_count"])
         seconds = 5
         recorded_dict = {"channels": channels_counts,
                          "sample_rate": samplerate,
@@ -225,7 +296,7 @@ class InputCalibrationModule(QWidget):
                          }
         # 获取下拉框通道数据
         channel_number_text = self.combo_channel.currentText()
-        mic_cal = (device_info.get("mic_cal") or {})
+        mic_cal = hardware.get("mic_cal") or {}
         channel_index = int(mic_cal.get(channel_number_text, {}).get("binding_index", 0))
         # 计算平均声压级（SPL）
         flag, average_spl = AudioThdFrequencyResponseAnalysis.calculate_average_spl(recorded_dict, channel_index)

@@ -17,7 +17,6 @@ from model.users_table import UsersTable
 
 ROLE_MAP = {
     "工程师": "Engineer",
-    "操作员": "Operator",
 }
 
 
@@ -56,7 +55,7 @@ class DeleteUserWindow(QWidget):
         role_label.setFixedWidth(44)
         role_row.addWidget(role_label)
         self.role_combo = QComboBox()
-        self.role_combo.addItems(["工程师", "操作员"])
+        self.role_combo.addItems(["工程师"])
         self.role_combo.setMinimumHeight(34)
         self.role_combo.currentIndexChanged.connect(self.load_users)
         role_row.addWidget(self.role_combo, 1)
@@ -79,7 +78,7 @@ class DeleteUserWindow(QWidget):
     def load_users(self):
         self.user_combo.clear()
         role_text = self.role_combo.currentText()
-        db_role = ROLE_MAP.get(role_text, "Operator")
+        db_role = ROLE_MAP.get(role_text, "Engineer")
         users = (
             UsersTable.select()
             .where(UsersTable.access_level == db_role)
@@ -99,7 +98,7 @@ class DeleteUserWindow(QWidget):
     def delete_user(self):
         username = self.user_combo.currentData()
         role_text = self.role_combo.currentText()
-        db_role = ROLE_MAP.get(role_text, "Operator")
+        db_role = ROLE_MAP.get(role_text, "Engineer")
         if not username:
             QMessageBox.warning(self, "提示", "没有可删除的用户。")
             return
@@ -123,8 +122,8 @@ class DeleteUserWindow(QWidget):
             .execute()
         )
         if deleted == 0:
-            QMessageBox.warning(self, "提示", "删除失败。")
+            QMessageBox.warning(self, "提示", "删除失败。              ")
             return
 
-        QMessageBox.information(self, "提示", "删除用户成功。")
+        QMessageBox.information(self, "提示", "删除用户成功。              ")
         self.load_users()

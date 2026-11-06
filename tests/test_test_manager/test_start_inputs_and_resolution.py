@@ -3,18 +3,142 @@ from __future__ import annotations
 from unittest.mock import MagicMock
 
 import numpy as np
+import pytest
 
 from app.service.analysis.test_manager import TestManager
 
 from ._support import (
+    _CaptureRecorderDoubleMixin,
     _DummySignal,
     _FakeSession,
+    _factory_runtime_config,
     _mock_bus,
     _mock_services,
 )
 
 
+class _CountingRecorder(_CaptureRecorderDoubleMixin):
+    instances = []
+
+    def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
+        self.device_name = device_name
+        self.hostapi = hostapi
+        self._sample_rate = sample_rate
+        self._n_channels = n_channels
+        self._record_duration = record_duration
+        self._buffer = np.zeros(
+            (int(float(sample_rate) * float(record_duration)), n_channels),
+            dtype=np.float32,
+        )
+        self.recording_done = _DummySignal()
+        self.error_occurred = _DummySignal()
+        self._running = False
+        _CountingRecorder.instances.append(self)
+
+    def isRunning(self):
+        return self._running
+
+    def start(self):
+        self._running = True
+
+    def stop(self):
+        self._running = False
+
+    def wait(self, timeout):
+        return True
+
+class _CountingMonitor:
+    instances = []
+
+    def __init__(
+        self,
+        *,
+        device_name,
+        hostapi,
+        sample_rate,
+        monitor_channel,
+        gain_db=0.0,
+    ):
+        self.device_name = device_name
+        self.hostapi = hostapi
+        self.sample_rate = sample_rate
+        self.monitor_channel = monitor_channel
+        self.gain_db = gain_db
+        self.error_occurred = _DummySignal()
+        _CountingMonitor.instances.append(self)
+
+    def feed(self, chunk):
+        return True
+
+    def start(self):
+        return None
+
+    def stop(self):
+        return None
+
+    def wait(self, timeout):
+        return True
+
+
+class _CountingSession(_FakeSession):
+    instances = []
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _CountingSession.instances.append(self)
+
+
+def _install_counting_runtime(monkeypatch):
+    _CountingRecorder.instances = []
+    _CountingMonitor.instances = []
+    _CountingSession.instances = []
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.AudioRecorder",
+        _CountingRecorder,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.AudioMonitor",
+        _CountingMonitor,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.test_manager.TestSession",
+        _CountingSession,
+    )
+
+
 class TestTestManagerStartStop:
+    def test_start_rejects_unavailable_managed_input_before_session_creation(self):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            config = _factory_runtime_config()
+            config["input_hardware_device_id"] = 9
+            services.config_service.load_config.return_value = config
+
+            class UnavailableHardwareService:
+                def load_input_device_for_config(self, _config):
+                    return {
+                        "input": {
+                            "id": 9,
+                            "name": "Missing Mic",
+                            "type": "ASIO",
+                            "samplerate": "44100",
+                            "channel_count": 2,
+                        },
+                        "mic_cal": {},
+                    }
+
+                def input_hardware_availability_error(self, _config):
+                    return "输入硬件“产线声卡”当前未连接。"
+
+            services.hss_service = UnavailableHardwareService()
+            manager = TestManager(bus, services)
+
+            accepted = manager.start({"config_id": config["config_id"]})
+
+            assert accepted is False
+            assert manager.last_start_error() == "输入硬件“产线声卡”当前未连接。"
+            bus.test_started.emit.assert_not_called()
+
     def test_start_passes_input_device_identity_to_recorder(self, monkeypatch):
             bus = _mock_bus()
             services = _mock_services(bus)
@@ -43,7 +167,7 @@ class TestTestManagerStartStop:
                 "output_device_name": None,
             }
 
-            class FakeRecorder:
+            class FakeRecorder(_CaptureRecorderDoubleMixin):
                 instances = []
 
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
@@ -53,7 +177,6 @@ class TestTestManagerStartStop:
                     self._n_channels = n_channels
                     self._record_duration = record_duration
                     self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
-                    self.chunk_ready = _DummySignal()
                     self.recording_done = _DummySignal()
                     self.error_occurred = _DummySignal()
                     self._running = False
@@ -70,15 +193,6 @@ class TestTestManagerStartStop:
 
                 def wait(self, timeout):
                     return True
-
-                def attach_session(self, *, record_duration):
-                    if record_duration > self._record_duration:
-                        self._record_duration = record_duration
-                        self._buffer = np.zeros((int(self._sample_rate * record_duration), self._n_channels), dtype=np.float32)
-                    return MagicMock(chunk_index=0, sample_index=0)
-
-                def get_buffer_from(self, snapshot):
-                    return self._buffer
 
             monkeypatch.setattr("app.service.analysis.test_manager.AudioRecorder", FakeRecorder)
             monkeypatch.setattr("app.service.analysis.test_manager.TestSession", _FakeSession)
@@ -191,13 +305,12 @@ class TestTestManagerStartStop:
                 "output_device_samplerate": 48000,
             }
 
-            class FakeRecorder:
+            class FakeRecorder(_CaptureRecorderDoubleMixin):
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
                     self._sample_rate = sample_rate
                     self._n_channels = n_channels
                     self._record_duration = record_duration
                     self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
-                    self.chunk_ready = _DummySignal()
                     self.recording_done = _DummySignal()
                     self.error_occurred = _DummySignal()
                     self._running = False
@@ -214,23 +327,23 @@ class TestTestManagerStartStop:
                 def wait(self, timeout):
                     return True
 
-                def attach_session(self, *, record_duration):
-                    if record_duration > self._record_duration:
-                        self._record_duration = record_duration
-                        self._buffer = np.zeros((int(self._sample_rate * record_duration), self._n_channels), dtype=np.float32)
-                    return MagicMock(chunk_index=0, sample_index=0)
-
-                def get_buffer_from(self, snapshot):
-                    return self._buffer
-
             class FakeMonitor:
                 instances = []
 
-                def __init__(self, *, device_name, hostapi, sample_rate, monitor_channel):
+                def __init__(
+                    self,
+                    *,
+                    device_name,
+                    hostapi,
+                    sample_rate,
+                    monitor_channel,
+                    gain_db=0.0,
+                ):
                     self.device_name = device_name
                     self.hostapi = hostapi
                     self.sample_rate = sample_rate
                     self.monitor_channel = monitor_channel
+                    self.gain_db = gain_db
                     self.error_occurred = _DummySignal()
                     FakeMonitor.instances.append(self)
 
@@ -288,13 +401,12 @@ class TestTestManagerStartStop:
                 "output_device_samplerate": 48000,
             }
 
-            class FakeRecorder:
+            class FakeRecorder(_CaptureRecorderDoubleMixin):
                 def __init__(self, *, device_name, hostapi, sample_rate, n_channels, record_duration):
                     self._sample_rate = sample_rate
                     self._n_channels = n_channels
                     self._record_duration = record_duration
                     self._buffer = np.zeros((int(sample_rate * record_duration), n_channels), dtype=np.float32)
-                    self.chunk_ready = _DummySignal()
                     self.recording_done = _DummySignal()
                     self.error_occurred = _DummySignal()
                     self._running = False
@@ -311,20 +423,20 @@ class TestTestManagerStartStop:
                 def wait(self, timeout):
                     return True
 
-                def attach_session(self, *, record_duration):
-                    if record_duration > self._record_duration:
-                        self._record_duration = record_duration
-                        self._buffer = np.zeros((int(self._sample_rate * record_duration), self._n_channels), dtype=np.float32)
-                    return MagicMock(chunk_index=0, sample_index=0)
-
-                def get_buffer_from(self, snapshot):
-                    return self._buffer
-
             class FakeMonitor:
                 instances = []
 
-                def __init__(self, *, device_name, hostapi, sample_rate, monitor_channel):
+                def __init__(
+                    self,
+                    *,
+                    device_name,
+                    hostapi,
+                    sample_rate,
+                    monitor_channel,
+                    gain_db=0.0,
+                ):
                     self.monitor_channel = monitor_channel
+                    self.gain_db = gain_db
                     self.error_occurred = _DummySignal()
                     FakeMonitor.instances.append(self)
 
@@ -349,3 +461,178 @@ class TestTestManagerStartStop:
 
             monitor = FakeMonitor.instances[0]
             assert monitor.monitor_channel == 1
+
+    def test_start_passes_monitor_controls_without_changing_analysis_channels(
+        self,
+        monkeypatch,
+    ):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            services.hss_service.load_io_devices.return_value["input"]["channel_count"] = "4"
+            config = _factory_runtime_config()
+            config["selected_channels"] = [1, 3]
+            config["monitor_channel_index"] = 2
+            config["monitor_gain_db"] = 35.0
+            services.config_service.load_config.return_value = config
+            _install_counting_runtime(monkeypatch)
+            mgr = TestManager(bus, services)
+
+            accepted = mgr.start({"config_id": 1, "sn": "SN1"})
+
+            assert accepted is True
+            assert _CountingRecorder.instances[0]._n_channels == 4
+            assert _CountingSession.instances[0]._config["selected_channels"] == [1, 3]
+            assert _CountingMonitor.instances[0].monitor_channel == 2
+            assert _CountingMonitor.instances[0].gain_db == pytest.approx(35.0)
+
+            hardware_buffer = np.column_stack(
+                [np.full(5, channel, dtype=np.float32) for channel in range(4)]
+            )
+            captured = _CountingSession.instances[0].capture_recorder_buffer(
+                hardware_buffer,
+                44100.0,
+            )
+            np.testing.assert_array_equal(captured, hardware_buffer[:, [1, 3]])
+            assert _CountingSession.instances[0]._real_to_logical_channel == {1: 0, 3: 1}
+            mgr.stop(config_id=1)
+
+    def test_start_treats_null_monitor_channel_as_first_selected_channel(
+        self,
+        monkeypatch,
+    ):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            config = _factory_runtime_config()
+            config["selected_channels"] = [1]
+            config["monitor_channel_index"] = None
+            services.config_service.load_config.return_value = config
+            _install_counting_runtime(monkeypatch)
+            mgr = TestManager(bus, services)
+
+            accepted = mgr.start({"config_id": 1, "sn": "SN1"})
+
+            assert accepted is True
+            assert _CountingMonitor.instances[0].monitor_channel == 1
+            mgr.stop(config_id=1)
+
+    @pytest.mark.parametrize("monitor_channel_index", [2, -1, True, "1"])
+    def test_start_rejects_invalid_monitor_channel_before_runtime_setup(
+        self,
+        monkeypatch,
+        monitor_channel_index,
+    ):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            config = _factory_runtime_config()
+            config["monitor_channel_index"] = monitor_channel_index
+            services.config_service.load_config.return_value = config
+            _install_counting_runtime(monkeypatch)
+            mgr = TestManager(bus, services)
+
+            accepted = mgr.start({"config_id": 1, "sn": "SN1"})
+
+            assert accepted is False
+            assert "监听通道" in (mgr.last_start_error() or "")
+            assert _CountingSession.instances == []
+            assert _CountingRecorder.instances == []
+            assert _CountingMonitor.instances == []
+            bus.test_started.emit.assert_not_called()
+
+    @pytest.mark.parametrize("vibration_view_channel_index", [2, -1, True, "1"])
+    def test_start_rejects_invalid_vibration_view_channel_before_runtime_setup(
+        self,
+        monkeypatch,
+        vibration_view_channel_index,
+    ):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            config = _factory_runtime_config()
+            config["selected_channels"] = [0]
+            config["vibration_view_channel_index"] = vibration_view_channel_index
+            services.config_service.load_config.return_value = config
+            _install_counting_runtime(monkeypatch)
+            mgr = TestManager(bus, services)
+
+            accepted = mgr.start({"config_id": 1, "sn": "SN1"})
+
+            assert accepted is False
+            assert "振动视图通道" in (mgr.last_start_error() or "")
+            assert _CountingSession.instances == []
+            assert _CountingRecorder.instances == []
+            assert _CountingMonitor.instances == []
+            bus.test_started.emit.assert_not_called()
+
+    @pytest.mark.parametrize("monitor_gain_db", [float("nan"), float("inf"), -60.1, 35.1, "6"])
+    def test_start_rejects_invalid_monitor_gain_before_runtime_setup(
+        self,
+        monkeypatch,
+        monitor_gain_db,
+    ):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            config = _factory_runtime_config()
+            config["monitor_gain_db"] = monitor_gain_db
+            services.config_service.load_config.return_value = config
+            _install_counting_runtime(monkeypatch)
+            mgr = TestManager(bus, services)
+
+            accepted = mgr.start({"config_id": 1, "sn": "SN1"})
+
+            assert accepted is False
+            assert "监听增益" in (mgr.last_start_error() or "")
+            assert _CountingSession.instances == []
+            assert _CountingRecorder.instances == []
+            assert _CountingMonitor.instances == []
+            bus.test_started.emit.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "selected_channels",
+        [
+            [2],
+            [1, 1],
+            [],
+            [0, 1, 2],
+            [True],
+            ["1"],
+        ],
+    )
+    def test_start_rejects_invalid_selected_channels_before_runtime_setup(
+        self,
+        monkeypatch,
+        selected_channels,
+    ):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            config = _factory_runtime_config()
+            config["selected_channels"] = selected_channels
+            services.config_service.load_config.return_value = config
+            _install_counting_runtime(monkeypatch)
+            mgr = TestManager(bus, services)
+
+            accepted = mgr.start({"config_id": 1, "sn": "SN1"})
+
+            assert accepted is False
+            assert "selected" in (mgr.last_start_error() or "")
+            assert _CountingSession.instances == []
+            assert _CountingRecorder.instances == []
+            assert _CountingMonitor.instances == []
+            bus.test_started.emit.assert_not_called()
+
+    def test_start_uses_normalized_selected_channels_for_runtime_setup(
+        self,
+        monkeypatch,
+    ):
+            bus = _mock_bus()
+            services = _mock_services(bus)
+            config = _factory_runtime_config()
+            config["selected_channels"] = (np.int64(1),)
+            services.config_service.load_config.return_value = config
+            _install_counting_runtime(monkeypatch)
+            mgr = TestManager(bus, services)
+
+            accepted = mgr.start({"config_id": 1, "sn": "SN1"})
+
+            assert accepted is True
+            assert _CountingSession.instances[0]._config["selected_channels"] == [1]
+            assert _CountingMonitor.instances[0].monitor_channel == 1
+            mgr.stop(config_id=1)

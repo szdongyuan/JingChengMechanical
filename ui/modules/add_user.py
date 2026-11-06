@@ -19,9 +19,7 @@ from ui.modules.login import encrypt_password
 
 
 ROLE_MAP = {
-    "管理员": "Admin",
     "工程师": "Engineer",
-    "操作员": "Operator",
 }
 
 
@@ -59,7 +57,7 @@ class AddUserWindow(QWidget):
         role_label.setFixedWidth(44)
         role_row.addWidget(role_label)
         self.role_combo = QComboBox()
-        self.role_combo.addItems(["管理员", "工程师", "操作员"])
+        self.role_combo.addItems(["工程师"])
         self.role_combo.setMinimumHeight(34)
         role_row.addWidget(self.role_combo, 1)
         root.addLayout(role_row)
@@ -111,7 +109,7 @@ class AddUserWindow(QWidget):
         role_text = self.role_combo.currentText()
 
         if not username or not password or not confirm_password:
-            QMessageBox.warning(self, "提示", "请填写完整。")
+            QMessageBox.warning(self, "提示", "请填写完整。              ")
             return
 
         if password != confirm_password:
@@ -119,19 +117,13 @@ class AddUserWindow(QWidget):
             return
 
         if UsersTable.select().where(UsersTable.user_name == username).exists():
-            QMessageBox.warning(self, "提示", "账号已存在。")
+            QMessageBox.warning(self, "提示", "账号已存在。              ")
             return
 
         db_role = ROLE_MAP.get(role_text)
-        if db_role == "Admin":
-            has_admin = (
-                UsersTable.select()
-                .where(UsersTable.access_level == "Admin")
-                .exists()
-            )
-            if has_admin:
-                QMessageBox.warning(self, "提示", "管理员账号只允许一个。")
-                return
+        if not db_role:
+            QMessageBox.warning(self, "提示", "请选择有效权限。              ")
+            return
 
         try:
             UsersTable.create(
@@ -145,5 +137,5 @@ class AddUserWindow(QWidget):
             QMessageBox.warning(self, "提示", f"保存失败：{exc}")
             return
 
-        QMessageBox.information(self, "提示", "添加用户成功。")
+        QMessageBox.information(self, "提示", "添加用户成功。              ")
         self.close()

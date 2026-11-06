@@ -140,6 +140,8 @@ class AiToolManagementModule(QWidget):
         detail_lay.setSpacing(10)
 
         form_host = QWidget()
+        form_host.setObjectName("ai_tool_management_form")
+        self._form_host = form_host
         form_lay = QFormLayout(form_host)
         form_lay.setContentsMargins(0, 0, 0, 0)
         form_lay.setHorizontalSpacing(10)
@@ -149,7 +151,6 @@ class AiToolManagementModule(QWidget):
         self.lb_toolchain_id_value.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        form_lay.addRow("内部标识", self.lb_toolchain_id_value)
 
         self.ed_display_name = QLineEdit()
         form_lay.addRow("显示名称", self.ed_display_name)
@@ -219,6 +220,13 @@ class AiToolManagementModule(QWidget):
         self.combo_execution_mode.addItem("单次进程", "oneshot_process")
         form_lay.addRow("执行模式", self.combo_execution_mode)
 
+        self.ed_decision_threshold = QLineEdit()
+        self.ed_decision_threshold.setPlaceholderText("留空使用 AI 返回阈值")
+        self.ed_decision_threshold.setClearButtonEnabled(True)
+        form_lay.addRow("合格分数阈值（可选）", self.ed_decision_threshold)
+        threshold_hint = QLabel("范围 0–1，分数 ≥ 阈值为合格；越高越严格，清空恢复 AI 阈值。保存后下次运行生效。")
+        threshold_hint.setWordWrap(True)
+        form_lay.addRow("", threshold_hint)
         self.txt_params_json = QPlainTextEdit()
         self.txt_params_json.setPlaceholderText('{"key": "value"}')
         self.txt_params_json.setMaximumHeight(100)
@@ -266,6 +274,7 @@ class AiToolManagementModule(QWidget):
         self.spin_timeout.textChanged.connect(self._on_editor_changed)
         self.chk_enabled.toggled.connect(self._on_editor_changed)
         self.combo_execution_mode.currentIndexChanged.connect(self._on_editor_changed)
+        self.ed_decision_threshold.textChanged.connect(self._on_editor_changed)
         self.txt_params_json.textChanged.connect(self._on_editor_changed)
         self.txt_description.textChanged.connect(self._on_editor_changed)
         self.btn_browse_package_dir.clicked.connect(self._browse_package_dir)
@@ -349,6 +358,7 @@ class AiToolManagementModule(QWidget):
             "enabled": True,
             "execution_mode": _DEFAULT_EXECUTION_MODE,
             "params_json": "{}",
+            "decision_threshold_text": "",
             "description": "",
         }
 
@@ -371,6 +381,17 @@ class AiToolManagementModule(QWidget):
                 "description": row.get("description", ""),
             }
         )
+        if "decision_threshold_text" in row:
+            payload["decision_threshold_text"] = row["decision_threshold_text"]
+        else:
+            try:
+                params = json.loads(payload["params_json"])
+                if isinstance(params, dict) and "decision_threshold" in params:
+                    value = params.pop("decision_threshold")
+                    payload["decision_threshold_text"] = "" if value is None else json.dumps(value, ensure_ascii=False)
+                    payload["params_json"] = json.dumps(params, ensure_ascii=False)
+            except (ValueError, TypeError):
+                pass  # Keep malformed JSON visible for correction in the editor.
         return payload
 
     @staticmethod
@@ -524,6 +545,7 @@ class AiToolManagementModule(QWidget):
                 row.get("execution_mode", _DEFAULT_EXECUTION_MODE)
             )
             self.txt_params_json.setPlainText(row.get("params_json", "{}"))
+            self.ed_decision_threshold.setText(row.get("decision_threshold_text", ""))
             self.txt_description.setPlainText(row.get("description", ""))
         finally:
             self._suspend_editor_change_tracking = False
@@ -619,11 +641,32 @@ class AiToolManagementModule(QWidget):
             "execution_mode": self.combo_execution_mode.currentData()
             or _DEFAULT_EXECUTION_MODE,
             "params_json": self.txt_params_json.toPlainText(),
+            "decision_threshold_text": self.ed_decision_threshold.text(),
             "description": self.txt_description.toPlainText(),
         }
 
     def _collect_save_payload(self) -> dict:
         payload = self._collect_payload()
+        raw_params = payload["params_json"].strip() or "{}"
+        try:
+            params = json.loads(raw_params)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"参数(JSON) 格式无效：{exc}") from exc
+        if not isinstance(params, dict):
+            raise ValueError("参数(JSON) 必须是对象")
+        if "decision_threshold" in params:
+            raise ValueError("decision_threshold 请在合格分数阈值专用编辑框中设置")
+        text = payload["decision_threshold_text"].strip()
+        if text:
+            from app.service.ai_threshold import coerce_probability
+            try:
+                value = coerce_probability(float(text))
+            except ValueError:
+                value = None
+            if value is None:
+                raise ValueError("decision_threshold 必须为 0 到 1 之间的有限数值")
+            params["decision_threshold"] = value
+            raw_params = json.dumps(params, ensure_ascii=False)
         return {
             "toolchain_id": payload["toolchain_id"].strip(),
             "display_name": payload["display_name"].strip(),
@@ -633,7 +676,7 @@ class AiToolManagementModule(QWidget):
             "default_timeout_ms": payload["default_timeout_ms"],
             "enabled": payload["enabled"],
             "execution_mode": payload["execution_mode"],
-            "params_json": payload["params_json"].strip() or "{}",
+            "params_json": raw_params,
             "description": payload["description"].strip(),
         }
 
@@ -664,14 +707,14 @@ class AiToolManagementModule(QWidget):
         self._save_current_editor()
 
     def _save_current_editor(self) -> bool:
-        payload = self._collect_save_payload()
-        if self._is_new_draft and self._draft_payload is not None:
-            self._ensure_draft_toolchain_id_available()
-            payload = self._collect_save_payload()
-            generated_id_prefix = self._draft_payload.get("generated_id_prefix")
-            if generated_id_prefix:
-                payload["generated_id_prefix"] = generated_id_prefix
         try:
+            payload = self._collect_save_payload()
+            if self._is_new_draft and self._draft_payload is not None:
+                self._ensure_draft_toolchain_id_available()
+                payload = self._collect_save_payload()
+                generated_id_prefix = self._draft_payload.get("generated_id_prefix")
+                if generated_id_prefix:
+                    payload["generated_id_prefix"] = generated_id_prefix
             self._validate_payload(payload)
             original_toolchain_id = (
                 None if self._is_new_draft else self._current_toolchain_id

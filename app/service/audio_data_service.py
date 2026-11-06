@@ -6,20 +6,65 @@ import zipfile
 from peewee import Model, SqliteDatabase, fn
 
 from base.utils import normalize_path
+from consts.time_consts import now_str
 from model.audio_data_table import AudioDataTable
 
 
 class AudioDataService:
+    def today_statistics(self):
+        # record_date 格式如 2026-04-29T11:11:32.813876+08:00，前 10 位是日期。
+        today = now_str()[:10]
+        today_condition = fn.Substr(AudioDataTable.record_date, 1, 10) == today
+        return {
+            "total": AudioDataTable.select().where(today_condition).count(),
+            "ok": AudioDataTable.select().where(
+                today_condition,
+                AudioDataTable.labels == "OK",
+            ).count(),
+            "ng": AudioDataTable.select().where(
+                today_condition,
+                AudioDataTable.labels == "NG",
+            ).count(),
+        }
+
     def list_column_names(self) -> list[str]:
         # 查询：返回 audio_data_table 的字段顺序，给 UI 生成表头用。
         return list(AudioDataTable._meta.sorted_field_names)
 
     def list_records(self, filters: dict[str, object] | None = None) -> list[dict[str, object]]:
         # 查询：读取音频表数据，按创建时间倒序给数据管理页展示。
+        return list(self._filtered_query(filters).dicts())
+
+    def count_records(self, filters: dict[str, object] | None = None) -> int:
+        """返回筛选后的总条数。"""
+        return self._apply_filters(AudioDataTable.select(), filters).count()
+
+    def list_records_page(self, filters=None, page=1, page_size=50):
+        """分页读取音频数据。"""
+        page = max(1, int(page))
+        page_size = max(1, int(page_size))
+        return list(self._filtered_query(filters).paginate(page, page_size).dicts())
+
+    def _filtered_query(self, filters: dict[str, object] | None = None):
+        """生成带筛选和倒序排序的查询。"""
         query = AudioDataTable.select()
         query = self._apply_filters(query, filters)
-        query = query.order_by(AudioDataTable.record_date.desc()).dicts()
-        return list(query)
+        return query.order_by(AudioDataTable.record_date.desc())
+
+    def delete_record(self, audio_data_id: object) -> None:
+        record_id = str(audio_data_id or "").strip()
+        if not record_id:
+            raise ValueError("缺少 audio_id")
+
+        record = AudioDataTable.get_or_none(AudioDataTable.audio_data_id == record_id)
+        if record is None:
+            raise ValueError("数据不存在")
+
+        file_path = normalize_path(record.file_path)
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+
+        record.delete_instance()
 
     def list_product_models(self) -> list[str]:
         # 查询：返回所有产品型号，给筛选下拉框使用。
@@ -48,7 +93,7 @@ class AudioDataService:
         max_value = latest.record_date[:19] if latest and latest.record_date else None
         return min_value, max_value
 
-    def export_zip(self, target_path: str, records: list[dict[str, object]]) -> None:
+    def export_zip(self, target_path: str, records: list[dict[str, object]], progress_callback=None) -> None:
         # 导出/保存：生成 zip 包，里面包含 1 个 db 和分类后的音频文件。
         base_name = os.path.splitext(os.path.basename(target_path))[0]
         db_name = f"{base_name}.db"
@@ -56,14 +101,21 @@ class AudioDataService:
         export_records = [self._build_export_record(record) for record in records]
 
         self._export_db(temp_db_path, export_records)
+        if progress_callback:
+            # 第一步是写出随 zip 一起导出的临时数据库。
+            progress_callback(1)
         try:
-            with zipfile.ZipFile(target_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            # 只打包不压缩，避免数据量大时压缩音频导致界面长时间卡住。
+            with zipfile.ZipFile(target_path, "w", zipfile.ZIP_STORED) as archive:
                 archive.write(temp_db_path, db_name)
-                for record in export_records:
+                for index, record in enumerate(export_records, start=2):
                     source_path = normalize_path(record.get("_source_file_path"))
                     archive_path = record.get("file_path")
                     if source_path and archive_path and os.path.exists(source_path):
                         archive.write(source_path, str(archive_path))
+                    if progress_callback:
+                        # 每处理完一个音频文件，通知界面更新一次进度。
+                        progress_callback(index)
         finally:
             if os.path.exists(temp_db_path):
                 os.remove(temp_db_path)
@@ -127,12 +179,25 @@ class AudioDataService:
             fn.replace(fn.Substr(AudioDataTable.record_date, 1, 19), "T", " ")
         )
 
-        product_model = str(filters.get("product_model") or "").strip()
-        if product_model and product_model != "ALL":
-            query = query.where(AudioDataTable.product_model == product_model)
+        product_models = filters.get("product_models")
+        normalized_models = []
+        if isinstance(product_models, (list, tuple, set)):
+            normalized_models = [
+                str(model).strip()
+                for model in product_models
+                if str(model).strip()
+            ]
+        if normalized_models:
+            query = query.where(
+                AudioDataTable.product_model.in_(normalized_models)
+            )
+        else:
+            product_model = str(filters.get("product_model") or "").strip()
+            if product_model and product_model != "ALL":
+                query = query.where(AudioDataTable.product_model == product_model)
 
         barcode = str(filters.get("barcode") or "").strip()
-        if barcode:
+        if barcode and not bool(filters.get("barcode_regex")):
             query = query.where(AudioDataTable.barcode.contains(barcode))
 
         start_time = str(filters.get("start_time") or "").strip()

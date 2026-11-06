@@ -31,10 +31,15 @@ class _SignalStub:
 
 class _BusStub:
     def __init__(self):
+        self.log = _SignalStub()
+        self.status = _SignalStub()
         self.stft_updated = _SignalStub()
+        self.current_trace_updated = _SignalStub()
         self.factory_state_changed = _SignalStub()
         self.factory_review_changed = _SignalStub()
         self.factory_display_reset = _SignalStub()
+        self.factory_runtime_start_accepted = _SignalStub()
+        self.factory_runtime_analyzing_entered = _SignalStub()
 
 
 def _make_module():

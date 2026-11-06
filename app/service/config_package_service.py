@@ -24,11 +24,12 @@ from model.test_config_table import TestConfigTable
 
 if TYPE_CHECKING:
     from app.service.ai_service import AiService
-    from app.service.config_service import ConfigService
+from app.service.config_service import ConfigService
+from app.service.fault_types import normalize_fault_types
 
 
 FORMAT = "jingcheng-config-package"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 MAX_UNCOMPRESSED_BYTES = 4 * 1024 * 1024 * 1024
 MAX_FILE_COUNT = 50_000
 MAX_NORMALIZED_PATH_LENGTH_WINDOWS = 240
@@ -142,6 +143,12 @@ class ConfigPackageService:
             raise ValueError("include_ai_package requires include_ai_toolchain")
 
         config_payload = self._config_service.load_config(config_id)
+        if "fault_types" not in config_payload:
+            raise ValueError("config payload is missing fault_types")
+        config_payload = dict(config_payload)
+        config_payload["fault_types"] = normalize_fault_types(
+            config_payload["fault_types"]
+        )
         ai_binding = self._serialize_ai_binding(self._ai_service.resolve_binding(config_id))
         package_payload = {
             "config": config_payload,
@@ -346,9 +353,9 @@ class ConfigPackageService:
                     config_errors = self._config_service.validate(prepared_config)
                     if config_errors:
                         raise ValueError("\n".join(config_errors))
-                    if config_action == "create" and TestConfigTable.select().where(
-                        TestConfigTable.config_id == target_config_id
-                    ).exists():
+                    if config_action == "create" and TestConfigTable.select(
+                        TestConfigTable.config_id
+                    ).where(TestConfigTable.config_id == target_config_id).exists():
                         raise ValueError("导入配置 ID 已被占用")
 
                     old_golden_paths = (
@@ -507,7 +514,10 @@ class ConfigPackageService:
         if not normalized:
             return None
         return (
-            TestConfigTable.select()
+            TestConfigTable.select(
+                TestConfigTable.config_id,
+                TestConfigTable.config_name,
+            )
             .where(TestConfigTable.config_name == normalized)
             .first()
         )
@@ -682,19 +692,24 @@ class ConfigPackageService:
     def _persist_imported_config(self, prepared_config: dict, *, config_action: str) -> None:
         config_id = prepared_config["config_id"]
         if config_action == "create":
-            TestConfigTable.create(
-                config_id=config_id,
-                created_time=now_str(),
-                updated_time=now_str(),
-                **self._config_service._config_row_values(prepared_config),
+            row_values = self._config_service._config_row_values(prepared_config)
+            row_values.update(
+                {
+                    "config_id": config_id,
+                    "created_time": now_str(),
+                    "updated_time": now_str(),
+                }
             )
+            self._config_service._insert_config_row_values(row_values)
             self._config_service._replace_channel_rows(
                 config_id=config_id,
                 channels=prepared_config["channels"],
             )
             return
 
-        if not TestConfigTable.select().where(TestConfigTable.config_id == config_id).exists():
+        if not TestConfigTable.select(TestConfigTable.config_id).where(
+            TestConfigTable.config_id == config_id
+        ).exists():
             raise ValueError("配置不存在或已被删除")
         (
             TestConfigTable.update(
@@ -968,7 +983,7 @@ class ConfigPackageService:
     ) -> None:
         for entry_name in file_entries:
             if entry_name.startswith("config/") and entry_name != _CONFIG_ENTRY:
-                raise ValueError("Version 1 is a single-config package format")
+                raise ValueError("Version 2 is a single-config package format")
 
         has_golden_files = any(self._is_under(entry_name, _GOLDEN_PREFIX) for entry_name in file_entries)
         if contents["golden_samples"] and not has_golden_files:
@@ -999,9 +1014,25 @@ class ConfigPackageService:
         contents: dict[str, bool],
         file_entries: dict[str, zipfile.ZipInfo],
     ) -> None:
+        if not isinstance(config_payload, dict):
+            raise ValueError("config/config.json must contain an object")
         config_root = config_payload.get("config")
         if not isinstance(config_root, dict):
             raise ValueError("config/config.json must contain a config object")
+        if "fault_types" not in config_root:
+            raise ValueError("config/config.json config is missing fault_types")
+        if type(config_root["fault_types"]) is not list:
+            raise ValueError("config/config.json fault_types must be a list")
+        config_root["fault_types"] = normalize_fault_types(
+            config_root["fault_types"]
+        )
+        if "manual_judgment_buttons_visible" in config_root:
+            if type(config_root["manual_judgment_buttons_visible"]) is not bool:
+                raise ValueError(
+                    "manual_judgment_buttons_visible must be a boolean"
+                )
+        else:
+            config_root["manual_judgment_buttons_visible"] = False
 
         golden_assets = config_payload.get("golden_sample_assets", {})
         if golden_assets is None:

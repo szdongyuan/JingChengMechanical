@@ -20,6 +20,12 @@ from app.service.analysis.golden_reference import (
     GoldenReferenceCache,
     GoldenReferenceError,
 )
+from app.service.analysis.limit_tables import (
+    LimitTable,
+    evaluate_limit_tables,
+    normalize_limit_tables,
+    validate_limit_tables,
+)
 from app.service.golden_sample_service import GoldenSampleService
 from app.service.config_service import _CHANNEL_DEFAULTS
 
@@ -48,6 +54,18 @@ def _runtime_channel_defaults(channel_index: int) -> dict:
     return cfg
 
 
+def _configured_vibration_view_channel(config: dict, selected_channels) -> int | None:
+    value = config.get("vibration_view_channel_index")
+    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+        return None
+    selected = {
+        channel
+        for channel in selected_channels
+        if isinstance(channel, int) and not isinstance(channel, bool) and channel >= 0
+    }
+    return value if value in selected else None
+
+
 class JudgmentEngine:
     """Compute pass/fail verdict for a completed recording."""
 
@@ -66,6 +84,12 @@ class JudgmentEngine:
         sample_rate: float,
         mic_cal: dict,
         audio_file_path: str,
+        *,
+        channel_column_map: dict[int, int] | None = None,
+        loudness_trace_cache: dict[int, dict] | None = None,
+        channel_features: dict[int, object] | None = None,
+        run_ai: bool = True,
+        allow_golden_runtime_resample: bool = False,
     ) -> JudgmentResult:
         """Run judgment on the configured automatic analysis window.
 
@@ -89,8 +113,20 @@ class JudgmentEngine:
                 "Captured audio does not fully cover the required analysis window "
                 f"({start_sec:.3f}s to {end_sec:.3f}s)"
             )
-        return self._run(config, buffer, sample_rate, mic_cal,
-                         audio_file_path, start_sec, end_sec)
+        return self._run(
+            config,
+            buffer,
+            sample_rate,
+            mic_cal,
+            audio_file_path,
+            start_sec,
+            end_sec,
+            channel_column_map=channel_column_map,
+            loudness_trace_cache=loudness_trace_cache,
+            channel_features=channel_features,
+            run_ai=run_ai,
+            allow_golden_runtime_resample=allow_golden_runtime_resample,
+        )
 
     def rejudge(
         self,
@@ -101,13 +137,31 @@ class JudgmentEngine:
         audio_file_path: str,
         start_sec: float,
         end_sec: float,
+        *,
+        channel_column_map: dict[int, int] | None = None,
+        loudness_trace_cache: dict[int, dict] | None = None,
+        channel_features: dict[int, object] | None = None,
+        run_ai: bool = True,
+        allow_golden_runtime_resample: bool = False,
     ) -> JudgmentResult:
         """Re-run judgment on a user-selected window."""
         total_sec = buffer.shape[0] / sample_rate
         start_sec = max(0.0, min(start_sec, total_sec))
         end_sec = max(start_sec, min(end_sec, total_sec))
-        return self._run(config, buffer, sample_rate, mic_cal,
-                         audio_file_path, start_sec, end_sec)
+        return self._run(
+            config,
+            buffer,
+            sample_rate,
+            mic_cal,
+            audio_file_path,
+            start_sec,
+            end_sec,
+            channel_column_map=channel_column_map,
+            loudness_trace_cache=loudness_trace_cache,
+            channel_features=channel_features,
+            run_ai=run_ai,
+            allow_golden_runtime_resample=allow_golden_runtime_resample,
+        )
 
     def _run(
         self,
@@ -118,6 +172,12 @@ class JudgmentEngine:
         audio_file_path: str,
         start_sec: float,
         end_sec: float,
+        *,
+        channel_column_map: dict[int, int] | None = None,
+        loudness_trace_cache: dict[int, dict] | None = None,
+        channel_features: dict[int, object] | None = None,
+        run_ai: bool = True,
+        allow_golden_runtime_resample: bool = False,
     ) -> JudgmentResult:
         start_idx = int(start_sec * sample_rate)
         end_idx = int(end_sec * sample_rate)
@@ -125,6 +185,12 @@ class JudgmentEngine:
         window = buffer[start_idx:end_idx]
 
         selected = config.get("selected_channels", [])
+        vibration_channel_index = _configured_vibration_view_channel(config, selected)
+        judged_channels = [
+            ch_idx
+            for ch_idx in selected
+            if ch_idx != vibration_channel_index
+        ]
         channels_cfg = {ch["channel_index"]: ch for ch in config.get("channels", [])}
         golden_cache = GoldenReferenceCache(
             golden_sample_service=self._golden_sample_service
@@ -134,15 +200,31 @@ class JudgmentEngine:
         channel_results: list[ChannelJudgment] = []
         all_pass = True
 
-        for ch_idx in selected:
+        for ch_idx in judged_channels:
             ch_cfg = channels_cfg.get(ch_idx)
             if ch_cfg is None:
                 # Spec: use defaults when channel config is missing
                 ch_cfg = _runtime_channel_defaults(ch_idx)
 
+            precomputed = (
+                channel_features.get(ch_idx)
+                if isinstance(channel_features, dict)
+                else None
+            )
+            column_index = self._buffer_column_for_channel(ch_idx, channel_column_map)
+
             # Extract single channel
-            if window.ndim == 2 and ch_idx < window.shape[1]:
-                sig = window[:, ch_idx].copy()
+            full_sig: np.ndarray | None = None
+            if precomputed is not None:
+                sig = np.asarray(precomputed.calibrated_signal, dtype=np.float64)
+            elif buffer.ndim == 2 and 0 <= column_index < buffer.shape[1]:
+                full_sig = buffer[:, column_index].copy()
+                sig = full_sig[start_idx:end_idx].copy()
+            elif buffer.ndim == 1:
+                full_sig = buffer.copy()
+                sig = full_sig[start_idx:end_idx].copy()
+            elif window.ndim == 2 and 0 <= column_index < window.shape[1]:
+                sig = window[:, column_index].copy()
             elif window.ndim == 1:
                 sig = window.copy()
             else:
@@ -150,7 +232,18 @@ class JudgmentEngine:
 
             # Apply mic calibration
             sensitivity = self._get_sensitivity(mic_cal, ch_idx)
-            sig = dsp.apply_mic_calibration(sig, sensitivity)
+            if precomputed is not None:
+                calibrated_full = None
+            else:
+                calibrated_full = (
+                    dsp.apply_mic_calibration(full_sig, sensitivity)
+                    if full_sig is not None
+                    else None
+                )
+                if calibrated_full is not None:
+                    sig = calibrated_full[start_idx:end_idx].copy()
+                else:
+                    sig = dsp.apply_mic_calibration(sig, sensitivity)
 
             # SPL checks
             spl_weighting = ch_cfg.get("spl_weighting", "Z")
@@ -181,29 +274,53 @@ class JudgmentEngine:
             spl_trace_error_message: str | None = None
             spl_average_available = False
             spl_average_error_message: str | None = None
+            spl_signal = calibrated_full if calibrated_full is not None else sig
+            spl_start_sample = start_idx if calibrated_full is not None else 0
+            spl_end_sample = end_idx if calibrated_full is not None else len(sig)
             try:
-                spl_db = float(dsp.compute_spl(
-                    sig,
-                    sample_rate,
-                    spl_weighting,
-                    spl_time_constant,
-                ))
-                _, spl_trace_db = dsp.compute_spl_trace(
-                    sig,
-                    sample_rate,
-                    spl_weighting,
-                    spl_time_constant,
-                    chunk_duration=_SPL_CHUNK_DURATION_SEC,
-                )
-                trace_values = spl_trace_db or [spl_db]
+                if precomputed is not None:
+                    if precomputed.spl_error is not None:
+                        raise RuntimeError(precomputed.spl_error)
+                    spl_trace_db = precomputed.spl_values
+                else:
+                    _, spl_trace_db = dsp.compute_spl_trace(
+                        spl_signal,
+                        sample_rate,
+                        spl_weighting,
+                        spl_time_constant,
+                        chunk_duration=_SPL_CHUNK_DURATION_SEC,
+                        output_start_sample=spl_start_sample,
+                        output_end_sample=spl_end_sample,
+                    )
+                trace_values = list(spl_trace_db)
+                if not trace_values:
+                    trace_values = [-np.inf]
+                spl_db = float(trace_values[-1])
                 spl_min_db, spl_max_db = self._value_bounds(trace_values)
                 spl_trace_available = True
-                spl_pass = self._values_pass_limits(trace_values, spl_lower, spl_upper)
+                spl_pass = self._values_pass_limits(
+                    trace_values,
+                    spl_lower,
+                    spl_upper,
+                )
             except Exception as exc:
                 spl_trace_error_message = str(exc) or exc.__class__.__name__
                 spl_pass = None if spl_constrained else True
             try:
-                spl_average_db = float(dsp.compute_spl_leq(sig, sample_rate, spl_weighting))
+                if precomputed is not None:
+                    if precomputed.spl_average_error is not None:
+                        raise RuntimeError(precomputed.spl_average_error)
+                    spl_average_db = float(precomputed.spl_average_db)
+                else:
+                    spl_average_db = float(
+                        dsp.compute_spl_leq(
+                            spl_signal,
+                            sample_rate,
+                            spl_weighting,
+                            start_sample=spl_start_sample,
+                            end_sample=spl_end_sample,
+                        )
+                    )
                 spl_average_available = True
                 spl_average_pass = self._values_pass_limits(
                     [spl_average_db],
@@ -241,7 +358,33 @@ class JudgmentEngine:
                 loudness_average_upper,
             )
             try:
-                _, loudness_values_sone, loudness_max_sone = dsp.compute_loudness_trace(sig, sample_rate)
+                if precomputed is not None:
+                    if precomputed.loudness_error is not None:
+                        raise RuntimeError(precomputed.loudness_error)
+                    times_sec = precomputed.loudness_times
+                    loudness_values_sone = precomputed.loudness_values
+                    loudness_max_sone = precomputed.loudness_max_sone
+                elif calibrated_full is not None and start_sec > 0.0:
+                    times_sec, loudness_values_sone, loudness_max_sone = (
+                        dsp.compute_loudness_trace_for_window(
+                            calibrated_full,
+                            sample_rate,
+                            start_sec,
+                            end_sec,
+                        )
+                    )
+                else:
+                    times_sec, loudness_values_sone, loudness_max_sone = (
+                        dsp.compute_loudness_trace(sig, sample_rate)
+                    )
+                if loudness_trace_cache is not None:
+                    loudness_trace_cache[ch_idx] = {
+                        "times_sec": list(times_sec),
+                        "values_sone": list(loudness_values_sone),
+                        "max_sone": float(loudness_max_sone),
+                        "algorithm": dsp.LOUDNESS_TRACE_ALGORITHM,
+                        "internal_rate_hz": dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ,
+                    }
                 loudness_min_sone, loudness_trace_max_sone = self._value_bounds(loudness_values_sone)
                 if loudness_trace_max_sone is not None:
                     loudness_max_sone = loudness_trace_max_sone
@@ -258,6 +401,8 @@ class JudgmentEngine:
                 )
                 loudness_available = True
             except Exception as exc:
+                if loudness_trace_cache is not None:
+                    loudness_trace_cache.pop(ch_idx, None)
                 loudness_error_message = str(exc) or exc.__class__.__name__
                 loudness_pass = None if loudness_constrained else True
                 loudness_average_pass = None if loudness_average_constrained else True
@@ -271,6 +416,8 @@ class JudgmentEngine:
                 configured_input_sample_rate=configured_input_sample_rate,
                 mic_sensitivity=sensitivity,
                 golden_cache=golden_cache,
+                allow_golden_runtime_resample=allow_golden_runtime_resample,
+                precomputed=precomputed,
             )
 
             # Octave band checks
@@ -282,15 +429,24 @@ class JudgmentEngine:
                 configured_input_sample_rate=configured_input_sample_rate,
                 mic_sensitivity=sensitivity,
                 golden_cache=golden_cache,
+                allow_golden_runtime_resample=allow_golden_runtime_resample,
+                precomputed=precomputed,
             )
+
+            fft_required = bool(ch_cfg.get("fft_band_limits")) or str(
+                ch_cfg.get("fft_golden_mode") or "off"
+            ).lower() != "off"
+            octave_required = bool(ch_cfg.get("oct_band_limits")) or str(
+                ch_cfg.get("oct_golden_mode") or "off"
+            ).lower() != "off"
 
             ch_pass = (
                 spl_pass is True
                 and spl_average_pass is True
                 and loudness_pass is True
                 and loudness_average_pass is True
-                and fft_available
-                and octave_available
+                and (fft_available or not fft_required)
+                and (octave_available or not octave_required)
                 and all(b.passed for b in fft_bands)
                 and all(b.passed for b in oct_bands)
             )
@@ -324,11 +480,14 @@ class JudgmentEngine:
                 oct_band_results=oct_bands,
             ))
 
-        if selected and not channel_results:
+        if judged_channels and not channel_results:
             all_pass = False
 
         # AI analysis
-        ai_pass, ai_score = self._run_ai(config, audio_file_path)
+        if run_ai:
+            ai_pass, ai_score = self._run_ai(config, audio_file_path)
+        else:
+            ai_pass, ai_score = None, None
 
         # Combined verdict
         limit_pass = all_pass
@@ -346,6 +505,18 @@ class JudgmentEngine:
             analysis_window=(start_sec, end_sec),
         )
 
+    @staticmethod
+    def _buffer_column_for_channel(
+        channel_index: int,
+        channel_column_map: dict[int, int] | None,
+    ) -> int:
+        if isinstance(channel_column_map, dict) and channel_index in channel_column_map:
+            try:
+                return int(channel_column_map[channel_index])
+            except (TypeError, ValueError):
+                return channel_index
+        return channel_index
+
     def _check_fft_bands(
         self,
         *,
@@ -356,13 +527,22 @@ class JudgmentEngine:
         configured_input_sample_rate,
         mic_sensitivity: float,
         golden_cache: GoldenReferenceCache,
+        allow_golden_runtime_resample: bool = False,
+        precomputed: object | None = None,
     ) -> tuple[list[BandResult], bool, str | None]:
         band_limits = channel_config.get("fft_band_limits", [])
+        weighting = self._fft_weighting(channel_config.get("fft_weighting", "Z"))
         mode = self._golden_mode(channel_config.get("fft_golden_mode"))
         overlay_requested = bool(channel_config.get("fft_show_golden_overlay"))
         nfft = channel_config.get("fft_nfft", _CHANNEL_DEFAULTS["fft_nfft"])
 
-        if not isinstance(band_limits, list) or not band_limits:
+        limit_tables, config_error = self._runtime_limit_tables(
+            band_limits,
+            label="FFT",
+        )
+        if config_error is not None:
+            return [], False, config_error
+        if not limit_tables:
             return [], True, None
 
         if mode != "off":
@@ -373,10 +553,12 @@ class JudgmentEngine:
                     configured_input_sample_rate=configured_input_sample_rate,
                     runtime_sample_rate=sample_rate,
                     mic_sensitivity=mic_sensitivity,
+                    allow_runtime_resample=allow_golden_runtime_resample,
                 )
                 golden_freqs, golden_levels = golden_cache.ensure_fft(
                     golden_bundle,
                     nfft=nfft,
+                    weighting=weighting,
                 )
             except GoldenReferenceError as exc:
                 return [], False, str(exc)
@@ -388,47 +570,53 @@ class JudgmentEngine:
                     configured_input_sample_rate=configured_input_sample_rate,
                     runtime_sample_rate=sample_rate,
                     mic_sensitivity=mic_sensitivity,
+                    allow_runtime_resample=allow_golden_runtime_resample,
                 )
             except GoldenReferenceError as exc:
                 logger.warning("黄金样本加载失败，FFT 对比曲线已忽略: %s", exc)
 
         try:
-            measured_freqs, measured_levels = self._measure_fft(
-                sig,
-                sample_rate,
-                nfft=nfft,
-            )
+            if precomputed is not None:
+                if precomputed.fft_error is not None:
+                    raise RuntimeError(precomputed.fft_error)
+                measured_freqs = np.asarray(precomputed.fft_frequencies)
+                measured_levels = np.asarray(precomputed.fft_magnitudes)
+            else:
+                measured_freqs, measured_levels = self._measure_fft(
+                    sig,
+                    sample_rate,
+                    nfft=nfft,
+                    weighting=weighting,
+                )
         except Exception as exc:
             return [], False, str(exc) or exc.__class__.__name__
         if mode == "off":
-            return (
-                self._build_fft_band_results(
-                    measured_freqs=measured_freqs,
-                    measured_levels=measured_levels,
-                    band_limits=band_limits,
-                    golden_levels=None,
-                    mode=mode,
-                ),
-                True,
-                None,
+            bands, active_count = self._build_fft_band_results(
+                measured_freqs=measured_freqs,
+                measured_levels=measured_levels,
+                limit_tables=limit_tables,
+                golden_levels=None,
+                mode=mode,
             )
+            if active_count == 0:
+                return [], False, "FFT 频率范围内无可评估频点"
+            return bands, True, None
 
         try:
             self._validate_matching_axis(measured_freqs, golden_freqs, "FFT")
         except GoldenReferenceError as exc:
             return [], False, str(exc)
-
-        return (
-            self._build_fft_band_results(
-                measured_freqs=measured_freqs,
-                measured_levels=measured_levels,
-                band_limits=band_limits,
-                golden_levels=golden_levels,
-                mode=mode,
-            ),
-            True,
-            None,
+        bands, active_count = self._build_fft_band_results(
+            measured_freqs=measured_freqs,
+            measured_levels=measured_levels,
+            limit_tables=limit_tables,
+            golden_levels=golden_levels,
+            mode=mode,
         )
+        if active_count == 0:
+            return [], False, "FFT 频率范围内无可评估频点"
+
+        return bands, True, None
 
     def _check_octave_bands(
         self,
@@ -440,13 +628,21 @@ class JudgmentEngine:
         configured_input_sample_rate,
         mic_sensitivity: float,
         golden_cache: GoldenReferenceCache,
+        allow_golden_runtime_resample: bool = False,
+        precomputed: object | None = None,
     ) -> tuple[list[BandResult], bool, str | None]:
         band_limits = channel_config.get("oct_band_limits", [])
         weighting = str(channel_config.get("oct_weighting", "Z") or "Z")
         mode = self._golden_mode(channel_config.get("oct_golden_mode"))
         overlay_requested = bool(channel_config.get("oct_show_golden_overlay"))
 
-        if not isinstance(band_limits, list) or not band_limits:
+        limit_tables, config_error = self._runtime_limit_tables(
+            band_limits,
+            label="倍频程",
+        )
+        if config_error is not None:
+            return [], False, config_error
+        if not limit_tables:
             return [], True, None
 
         if mode != "off":
@@ -457,6 +653,7 @@ class JudgmentEngine:
                     configured_input_sample_rate=configured_input_sample_rate,
                     runtime_sample_rate=sample_rate,
                     mic_sensitivity=mic_sensitivity,
+                    allow_runtime_resample=allow_golden_runtime_resample,
                 )
                 golden_centers, golden_levels = golden_cache.ensure_octave(
                     golden_bundle,
@@ -472,44 +669,53 @@ class JudgmentEngine:
                     configured_input_sample_rate=configured_input_sample_rate,
                     runtime_sample_rate=sample_rate,
                     mic_sensitivity=mic_sensitivity,
+                    allow_runtime_resample=allow_golden_runtime_resample,
                 )
             except GoldenReferenceError as exc:
                 logger.warning("黄金样本加载失败，倍频程对比曲线已忽略: %s", exc)
 
-        measured_centers, measured_levels = self._measure_octave(
-            sig,
-            sample_rate,
-            weighting,
-        )
+        try:
+            if precomputed is not None:
+                if precomputed.octave_error is not None:
+                    raise RuntimeError(precomputed.octave_error)
+                measured_centers = np.asarray(precomputed.octave_centers)
+                measured_levels = np.asarray(precomputed.octave_levels)
+            else:
+                measured_centers, measured_levels = self._measure_octave(
+                    sig,
+                    sample_rate,
+                    weighting,
+                )
+        except Exception as exc:
+            return [], False, str(exc) or exc.__class__.__name__
         if mode == "off":
-            return (
-                self._build_octave_band_results(
-                    measured_centers=measured_centers,
-                    measured_levels=measured_levels,
-                    band_limits=band_limits,
-                    golden_levels=None,
-                    mode=mode,
-                ),
-                True,
-                None,
+            bands, active_count = self._build_octave_band_results(
+                measured_centers=measured_centers,
+                measured_levels=measured_levels,
+                limit_tables=limit_tables,
+                golden_levels=None,
+                mode=mode,
             )
+            if active_count == 0:
+                return [], False, "倍频程频率范围内无可评估频点"
+            return bands, True, None
 
         try:
             self._validate_matching_axis(measured_centers, golden_centers, "倍频程")
         except GoldenReferenceError as exc:
             return [], False, str(exc)
 
-        return (
-            self._build_octave_band_results(
-                measured_centers=measured_centers,
-                measured_levels=measured_levels,
-                band_limits=band_limits,
-                golden_levels=golden_levels,
-                mode=mode,
-            ),
-            True,
-            None,
+        bands, active_count = self._build_octave_band_results(
+            measured_centers=measured_centers,
+            measured_levels=measured_levels,
+            limit_tables=limit_tables,
+            golden_levels=golden_levels,
+            mode=mode,
         )
+        if active_count == 0:
+            return [], False, "倍频程频率范围内无可评估频点"
+
+        return bands, True, None
 
     def _measure_fft(
         self,
@@ -517,8 +723,9 @@ class JudgmentEngine:
         sample_rate: float,
         *,
         nfft: int,
+        weighting: str = "Z",
     ) -> tuple[np.ndarray, np.ndarray]:
-        freqs, mag_db = dsp.compute_fft_spectrum(sig, sample_rate, nfft)
+        freqs, mag_db = dsp.compute_fft_spectrum(sig, sample_rate, nfft, weighting)
         return np.asarray(freqs, dtype=np.float64), self._absolute_levels_db(mag_db)
 
     def _measure_octave(
@@ -535,85 +742,180 @@ class JudgmentEngine:
         *,
         measured_freqs: np.ndarray,
         measured_levels: np.ndarray,
-        band_limits: list[dict],
+        limit_tables: list[LimitTable],
         golden_levels: np.ndarray | None,
         mode: str,
-    ) -> list[BandResult]:
-        results: list[BandResult] = []
-        for band_limit in band_limits:
-            target_freq = band_limit["freq"]
-            idx = int(np.argmin(np.abs(measured_freqs - target_freq)))
-            measured_level = float(measured_levels[idx])
-            level, lower, upper = self._judged_band_space(
-                measured_level=measured_level,
-                golden_level=(
-                    float(golden_levels[idx]) if golden_levels is not None else None
-                ),
-                lower=band_limit.get("lower", -np.inf),
-                upper=band_limit.get("upper", np.inf),
-                mode=mode,
-            )
-            results.append(
-                BandResult(
-                    freq=float(measured_freqs[idx]),
-                    level=level,
-                    lower=lower,
-                    upper=upper,
-                    passed=lower <= level <= upper,
-                )
-            )
-        return results
+    ) -> tuple[list[BandResult], int]:
+        eval_freqs, eval_measured, eval_golden = self._finite_limit_inputs(
+            frequencies=measured_freqs,
+            levels=measured_levels,
+            golden_levels=golden_levels,
+        )
+        if eval_freqs.size == 0:
+            return [], 0
+
+        evaluated = evaluate_limit_tables(
+            limit_tables,
+            eval_freqs,
+            golden_levels=eval_golden,
+            mode=mode,
+        )
+        judged_levels = self._judged_levels(
+            measured_levels=eval_measured,
+            golden_levels=eval_golden,
+            mode=mode,
+        )
+        return self._band_results_from_evaluated_limits(
+            frequencies=eval_freqs,
+            levels=judged_levels,
+            evaluated=evaluated,
+            include_passes=False,
+        )
 
     def _build_octave_band_results(
         self,
         *,
         measured_centers: np.ndarray,
         measured_levels: np.ndarray,
-        band_limits: list[dict],
+        limit_tables: list[LimitTable],
         golden_levels: np.ndarray | None,
         mode: str,
-    ) -> list[BandResult]:
-        results: list[BandResult] = []
-        for band_limit in band_limits:
-            target_freq = band_limit["freq"]
-            idx = int(np.argmin(np.abs(measured_centers - target_freq)))
-            measured_level = float(measured_levels[idx])
-            level, lower, upper = self._judged_band_space(
-                measured_level=measured_level,
-                golden_level=(
-                    float(golden_levels[idx]) if golden_levels is not None else None
-                ),
-                lower=band_limit.get("lower", -np.inf),
-                upper=band_limit.get("upper", np.inf),
-                mode=mode,
-            )
-            results.append(
-                BandResult(
-                    freq=float(measured_centers[idx]),
-                    level=level,
-                    lower=lower,
-                    upper=upper,
-                    passed=lower <= level <= upper,
-                )
-            )
-        return results
+    ) -> tuple[list[BandResult], int]:
+        eval_freqs, eval_measured, eval_golden = self._finite_limit_inputs(
+            frequencies=measured_centers,
+            levels=measured_levels,
+            golden_levels=golden_levels,
+        )
+        if eval_freqs.size == 0:
+            return [], 0
+
+        evaluated = evaluate_limit_tables(
+            limit_tables,
+            eval_freqs,
+            golden_levels=eval_golden,
+            mode=mode,
+        )
+        judged_levels = self._judged_levels(
+            measured_levels=eval_measured,
+            golden_levels=eval_golden,
+            mode=mode,
+        )
+        return self._band_results_from_evaluated_limits(
+            frequencies=eval_freqs,
+            levels=judged_levels,
+            evaluated=evaluated,
+            include_passes=True,
+        )
 
     @staticmethod
-    def _judged_band_space(
+    def _runtime_limit_tables(
+        raw_limits,
         *,
-        measured_level: float,
-        golden_level: float | None,
-        lower,
-        upper,
+        label: str,
+    ) -> tuple[list[LimitTable], str | None]:
+        errors = validate_limit_tables(raw_limits, label=label)
+        if errors:
+            return [], f"{label}配置错误: {'；'.join(errors)}"
+        try:
+            return normalize_limit_tables(raw_limits, label=label), None
+        except ValueError as exc:
+            return [], f"{label}配置错误: {exc}"
+
+    @staticmethod
+    def _finite_limit_inputs(
+        *,
+        frequencies: np.ndarray,
+        levels: np.ndarray,
+        golden_levels: np.ndarray | None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+        frequency_axis = np.asarray(frequencies, dtype=np.float64)
+        level_axis = np.asarray(levels, dtype=np.float64)
+        finite_mask = np.isfinite(frequency_axis) & np.isfinite(level_axis)
+        if golden_levels is None:
+            return frequency_axis[finite_mask], level_axis[finite_mask], None
+
+        golden_axis = np.asarray(golden_levels, dtype=np.float64)
+        finite_mask &= np.isfinite(golden_axis)
+        return (
+            frequency_axis[finite_mask],
+            level_axis[finite_mask],
+            golden_axis[finite_mask],
+        )
+
+    @staticmethod
+    def _judged_levels(
+        *,
+        measured_levels: np.ndarray,
+        golden_levels: np.ndarray | None,
         mode: str,
-    ) -> tuple[float, float, float]:
-        if mode == "absolute" and golden_level is not None:
-            lower = float(golden_level + lower)
-            upper = float(golden_level + upper)
-            return measured_level, lower, upper
-        if mode == "delta" and golden_level is not None:
-            return float(measured_level - golden_level), float(lower), float(upper)
-        return measured_level, float(lower), float(upper)
+    ) -> np.ndarray:
+        if mode == "delta" and golden_levels is not None:
+            return np.asarray(measured_levels, dtype=np.float64) - np.asarray(
+                golden_levels,
+                dtype=np.float64,
+            )
+        return np.asarray(measured_levels, dtype=np.float64)
+
+    @classmethod
+    def _band_results_from_evaluated_limits(
+        cls,
+        *,
+        frequencies: np.ndarray,
+        levels: np.ndarray,
+        evaluated,
+        include_passes: bool,
+    ) -> tuple[list[BandResult], int]:
+        results: list[BandResult] = []
+        active_count = 0
+        for freq, level, lower_value, upper_value, active in zip(
+            frequencies,
+            levels,
+            evaluated.lower,
+            evaluated.upper,
+            evaluated.active,
+            strict=False,
+        ):
+            if not bool(active):
+                continue
+            active_count += 1
+            lower = cls._finite_bound_or_none(lower_value)
+            upper = cls._finite_bound_or_none(upper_value)
+            passed = cls._passes_one_sided_limit(
+                level=float(level),
+                lower=lower,
+                upper=upper,
+            )
+            if include_passes or not passed:
+                results.append(
+                    BandResult(
+                        freq=float(freq),
+                        level=float(level),
+                        lower=lower,
+                        upper=upper,
+                        passed=passed,
+                    )
+                )
+        return results, active_count
+
+    @staticmethod
+    def _finite_bound_or_none(value) -> float | None:
+        numeric = float(value)
+        if np.isfinite(numeric):
+            return numeric
+        return None
+
+    @staticmethod
+    def _passes_one_sided_limit(
+        *,
+        level: float,
+        lower: float | None,
+        upper: float | None,
+    ) -> bool:
+        if lower is not None and level < lower:
+            return False
+        if upper is not None and level > upper:
+            return False
+        return True
 
     @staticmethod
     def _validate_matching_axis(
@@ -632,6 +934,11 @@ class JudgmentEngine:
         if mode in {"absolute", "delta"}:
             return mode
         return "off"
+
+    @staticmethod
+    def _fft_weighting(value) -> str:
+        weighting = str(value or "Z").strip().upper()
+        return weighting if weighting in {"A", "C", "Z"} else "Z"
 
     @staticmethod
     def _absolute_levels_db(levels_db: np.ndarray | list[float]) -> np.ndarray:
@@ -755,14 +1062,4 @@ class JudgmentEngine:
 
     @staticmethod
     def _get_sensitivity(mic_cal: dict, channel_index: int) -> float:
-        """Extract mic sensitivity from mic_cal dict.
-
-        mic_cal format: {"In1": {"deviation_value": "0.5", ...}, ...}
-        """
-        key = f"In{channel_index + 1}"
-        entry = mic_cal.get(key, {})
-        raw = entry.get("deviation_value", "0")
-        try:
-            return float(raw)
-        except (ValueError, TypeError):
-            return 0.0
+        return dsp.mic_sensitivity_from_calibration(mic_cal, channel_index)

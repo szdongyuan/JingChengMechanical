@@ -43,6 +43,7 @@ class FftFrame:
     time: float
     frequencies: np.ndarray    # freq axis (Hz)
     magnitudes: np.ndarray     # magnitude spectrum (dB)
+    weighting: str = "Z"       # "A", "C", or "Z"
 
 
 @dataclass
@@ -50,8 +51,8 @@ class BandResult:
     """Pass/fail result for a single frequency band limit check."""
     freq: float
     level: float
-    lower: float
-    upper: float
+    lower: float | None
+    upper: float | None
     passed: bool
 
 

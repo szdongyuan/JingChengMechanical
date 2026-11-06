@@ -4,9 +4,13 @@ Orchestrates: recorder -> pipelines -> judgment -> result.
 """
 from __future__ import annotations
 
+from app.service.ai_threshold import coerce_probability
+
+import inspect
 import json
 import math
 import os
+import threading
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -16,9 +20,22 @@ from typing import Any
 import numpy as np
 from scipy.io import wavfile
 
+from app.service.analysis import dsp
 from app.service.analysis.frames import JudgmentResult
 from app.service.analysis.judgment import JudgmentEngine, _runtime_channel_defaults
+from app.service.analysis.live_display_dispatcher import LiveDisplayDispatcher
 from app.service.analysis.pipeline import AnalysisPipeline
+from app.service.analysis.selected_channels import project_selected_channels
+from app.service.analysis.session_capture import (
+    CapturedAudioBlock,
+    RecorderAttachment,
+    SessionCaptureWindow,
+)
+from app.service.result_dashboard_layout import (
+    CHANNEL_PRIMARY_ACOUSTIC,
+    PANEL_FAMILY_ACOUSTIC,
+    resolve_layout_channel,
+)
 from model.audio_data_table import AudioDataTable
 
 _TZ8 = timezone(timedelta(hours=8))
@@ -58,34 +75,38 @@ class TestSession:
         self._sample_rate: float = float(config.get("input_device_samplerate", 44100))
 
         self._pipelines: list[AnalysisPipeline] = []
+        self._live_display_dispatcher: LiveDisplayDispatcher | None = None
         self._buffer: np.ndarray | None = None
+        self._source_channels: tuple[int, ...] = ()
+        self._real_to_logical_channel: dict[int, int] = {}
         self._judgment: JudgmentEngine = JudgmentEngine(ai_service)
         self._last_result: JudgmentResult | None = None
+        self._last_loudness_trace_cache: dict[int, dict] | None = None
         self._last_ai_review: dict[str, Any] | None = None
         self._audio_file_path: str | None = None
         self._audio_data_id: str | None = None
         self._test_run_id: str | None = None
         self._finished: bool = False
-        self._attach_chunk_index: int = 0
-        self._attach_snapshot: Any | None = None
-        self._processed_samples_since_attach: int = 0
-        self._recorder_chunk_window_samples: int = 0
-        self._attach_pending: bool = False
-        self._pending_attach_chunks: list[tuple[np.ndarray, int]] = []
+        self._capture_lock = threading.RLock()
+        self._capture_source_token: object | None = None
+        self._capture_attachment: RecorderAttachment | None = None
+        self._capture_window: SessionCaptureWindow | None = None
+        self._pending_capture_blocks: list[CapturedAudioBlock] = []
+        self._capture_closed = False
+        self._monitor_feed: Callable[[np.ndarray], Any] | None = None
         self._on_session_done_cb: Callable[[int], Any] | None = None
         self._live_loudness_channel_index: int | None = None
 
         # Connection refs set by TestManager for signal disconnection
-        self._chunk_conn: Callable | None = None
-        self._done_lambda: Callable | None = None
+        self._captured_block_conn: Callable | None = None
         self._error_lambda: Callable | None = None
-        self._monitor_lambda: Callable | None = None
         self._monitor_error_lambda: Callable | None = None
 
     def _setup_pipelines(self):
         """Create one AnalysisPipeline per selected channel."""
+        self.stop_live_display()
         selected = self._config.get("selected_channels", [])
-        self._live_loudness_channel_index = self._first_selected_channel(selected)
+        self._live_loudness_channel_index = self._default_live_loudness_channel(selected)
         channels_cfg = {ch["channel_index"]: ch for ch in self._config.get("channels", [])}
         self._pipelines = []
         for ch_idx in selected:
@@ -101,6 +122,14 @@ class TestSession:
                     mic_sensitivity=sensitivity,
                 )
             )
+        self._live_display_dispatcher = LiveDisplayDispatcher(
+            pipelines=self._pipelines,
+            bus=self._bus,
+            config_id=self.config_id,
+            coalesce_pending=True,
+            stft_emit_interval_sec=0.05,
+            coarse_stft=True,
+        )
 
     def set_live_loudness_channel_index(self, channel_index: int | None):
         if channel_index is None:
@@ -120,98 +149,223 @@ class TestSession:
         if normalized_channel in selected_channels:
             self._live_loudness_channel_index = normalized_channel
 
-    def prepare_for_attach(self):
-        """Buffer chunks until the recorder-owned attach boundary is known."""
-        self._attach_pending = True
-        self._pending_attach_chunks = []
+    def set_monitor_feed(self, callback: Callable[[np.ndarray], Any] | None) -> None:
+        """Set the retained-audio monitor sink used by this session."""
 
-    def attach_to_recorder(self, *, chunk_index: int, snapshot: Any | None = None):
-        """Record the chunk boundary where this session becomes live."""
-        self._attach_chunk_index = max(0, int(chunk_index))
-        self._attach_snapshot = snapshot
-        self._processed_samples_since_attach = 0
-        self._recorder_chunk_window_samples = 0
-        pending_chunks = self._pending_attach_chunks
-        self._pending_attach_chunks = []
-        self._attach_pending = False
-        for pending_chunk, pending_index in pending_chunks:
-            self._process_chunk(pending_chunk, pending_index)
+        if callback is not None and not callable(callback):
+            raise TypeError("monitor feed must be callable or None")
+        with self._capture_lock:
+            self._monitor_feed = callback
 
-    def _on_chunk(self, chunk: np.ndarray, chunk_index: int):
-        """Process one audio chunk through all pipelines and emit results."""
-        if self._attach_pending:
-            self._pending_attach_chunks.append((chunk.copy(), chunk_index))
-            return
-        self._process_chunk(chunk, chunk_index)
+    def prepare_for_attach(self, source_token: object) -> None:
+        """Start one recorder-source generation and buffer until handle binding."""
 
-    def _processed_sample_boundary_since_attach(self, *, chunk_index: int, chunk_samples: int) -> int:
-        chunk_window_samples = max(0, int(chunk_samples))
-        if chunk_window_samples > self._recorder_chunk_window_samples:
-            self._recorder_chunk_window_samples = chunk_window_samples
+        if source_token is None:
+            raise ValueError("source_token must be unique and non-None")
+        with self._capture_lock:
+            self._capture_source_token = source_token
+            self._capture_attachment = None
+            self._capture_window = None
+            self._pending_capture_blocks = []
+            self._capture_closed = False
+            self._finished = False
 
-        if self._recorder_chunk_window_samples <= 0:
-            return 0
+    def attach_to_recorder(
+        self,
+        attachment: RecorderAttachment,
+        *,
+        source_token: object,
+    ) -> None:
+        """Bind the exact capture handle and drain this generation in order."""
 
-        relative_chunk_count = max(0, int(chunk_index) - self._attach_chunk_index + 1)
-        processed_samples = relative_chunk_count * self._recorder_chunk_window_samples
-        target_samples = max(0, int(self._sample_rate * self._record_duration))
-        if target_samples > 0:
-            return min(processed_samples, target_samples)
-        return processed_samples
+        should_complete = False
+        with self._capture_lock:
+            if source_token is not self._capture_source_token:
+                raise ValueError("capture source generation is no longer active")
+            if self._capture_closed:
+                raise RuntimeError("capture session is already frozen")
+            if not isinstance(attachment, RecorderAttachment):
+                raise TypeError("attachment must be RecorderAttachment")
 
-    def _process_chunk(self, chunk: np.ndarray, chunk_index: int):
-        if chunk_index < self._attach_chunk_index:
-            return
+            self._capture_attachment = attachment
+            self._capture_window = SessionCaptureWindow(
+                attachment=attachment,
+                sample_rate=self._sample_rate,
+                record_duration=self._record_duration,
+            )
+            pending_blocks = self._pending_capture_blocks
+            self._pending_capture_blocks = []
+            for block in pending_blocks:
+                should_complete = (
+                    self._process_captured_block_locked(block) or should_complete
+                )
 
-        chunk_samples = int(chunk.shape[0]) if chunk.ndim > 0 else 0
-        self._processed_samples_since_attach = self._processed_sample_boundary_since_attach(
-            chunk_index=chunk_index,
-            chunk_samples=chunk_samples,
-        )
+        if should_complete:
+            self._notify_session_done()
+
+    def _on_captured_block(
+        self,
+        block: CapturedAudioBlock,
+        *,
+        source_token: object,
+    ) -> None:
+        """Route one exact recorder block through this session's retained window."""
+
+        should_complete = False
+        with self._capture_lock:
+            if (
+                source_token is not self._capture_source_token
+                or self._capture_closed
+                or self._finished
+            ):
+                return
+            if not isinstance(block, CapturedAudioBlock):
+                raise TypeError("block must be CapturedAudioBlock")
+
+            if self._capture_window is None:
+                self._pending_capture_blocks.append(
+                    CapturedAudioBlock(
+                        data=block.data.copy(),
+                        sample_start=block.sample_start,
+                        sample_end=block.sample_end,
+                        monotonic_start=block.monotonic_start,
+                        monotonic_end=block.monotonic_end,
+                    )
+                )
+                self._bus.recording_progress.emit(self.config_id, 0.0)
+                return
+
+            should_complete = self._process_captured_block_locked(block)
+
+        if should_complete:
+            self._notify_session_done()
+
+    def _process_captured_block_locked(self, block: CapturedAudioBlock) -> bool:
+        window = self._capture_window
+        if window is None or self._capture_closed or self._finished:
+            return False
+
+        retained = window.accept(block)
+        if retained is None:
+            elapsed = (
+                window.retained_frames / self._sample_rate
+                if self._sample_rate > 0
+                else 0.0
+            )
+            self._bus.recording_progress.emit(self.config_id, elapsed)
+            return False
+
+        monitor_feed = self._monitor_feed
+        if monitor_feed is not None:
+            try:
+                monitor_feed(retained.data)
+            except Exception as exc:
+                self._bus.log.emit(
+                    f"[TestSession] WARNING: monitor feed failed "
+                    f"for config={self.config_id}: {exc}"
+                )
+
         elapsed = (
-            self._processed_samples_since_attach / self._sample_rate
+            retained.sample_end / self._sample_rate
             if self._sample_rate > 0
             else 0.0
         )
-        frame_run_id = self._runtime_frame_run_id()
-
-        for pipeline in self._pipelines:
-            ch_idx = pipeline.channel_index
-            if chunk.ndim == 2 and ch_idx < chunk.shape[1]:
-                mono = chunk[:, ch_idx]
-            elif chunk.ndim == 1:
-                mono = chunk
-            else:
-                continue
-
-            result = pipeline.process_chunk(
-                mono,
-                elapsed,
-                compute_loudness=(ch_idx == self._live_loudness_channel_index),
-            )
-
-            for stft_frame in result["stft_frames"]:
-                self._bus.stft_updated.emit(self.config_id, frame_run_id, ch_idx, stft_frame)
-            if result["spl"] is not None:
-                self._bus.spl_updated.emit(self.config_id, frame_run_id, ch_idx, result["spl"])
-            if result.get("loudness") is not None:
-                self._bus.loudness_updated.emit(
-                    self.config_id,
-                    frame_run_id,
-                    ch_idx,
-                    result["loudness"],
-                )
-            if result["octave"] is not None:
-                self._bus.octave_updated.emit(self.config_id, frame_run_id, ch_idx, result["octave"])
-            if result["fft"] is not None:
-                self._bus.fft_updated.emit(self.config_id, frame_run_id, ch_idx, result["fft"])
-
+        self._submit_live_display_chunk(
+            retained.data,
+            elapsed,
+            self._runtime_frame_run_id(),
+            sample_start=retained.sample_start,
+            sample_end=retained.sample_end,
+        )
         self._bus.recording_progress.emit(self.config_id, elapsed)
 
-        if not self._finished and elapsed >= self._record_duration:
+        if window.complete and not self._finished:
             self._finished = True
-            if self._on_session_done_cb is not None:
-                self._on_session_done_cb(self.config_id)
+            return True
+        return False
+
+    def _notify_session_done(self) -> None:
+        callback = self._on_session_done_cb
+        if callback is not None:
+            callback(self.config_id)
+
+    @property
+    def capture_attachment(self) -> RecorderAttachment | None:
+        with self._capture_lock:
+            return self._capture_attachment
+
+    @property
+    def captured_frame_count(self) -> int:
+        with self._capture_lock:
+            if self._capture_window is None:
+                return 0
+            return self._capture_window.retained_frames
+
+    @property
+    def current_epoch(self) -> float | None:
+        with self._capture_lock:
+            if self._capture_attachment is None:
+                return None
+            return self._capture_attachment.current_epoch()
+
+    def freeze_capture(self) -> int:
+        """Atomically close capture fan-out and return the retained prefix size."""
+
+        with self._capture_lock:
+            self._capture_closed = True
+            self._pending_capture_blocks = []
+            if self._capture_window is None:
+                return 0
+            return self._capture_window.freeze()
+
+    def _submit_live_display_chunk(
+        self,
+        chunk: np.ndarray,
+        elapsed: float,
+        frame_run_id: str,
+        *,
+        sample_start: int | None = None,
+        sample_end: int | None = None,
+    ) -> None:
+        dispatcher = self._live_display_dispatcher
+        if dispatcher is None:
+            return
+        try:
+            submit_kwargs = {
+                "elapsed_time": elapsed,
+                "frame_run_id": frame_run_id,
+                "live_loudness_channel_index": self._live_loudness_channel_index,
+            }
+            submit = dispatcher.submit
+            if self._live_display_submit_accepts_sample_span(submit):
+                submit_kwargs["sample_start"] = sample_start
+                submit_kwargs["sample_end"] = sample_end
+            submit(chunk, **submit_kwargs)
+        except Exception as exc:
+            self._bus.log.emit(
+                f"[TestSession] WARNING: live display submission failed "
+                f"for config={self.config_id}: {exc}"
+            )
+
+    def stop_live_display(self) -> None:
+        dispatcher = self._live_display_dispatcher
+        self._live_display_dispatcher = None
+        if dispatcher is None:
+            return
+        stop = getattr(dispatcher, "stop", None)
+        if callable(stop):
+            stop()
+
+    def capture_recorder_buffer(self, hardware_buffer: np.ndarray, sample_rate: float) -> np.ndarray:
+        view = project_selected_channels(
+            hardware_buffer,
+            self._config.get("selected_channels", []),
+        )
+        self._buffer = view.buffer
+        self._source_channels = view.source_channels
+        self._real_to_logical_channel = view.real_to_logical
+        self._sample_rate = sample_rate
+        return self._buffer
 
     def _run_judgment(self) -> JudgmentResult | None:
         """Run judgment on the recorded buffer."""
@@ -221,13 +375,17 @@ class TestSession:
 
         self._audio_file_path = self._save_wav(self._buffer, self._sample_rate)
 
+        loudness_trace_cache: dict[int, dict] = {}
         result = self._judgment.judge(
             self._config,
             self._buffer,
             self._sample_rate,
             self._mic_cal,
             self._audio_file_path,
+            loudness_trace_cache=loudness_trace_cache,
+            **self._judgment_channel_kwargs(),
         )
+        self._last_loudness_trace_cache = loudness_trace_cache
         result = self._run_ai(result)
         self._last_result = result
         self._persist_audio_result_metadata(result)
@@ -378,18 +536,23 @@ class TestSession:
         default_window_duration_ms = int(self._analysis_duration * 1000)
         final_window_offset_ms = int(analysis_start * 1000)
         final_window_duration_ms = max(0, int((analysis_end - analysis_start) * 1000))
+        channel_metadata = self._ai_segment_channel_metadata()
         segments = [{
             "segment_id": self._audio_data_id,
             "role": "device_1",
             "audio_path": self._audio_file_path,
-            "channels": self._config.get("selected_channels", []),
+            "channels": channel_metadata["channels"],
+            "source_channels": channel_metadata["source_channels"],
+            "channel_map": channel_metadata["channel_map"],
             "duration_ms": final_window_duration_ms or default_window_duration_ms,
             "sample_rate": int(self._sample_rate),
             "metadata": {},
         }]
+        analysis_workorder = dict(self._workorder)
+        analysis_workorder.pop("rotation_speed", None)
         context = {
             "config_id": self.config_id,
-            "workorder": self._workorder,
+            "workorder": analysis_workorder,
         }
         ai_runs_dir = os.path.abspath(os.path.join(self._audio_dir, "..", "ai_runs"))
         test_run_id = self._get_or_create_test_run_id()
@@ -442,6 +605,8 @@ class TestSession:
             )
             return result
 
+        override = envelope.get("decision_threshold_source") == "request_params"
+        coerce_score = coerce_probability if override else self._coerce_ai_score
         module_status = str(envelope.get("module_status") or "").strip().lower()
         channel_index = self._coerce_ai_channel_index(envelope.get("channel_index"))
         envelope_threshold = self._coerce_ai_score(envelope.get("decision_threshold"))
@@ -449,7 +614,7 @@ class TestSession:
             self._last_ai_review = self._make_ai_review(
                 status=module_status or "error",
                 threshold=envelope_threshold,
-                score=self._coerce_ai_score(envelope.get("score")),
+                score=coerce_score(envelope.get("score")),
                 channel_index=channel_index,
                 error_message=self._normalize_ai_error(
                     envelope.get("error_summary"),
@@ -464,20 +629,33 @@ class TestSession:
             return result
 
         effective_threshold = envelope_threshold
-        score = self._coerce_ai_score(envelope.get("score"))
+        score = coerce_score(envelope.get("score"))
         ai_label = envelope.get("ai_label")
+        normalized_ai_label = self._normalize_ai_label(ai_label)
+        chinese_label_decision = self._ai_pass_from_chinese_label(normalized_ai_label)
 
         ai_pass = None
         ai_review_status = "success"
         ai_review_error = None
 
-        if score is not None:
+        if override:
+            if score is None:
+                ai_review_status = "missing_score"
+                ai_review_error = "AI score must be a finite number between 0 and 1 for decision_threshold override"
+            elif effective_threshold is None:
+                ai_review_error = "AI decision threshold unavailable"
+            else:
+                ai_pass = score >= effective_threshold
+            normalized_ai_label = None if ai_pass is None else "PASS" if ai_pass else "FAIL"
+        elif score is not None and chinese_label_decision is not None:
+            ai_pass = chinese_label_decision
+        elif score is not None:
             if effective_threshold is not None:
                 ai_pass = (score >= effective_threshold)
             else:
                 ai_review_error = "AI decision threshold unavailable"
-        elif isinstance(ai_label, str):
-            label = ai_label.strip().upper()
+        elif isinstance(normalized_ai_label, str):
+            label = normalized_ai_label.upper()
             if label == "PASS":
                 ai_pass = True
                 ai_review_status = "missing_score"
@@ -499,12 +677,15 @@ class TestSession:
             ai_review_status = "missing_score"
             ai_review_error = "AI score and usable AI label are unavailable"
 
+        review_threshold = None if chinese_label_decision is not None and not override else effective_threshold
         self._last_ai_review = self._make_ai_review(
             status=ai_review_status,
-            threshold=effective_threshold,
+            threshold=review_threshold,
             score=score,
             channel_index=channel_index,
             error_message=ai_review_error,
+            ai_label=normalized_ai_label,
+            passed=ai_pass,
         )
 
         result.ai_pass = ai_pass
@@ -543,6 +724,7 @@ class TestSession:
         if self._buffer is None or self._audio_file_path is None:
             return None
         self._last_ai_review = None
+        loudness_trace_cache: dict[int, dict] = {}
         result = self._judgment.rejudge(
             self._config,
             self._buffer,
@@ -551,10 +733,89 @@ class TestSession:
             self._audio_file_path,
             start_sec,
             end_sec,
+            loudness_trace_cache=loudness_trace_cache,
+            **self._judgment_channel_kwargs(),
         )
+        self._last_loudness_trace_cache = loudness_trace_cache
         result = self._run_ai(result)
         self._last_result = result
         return result
+
+    def _judgment_channel_kwargs(self) -> dict[str, dict[int, int]]:
+        if self._real_to_logical_channel:
+            return {"channel_column_map": dict(self._real_to_logical_channel)}
+        return {}
+
+    def _ai_segment_channel_metadata(self) -> dict[str, list[Any]]:
+        if self._source_channels:
+            source_channels = list(self._source_channels)
+            logical_channels = [
+                int(self._real_to_logical_channel.get(source, fallback))
+                for fallback, source in enumerate(source_channels)
+            ]
+        elif self._real_to_logical_channel:
+            pairs = sorted(
+                self._real_to_logical_channel.items(),
+                key=lambda item: item[1],
+            )
+            source_channels = [int(source) for source, _ in pairs]
+            logical_channels = [int(logical) for _, logical in pairs]
+        else:
+            source_channels, logical_channels = self._fallback_ai_segment_channels()
+
+        if len(source_channels) != len(logical_channels):
+            source_channels = source_channels[:len(logical_channels)]
+        if len(source_channels) < len(logical_channels):
+            source_channels = list(logical_channels)
+
+        return {
+            "channels": logical_channels,
+            "source_channels": source_channels,
+            "channel_map": [
+                {"logical_channel": logical, "source_channel": source}
+                for logical, source in zip(logical_channels, source_channels)
+            ],
+        }
+
+    def _fallback_ai_segment_channels(self) -> tuple[list[int], list[int]]:
+        selected_channels = self._selected_channels_for_ai_metadata()
+        buffer_channel_count = self._buffer_channel_count()
+
+        if buffer_channel_count <= 0:
+            logical_channels = list(range(len(selected_channels)))
+        elif selected_channels and all(
+            channel < buffer_channel_count for channel in selected_channels
+        ):
+            logical_channels = list(selected_channels)
+        else:
+            logical_channel_count = buffer_channel_count
+            if selected_channels:
+                logical_channel_count = min(buffer_channel_count, len(selected_channels))
+            logical_channels = list(range(logical_channel_count))
+
+        if selected_channels:
+            source_channels = selected_channels[:len(logical_channels)]
+        else:
+            source_channels = list(logical_channels)
+        return source_channels, logical_channels
+
+    def _selected_channels_for_ai_metadata(self) -> list[int]:
+        selected_channels: list[int] = []
+        for channel in self._config.get("selected_channels", []) or ():
+            if isinstance(channel, (bool, np.bool_)):
+                continue
+            if isinstance(channel, (int, np.integer)) and int(channel) >= 0:
+                selected_channels.append(int(channel))
+        return selected_channels
+
+    def _buffer_channel_count(self) -> int:
+        if self._buffer is None:
+            return 0
+        if self._buffer.ndim == 1:
+            return 1
+        if self._buffer.ndim == 2:
+            return int(self._buffer.shape[1])
+        return 0
 
     def _get_or_create_test_run_id(self) -> str:
         """Return the stable AI test_run_id for this session."""
@@ -572,14 +833,10 @@ class TestSession:
         return self._get_or_create_test_run_id()
 
     def _get_sensitivity(self, channel_index: int) -> float:
-        """Get mic sensitivity (Pa/V) for a channel from mic_cal."""
-        key = f"In{channel_index + 1}"
-        entry = self._mic_cal.get(key, {})
-        raw = entry.get("deviation_value", "0")
-        try:
-            return float(raw)
-        except (ValueError, TypeError):
-            return 0.0
+        return dsp.mic_sensitivity_from_calibration(
+            self._mic_cal,
+            channel_index,
+        )
 
     @property
     def last_result(self) -> JudgmentResult | None:
@@ -610,13 +867,24 @@ class TestSession:
             return text
         return None
 
-    @staticmethod
-    def _first_selected_channel(selected_channels) -> int | None:
-        for channel in selected_channels or ():
-            normalized = TestSession._as_non_bool_int(channel)
+    def _default_live_loudness_channel(self, selected_channels) -> int | None:
+        return resolve_layout_channel(
+            CHANNEL_PRIMARY_ACOUSTIC,
+            selected_channels=self._normalized_channel_indexes(selected_channels),
+            vibration_view_channel_index=self._as_non_bool_int(
+                self._config.get("vibration_view_channel_index")
+            ),
+            panel_family=PANEL_FAMILY_ACOUSTIC,
+        )
+
+    @classmethod
+    def _normalized_channel_indexes(cls, channels) -> list[int]:
+        normalized_channels = []
+        for channel in channels or ():
+            normalized = cls._as_non_bool_int(channel)
             if normalized is not None:
-                return normalized
-        return None
+                normalized_channels.append(normalized)
+        return normalized_channels
 
     @staticmethod
     def _as_non_bool_int(value) -> int | None:
@@ -626,6 +894,20 @@ class TestSession:
             return int(value)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _live_display_submit_accepts_sample_span(submit) -> bool:
+        try:
+            signature = inspect.signature(submit)
+        except (TypeError, ValueError):
+            return True
+        parameters = signature.parameters
+        if any(
+            parameter.kind == inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        ):
+            return True
+        return "sample_start" in parameters and "sample_end" in parameters
 
     @staticmethod
     def _coerce_ai_channel_index(value) -> int | None:
@@ -642,6 +924,26 @@ class TestSession:
         return fallback
 
     @staticmethod
+    def _normalize_ai_label(label) -> str | None:
+        if not isinstance(label, str):
+            return None
+        normalized = label.strip()
+        return normalized or None
+
+    @classmethod
+    def _ai_pass_from_chinese_label(cls, label: str | None) -> bool | None:
+        if label is None or not cls._contains_cjk(label):
+            return None
+        normalized = label.strip()
+        if normalized in {"通过", "合格", "正常"}:
+            return True
+        return False
+
+    @staticmethod
+    def _contains_cjk(text: str) -> bool:
+        return any("\u4e00" <= char <= "\u9fff" for char in text)
+
+    @staticmethod
     def _make_ai_review(
         *,
         status: str,
@@ -649,6 +951,8 @@ class TestSession:
         score: float | None,
         channel_index: int | None,
         error_message: str | None,
+        ai_label: str | None = None,
+        passed: bool | None = None,
     ) -> dict[str, Any]:
         return {
             "status": status,
@@ -656,4 +960,6 @@ class TestSession:
             "score": score,
             "channel_index": channel_index,
             "error_message": error_message,
+            "ai_label": ai_label,
+            "passed": passed,
         }

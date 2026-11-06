@@ -3,20 +3,21 @@ from __future__ import annotations
 from PyQt6.QtWidgets import QVBoxLayout, QWidget
 
 from app.services_container import FactoryControllerState, FactoryReviewPayload
-from ui.widgets.analysis_charts import LineChartWidget
+from ui.widgets.analysis_charts import LineChartExportSchema, LineChartWidget
 
 
 class SplModule(QWidget):
     module_id = "spl"
     _RENDER_PHASES = frozenset({"reviewing", "stopped"})
-    _BOTTOM_AXIS_LABEL = "Time (s)"
-    _LEFT_AXIS_LABEL = "SPL (dB)"
+    _BOTTOM_AXIS_LABEL = "时间 (s)"
+    _LEFT_AXIS_LABEL = "声压级 (dB)"
 
     def __init__(self, services):
         super().__init__()
         self.services = services
         self.selected_display_channel_provider = None
         self.selected_display_channel_sync = None
+        self.strict_selected_display_channel = False
         self._factory_state = getattr(
             services.factory_mode,
             "state",
@@ -33,7 +34,10 @@ class SplModule(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
 
-        self.plot = LineChartWidget(hide_left_axis_label=True)
+        self.plot = LineChartWidget(
+            hide_left_axis_label=True,
+            export_schema=LineChartExportSchema.spl(),
+        )
         self._set_axis_labels()
         lay.addWidget(self.plot, 1)
 
@@ -95,7 +99,13 @@ class SplModule(QWidget):
             else None
         )
         if not isinstance(spl_payload, dict):
-            self._clear_plot()
+            self._clear_plot(
+                rendered_channel_index=(
+                    channel_index
+                    if self.strict_selected_display_channel and channel_payload is None
+                    else None
+                )
+            )
             return
 
         times_sec = spl_payload.get("times_sec") or []
@@ -110,6 +120,7 @@ class SplModule(QWidget):
                 values_db,
                 lower_limit=spl_payload.get("lower_limit_db"),
                 upper_limit=spl_payload.get("upper_limit_db"),
+                x_axis_range=spl_payload.get("x_axis_range_sec"),
             )
         except (TypeError, ValueError):
             self._clear_plot()
@@ -119,9 +130,9 @@ class SplModule(QWidget):
         self._has_plot_data = True
         self._rendered_channel_index = channel_index
 
-    def _clear_plot(self) -> None:
+    def _clear_plot(self, *, rendered_channel_index: int | None = None) -> None:
         self._has_plot_data = False
-        self._rendered_channel_index = None
+        self._rendered_channel_index = rendered_channel_index
         self.plot.clear_data()
         self._set_axis_labels()
 
@@ -159,8 +170,13 @@ class SplModule(QWidget):
         chart_payload: dict[int, dict],
     ) -> tuple[int | None, dict | None]:
         selected_channel = self._selected_channel_index()
-        if selected_channel is not None and selected_channel in chart_payload:
-            return selected_channel, chart_payload[selected_channel]
+        if self.strict_selected_display_channel and selected_channel is None:
+            return None, None
+        if selected_channel is not None:
+            if selected_channel in chart_payload:
+                return selected_channel, chart_payload[selected_channel]
+            if self.strict_selected_display_channel:
+                return selected_channel, None
 
         for channel_index, channel_payload in chart_payload.items():
             self._sync_selected_channel(selected_channel, channel_index)

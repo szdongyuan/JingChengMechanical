@@ -22,7 +22,12 @@ from app.service.config_package_service import (
     ConfigPackageService,
 )
 from app.service.config_service import ConfigService
+from app.service.current_meter_service import normalize_current_meter_config
 from app.service.golden_sample_service import GoldenSampleService
+from model.channel_config_table import ChannelConfigTable
+from model.input_hardware_table import InputHardwareTable
+from model.test_config_ai_binding_table import TestConfigAiBindingTable as AiBindingTable
+from model.test_config_table import TestConfigTable as ConfigTable
 
 _TOOLCHAIN_MARKER_NAME = ".jingcheng_toolchain_id"
 
@@ -46,8 +51,96 @@ def _make_services(tmp_path: Path) -> SimpleNamespace:
     )
 
 
+def _recreate_legacy_config_schema_without_monitor_columns() -> None:
+    database = ConfigTable._meta.database
+    database.execute_sql("DROP TABLE IF EXISTS channel_config_table")
+    database.execute_sql("DROP TABLE IF EXISTS test_config_ai_binding_table")
+    database.execute_sql("DROP TABLE IF EXISTS test_config_table")
+    database.execute_sql(
+        """
+        CREATE TABLE test_config_table (
+            config_id INTEGER NOT NULL PRIMARY KEY,
+            config_name TEXT NOT NULL UNIQUE,
+            record_duration REAL NOT NULL DEFAULT 5.0,
+            analysis_duration REAL NOT NULL DEFAULT 3.0,
+            allow_incomplete_recording_analysis INTEGER NOT NULL DEFAULT 0,
+            scan_triggers_test INTEGER NOT NULL DEFAULT 0,
+            plc_id INTEGER,
+            plc_device_key TEXT,
+            plc_device_label TEXT,
+            created_time TEXT NOT NULL DEFAULT 'legacy-created',
+            updated_time TEXT NOT NULL DEFAULT 'legacy-updated',
+            input_device_name TEXT,
+            input_device_hostapi TEXT,
+            input_device_samplerate REAL,
+            output_device_name TEXT,
+            output_device_hostapi TEXT,
+            output_device_samplerate REAL,
+            selected_channels TEXT NOT NULL DEFAULT '[]',
+            fault_types_json TEXT NOT NULL DEFAULT '[]',
+            analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (plc_id) REFERENCES plc_table (id) ON DELETE SET NULL
+        )
+        """
+    )
+    ChannelConfigTable.create_table(safe=True)
+    AiBindingTable.create_table(safe=True)
+
+
+def _recreate_accepted_legacy_config_schema_without_current_meter_columns() -> None:
+    database = ConfigTable._meta.database
+    database.execute_sql("DROP TABLE IF EXISTS channel_config_table")
+    database.execute_sql("DROP TABLE IF EXISTS test_config_ai_binding_table")
+    database.execute_sql("DROP TABLE IF EXISTS test_config_table")
+    database.execute_sql(
+        """
+        CREATE TABLE test_config_table (
+            config_id INTEGER NOT NULL PRIMARY KEY,
+            config_name TEXT NOT NULL UNIQUE,
+            record_duration REAL NOT NULL DEFAULT 5.0,
+            analysis_duration REAL NOT NULL DEFAULT 3.0,
+            allow_incomplete_recording_analysis INTEGER NOT NULL DEFAULT 0,
+            scan_triggers_test INTEGER NOT NULL DEFAULT 0,
+            plc_id INTEGER,
+            plc_device_key TEXT,
+            plc_device_label TEXT,
+            created_time TEXT NOT NULL DEFAULT 'legacy-created',
+            updated_time TEXT NOT NULL DEFAULT 'legacy-updated',
+            input_device_name TEXT,
+            input_device_hostapi TEXT,
+            input_device_samplerate REAL,
+            output_device_name TEXT,
+            output_device_hostapi TEXT,
+            output_device_samplerate REAL,
+            selected_channels TEXT NOT NULL DEFAULT '[]',
+            fault_types_json TEXT NOT NULL DEFAULT '[]',
+            vibration_view_channel_index INTEGER,
+            analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0,
+            monitor_channel_index INTEGER,
+            monitor_gain_db REAL,
+            FOREIGN KEY (plc_id) REFERENCES plc_table (id) ON DELETE SET NULL
+        )
+        """
+    )
+    ChannelConfigTable.create_table(safe=True)
+    AiBindingTable.create_table(safe=True)
+
+
+def _config_table_columns() -> set[str]:
+    cursor = ConfigTable._meta.database.execute_sql("PRAGMA table_info(test_config_table)")
+    return {row[1] for row in cursor.fetchall()}
+
+
 @pytest.fixture
 def services(tmp_path: Path) -> SimpleNamespace:
+    InputHardwareTable.create(
+        hardware_id=1,
+        alias="Managed input",
+        device_name="Mic 1",
+        hostapi="ASIO",
+        samplerate=48_000,
+        channel_count=4,
+    )
     bundle = _make_services(tmp_path)
     try:
         yield bundle
@@ -99,7 +192,28 @@ def _channel_payload(channel_index: int) -> dict:
     }
 
 
-def _config_payload(config_id: int, *, config_name: str = "Cfg1") -> dict:
+_STFT_SCORE_CUSTOM = {
+    "stft_score_enabled": False,
+    "stft_score_summary_mode": "min",
+    "stft_score_percentile": 35.0,
+    "stft_score_loudness_reference_sone": 12.5,
+    "stft_score_modulation_reference": 0.35,
+    "stft_score_harmonic_ratio_reference": 0.45,
+    "stft_score_frequency_instability_reference": 0.08,
+    "stft_score_harmonic_start_order": 3,
+    "stft_score_harmonic_end_order": 80,
+}
+
+
+def _config_payload(
+    config_id: int,
+    *,
+    config_name: str = "Cfg1",
+    monitor_channel_index: int | None = 0,
+    monitor_gain_db: float | None = 0.0,
+    vibration_view_channel_index: int | None = None,
+    fault_types: list[str] | None = None,
+) -> dict:
     return {
         "config_id": config_id,
         "config_name": config_name,
@@ -115,8 +229,32 @@ def _config_payload(config_id: int, *, config_name: str = "Cfg1") -> dict:
         "output_device_name": "Speaker 1",
         "output_device_hostapi": "WASAPI",
         "output_device_samplerate": 44_100.0,
+        "input_hardware_device_id": 1,
+        "fault_types": list(fault_types or []),
         "selected_channels": [0],
+        "monitor_channel_index": monitor_channel_index,
+        "monitor_gain_db": monitor_gain_db,
+        "vibration_view_channel_index": vibration_view_channel_index,
         "channels": [_channel_payload(0)],
+    }
+
+
+def _chart_layout(*, columns: int = 1) -> dict:
+    return {
+        "version": 2,
+        "columns": columns,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "spectrum",
+                "type": "spectrum",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "primary_acoustic",
+            }
+        ],
     }
 
 
@@ -260,7 +398,7 @@ def _package_entries(
     }
     manifest = {
         "format": "jingcheng-config-package",
-        "format_version": 1,
+        "format_version": 2,
         "app": "JingChengMechanical",
         "exported_at": "2026-04-20T12:00:00Z",
         "contents": {
@@ -313,7 +451,14 @@ def _write_package(path: Path, entries: dict[str, object]) -> Path:
 
 
 def test_export_writes_manifest_and_single_config_payload(tmp_path: Path, services: SimpleNamespace):
-    config_id = _create_saved_config(services, name="Cfg1")
+    config_id = services.config_service.create_config("Cfg1")
+    saved_payload = _config_payload(
+        config_id,
+        config_name="Cfg1",
+        fault_types=[" 异响 ", "漏装"],
+    )
+    saved_payload["result_dashboard_layout"] = _chart_layout()
+    services.config_service.save_config(saved_payload)
     target = tmp_path / "export.dy"
 
     services.config_package_service.export_package(
@@ -329,11 +474,14 @@ def test_export_writes_manifest_and_single_config_payload(tmp_path: Path, servic
         payload = json.loads(zf.read("config/config.json"))
 
     assert manifest["format"] == "jingcheng-config-package"
-    assert manifest["format_version"] == 1
+    assert manifest["format_version"] == 2
     assert manifest["app"] == "JingChengMechanical"
     assert isinstance(manifest["exported_at"], str)
     assert manifest["contents"]["config"] is True
     assert payload["config"]["config_name"] == "Cfg1"
+    assert payload["config"]["fault_types"] == ["异响", "漏装"]
+    assert payload["config"]["result_dashboard_layout"]["columns"] == 1
+    assert payload["config"]["result_dashboard_layout"]["panels"][0]["id"] == "spectrum"
     channel = payload["config"]["channels"][0]
     assert channel["spl_lower_enabled"] is False
     assert channel["spl_average_upper_limit"] == 85.0
@@ -344,6 +492,273 @@ def test_export_writes_manifest_and_single_config_payload(tmp_path: Path, servic
         "toolchain_id": None,
         "timeout_ms": None,
     }
+
+
+def test_export_writes_manual_judgment_buttons_visible(
+    tmp_path: Path,
+    services: SimpleNamespace,
+) -> None:
+    config_id = services.config_service.create_config("Manual buttons export")
+    payload = _config_payload(config_id, config_name="Manual buttons export")
+    payload["manual_judgment_buttons_visible"] = True
+    services.config_service.save_config(payload)
+    target = tmp_path / "manual-buttons.dy"
+
+    services.config_package_service.export_package(
+        config_id=config_id,
+        target_path=str(target),
+        options=ConfigPackageExportOptions(),
+    )
+
+    with zipfile.ZipFile(target) as zf:
+        manifest = json.loads(zf.read("manifest.json"))
+        package_payload = json.loads(zf.read("config/config.json"))
+
+    assert manifest["format_version"] == 2
+    assert package_payload["config"]["manual_judgment_buttons_visible"] is True
+
+
+def test_import_round_trips_manual_judgment_buttons_visible(
+    tmp_path: Path,
+    services: SimpleNamespace,
+) -> None:
+    imported_config = _config_payload(999, config_name="Imported visible")
+    imported_config["manual_judgment_buttons_visible"] = True
+    path = _write_package(
+        tmp_path / "manual-buttons-import.dy",
+        _package_entries(config_payload=imported_config),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    assert services.config_service.load_config(result.config_id)[
+        "manual_judgment_buttons_visible"
+    ] is True
+
+
+def test_import_legacy_package_missing_manual_judgment_buttons_visible_defaults_false(
+    tmp_path: Path,
+    services: SimpleNamespace,
+) -> None:
+    legacy_config = _config_payload(999, config_name="Legacy hidden")
+    assert "manual_judgment_buttons_visible" not in legacy_config
+    entries = _package_entries(config_payload=legacy_config)
+    assert entries["manifest.json"]["format_version"] == 2
+    path = _write_package(tmp_path / "legacy-hidden.dy", entries)
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    assert services.config_service.load_config(result.config_id)[
+        "manual_judgment_buttons_visible"
+    ] is False
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None])
+def test_import_rejects_non_bool_manual_judgment_buttons_visible_before_side_effects(
+    tmp_path: Path,
+    services: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    value,
+) -> None:
+    config = _config_payload(999, config_name="Invalid manual visibility")
+    config["manual_judgment_buttons_visible"] = value
+    path = _write_package(
+        tmp_path / "invalid-manual-visibility.dy",
+        _package_entries(config_payload=config),
+    )
+    reserve = MagicMock(side_effect=AssertionError("database side effect"))
+    monkeypatch.setattr(
+        services.config_service,
+        "reserve_import_config_id",
+        reserve,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="manual_judgment_buttons_visible must be a boolean",
+    ):
+        services.config_package_service.import_package(
+            str(path),
+            ConfigPackageImportDecision(),
+        )
+
+    reserve.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "fault_types",
+    [
+        None,
+        "异响",
+        ["异响", " 异响 "],
+        [f"type-{index}" for index in range(33)],
+        ["x" * 129],
+    ],
+)
+def test_import_rejects_missing_wrong_or_invalid_fault_types_before_side_effects(
+    tmp_path: Path,
+    services: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    fault_types,
+) -> None:
+    config = _config_payload(999, config_name="Imported")
+    if fault_types is None:
+        config.pop("fault_types")
+    else:
+        config["fault_types"] = fault_types
+    entries = _package_entries(config_payload=config)
+    path = _write_package(tmp_path / "invalid-fault-types.dy", entries)
+    reserve = MagicMock(side_effect=AssertionError("database side effect"))
+    monkeypatch.setattr(
+        services.config_service,
+        "reserve_import_config_id",
+        reserve,
+    )
+
+    with pytest.raises(ValueError):
+        services.config_package_service.import_package(
+            str(path),
+            ConfigPackageImportDecision(),
+        )
+
+    reserve.assert_not_called()
+
+
+def test_import_rejects_version_one_before_side_effects(
+    tmp_path: Path,
+    services: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entries = _package_entries()
+    entries["manifest.json"]["format_version"] = 1
+    path = _write_package(tmp_path / "v1.dy", entries)
+    reserve = MagicMock(side_effect=AssertionError("database side effect"))
+    monkeypatch.setattr(
+        services.config_service,
+        "reserve_import_config_id",
+        reserve,
+    )
+
+    with pytest.raises(ValueError, match="format_version"):
+        services.config_package_service.import_package(
+            str(path),
+            ConfigPackageImportDecision(),
+        )
+
+    reserve.assert_not_called()
+
+
+def test_export_writes_monitor_fields_in_config_payload(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    config_id = services.config_service.create_config("CfgMonitor")
+    payload = _config_payload(
+        config_id,
+        config_name="CfgMonitor",
+        monitor_channel_index=2,
+        monitor_gain_db=-9.5,
+    )
+    services.config_service.save_config(payload)
+    target = tmp_path / "monitor.dy"
+
+    services.config_package_service.export_package(
+        config_id=config_id,
+        target_path=str(target),
+        options=ConfigPackageExportOptions(),
+    )
+
+    with zipfile.ZipFile(target) as zf:
+        package_payload = json.loads(zf.read("config/config.json"))
+
+    assert package_payload["config"]["monitor_channel_index"] == 2
+    assert package_payload["config"]["monitor_gain_db"] == -9.5
+
+
+def test_export_writes_vibration_view_channel_in_config_payload(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    config_id = services.config_service.create_config("CfgVibration")
+    payload = _config_payload(
+        config_id,
+        config_name="CfgVibration",
+        vibration_view_channel_index=0,
+    )
+    services.config_service.save_config(payload)
+    target = tmp_path / "vibration.dy"
+
+    services.config_package_service.export_package(
+        config_id=config_id,
+        target_path=str(target),
+        options=ConfigPackageExportOptions(),
+    )
+
+    with zipfile.ZipFile(target) as zf:
+        package_payload = json.loads(zf.read("config/config.json"))
+
+    assert package_payload["config"]["vibration_view_channel_index"] == 0
+
+
+def test_export_package_preserves_stft_color_scale_fields(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    config_id = services.config_service.create_config("Color Scale")
+    payload = _config_payload(config_id, config_name="Color Scale")
+    payload["channels"][0].update(
+        {
+            "stft_color_scale_enabled": True,
+            "stft_color_scale_min_db": -88.0,
+            "stft_color_scale_max_db": -8.0,
+        }
+    )
+    services.config_service.save_config(payload)
+    target = tmp_path / "stft-color-scale-export.dy"
+
+    services.config_package_service.export_package(
+        config_id=config_id,
+        target_path=str(target),
+        options=ConfigPackageExportOptions(),
+    )
+
+    with zipfile.ZipFile(target) as zf:
+        package_payload = json.loads(zf.read("config/config.json"))
+
+    channel = package_payload["config"]["channels"][0]
+    assert channel["stft_color_scale_enabled"] is True
+    assert channel["stft_color_scale_min_db"] == pytest.approx(-88.0)
+    assert channel["stft_color_scale_max_db"] == pytest.approx(-8.0)
+
+
+def test_export_package_preserves_stft_score_fields(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    config_id = services.config_service.create_config("STFT Score")
+    payload = _config_payload(config_id, config_name="STFT Score")
+    payload["channels"][0].update(_STFT_SCORE_CUSTOM)
+    services.config_service.save_config(payload)
+    target = tmp_path / "stft-score-export.dy"
+
+    services.config_package_service.export_package(
+        config_id=config_id,
+        target_path=str(target),
+        options=ConfigPackageExportOptions(),
+    )
+
+    with zipfile.ZipFile(target) as zf:
+        package_payload = json.loads(zf.read("config/config.json"))
+
+    channel = package_payload["config"]["channels"][0]
+    for field, expected in _STFT_SCORE_CUSTOM.items():
+        assert channel[field] == expected
 
 
 def test_export_includes_selected_golden_samples(tmp_path: Path, services: SimpleNamespace):
@@ -765,7 +1180,8 @@ def test_inspect_package_rejects_case_insensitive_collisions_on_windows(tmp_path
     ("manifest_updates", "entry_updates", "match"),
     [
         ({"format": "wrong"}, {}, "format"),
-        ({"format_version": 2}, {}, "format_version"),
+        ({"format_version": 1}, {}, "format_version"),
+        ({"format_version": 3}, {}, "format_version"),
         ({"contents": {"config": False, "golden_samples": False, "ai_toolchain": False, "ai_package": False}}, {}, "contents.config"),
         ({}, {"config/config.json": None}, "config/config.json"),
         ({}, {"config/extra.json": {}}, "single-config"),
@@ -971,6 +1387,36 @@ def test_inspect_package_reports_config_and_runnable_ai_conflicts(
     assert preview.default_ai_action in preview.ai_action_options
 
 
+def test_inspect_package_detects_conflict_with_legacy_schema_missing_monitor_columns(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    _recreate_legacy_config_schema_without_monitor_columns()
+    ConfigTable._meta.database.execute_sql(
+        """
+        INSERT INTO test_config_table (
+            config_id,
+            config_name,
+            record_duration,
+            analysis_duration,
+            scan_triggers_test,
+            selected_channels
+        )
+        VALUES (1, 'Imported', 5.0, 3.0, 0, '[0]')
+        """
+    )
+    path = _write_package(
+        tmp_path / "legacy-conflict.dy",
+        _package_entries(config_payload=_config_payload(999, config_name="Imported")),
+    )
+
+    preview = services.config_package_service.inspect_package(str(path))
+
+    assert preview.config_conflict is True
+    assert preview.config_action_options == ("overwrite", "use_existing_config", "cancel")
+    assert preview.default_config_action == "use_existing_config"
+
+
 def _managed_toolchain_dir_name(toolchain_id: str) -> str:
     digest = hashlib.sha256(toolchain_id.encode("utf-8")).hexdigest()[:16]
     return f"{toolchain_id}_{digest}"
@@ -1048,6 +1494,50 @@ def test_import_package_creates_new_config_by_default_and_restores_golden_sample
     assert services.config_service.golden_sample_service.is_managed_path(
         channel["golden_sample_path"]
     )
+
+
+def test_import_package_create_supports_accepted_legacy_schema_without_current_meter_columns(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    _recreate_accepted_legacy_config_schema_without_current_meter_columns()
+    imported_config = _config_payload(
+        999,
+        config_name="Imported Legacy",
+        vibration_view_channel_index=0,
+    )
+    path = _write_package(
+        tmp_path / "legacy-without-current-meter.dy",
+        _package_entries(config_payload=imported_config),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    loaded = services.config_service.load_config(result.config_id)
+    row = ConfigTable._meta.database.execute_sql(
+        """
+        SELECT created_time, updated_time
+        FROM test_config_table
+        WHERE config_id = ?
+        """,
+        (result.config_id,),
+    ).fetchone()
+
+    assert "vibration_view_channel_index" in _config_table_columns()
+    assert "current_meter_enabled" not in _config_table_columns()
+    assert result.status == "created"
+    assert result.config_id == 1
+    assert loaded["config_id"] == result.config_id
+    assert loaded["config_name"] == "Imported Legacy"
+    assert loaded["vibration_view_channel_index"] == 0
+    assert loaded["current_meter"] == normalize_current_meter_config(None)
+    assert len(loaded["channels"]) == 1
+    assert loaded["channels"][0]["channel_index"] == 0
+    assert row[0] not in (None, "legacy-created")
+    assert row[1] not in (None, "legacy-updated")
 
 
 def test_import_package_config_conflict_use_existing_skips_entire_package_import(
@@ -1174,6 +1664,124 @@ def test_import_package_round_trips_limit_switch_fields(
     assert channel["loudness_lower_limit"] == 2.5
     assert channel["loudness_average_upper_enabled"] is True
     assert channel["loudness_average_upper_limit"] == 9.5
+
+
+def test_import_package_round_trips_stft_color_scale_fields(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    imported_config = _config_payload(999, config_name="Imported")
+    imported_config["channels"][0].update(
+        {
+            "stft_color_scale_enabled": True,
+            "stft_color_scale_min_db": -88.0,
+            "stft_color_scale_max_db": -8.0,
+        }
+    )
+    path = _write_package(
+        tmp_path / "stft-color-scale-import.dy",
+        _package_entries(config_payload=imported_config),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    channel = services.config_service.load_config(result.config_id)["channels"][0]
+    assert channel["stft_color_scale_enabled"] is True
+    assert channel["stft_color_scale_min_db"] == pytest.approx(-88.0)
+    assert channel["stft_color_scale_max_db"] == pytest.approx(-8.0)
+
+
+def test_import_package_round_trips_stft_score_fields(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    imported_config = _config_payload(999, config_name="Imported")
+    imported_config["channels"][0].update(_STFT_SCORE_CUSTOM)
+    path = _write_package(
+        tmp_path / "stft-score-import.dy",
+        _package_entries(config_payload=imported_config),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    channel = services.config_service.load_config(result.config_id)["channels"][0]
+    for field, expected in _STFT_SCORE_CUSTOM.items():
+        assert channel[field] == expected
+
+
+def test_import_package_round_trips_monitor_fields(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    imported_config = _config_payload(
+        999,
+        config_name="Imported",
+        monitor_channel_index=2,
+        monitor_gain_db=6.5,
+    )
+    path = _write_package(
+        tmp_path / "monitor.dy",
+        _package_entries(config_payload=imported_config),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    loaded = services.config_service.load_config(result.config_id)
+    assert loaded["monitor_channel_index"] == 2
+    assert loaded["monitor_gain_db"] == 6.5
+
+
+def test_import_package_round_trips_vibration_view_channel(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    imported_config = _config_payload(
+        999,
+        config_name="Imported",
+        vibration_view_channel_index=0,
+    )
+    path = _write_package(
+        tmp_path / "vibration.dy",
+        _package_entries(config_payload=imported_config),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    loaded = services.config_service.load_config(result.config_id)
+    assert loaded["vibration_view_channel_index"] == 0
+
+
+def test_import_package_round_trips_result_dashboard_layout(
+    tmp_path: Path,
+    services: SimpleNamespace,
+):
+    imported_config = _config_payload(999, config_name="Imported")
+    imported_config["result_dashboard_layout"] = _chart_layout()
+    path = _write_package(
+        tmp_path / "dashboard-layout.dy",
+        _package_entries(config_payload=imported_config),
+    )
+
+    result = services.config_package_service.import_package(
+        str(path),
+        ConfigPackageImportDecision(config_action="create"),
+    )
+
+    loaded = services.config_service.load_config(result.config_id)
+    assert loaded["result_dashboard_layout"]["columns"] == 1
+    assert loaded["result_dashboard_layout"]["panels"][0]["id"] == "spectrum"
 
 
 def test_import_package_overwrite_rollback_preserves_old_golden_binding(
@@ -1648,3 +2256,18 @@ def test_import_package_without_ai_metadata_clears_binding_without_mutating_loca
     assert binding["toolchain_id"] is None
     assert toolchain.package_dir == str(local_package_dir)
     assert toolchain.updated_time == original.updated_time
+
+def test_threshold_params_package_roundtrip(tmp_path, services, monkeypatch):
+    monkeypatch.setattr(config_package_module, 'base_dir', str(tmp_path))
+    params = {'decision_threshold': 0.12345678901234568, 'mode': 'keep'}
+    path = _write_package(tmp_path / 'threshold.dy', _package_entries(
+        include_ai_metadata=True, include_ai_package=True,
+        toolchain_overrides={'params_json': json.dumps(params)}))
+    imported = services.config_package_service.import_package(str(path), ConfigPackageImportDecision())
+    assert json.loads(services.ai_service.resolve_binding(imported.config_id)['params_json']) == params
+    exported = tmp_path / 'threshold-export.dy'
+    services.config_package_service.export_package(
+        config_id=imported.config_id, target_path=str(exported),
+        options=ConfigPackageExportOptions(include_ai_toolchain=True, include_ai_package=True))
+    with zipfile.ZipFile(exported) as archive:
+        assert json.loads(json.loads(archive.read('ai/toolchain.json'))['params_json']) == params

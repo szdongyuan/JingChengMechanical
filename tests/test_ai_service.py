@@ -11,11 +11,20 @@ from unittest.mock import MagicMock
 import pytest
 
 import app.service.ai_service as ai_service_module
+import app.service.ai_subprocess as ai_subprocess_module
 from model.ai_execution_table import AiExecutionTable
 from model.test_config_table import TestConfigTable as ConfigTable
 from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable as AiBindingTable
 from app.service.ai_service import AiService
+from app.service.run_record_export.contracts import AiExportValue
+
+
+RUN_ID_1 = "12345678-1234-4abc-8def-1234567890ab"
+RUN_ID_2 = "22345678-1234-4abc-8def-1234567890ab"
+RUN_ID_3 = "32345678-1234-4abc-8def-1234567890ab"
+RUN_ID_4 = "42345678-1234-4abc-8def-1234567890ab"
+RUN_ID_5 = "52345678-1234-4abc-8def-1234567890ab"
 
 
 def test_ai_service_shutdown_delegates_to_resident_runtime():
@@ -100,6 +109,167 @@ def toolchain():
 @pytest.fixture
 def config():
     return ConfigTable.create(config_name="Cfg1")
+
+
+def _create_execution(
+    request_id: str,
+    run_id: str,
+    *,
+    started_time: str,
+    module_status: str = "success",
+    is_current_effective: bool = True,
+    score=None,
+    ai_label=None,
+):
+    return AiExecutionTable.create(
+        request_id=request_id,
+        test_run_id=run_id,
+        config_id=1,
+        toolchain_id="export-toolchain",
+        module_status=module_status,
+        started_time=started_time,
+        is_current_effective=is_current_effective,
+        score=score,
+        ai_label=ai_label,
+    )
+
+
+class TestCurrentEffectiveExportValues:
+    @pytest.mark.parametrize(
+        "run_ids",
+        [
+            [],
+            (),
+            (RUN_ID_1, RUN_ID_1),
+            ("12345678-1234-4ABC-8def-1234567890ab",),
+            ("12345678-1234-3abc-8def-1234567890ab",),
+        ],
+    )
+    def test_export_values_reject_invalid_selection(self, ai_service, run_ids):
+        with pytest.raises(ValueError):
+            ai_service.get_current_effective_export_values(run_ids)
+
+    def test_export_values_use_current_successful_rows_with_deterministic_order(
+        self, ai_service, setup_test_db, monkeypatch
+    ):
+        _create_execution(
+            "req_old",
+            RUN_ID_1,
+            started_time="2026-09-01T01:00:00+08:00",
+            score=0.25,
+            ai_label="old",
+        )
+        _create_execution(
+            "req_tie_a",
+            RUN_ID_1,
+            started_time="2026-09-02T01:00:00+08:00",
+            score=0.5,
+            ai_label="tie-a",
+        )
+        _create_execution(
+            "req_tie_z",
+            RUN_ID_1,
+            started_time="2026-09-02T01:00:00+08:00",
+            score=-4.25,
+            ai_label="  Raw 标签  ",
+        )
+        _create_execution(
+            "req_ineffective",
+            RUN_ID_1,
+            started_time="2026-09-03T01:00:00+08:00",
+            is_current_effective=False,
+            score=99.0,
+            ai_label="ineffective",
+        )
+        _create_execution(
+            "req_failed",
+            RUN_ID_1,
+            started_time="2026-09-04T01:00:00+08:00",
+            module_status="process_error",
+            score=88.0,
+            ai_label="failed",
+        )
+        _create_execution(
+            "req_invalid_fields",
+            RUN_ID_2,
+            started_time="2026-09-02T02:00:00+08:00",
+            score=float("inf"),
+            ai_label="NONFINITE_SCORE_LABEL",
+        )
+        _create_execution(
+            "req_failed_only",
+            RUN_ID_3,
+            started_time="2026-09-02T03:00:00+08:00",
+            module_status="invalid_output",
+            score=0.75,
+            ai_label="ignored",
+        )
+        _create_execution(
+            "req_blank_label",
+            RUN_ID_5,
+            started_time="2026-09-02T04:00:00+08:00",
+            score=3.5,
+            ai_label=" \t ",
+        )
+
+        select_count = 0
+        original_execute_sql = setup_test_db.execute_sql
+
+        def _counting_execute_sql(sql, *args, **kwargs):
+            nonlocal select_count
+            normalized_sql = " ".join(str(sql).lower().split())
+            if normalized_sql.startswith("select") and "ai_execution_table" in normalized_sql:
+                select_count += 1
+            return original_execute_sql(sql, *args, **kwargs)
+
+        monkeypatch.setattr(setup_test_db, "execute_sql", _counting_execute_sql)
+
+        result = ai_service.get_current_effective_export_values(
+            (RUN_ID_4, RUN_ID_2, RUN_ID_1, RUN_ID_3, RUN_ID_5)
+        )
+
+        assert result == {
+            RUN_ID_4: AiExportValue(None, None),
+            RUN_ID_2: AiExportValue(None, "NONFINITE_SCORE_LABEL"),
+            RUN_ID_1: AiExportValue(-4.25, "  Raw 标签  "),
+            RUN_ID_3: AiExportValue(None, None),
+            RUN_ID_5: AiExportValue(3.5, None),
+        }
+        assert select_count == 1
+
+    def test_export_values_treat_boolean_score_as_absent(
+        self, ai_service, monkeypatch
+    ):
+        row = SimpleNamespace(
+            test_run_id=RUN_ID_1,
+            score=True,
+            ai_label="BOOL_SCORE_LABEL",
+        )
+        query = MagicMock()
+        query.where.return_value = query
+        query.order_by.return_value = (row,)
+        monkeypatch.setattr(AiExecutionTable, "select", lambda *fields: query)
+
+        result = ai_service.get_current_effective_export_values((RUN_ID_1,))
+
+        assert result == {RUN_ID_1: AiExportValue(None, "BOOL_SCORE_LABEL")}
+
+    def test_export_values_treat_unconvertible_integer_score_as_absent(
+        self, ai_service, monkeypatch
+    ):
+        row = SimpleNamespace(
+            test_run_id=RUN_ID_1,
+            score=10**1000,
+            ai_label="OVERSIZED_SCORE_LABEL",
+        )
+        query = MagicMock()
+        query.where.return_value = query
+        query.order_by.return_value = (row,)
+        monkeypatch.setattr(AiExecutionTable, "select", lambda *fields: query)
+
+        result = ai_service.get_current_effective_export_values((RUN_ID_1,))
+
+        assert result == {RUN_ID_1: AiExportValue(None, "OVERSIZED_SCORE_LABEL")}
 
 
 class TestToolchainRegistry:
@@ -1075,20 +1245,31 @@ class TestToolchainRegistryCrud:
 
 
 class TestRunAiAnalysisRouting:
-    def test_execute_toolchain_runs_with_package_dir_cwd(
+    def test_execute_toolchain_preserves_io_and_uses_no_console_flags(
         self, ai_service, tmp_path, monkeypatch
     ):
         package_dir = tmp_path / "pkg"
         package_dir.mkdir()
         captured = {}
+        expected_flags = 0x08000040
+        monkeypatch.setattr(ai_subprocess_module, "os", SimpleNamespace(environ={
+            "PATH": "test-bin", "CUSTOM_AI": "keep", "OMP_NUM_THREADS": "8",
+        }))
+
+        monkeypatch.setattr(
+            ai_service_module,
+            "ai_subprocess_creation_flags",
+            lambda: expected_flags,
+        )
 
         def _run(cmd, **kwargs):
-            captured["cwd"] = kwargs.get("cwd")
-            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+            captured["cmd"] = cmd
+            captured["kwargs"] = kwargs
+            return subprocess.CompletedProcess(cmd, 7, stdout="out", stderr="err")
 
         monkeypatch.setattr(subprocess, "run", _run)
 
-        ai_service.execute_toolchain(
+        result = ai_service.execute_toolchain(
             entrypoint="python main.py",
             package_dir=str(package_dir),
             request_json_path="request.json",
@@ -1097,7 +1278,21 @@ class TestRunAiAnalysisRouting:
             timeout_ms=30000,
         )
 
-        assert captured["cwd"] == str(package_dir)
+        assert captured["kwargs"] == {
+            "capture_output": True,
+            "text": True,
+            "timeout": 30.0,
+            "cwd": str(package_dir),
+            "creationflags": expected_flags,
+            "env": {
+                "PATH": "test-bin", "CUSTOM_AI": "keep",
+                "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
+                "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1",
+            },
+        }
+        assert result["exit_code"] == 7
+        assert result["stdout_excerpt"] == "out"
+        assert result["stderr_excerpt"] == "err"
 
     def test_run_ai_analysis_routes_resident_process_through_runtime(
         self, ai_service, config, toolchain, tmp_path, monkeypatch
@@ -1624,3 +1819,27 @@ class TestBindingCrud:
                 "enabled": True,
                 "score_threshold": 0.5,
             })
+
+def test_threshold_save_next_snapshot_and_clear(ai_service, toolchain, config):
+    AiBindingTable.create(config=config, toolchain=toolchain, enabled=True)
+    ai_service.save_toolchain('motor-ai', _toolchain_payload(params_json={'mode': 'keep', 'decision_threshold': .6}))
+    frozen = ai_service.freeze_bound_toolchain(config.config_id)
+    assert frozen['params'] == {'mode': 'keep', 'decision_threshold': .6}
+    ai_service.save_toolchain('motor-ai', _toolchain_payload(params_json={'mode': 'keep', 'decision_threshold': .8}))
+    next_run = ai_service.freeze_bound_toolchain(config.config_id)
+    assert next_run['params']['decision_threshold'] == .8
+    assert next_run['execution_revision'] != frozen['execution_revision']
+    assert frozen['params']['decision_threshold'] == .6
+    ai_service.save_toolchain('motor-ai', _toolchain_payload(params_json={'mode': 'keep'}))
+    assert ai_service.freeze_bound_toolchain(config.config_id)['params'] == {'mode': 'keep'}
+
+@pytest.mark.parametrize('value', [True, '0.5', -1, 2, float('nan'), float('inf')])
+def test_invalid_threshold_save_and_preflight(ai_service, toolchain, config, tmp_path, value):
+    with pytest.raises(ValueError, match='decision_threshold'):
+        ai_service.save_toolchain('motor-ai', _toolchain_payload(params_json={'decision_threshold': value}))
+    toolchain.params_json = json.dumps({'decision_threshold': value})
+    toolchain.save()
+    AiBindingTable.create(config=config, toolchain=toolchain, enabled=True)
+    result = ai_service.preflight_check(config.config_id, _analysis_segments(tmp_path))
+    assert result['status'] != 'ready'
+    assert 'decision_threshold' in result['error']

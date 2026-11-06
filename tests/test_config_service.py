@@ -1,17 +1,25 @@
 """Tests for ConfigService hardware field persistence and validation."""
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 from scipy.io import wavfile
 
-from app.service.config_service import ConfigService, _GOLDEN_BINDING_FIELDS
+from app.service.config_service import (
+    MONITOR_GAIN_DEFAULT_DB,
+    ConfigService,
+    _GOLDEN_BINDING_FIELDS,
+)
 from app.service.golden_sample_service import GoldenSampleService
 from model.channel_config_table import ChannelConfigTable
+from model.device_table import DeviceTable
+from model.input_hardware_table import InputHardwareTable
 from model.plc_table import PlcTable
 from model.test_config_ai_binding_table import (
     TestConfigAiBindingTable as AiBindingTable,
@@ -23,12 +31,81 @@ class FakeBus:
     config_changed = MagicMock()
 
 
+_INVALID_MANAGED_INPUT_ERROR = (
+    "\u5fc5\u987b\u9009\u62e9\u6709\u6548\u7684\u8f93\u5165\u786c\u4ef6\u8bbe\u5907"
+)
+_UNAVAILABLE_MANAGED_INPUT_ERROR = (
+    "\u6240\u9009\u8f93\u5165\u786c\u4ef6\u8bbe\u5907\u4e0d\u53ef\u7528"
+)
+_MONITOR_CHANNEL_RANGE_ERROR = (
+    "\u76d1\u542c\u901a\u9053\u5fc5\u987b\u5c0f\u4e8e\u8f93\u5165\u901a\u9053\u6570"
+)
+_VIBRATION_CHANNEL_RANGE_ERROR = (
+    "\u632f\u52a8\u89c6\u56fe\u901a\u9053\u5fc5\u987b\u5c0f\u4e8e\u8f93\u5165\u901a\u9053\u6570"
+)
+_MISSING = object()
+
+
+@pytest.fixture(autouse=True)
+def valid_managed_input():
+    return InputHardwareTable.create(
+        hardware_id=1,
+        alias="Managed input",
+        device_name="Managed microphone",
+        hostapi="ASIO",
+        samplerate=48_000,
+        channel_count=4,
+    )
+
+
 def _service(golden_root: Path | None = None) -> ConfigService:
     FakeBus.config_changed.reset_mock()
     golden_service = None
     if golden_root is not None:
         golden_service = GoldenSampleService(root_dir=str(golden_root))
     return ConfigService(FakeBus(), golden_sample_service=golden_service)
+
+
+def _recreate_legacy_config_schema_without_monitor_columns() -> None:
+    database = ConfigTable._meta.database
+    database.execute_sql("DROP TABLE IF EXISTS channel_config_table")
+    database.execute_sql("DROP TABLE IF EXISTS test_config_ai_binding_table")
+    database.execute_sql("DROP TABLE IF EXISTS test_config_table")
+    database.execute_sql(
+        """
+        CREATE TABLE test_config_table (
+            config_id INTEGER NOT NULL PRIMARY KEY,
+            config_name TEXT NOT NULL UNIQUE,
+            record_duration REAL NOT NULL DEFAULT 5.0,
+            analysis_duration REAL NOT NULL DEFAULT 3.0,
+            allow_incomplete_recording_analysis INTEGER NOT NULL DEFAULT 0,
+            scan_triggers_test INTEGER NOT NULL DEFAULT 0,
+            plc_id INTEGER,
+            plc_device_key TEXT,
+            plc_device_label TEXT,
+            created_time TEXT NOT NULL DEFAULT 'legacy-created',
+            updated_time TEXT NOT NULL DEFAULT 'legacy-updated',
+            input_device_name TEXT,
+            input_device_hostapi TEXT,
+            input_device_samplerate REAL,
+            output_device_name TEXT,
+            output_device_hostapi TEXT,
+            output_device_samplerate REAL,
+            selected_channels TEXT NOT NULL DEFAULT '[]',
+            fault_types_json TEXT NOT NULL DEFAULT '[]',
+            analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (plc_id) REFERENCES plc_table (id) ON DELETE SET NULL
+        )
+        """
+    )
+    ChannelConfigTable.create_table(safe=True)
+
+
+def _legacy_config_columns() -> set[str]:
+    cursor = ConfigTable._meta.database.execute_sql(
+        "PRAGMA table_info(test_config_table)"
+    )
+    return {row[1] for row in cursor.fetchall()}
 
 
 def _channel_payload(channel_index: int) -> dict:
@@ -52,6 +129,7 @@ def _channel_payload(channel_index: int) -> dict:
         "loudness_average_lower_limit": 0.0,
         "loudness_average_upper_enabled": False,
         "loudness_average_upper_limit": 60.0,
+        "fft_x_axis_scale": "linear",
         "fft_band_limits": [],
         "oct_weighting": "A",
         "oct_band_limits": [],
@@ -69,6 +147,31 @@ def _channel_payload(channel_index: int) -> dict:
         "oct_golden_mode": "off",
         "oct_show_golden_overlay": False,
     }
+
+
+_STFT_SCORE_DEFAULTS = {
+    "stft_score_enabled": True,
+    "stft_score_summary_mode": "percentile",
+    "stft_score_percentile": 10.0,
+    "stft_score_loudness_reference_sone": 10.0,
+    "stft_score_modulation_reference": 0.20,
+    "stft_score_harmonic_ratio_reference": 0.25,
+    "stft_score_frequency_instability_reference": 0.05,
+    "stft_score_harmonic_start_order": 2,
+    "stft_score_harmonic_end_order": 100,
+}
+
+_STFT_SCORE_CUSTOM = {
+    "stft_score_enabled": False,
+    "stft_score_summary_mode": "mean",
+    "stft_score_percentile": 25.0,
+    "stft_score_loudness_reference_sone": 12.5,
+    "stft_score_modulation_reference": 0.35,
+    "stft_score_harmonic_ratio_reference": 0.45,
+    "stft_score_frequency_instability_reference": 0.08,
+    "stft_score_harmonic_start_order": 3,
+    "stft_score_harmonic_end_order": 80,
+}
 
 
 def _channel_payload_with_loudness(
@@ -101,6 +204,10 @@ def _config_payload(
     analysis_duration: float = 3.0,
     sample_rate: float = 48_000.0,
     golden_editor_state: dict[int, dict] | None = None,
+    monitor_channel_index: int | None = None,
+    monitor_gain_db: float | None = 0.0,
+    vibration_view_channel_index: int | None = None,
+    fault_types: list[str] | None = None,
 ) -> dict:
     channels = channels or []
     if selected_channels is None:
@@ -118,12 +225,36 @@ def _config_payload(
         "output_device_name": "Speaker 1",
         "output_device_hostapi": "WASAPI",
         "output_device_samplerate": 44_100.0,
+        "input_hardware_device_id": 1,
+        "fault_types": list(fault_types or []),
         "selected_channels": selected_channels,
+        "monitor_channel_index": monitor_channel_index,
+        "monitor_gain_db": monitor_gain_db,
+        "vibration_view_channel_index": vibration_view_channel_index,
         "channels": channels,
     }
     if golden_editor_state is not None:
         payload["golden_editor_state"] = golden_editor_state
     return payload
+
+
+def _chart_layout(*, columns: int = 1) -> dict:
+    return {
+        "version": 2,
+        "columns": columns,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "spectrum",
+                "type": "spectrum",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "primary_acoustic",
+            }
+        ],
+    }
 
 
 def _write_temp_wav(
@@ -201,6 +332,358 @@ def test_create_config_no_channel_rows():
     assert ChannelConfigTable.select().where(ChannelConfigTable.config == config_id).count() == 0
 
 
+def test_fault_types_column_has_exact_orm_definition() -> None:
+    row = next(
+        row
+        for row in ConfigTable._meta.database.execute_sql(
+            "PRAGMA table_info(test_config_table)"
+        ).fetchall()
+        if row[1] == "fault_types_json"
+    )
+
+    assert row[2].upper() == "TEXT"
+    assert bool(row[3]) is True
+    assert row[4] == "'[]'"
+
+
+def test_create_config_explicitly_stores_empty_fault_types() -> None:
+    svc = _service()
+
+    config_id = svc.create_config("Fault defaults")
+
+    stored = ConfigTable.get_by_id(config_id)
+    assert stored.fault_types_json == "[]"
+    assert svc.load_config(config_id)["fault_types"] == []
+
+
+def test_create_config_defaults_manual_judgment_buttons_visible_to_false() -> None:
+    svc = _service()
+
+    config_id = svc.create_config("Manual judgment default")
+
+    stored = ConfigTable.get_by_id(config_id)
+    loaded = svc.load_config(config_id)
+    assert stored.manual_judgment_buttons_visible is False
+    assert loaded["manual_judgment_buttons_visible"] is False
+    assert type(loaded["manual_judgment_buttons_visible"]) is bool
+
+
+def test_manual_judgment_buttons_visible_save_load_and_copy_round_trip() -> None:
+    svc = _service()
+    source_id = svc.create_config("Source")
+    source_payload = _config_payload(
+        source_id,
+        config_name="Source",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    source_payload["manual_judgment_buttons_visible"] = True
+
+    svc.save_config(source_payload)
+
+    source_loaded = svc.load_config(source_id)
+    raw_value = ConfigTable._meta.database.execute_sql(
+        "SELECT manual_judgment_buttons_visible FROM test_config_table WHERE config_id = ?",
+        (source_id,),
+    ).fetchone()[0]
+    assert source_loaded["manual_judgment_buttons_visible"] is True
+    assert raw_value == 1
+
+    copied_payload = dict(source_loaded)
+    copied_payload["config_name"] = "Copied"
+    copied_id = svc.create_imported_config(
+        copied_payload,
+        reserved_config_id=svc.reserve_import_config_id(),
+    )
+
+    assert svc.load_config(copied_id)["manual_judgment_buttons_visible"] is True
+
+
+def test_save_legacy_input_missing_manual_judgment_buttons_visible_defaults_false() -> None:
+    svc = _service()
+    config_id = svc.create_config("Legacy input")
+    ConfigTable.update(manual_judgment_buttons_visible=True).where(
+        ConfigTable.config_id == config_id
+    ).execute()
+    legacy_payload = _config_payload(
+        config_id,
+        config_name="Legacy input",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+
+    svc.save_config(legacy_payload)
+
+    assert svc.load_config(config_id)["manual_judgment_buttons_visible"] is False
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None])
+def test_save_rejects_non_bool_manual_judgment_buttons_visible(value) -> None:
+    svc = _service()
+    config_id = svc.create_config("Invalid manual judgment visibility")
+    payload = _config_payload(
+        config_id,
+        config_name="Invalid manual judgment visibility",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    payload["manual_judgment_buttons_visible"] = value
+
+    with pytest.raises(
+        ValueError,
+        match="manual_judgment_buttons_visible must be a boolean",
+    ):
+        svc.save_config(payload)
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None])
+def test_prepare_import_rejects_non_bool_manual_judgment_buttons_visible(value) -> None:
+    svc = _service()
+    payload = _config_payload(999, config_name="Imported")
+    payload["manual_judgment_buttons_visible"] = value
+
+    with pytest.raises(
+        ValueError,
+        match="manual_judgment_buttons_visible must be a boolean",
+    ):
+        svc.prepare_import_payload(payload)
+
+
+def test_fault_types_save_load_dashboard_and_fresh_list_round_trip() -> None:
+    svc = _service()
+    cfg = ConfigTable.create(config_name="Cfg1")
+    payload = _config_payload(
+        cfg.config_id,
+        fault_types=[" 异响 ", "漏装"],
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+
+    svc.save_config(payload)
+
+    assert ConfigTable.get_by_id(cfg.config_id).fault_types_json == '["异响","漏装"]'
+    first = svc.load_config(cfg.config_id)
+    dashboard = svc.load_config_for_result_dashboard(cfg.config_id)
+    assert first["fault_types"] == ["异响", "漏装"]
+    assert dashboard["fault_types"] == ["异响", "漏装"]
+    assert first["fault_types"] is not dashboard["fault_types"]
+    first["fault_types"].append("mutated")
+    assert svc.load_config(cfg.config_id)["fault_types"] == ["异响", "漏装"]
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        '["异响", "漏装"]',
+        '[" 异响 "]',
+        '{"fault_types":[]}',
+        "not-json",
+    ],
+)
+def test_load_config_rejects_malformed_or_noncanonical_fault_types(stored: str) -> None:
+    svc = _service()
+    cfg = ConfigTable.create(config_name="Cfg1")
+    ConfigTable.update(fault_types_json=stored).where(
+        ConfigTable.config_id == cfg.config_id
+    ).execute()
+
+    with pytest.raises(ValueError):
+        svc.load_config(cfg.config_id)
+
+
+def test_save_rejects_missing_fault_types_before_opening_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc = _service()
+    cfg = ConfigTable.create(config_name="Cfg1")
+    payload = _config_payload(cfg.config_id)
+    payload.pop("fault_types")
+
+    def _unexpected_atomic():
+        raise AssertionError("invalid semantic payload opened a transaction")
+
+    monkeypatch.setattr(ConfigTable._meta.database, "atomic", _unexpected_atomic)
+
+    with pytest.raises(ValueError):
+        svc.save_config(payload)
+
+
+def test_load_config_defaults_missing_result_dashboard_layout():
+    svc = _service()
+    cfg = ConfigTable.create(config_name="Cfg1", selected_channels="[0]")
+
+    loaded = svc.load_config(cfg.config_id)
+
+    assert loaded["result_dashboard_layout"]["columns"] == 3
+    assert loaded["result_dashboard_layout"]["panels"][0]["type"] == "stft"
+
+
+def test_save_config_persists_result_dashboard_layout():
+    svc = _service()
+    cfg = ConfigTable.create(config_name="Cfg1", selected_channels="[0]")
+    payload = _config_payload(
+        cfg.config_id,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    payload["result_dashboard_layout"] = _chart_layout()
+
+    svc.save_config(payload)
+
+    loaded = svc.load_config(cfg.config_id)
+    assert loaded["result_dashboard_layout"]["columns"] == 1
+
+
+def test_prepare_import_payload_preserves_result_dashboard_layout():
+    svc = _service()
+    source = _config_payload(
+        999,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    source["result_dashboard_layout"] = _chart_layout()
+
+    assert svc.prepare_import_payload(source)["result_dashboard_layout"]["columns"] == 1
+
+
+def test_create_config_writes_default_result_dashboard_layout():
+    svc = _service()
+
+    config_id = svc.create_config("NewCfg")
+    loaded = svc.load_config(config_id)
+
+    assert loaded["result_dashboard_layout"]["columns"] == 3
+    assert loaded["result_dashboard_layout"]["panels"][0]["type"] == "stft"
+
+
+def test_load_config_preserves_malformed_layout_so_editor_can_repair_it():
+    svc = _service()
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        selected_channels="[0]",
+        result_dashboard_layout="{bad json",
+    )
+
+    loaded = svc.load_config(cfg.config_id)
+
+    assert loaded["result_dashboard_layout"] == "{bad json"
+    assert "结果展示布局" in loaded["_result_dashboard_layout_error"]
+
+
+def test_load_config_for_result_dashboard_falls_back_for_malformed_layout():
+    svc = _service()
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        selected_channels="[0]",
+        result_dashboard_layout="{bad json",
+    )
+
+    loaded = svc.load_config_for_result_dashboard(cfg.config_id)
+
+    assert loaded["result_dashboard_layout"]["columns"] == 3
+    assert loaded["result_dashboard_layout"]["panels"][0]["id"] == "stft_acoustic"
+
+
+def test_load_config_for_result_dashboard_falls_back_when_layout_binding_exceeds_selected_channels():
+    svc = _service()
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        selected_channels="[0]",
+        result_dashboard_layout=json.dumps(
+            {
+                "version": 2,
+                "columns": 1,
+                "rows": 1,
+                "panels": [
+                    {
+                        "id": "spectrum",
+                        "type": "spectrum",
+                        "row": 0,
+                        "column": 0,
+                        "row_span": 1,
+                        "column_span": 1,
+                        "channel": "selected_2",
+                    },
+                ],
+            }
+        ),
+    )
+
+    loaded = svc.load_config_for_result_dashboard(cfg.config_id)
+
+    assert loaded["result_dashboard_layout"]["columns"] == 3
+    assert loaded["result_dashboard_layout"]["panels"][0]["id"] == "stft_acoustic"
+
+
+def test_prepare_import_payload_rejects_malformed_result_dashboard_layout():
+    svc = _service()
+    source = _config_payload(
+        999,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    source["result_dashboard_layout"] = "{bad json"
+
+    with pytest.raises(ValueError, match="结果展示布局|JSON|invalid"):
+        svc.prepare_import_payload(source)
+
+
+def test_prepare_import_payload_rejects_unknown_layout_panel_type():
+    svc = _service()
+    source = _config_payload(
+        999,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    source["result_dashboard_layout"] = {
+        "version": 2,
+        "columns": 1,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "custom",
+                "type": "custom_widget",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "primary_acoustic",
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError, match="结果展示布局|面板|panel|type"):
+        svc.prepare_import_payload(source)
+
+
+def test_prepare_import_payload_rejects_invalid_layout_channel_key():
+    svc = _service()
+    source = _config_payload(
+        999,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    source["result_dashboard_layout"] = {
+        "version": 2,
+        "columns": 1,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "spectrum",
+                "type": "spectrum",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "bad_channel",
+            },
+        ],
+    }
+
+    with pytest.raises(ValueError, match="结果展示布局|通道|channel"):
+        svc.prepare_import_payload(source)
+
+
 def test_load_config_returns_hardware_fields_with_cleaned_trigger_model():
     svc = _service()
     cfg = ConfigTable.create(
@@ -232,6 +715,13 @@ def test_load_config_returns_hardware_fields_with_cleaned_trigger_model():
         "output_device_hostapi",
         "output_device_samplerate",
         "selected_channels",
+        "fault_types",
+        "manual_judgment_buttons_visible",
+        "monitor_channel_index",
+        "monitor_gain_db",
+        "vibration_view_channel_index",
+        "result_dashboard_layout",
+        "current_meter",
         "channels",
     }
     assert result["input_device_name"] == "Mic 1"
@@ -243,6 +733,8 @@ def test_load_config_returns_hardware_fields_with_cleaned_trigger_model():
     assert result["plc_id"] is None
     assert result["allow_incomplete_recording_analysis"] is False
     assert result["selected_channels"] == [0, 2]
+    assert result["monitor_channel_index"] == 0
+    assert result["monitor_gain_db"] == 0.0
 
 
 def test_load_config_returns_plc_id_and_not_legacy_plc_text_fields():
@@ -274,6 +766,13 @@ def test_load_config_returns_plc_id_and_not_legacy_plc_text_fields():
         "output_device_hostapi",
         "output_device_samplerate",
         "selected_channels",
+        "fault_types",
+        "manual_judgment_buttons_visible",
+        "monitor_channel_index",
+        "monitor_gain_db",
+        "vibration_view_channel_index",
+        "result_dashboard_layout",
+        "current_meter",
         "channels",
     }
     assert result["plc_id"] == plc.id
@@ -294,12 +793,14 @@ def test_save_config_persists_hardware_fields():
             "record_duration": 5.0,
             "analysis_duration": 3.0,
             "scan_triggers_test": False,
+            "fault_types": [],
             "input_device_name": "Mic 1",
             "input_device_hostapi": "ASIO",
             "input_device_samplerate": 48000,
             "output_device_name": "Speaker 1",
             "output_device_hostapi": "WASAPI",
             "output_device_samplerate": 44100,
+            "input_hardware_device_id": 1,
             "selected_channels": [0, 2],
             "channels": [_channel_payload(0), _channel_payload(2)],
         }
@@ -323,7 +824,15 @@ def test_save_config_persists_hardware_fields():
         "output_device_name",
         "output_device_hostapi",
         "output_device_samplerate",
-        "selected_channels",
+            "input_hardware_device_id",
+            "selected_channels",
+            "fault_types",
+            "manual_judgment_buttons_visible",
+        "monitor_channel_index",
+        "monitor_gain_db",
+        "vibration_view_channel_index",
+        "result_dashboard_layout",
+        "current_meter",
         "channels",
     }
     assert loaded["input_device_name"] == "Mic 1"
@@ -335,7 +844,265 @@ def test_save_config_persists_hardware_fields():
     assert loaded["plc_id"] is None
     assert loaded["allow_incomplete_recording_analysis"] is False
     assert loaded["selected_channels"] == [0, 2]
+    assert loaded["monitor_channel_index"] == 0
+    assert loaded["monitor_gain_db"] == 0.0
     assert row.plc_id is None
+
+
+def test_load_config_defaults_null_monitor_fields_to_selected_channel_and_gain_zero():
+    svc = _service()
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        selected_channels="[2, 0]",
+        monitor_channel_index=None,
+        monitor_gain_db=None,
+    )
+
+    result = svc.load_config(cfg.config_id)
+
+    assert result["monitor_channel_index"] == 2
+    assert result["monitor_gain_db"] == 0.0
+
+
+def test_load_config_does_not_default_null_monitor_from_legacy_input_channels():
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="4")
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        selected_channels="[]",
+        monitor_channel_index=None,
+        monitor_gain_db=None,
+    )
+
+    result = svc.load_config(cfg.config_id)
+
+    assert result["monitor_channel_index"] is None
+    assert result["monitor_gain_db"] == 0.0
+
+
+def test_load_config_defaults_null_monitor_to_zero_for_bound_managed_input():
+    svc = _service()
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        input_hardware_device_id=1,
+        selected_channels="[]",
+        monitor_channel_index=None,
+    )
+
+    result = svc.load_config(cfg.config_id)
+
+    assert result["monitor_channel_index"] == 0
+
+
+def test_load_config_preserves_valid_stored_monitor_without_managed_binding():
+    svc = _service()
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        selected_channels="[]",
+        monitor_channel_index=3,
+    )
+
+    result = svc.load_config(cfg.config_id)
+
+    assert result["monitor_channel_index"] == 3
+
+
+@pytest.mark.parametrize(
+    ("hardware_id", "channel_count"),
+    [
+        (999, 4),
+        (1, None),
+        (1, True),
+        (1, 4.0),
+        (1, "4"),
+        (1, 0),
+        (1, -1),
+    ],
+)
+def test_load_config_does_not_default_monitor_for_unavailable_managed_input(
+    monkeypatch,
+    hardware_id,
+    channel_count,
+):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="4")
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        input_hardware_device_id=hardware_id,
+        selected_channels="[]",
+        monitor_channel_index=None,
+    )
+    if hardware_id == 1:
+        monkeypatch.setattr(
+            InputHardwareTable,
+            "get_by_id",
+            lambda _hardware_id: SimpleNamespace(channel_count=channel_count),
+        )
+
+    result = svc.load_config(cfg.config_id)
+
+    assert result["monitor_channel_index"] is None
+
+
+def test_load_config_does_not_default_monitor_when_managed_lookup_raises(
+    monkeypatch,
+):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="4")
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        input_hardware_device_id=1,
+        selected_channels="[]",
+        monitor_channel_index=None,
+    )
+
+    def raise_lookup_error(_hardware_id):
+        raise RuntimeError("lookup failed")
+
+    monkeypatch.setattr(InputHardwareTable, "get_by_id", raise_lookup_error)
+
+    result = svc.load_config(cfg.config_id)
+
+    assert result["monitor_channel_index"] is None
+
+
+def test_save_config_persists_monitor_fields_independent_of_selected_channels():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+
+    svc.save_config(
+        _config_payload(
+            config_id,
+            channels=[_channel_payload(0)],
+            selected_channels=[0],
+            monitor_channel_index=2,
+            monitor_gain_db=-12.5,
+        )
+    )
+
+    loaded = svc.load_config(config_id)
+    row = ConfigTable.get_by_id(config_id)
+
+    assert loaded["monitor_channel_index"] == 2
+    assert loaded["monitor_gain_db"] == -12.5
+    assert row.monitor_channel_index == 2
+    assert row.monitor_gain_db == -12.5
+
+
+def test_save_config_persists_vibration_view_channel():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+
+    svc.save_config(
+        {
+            "config_id": config_id,
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "scan_triggers_test": False,
+            "fault_types": [],
+            "input_device_name": "Mic 1",
+            "input_device_hostapi": "ASIO",
+            "input_device_samplerate": 48000,
+            "output_device_name": "Speaker 1",
+            "output_device_hostapi": "WASAPI",
+            "output_device_samplerate": 44100,
+            "input_hardware_device_id": 1,
+            "selected_channels": [0, 2],
+            "vibration_view_channel_index": 2,
+            "channels": [_channel_payload(0), _channel_payload(2)],
+        }
+    )
+
+    loaded = svc.load_config(config_id)
+    row = ConfigTable.get_by_id(config_id)
+
+    assert loaded["vibration_view_channel_index"] == 2
+    assert row.vibration_view_channel_index == 2
+
+
+def test_save_config_persists_current_meter_config():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    payload = _config_payload(
+        config_id,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    payload["current_meter"] = {
+        "enabled": True,
+        "source": "modbus_tcp",
+        "host": "192.168.1.20",
+        "port": 1502,
+        "unit_id": 3,
+        "register_type": "input",
+        "register_address": 120,
+        "register_count": 2,
+        "data_type": "float32",
+        "byte_order": "little",
+        "word_order": "big",
+        "scale": 0.1,
+        "offset": 1.5,
+        "poll_interval_ms": 250,
+        "timeout_ms": 1200,
+    }
+
+    svc.save_config(payload)
+
+    loaded = svc.load_config(config_id)
+    row = ConfigTable.get_by_id(config_id)
+    assert loaded["current_meter"] == payload["current_meter"]
+    assert row.current_meter_enabled is True
+    assert row.current_meter_source == "modbus_tcp"
+    assert row.current_meter_host == "192.168.1.20"
+    assert row.current_meter_register_type == "input"
+    assert row.current_meter_scale == pytest.approx(0.1)
+
+
+def test_plc_current_source_requires_valid_plc_and_does_not_require_modbus_host():
+    svc = _service()
+    plc = PlcTable.create(plc_name="PLC A")
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    payload = _config_payload(
+        config_id,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    payload["plc_id"] = plc.id
+    payload["current_meter"] = {
+        "enabled": True,
+        "source": "plc",
+        "host": "",
+    }
+
+    assert svc.validate(payload) == []
+    svc.save_config(payload)
+
+    loaded = svc.load_config(config_id)
+    row = ConfigTable.get_by_id(config_id)
+    assert loaded["current_meter"]["enabled"] is True
+    assert loaded["current_meter"]["source"] == "plc"
+    assert loaded["current_meter"]["host"] == ""
+    assert row.current_meter_source == "plc"
+
+    payload["plc_id"] = None
+    assert any("PLC" in error for error in svc.validate(payload))
+
+
+def test_current_meter_source_defaults_to_modbus_tcp_for_legacy_payloads():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    payload = _config_payload(
+        config_id,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    payload["current_meter"] = {"enabled": False}
+
+    svc.save_config(payload)
+
+    assert svc.load_config(config_id)["current_meter"]["source"] == "modbus_tcp"
+    assert ConfigTable.get_by_id(config_id).current_meter_source == "modbus_tcp"
 
 
 def test_save_config_persists_plc_id_and_rejects_missing_plc_rows():
@@ -351,6 +1118,8 @@ def test_save_config_persists_plc_id_and_rejects_missing_plc_rows():
             "analysis_duration": 3.0,
             "analysis_window_offset_ms": 500,
             "scan_triggers_test": False,
+            "fault_types": [],
+            "input_hardware_device_id": 1,
             "plc_id": plc.id,
             "input_device_name": "Mic 1",
             "input_device_hostapi": "ASIO",
@@ -378,6 +1147,7 @@ def test_save_config_persists_plc_id_and_rejects_missing_plc_rows():
                 "record_duration": 5.0,
                 "analysis_duration": 3.0,
                 "scan_triggers_test": False,
+                "input_hardware_device_id": 1,
                 "plc_id": plc.id + 999,
                 "selected_channels": [0],
                 "channels": [_channel_payload(0)],
@@ -395,6 +1165,8 @@ def test_save_config_reports_late_db_level_plc_fk_failure_as_plc_error(monkeypat
         "record_duration": 5.0,
         "analysis_duration": 3.0,
         "scan_triggers_test": False,
+        "fault_types": [],
+        "input_hardware_device_id": 1,
         "plc_id": plc.id,
         "selected_channels": [0],
         "channels": [_channel_payload(0)],
@@ -429,6 +1201,8 @@ def test_save_config_does_not_misreport_non_plc_fk_failure_as_plc_error(monkeypa
         "record_duration": 5.0,
         "analysis_duration": 3.0,
         "scan_triggers_test": False,
+        "fault_types": [],
+        "input_hardware_device_id": 1,
         "plc_id": plc.id,
         "selected_channels": [0],
         "channels": [_channel_payload(0)],
@@ -471,6 +1245,8 @@ def test_save_config_keeps_existing_ai_binding_row_while_offset_stays_config_own
             "analysis_duration": 3.0,
             "analysis_window_offset_ms": 500,
             "scan_triggers_test": False,
+            "fault_types": [],
+            "input_hardware_device_id": 1,
             "input_device_name": "Mic 1",
             "input_device_hostapi": "ASIO",
             "input_device_samplerate": 48000,
@@ -566,6 +1342,80 @@ def test_create_imported_config_uses_reserved_id_and_clears_plc_id():
     assert loaded["output_device_samplerate"] == 48_000.0
 
 
+def test_create_imported_config_normalizes_legacy_and_grouped_limit_tables():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {"freq": 1000.0, "lower": 40.0, "upper": 100.0},
+        {"freq": 2000.0, "lower": 50.0, "upper": 90.0},
+    ]
+    channel["oct_band_limits"] = [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 125.0, "limit": 20.0},
+                {"freq": 250.0, "limit": 25.0},
+            ],
+        }
+    ]
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[channel],
+        selected_channels=[0],
+    )
+    reserved_id = svc.reserve_import_config_id()
+
+    new_id = svc.create_imported_config(source, reserved_config_id=reserved_id)
+    loaded_channel = svc.load_config(new_id)["channels"][0]
+
+    assert loaded_channel["fft_band_limits"] == [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 40.0},
+                {"freq": 2000.0, "limit": 50.0},
+            ],
+        },
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 90.0},
+            ],
+        },
+    ]
+    assert loaded_channel["oct_band_limits"] == channel["oct_band_limits"]
+
+
+def test_create_imported_config_rejects_malformed_grouped_limits_with_ui_message():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {
+            "kind": "ceiling",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 90.0},
+            ],
+        }
+    ]
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[channel],
+        selected_channels=[0],
+    )
+    reserved_id = svc.reserve_import_config_id()
+
+    with pytest.raises(ValueError) as excinfo:
+        svc.create_imported_config(source, reserved_config_id=reserved_id)
+
+    message = str(excinfo.value)
+    assert "通道 1: FFT限制表第 1 项类型必须是上限或下限" in message
+    assert "upper 或 lower" not in message
+
+
 def test_overwrite_imported_config_keeps_local_id_and_clears_plc_id():
     svc = _service()
     local_plc = PlcTable.create(plc_name="Local PLC")
@@ -599,6 +1449,195 @@ def test_overwrite_imported_config_keeps_local_id_and_clears_plc_id():
     assert loaded["input_device_name"] == "Source Mic"
     assert loaded["input_device_hostapi"] == "Source API"
     assert loaded["input_device_samplerate"] == 44_100.0
+
+
+def test_prepare_import_payload_preserves_monitor_fields_and_defaults_absent_gain():
+    svc = _service()
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+        monitor_channel_index=3,
+        monitor_gain_db=6.5,
+    )
+    legacy_source = dict(source)
+    legacy_source.pop("monitor_channel_index")
+    legacy_source.pop("monitor_gain_db")
+
+    prepared = svc.prepare_import_payload(source)
+    legacy_prepared = svc.prepare_import_payload(legacy_source)
+
+    assert prepared["monitor_channel_index"] == 3
+    assert prepared["monitor_gain_db"] == 6.5
+    assert legacy_prepared["monitor_channel_index"] is None
+    assert legacy_prepared["monitor_gain_db"] == 0.0
+
+
+def test_prepare_import_payload_preserves_vibration_view_channel():
+    svc = _service()
+    source = _config_payload(
+        1,
+        channels=[_channel_payload(0), _channel_payload(2)],
+        selected_channels=[0, 2],
+    )
+    source["vibration_view_channel_index"] = 2
+
+    prepared = svc.prepare_import_payload(source)
+
+    assert prepared["vibration_view_channel_index"] == 2
+
+
+def test_prepare_import_payload_defaults_missing_fft_x_axis_scale_to_linear():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel.pop("fft_x_axis_scale", None)
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[channel],
+        selected_channels=[0],
+    )
+
+    prepared = svc.prepare_import_payload(source)
+
+    assert prepared["channels"][0]["fft_x_axis_scale"] == "linear"
+
+
+def test_prepare_import_payload_normalizes_legacy_limits_and_preserves_grouped_limits():
+    svc = _service()
+    legacy_channel = _channel_payload(0)
+    legacy_channel["fft_band_limits"] = [
+        {"freq": 1000.0, "lower": 40.0, "upper": 100.0},
+        {"freq": 2000.0, "lower": 50.0, "upper": 90.0},
+    ]
+    legacy_channel["oct_band_limits"] = [
+        {"freq": 125.0, "lower": 15.0, "upper": 60.0},
+        {"freq": 250.0, "lower": 20.0, "upper": 55.0},
+    ]
+    grouped_channel = _channel_payload(1)
+    grouped_channel["fft_band_limits"] = [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 3000.0, "limit": 80.0},
+                {"freq": 4000.0, "limit": 75.0},
+            ],
+        }
+    ]
+    grouped_channel["oct_band_limits"] = [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 500.0, "limit": 30.0},
+                {"freq": 1000.0, "limit": 35.0},
+            ],
+        }
+    ]
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[legacy_channel, grouped_channel],
+        selected_channels=[0, 1],
+    )
+
+    prepared = svc.prepare_import_payload(source)
+
+    assert prepared["channels"][0]["fft_band_limits"] == [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 40.0},
+                {"freq": 2000.0, "limit": 50.0},
+            ],
+        },
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 90.0},
+            ],
+        },
+    ]
+    assert prepared["channels"][0]["oct_band_limits"] == [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 125.0, "limit": 15.0},
+                {"freq": 250.0, "limit": 20.0},
+            ],
+        },
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 125.0, "limit": 60.0},
+                {"freq": 250.0, "limit": 55.0},
+            ],
+        },
+    ]
+    assert prepared["channels"][1]["fft_band_limits"] == grouped_channel[
+        "fft_band_limits"
+    ]
+    assert prepared["channels"][1]["oct_band_limits"] == grouped_channel[
+        "oct_band_limits"
+    ]
+
+
+def test_prepare_import_payload_malformed_grouped_limits_validate_with_ui_message():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["oct_band_limits"] = [{"kind": "upper", "points": "bad"}]
+    source = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[channel],
+        selected_channels=[0],
+    )
+
+    prepared = svc.prepare_import_payload(source)
+    errors = svc.validate(prepared)
+
+    assert "通道 1: 倍频程限制表第 1 项频点列表必须是列表" in errors
+    assert not any("points" in error for error in errors)
+
+
+def test_prepare_import_payload_defaults_missing_stft_color_scale_fields():
+    service = _service()
+    payload = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    channel = payload["channels"][0]
+    channel.pop("stft_color_scale_enabled", None)
+    channel.pop("stft_color_scale_min_db", None)
+    channel.pop("stft_color_scale_max_db", None)
+
+    prepared = service.prepare_import_payload(payload)
+
+    channel = prepared["channels"][0]
+    assert channel["stft_color_scale_enabled"] is False
+    assert channel["stft_color_scale_min_db"] == -120.0
+    assert channel["stft_color_scale_max_db"] == 0.0
+
+
+def test_prepare_import_payload_defaults_missing_stft_score_fields():
+    service = _service()
+    payload = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    for field in _STFT_SCORE_DEFAULTS:
+        payload["channels"][0].pop(field, None)
+
+    prepared = service.prepare_import_payload(payload)
+
+    channel = prepared["channels"][0]
+    for field, expected in _STFT_SCORE_DEFAULTS.items():
+        assert channel[field] == expected
 
 
 def test_imported_config_omitted_golden_assets_clear_bindings_and_modes(tmp_path):
@@ -766,6 +1805,117 @@ def test_legacy_fallback_infers_selected_channels():
     assert result["selected_channels"] == [0, 2]
 
 
+def test_legacy_schema_list_and_load_defaults_monitor_fields_without_columns():
+    svc = _service()
+    _recreate_legacy_config_schema_without_monitor_columns()
+    ConfigTable._meta.database.execute_sql(
+        """
+        INSERT INTO test_config_table (
+            config_id,
+            config_name,
+            record_duration,
+            analysis_duration,
+            scan_triggers_test,
+            selected_channels,
+            input_device_name
+        )
+        VALUES (1, 'Legacy', 5.0, 3.0, 0, '[2, 0]', 'Legacy Mic')
+        """
+    )
+
+    assert "monitor_channel_index" not in _legacy_config_columns()
+    assert "monitor_gain_db" not in _legacy_config_columns()
+    assert svc.list_configs() == [{"config_id": 1, "config_name": "Legacy"}]
+
+    result = svc.load_config(1)
+
+    assert result["config_name"] == "Legacy"
+    assert result["input_device_name"] == "Legacy Mic"
+    assert result["selected_channels"] == [2, 0]
+    assert result["monitor_channel_index"] == 2
+    assert result["monitor_gain_db"] == 0.0
+    assert result["current_meter"]["source"] == "modbus_tcp"
+
+
+def test_legacy_schema_save_and_import_omit_monitor_writes_and_preserve_fields():
+    svc = _service()
+    _recreate_legacy_config_schema_without_monitor_columns()
+    ConfigTable._meta.database.execute_sql(
+        """
+        INSERT INTO test_config_table (
+            config_id,
+            config_name,
+            record_duration,
+            analysis_duration,
+            scan_triggers_test,
+            selected_channels,
+            input_device_name
+        )
+        VALUES (1, 'Legacy Save', 5.0, 3.0, 0, '[0]', 'Before Mic')
+        """
+    )
+
+    save_payload = _config_payload(
+        1,
+        config_name="Legacy Save",
+        channels=[_channel_payload(1)],
+        selected_channels=[1],
+        monitor_channel_index=0,
+        monitor_gain_db=12.0,
+    )
+    save_payload["input_device_name"] = "After Save Mic"
+    save_payload["analysis_window_offset_ms"] = 250
+    svc.save_config(save_payload)
+    saved = svc.load_config(1)
+
+    assert "monitor_channel_index" not in _legacy_config_columns()
+    assert "monitor_gain_db" not in _legacy_config_columns()
+    assert saved["input_device_name"] == "After Save Mic"
+    assert saved["analysis_window_offset_ms"] == 250
+    assert saved["selected_channels"] == [1]
+    assert saved["monitor_channel_index"] == 1
+    assert saved["monitor_gain_db"] == 0.0
+
+    import_payload = _config_payload(
+        999,
+        config_name="Imported Legacy",
+        channels=[_channel_payload(2)],
+        selected_channels=[2],
+        monitor_channel_index=0,
+        monitor_gain_db=6.0,
+    )
+    import_payload["input_device_name"] = "Imported Mic"
+    imported_id = svc.create_imported_config(
+        import_payload,
+        reserved_config_id=svc.reserve_import_config_id(),
+    )
+    imported = svc.load_config(imported_id)
+
+    assert imported["config_name"] == "Imported Legacy"
+    assert imported["input_device_name"] == "Imported Mic"
+    assert imported["selected_channels"] == [2]
+    assert imported["monitor_channel_index"] == 2
+    assert imported["monitor_gain_db"] == 0.0
+
+    overwrite_payload = _config_payload(
+        999,
+        config_name="Imported Legacy",
+        channels=[_channel_payload(3)],
+        selected_channels=[3],
+        monitor_channel_index=0,
+        monitor_gain_db=-18.0,
+    )
+    overwrite_payload["input_device_name"] = "Overwrite Mic"
+    svc.overwrite_imported_config(imported_id, overwrite_payload)
+    overwritten = svc.load_config(imported_id)
+
+    assert overwritten["config_name"] == "Imported Legacy"
+    assert overwritten["input_device_name"] == "Overwrite Mic"
+    assert overwritten["selected_channels"] == [3]
+    assert overwritten["monitor_channel_index"] == 3
+    assert overwritten["monitor_gain_db"] == 0.0
+
+
 def test_load_config_returns_default_loudness_fields_for_channel_rows():
     svc = _service()
     cfg = ConfigTable.create(config_name="Cfg1")
@@ -788,6 +1938,41 @@ def test_load_config_returns_default_fft_resolution_for_channel_rows():
     assert result["channels"][0]["fft_nfft"] == 4096
 
 
+def test_load_config_returns_default_fft_x_axis_scale_for_channel_rows():
+    svc = _service()
+    cfg = ConfigTable.create(config_name="Cfg1")
+    ChannelConfigTable.create(config=cfg, **_channel_payload(0))
+
+    result = svc.load_config(cfg.config_id)
+
+    assert result["channels"][0]["fft_x_axis_scale"] == "linear"
+
+
+def test_load_config_defaults_stft_color_scale_fields_for_channel_rows():
+    svc = _service()
+    cfg = ConfigTable.create(config_name="Cfg1", selected_channels="[0]")
+    ChannelConfigTable.create(config=cfg, **_channel_payload(0))
+
+    result = svc.load_config(cfg.config_id)
+
+    channel = result["channels"][0]
+    assert channel["stft_color_scale_enabled"] is False
+    assert channel["stft_color_scale_min_db"] == -120.0
+    assert channel["stft_color_scale_max_db"] == 0.0
+
+
+def test_load_config_defaults_stft_score_fields_for_channel_rows():
+    svc = _service()
+    cfg = ConfigTable.create(config_name="Cfg1", selected_channels="[0]")
+    ChannelConfigTable.create(config=cfg, **_channel_payload(0))
+
+    result = svc.load_config(cfg.config_id)
+
+    channel = result["channels"][0]
+    for field, expected in _STFT_SCORE_DEFAULTS.items():
+        assert channel[field] == expected
+
+
 def test_save_config_persists_loudness_fields():
     svc = _service()
     config_id = ConfigTable.create(config_name="Cfg1").config_id
@@ -799,6 +1984,8 @@ def test_save_config_persists_loudness_fields():
             "record_duration": 5.0,
             "analysis_duration": 3.0,
             "scan_triggers_test": False,
+            "fault_types": [],
+            "input_hardware_device_id": 1,
             "selected_channels": [0],
             "channels": [
                 _channel_payload_with_loudness(
@@ -835,6 +2022,8 @@ def test_save_config_persists_fft_resolution():
             "record_duration": 5.0,
             "analysis_duration": 3.0,
             "scan_triggers_test": False,
+            "fault_types": [],
+            "input_hardware_device_id": 1,
             "selected_channels": [0],
             "channels": [channel],
         }
@@ -848,6 +2037,245 @@ def test_save_config_persists_fft_resolution():
 
     assert loaded["channels"][0]["fft_nfft"] == 2048
     assert getattr(row, "fft_nfft", None) == 2048
+
+
+def test_save_config_persists_fft_x_axis_scale():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    channel = _channel_payload(0)
+    channel["fft_x_axis_scale"] = "log"
+
+    svc.save_config(
+        {
+            "config_id": config_id,
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "scan_triggers_test": False,
+            "fault_types": [],
+            "input_hardware_device_id": 1,
+            "selected_channels": [0],
+            "channels": [channel],
+        }
+    )
+
+    loaded = svc.load_config(config_id)
+    row = ChannelConfigTable.get(
+        (ChannelConfigTable.config == config_id)
+        & (ChannelConfigTable.channel_index == 0)
+    )
+
+    assert loaded["channels"][0]["fft_x_axis_scale"] == "log"
+    assert getattr(row, "fft_x_axis_scale", None) == "log"
+
+
+def test_save_config_persists_fft_weighting():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    channel = _channel_payload(0)
+    channel["fft_weighting"] = "C"
+
+    svc.save_config(
+        {
+            "config_id": config_id,
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "scan_triggers_test": False,
+            "fault_types": [],
+            "input_hardware_device_id": 1,
+            "selected_channels": [0],
+            "channels": [channel],
+        }
+    )
+
+    loaded = svc.load_config(config_id)
+    row = ChannelConfigTable.get(
+        (ChannelConfigTable.config == config_id)
+        & (ChannelConfigTable.channel_index == 0)
+    )
+
+    assert loaded["channels"][0]["fft_weighting"] == "C"
+    assert row.fft_weighting == "C"
+
+
+def test_save_config_preserves_grouped_fft_and_octave_limits():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 80.0},
+            ],
+        }
+    ]
+    channel["oct_band_limits"] = [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 125.0, "limit": 20.0},
+                {"freq": 250.0, "limit": 25.0},
+            ],
+        }
+    ]
+
+    svc.save_config(
+        _config_payload(config_id, channels=[channel], selected_channels=[0])
+    )
+
+    loaded = svc.load_config(config_id)
+    row = ChannelConfigTable.get(
+        (ChannelConfigTable.config == config_id)
+        & (ChannelConfigTable.channel_index == 0)
+    )
+    assert loaded["channels"][0]["fft_band_limits"] == channel["fft_band_limits"]
+    assert loaded["channels"][0]["oct_band_limits"] == channel["oct_band_limits"]
+    assert json.loads(row.fft_band_limits) == channel["fft_band_limits"]
+    assert json.loads(row.oct_band_limits) == channel["oct_band_limits"]
+
+
+def test_save_config_converts_legacy_paired_fft_and_octave_limits_to_grouped_storage():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {"freq": 1000.0, "lower": 40.0, "upper": 100.0},
+        {"freq": 2000.0, "lower": 50.0, "upper": 90.0},
+        {"freq": 2000.0, "lower": 55.0, "upper": 85.0},
+    ]
+    channel["oct_band_limits"] = [
+        {"freq": 125.0, "lower": 15.0, "upper": 60.0},
+        {"freq": 250.0, "lower": 20.0, "upper": 55.0},
+    ]
+
+    svc.save_config(
+        _config_payload(config_id, channels=[channel], selected_channels=[0])
+    )
+
+    expected_fft = [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 40.0},
+                {"freq": 2000.0, "limit": 50.0},
+                {"freq": 2000.0, "limit": 55.0},
+            ],
+        },
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 90.0},
+                {"freq": 2000.0, "limit": 85.0},
+            ],
+        },
+    ]
+    expected_octave = [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 125.0, "limit": 15.0},
+                {"freq": 250.0, "limit": 20.0},
+            ],
+        },
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 125.0, "limit": 60.0},
+                {"freq": 250.0, "limit": 55.0},
+            ],
+        },
+    ]
+
+    loaded = svc.load_config(config_id)
+    row = ChannelConfigTable.get(
+        (ChannelConfigTable.config == config_id)
+        & (ChannelConfigTable.channel_index == 0)
+    )
+    assert loaded["channels"][0]["fft_band_limits"] == expected_fft
+    assert loaded["channels"][0]["oct_band_limits"] == expected_octave
+    assert json.loads(row.fft_band_limits) == expected_fft
+    assert json.loads(row.oct_band_limits) == expected_octave
+
+
+def test_save_config_drops_empty_grouped_limit_tables_without_validation_error():
+    svc = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {"kind": "upper", "points": []},
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 40.0},
+                {"freq": 2000.0, "limit": 45.0},
+            ],
+        },
+    ]
+    channel["oct_band_limits"] = [{"kind": "upper", "points": []}]
+    payload = _config_payload(config_id, channels=[channel], selected_channels=[0])
+
+    assert svc.validate(payload) == []
+    svc.save_config(payload)
+
+    loaded = svc.load_config(config_id)
+    assert loaded["channels"][0]["fft_band_limits"] == [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 1000.0, "limit": 40.0},
+                {"freq": 2000.0, "limit": 45.0},
+            ],
+        }
+    ]
+    assert loaded["channels"][0]["oct_band_limits"] == []
+
+
+def test_save_config_persists_stft_color_scale_fields():
+    service = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    config = _config_payload(
+        config_id,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    config["channels"][0]["stft_color_scale_enabled"] = True
+    config["channels"][0]["stft_color_scale_min_db"] = -90.5
+    config["channels"][0]["stft_color_scale_max_db"] = -10.25
+
+    config_id = service.save_config(config)
+
+    loaded = service.load_config(config_id)
+    channel = loaded["channels"][0]
+    assert channel["stft_color_scale_enabled"] is True
+    assert channel["stft_color_scale_min_db"] == -90.5
+    assert channel["stft_color_scale_max_db"] == -10.25
+
+
+def test_save_config_persists_stft_score_fields():
+    service = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    config = _config_payload(
+        config_id,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    config["channels"][0].update(_STFT_SCORE_CUSTOM)
+
+    config_id = service.save_config(config)
+
+    loaded = service.load_config(config_id)
+    channel = loaded["channels"][0]
+    row = ChannelConfigTable.get(
+        (ChannelConfigTable.config == config_id)
+        & (ChannelConfigTable.channel_index == 0)
+    )
+    for field, expected in _STFT_SCORE_CUSTOM.items():
+        assert channel[field] == expected
+        assert getattr(row, field) == expected
 
 
 def test_validate_device_without_channels_error():
@@ -866,6 +2294,561 @@ def test_validate_device_without_channels_error():
     )
 
     assert "已选择输入设备但未选择任何通道" in errors
+
+
+def test_validate_rejects_more_than_two_selected_channels():
+    svc = _service()
+    data = _config_payload(
+        1,
+        channels=[_channel_payload(0), _channel_payload(1), _channel_payload(2)],
+        selected_channels=[0, 1, 2],
+    )
+
+    errors = svc.validate(data)
+
+    assert any("最多" in error and "两个通道" in error for error in errors)
+
+
+def test_validate_rejects_invalid_result_dashboard_layout():
+    svc = _service()
+    data = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    data["result_dashboard_layout"] = "{bad json"
+
+    errors = svc.validate(data)
+
+    assert any("结果展示布局" in error for error in errors)
+
+
+def test_validate_rejects_selected_2_layout_binding_for_one_selected_channel():
+    svc = _service()
+    data = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    data["result_dashboard_layout"] = {
+        "version": 2,
+        "columns": 1,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "spectrum",
+                "type": "spectrum",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "selected_2",
+            },
+        ],
+    }
+
+    errors = svc.validate(data)
+
+    assert any("结果展示布局" in error and "通道2" in error for error in errors)
+
+
+def test_validate_rejects_unknown_layout_panel_type():
+    svc = _service()
+    data = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    data["result_dashboard_layout"] = {
+        "version": 2,
+        "columns": 1,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "custom",
+                "type": "custom_widget",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "primary_acoustic",
+            },
+        ],
+    }
+
+    errors = svc.validate(data)
+
+    assert any(
+        "结果展示布局" in error and ("面板" in error or "type" in error)
+        for error in errors
+    )
+
+
+def test_validate_rejects_invalid_layout_channel_key():
+    svc = _service()
+    data = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    data["result_dashboard_layout"] = {
+        "version": 2,
+        "columns": 1,
+        "rows": 1,
+        "panels": [
+            {
+                "id": "spectrum",
+                "type": "spectrum",
+                "row": 0,
+                "column": 0,
+                "row_span": 1,
+                "column_span": 1,
+                "channel": "bad_channel",
+            },
+        ],
+    }
+
+    errors = svc.validate(data)
+
+    assert any("结果展示布局" in error and "通道" in error for error in errors)
+
+
+@pytest.mark.parametrize("monitor_channel_index", [True, "1", 1.5, -1])
+def test_validate_rejects_invalid_monitor_channel(monitor_channel_index):
+    svc = _service()
+    payload = _config_payload(
+        1,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+        monitor_channel_index=monitor_channel_index,
+    )
+
+    errors = svc.validate(payload)
+
+    assert any("监听通道" in err for err in errors)
+
+
+def test_validate_rejects_monitor_channel_outside_managed_channel_count(
+    valid_managed_input,
+):
+    svc = _service()
+    valid_managed_input.channel_count = 2
+    valid_managed_input.save()
+    payload = _config_payload(
+        1,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+        monitor_channel_index=2,
+    )
+
+    errors = svc.validate(payload)
+
+    assert any("监听通道" in err and "输入通道" in err for err in errors)
+
+
+def test_validate_uses_managed_channel_count_instead_of_smaller_legacy_channel_count():
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="2")
+    payload = _config_payload(
+        1,
+        channels=[_channel_payload(0), _channel_payload(2)],
+        selected_channels=[0, 2],
+        monitor_channel_index=2,
+        vibration_view_channel_index=2,
+    )
+
+    errors = svc.validate(payload)
+
+    assert "\u76d1\u542c\u901a\u9053\u5fc5\u987b\u5c0f\u4e8e\u8f93\u5165\u901a\u9053\u6570" not in errors
+    assert "\u632f\u52a8\u89c6\u56fe\u901a\u9053\u5fc5\u987b\u5c0f\u4e8e\u8f93\u5165\u901a\u9053\u6570" not in errors
+
+
+def test_validate_uses_managed_channel_count_instead_of_larger_legacy_channel_count(
+    valid_managed_input,
+):
+    svc = _service()
+    valid_managed_input.channel_count = 2
+    valid_managed_input.save()
+    DeviceTable.create(id=1, input_channel_count="4")
+    payload = _config_payload(
+        1,
+        channels=[_channel_payload(0), _channel_payload(2)],
+        selected_channels=[0, 2],
+        monitor_channel_index=2,
+        vibration_view_channel_index=2,
+    )
+
+    errors = svc.validate(payload)
+
+    assert errors.count(
+        "\u76d1\u542c\u901a\u9053\u5fc5\u987b\u5c0f\u4e8e\u8f93\u5165\u901a\u9053\u6570"
+    ) == 1
+    assert errors.count(
+        "\u632f\u52a8\u89c6\u56fe\u901a\u9053\u5fc5\u987b\u5c0f\u4e8e\u8f93\u5165\u901a\u9053\u6570"
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    "hardware_id",
+    [_MISSING, None, True, False, 0, -1, 1.0, "1"],
+)
+def test_validate_reports_invalid_input_hardware_id_once_without_legacy_fallback(
+    hardware_id,
+):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="16")
+    payload = _config_payload(
+        1,
+        selected_channels=[9],
+        monitor_channel_index=9,
+        vibration_view_channel_index=9,
+    )
+    if hardware_id is _MISSING:
+        payload.pop("input_hardware_device_id")
+    else:
+        payload["input_hardware_device_id"] = hardware_id
+
+    errors = svc.validate(payload)
+
+    assert errors.count(_INVALID_MANAGED_INPUT_ERROR) == 1
+
+
+@pytest.mark.parametrize("remove_bound_row", [False, True])
+def test_validate_reports_unavailable_input_hardware_once_without_legacy_fallback(
+    valid_managed_input,
+    remove_bound_row,
+):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="16")
+    payload = _config_payload(
+        1,
+        selected_channels=[9],
+        monitor_channel_index=9,
+        vibration_view_channel_index=9,
+    )
+    if remove_bound_row:
+        valid_managed_input.delete_instance()
+    else:
+        payload["input_hardware_device_id"] = 999
+
+    errors = svc.validate(payload)
+
+    assert errors.count(_UNAVAILABLE_MANAGED_INPUT_ERROR) == 1
+
+
+@pytest.mark.parametrize("channel_count", [None, True, 4.0, "4", 0, -1])
+def test_validate_rejects_invalid_managed_input_channel_count_once(
+    monkeypatch,
+    channel_count,
+):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="16")
+    payload = _config_payload(
+        1,
+        selected_channels=[9],
+        monitor_channel_index=9,
+        vibration_view_channel_index=9,
+    )
+    monkeypatch.setattr(
+        InputHardwareTable,
+        "get_by_id",
+        lambda _hardware_id: SimpleNamespace(channel_count=channel_count),
+    )
+
+    errors = svc.validate(payload)
+
+    assert errors.count(_UNAVAILABLE_MANAGED_INPUT_ERROR) == 1
+
+
+def test_validate_reports_managed_input_lookup_exception_once(monkeypatch):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="16")
+    payload = _config_payload(
+        1,
+        selected_channels=[9],
+        monitor_channel_index=9,
+        vibration_view_channel_index=9,
+    )
+
+    def raise_lookup_error(_hardware_id):
+        raise RuntimeError("lookup failed")
+
+    monkeypatch.setattr(InputHardwareTable, "get_by_id", raise_lookup_error)
+
+    errors = svc.validate(payload)
+
+    assert errors.count(_UNAVAILABLE_MANAGED_INPUT_ERROR) == 1
+
+
+@pytest.mark.parametrize(
+    ("channel_index", "expected_count"),
+    [(3, 0), (4, 1)],
+)
+def test_validate_uses_zero_based_managed_channel_boundaries(
+    channel_index,
+    expected_count,
+):
+    svc = _service()
+    payload = _config_payload(
+        1,
+        selected_channels=[channel_index],
+        monitor_channel_index=channel_index,
+        vibration_view_channel_index=channel_index,
+    )
+
+    errors = svc.validate(payload)
+
+    assert errors.count(_MONITOR_CHANNEL_RANGE_ERROR) == expected_count
+    assert errors.count(_VIBRATION_CHANNEL_RANGE_ERROR) == expected_count
+
+
+def test_validate_allows_null_monitor_and_vibration_with_valid_managed_input():
+    svc = _service()
+    payload = _config_payload(
+        1,
+        selected_channels=[],
+        monitor_channel_index=None,
+        vibration_view_channel_index=None,
+    )
+
+    errors = svc.validate(payload)
+
+    assert _INVALID_MANAGED_INPUT_ERROR not in errors
+    assert _UNAVAILABLE_MANAGED_INPUT_ERROR not in errors
+    assert not any("\u76d1\u542c\u901a\u9053" in error for error in errors)
+    assert not any("\u632f\u52a8\u89c6\u56fe\u901a\u9053" in error for error in errors)
+
+
+def test_validate_resolves_managed_input_once_for_both_channel_fields(monkeypatch):
+    svc = _service()
+    payload = _config_payload(
+        1,
+        selected_channels=[2],
+        monitor_channel_index=2,
+        vibration_view_channel_index=2,
+    )
+    original_get_by_id = InputHardwareTable.get_by_id
+    lookup_ids = []
+
+    def counted_get_by_id(hardware_id):
+        lookup_ids.append(hardware_id)
+        return original_get_by_id(hardware_id)
+
+    monkeypatch.setattr(InputHardwareTable, "get_by_id", counted_get_by_id)
+
+    svc.validate(payload)
+
+    assert lookup_ids == [1]
+
+
+@pytest.mark.parametrize(
+    "hardware_id",
+    [_MISSING, None, True, False, 0, -1, 1.0, "1"],
+)
+def test_validate_factory_runtime_reports_invalid_input_hardware_id_once(
+    hardware_id,
+):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="16")
+    payload = _config_payload(
+        1,
+        selected_channels=[9],
+        vibration_view_channel_index=9,
+    )
+    if hardware_id is _MISSING:
+        payload.pop("input_hardware_device_id")
+    else:
+        payload["input_hardware_device_id"] = hardware_id
+
+    errors = svc.validate_factory_runtime(payload)
+
+    assert errors.count(_INVALID_MANAGED_INPUT_ERROR) == 1
+
+
+@pytest.mark.parametrize("channel_count", [_MISSING, None, True, 4.0, "4", 0, -1])
+def test_validate_factory_runtime_reports_unavailable_input_hardware_once(
+    monkeypatch,
+    channel_count,
+):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="16")
+    payload = _config_payload(
+        1,
+        selected_channels=[9],
+        vibration_view_channel_index=9,
+    )
+    if channel_count is _MISSING:
+        payload["input_hardware_device_id"] = 999
+    else:
+        monkeypatch.setattr(
+            InputHardwareTable,
+            "get_by_id",
+            lambda _hardware_id: SimpleNamespace(channel_count=channel_count),
+        )
+
+    errors = svc.validate_factory_runtime(payload)
+
+    assert errors.count(_UNAVAILABLE_MANAGED_INPUT_ERROR) == 1
+
+
+def test_validate_factory_runtime_reports_managed_lookup_exception_once(
+    monkeypatch,
+):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="16")
+    payload = _config_payload(
+        1,
+        selected_channels=[9],
+        vibration_view_channel_index=9,
+    )
+
+    def raise_lookup_error(_hardware_id):
+        raise RuntimeError("lookup failed")
+
+    monkeypatch.setattr(InputHardwareTable, "get_by_id", raise_lookup_error)
+
+    errors = svc.validate_factory_runtime(payload)
+
+    assert errors.count(_UNAVAILABLE_MANAGED_INPUT_ERROR) == 1
+
+
+def test_validate_factory_runtime_resolves_managed_input_once(monkeypatch):
+    svc = _service()
+    payload = _config_payload(
+        1,
+        selected_channels=[2],
+        vibration_view_channel_index=2,
+    )
+    original_get_by_id = InputHardwareTable.get_by_id
+    lookup_ids = []
+
+    def counted_get_by_id(hardware_id):
+        lookup_ids.append(hardware_id)
+        return original_get_by_id(hardware_id)
+
+    monkeypatch.setattr(InputHardwareTable, "get_by_id", counted_get_by_id)
+
+    errors = svc.validate_factory_runtime(payload)
+
+    assert errors == []
+    assert lookup_ids == [1]
+
+
+def test_config_service_has_no_legacy_managed_channel_count_dependency():
+    source = (
+        Path(__file__).parents[1] / "app" / "service" / "config_service.py"
+    ).read_text(encoding="utf-8")
+
+    assert "DeviceTable" not in source
+    assert "get_channel_count" not in source
+    assert "input_channel_count" not in source
+
+
+def test_validate_accepts_null_vibration_view_channel():
+    svc = _service()
+    data = _config_payload(
+        1,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    data["vibration_view_channel_index"] = None
+
+    errors = svc.validate(data)
+
+    assert not any("振动视图通道" in error for error in errors)
+
+
+def test_validate_accepts_selected_vibration_view_channel():
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="4")
+    data = _config_payload(
+        1,
+        channels=[_channel_payload(0), _channel_payload(2)],
+        selected_channels=[0, 2],
+    )
+    data["vibration_view_channel_index"] = 2
+
+    errors = svc.validate(data)
+
+    assert not any("振动视图通道" in error for error in errors)
+
+
+@pytest.mark.parametrize("value", [-1, True, "1", 1.5])
+def test_validate_rejects_invalid_vibration_view_channel_values(value):
+    svc = _service()
+    data = _config_payload(
+        1,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    data["vibration_view_channel_index"] = value
+
+    errors = svc.validate(data)
+
+    assert any("振动视图通道" in error for error in errors)
+
+
+def test_validate_rejects_vibration_view_channel_not_selected():
+    svc = _service()
+    data = _config_payload(
+        1,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    data["vibration_view_channel_index"] = 1
+
+    errors = svc.validate(data)
+
+    assert "振动视图通道必须来自已选择通道" in errors
+    assert errors.count("振动视图通道必须来自已选择通道") == 1
+
+
+def test_validate_rejects_vibration_view_channel_outside_managed_channel_count(
+    valid_managed_input,
+):
+    svc = _service()
+    valid_managed_input.channel_count = 2
+    valid_managed_input.save()
+    data = _config_payload(
+        1,
+        channels=[_channel_payload(0), _channel_payload(2)],
+        selected_channels=[0, 2],
+    )
+    data["vibration_view_channel_index"] = 2
+
+    errors = svc.validate(data)
+
+    assert any("振动视图通道" in error and "输入通道" in error for error in errors)
+
+
+@pytest.mark.parametrize("value", [-1, True, "1", 1])
+def test_validate_factory_runtime_rejects_invalid_vibration_view_channel(value):
+    svc = _service()
+    data = _config_payload(
+        1,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    data["vibration_view_channel_index"] = value
+
+    errors = svc.validate_factory_runtime(data)
+
+    assert any("振动视图通道" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    "monitor_gain_db",
+    [True, "0", float("nan"), float("inf"), -60.1, 35.1],
+)
+def test_validate_rejects_invalid_monitor_gain(monitor_gain_db):
+    svc = _service()
+    payload = _config_payload(
+        1,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+        monitor_gain_db=monitor_gain_db,
+    )
+
+    errors = svc.validate(payload)
+
+    assert any("监听增益" in err for err in errors)
+
+
+def test_validate_accepts_new_monitor_gain_upper_bound_without_changing_default():
+    svc = _service()
+    payload = _config_payload(
+        1,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+        monitor_gain_db=35.0,
+    )
+
+    assert not any("监听增益" in err for err in svc.validate(payload))
+    assert MONITOR_GAIN_DEFAULT_DB == pytest.approx(0.0)
 
 
 def test_validate_rejects_invalid_loudness_unit():
@@ -906,6 +2889,501 @@ def test_validate_rejects_invalid_fft_resolution():
     )
 
     assert any("FFT 分辨率" in err for err in errors)
+
+
+def test_validate_rejects_invalid_fft_x_axis_scale():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_x_axis_scale"] = "semilog"
+
+    errors = svc.validate(
+        {
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "scan_triggers_test": False,
+            "selected_channels": [0],
+            "channels": [channel],
+        }
+    )
+
+    assert any("FFT 横轴模式" in err for err in errors)
+
+
+def test_validate_rejects_invalid_fft_weighting():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_weighting"] = "B"
+
+    errors = svc.validate(
+        {
+            "config_name": "Cfg1",
+            "record_duration": 5.0,
+            "analysis_duration": 3.0,
+            "scan_triggers_test": False,
+            "selected_channels": [0],
+            "channels": [channel],
+        }
+    )
+
+    assert "通道 1: FFT 计权模式无效" in errors
+
+
+def test_validate_rejects_enabled_stft_color_scale_with_invalid_range():
+    service = _service()
+    config = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    channel = config["channels"][0]
+    channel["stft_color_scale_enabled"] = True
+    channel["stft_color_scale_min_db"] = -20.0
+    channel["stft_color_scale_max_db"] = -20.0
+
+    errors = service.validate(config)
+
+    assert any("STFT 色阶下限必须小于上限" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("stft_color_scale_min_db", float("nan")),
+        ("stft_color_scale_min_db", float("inf")),
+        ("stft_color_scale_max_db", float("nan")),
+        ("stft_color_scale_max_db", float("-inf")),
+    ],
+)
+def test_validate_rejects_enabled_stft_color_scale_with_non_finite_bounds(
+    field,
+    value,
+):
+    service = _service()
+    config = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    channel = config["channels"][0]
+    channel["stft_color_scale_enabled"] = True
+    channel["stft_color_scale_min_db"] = -90.0
+    channel["stft_color_scale_max_db"] = -10.0
+    channel[field] = value
+
+    errors = service.validate(config)
+
+    assert any("STFT 色阶上下限必须为有限数值" in error for error in errors)
+
+
+@pytest.mark.parametrize("enabled", ["false", "yes", 1, None])
+def test_validate_rejects_stft_color_scale_enabled_non_bool(enabled):
+    service = _service()
+    config = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    channel = config["channels"][0]
+    channel["stft_color_scale_enabled"] = enabled
+    channel["stft_color_scale_min_db"] = -90.0
+    channel["stft_color_scale_max_db"] = -10.0
+
+    errors = service.validate(config)
+
+    assert any("STFT 固定色阶开关必须为布尔值" in error for error in errors)
+
+
+def test_save_config_rejects_enabled_stft_color_scale_with_non_finite_bounds():
+    service = _service()
+    config_id = ConfigTable.create(config_name="Cfg1").config_id
+    config = _config_payload(
+        config_id,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    channel = config["channels"][0]
+    channel["stft_color_scale_enabled"] = True
+    channel["stft_color_scale_min_db"] = float("nan")
+    channel["stft_color_scale_max_db"] = -10.0
+
+    with pytest.raises(ValueError, match="STFT 色阶上下限必须为有限数值"):
+        service.save_config(config)
+
+
+def test_create_imported_config_rejects_enabled_stft_color_scale_with_non_finite_bounds():
+    service = _service()
+    payload = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    channel = payload["channels"][0]
+    channel["stft_color_scale_enabled"] = True
+    channel["stft_color_scale_min_db"] = -90.0
+    channel["stft_color_scale_max_db"] = float("inf")
+    reserved_id = service.reserve_import_config_id()
+
+    with pytest.raises(ValueError, match="STFT 色阶上下限必须为有限数值"):
+        service.create_imported_config(payload, reserved_config_id=reserved_id)
+
+
+def test_create_imported_config_rejects_stft_color_scale_enabled_non_bool():
+    service = _service()
+    payload = _config_payload(
+        999,
+        config_name="Imported",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    channel = payload["channels"][0]
+    channel["stft_color_scale_enabled"] = "false"
+    channel["stft_color_scale_min_db"] = -90.0
+    channel["stft_color_scale_max_db"] = -10.0
+    reserved_id = service.reserve_import_config_id()
+
+    with pytest.raises(ValueError, match="STFT 固定色阶开关必须为布尔值"):
+        service.create_imported_config(payload, reserved_config_id=reserved_id)
+
+
+@pytest.mark.parametrize("enabled", ["false", 1, None])
+def test_validate_rejects_stft_score_enabled_non_bool(enabled):
+    service = _service()
+    config = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    config["channels"][0]["stft_score_enabled"] = enabled
+
+    errors = service.validate(config)
+
+    assert any("STFT 评分启用必须为布尔值" in error for error in errors)
+
+
+@pytest.mark.parametrize("summary_mode", ["median", "", None])
+def test_validate_rejects_invalid_stft_score_summary_mode(summary_mode):
+    service = _service()
+    config = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    config["channels"][0]["stft_score_summary_mode"] = summary_mode
+
+    errors = service.validate(config)
+
+    assert any("STFT 评分汇总方式无效" in error for error in errors)
+
+
+@pytest.mark.parametrize("summary_mode", [[], {"mode": "percentile"}])
+def test_validate_rejects_structured_stft_score_summary_mode(summary_mode):
+    service = _service()
+    config = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    config["channels"][0]["stft_score_summary_mode"] = summary_mode
+
+    errors = service.validate(config)
+
+    assert any("STFT 评分汇总方式无效" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    "percentile",
+    [0.0, -1.0, 100.1, float("nan"), float("inf"), "10", True],
+)
+def test_validate_rejects_invalid_stft_score_percentile(percentile):
+    service = _service()
+    config = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    config["channels"][0]["stft_score_percentile"] = percentile
+
+    errors = service.validate(config)
+
+    assert any("STFT 评分分位数" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("field", "label"),
+    [
+        ("stft_score_loudness_reference_sone", "响度参考值"),
+        ("stft_score_modulation_reference", "响度变化参考值"),
+        ("stft_score_harmonic_ratio_reference", "谐波占比参考值"),
+        ("stft_score_frequency_instability_reference", "频率不稳定参考值"),
+    ],
+)
+@pytest.mark.parametrize("value", [0.0, -0.1, float("nan"), float("inf"), "1", True])
+def test_validate_rejects_invalid_stft_score_references(field, label, value):
+    service = _service()
+    config = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    config["channels"][0][field] = value
+
+    errors = service.validate(config)
+
+    assert any(f"STFT 评分{label}必须为正数" in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("updates", "expected_fragment"),
+    [
+        ({"stft_score_harmonic_start_order": 1}, "谐波起始阶次必须大于等于2"),
+        (
+            {
+                "stft_score_harmonic_start_order": 5,
+                "stft_score_harmonic_end_order": 4,
+            },
+            "谐波结束阶次必须大于等于起始阶次",
+        ),
+    ],
+)
+def test_validate_rejects_invalid_stft_score_harmonic_order_range(
+    updates,
+    expected_fragment,
+):
+    service = _service()
+    config = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    config["channels"][0].update(updates)
+
+    errors = service.validate(config)
+
+    assert any(f"STFT 评分{expected_fragment}" in error for error in errors)
+
+
+@pytest.mark.parametrize("field", ["stft_score_harmonic_start_order", "stft_score_harmonic_end_order"])
+@pytest.mark.parametrize("value", [2.5, "3", True])
+def test_validate_rejects_non_integer_stft_score_harmonic_orders(field, value):
+    service = _service()
+    config = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    config["channels"][0][field] = value
+
+    errors = service.validate(config)
+
+    expected = "起始阶次" if field.endswith("start_order") else "结束阶次"
+    assert any(f"STFT 评分谐波{expected}必须为整数" in error for error in errors)
+
+
+def test_validate_rejects_invalid_stft_score_values_when_disabled():
+    service = _service()
+    config = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
+    config["channels"][0].update(
+        {
+            "stft_score_enabled": False,
+            "stft_score_loudness_reference_sone": 0.0,
+            "stft_score_harmonic_start_order": 1,
+        }
+    )
+
+    errors = service.validate(config)
+
+    assert any("STFT 评分响度参考值必须为正数" in error for error in errors)
+    assert any("STFT 评分谐波起始阶次必须大于等于2" in error for error in errors)
+
+
+def test_validate_accepts_grouped_upper_only_fft_limits():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 50.0},
+            ],
+        }
+    ]
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert errors == []
+
+
+def test_validate_accepts_grouped_lower_only_octave_limits():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["oct_band_limits"] = [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 125.0, "limit": 20.0},
+                {"freq": 250.0, "limit": 25.0},
+            ],
+        }
+    ]
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert errors == []
+
+
+def test_validate_accepts_unsorted_and_duplicate_fft_limit_control_points():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {"freq": 300.0, "lower": 60.0, "upper": 90.0},
+        {"freq": 100.0, "lower": 30.0, "upper": 80.0},
+        {"freq": 300.0, "lower": 80.0, "upper": 100.0},
+    ]
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert not [error for error in errors if "FFT" in error]
+
+
+def test_validate_rejects_fft_limits_with_less_than_two_distinct_frequencies():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {"freq": 300.0, "lower": 60.0, "upper": 90.0},
+        {"freq": 300.0, "lower": 70.0, "upper": 100.0},
+    ]
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert any("FFT限制表" in error and "至少需要两个不同频率" in error for error in errors)
+
+
+def test_validate_rejects_fft_duplicate_collapsed_invalid_envelope():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {"freq": 100.0, "lower": 30.0, "upper": 60.0},
+        {"freq": 100.0, "lower": 70.0, "upper": 80.0},
+        {"freq": 200.0, "lower": 30.0, "upper": 90.0},
+    ]
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert "通道 1: FFT限制表下限必须小于上限" in errors
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("freq", float("inf"), "通道 1: FFT限制表第 1 行频率必须是有限数字"),
+        ("freq", float("nan"), "通道 1: FFT限制表第 1 行频率必须是有限数字"),
+        ("lower", float("nan"), "通道 1: FFT限制表第 1 行下限必须是有限数字"),
+        ("upper", float("inf"), "通道 1: FFT限制表第 1 行上限必须是有限数字"),
+    ],
+)
+def test_validate_rejects_non_finite_fft_limit_values(field, value, message):
+    svc = _service()
+    channel = _channel_payload(0)
+    band = {"freq": 100.0, "lower": 30.0, "upper": 60.0}
+    band[field] = value
+    channel["fft_band_limits"] = [
+        band,
+        {"freq": 200.0, "lower": 30.0, "upper": 60.0},
+    ]
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert message in errors
+
+
+def test_validate_rejects_mixed_legacy_and_grouped_limit_shapes():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = [
+        {"freq": 1000.0, "lower": 40.0, "upper": 100.0},
+        {
+            "kind": "upper",
+            "points": [
+                {"freq": 1000.0, "limit": 100.0},
+                {"freq": 2000.0, "limit": 80.0},
+            ],
+        },
+    ]
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert "通道 1: FFT限制表不能混合旧版频点格式和分组格式" in errors
+
+
+def test_validate_rejects_malformed_grouped_point_data():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["oct_band_limits"] = [
+        {
+            "kind": "lower",
+            "points": [
+                {"freq": 125.0, "limit": 20.0},
+                {"freq": 250.0, "limit": "bad"},
+            ],
+        }
+    ]
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert "通道 1: 倍频程限制表第 1 项第 2 个频点限值必须是有限数字" in errors
+
+
+@pytest.mark.parametrize(
+    ("limits", "expected", "raw_fragment"),
+    [
+        (
+            [
+                {
+                    "kind": "ceiling",
+                    "points": [
+                        {"freq": 1000.0, "limit": 100.0},
+                        {"freq": 2000.0, "limit": 90.0},
+                    ],
+                }
+            ],
+            "通道 1: FFT限制表第 1 项类型必须是上限或下限",
+            "upper 或 lower",
+        ),
+        (
+            [{"kind": "upper", "points": "bad"}],
+            "通道 1: FFT限制表第 1 项频点列表必须是列表",
+            "points 必须是列表",
+        ),
+    ],
+)
+def test_validate_maps_grouped_limit_shape_messages_for_ui(
+    limits, expected, raw_fragment
+):
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["fft_band_limits"] = limits
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert expected in errors
+    assert not any(raw_fragment in error for error in errors)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "expected"),
+    [
+        ("fft_band_limits", None, "通道 1: FFT限制表必须是列表"),
+        ("oct_band_limits", {"kind": "upper"}, "通道 1: 倍频程限制表必须是列表"),
+    ],
+)
+def test_validate_rejects_none_or_non_list_limit_fields(field, value, expected):
+    svc = _service()
+    channel = _channel_payload(0)
+    channel[field] = value
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert expected in errors
+
+
+def test_validate_rejects_octave_one_point_table():
+    svc = _service()
+    channel = _channel_payload(0)
+    channel["oct_band_limits"] = [
+        {
+            "kind": "upper",
+            "points": [{"freq": 1000.0, "limit": 80.0}],
+        }
+    ]
+
+    errors = svc.validate(
+        _config_payload(1, channels=[channel], selected_channels=[0])
+    )
+
+    assert "通道 1: 倍频程限制表第 1 项至少需要两个不同频率" in errors
 
 
 def test_validate_rejects_negative_loudness_limits():
@@ -972,6 +3450,8 @@ def test_validate_ignores_disabled_invalid_limit_values():
             "record_duration": 5.0,
             "analysis_duration": 3.0,
             "scan_triggers_test": False,
+            "fault_types": [],
+            "input_hardware_device_id": 1,
             "selected_channels": [0],
             "channels": [channel],
         }
@@ -1057,6 +3537,7 @@ def test_validate_factory_runtime_allows_exact_fit_analysis_window_boundary():
             "record_duration": 0.3,
             "analysis_duration": 0.1,
             "analysis_window_offset_ms": 200,
+            "input_hardware_device_id": 1,
         }
     )
 
@@ -1072,8 +3553,10 @@ def test_validate_allows_unbound_plc_id_and_existing_row_only():
             "config_name": "Cfg1",
             "record_duration": 5.0,
             "analysis_duration": 3.0,
-            "analysis_window_offset_ms": 0,
-            "scan_triggers_test": False,
+                "analysis_window_offset_ms": 0,
+                "scan_triggers_test": False,
+                "fault_types": [],
+                "input_hardware_device_id": 1,
             "plc_id": None,
             "selected_channels": [],
             "channels": [],
@@ -1084,8 +3567,10 @@ def test_validate_allows_unbound_plc_id_and_existing_row_only():
             "config_name": "Cfg1",
             "record_duration": 5.0,
             "analysis_duration": 3.0,
-            "analysis_window_offset_ms": 0,
-            "scan_triggers_test": False,
+                "analysis_window_offset_ms": 0,
+                "scan_triggers_test": False,
+                "fault_types": [],
+                "input_hardware_device_id": 1,
             "plc_id": plc.id,
             "selected_channels": [],
             "channels": [],
@@ -1096,8 +3581,10 @@ def test_validate_allows_unbound_plc_id_and_existing_row_only():
             "config_name": "Cfg1",
             "record_duration": 5.0,
             "analysis_duration": 3.0,
-            "analysis_window_offset_ms": 0,
-            "scan_triggers_test": False,
+                "analysis_window_offset_ms": 0,
+                "scan_triggers_test": False,
+                "fault_types": [],
+                "input_hardware_device_id": 1,
             "plc_id": plc.id + 999,
             "selected_channels": [],
             "channels": [],

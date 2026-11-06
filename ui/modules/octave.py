@@ -15,6 +15,7 @@ class OctaveModule(QWidget):
         self.services = services
         self.selected_display_channel_provider = None
         self.selected_display_channel_sync = None
+        self.strict_selected_display_channel = False
         self._factory_state = getattr(
             services.factory_mode,
             "state",
@@ -53,6 +54,9 @@ class OctaveModule(QWidget):
 
     def current_render_channel(self) -> int | None:
         return self._rendered_channel_index
+
+    def set_vibration_mode(self, enabled: bool) -> None:
+        self.plot.set_vibration_semantics(enabled)
 
     def refresh_selected_display_channel(self) -> None:
         self._refresh_committed_rendering()
@@ -106,6 +110,7 @@ class OctaveModule(QWidget):
                 center_freqs_hz=center_freqs_hz,
                 levels_db=levels_db,
                 limit_bands=octave_payload.get("limit_bands"),
+                limit_lines=octave_payload.get("limit_lines"),
                 golden_overlay_levels_db=octave_payload.get("golden_overlay_levels_db"),
                 show_zero_reference=bool(octave_payload.get("show_zero_reference")),
             )
@@ -151,8 +156,13 @@ class OctaveModule(QWidget):
         chart_payload: dict[int, dict],
     ) -> tuple[int | None, dict | None]:
         selected_channel = self._selected_channel_index()
-        if selected_channel is not None and selected_channel in chart_payload:
-            return selected_channel, chart_payload[selected_channel]
+        if self.strict_selected_display_channel and selected_channel is None:
+            return None, None
+        if selected_channel is not None:
+            if selected_channel in chart_payload:
+                return selected_channel, chart_payload[selected_channel]
+            if self.strict_selected_display_channel:
+                return selected_channel, None
 
         for channel_index, channel_payload in chart_payload.items():
             self._sync_selected_channel(selected_channel, channel_index)

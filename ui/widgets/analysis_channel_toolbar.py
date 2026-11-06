@@ -31,7 +31,11 @@ class AnalysisChannelToolbar(QWidget):
         self.channel_combo.currentIndexChanged.connect(self._on_current_index_changed)
         layout.addWidget(self.channel_combo)
 
-    def set_available_channels(self, channels: Iterable[int]) -> None:
+    def set_available_channels(
+        self,
+        channels: Iterable[int],
+        labels: dict[int, str] | None = None,
+    ) -> None:
         normalized_channels: list[int] = []
         for channel in channels:
             try:
@@ -45,7 +49,10 @@ class AnalysisChannelToolbar(QWidget):
         current_channel = self.current_channel_index()
         self.channel_combo.clear()
         for channel_index in normalized_channels:
-            self.channel_combo.addItem(_channel_label(channel_index), channel_index)
+            self.channel_combo.addItem(
+                self._display_label(channel_index, labels),
+                channel_index,
+            )
 
         if current_channel in normalized_channels:
             self.channel_combo.setCurrentIndex(
@@ -57,6 +64,17 @@ class AnalysisChannelToolbar(QWidget):
         self.channel_label.setVisible(selector_visible)
         self.channel_combo.setVisible(selector_visible)
         self.channel_combo.setEnabled(selector_visible)
+
+    @staticmethod
+    def _display_label(
+        channel_index: int,
+        labels: dict[int, str] | None,
+    ) -> str:
+        if labels:
+            label = labels.get(channel_index)
+            if isinstance(label, str) and label.strip():
+                return label.strip()
+        return _channel_label(channel_index)
 
     def set_current_channel(self, channel_index: int | None) -> None:
         blocker = QSignalBlocker(self.channel_combo)

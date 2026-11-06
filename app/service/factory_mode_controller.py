@@ -1,58 +1,105 @@
 from __future__ import annotations
 
-import uuid
-from dataclasses import replace
+import time
+from dataclasses import dataclass, replace
 
 from PyQt6.QtCore import QObject
 
-from app.service.analysis.review_payloads import build_summary_payload
 from app.service.analysis.test_session import ManualLabelUpdateResult
+from app.service.factory_selection_settings import (
+    PendingSelectionPersistenceIndeterminateError,
+    PRODUCTION_CONFIG_RESTART_REQUIRED_NOTICE,
+    PRODUCTION_SELECTION_LEASE_NOTICE,
+)
+from app.service.multi_run_coordinator_mvp.contracts import (
+    StartStatus,
+    TriggerSource,
+)
 from app.services_container import (
     FactoryControllerState,
     FactoryPlcIngressPayload,
     FactoryReviewPayload,
-    FactoryRuntimeConfigPayload,
-    FactoryRuntimeStartPayload,
-    FactoryRuntimeStoppedPayload,
     FactoryScanIngressPayload,
     FactoryStartBlockedPayload,
 )
 
-_UNSET = object()
+
+_ACCEPTED_STARTS = frozenset(
+    {
+        StartStatus.ACCEPTED_ACTIVE,
+        StartStatus.ACCEPTED_TERMINAL,
+    }
+)
+_SELECTION_PERSISTENCE_INDETERMINATE_REASON = (
+    "严重错误：配置选择持久化状态不确定，请重启软件后重新对账。"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class FactorySelectionApplyResult:
+    status: str
+    selected_config_ids: tuple[int, ...]
+    message: str = ""
 
 
 class FactoryModeController(QObject):
-    """Owns the factory-mode page state and the UI-facing review contract."""
+    """Narrow UI readiness and ingress-intent adapter.
+
+    Run admission, capacity, lifecycle, review state, and result operations
+    belong to the final Coordinator and the Dashboard-owned history store.
+    """
 
     __test__ = False
-    _BLOCKED_START_PHASES = frozenset({"running", "analyzing", "reanalyzing"})
-    _ACTIVE_RUN_PHASES = frozenset({"running", "analyzing"})
-    _BLOCKED_START_PHASE_REASONS = {
-        "running": "当前测试运行中",
-        "analyzing": "当前测试分析中",
-        "reanalyzing": "当前正在重新分析",
-    }
 
-    def __init__(self, bus, services=None):
+    def __init__(
+        self,
+        bus,
+        services=None,
+        *,
+        monotonic_ns=time.monotonic_ns,
+        prepared_selected_config_ids: tuple[int, ...] = (),
+        prepared_config_routes: tuple[
+            tuple[int, int | None], ...
+        ] = (),
+    ) -> None:
         super().__init__()
+        if not callable(monotonic_ns):
+            raise ValueError("monotonic_ns must be callable")
         self.bus = bus
         self.services = services
-        self._state = FactoryControllerState()
-        self._review_payload = FactoryReviewPayload()
-        self._stopped_review_payload: FactoryReviewPayload | None = None
-        self._pending_start: tuple[int, str] | None = None
-        self._pending_start_request_id: str | None = None
-        self._dispatching_runtime_start_accepted_payload: FactoryRuntimeStartPayload | None = None
-        self._owned_runtime_config_id: int | None = None
-        self._owned_runtime_run_id: str | None = None
-        self._owned_reanalysis_config_id: int | None = None
-        self._owned_reanalysis_run_id: str | None = None
+        self._monotonic_ns = monotonic_ns
+        prepared_selection = tuple(prepared_selected_config_ids)
+        if any(type(config_id) is not int for config_id in prepared_selection):
+            raise ValueError("prepared selected config IDs must be integers")
+        prepared_routes = self._normalize_routes(prepared_config_routes)
+        if prepared_routes:
+            if tuple(config_id for config_id, _plc_id in prepared_routes) != (
+                prepared_selection
+            ):
+                raise ValueError(
+                    "prepared config routes must match prepared selection"
+                )
+        else:
+            prepared_routes = tuple(
+                (config_id, None) for config_id in prepared_selection
+            )
+        self._prepared_config_routes = prepared_routes
+        self._state = FactoryControllerState(
+            selected_config_ids=prepared_selection,
+            run_phase="armed" if prepared_selection else "not_ready",
+            selection_ready=bool(prepared_selection),
+            start_ready=bool(prepared_selection),
+        )
+        self._selected_configs: dict[int, dict] = {
+            config_id: {"config_id": config_id}
+            for config_id in prepared_selection
+        }
+        self._restored_selection_has_missing_configs = False
+        self._selection_restart_required = False
+        self._selection_persistence_indeterminate = False
+        self._selection_initialized = False
         self._last_plc_ingress: FactoryPlcIngressPayload | None = None
         self._last_scan_ingress: FactoryScanIngressPayload | None = None
-        self._selected_configs: dict[int, dict] = {}
-        self._selection_refresh_deferred = False
-        self._invalid_selection_warning_active = False
-        self._controller_selection_notice_active = False
         self._connect_bus()
 
     @property
@@ -61,7 +108,7 @@ class FactoryModeController(QObject):
 
     @property
     def review_payload(self) -> FactoryReviewPayload:
-        return self._review_payload
+        return FactoryReviewPayload()
 
     @property
     def last_plc_ingress(self) -> FactoryPlcIngressPayload | None:
@@ -71,43 +118,308 @@ class FactoryModeController(QObject):
     def last_scan_ingress(self) -> FactoryScanIngressPayload | None:
         return self._last_scan_ingress
 
+    @property
+    def selection_restart_required(self) -> bool:
+        return self._selection_restart_required
+
+    @property
+    def selection_persistence_indeterminate(self) -> bool:
+        return self._selection_persistence_indeterminate
+
+    def confirm_selection(
+        self,
+        selected_config_ids,
+    ) -> FactorySelectionApplyResult:
+        selected = self._validate_confirmed_selection(selected_config_ids)
+        if selected is None:
+            return self._selection_result(
+                "rejected",
+                message="配置选择无效",
+            )
+        if self._selection_edit_locked():
+            return self._selection_result(
+                "rejected",
+                message=self._selection_lock_reason(),
+            )
+        if selected == tuple(self._state.selected_config_ids):
+            return self._selection_result("unchanged")
+
+        old_selected = tuple(self._state.selected_config_ids)
+        if self._requires_pending_restart(selected):
+            try:
+                error = self._save_pending_selection(selected)
+            except PendingSelectionPersistenceIndeterminateError:
+                self._block_for_indeterminate_selection_persistence()
+                return self._selection_result(
+                    "indeterminate",
+                    message=_SELECTION_PERSISTENCE_INDETERMINATE_REASON,
+                )
+            if error:
+                self.bus.factory_selection_notice.emit(error)
+                return self._selection_result("rejected", message=error)
+            self._request_added_plc_resets(old_selected, selected)
+            self._apply_pending_selection_state(selected)
+            return self._selection_result(
+                "restart_required",
+                message=PRODUCTION_CONFIG_RESTART_REQUIRED_NOTICE,
+            )
+
+        error = self._save_authoritative_selection(selected)
+        if error:
+            self.bus.factory_selection_notice.emit(error)
+            return self._selection_result("rejected", message=error)
+        self._request_added_plc_resets(old_selected, selected)
+        self.set_selection(selected)
+        self.bus.factory_selection_notice.emit("")
+        return self._selection_result("applied")
+
+    def _selection_result(
+        self,
+        status: str,
+        *,
+        message: str = "",
+    ) -> FactorySelectionApplyResult:
+        return FactorySelectionApplyResult(
+            status=status,
+            selected_config_ids=tuple(self._state.selected_config_ids),
+            message=message,
+        )
+
+    def _validate_confirmed_selection(
+        self,
+        selected_config_ids,
+    ) -> tuple[int, ...] | None:
+        try:
+            selected = tuple(selected_config_ids)
+        except TypeError:
+            return None
+        if (
+            not selected
+            or any(
+                type(config_id) is not int or config_id <= 0
+                for config_id in selected
+            )
+            or len(set(selected)) != len(selected)
+        ):
+            return None
+
+        list_configs = getattr(
+            getattr(self.services, "config_service", None),
+            "list_configs",
+            None,
+        )
+        if not callable(list_configs):
+            return None
+        try:
+            rows = tuple(list_configs())
+        except Exception:
+            return None
+        available = {
+            row.get("config_id")
+            for row in rows
+            if type(row) is dict
+            and type(row.get("config_id")) is int
+            and row.get("config_id") > 0
+        }
+        if any(config_id not in available for config_id in selected):
+            return None
+        return selected
+
+    def _selection_edit_locked(self) -> bool:
+        return self._selection_persistence_indeterminate or (
+            self._state.run_phase in {
+                "running",
+                "analyzing",
+                "reanalyzing",
+            }
+            or self._state.start_ready_reason == "启动请求处理中"
+        )
+
+    def _selection_lock_reason(self) -> str:
+        if self._selection_persistence_indeterminate:
+            return _SELECTION_PERSISTENCE_INDETERMINATE_REASON
+        if self._state.start_ready_reason == "启动请求处理中":
+            return "启动请求处理中"
+        return {
+            "running": "当前测试运行中",
+            "analyzing": "当前测试分析中",
+            "reanalyzing": "当前正在重新分析",
+        }.get(self._state.run_phase, "当前无法修改配置选择")
+
+    def _requires_pending_restart(
+        self,
+        selected: tuple[int, ...],
+    ) -> bool:
+        if not bool(
+            getattr(self.services, "production_selection_locked", False)
+        ):
+            return False
+        prepared_ids = {
+            config_id
+            for config_id, _plc_id in self._prepared_config_routes
+        }
+        return self._selection_restart_required or any(
+            config_id not in prepared_ids for config_id in selected
+        )
+
+    def _save_authoritative_selection(
+        self,
+        selected: tuple[int, ...],
+    ) -> str | None:
+        save = getattr(
+            getattr(self.services, "factory_selection_settings", None),
+            "save_selected_config_ids",
+            None,
+        )
+        if not callable(save):
+            return "配置保存失败"
+        try:
+            error = save(selected)
+        except Exception:
+            return "配置保存失败"
+        return None if not error else str(error)
+
+    def _save_pending_selection(
+        self,
+        selected: tuple[int, ...],
+    ) -> str | None:
+        settings = getattr(
+            self.services,
+            "factory_selection_settings",
+            None,
+        )
+        save = getattr(settings, "save_pending_selected_config_ids", None)
+        if not callable(save):
+            return "下次启动配置保存失败"
+        try:
+            error = save(selected)
+            if error:
+                return str(error)
+        except PendingSelectionPersistenceIndeterminateError:
+            raise
+        except Exception:
+            return "下次启动配置保存失败"
+        return None
+
+    def _request_added_plc_resets(
+        self,
+        old_selected: tuple[int, ...],
+        selected: tuple[int, ...],
+    ) -> None:
+        old_ids = set(old_selected)
+        added = tuple(
+            config_id for config_id in selected if config_id not in old_ids
+        )
+        request_resets = getattr(
+            self.services,
+            "request_plc_start_signal_resets_for_configs",
+            None,
+        )
+        if added and callable(request_resets):
+            request_resets(added)
+
+    def initialize_selection(self) -> FactoryControllerState:
+        if self._selection_initialized:
+            return self._state
+        self._selection_initialized = True
+        if bool(
+            getattr(self.services, "production_selection_locked", False)
+        ):
+            selected = tuple(self._state.selected_config_ids)
+        else:
+            selected, had_missing = self._load_reconciled_startup_selection()
+            self.restore_selection(
+                selected,
+                had_missing_configs=had_missing,
+            )
+        self._request_added_plc_resets((), selected)
+        return self._state
+
+    def _load_reconciled_startup_selection(
+        self,
+    ) -> tuple[tuple[int, ...], bool]:
+        config_service = getattr(self.services, "config_service", None)
+        list_configs = getattr(config_service, "list_configs", None)
+        settings = getattr(
+            self.services,
+            "factory_selection_settings",
+            None,
+        )
+        reconcile = getattr(settings, "reconcile_for_startup", None)
+        if not callable(list_configs) or not callable(reconcile):
+            return (), False
+        try:
+            rows = tuple(list_configs())
+        except Exception:
+            return (), False
+        existing = tuple(
+            row.get("config_id")
+            for row in rows
+            if type(row) is dict
+            and type(row.get("config_id")) is int
+            and row.get("config_id") > 0
+        )
+        existing = tuple(dict.fromkeys(existing))
+
+        load_pending = getattr(
+            settings,
+            "load_pending_selected_config_ids",
+            None,
+        )
+        load_selected = getattr(settings, "load_selected_config_ids", None)
+        candidate = ()
+        try:
+            pending = load_pending() if callable(load_pending) else None
+            if pending is not None:
+                candidate = tuple(pending)
+            elif callable(load_selected):
+                candidate = tuple(load_selected())
+            selected = tuple(reconcile(existing))
+        except Exception as exc:
+            self.bus.factory_selection_notice.emit(str(exc))
+            return (), False
+
+        existing_set = set(existing)
+        seen: set[int] = set()
+        had_missing = False
+        for config_id in candidate:
+            if (
+                type(config_id) is not int
+                or config_id <= 0
+                or config_id not in existing_set
+                or config_id in seen
+            ):
+                had_missing = True
+            if type(config_id) is int:
+                seen.add(config_id)
+        return selected, had_missing
+
     def set_selection(
         self,
         selected_config_ids: tuple[int, ...] | list[int],
     ) -> FactoryControllerState:
-        if self._state.run_phase in self._BLOCKED_START_PHASES:
-            return self._state
-
-        selected = tuple(selected_config_ids)
-        selection_changed = selected != self._state.selected_config_ids
-        has_review_context = self._has_review_context()
-        if has_review_context and not selection_changed:
-            return self._state
-
-        if selection_changed and self._pending_start is not None:
-            if not self._cancel_pending_start(emit_state=False):
-                return self._state
-
-        if selection_changed:
-            self._invalid_selection_warning_active = False
-
-        is_ready = self._reload_selected_configs(selected_config_ids=selected)
-
-        next_state = self._state_with_readiness(
-            FactoryControllerState(
-                selected_config_ids=selected,
-                active_config_id=None,
-                displayed_config_id=None,
-                run_phase="armed" if is_ready else "not_ready",
-                trigger_source=None,
+        if self._selection_persistence_indeterminate:
+            self.bus.factory_selection_notice.emit(
+                _SELECTION_PERSISTENCE_INDETERMINATE_REASON
             )
+            return self._state
+        selected = tuple(selected_config_ids)
+        if bool(
+            getattr(self.services, "production_selection_locked", False)
+        ):
+            return self._set_prepared_selection(selected)
+        self._restored_selection_has_missing_configs = False
+        self._selected_configs = self._load_selected_configs(selected)
+        ready, reason = self._selection_readiness(selected)
+        self._state = FactoryControllerState(
+            selected_config_ids=selected,
+            run_phase="armed" if ready else "not_ready",
+            selection_ready=ready,
+            selection_ready_reason=reason,
+            start_ready=ready,
+            start_ready_reason=reason,
         )
-
-        if has_review_context:
-            self._reset_review_context("selection_changed", state=next_state)
-        else:
-            self._state = next_state
-            self._emit_state()
+        self._emit_state()
         return self._state
 
     def restore_selection(
@@ -116,775 +428,560 @@ class FactoryModeController(QObject):
         *,
         had_missing_configs: bool,
     ) -> FactoryControllerState:
-        if self._state.run_phase in self._BLOCKED_START_PHASES:
-            return self._state
-
-        self._invalid_selection_warning_active = bool(had_missing_configs)
         selected = tuple(selected_config_ids)
-        is_ready = self._reload_selected_configs(selected_config_ids=selected)
-        self._state = self._state_with_readiness(
-            FactoryControllerState(
-                selected_config_ids=selected,
-                active_config_id=None,
-                displayed_config_id=None,
-                run_phase="armed" if is_ready else "not_ready",
-                trigger_source=None,
-            )
+        if bool(
+            getattr(self.services, "production_selection_locked", False)
+        ):
+            return self.set_selection(selected)
+        self._restored_selection_has_missing_configs = had_missing_configs
+        self._selected_configs = self._load_selected_configs(selected)
+        ready, reason = self._selection_readiness(selected)
+        self._state = FactoryControllerState(
+            selected_config_ids=selected,
+            run_phase="armed" if ready else "not_ready",
+            selection_ready=ready,
+            selection_ready_reason=reason,
+            start_ready=ready,
+            start_ready_reason=reason,
         )
         self._emit_state()
         return self._state
 
     def refresh_selection(self) -> FactoryControllerState:
-        selected = tuple(self._state.selected_config_ids)
-        pruned_selected, had_missing_configs = self._prune_missing_selected_config_ids(selected)
-        if had_missing_configs:
-            self._invalid_selection_warning_active = True
-            self._persist_runtime_selected_config_ids(pruned_selected)
-        return self._refresh_selection_now(
-            selected_config_ids=pruned_selected,
-        )
-
-    def _refresh_selection_now(
-        self,
-        *,
-        selected_config_ids: tuple[int, ...] | object = _UNSET,
-        emit_state: bool = True,
-    ) -> FactoryControllerState:
-        self._selection_refresh_deferred = False
-
-        selected = (
-            tuple(selected_config_ids)
-            if selected_config_ids is not _UNSET
-            else tuple(self._state.selected_config_ids)
-        )
-
-        is_ready = self._reload_selected_configs(selected_config_ids=selected)
-        preserve_current_context = (
-            self._has_review_context()
-            or self._pending_start is not None
-            or self._backend_session_running()
-        )
-        if preserve_current_context:
-            self._state = self._state_with_readiness(
-                replace(
-                    self._state,
-                    selected_config_ids=selected,
-                )
-            )
-            if emit_state:
-                self._emit_state()
+        if bool(
+            getattr(self.services, "production_selection_locked", False)
+        ):
             return self._state
-
-        self._state = self._state_with_readiness(
-            FactoryControllerState(
-                selected_config_ids=selected,
-                active_config_id=None,
-                displayed_config_id=None,
-                run_phase="armed" if is_ready else "not_ready",
-                trigger_source=None,
-            )
+        selected = tuple(self._state.selected_config_ids)
+        config_service = getattr(self.services, "config_service", None)
+        list_configs = getattr(config_service, "list_configs", None)
+        if callable(list_configs):
+            try:
+                rows = tuple(list_configs())
+            except Exception:
+                rows = None
+            if rows is not None:
+                existing = {
+                    row.get("config_id")
+                    for row in rows
+                    if type(row) is dict and type(row.get("config_id")) is int
+                }
+                pruned = tuple(
+                    config_id for config_id in selected if config_id in existing
+                )
+                if pruned != selected:
+                    selected = pruned
+                    self._restored_selection_has_missing_configs = True
+                    settings = getattr(
+                        self.services,
+                        "factory_selection_settings",
+                        None,
+                    )
+                    save = getattr(settings, "save_selected_config_ids", None)
+                    if callable(save):
+                        try:
+                            error = save(selected)
+                        except Exception as exc:
+                            error = str(exc)
+                        if error:
+                            self.bus.factory_selection_notice.emit(str(error))
+        self._selected_configs = self._load_selected_configs(selected)
+        ready, reason = self._selection_readiness(selected)
+        self._state = FactoryControllerState(
+            selected_config_ids=selected,
+            run_phase="armed" if ready else "not_ready",
+            selection_ready=ready,
+            selection_ready_reason=reason,
+            start_ready=ready,
+            start_ready_reason=reason,
         )
-        if emit_state:
-            self._emit_state()
+        self._emit_state()
         return self._state
 
-    def _apply_deferred_selection_refresh(self, *, emit_state: bool = False) -> None:
-        if not self._selection_refresh_deferred:
-            return
-        self._refresh_selection_now(emit_state=emit_state)
+    def handle_configuration_changed(self) -> FactoryControllerState:
+        if not bool(
+            getattr(self.services, "production_selection_locked", False)
+        ):
+            return self.refresh_selection()
+        settings = getattr(
+            self.services,
+            "factory_selection_settings",
+            None,
+        )
+        if not callable(
+            getattr(settings, "save_pending_selected_config_ids", None)
+        ):
+            return self._state
+
+        selected = tuple(self._state.selected_config_ids)
+        config_service = getattr(self.services, "config_service", None)
+        list_configs = getattr(config_service, "list_configs", None)
+        if callable(list_configs):
+            try:
+                rows = tuple(list_configs())
+            except Exception:
+                rows = None
+            if rows is not None:
+                available = tuple(
+                    row.get("config_id")
+                    for row in rows
+                    if type(row) is dict
+                    and type(row.get("config_id")) is int
+                    and row.get("config_id") > 0
+                )
+                available_set = set(available)
+                selected = tuple(
+                    config_id
+                    for config_id in selected
+                    if config_id in available_set
+                )
+                if not selected and available:
+                    selected = (available[0],)
+        return self._set_pending_selection(selected)
 
     def can_arm(self) -> bool:
-        previous_state = self._state
-        if self._state.run_phase not in self._BLOCKED_START_PHASES and not self._start_feedback_is_busy():
-            self._apply_deferred_selection_refresh()
-        next_state = self._state_with_readiness(self._state)
+        if self._selection_persistence_indeterminate:
+            return False
+        if bool(
+            getattr(self.services, "production_selection_locked", False)
+        ):
+            return self._state.start_ready
+        ready, reason = self._selection_readiness(
+            self._state.selected_config_ids
+        )
+        next_state = replace(
+            self._state,
+            run_phase="armed" if ready else "not_ready",
+            selection_ready=ready,
+            selection_ready_reason=reason,
+            start_ready=ready,
+            start_ready_reason=reason,
+        )
         if next_state != self._state:
             self._state = next_state
-        if self._state != previous_state:
             self._emit_state()
-        return self._state.start_ready
+        return ready
 
     def start_manual(self, workorder: dict | None = None) -> bool:
-        if self._start_feedback_is_busy():
-            return False
         if not self.can_arm():
-            return self._emit_blocked_start("manual")
-        selected = tuple(self._state.selected_config_ids)
-        if not selected:
-            return self._emit_blocked_start("manual")
-        config_id = selected[0]
-        return self._accept_start(config_id, "manual", workorder)
+            return self._emit_blocked("manual")
+        config_id = self._route_config_id(TriggerSource.MANUAL, None)
+        if config_id is None:
+            return False
+        trigger_monotonic_ns = self._sample_trigger()
+        if trigger_monotonic_ns is None:
+            return self._emit_blocked_reason(
+                "invalid captured-ingress timestamp",
+                "manual",
+            )
+        return self._submit_captured(
+            source=TriggerSource.MANUAL,
+            trigger_monotonic_ns=trigger_monotonic_ns,
+            workorder=workorder,
+            plc_id=None,
+            config_id=config_id,
+        )
+
+    def handle_plc_event(self, payload: FactoryPlcIngressPayload) -> bool:
+        self._last_plc_ingress = payload
+        if not self.can_arm():
+            return self._emit_blocked("plc")
+        config_id = self._route_config_id(TriggerSource.PLC, payload.plc_id)
+        if config_id is None:
+            return False
+        workorder = {
+            key: value
+            for key, value in {
+                "sn": payload.sn,
+                "model": payload.model,
+                "rotation_speed": payload.rotation_speed,
+            }.items()
+            if value is not None
+        }
+        return self._submit_captured(
+            source=TriggerSource.PLC,
+            trigger_monotonic_ns=payload.trigger_monotonic_ns,
+            workorder=workorder,
+            plc_id=payload.plc_id,
+            config_id=config_id,
+        )
+
+    def handle_scan_event(self, payload: FactoryScanIngressPayload) -> bool:
+        self._last_scan_ingress = payload
+        if not self.can_arm():
+            return self._emit_blocked("scanner")
+        config_id = self._route_config_id(TriggerSource.SCANNER, None)
+        if config_id is None:
+            return False
+        return self._submit_captured(
+            source=TriggerSource.SCANNER,
+            trigger_monotonic_ns=payload.trigger_monotonic_ns,
+            workorder={"sn": payload.scan_text},
+            plc_id=None,
+            config_id=config_id,
+        )
+
+    def apply_manual_judgment(self, _label: str) -> ManualLabelUpdateResult:
+        return ManualLabelUpdateResult(
+            False,
+            "Use the selected Dashboard run for manual judgment.",
+        )
+
+    def begin_reanalysis(self, _start_sec: float, _end_sec: float) -> bool:
+        return False
+
+    def stop_active_run(self) -> bool:
+        return False
 
     def clear_display_state(self, reason: str) -> None:
         self.clear_for_next_run(reason)
 
-    def apply_manual_judgment(self, label: str) -> ManualLabelUpdateResult:
-        normalized = str(label or "").strip().upper()
-        if normalized not in {"OK", "NG"}:
-            return ManualLabelUpdateResult(False, "无效判定结果")
-        if (
-            self._pending_start is not None
-            or self._state.run_phase in self._BLOCKED_START_PHASES
-        ):
-            return ManualLabelUpdateResult(False, "测试仍在进行中，无法人工判定")
-
-        config_id = self._state.displayed_config_id
-        if config_id is None:
-            return ManualLabelUpdateResult(False, "当前没有可判定的测试结果")
-
-        run_id = self._manual_judgment_run_id(config_id)
-        test_manager = getattr(self.services, "test", None)
-        apply_manual_judgment = getattr(test_manager, "apply_manual_judgment", None)
-        if not callable(apply_manual_judgment):
-            return ManualLabelUpdateResult(False, "当前测试不支持人工判定")
-
-        result = apply_manual_judgment(
-            config_id=config_id,
-            run_id=run_id,
-            label=normalized,
-        )
-        if not getattr(result, "success", False):
-            message = str(getattr(result, "message", "") or "保存人工判定失败")
-            return ManualLabelUpdateResult(
-                False,
-                message,
-                getattr(result, "audio_data_id", None),
-            )
-
-        reason = "manual_judgment_ok" if normalized == "OK" else "manual_judgment_ng"
-        self.clear_for_next_run(reason)
-        return ManualLabelUpdateResult(True, "", getattr(result, "audio_data_id", None))
-
-    def handle_plc_event(self, payload: FactoryPlcIngressPayload) -> bool:
-        self._last_plc_ingress = payload
-        if self._start_feedback_is_busy():
-            self._log_ingress_ignored(
-                event_type="PLC",
-                reason=self._busy_state_reason_label(),
-                plc_id=payload.plc_id,
-            )
-            return False
-        if not self.can_arm():
-            self._log_ingress_ignored(
-                event_type="PLC",
-                reason="not armed",
-                plc_id=payload.plc_id,
-            )
-            return self._emit_blocked_start("plc")
-        config_id = self._resolve_plc_config_id(payload.plc_id)
-        if config_id is None:
-            self._log_ingress_ignored(
-                event_type="PLC",
-                reason="no match",
-                plc_id=payload.plc_id,
-            )
-            return False
-        return self._accept_start(config_id, "plc")
-
-    def handle_scan_event(self, payload: FactoryScanIngressPayload) -> bool:
-        self._last_scan_ingress = payload
-        if self._start_feedback_is_busy():
-            self._log_ingress_ignored(
-                event_type="scan",
-                reason=self._busy_state_reason_label(),
-                scan_text=payload.scan_text,
-            )
-            return False
-        if not self.can_arm():
-            self._log_ingress_ignored(
-                event_type="scan",
-                reason="not armed",
-                scan_text=payload.scan_text,
-            )
-            return self._emit_blocked_start("scan")
-        config_id = self._resolve_scan_config_id()
-        if config_id is None:
-            self._log_ingress_ignored(
-                event_type="scan",
-                reason="no match",
-                scan_text=payload.scan_text,
-            )
-            return False
-        return self._accept_start(config_id, "scan")
-
-    def handle_runtime_started(self, payload: FactoryRuntimeStartPayload) -> None:
-        if not self._matches_pending_start(payload):
-            return
-
-        self._pending_start = None
-        self._pending_start_request_id = None
-        if self._has_review_context():
-            self._reset_review_context("next_run_accepted")
-
-        self._owned_runtime_config_id = payload.config_id
-        self._owned_runtime_run_id = payload.run_id
-        self._state = self._state_with_readiness(
-            replace(
-                self._state,
-                active_config_id=payload.config_id,
-                displayed_config_id=payload.config_id,
-                run_phase="running",
-                trigger_source=payload.trigger_source,
-            )
-        )
-        self._emit_state()
-
-    def handle_runtime_start_accepted(self, payload: FactoryRuntimeStartPayload) -> None:
-        if payload is not self._dispatching_runtime_start_accepted_payload:
-            return
-        self.handle_runtime_started(payload)
-
-    def handle_runtime_analyzing(self, payload: FactoryRuntimeConfigPayload) -> None:
-        if not self._owns_runtime_payload(
-            config_id=payload.config_id,
-            run_id=payload.run_id,
-            allowed_phases=self._ACTIVE_RUN_PHASES,
-        ):
-            return
-
-        self._state = self._state_with_readiness(
-            replace(
-                self._state,
-                active_config_id=payload.config_id,
-                displayed_config_id=payload.config_id,
-                run_phase="analyzing",
-            )
-        )
-        self._emit_state()
-
-    def handle_runtime_analyzing_entered(self, payload: FactoryRuntimeConfigPayload) -> None:
-        self.handle_runtime_analyzing(payload)
-
-    def handle_runtime_review_ready(self, payload: FactoryReviewPayload) -> None:
-        if not self._owns_active_review_payload(payload):
-            return
-
-        self._owned_runtime_config_id = None
-        self._owned_runtime_run_id = None
-        self._apply_review_payload(payload)
-
-    def handle_runtime_auto_analysis_succeeded(self, payload: FactoryReviewPayload) -> None:
-        self.handle_runtime_review_ready(payload)
-
-    def handle_runtime_no_result(self, payload: FactoryReviewPayload) -> None:
-        if not self._owns_active_review_payload(payload):
-            return
-
-        self._owned_runtime_config_id = None
-        self._owned_runtime_run_id = None
-        self._apply_review_payload(payload)
-
-    def handle_runtime_auto_analysis_no_result(self, payload: FactoryReviewPayload) -> None:
-        self.handle_runtime_no_result(payload)
-
-    def handle_runtime_auto_analysis_error(self, payload: FactoryReviewPayload) -> None:
-        self.handle_runtime_no_result(payload)
-
-    def handle_runtime_stopped(self, payload: FactoryRuntimeStoppedPayload) -> None:
-        if not self._owns_runtime_payload(
-            config_id=payload.config_id,
-            run_id=payload.run_id,
-            allowed_phases=self._ACTIVE_RUN_PHASES,
-        ):
-            return
-
-        self._owned_runtime_config_id = None
-        self._owned_runtime_run_id = None
-        self._stopped_review_payload = replace(
-            self._review_payload,
-            displayed_config_id=payload.config_id,
-            run_id=payload.run_id,
-            trigger_source=payload.trigger_source,
-        )
-        self._state = self._state_with_readiness(
-            replace(
-                self._state,
-                active_config_id=None,
-                displayed_config_id=payload.config_id,
-                run_phase="stopped",
-                trigger_source=payload.trigger_source,
-            )
-        )
-        self._emit_state()
-
-    def handle_runtime_aborted(self, payload) -> None:
-        if not self._owns_runtime_payload(
-            config_id=payload.config_id,
-            run_id=payload.run_id,
-            allowed_phases=self._ACTIVE_RUN_PHASES,
-        ):
-            return
-        self._reset_review_context("runtime_aborted")
-
-    def begin_reanalysis(self, start_sec: float, end_sec: float) -> bool:
-        if (
-            self._state.run_phase != "reviewing"
-            or self._state.displayed_config_id is None
-            or not self._review_payload.manual_reanalysis_allowed
-        ):
-            return False
-
-        config_id = self._state.displayed_config_id
-        self._owned_reanalysis_config_id = config_id
-        self._owned_reanalysis_run_id = self._review_payload.run_id
-        self._review_payload = replace(
-            self._review_payload,
-            displayed_config_id=config_id,
-            trigger_source=self._state.trigger_source,
-            no_result=False,
-            error_message=None,
-            judgment_payload=None,
-            summary_payload=None,
-            chart_payload=None,
-        )
-        self._state = self._state_with_readiness(
-            replace(
-                self._state,
-                active_config_id=None,
-                displayed_config_id=config_id,
-                run_phase="reanalyzing",
-            )
-        )
-        self.bus.factory_review_changed.emit(self._review_payload)
-        self._emit_state()
-        test_manager = getattr(self.services, "test", None)
-        if test_manager is not None:
-            try:
-                test_manager.rejudge(config_id, start_sec, end_sec)
-            except Exception as exc:
-                self.finish_reanalysis_failure(str(exc))
-                return False
-        return True
-
-    def finish_reanalysis_success(self, payload: FactoryReviewPayload) -> None:
-        self._owned_reanalysis_config_id = None
-        self._owned_reanalysis_run_id = None
-        self._apply_review_payload(payload)
-
-    def finish_reanalysis_failure(
-        self,
-        error: Exception | str,
-        *,
-        summary_payload: dict | None = None,
-    ) -> None:
-        self._owned_reanalysis_config_id = None
-        self._owned_reanalysis_run_id = None
-        error_message = str(error)
-        summary_payload = self._normalize_no_result_summary(
-            error_message=error_message,
-            summary_payload=summary_payload,
-        )
-        self._apply_review_payload(
-            replace(
-                self._review_payload,
-                displayed_config_id=(
-                    self._state.displayed_config_id or self._review_payload.displayed_config_id
-                ),
-                trigger_source=self._state.trigger_source,
-                no_result=True,
-                error_message=self._summary_error_message(
-                    error_message=error_message,
-                    summary_payload=summary_payload,
-                ),
-                judgment_payload=None,
-                summary_payload=summary_payload,
-                chart_payload=None,
-            )
-        )
-
-    def handle_runtime_reanalysis_completed(self, payload: FactoryReviewPayload) -> None:
-        if not self._owns_reanalysis_payload(payload):
-            return
-        if isinstance(payload.summary_payload, dict):
-            self.finish_reanalysis_success(self._merge_reanalysis_review_payload(payload))
-            return
-        if payload.no_result or payload.error_message:
-            self.finish_reanalysis_failure(
-                payload.error_message or "manual reanalysis failed",
-                summary_payload=payload.summary_payload,
-            )
-            return
-        self.finish_reanalysis_success(self._merge_reanalysis_review_payload(payload))
-
-    def stop_active_run(self) -> bool:
-        if self._pending_start is not None:
-            return self._cancel_pending_start()
-
-        config_id = self._state.active_config_id
-        if config_id is None or self._state.run_phase not in self._ACTIVE_RUN_PHASES:
-            return False
-
-        stopped = True
-        test_manager = getattr(self.services, "test", None)
-        stop_active_run = getattr(test_manager, "stop_active_run", None)
-        try:
-            if callable(stop_active_run):
-                stopped = bool(stop_active_run(config_id=config_id))
-            elif test_manager is not None:
-                stop = getattr(test_manager, "stop", None)
-                if callable(stop):
-                    stop(config_id=config_id)
-                else:
-                    stopped = False
-        except Exception:
-            stopped = False
-
-        return stopped
-
     def clear_for_next_run(self, reason: str = "next_run_accepted") -> None:
-        if self._pending_start is not None or self._state.run_phase in self._BLOCKED_START_PHASES:
-            return
-        self._reset_review_context(reason)
+        self.bus.factory_display_reset.emit(reason)
 
-    def _connect_bus(self) -> None:
-        if hasattr(self.bus, "config_changed"):
-            self.bus.config_changed.connect(self.refresh_selection)
-        if hasattr(self.bus, "plc_changed"):
-            self.bus.plc_changed.connect(self.refresh_selection)
-        self.bus.factory_plc_event.connect(self.handle_plc_event)
-        self.bus.factory_scan_event.connect(self.handle_scan_event)
-        self.bus.factory_runtime_start_accepted.connect(self.handle_runtime_start_accepted)
-        self.bus.factory_runtime_analyzing_entered.connect(self.handle_runtime_analyzing_entered)
-        self.bus.factory_runtime_auto_analysis_succeeded.connect(
-            self.handle_runtime_auto_analysis_succeeded
-        )
-        self.bus.factory_runtime_auto_analysis_no_result.connect(
-            self.handle_runtime_auto_analysis_no_result
-        )
-        self.bus.factory_runtime_auto_analysis_error.connect(
-            self.handle_runtime_auto_analysis_error
-        )
-        if hasattr(self.bus, "factory_runtime_auto_analysis_cleanup_settled"):
-            self.bus.factory_runtime_auto_analysis_cleanup_settled.connect(
-                self.handle_runtime_auto_analysis_cleanup_settled
+    def _sample_trigger(self) -> int | None:
+        try:
+            value = self._monotonic_ns()
+        except Exception:
+            return None
+        if type(value) is not int or value <= 0:
+            return None
+        return value
+
+    def _reject_selection_mutation(self) -> bool:
+        if self._selection_persistence_indeterminate:
+            self.bus.factory_selection_notice.emit(
+                _SELECTION_PERSISTENCE_INDETERMINATE_REASON
             )
-        self.bus.factory_runtime_stopped.connect(self.handle_runtime_stopped)
-        self.bus.factory_runtime_aborted.connect(self.handle_runtime_aborted)
-        self.bus.factory_runtime_reanalysis_completed.connect(
-            self.handle_runtime_reanalysis_completed
-        )
-
-    def _accept_start(
-        self,
-        config_id: int,
-        trigger_source: str,
-        workorder: dict | None = None,
-    ) -> bool:
-        if not self.can_arm() or self._backend_session_running():
+            return True
+        if not bool(
+            getattr(self.services, "production_selection_locked", False)
+        ):
             return False
-
-        payload = dict(workorder or {})
-        payload["config_id"] = config_id
-        payload["trigger_source"] = trigger_source
-        request_id = f"factory-start-{uuid.uuid4().hex}"
-        payload["factory_start_request_id"] = request_id
-        self._pending_start = (config_id, trigger_source)
-        self._pending_start_request_id = request_id
-        runtime_start_accepted = False
-
-        def _on_start_accepted(run_id: str) -> None:
-            nonlocal runtime_start_accepted
-            if not self._matches_pending_start_request(
-                config_id=config_id,
-                trigger_source=trigger_source,
-                request_id=request_id,
-            ):
-                return
-            accepted_payload = FactoryRuntimeStartPayload(
-                config_id=config_id,
-                run_id=run_id,
-                trigger_source=trigger_source,
-            )
-            self._dispatching_runtime_start_accepted_payload = accepted_payload
-            try:
-                self.bus.factory_runtime_start_accepted.emit(accepted_payload)
-                runtime_start_accepted = True
-            finally:
-                if self._dispatching_runtime_start_accepted_payload is accepted_payload:
-                    self._dispatching_runtime_start_accepted_payload = None
-
-        start_accepted = True
-        test_manager = getattr(self.services, "test", None)
-        if test_manager is not None:
-            start = getattr(test_manager, "start", None)
-            if callable(start):
-                try:
-                    start_accepted = bool(
-                        start(payload, on_start_accepted=_on_start_accepted)
-                    )
-                except Exception as exc:
-                    explicit_reason = self._last_backend_start_error(test_manager)
-                    self._pending_start = None
-                    self._pending_start_request_id = None
-                    if runtime_start_accepted:
-                        return False
-                    self._emit_start_blocked_reason(
-                        explicit_reason or f"启动失败：{exc}",
-                        trigger_source,
-                    )
-                    return False
-            else:
-                start_accepted = False
-        else:
-            _on_start_accepted(self._make_fallback_run_id(config_id))
-
-        if not start_accepted:
-            explicit_reason = self._last_backend_start_error(test_manager)
-            pending_matches_request = self._matches_pending_start_request(
-                config_id=config_id,
-                trigger_source=trigger_source,
-                request_id=request_id,
-            )
-            request_canceled_or_stale = not pending_matches_request and explicit_reason is None
-            self._pending_start = None
-            self._pending_start_request_id = None
-            if runtime_start_accepted:
-                return False
-            if explicit_reason is not None:
-                self._emit_start_blocked_reason(explicit_reason, trigger_source)
-                return False
-            if request_canceled_or_stale:
-                return False
-            self._emit_start_blocked_reason(
-                "启动失败，请检查硬件配置和日志。",
-                trigger_source,
-            )
-            return False
-
-        if self._pending_start is not None:
-            self._state = self._state_with_readiness(self._state)
-            self._emit_state()
+        self.bus.factory_selection_notice.emit(
+            PRODUCTION_SELECTION_LEASE_NOTICE
+        )
         return True
 
-    def _apply_review_payload(self, payload: FactoryReviewPayload) -> None:
-        self._apply_deferred_selection_refresh()
-        trigger_source = payload.trigger_source
-        if trigger_source is None:
-            trigger_source = self._state.trigger_source
+    def _set_prepared_selection(
+        self,
+        selected: tuple[int, ...],
+    ) -> FactoryControllerState:
+        prepared_ids = {
+            config_id
+            for config_id, _plc_id in self._prepared_config_routes
+        }
+        if any(type(config_id) is not int for config_id in selected) or (
+            len(set(selected)) != len(selected)
+        ):
+            self._reject_selection_mutation()
+            return self._state
+        if self._selection_restart_required or any(
+            config_id not in prepared_ids for config_id in selected
+        ):
+            return self._set_pending_selection(selected)
+        ready = bool(selected)
+        reason = None if ready else "请至少启用一个配置"
+        self._restored_selection_has_missing_configs = False
+        self._selected_configs = {
+            config_id: {"config_id": config_id}
+            for config_id in selected
+        }
+        self._state = FactoryControllerState(
+            selected_config_ids=selected,
+            run_phase="armed" if ready else "not_ready",
+            selection_ready=ready,
+            selection_ready_reason=reason,
+            start_ready=ready,
+            start_ready_reason=reason,
+        )
+        self._emit_state()
+        return self._state
 
-        self._stopped_review_payload = None
-        self._review_payload = replace(payload, trigger_source=trigger_source)
-        self._state = self._state_with_readiness(
-            replace(
-                self._state,
-                active_config_id=None,
-                displayed_config_id=self._review_payload.displayed_config_id,
-                run_phase="reviewing",
-                trigger_source=trigger_source,
+    def _set_pending_selection(
+        self,
+        selected: tuple[int, ...],
+    ) -> FactoryControllerState:
+        if self._selection_persistence_indeterminate:
+            self._reject_selection_mutation()
+            return self._state
+        if (
+            any(
+                type(config_id) is not int or config_id <= 0
+                for config_id in selected
+            )
+            or len(set(selected)) != len(selected)
+        ):
+            self._reject_selection_mutation()
+            return self._state
+
+        settings = getattr(
+            self.services,
+            "factory_selection_settings",
+            None,
+        )
+        if not callable(
+            getattr(settings, "save_pending_selected_config_ids", None)
+        ) or not callable(
+            getattr(settings, "load_pending_selected_config_ids", None)
+        ):
+            self._reject_selection_mutation()
+            return self._state
+        try:
+            error = self._save_pending_selection(selected)
+        except PendingSelectionPersistenceIndeterminateError:
+            return self._block_for_indeterminate_selection_persistence()
+        if error:
+            self.bus.factory_selection_notice.emit(error)
+            return self._state
+
+        return self._apply_pending_selection_state(selected)
+
+    def _apply_pending_selection_state(
+        self,
+        selected: tuple[int, ...],
+    ) -> FactoryControllerState:
+        self._selection_restart_required = True
+        self._restored_selection_has_missing_configs = False
+        self._selected_configs = {
+            config_id: {"config_id": config_id}
+            for config_id in selected
+        }
+        self._state = FactoryControllerState(
+            selected_config_ids=selected,
+            run_phase=(
+                self._state.run_phase
+                if self._state.run_phase
+                in {"running", "analyzing", "reanalyzing"}
+                else "not_ready"
+            ),
+            selection_ready=bool(selected),
+            selection_ready_reason=(
+                None if selected else "请至少启用一个配置"
+            ),
+            start_ready=False,
+            start_ready_reason=PRODUCTION_CONFIG_RESTART_REQUIRED_NOTICE,
+        )
+        self._emit_state()
+        self.bus.factory_selection_notice.emit(
+            PRODUCTION_CONFIG_RESTART_REQUIRED_NOTICE
+        )
+        return self._state
+
+    def _block_for_indeterminate_selection_persistence(
+        self,
+    ) -> FactoryControllerState:
+        self._selection_persistence_indeterminate = True
+        self._selection_restart_required = True
+        self._state = replace(
+            self._state,
+            run_phase=(
+                self._state.run_phase
+                if self._state.run_phase
+                in {"running", "analyzing", "reanalyzing"}
+                else "not_ready"
+            ),
+            selection_ready=False,
+            selection_ready_reason=(
+                _SELECTION_PERSISTENCE_INDETERMINATE_REASON
+            ),
+            start_ready=False,
+            start_ready_reason=(
+                _SELECTION_PERSISTENCE_INDETERMINATE_REASON
             ),
         )
-        self.bus.factory_review_changed.emit(self._review_payload)
         self._emit_state()
-
-    def _manual_judgment_run_id(self, config_id: int) -> str | None:
-        if (
-            self._state.run_phase == "stopped"
-            and self._stopped_review_payload is not None
-            and self._stopped_review_payload.displayed_config_id == config_id
-        ):
-            return self._stopped_review_payload.run_id
-        return self._review_payload.run_id
-
-    def _load_selected_configs(self, selected_config_ids: tuple[int, ...]) -> dict[int, dict]:
-        config_service = getattr(self.services, "config_service", None)
-        if config_service is None:
-            return {
-                config_id: {"config_id": config_id}
-                for config_id in selected_config_ids
-            }
-
-        configs: dict[int, dict] = {}
-        for config_id in selected_config_ids:
-            try:
-                configs[config_id] = config_service.load_config(config_id)
-            except Exception:
-                return {}
-        return configs
-
-    def _reload_selected_configs(
-        self,
-        *,
-        selected_config_ids: tuple[int, ...],
-    ) -> bool:
-        self._selected_configs = {}
-        if selected_config_ids:
-            self._selected_configs = self._load_selected_configs(selected_config_ids)
-        return self._selection_is_start_ready(selected_config_ids=selected_config_ids)
-
-    def _runtime_errors_for(self, config_id: int) -> list[str]:
-        config_service = getattr(self.services, "config_service", None)
-        validate = getattr(config_service, "validate_factory_runtime", None)
-        config = self._selected_configs.get(config_id)
-        if config is None or not callable(validate):
-            return []
-        return list(validate(config))
-
-    def _first_selected_config_runtime_error(
-        self,
-        *,
-        selected_config_ids: tuple[int, ...] | object = _UNSET,
-    ) -> str | None:
-        selected = (
-            tuple(selected_config_ids)
-            if selected_config_ids is not _UNSET
-            else tuple(self._state.selected_config_ids)
+        self.bus.factory_selection_notice.emit(
+            _SELECTION_PERSISTENCE_INDETERMINATE_REASON
         )
-        for config_id in selected:
-            errors = self._runtime_errors_for(config_id)
-            if errors:
-                return errors[0]
+        return self._state
+
+    def _submit_captured(
+        self,
+        *,
+        source: TriggerSource,
+        trigger_monotonic_ns: int,
+        workorder: dict | None,
+        plc_id: int | None,
+        config_id: int,
+    ) -> bool:
+        submit = getattr(self.services, "submit_captured_start", None)
+        if callable(submit):
+            try:
+                return bool(
+                    submit(
+                        source=source,
+                        trigger_monotonic_ns=trigger_monotonic_ns,
+                        workorder=workorder,
+                        plc_id=plc_id,
+                        config_id=config_id,
+                    )
+                )
+            except Exception:
+                return False
+        build = getattr(self.services, "build_captured_start_request", None)
+        coordinator = getattr(self.services, "multi_run_coordinator", None)
+        start = getattr(coordinator, "start_captured", None)
+        if not callable(build) or not callable(start):
+            return False
+        try:
+            request = build(
+                source=source,
+                trigger_monotonic_ns=trigger_monotonic_ns,
+                workorder=workorder,
+                plc_id=plc_id,
+                config_id=config_id,
+            )
+            result = start(request)
+        except Exception:
+            return False
+        return getattr(result, "status", None) in _ACCEPTED_STARTS
+
+    @staticmethod
+    def _normalize_routes(
+        routes: tuple[tuple[int, int | None], ...],
+    ) -> tuple[tuple[int, int | None], ...]:
+        if type(routes) is not tuple:
+            raise ValueError("prepared config routes must be an exact tuple")
+        normalized = []
+        for route in routes:
+            if type(route) is not tuple or len(route) != 2:
+                raise ValueError("prepared config route is malformed")
+            config_id, plc_id = route
+            if type(config_id) is not int or config_id <= 0:
+                raise ValueError("prepared config route ID is invalid")
+            if plc_id is not None and (
+                type(plc_id) is not int or plc_id <= 0
+            ):
+                raise ValueError("prepared PLC route ID is invalid")
+            normalized.append((config_id, plc_id))
+        if len({config_id for config_id, _plc_id in normalized}) != len(
+            normalized
+        ):
+            raise ValueError("prepared config routes contain duplicate IDs")
+        return tuple(normalized)
+
+    def _routes(self) -> tuple[tuple[int, int | None], ...]:
+        if bool(
+            getattr(self.services, "production_selection_locked", False)
+        ):
+            selected = self._state.selected_config_ids
+            route_by_config_id = {
+                config_id: (config_id, plc_id)
+                for config_id, plc_id in self._prepared_config_routes
+            }
+            if selected and selected[0] not in route_by_config_id:
+                return ()
+            return tuple(
+                route_by_config_id[config_id]
+                for config_id in selected
+                if config_id in route_by_config_id
+            )
+        routes = []
+        for config_id in self._state.selected_config_ids:
+            config = self._selected_configs.get(config_id, {})
+            raw_plc_id = config.get("plc_id")
+            plc_id = (
+                raw_plc_id
+                if type(raw_plc_id) is int and raw_plc_id > 0
+                else None
+            )
+            routes.append((config_id, plc_id))
+        return tuple(routes)
+
+    def _route_config_id(
+        self,
+        source: TriggerSource,
+        plc_id: int | None,
+    ) -> int | None:
+        routes = self._routes()
+        if source is TriggerSource.PLC:
+            if type(plc_id) is not int or plc_id <= 0:
+                return self._reject_route(
+                    "PLC ingress requires a positive integer PLC ID."
+                )
+            matches = tuple(
+                config_id
+                for config_id, route_plc_id in routes
+                if route_plc_id == plc_id
+            )
+            if matches:
+                return matches[0]
+            # A registered PLC does not have to participate in production.
+            # Its ingress adapter still resets the start signal; there is
+            # simply no run to create when no selected config uses this PLC.
+            return None
+        if source is TriggerSource.MANUAL:
+            if routes:
+                return routes[0][0]
+            return self._reject_route(
+                "manual ingress requires at least one prepared config."
+            )
+        if len(routes) == 1:
+            return routes[0][0]
+        return self._reject_route(
+            f"{source.name.lower()} ingress requires exactly one "
+            "prepared config."
+        )
+
+    def _reject_route(self, reason: str) -> None:
+        self.bus.factory_selection_notice.emit(reason)
+        log = getattr(self.bus, "log", None)
+        if log is not None:
+            log.emit(reason)
         return None
 
-    def _selection_is_start_ready(
+    def _load_selected_configs(
         self,
-        *,
-        selected_config_ids: tuple[int, ...] | object = _UNSET,
-    ) -> bool:
-        selected = (
-            tuple(selected_config_ids)
-            if selected_config_ids is not _UNSET
-            else tuple(self._state.selected_config_ids)
-        )
-        ready, _ = self._selection_readiness(selected_config_ids=selected)
-        return ready
+        selected: tuple[int, ...],
+    ) -> dict[int, dict]:
+        config_service = getattr(self.services, "config_service", None)
+        load = getattr(config_service, "load_config", None)
+        if not callable(load):
+            return {config_id: {"config_id": config_id} for config_id in selected}
+        configs = {}
+        for config_id in selected:
+            try:
+                config = load(config_id)
+            except Exception:
+                return {}
+            if type(config) is not dict:
+                return {}
+            configs[config_id] = config
+        return configs
 
     def _selection_readiness(
         self,
-        *,
-        selected_config_ids: tuple[int, ...] | object = _UNSET,
+        selected: tuple[int, ...],
     ) -> tuple[bool, str | None]:
-        selected = (
-            tuple(selected_config_ids)
-            if selected_config_ids is not _UNSET
-            else tuple(self._state.selected_config_ids)
-        )
-        if self._invalid_selection_warning_active:
-            return False, "配置已失效"
         if not selected:
             return False, "请至少启用一个配置"
+        if self._restored_selection_has_missing_configs:
+            return False, "配置已失效"
         if len(self._selected_configs) != len(selected):
             return False, "配置加载失败"
-        runtime_error = self._first_selected_config_runtime_error(selected_config_ids=selected)
-        if runtime_error is not None:
-            return False, runtime_error
+        validate = getattr(
+            getattr(self.services, "config_service", None),
+            "validate_factory_runtime",
+            None,
+        )
+        if callable(validate):
+            for config in self._selected_configs.values():
+                try:
+                    errors = tuple(validate(config))
+                except Exception:
+                    return False, "配置校验失败"
+                if errors:
+                    return False, str(errors[0])
         return True, None
 
-    def _start_readiness(
-        self,
-        *,
-        state: FactoryControllerState,
-        selection_ready: bool,
-        selection_ready_reason: str | None,
-        ignore_backend_session_running: bool = False,
-    ) -> tuple[bool, str | None]:
-        blocked_phase_reason = self._BLOCKED_START_PHASE_REASONS.get(state.run_phase)
-        if blocked_phase_reason is not None:
-            return False, blocked_phase_reason
-        if self._pending_start is not None:
-            return False, "启动请求处理中"
-        if not ignore_backend_session_running and self._backend_session_running():
-            return False, "当前测试运行中"
-        if not selection_ready:
-            return False, selection_ready_reason
-        if state.run_phase not in {"armed", "reviewing", "stopped"}:
-            return False, "工厂模式未就绪"
-        return True, None
-
-    def _state_with_readiness(
-        self,
-        state: FactoryControllerState,
-        *,
-        ignore_backend_session_running: bool = False,
-    ) -> FactoryControllerState:
-        selection_ready, selection_ready_reason = self._selection_readiness(
-            selected_config_ids=state.selected_config_ids,
-        )
-        start_ready, start_ready_reason = self._start_readiness(
-            state=state,
-            selection_ready=selection_ready,
-            selection_ready_reason=selection_ready_reason,
-            ignore_backend_session_running=ignore_backend_session_running,
-        )
-        return replace(
-            state,
-            selection_ready=selection_ready,
-            selection_ready_reason=selection_ready_reason,
-            start_ready=start_ready,
-            start_ready_reason=start_ready_reason,
+    def _emit_blocked(self, trigger_source: str) -> bool:
+        return self._emit_blocked_reason(
+            self._state.start_ready_reason or "factory ingress is not ready",
+            trigger_source,
         )
 
-    def _resolve_plc_config_id(self, plc_id: int) -> int | None:
-        if not isinstance(plc_id, int) or isinstance(plc_id, bool):
-            return None
-        matches = [
-            config_id
-            for config_id, config in self._selected_configs.items()
-            if config.get("plc_id") == plc_id
-        ]
-        if matches:
-            return matches[0]
-        return None
-
-    def _resolve_scan_config_id(self) -> int | None:
-        matches = [
-            config_id
-            for config_id, config in self._selected_configs.items()
-            if bool(config.get("scan_triggers_test"))
-        ]
-        if matches:
-            return matches[0]
-        return None
-
-    def _has_review_context(self) -> bool:
-        return (
-            self._review_payload != FactoryReviewPayload()
-            or self._state.displayed_config_id is not None
-            or self._state.run_phase in {"reviewing", "reanalyzing", "stopped"}
-        )
-
-    @staticmethod
-    def _normalize_optional_text(value: object) -> str | None:
-        if not isinstance(value, str):
-            return None
-        text = value.strip()
-        return text or None
-
-    def _reset_review_context(
-        self,
-        reason: str,
-        *,
-        state: FactoryControllerState | None = None,
-    ) -> None:
-        self._pending_start = None
-        self._pending_start_request_id = None
-        self._owned_runtime_config_id = None
-        self._owned_runtime_run_id = None
-        self._owned_reanalysis_config_id = None
-        self._owned_reanalysis_run_id = None
-        self._stopped_review_payload = None
-        self._apply_deferred_selection_refresh()
-        self._review_payload = FactoryReviewPayload()
-        self._state = self._state_with_readiness(
-            state
-            or replace(
-                self._state,
-                active_config_id=None,
-                displayed_config_id=None,
-                run_phase="armed" if self._selection_is_start_ready() else "not_ready",
-                trigger_source=None,
-            )
-        )
-        self.bus.factory_display_reset.emit(reason)
-        self.bus.factory_review_changed.emit(self._review_payload)
-        self._emit_state()
-
-    def _emit_blocked_start(self, trigger_source: str) -> bool:
-        reason = self._state.start_ready_reason
-        if reason is None:
-            return False
-        return self._emit_start_blocked_reason(reason, trigger_source)
-
-    def _emit_start_blocked_reason(self, reason: str, trigger_source: str) -> bool:
+    def _emit_blocked_reason(self, reason: str, trigger_source: str) -> bool:
         self.bus.factory_start_blocked.emit(
             FactoryStartBlockedPayload(
                 reason=reason,
@@ -893,311 +990,15 @@ class FactoryModeController(QObject):
         )
         return False
 
-    @staticmethod
-    def _last_backend_start_error(test_manager) -> str | None:
-        last_start_error = getattr(test_manager, "last_start_error", None)
-        if not callable(last_start_error):
-            return None
-        try:
-            reason = last_start_error()
-        except Exception:
-            return None
-        if not isinstance(reason, str):
-            return None
-        reason = reason.strip()
-        return reason or None
+    def _connect_bus(self) -> None:
+        if hasattr(self.bus, "config_changed"):
+            self.bus.config_changed.connect(
+                self.handle_configuration_changed
+            )
+        if hasattr(self.bus, "plc_changed"):
+            self.bus.plc_changed.connect(self.refresh_selection)
+        self.bus.factory_plc_event.connect(self.handle_plc_event)
+        self.bus.factory_scan_event.connect(self.handle_scan_event)
 
     def _emit_state(self) -> None:
         self.bus.factory_state_changed.emit(self._state)
-
-    def _start_feedback_is_busy(self) -> bool:
-        return (
-            self._state.run_phase in self._BLOCKED_START_PHASES
-            or self._pending_start is not None
-            or self._backend_session_running()
-        )
-
-    def _busy_state_reason_label(self) -> str:
-        if self._pending_start is not None:
-            return "pending start"
-        if self._state.run_phase in self._BLOCKED_START_PHASES:
-            return self._state.run_phase
-        if self._backend_session_running():
-            return "backend running"
-        return self._state.run_phase
-
-    def _prune_missing_selected_config_ids(
-        self,
-        selected_config_ids: tuple[int, ...],
-    ) -> tuple[tuple[int, ...], bool]:
-        config_service = getattr(self.services, "config_service", None)
-        list_configs = getattr(config_service, "list_configs", None)
-        if not callable(list_configs):
-            return selected_config_ids, False
-
-        try:
-            config_rows = list_configs()
-        except Exception:
-            return selected_config_ids, False
-
-        existing_config_ids = {
-            row.get("config_id")
-            for row in config_rows
-            if isinstance(row, dict) and isinstance(row.get("config_id"), int)
-        }
-        pruned_selected_config_ids = tuple(
-            config_id for config_id in selected_config_ids if config_id in existing_config_ids
-        )
-        return pruned_selected_config_ids, pruned_selected_config_ids != selected_config_ids
-
-    def _persist_runtime_selected_config_ids(
-        self,
-        selected_config_ids: tuple[int, ...],
-    ) -> None:
-        selection_settings = getattr(self.services, "factory_selection_settings", None)
-        save_selected_config_ids = getattr(selection_settings, "save_selected_config_ids", None)
-        if not callable(save_selected_config_ids):
-            return
-
-        error_message = save_selected_config_ids(selected_config_ids)
-        if error_message:
-            self._controller_selection_notice_active = True
-            self.bus.factory_selection_notice.emit(error_message)
-            return
-        if self._controller_selection_notice_active:
-            self._controller_selection_notice_active = False
-            self.bus.factory_selection_notice.emit("")
-
-    def handle_runtime_auto_analysis_cleanup_settled(
-        self,
-        payload: FactoryRuntimeConfigPayload,
-    ) -> None:
-        if self._state.run_phase != "reviewing":
-            return
-        if self._state.displayed_config_id != payload.config_id:
-            return
-        if self._review_payload.run_id != payload.run_id:
-            return
-
-        next_state = self._state_with_readiness(self._state)
-        if next_state == self._state:
-            return
-        self._state = next_state
-        self._emit_state()
-
-    def _matches_pending_start(self, payload: FactoryRuntimeStartPayload) -> bool:
-        return (
-            self._pending_start is not None
-            and self._pending_start_request_id is not None
-            and payload.config_id == self._pending_start[0]
-            and payload.trigger_source == self._pending_start[1]
-        )
-
-    def _matches_pending_start_request(
-        self,
-        *,
-        config_id: int,
-        trigger_source: str,
-        request_id: str,
-    ) -> bool:
-        return (
-            self._pending_start is not None
-            and self._pending_start_request_id is not None
-            and config_id == self._pending_start[0]
-            and trigger_source == self._pending_start[1]
-            and self._pending_start_request_id == request_id
-        )
-
-    def _cancel_pending_start(self, *, emit_state: bool = True) -> bool:
-        request_id = self._pending_start_request_id
-        if self._pending_start is None:
-            self._pending_start_request_id = None
-            return True
-        if not request_id:
-            return False
-
-        test_manager = getattr(self.services, "test", None)
-        cancel_pending_start = getattr(test_manager, "cancel_pending_start", None)
-        if not callable(cancel_pending_start):
-            return False
-
-        try:
-            canceled = bool(
-                cancel_pending_start(
-                    request_id=request_id,
-                    config_id=self._pending_start[0],
-                )
-            )
-        except Exception:
-            return False
-
-        if not canceled:
-            return False
-
-        self._pending_start = None
-        self._pending_start_request_id = None
-        if emit_state:
-            self._apply_deferred_selection_refresh()
-            self._state = self._state_with_readiness(self._state)
-            self._emit_state()
-        return True
-
-    def _stale_pending_start(self) -> None:
-        if self._pending_start is None:
-            self._pending_start_request_id = None
-            return
-        if self._cancel_pending_start(emit_state=False):
-            return
-        self._pending_start = None
-        self._pending_start_request_id = None
-
-    def _backend_session_running(self) -> bool:
-        test_manager = getattr(self.services, "test", None)
-        is_running = getattr(test_manager, "is_running", None)
-        if not callable(is_running):
-            return False
-
-        try:
-            return bool(is_running())
-        except Exception:
-            return False
-
-    def _log_ingress_ignored(self, *, event_type: str, reason: str, **details) -> None:
-        log_signal = getattr(self.bus, "log", None)
-        emit = getattr(log_signal, "emit", None)
-        if not callable(emit):
-            return
-
-        detail_parts = [
-            f"{key}={value}"
-            for key, value in details.items()
-            if value is not None and value != ""
-        ]
-        detail_suffix = ""
-        if detail_parts:
-            detail_suffix = f" ({', '.join(detail_parts)})"
-        emit(f"[FactoryModeController] {event_type} event ignored: {reason}{detail_suffix}")
-
-    def _owns_runtime_payload(
-        self,
-        *,
-        config_id: int,
-        run_id: str | None,
-        allowed_phases: frozenset[str],
-    ) -> bool:
-        return (
-            run_id is not None
-            and
-            self._owned_runtime_config_id == config_id
-            and self._owned_runtime_run_id == run_id
-            and self._state.active_config_id == config_id
-            and self._state.run_phase in allowed_phases
-        )
-
-    def _owns_active_review_payload(self, payload: FactoryReviewPayload) -> bool:
-        config_id = payload.displayed_config_id
-        return (
-            config_id is not None
-            and self._owns_runtime_payload(
-                config_id=config_id,
-                run_id=payload.run_id,
-                allowed_phases=frozenset({"analyzing"}),
-            )
-        )
-
-    def _owns_reanalysis_payload(self, payload: FactoryReviewPayload) -> bool:
-        if self._state.run_phase != "reanalyzing":
-            return False
-
-        if payload.displayed_config_id is None and payload.run_id is None:
-            return False
-
-        config_id = (
-            payload.displayed_config_id
-            if payload.displayed_config_id is not None
-            else self._owned_reanalysis_config_id
-        )
-        if (
-            config_id is None
-            or config_id != self._owned_reanalysis_config_id
-            or self._state.displayed_config_id != config_id
-        ):
-            return False
-
-        run_id = payload.run_id if payload.run_id is not None else self._owned_reanalysis_run_id
-        if run_id is None:
-            return self._review_payload.run_id is None
-
-        return (
-            run_id == self._owned_reanalysis_run_id
-            and self._review_payload.run_id == run_id
-        )
-
-    @staticmethod
-    def _make_fallback_run_id(config_id: int) -> str:
-        return f"factory-run-{config_id}-{uuid.uuid4().hex}"
-
-    @staticmethod
-    def _normalize_no_result_summary(
-        *,
-        error_message: str | None,
-        summary_payload: dict | None,
-    ) -> dict:
-        if isinstance(summary_payload, dict):
-            return summary_payload
-        return build_summary_payload(
-            config={},
-            judgment_payload=None,
-            error_message=error_message,
-        )
-
-    @classmethod
-    def _summary_error_message(
-        cls,
-        *,
-        error_message: str | None,
-        summary_payload: dict | None,
-    ) -> str | None:
-        if isinstance(summary_payload, dict):
-            summary_error_message = cls._normalize_optional_text(
-                summary_payload.get("error_message")
-            )
-            if summary_error_message is not None:
-                return summary_error_message
-        normalized_error_message = cls._normalize_optional_text(error_message)
-        if normalized_error_message is not None:
-            return normalized_error_message
-        return normalized_error_message
-
-    def _merge_reanalysis_review_payload(
-        self,
-        payload: FactoryReviewPayload,
-    ) -> FactoryReviewPayload:
-        return replace(
-            payload,
-            displayed_config_id=(
-                payload.displayed_config_id
-                or self._state.displayed_config_id
-                or self._review_payload.displayed_config_id
-            ),
-            run_id=payload.run_id or self._review_payload.run_id,
-            trigger_source=(
-                payload.trigger_source
-                or self._state.trigger_source
-                or self._review_payload.trigger_source
-            ),
-            captured_duration_sec=(
-                payload.captured_duration_sec
-                if payload.captured_duration_sec is not None
-                else self._review_payload.captured_duration_sec
-            ),
-            default_window=payload.default_window or self._review_payload.default_window,
-            fallback_window=payload.fallback_window or self._review_payload.fallback_window,
-            manual_reanalysis_allowed=(
-                payload.manual_reanalysis_allowed or self._review_payload.manual_reanalysis_allowed
-            ),
-            error_message=self._summary_error_message(
-                error_message=payload.error_message,
-                summary_payload=payload.summary_payload,
-            ),
-        )
