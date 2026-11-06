@@ -12,70 +12,11 @@ from numbers import Integral
 import numpy as np
 from scipy import signal as scipy_signal
 
-
-# ---------------------------------------------------------------------------
-# Frequency weighting (IEC 61672-1)
-# ---------------------------------------------------------------------------
-
-
-def a_weighting(frequencies: np.ndarray) -> np.ndarray:
-    """Return A-weighting gains (dB) for the given frequencies.
-
-    Uses the IEC 61672-1 formula. DC (0 Hz) returns a large negative value.
-    """
-    f = np.asarray(frequencies, dtype=np.float64)
-    f2 = f ** 2
-    with np.errstate(divide="ignore", invalid="ignore"):
-        num = 12194.0 ** 2 * f2 ** 2
-        den = (
-            (f2 + 20.6 ** 2)
-            * np.sqrt((f2 + 107.7 ** 2) * (f2 + 737.9 ** 2))
-            * (f2 + 12194.0 ** 2)
-        )
-        ra = num / den
-    ra_1k = _a_weight_linear(1000.0)
-    with np.errstate(divide="ignore"):
-        db = 20.0 * np.log10(np.maximum(ra, 1e-30)) - 20.0 * np.log10(ra_1k)
-    return np.where(np.isfinite(db), db, -np.inf)
-
-
-
-def _a_weight_linear(f: float) -> float:
-    f2 = f ** 2
-    num = 12194.0 ** 2 * f2 ** 2
-    den = (
-        (f2 + 20.6 ** 2)
-        * np.sqrt((f2 + 107.7 ** 2) * (f2 + 737.9 ** 2))
-        * (f2 + 12194.0 ** 2)
-    )
-    return num / den
-
-
-
-def c_weighting(frequencies: np.ndarray) -> np.ndarray:
-    """Return C-weighting gains (dB) for the given frequencies.
-
-    Uses the IEC 61672-1 formula.
-    """
-    f = np.asarray(frequencies, dtype=np.float64)
-    f2 = f ** 2
-    with np.errstate(divide="ignore", invalid="ignore"):
-        num = 12194.0 ** 2 * f2
-        den = (f2 + 20.6 ** 2) * (f2 + 12194.0 ** 2)
-        rc = num / den
-    rc_1k = _c_weight_linear(1000.0)
-    with np.errstate(divide="ignore"):
-        db = 20.0 * np.log10(np.maximum(rc, 1e-30)) - 20.0 * np.log10(rc_1k)
-    return np.where(np.isfinite(db), db, -np.inf)
-
-
-
-def _c_weight_linear(f: float) -> float:
-    f2 = f ** 2
-    num = 12194.0 ** 2 * f2
-    den = (f2 + 20.6 ** 2) * (f2 + 12194.0 ** 2)
-    return num / den
-
+from app.service.analysis.spl_weighting import (
+    SplFrequencyWeightingFilter,
+    a_weighting,
+    c_weighting,
+)
 
 # ---------------------------------------------------------------------------
 # SPL computation
@@ -85,7 +26,7 @@ def _c_weight_linear(f: float) -> float:
 _REF_PRESSURE = 20e-6
 LOUDNESS_BACKEND_SAMPLE_RATE = 48000.0
 LOUDNESS_TRACE_ALGORITHM = "reduced_zwtv"
-LOUDNESS_TRACE_INTERNAL_RATE_HZ = 150.0
+LOUDNESS_TRACE_INTERNAL_RATE_HZ = 75.0
 LOUDNESS_TRACE_DISPLAY_RATE_HZ = 25.0
 _LOUDNESS_REDUCED_ZWTV_NL_ITER = 12
 _LOUDNESS_REDUCED_ZWTV_LP_ITER = 12
@@ -111,6 +52,10 @@ class SplDetector:
         if self.time_constant <= 0.0:
             raise ValueError("time_constant must be positive")
         self._alpha = 1.0 - np.exp(-1.0 / (self.sample_rate * self.time_constant))
+        self._frequency_weighting = SplFrequencyWeightingFilter(
+            self.sample_rate,
+            self.weighting,
+        )
         self._mean_square_state: float | None = None
 
     def process(self, signal: np.ndarray) -> float:
@@ -118,11 +63,7 @@ class SplDetector:
         if sig.size == 0:
             return -np.inf
 
-        weighted = _apply_spl_frequency_weighting(
-            sig,
-            self.sample_rate,
-            self.weighting,
-        ).reshape(-1)
+        weighted = self._frequency_weighting.process(sig)
         squared = weighted ** 2
         if self._mean_square_state is None:
             self._mean_square_state = float(np.mean(squared))
@@ -138,6 +79,7 @@ class SplDetector:
         return float(10.0 * np.log10(state / (_REF_PRESSURE ** 2)))
 
     def reset(self) -> None:
+        self._frequency_weighting.reset()
         self._mean_square_state = None
 
 
@@ -161,16 +103,34 @@ def compute_spl(signal: np.ndarray, sample_rate: float,
     return detector.process(signal)
 
 
-def compute_spl_leq(signal: np.ndarray, sample_rate: float, weighting: str) -> float:
-    """Compute equivalent continuous SPL (Leq) over a full signal."""
+def compute_spl_leq(
+    signal: np.ndarray,
+    sample_rate: float,
+    weighting: str,
+    *,
+    start_sample: int | None = None,
+    end_sample: int | None = None,
+) -> float:
+    """Compute Leq over a bounded window after continuous frequency weighting."""
     sig = np.asarray(signal, dtype=np.float64).reshape(-1)
     if sig.size == 0:
         return -np.inf
     sample_rate = float(sample_rate)
     if sample_rate <= 0.0:
         raise ValueError("sample_rate must be positive")
-    sig = _apply_spl_frequency_weighting(sig, sample_rate, weighting)
-    mean_square = float(np.mean(sig ** 2))
+    normalized_start, normalized_end = _normalize_sample_bounds(
+        sig.size,
+        start_sample,
+        end_sample,
+    )
+    if normalized_end <= normalized_start:
+        return -np.inf
+
+    weighted = SplFrequencyWeightingFilter(sample_rate, weighting).process(
+        sig[:normalized_end]
+    )
+    window = weighted[normalized_start:normalized_end]
+    mean_square = float(np.mean(window ** 2))
     if mean_square <= 0.0:
         return -np.inf
     return float(10.0 * np.log10(mean_square / (_REF_PRESSURE ** 2)))
@@ -183,8 +143,10 @@ def compute_spl_trace(
     time_constant: float,
     *,
     chunk_duration: float = 0.05,
+    output_start_sample: int | None = None,
+    output_end_sample: int | None = None,
 ) -> tuple[list[float], list[float]]:
-    """Compute chunked weighted SPL values across a signal."""
+    """Compute a bounded trace using detector state warmed from sample zero."""
     sig = np.asarray(signal, dtype=np.float64).reshape(-1)
     if sig.size == 0:
         return [], []
@@ -195,22 +157,40 @@ def compute_spl_trace(
     if chunk_duration <= 0.0:
         raise ValueError("chunk_duration must be positive")
 
+    normalized_start, normalized_end = _normalize_sample_bounds(
+        sig.size,
+        output_start_sample,
+        output_end_sample,
+    )
+    if normalized_end <= normalized_start:
+        return [], []
+
     chunk_samples = max(1, int(round(sample_rate * chunk_duration)))
     detector = SplDetector(sample_rate, weighting, time_constant)
     times_sec: list[float] = []
     values_db: list[float] = []
 
-    if sig.size < chunk_samples:
-        times_sec.append(float(sig.size / sample_rate))
-        values_db.append(float(detector.process(sig)))
-        return times_sec, values_db
-
-    for start in range(0, int(sig.size) - chunk_samples + 1, chunk_samples):
-        chunk = sig[start : start + chunk_samples]
-        times_sec.append(float((start + chunk.size) / sample_rate))
-        values_db.append(float(detector.process(chunk)))
+    for chunk_start in range(0, normalized_end, chunk_samples):
+        chunk_end = min(chunk_start + chunk_samples, normalized_end)
+        value_db = detector.process(sig[chunk_start:chunk_end])
+        if chunk_end > normalized_start:
+            times_sec.append(float(chunk_end / sample_rate))
+            values_db.append(float(value_db))
 
     return times_sec, values_db
+
+
+def _normalize_sample_bounds(
+    signal_size: int,
+    start_sample: int | None,
+    end_sample: int | None,
+) -> tuple[int, int]:
+    start = 0 if start_sample is None else int(start_sample)
+    end = int(signal_size) if end_sample is None else int(end_sample)
+    return (
+        min(max(start, 0), int(signal_size)),
+        min(max(end, 0), int(signal_size)),
+    )
 
 
 def _apply_spl_frequency_weighting(
@@ -219,19 +199,10 @@ def _apply_spl_frequency_weighting(
     weighting: str,
 ) -> np.ndarray:
     sig = np.asarray(signal, dtype=np.float64)
-    if sig.size == 0 or weighting not in ("A", "C"):
+    if sig.size == 0:
         return sig
-
-    n = sig.size
-    freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
-    spectrum = np.fft.rfft(sig)
-    if weighting == "A":
-        gains_db = a_weighting(freqs)
-    else:
-        gains_db = c_weighting(freqs)
-    gains_linear = 10.0 ** (gains_db / 20.0)
-    spectrum *= gains_linear
-    return np.fft.irfft(spectrum, n=n)
+    filtered = SplFrequencyWeightingFilter(sample_rate, weighting).process(sig)
+    return filtered.reshape(sig.shape)
 
 
 @lru_cache(maxsize=1)
@@ -257,6 +228,12 @@ def _load_reduced_zwtv_components():
     except ImportError as exc:
         raise RuntimeError("MoSQITo loudness backend is unavailable") from exc
     return _third_octave_levels, _main_loudness, _calc_slopes
+
+
+def preload_loudness_backend() -> None:
+    """Pay the MoSQITo import cost before the first completed recording."""
+
+    _load_reduced_zwtv_components()
 
 
 def _loudness_trace_internal_times(signal_size: int) -> np.ndarray:
@@ -803,7 +780,11 @@ def downsample_loudness_trace_for_display(
 
     internal_period = 1.0 / LOUDNESS_TRACE_INTERNAL_RATE_HZ
     if np.allclose(np.diff(times), internal_period, rtol=0.0, atol=1e-9):
-        return times[::6].tolist(), values[::6].tolist()
+        display_step = max(
+            1,
+            int(round(LOUDNESS_TRACE_INTERNAL_RATE_HZ / LOUDNESS_TRACE_DISPLAY_RATE_HZ)),
+        )
+        return times[::display_step].tolist(), values[::display_step].tolist()
 
     display_period = 1.0 / LOUDNESS_TRACE_DISPLAY_RATE_HZ
     display_count = max(1, int(np.floor((times[-1] - times[0]) / display_period + 1e-12)) + 1)
@@ -1047,6 +1028,56 @@ def compute_octave_bands(signal: np.ndarray, sample_rate: float,
 # ---------------------------------------------------------------------------
 # Mic calibration
 # ---------------------------------------------------------------------------
+
+
+def mic_sensitivity_from_calibration(
+    calibration: object,
+    channel_index: int,
+) -> float:
+    """Read one channel's calibration value from legacy or frozen payloads."""
+
+    if not isinstance(calibration, dict):
+        return 0.0
+
+    legacy = calibration.get(f"In{channel_index + 1}")
+    if isinstance(legacy, dict):
+        try:
+            value = float(legacy.get("deviation_value", 0.0))
+        except (TypeError, ValueError):
+            pass
+        else:
+            return value if np.isfinite(value) else 0.0
+
+    channels = calibration.get("channels")
+    if not isinstance(channels, (list, tuple)):
+        return 0.0
+    for item in channels:
+        raw_value = None
+        if isinstance(item, dict):
+            if item.get("channel_index") != channel_index:
+                continue
+            if item.get("trusted") is False:
+                return 0.0
+            raw_value = item.get(
+                "deviation_value",
+                item.get("correction_db"),
+            )
+        elif (
+            isinstance(item, (list, tuple))
+            and len(item) >= 4
+            and item[0] == channel_index
+        ):
+            if item[1] is False:
+                return 0.0
+            raw_value = item[3]
+        else:
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            return 0.0
+        return value if np.isfinite(value) else 0.0
+    return 0.0
 
 
 def apply_mic_calibration(signal: np.ndarray,

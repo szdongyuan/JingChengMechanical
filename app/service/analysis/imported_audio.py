@@ -450,6 +450,7 @@ def _shape_import_configs(
     assignments: tuple[ImportedChannelAssignment, ...],
     sample_rate: float,
     warnings: list[ImportAudioWarning],
+    frozen_golden_channels: frozenset[int] = frozenset(),
 ) -> dict:
     source_config = copy.deepcopy(source_config)
     source_channels = _source_channels_by_index(source_config)
@@ -487,6 +488,7 @@ def _shape_import_configs(
                 wav_channel_index=assignment.wav_channel_index,
                 warnings=warnings,
                 forced_no_results=forced_no_results,
+                frozen_available=channel_index in frozen_golden_channels,
             )
             if no_result_metrics:
                 forced_no_results.setdefault(channel_index, set()).update(no_result_metrics)
@@ -754,6 +756,7 @@ def _inspect_golden_configuration(
     wav_channel_index: int,
     warnings: list[ImportAudioWarning],
     forced_no_results: dict[int, set[str]],
+    frozen_available: bool = False,
 ) -> None:
     for metric in ("fft", "octave"):
         if not _golden_requested(channel_config, metric):
@@ -773,7 +776,7 @@ def _inspect_golden_configuration(
                 )
             )
         golden_path = str(channel_config.get("golden_sample_path") or "").strip()
-        if not golden_path or not Path(golden_path).is_file():
+        if not frozen_available and (not golden_path or not Path(golden_path).is_file()):
             _append_import_warning_once(
                 warnings,
                 ImportAudioWarning(
@@ -1189,6 +1192,17 @@ def _add_imported_stft_payload(
                     for freq in np.asarray(frequencies_hz, dtype=np.float64)
                 ],
                 "magnitude_db": np.asarray(magnitude_db, dtype=np.float64),
+                "stft_color_scale_enabled": bool(
+                    channel_config.get("stft_color_scale_enabled", False)
+                ),
+                "stft_color_scale_min_db": channel_config.get(
+                    "stft_color_scale_min_db",
+                    -120.0,
+                ),
+                "stft_color_scale_max_db": channel_config.get(
+                    "stft_color_scale_max_db",
+                    0.0,
+                ),
             }
             if "stft_score" not in channel_payload:
                 try:

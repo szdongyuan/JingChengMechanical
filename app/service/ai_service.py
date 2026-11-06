@@ -6,6 +6,7 @@ and UI ViewModel adaptation.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -22,11 +23,20 @@ from datetime import datetime, timedelta, timezone
 
 from peewee import DoesNotExist, IntegrityError
 
+from app.service.ai_threshold import (
+    coerce_probability as _coerce_probability,
+    resolve_effective_decision_threshold as _resolve_effective_decision_threshold,
+)
 from app.service.ai_resident_runtime import ResidentToolchainRuntime
+from app.service.ai_subprocess import (
+    ai_subprocess_creation_flags,
+    ai_subprocess_environment,
+)
 from model.ai_toolchain_table import AiToolchainTable
 from model.test_config_ai_binding_table import TestConfigAiBindingTable
 from model.ai_execution_table import AiExecutionTable
 from model.test_config_table import TestConfigTable
+from app.service.run_record_export.contracts import AiExportValue
 
 _SUPPORTED_PROTOCOL_VERSION = 1
 _DEFAULT_EXECUTION_MODE = "resident_process"
@@ -49,40 +59,6 @@ def _gen_request_id() -> str:
     ts = datetime.now(_TZ8).strftime("%Y%m%d_%H%M%S")
     short = uuid.uuid4().hex[:8]
     return f"req_{ts}_{short}"
-
-
-def _coerce_probability(value) -> float | None:
-    if isinstance(value, bool):
-        return None
-    if not isinstance(value, (int, float)):
-        return None
-    probability = float(value)
-    if not math.isfinite(probability):
-        return None
-    if 0.0 <= probability <= 1.0:
-        return probability
-    return None
-
-
-def _resolve_effective_decision_threshold(
-    ai_result: dict, request_params: dict
-) -> tuple[float, str]:
-    extra = ai_result.get("extra")
-    response_threshold = None
-    if isinstance(extra, dict):
-        response_threshold = _coerce_probability(extra.get("decision_threshold"))
-    if response_threshold is not None:
-        return response_threshold, "response_extra"
-
-    request_threshold = None
-    if isinstance(request_params, dict):
-        request_threshold = _coerce_probability(
-            request_params.get("decision_threshold")
-        )
-    if request_threshold is not None:
-        return request_threshold, "request_params"
-
-    return 0.5, "default"
 
 
 class AiService:
@@ -198,6 +174,7 @@ class AiService:
             raise ValueError("params_json must be valid JSON") from exc
         if not isinstance(parsed, dict):
             raise ValueError("params_json must be a JSON object")
+        _resolve_effective_decision_threshold({}, parsed)
         return json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))
 
     def _normalize_toolchain_payload(
@@ -426,6 +403,77 @@ class AiService:
 
     # ── Binding CRUD (for config UI) ────────────────────────
 
+    def freeze_bound_toolchain(self, config_id: int) -> dict | None:
+        """Freeze an enabled binding into the durable analysis envelope shape.
+
+        Production runs must not re-read a mutable binding after acceptance.
+        Returning ``None`` keeps AI optional; an enabled but invalid binding
+        fails closed instead of silently skipping the configured toolchain.
+        """
+        binding = self.resolve_binding(config_id)
+        if binding is None or not binding["enabled"]:
+            return None
+
+        toolchain_id = binding["toolchain_id"]
+        if not isinstance(toolchain_id, str) or not toolchain_id.strip():
+            raise ValueError("Enabled AI binding has no toolchain selected")
+        toolchain = self.get_toolchain(toolchain_id)
+        if toolchain is None or not toolchain.enabled:
+            raise ValueError("Bound AI toolchain was not found or is disabled")
+        if toolchain.protocol_version != _SUPPORTED_PROTOCOL_VERSION:
+            raise ValueError("Bound AI toolchain protocol version is unsupported")
+
+        execution_mode = str(toolchain.execution_mode or "").strip()
+        if execution_mode not in _SUPPORTED_EXECUTION_MODES:
+            raise ValueError("Bound AI toolchain execution mode is unsupported")
+        entrypoint = str(toolchain.entrypoint or "").strip()
+        if not entrypoint:
+            raise ValueError("Bound AI toolchain entrypoint is empty")
+        raw_package_dir = str(toolchain.package_dir or "").strip()
+        if not raw_package_dir:
+            raise ValueError("Bound AI toolchain package directory is invalid")
+        package_dir = os.path.abspath(raw_package_dir)
+        if not os.path.isdir(package_dir):
+            raise ValueError("Bound AI toolchain package directory is invalid")
+
+        timeout_ms = binding["effective_timeout_ms"]
+        if (
+            isinstance(timeout_ms, bool)
+            or not isinstance(timeout_ms, int)
+            or timeout_ms <= 0
+        ):
+            raise ValueError("Bound AI toolchain timeout is invalid")
+        params = json.loads(self._normalize_params_json(binding["params_json"]))
+
+        revision_payload = {
+            "toolchain_id": toolchain.toolchain_id,
+            "updated_time": str(toolchain.updated_time or ""),
+            "version": str(toolchain.version or ""),
+            "execution_mode": execution_mode,
+            "entrypoint": entrypoint,
+            "package_dir": package_dir,
+            "params": params,
+            "timeout_ms": timeout_ms,
+        }
+        revision_bytes = json.dumps(
+            revision_payload,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        return {
+            "toolchain_id": toolchain.toolchain_id,
+            "execution_revision": (
+                "sha256:" + hashlib.sha256(revision_bytes).hexdigest()
+            ),
+            "execution_mode": execution_mode,
+            "entrypoint": entrypoint,
+            "package_dir": package_dir,
+            "params": params,
+            "timeout_seconds": float(timeout_ms) / 1000.0,
+        }
+
     def _binding_table_has_legacy_offset_column(self, database) -> bool:
         cursor = database.execute_sql("PRAGMA table_info(test_config_ai_binding_table)")
         return any(row[1] == "analysis_window_offset_ms" for row in cursor.fetchall())
@@ -618,6 +666,8 @@ class AiService:
                 text=True,
                 timeout=timeout_ms / 1000.0,
                 cwd=package_dir or None,
+                creationflags=ai_subprocess_creation_flags(),
+                env=ai_subprocess_environment(),
             )
             elapsed_ms = int((time.monotonic() - t0) * 1000)
             finished_at = _now_iso()
@@ -769,6 +819,70 @@ class AiService:
             )
         except DoesNotExist:
             return None
+
+    def get_current_effective_export_values(
+        self, run_ids: tuple[str, ...]
+    ) -> dict[str, AiExportValue]:
+        """Return current successful AI display values for selected runs."""
+        if type(run_ids) is not tuple or not run_ids:
+            raise ValueError("run_ids must be a nonempty tuple")
+        for run_id in run_ids:
+            if type(run_id) is not str:
+                raise ValueError("run_ids must contain canonical UUIDv4 strings")
+            try:
+                parsed = uuid.UUID(run_id)
+            except ValueError:
+                raise ValueError(
+                    "run_ids must contain canonical UUIDv4 strings"
+                ) from None
+            if parsed.version != 4 or str(parsed) != run_id:
+                raise ValueError(
+                    "run_ids must contain canonical UUIDv4 strings"
+                )
+        if len(set(run_ids)) != len(run_ids):
+            raise ValueError("run_ids must be unique")
+
+        unavailable = AiExportValue(None, None)
+        values = {run_id: unavailable for run_id in run_ids}
+        found_run_ids: set[str] = set()
+        rows = (
+            AiExecutionTable.select(
+                AiExecutionTable.test_run_id,
+                AiExecutionTable.score,
+                AiExecutionTable.ai_label,
+            )
+            .where(
+                AiExecutionTable.test_run_id.in_(run_ids),
+                AiExecutionTable.is_current_effective == True,
+                AiExecutionTable.module_status == "success",
+            )
+            .order_by(
+                AiExecutionTable.started_time.desc(),
+                AiExecutionTable.request_id.desc(),
+            )
+        )
+        for row in rows:
+            if row.test_run_id in found_run_ids:
+                continue
+            found_run_ids.add(row.test_run_id)
+
+            score = row.score
+            if isinstance(score, bool) or not isinstance(score, (int, float)):
+                score = None
+            else:
+                try:
+                    score = float(score)
+                except (TypeError, ValueError, OverflowError):
+                    score = None
+                else:
+                    if not math.isfinite(score):
+                        score = None
+
+            label = row.ai_label
+            if not isinstance(label, str) or not label.strip():
+                label = None
+            values[row.test_run_id] = AiExportValue(score, label)
+        return values
 
     # ── Orchestrator (full run) ─────────────────────────────
 

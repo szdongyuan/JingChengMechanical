@@ -6,6 +6,7 @@ import pytest
 from app.service.analysis import dsp, stft_score
 from app.service.analysis.golden_reference import GoldenReferenceError
 from app.service.analysis.review_payloads import (
+    _mic_sensitivity,
     attach_stft_score_summary,
     build_chart_payload,
     build_summary_payload,
@@ -58,6 +59,19 @@ def _make_config(*, fft_limits=True, octave_limits=True):
         "selected_channels": [0, 1],
         "channels": [_channel(0), _channel(1)],
     }
+
+
+def test_chart_payload_reads_frozen_channel_calibration_value():
+    calibration = {
+        "hardware_id": 8,
+        "calibration_revision": 1,
+        "channels": [
+            [0, True, 1, 1.5],
+            [2, True, 1, 3.25],
+        ],
+    }
+
+    assert _mic_sensitivity(calibration, 2) == pytest.approx(3.25)
 
 
 def _make_judgment_payload():
@@ -312,7 +326,7 @@ def _valid_loudness_cache_entry(values_sone):
 
 
 def _two_display_point_values(start: float, end: float) -> np.ndarray:
-    return np.linspace(start, end, 7, dtype=np.float64)
+    return np.linspace(start, end, 4, dtype=np.float64)
 
 
 def _patch_basic_chart_backends(
@@ -448,6 +462,61 @@ def test_build_chart_payload_adds_selected_window_axis_range_to_acoustic_time_se
     assert "x_axis_range_sec" not in payload[0].get("octave", {})
     assert "x_axis_range_sec" not in payload[0].get("stft_score", {})
     assert "x_axis_range_sec" not in payload[0].get("current_trace", {})
+
+
+@pytest.mark.parametrize("panel_types,expected_calls", [
+    (["vibration_stft"], (0, 0)),
+    (["vibration_pulse"], (0, 1)),
+    (["vibration_frequency_stability"], (1, 0)),
+    (["vibration_frequency_stability", "vibration_pulse"], (1, 1)),
+    (["vibration_frequency_stability", "vibration_frequency_stability",
+      "vibration_pulse", "vibration_pulse"], (1, 1)),
+    ([], (0, 0)),
+])
+def test_chart_layout_suppresses_unrequested_trends_and_preserves_window(
+    monkeypatch, panel_types, expected_calls,
+):
+    from app.service.analysis import vibration_payloads
+
+    _patch_basic_chart_backends(monkeypatch)
+    config = _make_single_channel_config()
+    config["vibration_view_channel_index"] = 0
+    config["result_dashboard_layout"] = {
+        "version": 2, "columns": 1, "rows": max(1, len(panel_types)),
+        "panels": [
+            {"id": f"panel-{i}", "type": kind, "channel": "vibration",
+             "row": i, "column": 0, "row_span": 1, "column_span": 1}
+            for i, kind in enumerate(panel_types)
+        ],
+    }
+    signal = np.sin(2 * np.pi * 60 * np.arange(2000) / 1000)
+    legacy = vibration_payloads.build_vibration_payload(
+        channel_index=0, signal=signal[500:1500], sample_rate=1000,
+        calibration_value=None,
+    )
+    calls = {"_frequency_trend": 0, "_trend": 0}
+    for name, expected in zip(calls, expected_calls):
+        original = getattr(vibration_payloads, name)
+
+        def counted(*args, _name=name, _expected=expected, _original=original):
+            calls[_name] += 1
+            assert _expected, f"unrequested {_name} was called"
+            return _original(*args)
+
+        monkeypatch.setattr(vibration_payloads, name, counted)
+    charts = build_chart_payload(
+        buffer=signal.reshape(-1, 1), config=config, sample_rate=1000,
+        mic_cal={}, analysis_window=(0.5, 1.5),
+    )
+    # Check outside the builder's exception guard as well.
+    assert tuple(calls.values()) == expected_calls
+    payload = charts[0]["vibration"]
+    for key in ("overall_rms", "overall_peak", "overall_crest_factor",
+                "dominant_frequency_hz", "low_frequency_energy_share"):
+        assert payload[key] == legacy[key]
+    for key, enabled in [("frequency_times_sec", expected_calls[0]), ("times_sec", expected_calls[1])]:
+        assert payload[key] == ([value + 0.5 for value in legacy[key]] if enabled else [])
+    assert payload["x_axis_range_sec"] == [0.5, 1.5]
 
 
 def test_build_chart_payload_adds_selected_window_axis_range_to_vibration_payload():
@@ -742,7 +811,7 @@ def test_build_chart_payload_passes_non_grid_aligned_loudness_cache_to_stft_scor
 
     monkeypatch.setattr(stft_score, "compute_stft_score_payload", fake_score)
     cache_entry = _valid_loudness_cache_entry(
-        np.linspace(2.0, 4.0, 152, dtype=np.float64)
+        np.linspace(2.0, 4.0, 77, dtype=np.float64)
     )
 
     payload = build_chart_payload(
@@ -760,7 +829,7 @@ def test_build_chart_payload_passes_non_grid_aligned_loudness_cache_to_stft_scor
 
     assert payload[0]["stft_score"]["summary_score"] == 88.0
     assert captured["loudness_trace"] == cache_entry
-    assert captured["loudness_trace"]["times_sec"][-1] == pytest.approx(1.0066666667)
+    assert captured["loudness_trace"]["times_sec"][-1] == pytest.approx(1.0133333333)
 
 
 def test_build_chart_payload_disabled_stft_score_uses_disabled_payload(monkeypatch):
@@ -1175,6 +1244,44 @@ def test_build_summary_payload_displays_chinese_ai_defect_label_with_score():
     assert ai_row["failure_label"] == "嗡嗡音"
     assert ai_row["result_display"] == "NG（嗡嗡音）"
     assert ai_row["constrained"] is True
+
+
+def test_visibility_flag_does_not_change_analysis_or_ai_summary_semantics():
+    hidden_config = _make_ai_only_config()
+    hidden_config["fault_types"] = ["嗡嗡音"]
+    hidden_config["manual_judgment_buttons_visible"] = False
+    visible_config = dict(hidden_config)
+    visible_config["manual_judgment_buttons_visible"] = True
+    judgment_payload = _make_ai_only_judgment_payload(
+        ai_pass=False,
+        ai_score=0.91,
+    )
+    ai_review = {
+        "status": "success",
+        "threshold": 0.5,
+        "score": 0.91,
+        "passed": False,
+        "ai_label": "嗡嗡音",
+    }
+
+    hidden_summary = build_summary_payload(
+        config=hidden_config,
+        judgment_payload=judgment_payload,
+        ai_review=ai_review,
+    )
+    visible_summary = build_summary_payload(
+        config=visible_config,
+        judgment_payload=judgment_payload,
+        ai_review=ai_review,
+    )
+
+    assert hidden_summary == visible_summary
+    assert hidden_summary["overall_status"] == "fail"
+    assert hidden_summary["overall_label"] == "FAIL"
+    ai_row = hidden_summary["rows"][-1]
+    assert ai_row["status"] == "NG"
+    assert ai_row["actual_value"] == pytest.approx(0.91)
+    assert ai_row["failure_label"] == "嗡嗡音"
 
 
 def test_build_summary_payload_keeps_scoreless_success_with_ai_threshold_as_no_result_even_when_judgment_used_ai_label():
@@ -3799,7 +3906,107 @@ def test_build_chart_payload_emits_null_limits_when_spl_and_loudness_bounds_are_
     assert payload[0]["loudness"]["upper_limit"] is None
 
 
-def test_build_chart_payload_spl_omits_trailing_partial_tail_for_a_weighted_series():
+def test_build_chart_payload_spl_uses_full_calibrated_signal_and_exact_absolute_bounds(
+    monkeypatch,
+):
+    _patch_basic_chart_backends(monkeypatch)
+    captured = {}
+
+    def fake_spl_trace(signal, sample_rate, weighting, time_constant, **kwargs):
+        captured["signal"] = np.asarray(signal, dtype=np.float64).copy()
+        captured["sample_rate"] = sample_rate
+        captured["weighting"] = weighting
+        captured["time_constant"] = time_constant
+        captured["kwargs"] = kwargs
+        return [0.55, 1.0, 1.37], [61.0, 62.0, 63.0]
+
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_spl_trace",
+        fake_spl_trace,
+    )
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_loudness_trace_for_window",
+        lambda *_args, **_kwargs: _internal_loudness_trace(
+            _two_display_point_values(2.0, 3.0)
+        ),
+    )
+    buffer = np.arange(200, dtype=np.float64).reshape(-1, 1)
+
+    payload = build_chart_payload(
+        buffer=buffer,
+        config=_make_single_channel_config(
+            spl_weighting="A",
+            spl_time_constant=0.25,
+            fft_band_limits=[],
+            oct_band_limits=[],
+        ),
+        sample_rate=100.0,
+        mic_cal={"In1": {"deviation_value": "2.5"}},
+        analysis_window=(0.53, 1.37),
+    )
+
+    np.testing.assert_allclose(captured["signal"], buffer[:, 0] * 2.5)
+    assert captured["sample_rate"] == 100.0
+    assert captured["weighting"] == "A"
+    assert captured["time_constant"] == 0.25
+    assert captured["kwargs"] == {
+        "chunk_duration": 0.05,
+        "output_start_sample": 53,
+        "output_end_sample": 137,
+    }
+    assert payload[0]["spl"]["times_sec"] == [0.55, 1.0, 1.37]
+    assert payload[0]["spl"]["values_db"] == [61.0, 62.0, 63.0]
+
+
+def test_build_chart_payload_spl_warms_from_capture_start_but_emits_only_window_points(
+    monkeypatch,
+):
+    _patch_basic_chart_backends(monkeypatch)
+    instances = []
+
+    class FakeDetector:
+        def __init__(self, sample_rate, weighting, time_constant):
+            self.total = 0.0
+            self.calls = []
+            instances.append(self)
+
+        def process(self, signal):
+            values = np.asarray(signal, dtype=np.float64)
+            self.calls.append(values.copy())
+            self.total += float(np.sum(values))
+            return self.total
+
+    monkeypatch.setattr("app.service.analysis.dsp.SplDetector", FakeDetector)
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_loudness_trace_for_window",
+        lambda *_args, **_kwargs: _internal_loudness_trace(
+            _two_display_point_values(2.0, 3.0)
+        ),
+    )
+    signal = np.arange(1.0, 11.0, dtype=np.float64)
+
+    payload = build_chart_payload(
+        buffer=signal.reshape(-1, 1),
+        config=_make_single_channel_config(
+            spl_weighting="A",
+            fft_band_limits=[],
+            oct_band_limits=[],
+        ),
+        sample_rate=20.0,
+        mic_cal={},
+        analysis_window=(0.1, 0.25),
+    )
+
+    assert len(instances) == 1
+    np.testing.assert_allclose(
+        np.concatenate(instances[0].calls),
+        signal[:5],
+    )
+    assert payload[0]["spl"]["times_sec"] == [0.15, 0.2, 0.25]
+    assert payload[0]["spl"]["values_db"] == [6.0, 10.0, 15.0]
+
+
+def test_build_chart_payload_spl_includes_trailing_partial_tail_for_a_weighted_series():
     sample_rate = 48000.0
     chunk_samples = int(round(sample_rate * 0.05))
     signal = np.full(chunk_samples * 2 + 1, 0.1, dtype=np.float32).reshape(-1, 1)
@@ -3816,11 +4023,15 @@ def test_build_chart_payload_spl_omits_trailing_partial_tail_for_a_weighted_seri
         analysis_window=(0.0, signal.shape[0] / sample_rate),
     )
 
-    assert payload[0]["spl"]["times_sec"] == [0.05, 0.1]
-    assert len(payload[0]["spl"]["values_db"]) == 2
+    assert payload[0]["spl"]["times_sec"] == [
+        0.05,
+        0.1,
+        round(signal.shape[0] / sample_rate, 6),
+    ]
+    assert len(payload[0]["spl"]["values_db"]) == 3
 
 
-def test_build_chart_payload_spl_omits_trailing_partial_tail_for_c_weighted_series():
+def test_build_chart_payload_spl_includes_trailing_partial_tail_for_c_weighted_series():
     sample_rate = 48000.0
     chunk_samples = int(round(sample_rate * 0.05))
     signal = np.full(chunk_samples * 2 + 1, 0.1, dtype=np.float32).reshape(-1, 1)
@@ -3837,8 +4048,48 @@ def test_build_chart_payload_spl_omits_trailing_partial_tail_for_c_weighted_seri
         analysis_window=(0.0, signal.shape[0] / sample_rate),
     )
 
-    assert payload[0]["spl"]["times_sec"] == [0.05, 0.1]
-    assert len(payload[0]["spl"]["values_db"]) == 2
+    assert payload[0]["spl"]["times_sec"] == [
+        0.05,
+        0.1,
+        round(signal.shape[0] / sample_rate, 6),
+    ]
+    assert len(payload[0]["spl"]["values_db"]) == 3
+
+
+def test_build_chart_payload_spl_a_weighted_31_5hz_uses_continuous_preroll_and_partial_end(
+    monkeypatch,
+):
+    _patch_basic_chart_backends(monkeypatch)
+    monkeypatch.setattr(
+        "app.service.analysis.review_payloads.dsp.compute_loudness_trace_for_window",
+        lambda *_args, **_kwargs: _internal_loudness_trace(
+            _two_display_point_values(2.0, 3.0)
+        ),
+    )
+    signal, sample_rate = _stable_calibrator_signal(
+        sample_rate=48000.0,
+        duration_sec=3.0,
+        freq_hz=31.5,
+        spl_db=94.0,
+    )
+    selected_end_sec = 2.011
+
+    payload = build_chart_payload(
+        buffer=signal.reshape(-1, 1),
+        config=_make_single_channel_config(
+            spl_weighting="A",
+            spl_time_constant=0.125,
+            fft_band_limits=[],
+            oct_band_limits=[],
+        ),
+        sample_rate=sample_rate,
+        mic_cal={},
+        analysis_window=(1.0, selected_end_sec),
+    )
+
+    spl = payload[0]["spl"]
+    assert float(np.mean(spl["values_db"][-10:])) == pytest.approx(54.47, abs=1.0)
+    assert spl["times_sec"][-1] == pytest.approx(selected_end_sec)
 
 
 def test_build_chart_payload_spl_exact_chunk_boundary_keeps_full_point_count():
@@ -4894,10 +5145,10 @@ def test_build_chart_payload_reuses_valid_internal_loudness_trace_cache_as_displ
         config=_make_config(),
         sample_rate=100.0,
         mic_cal={},
-        analysis_window=(0.5, 0.58),
-        loudness_trace_cache={
-            0: _valid_loudness_cache_entry(np.arange(1.0, 14.0, dtype=np.float64)),
-            1: _valid_loudness_cache_entry(np.linspace(24.0, 30.0, 13, dtype=np.float64)),
+            analysis_window=(0.5, 0.58),
+            loudness_trace_cache={
+                0: _valid_loudness_cache_entry(np.linspace(1.0, 13.0, 7, dtype=np.float64)),
+                1: _valid_loudness_cache_entry(np.linspace(24.0, 30.0, 7, dtype=np.float64)),
         },
     )
 
@@ -4934,10 +5185,10 @@ def test_build_chart_payload_reuses_loudness_trace_cache_with_phon_unit(monkeypa
         config=config,
         sample_rate=100.0,
         mic_cal={},
-        analysis_window=(0.5, 0.58),
-        loudness_trace_cache={
-            0: _valid_loudness_cache_entry(np.linspace(42.0, 48.0, 13, dtype=np.float64)),
-            1: _valid_loudness_cache_entry(np.linspace(24.0, 30.0, 13, dtype=np.float64)),
+            analysis_window=(0.5, 0.58),
+            loudness_trace_cache={
+                0: _valid_loudness_cache_entry(np.linspace(42.0, 48.0, 7, dtype=np.float64)),
+                1: _valid_loudness_cache_entry(np.linspace(24.0, 30.0, 7, dtype=np.float64)),
         },
     )
 

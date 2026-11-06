@@ -5,6 +5,7 @@ import gc
 import os
 import sys
 from types import ModuleType, SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -14,6 +15,7 @@ sys.modules.setdefault("cv2", SimpleNamespace())
 if "snap7" not in sys.modules:
     snap7_module = ModuleType("snap7")
     snap7_client_module = ModuleType("snap7.client")
+    snap7_error_module = ModuleType("snap7.error")
     snap7_util_module = ModuleType("snap7.util")
 
     class _Client:
@@ -24,17 +26,26 @@ if "snap7" not in sys.modules:
             return None
 
     snap7_client_module.Client = _Client
+    snap7_error_module.S7Error = RuntimeError
     snap7_util_module.get_bool = lambda *_args, **_kwargs: False
     snap7_util_module.set_bool = lambda *_args, **_kwargs: None
     snap7_module.client = snap7_client_module
     snap7_module.util = snap7_util_module
     sys.modules["snap7"] = snap7_module
     sys.modules["snap7.client"] = snap7_client_module
+    sys.modules["snap7.error"] = snap7_error_module
     sys.modules["snap7.util"] = snap7_util_module
 
 from PyQt6 import sip
 from PyQt6.QtCore import QCoreApplication, QEvent, Qt
-from PyQt6.QtWidgets import QApplication, QLabel, QWidget
+from PyQt6.QtWidgets import (
+    QApplication,
+    QLabel,
+    QMainWindow,
+    QPushButton,
+    QToolButton,
+    QWidget,
+)
 
 try:
     from pyqtgraph.widgets.GraphicsView import GraphicsView
@@ -45,6 +56,7 @@ else:
     _NOOP_GRAPHICS_VIEW_PAINT_EVENT = lambda self, event: None
 
 from app.service.analysis.frames import StftFrame
+from app.service.multi_run_integration.shutdown import ApplicationShutdownReport
 from app.services_container import (
     FactoryControllerState,
     FactoryReviewPayload,
@@ -154,6 +166,472 @@ def qapp():
 
 def _is_analysis_chart_widget(widget: QWidget) -> bool:
     return type(widget).__module__ == "ui.widgets.analysis_charts"
+
+
+def test_main_window_source_wires_dashboard_to_the_one_history_adapter():
+    import inspect
+    import app.main_window as main_window
+
+    source = inspect.getsource(main_window.MainWindow)
+    assert "result_history_store" in source
+    assert "attach_result_dashboard" in source
+    assert "self.control.manual_judgment_widget" in source
+
+
+def test_main_window_close_uses_only_cached_application_shutdown_and_preserves_stop_text():
+    import inspect
+    import app.main_window as main_window
+
+    source = inspect.getsource(main_window.MainWindow.closeEvent)
+    class_source = inspect.getsource(main_window.MainWindow)
+
+    assert "self.services.shutdown()" in source
+    assert "plc_services" not in source
+    assert "plc_threads" not in source
+    assert "BlockingQueuedConnection" not in source
+    assert 'setText("停止测试")' in class_source
+    assert "self.video.stop_camera" in class_source
+    assert source.index("self.control.shutdown()") < source.index(
+        "self.services.shutdown()"
+    )
+
+
+def test_main_window_source_wires_only_run_scoped_result_operation_intents():
+    import inspect
+    import app.main_window as main_window
+
+    source = inspect.getsource(main_window.MainWindow)
+
+    assert "manual_judgment_target_changed.connect" in source
+    assert "manual_judgment_intent.connect" in source
+    assert "manual_judgment_requested.connect" in source
+    assert "reanalysis_requested.connect" in source
+    assert "reanalysis_cancel_requested.connect" in source
+    assert "stop_intent.connect" in source
+    assert "attach_committed_history_observer" in source
+    assert "factory_mode.apply_manual_judgment" not in source
+    assert "factory_review_changed" not in source
+    assert "FactoryReviewPayload" not in source
+    assert "_review_payload" not in source
+    assert "displayed_config_id" not in source
+
+
+def test_reanalysis_not_found_emits_one_chinese_status_without_retry():
+    from unittest.mock import MagicMock
+
+    from app.main_window import MainWindow
+    from app.service.multi_run_coordinator_mvp import OperationResult, OperationStatus
+    from app.service.result_history_contracts import ReanalysisRequest
+
+    run_id = "00000000-0000-4000-8000-000000000001"
+    coordinator = SimpleNamespace(
+        start_reanalysis=MagicMock(
+            return_value=OperationResult(
+                run_id=run_id,
+                status=OperationStatus.NOT_FOUND,
+                attempt_id=None,
+                reason="result-control facts were not found",
+            )
+        )
+    )
+    status = _SignalStub()
+    window = SimpleNamespace(
+        services=SimpleNamespace(
+            multi_run_coordinator=coordinator,
+            bus=SimpleNamespace(status=status),
+        )
+    )
+
+    MainWindow._start_reanalysis_request(
+        window,
+        ReanalysisRequest(run_id, 7, 0.25, 1.75),
+    )
+
+    coordinator.start_reanalysis.assert_called_once()
+    assert status.emissions == [
+        (("重新分析失败：所选运行记录不存在，可能已被删除",), {})
+    ]
+
+
+def test_main_window_registers_process_plc_shutdown_after_module_construction():
+    import inspect
+    import app.main_window as main_window
+
+    source = inspect.getsource(main_window.MainWindow.build_hardware_page)
+    construction = source.index(
+        "self.plc_settings_module = PlcSettingsModule(self.services)"
+    )
+    registration = source.index(
+        "self.plc_settings_module.shutdown_process_param_service"
+    )
+
+    assert construction < registration
+    assert "register_independent_shutdown_resource" in source
+
+
+class _RestartControlStub:
+    def __init__(self, order, shutdown_error=None):
+        self._order = order
+        self._shutdown_error = shutdown_error
+        self.pending = []
+
+    def set_restart_pending(self, pending):
+        self.pending.append(pending)
+
+    def shutdown(self):
+        self._order.append("control")
+        if self._shutdown_error is not None:
+            raise self._shutdown_error
+
+
+def _application_shutdown_report(*, clean=True):
+    return ApplicationShutdownReport(
+        clean=clean,
+        restart_required=not clean,
+        deadline_monotonic=1.0,
+        stages=(),
+        errors=(),
+    )
+
+
+_DEFAULT_SHUTDOWN_RESULT = object()
+
+
+def _restart_window(
+    *,
+    can_leave=True,
+    control_error=None,
+    service_error=None,
+    service_result=_DEFAULT_SHUTDOWN_RESULT,
+):
+    from app.main_window import MainWindow
+
+    order = []
+    if service_result is _DEFAULT_SHUTDOWN_RESULT:
+        service_result = _application_shutdown_report()
+    window = MainWindow.__new__(MainWindow)
+    window._restart_in_progress = False
+    window.tab = SimpleNamespace(currentIndex=lambda: 2)
+    window._can_leave_main_tab = MagicMock(return_value=can_leave)
+    window.control = _RestartControlStub(order, control_error)
+
+    def shutdown():
+        order.append("services")
+        if service_error is not None:
+            raise service_error
+        return service_result
+
+    window.services = SimpleNamespace(
+        shutdown=MagicMock(side_effect=shutdown),
+        bus=SimpleNamespace(log=_SignalStub()),
+    )
+    return window, order
+
+
+def test_restart_cancel_clears_guard_and_reenables_control(monkeypatch):
+    import app.main_window as main_window
+
+    window, order = _restart_window(can_leave=False)
+    detached = MagicMock(return_value=True)
+    monkeypatch.setattr(main_window.QProcess, "startDetached", detached)
+
+    window._restart_application()
+
+    assert order == []
+    detached.assert_not_called()
+    assert window._restart_in_progress is False
+    assert window.control.pending == [True, False]
+
+
+def test_restart_shutdown_is_ordered_and_launches_once_only_after_clean_shutdown(
+    monkeypatch,
+):
+    import app.main_window as main_window
+
+    window, order = _restart_window()
+    detached = MagicMock(return_value=True)
+    app = SimpleNamespace(quit=MagicMock())
+    monkeypatch.setattr(main_window.QProcess, "startDetached", detached)
+    monkeypatch.setattr(
+        main_window,
+        "QApplication",
+        SimpleNamespace(instance=lambda: app),
+    )
+    monkeypatch.setattr(
+        window,
+        "_restart_command",
+        lambda: ("python.exe", ["C:\\app\\main.py", "--flag"]),
+    )
+
+    window._restart_application()
+    window._restart_application()
+
+    assert order == ["control", "services"]
+    detached.assert_called_once_with(
+        "python.exe",
+        ["C:\\app\\main.py", "--flag"],
+    )
+    app.quit.assert_called_once_with()
+    assert window._restart_in_progress is True
+    assert window.control.pending == [True]
+
+
+@pytest.mark.parametrize(
+    ("control_error", "service_error"),
+    [
+        (RuntimeError("control close failed"), None),
+        (None, RuntimeError("service close failed")),
+    ],
+)
+def test_restart_unclean_shutdown_never_relaunches_and_allows_retry(
+    monkeypatch,
+    control_error,
+    service_error,
+):
+    import app.main_window as main_window
+
+    window, order = _restart_window(
+        control_error=control_error,
+        service_error=service_error,
+    )
+    detached = MagicMock(return_value=True)
+    critical = MagicMock()
+    monkeypatch.setattr(main_window.QProcess, "startDetached", detached)
+    monkeypatch.setattr(
+        main_window,
+        "QMessageBox",
+        SimpleNamespace(critical=critical),
+    )
+
+    window._restart_application()
+
+    assert order == ["control", "services"]
+    detached.assert_not_called()
+    assert window._restart_in_progress is False
+    assert window.control.pending == [True, False]
+    assert "关闭失败" in critical.call_args.args[2]
+    assert "未启动新实例" in critical.call_args.args[2]
+
+
+@pytest.mark.parametrize(
+    "shutdown_result",
+    [
+        _application_shutdown_report(clean=False),
+        None,
+        SimpleNamespace(clean=True),
+    ],
+)
+def test_restart_requires_an_exact_clean_application_shutdown_report(
+    monkeypatch,
+    shutdown_result,
+):
+    import app.main_window as main_window
+
+    window, order = _restart_window(service_result=shutdown_result)
+    detached = MagicMock(return_value=True)
+    critical = MagicMock()
+    monkeypatch.setattr(main_window.QProcess, "startDetached", detached)
+    monkeypatch.setattr(
+        main_window,
+        "QMessageBox",
+        SimpleNamespace(critical=critical),
+    )
+
+    window._restart_application()
+
+    assert order == ["control", "services"]
+    detached.assert_not_called()
+    assert window._restart_in_progress is False
+    assert window.control.pending == [True, False]
+    assert "关闭失败" in critical.call_args.args[2]
+    assert "未启动新实例" in critical.call_args.args[2]
+
+
+@pytest.mark.parametrize(
+    "detached_result",
+    [False, (False, 0)],
+)
+def test_restart_launch_failure_shows_chinese_error_and_allows_retry(
+    monkeypatch,
+    detached_result,
+):
+    import app.main_window as main_window
+
+    window, order = _restart_window()
+    detached = MagicMock(return_value=detached_result)
+    critical = MagicMock()
+    app = SimpleNamespace(quit=MagicMock())
+    monkeypatch.setattr(main_window.QProcess, "startDetached", detached)
+    monkeypatch.setattr(
+        main_window,
+        "QMessageBox",
+        SimpleNamespace(critical=critical),
+    )
+    monkeypatch.setattr(
+        main_window,
+        "QApplication",
+        SimpleNamespace(instance=lambda: app),
+    )
+
+    window._restart_application()
+
+    assert order == ["control", "services"]
+    detached.assert_called_once()
+    app.quit.assert_not_called()
+    assert window._restart_in_progress is False
+    assert window.control.pending == [True, False]
+    assert "重启失败" in critical.call_args.args[2]
+    assert "未启动新实例" in critical.call_args.args[2]
+
+
+def test_restart_command_reconstructs_frozen_argv(monkeypatch):
+    import app.main_window as main_window
+
+    monkeypatch.setattr(main_window.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(
+        main_window.sys,
+        "argv",
+        ["C:\\dist\\jingcheng.exe", "--station", "A"],
+    )
+    monkeypatch.setattr(main_window.sys, "executable", "C:\\dist\\jingcheng.exe")
+
+    assert main_window.MainWindow._restart_command() == (
+        "C:\\dist\\jingcheng.exe",
+        ["--station", "A"],
+    )
+
+
+def test_restart_command_reconstructs_source_argv(monkeypatch):
+    import app.main_window as main_window
+
+    monkeypatch.delattr(main_window.sys, "frozen", raising=False)
+    monkeypatch.setattr(
+        main_window.sys,
+        "argv",
+        ["main.py", "--station", "A"],
+    )
+    monkeypatch.setattr(
+        main_window.sys,
+        "executable",
+        "C:\\Python\\python.exe",
+    )
+
+    program, arguments = main_window.MainWindow._restart_command()
+
+    assert program == "C:\\Python\\python.exe"
+    assert arguments[0] == os.path.abspath(
+        os.path.join(os.path.dirname(main_window.__file__), os.pardir, "main.py")
+    )
+    assert arguments[1:] == ["--station", "A"]
+
+
+def test_degraded_production_still_builds_configuration_and_hardware_pages(
+    qapp,
+    monkeypatch,
+):
+    import app.main_window as main_window
+
+    built_pages = []
+    monkeypatch.setattr(
+        main_window.MainWindow,
+        "build_topbar",
+        lambda _self: QWidget(),
+    )
+    monkeypatch.setattr(
+        main_window.MainWindow,
+        "_connect_bus_signals",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        main_window.MainWindow,
+        "_reload_selected_plc_bindings",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(
+        main_window.MainWindow,
+        "_refresh_plc_state_labels",
+        lambda _self: None,
+    )
+    monkeypatch.setattr(main_window.os.path, "exists", lambda _path: False)
+    services = SimpleNamespace(
+        bus=SimpleNamespace(log=_SignalStub()),
+        factory_mode=None,
+        startup_failure=None,
+        production_unavailable_reason=(
+            "生产功能不可用，请修复设备或配置后重启软件。"
+        ),
+    )
+    for method_name, page_name in (
+        ("build_test_page", "test"),
+        ("build_data_page", "data"),
+        ("build_config_page", "config"),
+        ("build_ai_tool_management_page", "ai"),
+        ("build_hardware_page", "hardware"),
+    ):
+        monkeypatch.setattr(
+            main_window.MainWindow,
+            method_name,
+            lambda _self, name=page_name: (
+                built_pages.append(name) or QWidget()
+            ),
+        )
+    monkeypatch.setattr(main_window.MainWindow, "set_role", lambda _self: None)
+
+    window = main_window.MainWindow(services)
+
+    assert built_pages == ["test", "data", "config", "ai", "hardware"]
+    assert window.tab.count() == 5
+
+
+def test_operator_can_activate_data_management_but_not_admin_pages():
+    import app.main_window as main_window
+
+    window = main_window.MainWindow.__new__(main_window.MainWindow)
+    window.current_user_role = "操作员"
+    window.tab_names = ["测试", "数据管理", "配置", "AI管理", "硬件"]
+
+    assert window._can_activate_main_tab(0)
+    assert window._can_activate_main_tab(1)
+    assert not window._can_activate_main_tab(2)
+    assert not window._can_activate_main_tab(3)
+    assert not window._can_activate_main_tab(4)
+
+
+def _role_projection_window(main_window, role: str):
+    window = main_window.MainWindow.__new__(main_window.MainWindow)
+    QMainWindow.__init__(window)
+    window.current_user_name = "operator" if role == "操作员" else "privileged-user"
+    window.current_user_role = role
+    window.top_button_dict = {
+        name: QToolButton()
+        for name in ("测试", "数据管理", "配置", "AI管理", "硬件")
+    }
+    window.workorder = SimpleNamespace()
+    window.config_module = SimpleNamespace(
+        btn_select_active_configs=QPushButton("选择使用配置")
+    )
+    return window
+
+
+def test_operator_has_no_factory_selection_entry_on_test_page(qapp):
+    import app.main_window as main_window
+
+    window = _role_projection_window(main_window, "操作员")
+    window.set_role()
+
+    assert window.top_button_dict["配置"].isEnabled() is False
+    assert hasattr(window.workorder, "config_selector") is False
+
+
+@pytest.mark.parametrize("role", ["管理员", "工程师"])
+def test_privileged_roles_can_access_factory_selection_entry(qapp, role):
+    import app.main_window as main_window
+
+    window = _role_projection_window(main_window, role)
+    window.set_role()
+
+    assert window.top_button_dict["配置"].isEnabled() is True
+    assert window.config_module.btn_select_active_configs.isEnabled() is True
 
 
 def _disable_updates_and_remove_events(widget: QWidget) -> None:

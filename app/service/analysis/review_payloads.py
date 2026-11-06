@@ -16,6 +16,10 @@ from app.service.analysis.limit_tables import (
     normalize_limit_tables,
 )
 from app.service.analysis.vibration_payloads import build_vibration_payload
+from app.service.analysis.vibration_requirements import (
+    configured_vibration_channel as _configured_vibration_view_channel,
+    resolve_vibration_requirements,
+)
 from app.service.current_meter_service import current_trace_display_at_time
 
 _SUMMARY_ROW_DEFS = (
@@ -45,6 +49,8 @@ class _AnalysisWindowSlice:
     samples: np.ndarray
     start_sec: float
     end_sec: float
+    start_sample: int
+    end_sample: int
     has_explicit_window: bool
 
     @property
@@ -175,6 +181,8 @@ def build_chart_payload(
     judgment_payload: dict | None = None,
     channel_column_map: dict[int, int] | None = None,
     loudness_trace_cache: dict[int, dict] | None = None,
+    channel_features: dict[int, object] | None = None,
+    precomputed_window_start_sec: float | None = None,
     current_trace_payload: dict | None = None,
     allow_golden_runtime_resample: bool = False,
 ) -> dict[int, dict]:
@@ -196,6 +204,10 @@ def build_chart_payload(
     window = window_slice.samples
     window_start_sec = window_slice.start_sec
     x_axis_range_sec = window_slice.x_axis_range_sec
+    if precomputed_window_start_sec is not None:
+        window_start_sec = float(precomputed_window_start_sec)
+        duration_sec = float(window.shape[0]) / sample_rate
+        x_axis_range_sec = [window_start_sec, window_start_sec + duration_sec]
     if window.size <= 0:
         return {}
 
@@ -208,27 +220,44 @@ def build_chart_payload(
     configured_input_sample_rate = config.get("input_device_samplerate")
     payload: dict[int, dict] = {}
     vibration_channel_index = _configured_vibration_view_channel(config)
+    include_frequency_trend, include_pulse_trend = resolve_vibration_requirements(config)
     for channel_index in _selected_chart_channels(config, buffer):
-        signal = _extract_channel(
-            window,
-            channel_index,
-            channel_column_map=channel_column_map,
+        precomputed = (
+            channel_features.get(channel_index)
+            if isinstance(channel_features, dict)
+            else None
+        )
+        signal = (
+            np.asarray(precomputed.calibrated_signal, dtype=np.float64)
+            if precomputed is not None
+            else _extract_channel(
+                window,
+                channel_index,
+                channel_column_map=channel_column_map,
+            )
         )
         if signal is None or signal.size <= 0:
             continue
         channel_config = _runtime_channel_config(config, channel_index)
         mic_sensitivity = _mic_sensitivity(mic_cal, channel_index)
-        calibrated = dsp.apply_mic_calibration(signal, mic_sensitivity)
-        full_signal = _extract_channel(
-            buffer,
-            channel_index,
-            channel_column_map=channel_column_map,
+        calibrated = (
+            signal
+            if precomputed is not None
+            else dsp.apply_mic_calibration(signal, mic_sensitivity)
         )
-        calibrated_full = (
-            dsp.apply_mic_calibration(full_signal, mic_sensitivity)
-            if full_signal is not None and full_signal.size > 0
-            else None
-        )
+        if precomputed is not None:
+            calibrated_full = None
+        else:
+            full_signal = _extract_channel(
+                buffer,
+                channel_index,
+                channel_column_map=channel_column_map,
+            )
+            calibrated_full = (
+                dsp.apply_mic_calibration(full_signal, mic_sensitivity)
+                if full_signal is not None and full_signal.size > 0
+                else None
+            )
         channel_result = channel_results.get(channel_index)
         golden_bundle_loader = _build_golden_bundle_loader(
             channel_index=channel_index,
@@ -242,11 +271,24 @@ def build_chart_payload(
         is_vibration_channel = channel_index == vibration_channel_index
         channel_payload = {}
         if not is_vibration_channel:
+            spl_signal = (
+                calibrated_full if calibrated_full is not None else calibrated
+            )
+            spl_start = (
+                window_slice.start_sample if calibrated_full is not None else 0
+            )
+            spl_end = (
+                window_slice.end_sample
+                if calibrated_full is not None
+                else len(calibrated)
+            )
             spl_payload = _build_spl_chart(
-                signal=calibrated,
+                signal=spl_signal,
                 sample_rate=sample_rate,
                 channel_config=channel_config,
-                window_start_sec=window_start_sec,
+                output_start_sample=spl_start,
+                output_end_sample=spl_end,
+                precomputed=precomputed,
             )
             if x_axis_range_sec is not None:
                 spl_payload["x_axis_range_sec"] = list(x_axis_range_sec)
@@ -259,6 +301,7 @@ def build_chart_payload(
             channel_result=channel_result,
             golden_cache=golden_cache,
             golden_bundle_loader=golden_bundle_loader,
+            precomputed=precomputed,
         )
         if isinstance(fft_payload, dict):
             channel_payload["fft"] = fft_payload
@@ -270,6 +313,7 @@ def build_chart_payload(
             channel_result=channel_result,
             golden_cache=golden_cache,
             golden_bundle_loader=golden_bundle_loader,
+            precomputed=precomputed,
         )
         if isinstance(octave_payload, dict):
             channel_payload["octave"] = octave_payload
@@ -305,6 +349,7 @@ def build_chart_payload(
                 window_start_sec=window_start_sec,
                 loudness_context_signal=calibrated_full,
                 loudness_trace=cached_loudness_trace,
+                precomputed=precomputed,
             )
             if isinstance(score_payload, dict):
                 channel_payload["stft_score"] = score_payload
@@ -315,6 +360,8 @@ def build_chart_payload(
                     signal=calibrated,
                     sample_rate=sample_rate,
                     calibration_value=mic_sensitivity,
+                    include_frequency_trend=include_frequency_trend,
+                    include_pulse_trend=include_pulse_trend,
                 )
             except Exception as exc:
                 _log_chart_warning(
@@ -341,16 +388,69 @@ def build_chart_payload(
     return payload
 
 
-def _configured_vibration_view_channel(config: dict) -> int | None:
-    value = config.get("vibration_view_channel_index")
-    if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        return None
-    selected = {
-        int(channel)
-        for channel in config.get("selected_channels", [])
-        if isinstance(channel, int) and not isinstance(channel, bool) and channel >= 0
-    }
-    return value if value in selected else None
+def build_summary_feature_chart_payload(
+    *,
+    config: dict,
+    sample_rate: float,
+    analysis_window_start_sec: float,
+    channel_features: dict[int, object],
+    current_trace_payload: dict | None = None,
+) -> dict[int, dict]:
+    """Materialize only the bounded traces needed to build the Decision summary."""
+
+    payload: dict[int, dict] = {}
+    vibration_channel = _configured_vibration_view_channel(config)
+    for channel_index in config.get("selected_channels", []):
+        feature = channel_features.get(channel_index)
+        if feature is None or channel_index == vibration_channel:
+            continue
+        channel_config = _runtime_channel_config(config, channel_index)
+        channel_payload: dict[str, object] = {}
+        try:
+            channel_payload["spl"] = _build_spl_chart(
+                signal=feature.calibrated_signal,
+                sample_rate=sample_rate,
+                channel_config=channel_config,
+                output_start_sample=0,
+                output_end_sample=len(feature.calibrated_signal),
+                precomputed=feature,
+            )
+        except Exception:
+            pass
+        cached_loudness = {
+            "times_sec": feature.loudness_times,
+            "values_sone": feature.loudness_values,
+            "max_sone": feature.loudness_max_sone,
+            "algorithm": dsp.LOUDNESS_TRACE_ALGORITHM,
+            "internal_rate_hz": dsp.LOUDNESS_TRACE_INTERNAL_RATE_HZ,
+        }
+        try:
+            channel_payload["loudness"] = _build_loudness_chart(
+                channel_index=channel_index,
+                signal=feature.calibrated_signal,
+                sample_rate=sample_rate,
+                channel_config=channel_config,
+                loudness_trace_cache=None,
+                window_start_sec=analysis_window_start_sec,
+                cached_trace=cached_loudness,
+            )
+        except Exception:
+            pass
+        score_payload = _build_stft_score_payload(
+            channel_index=channel_index,
+            signal=feature.calibrated_signal,
+            sample_rate=sample_rate,
+            channel_config=channel_config,
+            window_start_sec=analysis_window_start_sec,
+            loudness_trace=cached_loudness,
+            precomputed=feature,
+        )
+        if isinstance(score_payload, dict):
+            channel_payload["stft_score"] = score_payload
+        if isinstance(current_trace_payload, dict):
+            channel_payload["current_trace"] = deepcopy(current_trace_payload)
+        payload[channel_index] = channel_payload
+    return payload
 
 
 def _selected_channels(config: dict, judgment_payload: dict) -> tuple[int, ...]:
@@ -1815,14 +1915,35 @@ def _slice_analysis_window_with_bounds(
         not isinstance(analysis_window, (list, tuple))
         or len(analysis_window) != 2
     ):
-        return _AnalysisWindowSlice(buffer, 0.0, total_sec, False)
+        return _AnalysisWindowSlice(
+            buffer,
+            0.0,
+            total_sec,
+            0,
+            total_samples,
+            False,
+        )
     try:
         start_sec = float(analysis_window[0])
         end_sec = float(analysis_window[1])
     except (TypeError, ValueError):
-        return _AnalysisWindowSlice(buffer, 0.0, total_sec, False)
+        return _AnalysisWindowSlice(
+            buffer,
+            0.0,
+            total_sec,
+            0,
+            total_samples,
+            False,
+        )
     if not math.isfinite(start_sec) or not math.isfinite(end_sec):
-        return _AnalysisWindowSlice(buffer, 0.0, total_sec, False)
+        return _AnalysisWindowSlice(
+            buffer,
+            0.0,
+            total_sec,
+            0,
+            total_samples,
+            False,
+        )
     start_sec = max(0.0, min(total_sec, start_sec))
     end_sec = max(start_sec, min(total_sec, end_sec))
     start_idx = max(0, min(total_samples, int(start_sec * sample_rate)))
@@ -1836,6 +1957,8 @@ def _slice_analysis_window_with_bounds(
         buffer[start_idx:end_idx],
         start_sec,
         end_sec,
+        start_idx,
+        end_idx,
         has_explicit_window,
     )
 
@@ -1893,14 +2016,10 @@ def _buffer_column_for_channel(
 
 
 def _mic_sensitivity(mic_cal: dict, channel_index: int) -> float:
-    if not isinstance(mic_cal, dict):
-        return 0.0
-    entry = mic_cal.get(f"In{channel_index + 1}", {})
-    raw = entry.get("deviation_value", "0")
-    try:
-        return float(raw)
-    except (TypeError, ValueError):
-        return 0.0
+    return dsp.mic_sensitivity_from_calibration(
+        mic_cal,
+        channel_index,
+    )
 
 
 def _build_golden_bundle_loader(
@@ -1941,7 +2060,9 @@ def _build_spl_chart(
     signal: np.ndarray,
     sample_rate: float,
     channel_config: dict,
-    window_start_sec: float = 0.0,
+    output_start_sample: int,
+    output_end_sample: int,
+    precomputed: object | None = None,
 ) -> dict:
     weighting = str(channel_config.get("spl_weighting", "Z") or "Z")
     try:
@@ -1949,17 +2070,25 @@ def _build_spl_chart(
     except (TypeError, ValueError):
         time_constant = 0.125
 
-    raw_times_sec, raw_values_db = dsp.compute_spl_trace(
-        signal,
-        sample_rate,
-        weighting,
-        time_constant,
-        chunk_duration=_SPL_CHUNK_DURATION_SEC,
-    )
+    if precomputed is not None:
+        if precomputed.spl_error is not None:
+            raise RuntimeError(precomputed.spl_error)
+        raw_times_sec = precomputed.spl_times
+        raw_values_db = precomputed.spl_values
+    else:
+        raw_times_sec, raw_values_db = dsp.compute_spl_trace(
+            signal,
+            sample_rate,
+            weighting,
+            time_constant,
+            chunk_duration=_SPL_CHUNK_DURATION_SEC,
+            output_start_sample=output_start_sample,
+            output_end_sample=output_end_sample,
+        )
     times_sec = []
     values_db = []
     for end_time, value in zip(raw_times_sec, raw_values_db):
-        normalized_time = _normalize_chart_number(float(end_time) + float(window_start_sec))
+        normalized_time = _normalize_chart_number(end_time)
         normalized_value = _normalize_chart_number(value)
         if normalized_time is None or normalized_value is None:
             continue
@@ -2052,6 +2181,7 @@ def _build_stft_score_payload(
     window_start_sec: float,
     loudness_context_signal: np.ndarray | None = None,
     loudness_trace: dict | None = None,
+    precomputed: object | None = None,
 ) -> dict | None:
     try:
         defaults = _runtime_channel_defaults(channel_index)
@@ -2064,6 +2194,13 @@ def _build_stft_score_payload(
             absolute_start_sec=window_start_sec,
             loudness_context_signal=loudness_context_signal,
             loudness_trace=loudness_trace,
+            stft_times=(precomputed.stft_times if precomputed is not None else None),
+            stft_frequencies=(
+                precomputed.stft_frequencies if precomputed is not None else None
+            ),
+            stft_magnitudes=(
+                precomputed.stft_magnitudes if precomputed is not None else None
+            ),
         )
     except Exception as exc:
         _log_chart_warning(
@@ -2164,6 +2301,7 @@ def _build_fft_chart(
     channel_result: dict | None,
     golden_cache: GoldenReferenceCache,
     golden_bundle_loader,
+    precomputed: object | None = None,
 ) -> dict | None:
     weighting = _fft_weighting(channel_config.get("fft_weighting", "Z"))
     mode = _golden_mode(channel_config.get("fft_golden_mode"))
@@ -2181,12 +2319,18 @@ def _build_fft_chart(
         return None
 
     try:
-        frequencies_hz, measured_levels_db = _measure_fft_levels(
-            signal,
-            sample_rate,
-            nfft=nfft,
-            weighting=weighting,
-        )
+        if precomputed is not None:
+            if precomputed.fft_error is not None:
+                raise RuntimeError(precomputed.fft_error)
+            frequencies_hz = np.asarray(precomputed.fft_frequencies)
+            measured_levels_db = np.asarray(precomputed.fft_magnitudes)
+        else:
+            frequencies_hz, measured_levels_db = _measure_fft_levels(
+                signal,
+                sample_rate,
+                nfft=nfft,
+                weighting=weighting,
+            )
     except Exception as exc:
         _log_chart_warning("FFT chart payload omitted", channel_index=channel_index, error=exc)
         return None
@@ -2320,6 +2464,7 @@ def _build_octave_chart(
     channel_result: dict | None,
     golden_cache: GoldenReferenceCache,
     golden_bundle_loader,
+    precomputed: object | None = None,
 ) -> dict | None:
     weighting = str(channel_config.get("oct_weighting", "Z") or "Z")
     mode = _golden_mode(channel_config.get("oct_golden_mode"))
@@ -2333,7 +2478,15 @@ def _build_octave_chart(
         return None
 
     try:
-        center_freqs_hz, measured_levels_db = _measure_octave_levels(signal, sample_rate, weighting)
+        if precomputed is not None:
+            if precomputed.octave_error is not None:
+                raise RuntimeError(precomputed.octave_error)
+            center_freqs_hz = np.asarray(precomputed.octave_centers)
+            measured_levels_db = np.asarray(precomputed.octave_levels)
+        else:
+            center_freqs_hz, measured_levels_db = _measure_octave_levels(
+                signal, sample_rate, weighting
+            )
     except Exception as exc:
         if mode != "off":
             logger.warning(
@@ -3462,6 +3615,7 @@ __all__ = [
     "attach_event_current_labels",
     "attach_stft_score_summary",
     "build_chart_payload",
+    "build_summary_feature_chart_payload",
     "build_summary_payload",
     "canonical_channel_label",
 ]

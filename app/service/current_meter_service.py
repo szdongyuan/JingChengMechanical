@@ -7,6 +7,10 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Iterable
 
+from PyQt6.QtCore import Qt
+
+from app.service.run_persistence import CurrentTrace
+
 try:  # pragma: no cover - exercised by integration with installed dependency.
     from pymodbus.client import ModbusTcpClient
 except Exception:  # pragma: no cover - pymodbus may be absent in tests.
@@ -25,6 +29,33 @@ class CurrentSample:
     time_sec: float
     current_a: float
     monotonic_time: float | None = None
+
+
+def current_samples_to_trace(
+    samples: Iterable[CurrentSample],
+) -> CurrentTrace | None:
+    """Build a trace in arrival order while repairing software timestamps."""
+
+    pairs: list[tuple[float, float]] = []
+    previous_time: float | None = None
+    for sample in samples or ():
+        if not isinstance(sample, CurrentSample):
+            continue
+        try:
+            time_sec = float(sample.time_sec)
+            current_a = float(sample.current_a)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(time_sec) or not math.isfinite(current_a):
+            continue
+        time_sec = max(0.0, time_sec)
+        if previous_time is not None and time_sec <= previous_time:
+            time_sec = math.nextafter(previous_time, math.inf)
+        if not math.isfinite(time_sec):
+            continue
+        pairs.append((time_sec, current_a))
+        previous_time = time_sec
+    return CurrentTrace(samples=tuple(pairs)) if pairs else None
 
 
 def rebase_current_samples(
@@ -211,6 +242,13 @@ def build_current_trace_payload(
     times = [round(sample.time_sec, 6) for sample in normalized_samples]
     values = [round(sample.current_a, 6) for sample in normalized_samples]
     average = sum(values) / len(values)
+    # The collector joins a run between two PLC polls.  For display, extend
+    # the first observed value back to the run origin so the graph does not
+    # begin one poll interval after the audio graph.  Raw samples remain
+    # untouched for persistence and statistics.
+    if analysis_window is None and times[0] > 0.0:
+        times.insert(0, 0.0)
+        values.insert(0, values[0])
     payload = {
         "times_sec": times,
         "values_a": values,
@@ -272,12 +310,16 @@ class CurrentMeterCollector:
         *,
         client_factory: Callable[..., object] | None = None,
         time_func: Callable[[], float] | None = None,
+        time_origin: float | None = None,
         log_callback: Callable[[str], None] | None = None,
         sample_callback: Callable[[CurrentSample, tuple[CurrentSample, ...]], None] | None = None,
     ):
         self._config = normalize_current_meter_config(config)
         self._client_factory = client_factory
         self._time = time_func or time.monotonic
+        self._time_origin = (
+            None if time_origin is None else float(time_origin)
+        )
         self._log = log_callback
         self._sample_callback = sample_callback
         self._samples: list[CurrentSample] = []
@@ -299,7 +341,11 @@ class CurrentMeterCollector:
         if self._thread is not None and self._thread.is_alive():
             return True
         self._stop_event.clear()
-        self._start_time = self._time()
+        self._start_time = (
+            self._time()
+            if self._time_origin is None
+            else self._time_origin
+        )
         self._thread = threading.Thread(
             target=self._run,
             name="CurrentMeterCollector",
@@ -313,6 +359,8 @@ class CurrentMeterCollector:
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout)
+            if thread.is_alive():
+                raise TimeoutError("current collector stop timed out")
 
     def samples(self) -> list[CurrentSample]:
         with self._samples_lock:
@@ -461,19 +509,26 @@ class PlcCurrentCollector:
         *,
         bus,
         plc_id: int,
+        history=None,
         time_func: Callable[[], float] | None = None,
+        time_origin: float | None = None,
         log_callback: Callable[[str], None] | None = None,
         sample_callback: Callable[[CurrentSample, tuple[CurrentSample, ...]], None] | None = None,
     ):
         self._config = normalize_current_meter_config(config)
         self._bus = bus
         self._plc_id = int(plc_id)
+        self._history = history
+        self._subscription = None
         self._time = time_func or time.monotonic
+        self._time_origin = (
+            None if time_origin is None else float(time_origin)
+        )
         self._log = log_callback
         self._sample_callback = sample_callback
         self._samples: list[CurrentSample] = []
         self._samples_lock = threading.Lock()
-        self._state_lock = threading.Lock()
+        self._state_lock = threading.RLock()
         self._running = False
         self._start_time = 0.0
         self._last_callback_error = ""
@@ -491,13 +546,29 @@ class PlcCurrentCollector:
         with self._state_lock:
             if self._running:
                 return True
-            self._start_time = self._time()
+            self._start_time = (
+                self._time()
+                if self._time_origin is None
+                else self._time_origin
+            )
+            self._running = True
             try:
-                signal.connect(self._signal_handler)
+                if self._history is not None:
+                    self._subscription = self._history.subscribe(
+                        self._plc_id, self._start_time, self._signal_handler,
+                    )
+                else:
+                    signal.connect(
+                        self._signal_handler,
+                        Qt.ConnectionType.DirectConnection,
+                    )
             except Exception as exc:
+                self._running = False
                 self._log_message(f"PLC 电流采集启动失败: {exc}")
                 return False
-            self._running = True
+            subscription = self._subscription
+        if subscription is not None:
+            subscription.drain()
         return True
 
     def stop(self, timeout: float | None = None) -> None:
@@ -506,12 +577,20 @@ class PlcCurrentCollector:
             if not self._running:
                 return
             self._running = False
+            subscription = self._subscription
+            self._subscription = None
             signal = getattr(self._bus, "plc_current_sampled", None)
-            if signal is not None and callable(getattr(signal, "disconnect", None)):
+            if (
+                subscription is None
+                and signal is not None
+                and callable(getattr(signal, "disconnect", None))
+            ):
                 try:
                     signal.disconnect(self._signal_handler)
                 except (TypeError, RuntimeError):
                     pass
+        if subscription is not None:
+            subscription.close()
 
     def samples(self) -> list[CurrentSample]:
         with self._samples_lock:
@@ -554,8 +633,9 @@ class PlcCurrentCollector:
                 self._samples.append(sample)
                 if has_sample_callback:
                     samples_snapshot = tuple(self._samples)
-        if has_sample_callback:
-            self._notify_sample_callback(sample, samples_snapshot)
+            # Stop also waits for notification, not only sample storage.
+            if has_sample_callback:
+                self._notify_sample_callback(sample, samples_snapshot)
 
     def _notify_sample_callback(
         self,

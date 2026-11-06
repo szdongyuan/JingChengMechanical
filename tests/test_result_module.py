@@ -194,12 +194,10 @@ def _state(
     run_phase: str,
     *,
     displayed_config_id: int | None = None,
-    active_config_id: int | None = None,
     selected_config_ids: tuple[int, ...] = (101, 202),
 ) -> FactoryControllerState:
     return FactoryControllerState(
         selected_config_ids=selected_config_ids,
-        active_config_id=active_config_id,
         displayed_config_id=displayed_config_id,
         run_phase=run_phase,
         trigger_source="manual" if displayed_config_id is not None else None,
@@ -300,7 +298,7 @@ def test_result_module_updates_live_metrics_only_for_current_run_and_channel(qap
         "channels": [{"channel_index": 1, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -350,7 +348,7 @@ def test_result_module_live_metric_frames_use_cached_config_after_refresh(qapp, 
 
     module.services.config_service = SimpleNamespace(load_config=load_config)
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -397,7 +395,7 @@ def test_result_module_non_current_spl_frames_reuse_displayed_config_metadata(qa
 
     module.services.config_service = SimpleNamespace(load_config=load_config)
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -443,7 +441,7 @@ def test_result_module_throttles_only_spl_metric_repaint_while_updating_cache(
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -494,7 +492,7 @@ def test_result_module_spl_throttle_uses_finite_frame_time_over_wall_clock(
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -537,7 +535,7 @@ def test_result_module_spl_throttle_uses_one_clock_after_missing_frame_time(
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -588,7 +586,7 @@ def test_result_module_spl_throttle_uses_monotonic_fallback_for_nonfinite_frame_
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -626,7 +624,7 @@ def test_result_module_selected_channel_refresh_bypasses_spl_throttle(qapp):
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -660,7 +658,7 @@ def test_result_module_invalid_spl_clears_repaint_timestamp_and_next_valid_repai
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -699,7 +697,7 @@ def test_result_module_loudness_repaints_immediately_without_forcing_spl_repaint
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -737,7 +735,7 @@ def test_result_module_matching_invalid_spl_clears_only_spl_metric(qapp):
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -777,7 +775,7 @@ def test_result_module_matching_invalid_loudness_clears_only_loudness_metric(qap
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -845,7 +843,7 @@ def test_result_module_preserves_live_metric_caches_when_selected_channel_change
         ],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -994,7 +992,7 @@ def test_result_module_review_averages_render_only_in_reviewing_or_stopped(qapp,
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state(phase, displayed_config_id=101, active_config_id=101)
+        _state(phase, displayed_config_id=101)
     )
     module.services.bus.factory_review_changed.emit(
         _make_review_payload(
@@ -1172,7 +1170,7 @@ def test_result_module_hides_metrics_when_provider_channel_is_not_selected(qapp)
     })
 
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -1211,7 +1209,7 @@ def test_result_module_hides_metrics_when_selected_channel_config_is_missing(qap
     })
 
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -1296,7 +1294,7 @@ def test_result_module_clears_live_run_when_displayed_config_changes(qapp):
     })
 
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -1307,7 +1305,7 @@ def test_result_module_clears_live_run_when_displayed_config_changes(qapp):
     assert module.lb_spl_metric_value.text() == "61.0 dB"
 
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=202, active_config_id=202)
+        _state("running", displayed_config_id=202)
     )
     assert module.lb_spl_metric_value.text() == "--"
     assert (101, "run-101", 0) not in module._live_spl_by_key
@@ -1328,7 +1326,7 @@ def test_result_module_new_matching_start_clears_prior_live_metrics_and_rejects_
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-1", trigger_source="manual")
@@ -1364,7 +1362,7 @@ def test_result_module_runtime_start_for_active_non_displayed_config_does_not_re
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=202, active_config_id=101)
+        _state("running", displayed_config_id=202)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=202, run_id="run-202", trigger_source="manual")
@@ -1389,7 +1387,7 @@ def test_result_module_preserves_latest_live_metrics_during_analyzing_until_revi
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -1398,7 +1396,7 @@ def test_result_module_preserves_latest_live_metrics_during_analyzing_until_revi
     module.services.bus.loudness_updated.emit(101, "run-101", 0, SimpleNamespace(loudness_sone=1.25))
 
     module.services.bus.factory_state_changed.emit(
-        _state("analyzing", displayed_config_id=101, active_config_id=101)
+        _state("analyzing", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_analyzing_entered.emit(
         SimpleNamespace(config_id=101, run_id="run-101")
@@ -1430,7 +1428,7 @@ def test_result_module_factory_display_reset_clears_metrics_and_live_run(qapp):
         "channels": [{"channel_index": 0, "loudness_unit": "sone"}],
     })
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
     module.services.bus.factory_runtime_start_accepted.emit(
         SimpleNamespace(config_id=101, run_id="run-101", trigger_source="manual")
@@ -1723,7 +1721,6 @@ def test_result_module_shows_analysis_in_progress_when_summary_payload_is_missin
         _state(
             phase,
             displayed_config_id=101,
-            active_config_id=101 if phase == "analyzing" else None,
         )
     )
     module.services.bus.factory_review_changed.emit(
@@ -1740,7 +1737,7 @@ def test_result_module_keeps_in_progress_badge_when_plain_stopped_preserves_disp
     module = _make_module()
 
     module.services.bus.factory_state_changed.emit(
-        _state("running", displayed_config_id=101, active_config_id=101)
+        _state("running", displayed_config_id=101)
     )
 
     assert module.lb_overall.text() == "分析中"

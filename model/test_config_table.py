@@ -4,6 +4,7 @@ from peewee import (
     FloatField,
     ForeignKeyField,
     IntegerField,
+    SQL,
     TextField,
 )
 
@@ -39,6 +40,14 @@ class TestConfigTable(BaseModel):
     output_device_hostapi = TextField(null=True)
     output_device_samplerate = FloatField(null=True)
     selected_channels = TextField(default='[]')
+    fault_types_json = TextField(
+        default="[]",
+        constraints=[SQL("DEFAULT '[]'")],
+    )
+    manual_judgment_buttons_visible = BooleanField(
+        default=False,
+        constraints=[SQL("DEFAULT 0")],
+    )
     vibration_view_channel_index = IntegerField(null=True, default=None)
     result_dashboard_layout = TextField(null=True, default=None)
     analysis_window_offset_ms = IntegerField(default=0)

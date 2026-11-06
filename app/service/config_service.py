@@ -17,6 +17,11 @@ from app.service.current_meter_service import (
     normalize_current_meter_config,
     validate_current_meter_config,
 )
+from app.service.fault_types import (
+    decode_fault_types_json,
+    encode_fault_types_json,
+    normalize_fault_types,
+)
 from app.service.golden_sample_service import GoldenSampleService, StagedGoldenSample
 from app.service.result_dashboard_layout import (
     DEFAULT_RESULT_DASHBOARD_LAYOUT,
@@ -27,11 +32,19 @@ from app.service.result_dashboard_layout import (
 )
 from consts.time_consts import now_str
 from model.channel_config_table import ChannelConfigTable
-from model.device_table import DeviceTable
+from model.input_hardware_table import InputHardwareTable
 from model.plc_table import PlcTable
 from model.test_config_table import TestConfigTable
 
 logger = logging.getLogger(__name__)
+
+_INVALID_INPUT_HARDWARE_ERROR = (
+    "\u5fc5\u987b\u9009\u62e9\u6709\u6548\u7684\u8f93\u5165\u786c\u4ef6\u8bbe\u5907"
+)
+_UNAVAILABLE_INPUT_HARDWARE_ERROR = (
+    "\u6240\u9009\u8f93\u5165\u786c\u4ef6\u8bbe\u5907\u4e0d\u53ef\u7528"
+)
+_UNRESOLVED_MANAGED_COUNT = object()
 
 # Default values for new channel configs
 _CHANNEL_DEFAULTS = {
@@ -156,7 +169,7 @@ _VALID_FFT_X_AXIS_SCALES = {"linear", "log"}
 _VALID_STFT_SCORE_SUMMARY_MODES = {"percentile", "mean", "min"}
 MONITOR_GAIN_DEFAULT_DB = 0.0
 MONITOR_GAIN_MIN_DB = -60.0
-MONITOR_GAIN_MAX_DB = 24.0
+MONITOR_GAIN_MAX_DB = 35.0
 _MONITOR_CONFIG_FIELDS = ("monitor_channel_index", "monitor_gain_db")
 _CURRENT_METER_SOURCES = frozenset({"modbus_tcp", "plc"})
 _CURRENT_METER_CONFIG_FIELDS = (
@@ -193,11 +206,24 @@ _CONFIG_LOAD_FIELD_NAMES = (
     "output_device_hostapi",
     "output_device_samplerate",
     "selected_channels",
+    "fault_types_json",
+    "manual_judgment_buttons_visible",
     "vibration_view_channel_index",
     "result_dashboard_layout",
     *_MONITOR_CONFIG_FIELDS,
     *_CURRENT_METER_CONFIG_FIELDS,
 )
+
+
+def _normalize_manual_judgment_buttons_visible(data: dict) -> bool:
+    if "manual_judgment_buttons_visible" in data:
+        value = data["manual_judgment_buttons_visible"]
+        if type(value) is not bool:
+            raise ValueError(
+                "manual_judgment_buttons_visible must be a boolean"
+            )
+        return value
+    return False
 
 
 @dataclass(frozen=True)
@@ -267,7 +293,8 @@ class ConfigService:
         fields = [
             TestConfigTable._meta.fields[field_name]
             for field_name in _CONFIG_LOAD_FIELD_NAMES
-            if self._config_field_exists(field_name, available_columns)
+            if field_name == "fault_types_json"
+            or self._config_field_exists(field_name, available_columns)
         ]
         cfg = (
             TestConfigTable.select(*fields)
@@ -279,6 +306,14 @@ class ConfigService:
             raise TestConfigTable.DoesNotExist
 
         selected_channels = self._parse_json(cfg.get("selected_channels"), [])
+        fault_types = decode_fault_types_json(cfg["fault_types_json"])
+        manual_judgment_buttons_visible = (
+            cfg.get("manual_judgment_buttons_visible", False)
+        )
+        if type(manual_judgment_buttons_visible) is not bool:
+            raise ValueError(
+                "manual_judgment_buttons_visible must be a boolean"
+            )
         result = {
             "config_id": cfg["config_id"],
             "config_name": cfg["config_name"],
@@ -297,6 +332,8 @@ class ConfigService:
             "output_device_hostapi": cfg.get("output_device_hostapi"),
             "output_device_samplerate": cfg.get("output_device_samplerate"),
             "selected_channels": selected_channels,
+            "fault_types": list(fault_types),
+            "manual_judgment_buttons_visible": manual_judgment_buttons_visible,
             "vibration_view_channel_index": cfg.get("vibration_view_channel_index"),
             "monitor_channel_index": None,
             "monitor_gain_db": self._normalize_monitor_gain(
@@ -516,9 +553,11 @@ class ConfigService:
         )
         if result_dashboard_layout_error is not None:
             result["_result_dashboard_layout_error"] = result_dashboard_layout_error
+        managed_channel_count, _ = self._resolve_managed_channel_count(result)
         result["monitor_channel_index"] = self._resolve_monitor_channel_index(
             cfg.get("monitor_channel_index"),
             selected_channels=result["selected_channels"],
+            managed_channel_count=managed_channel_count,
         )
         return result
 
@@ -573,6 +612,8 @@ class ConfigService:
                     "allow_incomplete_recording_analysis": False,
                     "scan_triggers_test": False,
                     "selected_channels": "[]",
+                    "fault_types_json": "[]",
+                    "manual_judgment_buttons_visible": False,
                     "result_dashboard_layout": serialize_result_dashboard_layout(
                         DEFAULT_RESULT_DASHBOARD_LAYOUT
                     ),
@@ -690,6 +731,12 @@ class ConfigService:
         golden_asset_paths_by_channel: dict[int, dict] | None = None,
     ) -> dict:
         source = deepcopy(payload or {})
+        if "fault_types" not in source:
+            raise ValueError("fault_types is required")
+        fault_types = normalize_fault_types(source["fault_types"])
+        manual_judgment_buttons_visible = (
+            _normalize_manual_judgment_buttons_visible(source)
+        )
         channels = source.get("channels", [])
         if not isinstance(channels, list):
             channels = []
@@ -741,6 +788,8 @@ class ConfigService:
             ),
             "scan_triggers_test": source.get("scan_triggers_test", False),
             "plc_id": None,
+            "fault_types": list(fault_types),
+            "manual_judgment_buttons_visible": manual_judgment_buttons_visible,
             "input_hardware_device_id": source.get("input_hardware_device_id"),
             "input_device_name": source.get("input_device_name"),
             "input_device_hostapi": source.get("input_device_hostapi"),
@@ -891,15 +940,35 @@ class ConfigService:
             return True
         return False
 
-    def get_channel_count(self) -> int:
+    @staticmethod
+    def _resolve_managed_channel_count(
+        data: dict,
+    ) -> tuple[int | None, str | None]:
+        hardware_id = data.get("input_hardware_device_id")
+        if type(hardware_id) is not int or hardware_id <= 0:
+            return None, _INVALID_INPUT_HARDWARE_ERROR
         try:
-            row = DeviceTable.get_by_id(1)
-            return int(row.input_channel_count)
+            row = InputHardwareTable.get_by_id(hardware_id)
         except Exception:
-            return 0
+            return None, _UNAVAILABLE_INPUT_HARDWARE_ERROR
+        channel_count = row.channel_count
+        if type(channel_count) is not int or channel_count <= 0:
+            return None, _UNAVAILABLE_INPUT_HARDWARE_ERROR
+        return channel_count, None
 
     def validate(self, data: dict) -> list[str]:
         errors = []
+        try:
+            _normalize_manual_judgment_buttons_visible(data)
+        except ValueError as exc:
+            errors.append(str(exc))
+        if "fault_types" not in data:
+            errors.append("fault_types is required")
+        else:
+            try:
+                normalize_fault_types(data["fault_types"])
+            except ValueError as exc:
+                errors.append(str(exc))
         name = data.get("config_name", "").strip()
         if not name:
             errors.append("配置名称不能为空")
@@ -933,7 +1002,16 @@ class ConfigService:
             elif not PlcTable.select().where(PlcTable.id == plc_id).exists():
                 errors.append("PLC 不存在或已被删除")
 
-        errors.extend(self.validate_factory_runtime(data))
+        managed_count_result = self._resolve_managed_channel_count(data)
+        managed_channel_count, managed_input_error = managed_count_result
+        if managed_input_error is not None:
+            errors.append(managed_input_error)
+        errors.extend(
+            self.validate_factory_runtime(
+                data,
+                _managed_count_result=managed_count_result,
+            )
+        )
         current_meter = _normalize_current_meter_with_source(data.get("current_meter"))
         if current_meter["enabled"] and current_meter["source"] == "plc":
             if plc_id is None:
@@ -966,8 +1044,10 @@ class ConfigService:
             ):
                 errors.append("监听通道必须为不小于 0 的整数")
             else:
-                input_channel_count = self.get_channel_count()
-                if input_channel_count > 0 and monitor_channel >= input_channel_count:
+                if (
+                    managed_channel_count is not None
+                    and monitor_channel >= managed_channel_count
+                ):
                     errors.append("监听通道必须小于输入通道数")
 
         monitor_gain = data.get("monitor_gain_db", MONITOR_GAIN_DEFAULT_DB)
@@ -1085,7 +1165,12 @@ class ConfigService:
         )
         return errors
 
-    def _validate_vibration_view_channel(self, data: dict) -> list[str]:
+    def _validate_vibration_view_channel(
+        self,
+        data: dict,
+        *,
+        managed_channel_count: int | None,
+    ) -> list[str]:
         vibration_channel = data.get("vibration_view_channel_index")
         if vibration_channel is None:
             return []
@@ -1096,8 +1181,10 @@ class ConfigService:
         ):
             return ["振动视图通道必须为不小于 0 的整数"]
 
-        input_channel_count = self.get_channel_count()
-        if input_channel_count > 0 and vibration_channel >= input_channel_count:
+        if (
+            managed_channel_count is not None
+            and vibration_channel >= managed_channel_count
+        ):
             return ["振动视图通道必须小于输入通道数"]
 
         selected_channels = data.get("selected_channels", [])
@@ -1105,8 +1192,18 @@ class ConfigService:
             return ["振动视图通道必须来自已选择通道"]
         return []
 
-    def validate_factory_runtime(self, data: dict) -> list[str]:
+    def validate_factory_runtime(
+        self,
+        data: dict,
+        *,
+        _managed_count_result=_UNRESOLVED_MANAGED_COUNT,
+    ) -> list[str]:
         errors = []
+        if _managed_count_result is _UNRESOLVED_MANAGED_COUNT:
+            _managed_count_result = self._resolve_managed_channel_count(data)
+            if _managed_count_result[1] is not None:
+                errors.append(_managed_count_result[1])
+        managed_channel_count = _managed_count_result[0]
         selected_channels = data.get("selected_channels", [])
         if isinstance(selected_channels, (list, tuple)) and len(selected_channels) > 2:
             errors.append("最多选择两个通道")
@@ -1128,7 +1225,12 @@ class ConfigService:
                 if window_end_ms > record_duration_ms:
                     errors.append("分析窗起始偏移加分析时长不能超过录音时长")
 
-        errors.extend(self._validate_vibration_view_channel(data))
+        errors.extend(
+            self._validate_vibration_view_channel(
+                data,
+                managed_channel_count=managed_channel_count,
+            )
+        )
         return errors
 
     def _validate_stft_score_fields(self, prefix: str, channel: dict) -> list[str]:
@@ -1707,6 +1809,9 @@ class ConfigService:
 
     def _config_row_values(self, data: dict) -> dict:
         analysis_window_offset_ms = int(data.get("analysis_window_offset_ms", 0))
+        manual_judgment_buttons_visible = (
+            _normalize_manual_judgment_buttons_visible(data)
+        )
         values = {
             "config_name": data["config_name"].strip(),
             "record_duration": data["record_duration"],
@@ -1724,8 +1829,18 @@ class ConfigService:
             "output_device_hostapi": data.get("output_device_hostapi"),
             "output_device_samplerate": data.get("output_device_samplerate"),
             "selected_channels": json.dumps(data.get("selected_channels", [])),
+            "fault_types_json": encode_fault_types_json(data["fault_types"]),
         }
         available_columns = self._config_table_columns()
+        if "fault_types_json" not in available_columns:
+            raise ValueError("test_config_table is missing fault_types_json")
+        if self._config_field_exists(
+            "manual_judgment_buttons_visible",
+            available_columns,
+        ):
+            values["manual_judgment_buttons_visible"] = (
+                manual_judgment_buttons_visible
+            )
         if self._config_field_exists(
             "input_hardware_device_id", available_columns
         ):
@@ -1808,6 +1923,11 @@ class ConfigService:
 
     def _insert_config_row_values(self, values: dict) -> int:
         available_columns = self._config_table_columns()
+        if (
+            "fault_types_json" in values
+            and "fault_types_json" not in available_columns
+        ):
+            raise ValueError("test_config_table is missing fault_types_json")
         filtered_values = {
             field_name: value
             for field_name, value in values.items()
@@ -1852,6 +1972,7 @@ class ConfigService:
         value,
         *,
         selected_channels: list,
+        managed_channel_count: int | None,
     ) -> int | None:
         if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
             return value
@@ -1862,7 +1983,7 @@ class ConfigService:
                 and channel_index >= 0
             ):
                 return channel_index
-        if self.get_channel_count() > 0:
+        if managed_channel_count is not None:
             return 0
         return None
 

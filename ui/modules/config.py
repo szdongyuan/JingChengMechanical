@@ -3,10 +3,11 @@ from __future__ import annotations
 import copy
 from contextlib import contextmanager
 
-from PyQt6.QtCore import QPoint, Qt, QTimer
-from PyQt6.QtGui import QWheelEvent
+from PyQt6.QtCore import QPoint, QRect, Qt, QTimer
+from PyQt6.QtGui import QStandardItem, QStandardItemModel, QWheelEvent
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -28,17 +29,35 @@ from PyQt6.QtWidgets import (
     QScrollArea,
     QSpinBox,
     QStackedWidget,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
 from app.service.current_meter_service import current_meter_display_unit, normalize_current_meter_config
+from app.service.fault_types import (
+    normalize_fault_type_name,
+    parse_fault_types_editor,
+    render_fault_types_editor,
+)
 from app.service.result_dashboard_layout import (
     normalize_result_dashboard_layout,
     normalize_result_dashboard_layout_for_display,
 )
 from model.plc_table import PlcTable
+from model.malfunction_type_table import (
+    MalfunctionTypeTable,
+    ensure_builtin_malfunction_type,
+    is_builtin_malfunction_type_id,
+)
 from ui.popups import config_package_dialogs
+from ui.popups.factory_config_selection_dialog import (
+    FactoryConfigSelectionDialog,
+)
 from ui.popups.golden_sample_import_dialog import GoldenSampleImportDialog
 from ui.widgets.cards import Card
 from ui.widgets.collapsible_group_box import CollapsibleGroupBox
@@ -87,11 +106,371 @@ class _NoWheelComboBox(QComboBox):
         event.ignore()
 
 
+class _FaultTypeCheckDelegate(QStyledItemDelegate):
+    """让下拉列表里的勾选项显示成真正的选择框。"""
+
+    def paint(self, painter, option, index):
+        widget = option.widget
+        style = widget.style() if widget is not None else QApplication.style()
+        style.drawPrimitive(
+            QStyle.PrimitiveElement.PE_PanelItemViewItem,
+            option,
+            painter,
+            widget,
+        )
+
+        indicator_width = style.pixelMetric(
+            QStyle.PixelMetric.PM_IndicatorWidth,
+            None,
+            widget,
+        )
+        indicator_height = style.pixelMetric(
+            QStyle.PixelMetric.PM_IndicatorHeight,
+            None,
+            widget,
+        )
+        indicator_rect = QRect(
+            option.rect.left() + 8,
+            option.rect.top() + (option.rect.height() - indicator_height) // 2,
+            indicator_width,
+            indicator_height,
+        )
+
+        check_option = QStyleOptionButton()
+        check_option.rect = indicator_rect
+        check_option.state = QStyle.StateFlag.State_Enabled
+        if index.data(Qt.ItemDataRole.CheckStateRole) == Qt.CheckState.Checked:
+            check_option.state |= QStyle.StateFlag.State_On
+        else:
+            check_option.state |= QStyle.StateFlag.State_Off
+        style.drawControl(
+            QStyle.ControlElement.CE_CheckBox,
+            check_option,
+            painter,
+            widget,
+        )
+
+        text_rect = option.rect.adjusted(indicator_width + 18, 0, -6, 0)
+        style.drawItemText(
+            painter,
+            text_rect,
+            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+            option.palette,
+            True,
+            str(index.data(Qt.ItemDataRole.DisplayRole) or ""),
+        )
+
+
+class _FaultTypeMultiSelectCombo(_NoWheelComboBox):
+    """多选故障类型下拉框，显示值仍保持逗号分隔。"""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self._selected_names: list[str] = []
+        self._skip_next_hide = False
+        self._model = QStandardItemModel(self)
+        self.setModel(self._model)
+        self.setEditable(True)
+        self.lineEdit().setReadOnly(True)
+        self.lineEdit().setPlaceholderText("请选择故障类型")
+        self.view().setItemDelegate(_FaultTypeCheckDelegate(self.view()))
+        self.view().pressed.connect(self._toggle_item)
+        self.refresh_options()
+
+    def text(self) -> str:
+        return ", ".join(self._selected_names)
+
+    def setText(self, value: object):
+        try:
+            self._selected_names = parse_fault_types_editor(str(value or ""))
+        except ValueError:
+            self._selected_names = []
+        self.refresh_options()
+        self._refresh_display()
+
+    def refresh_options(self):
+        ensure_builtin_malfunction_type()
+        checked = list(self._selected_names)
+        self._model.clear()
+        seen: set[str] = set()
+        try:
+            rows = list(
+                MalfunctionTypeTable.select().order_by(MalfunctionTypeTable.id)
+            )
+        except Exception:
+            rows = []
+
+        for row in rows:
+            name = str(row.malfunction_name or "").strip()
+            if not name:
+                continue
+            number = str(row.malfunction_number or "").strip()
+            label = f"{name}（{number}）" if number else name
+            self._add_option(label, name, name in checked)
+            seen.add(name)
+
+        # 兼容已经保存过、但后来从故障类型表里删掉的配置值。
+        for name in checked:
+            if name not in seen:
+                self._add_option(f"{name}（未建档）", name, True)
+
+        self._selected_names = self._checked_names()
+        self._refresh_display()
+
+    def showPopup(self):
+        self.refresh_options()
+        super().showPopup()
+
+    def hidePopup(self):
+        if self._skip_next_hide:
+            self._skip_next_hide = False
+            return
+        self._selected_names = self._checked_names()
+        self._refresh_display()
+        super().hidePopup()
+
+    def _add_option(self, label: str, name: str, checked: bool):
+        item = QStandardItem(label)
+        item.setData(name, Qt.ItemDataRole.UserRole)
+        item.setCheckable(True)
+        item.setCheckState(
+            Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        )
+        item.setFlags(
+            Qt.ItemFlag.ItemIsEnabled
+            | Qt.ItemFlag.ItemIsSelectable
+            | Qt.ItemFlag.ItemIsUserCheckable
+        )
+        self._model.appendRow(item)
+
+    def _toggle_item(self, index):
+        item = self._model.itemFromIndex(index)
+        if item is None:
+            return
+        item.setCheckState(
+            Qt.CheckState.Unchecked
+            if item.checkState() == Qt.CheckState.Checked
+            else Qt.CheckState.Checked
+        )
+        self._skip_next_hide = True
+        QTimer.singleShot(0, self._refresh_display)
+
+    def _checked_names(self) -> list[str]:
+        names: list[str] = []
+        for row in range(self._model.rowCount()):
+            item = self._model.item(row)
+            if item.checkState() != Qt.CheckState.Checked:
+                continue
+            name = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+            if name and name not in names:
+                names.append(name)
+        return names
+
+    def _refresh_display(self):
+        display = ", ".join(self._selected_names)
+        self.lineEdit().setText(display)
+        self.setToolTip(display)
+
+
 class _NoWheelPlainTextEdit(QPlainTextEdit):
     """QPlainTextEdit that ignores mouse wheel events."""
 
     def wheelEvent(self, event: QWheelEvent):
         event.ignore()
+
+
+class _MalfunctionTypeManageDialog(QDialog):
+    """配置页里的故障类型管理弹窗。"""
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.setWindowTitle("故障类型管理")
+        self.resize(680, 460)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        self.table = QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["ID", "故障编号", "故障名称", "备注"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.horizontalHeader().setSectionResizeMode(
+            0,
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            1,
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            2,
+            QHeaderView.ResizeMode.ResizeToContents,
+        )
+        self.table.horizontalHeader().setSectionResizeMode(
+            3,
+            QHeaderView.ResizeMode.Stretch,
+        )
+        root.addWidget(self.table, 1)
+
+        form_host = QWidget()
+        form = QFormLayout(form_host)
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(8)
+
+        self.ed_number = QLineEdit()
+        self.ed_number.setPlaceholderText("例如：dd")
+        self.ed_name = QLineEdit()
+        self.ed_name.setPlaceholderText("例如：异音")
+        self.ed_notes = QLineEdit()
+        self.ed_notes.setPlaceholderText("可不填")
+
+        form.addRow("故障编号", self.ed_number)
+        form.addRow("故障名称", self.ed_name)
+        form.addRow("备注", self.ed_notes)
+        root.addWidget(form_host)
+
+        actions = QHBoxLayout()
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(8)
+
+        self.btn_add = QPushButton("新增")
+        self.btn_add.setObjectName("Primary")
+        self.btn_delete = QPushButton("删除选中")
+        self.btn_delete.setObjectName("Danger")
+        self.btn_close = QPushButton("关闭")
+
+        actions.addWidget(self.btn_add)
+        actions.addWidget(self.btn_delete)
+        actions.addStretch(1)
+        actions.addWidget(self.btn_close)
+        root.addLayout(actions)
+
+        self.btn_add.clicked.connect(self._add_type)
+        self.btn_delete.clicked.connect(self._delete_selected_type)
+        self.btn_close.clicked.connect(self.accept)
+        self.table.itemSelectionChanged.connect(self._fill_inputs_from_selected)
+
+        self._reload_rows()
+
+    def _reload_rows(self):
+        try:
+            ensure_builtin_malfunction_type()
+            rows = list(
+                MalfunctionTypeTable.select().order_by(MalfunctionTypeTable.id)
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "读取失败", f"无法读取故障类型表：{exc}")
+            rows = []
+
+        self.table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            values = [
+                row.id,
+                row.malfunction_number,
+                row.malfunction_name,
+                row.malfunction_notes or "",
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(str(value))
+                item.setTextAlignment(
+                    Qt.AlignmentFlag.AlignCenter | Qt.AlignmentFlag.AlignVCenter
+                )
+                if column == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, int(row.id))
+                self.table.setItem(row_index, column, item)
+
+    def _selected_type_id(self) -> int | None:
+        row = self.table.currentRow()
+        if row < 0:
+            return None
+        item = self.table.item(row, 0)
+        if item is None:
+            return None
+        value = item.data(Qt.ItemDataRole.UserRole)
+        return int(value) if value is not None else None
+
+    def _selected_type_name(self) -> str:
+        row = self.table.currentRow()
+        if row < 0:
+            return ""
+        item = self.table.item(row, 2)
+        return "" if item is None else item.text().strip()
+
+    def _fill_inputs_from_selected(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return
+        self.ed_number.setText(self.table.item(row, 1).text())
+        self.ed_name.setText(self.table.item(row, 2).text())
+        self.ed_notes.setText(self.table.item(row, 3).text())
+
+    def _add_type(self):
+        number = self.ed_number.text().strip()
+        name = self.ed_name.text().strip()
+        notes = self.ed_notes.text().strip()
+        if not number:
+            QMessageBox.warning(self, "提示", "请填写故障编号。")
+            self.ed_number.setFocus()
+            return
+        try:
+            name = normalize_fault_type_name(name)
+        except ValueError as exc:
+            QMessageBox.warning(self, "提示", f"故障名称不正确：{exc}")
+            self.ed_name.setFocus()
+            return
+
+        if (
+            MalfunctionTypeTable.select()
+            .where(
+                (MalfunctionTypeTable.malfunction_number == number)
+                | (MalfunctionTypeTable.malfunction_name == name)
+            )
+            .exists()
+        ):
+            QMessageBox.warning(self, "提示", "故障编号或故障名称已存在。")
+            return
+
+        try:
+            MalfunctionTypeTable.create(
+                malfunction_number=number,
+                malfunction_name=name,
+                malfunction_notes=notes or None,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "新增失败", str(exc))
+            return
+
+        self.ed_number.clear()
+        self.ed_name.clear()
+        self.ed_notes.clear()
+        self._reload_rows()
+
+    def _delete_selected_type(self):
+        type_id = self._selected_type_id()
+        if type_id is None:
+            QMessageBox.warning(self, "提示", "请先选择一条故障类型。")
+            return
+        if is_builtin_malfunction_type_id(type_id):
+            QMessageBox.warning(self, "提示", "系统默认“不良”类型不能删除。")
+            return
+        if (
+            QMessageBox.question(self, "确认删除", "确定删除选中的故障类型吗？")
+            != QMessageBox.StandardButton.Yes
+        ):
+            return
+        try:
+            MalfunctionTypeTable.delete().where(
+                MalfunctionTypeTable.id == type_id
+            ).execute()
+        except Exception as exc:
+            QMessageBox.warning(self, "删除失败", str(exc))
+            return
+        self._reload_rows()
 
 
 class _ConfigSectionCardDialog(QDialog):
@@ -395,6 +774,7 @@ class ConfigModule(QWidget):
         self._top_level_config_dialogs: dict[str, _ConfigSectionCardDialog] = {}
         self._loaded_config_editor_snapshot: dict | None = None
         self._restoring_config_selection = False
+        self._factory_selection_dialog: FactoryConfigSelectionDialog | None = None
         self._result_dashboard_layout = normalize_result_dashboard_layout(None)
         self._result_dashboard_layout_error = None
 
@@ -432,6 +812,12 @@ class ConfigModule(QWidget):
         btn_lay.addWidget(self.btn_import)
         btn_lay.addWidget(self.btn_export)
         left_lay.addWidget(btn_row)
+
+        self.btn_select_active_configs = QPushButton("选择使用配置")
+        self.btn_select_active_configs.setObjectName(
+            "select_active_factory_configs"
+        )
+        left_lay.addWidget(self.btn_select_active_configs)
 
         self.config_list = QListWidget()
         self.config_list.setSelectionMode(
@@ -519,6 +905,35 @@ class ConfigModule(QWidget):
 
         scroll_lay.addWidget(Card("全局参数", global_form))
 
+        manual_judgment_form = QWidget()
+        manual_judgment_lay = QFormLayout(manual_judgment_form)
+        manual_judgment_lay.setContentsMargins(0, 0, 0, 0)
+        manual_judgment_lay.setHorizontalSpacing(10)
+        manual_judgment_lay.setVerticalSpacing(8)
+
+        self.chk_manual_judgment_buttons_visible = QCheckBox(
+            "在主页结果中显示人工标注按钮"
+        )
+        self.chk_manual_judgment_buttons_visible.setObjectName(
+            "manual_judgment_buttons_visible"
+        )
+        manual_judgment_lay.addRow(self.chk_manual_judgment_buttons_visible)
+
+        self.fault_types_editor = _FaultTypeMultiSelectCombo()
+        self.fault_types_editor.setObjectName("fault_types_editor")
+        fault_types_row = QWidget()
+        fault_types_lay = QHBoxLayout(fault_types_row)
+        fault_types_lay.setContentsMargins(0, 0, 0, 0)
+        fault_types_lay.setSpacing(6)
+        self.btn_manage_fault_types = QPushButton("故障类型管理")
+        self.btn_manage_fault_types.setFixedWidth(120)
+        fault_types_lay.addWidget(self.fault_types_editor, 1)
+        fault_types_lay.addWidget(self.btn_manage_fault_types)
+        manual_judgment_lay.addRow("故障类型", fault_types_row)
+
+        self.manual_judgment_group = Card("人工标注", manual_judgment_form)
+        scroll_lay.addWidget(self.manual_judgment_group)
+
         # PLC binding remains visible at the top level.
         plc_form = QWidget()
         plc_lay = QFormLayout(plc_form)
@@ -591,7 +1006,7 @@ class ConfigModule(QWidget):
 
         self.spin_monitor_gain_db = _NoWheelSpinBox()
         self.spin_monitor_gain_db.setObjectName("spin_monitor_gain_db")
-        self.spin_monitor_gain_db.setRange(-60.0, 24.0)
+        self.spin_monitor_gain_db.setRange(-60.0, 35.0)
         self.spin_monitor_gain_db.setSingleStep(1.0)
         self.spin_monitor_gain_db.setDecimals(1)
         self.spin_monitor_gain_db.setSuffix(" dB")
@@ -835,7 +1250,13 @@ class ConfigModule(QWidget):
         self.btn_delete.clicked.connect(self._on_delete)
         self.btn_import.clicked.connect(self._on_import_package)
         self.btn_export.clicked.connect(self._on_export_package)
+        self.btn_select_active_configs.clicked.connect(
+            self._open_factory_config_selection_dialog
+        )
         self.btn_save.clicked.connect(self._on_save)
+        self.btn_manage_fault_types.clicked.connect(
+            self._open_malfunction_type_dialog
+        )
         self.config_list.currentItemChanged.connect(self._on_item_changed)
         self.combo_input_dev.currentIndexChanged.connect(self._on_input_device_changed)
         self.combo_monitor_channel.currentIndexChanged.connect(
@@ -876,6 +1297,11 @@ class ConfigModule(QWidget):
         plc_changed = getattr(self.services.bus, "plc_changed", None)
         if plc_changed is not None:
             plc_changed.connect(self._on_plc_changed)
+
+    def _open_malfunction_type_dialog(self):
+        dialog = _MalfunctionTypeManageDialog(self)
+        dialog.exec()
+        self.fault_types_editor.refresh_options()
 
     def _populate_devices(self):
         """Populate the input combo from the managed hardware registry."""
@@ -1334,26 +1760,138 @@ class ConfigModule(QWidget):
                     return
         self._on_channel_tab_clicked(0)
 
-    def _apply_loaded_config_state(self, config_id: int, loaded: dict) -> None:
-        self._skip_reload = True
-        try:
-            self._refresh_list()
-            self._select_config_by_id(config_id)
-        finally:
-            self._skip_reload = False
-        self._current_config_id = config_id
-        self._populate_detail(loaded)
+    def _capture_config_load_transaction_state(self) -> dict:
+        return {
+            "config_id": self._current_config_id,
+            "editor_snapshot": self._capture_editor_snapshot(),
+            "clean_snapshot": copy.deepcopy(
+                self._loaded_config_editor_snapshot
+            ),
+            "loaded_ai_binding_state": copy.deepcopy(
+                self._loaded_ai_binding_state
+            ),
+            "ai_binding_dirty": self._ai_binding_dirty,
+            "golden_editor_state": copy.deepcopy(self._golden_editor_state),
+            "section_state": self._capture_collapsible_section_state(),
+            "selected_channel_index": self._selected_channel_index(),
+            "empty_label_visible": not self.empty_label.isHidden(),
+            "detail_visible": not self.detail.isHidden(),
+            "delete_enabled": self.btn_delete.isEnabled(),
+            "export_enabled": self.btn_export.isEnabled(),
+            "save_enabled": self.btn_save.isEnabled(),
+        }
 
-    def _reload_authoritative_config_state(self, config_id: int) -> None:
-        loaded = self.services.config_service.load_config(config_id)
-        self._apply_loaded_config_state(config_id, loaded)
+    def _restore_ai_binding_transaction_state(
+        self,
+        *,
+        editor_state: dict,
+        loaded_state: dict,
+        dirty: bool,
+    ) -> None:
+        binding = self._normalize_ai_binding(editor_state)
+        bound_toolchain_id = binding["toolchain_id"]
+        with self._suspend_ai_binding_dirty_updates():
+            self._refresh_ai_toolchains(bound_toolchain_id)
+            self.chk_ai_enabled.setChecked(binding["enabled"])
+            index = self.combo_ai_toolchain.findData(bound_toolchain_id)
+            self.combo_ai_toolchain.setCurrentIndex(index if index >= 0 else 0)
+            self.spin_ai_timeout.setValue(binding["timeout_ms"] or 0)
+        self._loaded_ai_binding_state = copy.deepcopy(loaded_state)
+        self._ai_binding_dirty = dirty
+
+    def _restore_config_load_transaction_state(self, state: dict) -> None:
+        config_id = state["config_id"]
+        editor_snapshot = state["editor_snapshot"]
+        if config_id is None or editor_snapshot is None:
+            self._reset_editor_after_failed_initial_load()
+            return
+
+        previous_config = editor_snapshot.get("config")
+        if not isinstance(previous_config, dict):
+            raise ValueError("previous configuration snapshot is unavailable")
+
+        self._current_config_id = config_id
+        self._golden_editor_state = copy.deepcopy(state["golden_editor_state"])
+        self._populate_detail(
+            copy.deepcopy(previous_config),
+            mark_clean=False,
+            discard_staged_bindings=False,
+        )
+        self._golden_editor_state = copy.deepcopy(state["golden_editor_state"])
+        self._restore_ai_binding_transaction_state(
+            editor_state=editor_snapshot["ai_binding"],
+            loaded_state=state["loaded_ai_binding_state"],
+            dirty=state["ai_binding_dirty"],
+        )
+        self._loaded_config_editor_snapshot = copy.deepcopy(
+            state["clean_snapshot"]
+        )
+        self._restore_collapsible_section_state(state["section_state"])
+        self._restore_selected_channel_tab(state["selected_channel_index"])
+        self.empty_label.setVisible(state["empty_label_visible"])
+        self.detail.setVisible(state["detail_visible"])
+        self.btn_delete.setEnabled(state["delete_enabled"])
+        self.btn_export.setEnabled(state["export_enabled"])
+        self.btn_save.setEnabled(state["save_enabled"])
+        self._restore_current_config_selection()
+
+    def _load_config_to_editor_atomically(
+        self,
+        *,
+        config_id: int,
+        refresh_list: bool,
+    ) -> dict:
+        previous_state = self._capture_config_load_transaction_state()
+        try:
+            loaded = self.services.config_service.load_config(config_id)
+            self._populate_detail(
+                loaded,
+                mark_clean=False,
+                discard_staged_bindings=False,
+            )
+            if refresh_list:
+                self._skip_reload = True
+                try:
+                    self._refresh_list()
+                    self._select_config_by_id(config_id)
+                finally:
+                    self._skip_reload = False
+            else:
+                self._select_config_by_id(config_id, suppress_reload=True)
+            self._current_config_id = config_id
+            self._discard_all_staged_bindings()
+            self._refresh_all_golden_sections()
+            self.empty_label.setVisible(False)
+            self.detail.setVisible(True)
+            self.btn_delete.setEnabled(True)
+            self.btn_export.setEnabled(True)
+            self.btn_save.setEnabled(True)
+            self._mark_editor_snapshot_clean()
+            return loaded
+        except Exception:
+            self._restore_config_load_transaction_state(previous_state)
+            raise
+
+    def _reload_authoritative_config_state(self, config_id: int) -> dict:
+        return self._load_config_to_editor_atomically(
+            config_id=config_id,
+            refresh_list=True,
+        )
 
     def _capture_editor_snapshot(self) -> dict | None:
         if self._current_config_id is None:
             return None
+        try:
+            config = self._collect_data()
+        except ValueError as exc:
+            config = {
+                "_validation_error": str(exc),
+                "_fault_types_editor_text": self.fault_types_editor.text(),
+            }
         return copy.deepcopy(
             {
-                "config": self._collect_data(),
+                "config": config,
+                "fault_types_editor_text": self.fault_types_editor.text(),
                 "ai_binding": self._capture_ai_binding_editor_state(),
             }
         )
@@ -2784,6 +3322,12 @@ class ConfigModule(QWidget):
         data = {
             "config_id": self._current_config_id,
             "config_name": self.ed_name.text(),
+            "manual_judgment_buttons_visible": (
+                self.chk_manual_judgment_buttons_visible.isChecked()
+            ),
+            "fault_types": parse_fault_types_editor(
+                self.fault_types_editor.text()
+            ),
             "record_duration": self.spin_record.value(),
             "analysis_duration": self.spin_analysis.value(),
             "analysis_window_offset_ms": self.spin_analysis_window_offset.value(),
@@ -2931,10 +3475,31 @@ class ConfigModule(QWidget):
 
     # ── Populate UI from data ───────────────────────────────
 
-    def _populate_detail(self, data: dict):
+    def _populate_detail(
+        self,
+        data: dict,
+        *,
+        mark_clean: bool = True,
+        discard_staged_bindings: bool = True,
+    ):
+        manual_judgment_buttons_visible = data.get(
+            "manual_judgment_buttons_visible",
+            False,
+        )
+        if type(manual_judgment_buttons_visible) is not bool:
+            raise ValueError(
+                "manual_judgment_buttons_visible must be a boolean"
+            )
         self._hide_top_level_config_dialogs()
-        self._discard_all_staged_bindings()
+        if discard_staged_bindings:
+            self._discard_all_staged_bindings()
         self.ed_name.setText(data["config_name"])
+        self.chk_manual_judgment_buttons_visible.setChecked(
+            manual_judgment_buttons_visible
+        )
+        self.fault_types_editor.setText(
+            render_fault_types_editor(data["fault_types"])
+        )
         self.spin_record.setValue(data["record_duration"])
         self.spin_analysis.setValue(data["analysis_duration"])
         self.spin_analysis_window_offset.setValue(
@@ -2962,9 +3527,19 @@ class ConfigModule(QWidget):
         self._build_channel_tabs(all_indices, data.get("channels"))
         self._populate_ai_binding(data["config_id"])
         self._refresh_all_golden_sections()
-        self._mark_editor_snapshot_clean()
+        if mark_clean:
+            self._mark_editor_snapshot_clean()
 
     # ── Interactions ────────────────────────────────────────
+
+    def _open_factory_config_selection_dialog(self) -> None:
+        if self._factory_selection_dialog is None:
+            self._factory_selection_dialog = FactoryConfigSelectionDialog(
+                self.services,
+                self,
+            )
+        self._factory_selection_dialog.prepare_for_open()
+        self._factory_selection_dialog.exec()
 
     def _refresh_list(self):
         self.config_list.clear()
@@ -3014,11 +3589,25 @@ class ConfigModule(QWidget):
             self._restoring_config_selection = False
 
     def _load_config_into_editor(self, config_id: int) -> None:
-        self._current_config_id = config_id
-        data = self.services.config_service.load_config(config_id)
-        self.empty_label.setVisible(False)
-        self.detail.setVisible(True)
-        self._populate_detail(data)
+        self._load_config_to_editor_atomically(
+            config_id=config_id,
+            refresh_list=False,
+        )
+
+    def _reset_editor_after_failed_initial_load(self) -> None:
+        self._current_config_id = None
+        self._loaded_config_editor_snapshot = None
+        self._restoring_config_selection = True
+        try:
+            self.config_list.setCurrentRow(-1)
+        finally:
+            self._restoring_config_selection = False
+        self._hide_top_level_config_dialogs()
+        self.empty_label.setVisible(True)
+        self.detail.setVisible(False)
+        self.btn_delete.setEnabled(False)
+        self.btn_export.setEnabled(False)
+        self.btn_save.setEnabled(False)
 
     def _on_item_changed(self, current: QListWidgetItem | None, _prev):
         if current is None:
@@ -3144,7 +3733,14 @@ class ConfigModule(QWidget):
     def _save_current_config(self, *, show_success: bool = True) -> bool:
         if self._current_config_id is None:
             return True
-        data = self._collect_data()
+        try:
+            data = self._collect_data()
+        except ValueError as exc:
+            self._finalize_failed_save(
+                message_title="验证失败",
+                message_text=str(exc),
+            )
+            return False
         errors = self.services.config_service.validate(data)
         if errors:
             self._finalize_failed_save(
@@ -3186,8 +3782,7 @@ class ConfigModule(QWidget):
             if callable(commit_pending_save):
                 pending_save_committed = True
                 commit_pending_save(pending_save)
-            loaded = self.services.config_service.load_config(saved_id)
-            self._apply_loaded_config_state(saved_id, loaded)
+            loaded = self._reload_authoritative_config_state(saved_id)
             self._restore_collapsible_section_state(section_state)
             self._restore_selected_channel_tab(selected_channel_index)
             self.services.bus.status.emit("配置已保存")

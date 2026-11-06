@@ -117,6 +117,7 @@ class SpectrumModule(QWidget):
                     fft_payload,
                     channel_index,
                 ),
+                weighting=fft_payload.get("weighting", "Z"),
             )
         except (TypeError, ValueError):
             self._clear_plot(rendered_channel_index=channel_index)

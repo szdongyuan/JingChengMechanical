@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import importlib
 import os
 from contextlib import contextmanager
@@ -24,6 +25,7 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QLabel,
     QPushButton,
+    QLineEdit,
     QScrollArea,
     QSpinBox,
     QTableWidget,
@@ -39,9 +41,11 @@ from app.service.config_package_service import (
 )
 from app.service.golden_sample_service import GoldenSampleService
 from model.channel_config_table import ChannelConfigTable
+from model.input_hardware_table import InputHardwareTable
 from model.plc_table import PlcTable
 from model.test_config_table import TestConfigTable as ConfigTable
 from ui.modules.config import ConfigModule
+from ui.widgets.cards import Card
 from ui.widgets.collapsible_group_box import CollapsibleGroupBox
 from ui.widgets.limit_table_editor import LimitTableEditor
 from ui.widgets.result_dashboard_layout_editor import ResultDashboardLayoutEditor
@@ -345,6 +349,17 @@ class _ManagedHardwareServiceStub:
         )
 
 
+def _create_valid_managed_input() -> InputHardwareTable:
+    return InputHardwareTable.create(
+        hardware_id=11,
+        alias="Managed input",
+        device_name="Interface A",
+        hostapi="ASIO",
+        samplerate=48_000,
+        channel_count=2,
+    )
+
+
 @contextmanager
 def _capture_qt_messages():
     messages: list[str] = []
@@ -385,6 +400,13 @@ def _make_module(
         ai_service=ai_service or _AiServiceStub(binding=binding),
         config_package_service=config_package_service or _ConfigPackageServiceStub(),
         hss_service=hardware_service or _HardwareServiceStub(),
+        factory_mode=SimpleNamespace(
+            state=SimpleNamespace(
+                selected_config_ids=(),
+                run_phase="idle",
+                start_ready_reason="",
+            ),
+        ),
         bus=services_bus,
     )
     return ConfigModule(services)
@@ -472,6 +494,8 @@ def _detail_payload(
     config_id: int = 7,
     config_name: str = "Cfg1",
     plc_id: int | None = None,
+    fault_types: list[str] | None = None,
+    manual_judgment_buttons_visible: bool = False,
 ) -> dict:
     return {
         "config_id": config_id,
@@ -482,6 +506,8 @@ def _detail_payload(
         "allow_incomplete_recording_analysis": False,
         "scan_triggers_test": False,
         "plc_id": plc_id,
+        "fault_types": list(fault_types or []),
+        "manual_judgment_buttons_visible": manual_judgment_buttons_visible,
         "input_device_name": "Mic 1",
         "input_device_hostapi": "ASIO",
         "input_device_samplerate": 48000,
@@ -491,6 +517,753 @@ def _detail_payload(
         "selected_channels": [0],
         "channels": channels,
     }
+
+
+def _fault_editor_text_with_length(length: int) -> str:
+    names = [f"n{index}" for index in range(32)]
+    base = ",".join(names)
+    return names[0] + (" " * (length - len(base))) + "," + ",".join(names[1:])
+
+
+def test_factory_selection_launcher_is_always_available(qapp):
+    module = _make_module()
+
+    assert module.btn_select_active_configs.text() == "选择使用配置"
+    assert module.btn_select_active_configs.isEnabled() is True
+
+
+def test_factory_selection_launcher_opens_modal_without_resolving_dirty_editor(
+    qapp,
+    monkeypatch,
+):
+    module = _make_module(
+        config_service=_ConfigServiceStub(
+            loaded_configs={7: _detail_payload([], config_id=7)}
+        )
+    )
+    module.spin_record.setValue(module.spin_record.value() + 1.0)
+    opened = []
+    monkeypatch.setattr(
+        "ui.modules.config.FactoryConfigSelectionDialog.exec",
+        lambda dialog: opened.append(dialog),
+    )
+
+    module.btn_select_active_configs.click()
+
+    assert opened
+    assert module._has_unsaved_changes() is True
+
+
+def test_factory_selection_launcher_reuses_one_modal_instance(qapp, monkeypatch):
+    module = _make_module()
+    events = []
+    monkeypatch.setattr(
+        "ui.modules.config.FactoryConfigSelectionDialog.prepare_for_open",
+        lambda dialog: events.append(("prepare", id(dialog))),
+    )
+    monkeypatch.setattr(
+        "ui.modules.config.FactoryConfigSelectionDialog.exec",
+        lambda dialog: events.append(("exec", id(dialog))),
+    )
+
+    module.btn_select_active_configs.click()
+    module.btn_select_active_configs.click()
+
+    assert [event for event, _identity in events] == [
+        "prepare",
+        "prepare",
+        "exec",
+        "prepare",
+        "exec",
+    ]
+    assert len({identity for _event, identity in events}) == 1
+
+
+def test_manual_judgment_buttons_group_contains_visibility_and_fault_type_controls(
+    qapp,
+) -> None:
+    module = _make_module()
+
+    group = next(
+        card for card in module.findChildren(Card) if card.title() == "人工标注"
+    )
+    checkbox = module.findChild(QCheckBox, "manual_judgment_buttons_visible")
+    editor = module.findChild(QComboBox, "fault_types_editor")
+
+    assert group is module.manual_judgment_group
+    assert group.title() == "人工标注"
+    assert checkbox is module.chk_manual_judgment_buttons_visible
+    assert checkbox.text() == "在主页结果中显示人工标注按钮"
+    assert checkbox.isChecked() is False
+    assert editor is module.fault_types_editor
+    assert editor.isEditable() is True
+    assert editor.lineEdit().isReadOnly() is True
+    assert _field_label_text(module, "fault_types_editor") == "故障类型"
+    assert module.btn_manage_fault_types.text() == "故障类型管理"
+    assert _is_descendant_of(checkbox, group)
+    assert _is_descendant_of(editor, group)
+    assert _is_descendant_of(module.btn_manage_fault_types, group)
+
+
+def test_manual_judgment_buttons_visibility_load_collect_dirty_and_missing_default(
+    qapp,
+) -> None:
+    module = _make_module()
+    module._current_config_id = 7
+    true_payload = _detail_payload([], manual_judgment_buttons_visible=True)
+
+    module._populate_detail(true_payload)
+
+    assert module.chk_manual_judgment_buttons_visible.isChecked() is True
+    assert module._collect_data()["manual_judgment_buttons_visible"] is True
+    assert type(module._collect_data()["manual_judgment_buttons_visible"]) is bool
+    assert module._has_unsaved_changes() is False
+
+    module.chk_manual_judgment_buttons_visible.setChecked(False)
+
+    assert module._collect_data()["manual_judgment_buttons_visible"] is False
+    assert module._has_unsaved_changes() is True
+
+    legacy_payload = _detail_payload([])
+    legacy_payload.pop("manual_judgment_buttons_visible")
+    module._populate_detail(legacy_payload)
+
+    assert module.chk_manual_judgment_buttons_visible.isChecked() is False
+    assert module._has_unsaved_changes() is False
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", None])
+def test_manual_judgment_buttons_visibility_rejects_explicit_non_bool_payload(
+    qapp,
+    value,
+) -> None:
+    module = _make_module()
+    payload = _detail_payload([])
+    payload["manual_judgment_buttons_visible"] = value
+
+    with pytest.raises(
+        ValueError,
+        match="manual_judgment_buttons_visible must be a boolean",
+    ):
+        module._populate_detail(payload)
+
+
+def test_manual_judgment_buttons_visibility_save_reload_and_discard(
+    qapp,
+    monkeypatch,
+) -> None:
+    loaded = {
+        7: _detail_payload(
+            [],
+            config_id=7,
+            manual_judgment_buttons_visible=True,
+        ),
+    }
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service)
+    qapp.processEvents()
+
+    assert module.chk_manual_judgment_buttons_visible.isChecked() is True
+
+    module.chk_manual_judgment_buttons_visible.setChecked(False)
+    assert module._has_unsaved_changes() is True
+    assert module._discard_unsaved_config_changes() is True
+    assert module.chk_manual_judgment_buttons_visible.isChecked() is True
+    assert module._has_unsaved_changes() is False
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    monkeypatch.setattr("ui.modules.config.QMessageBox.information", lambda *args: None)
+    module.chk_manual_judgment_buttons_visible.setChecked(False)
+
+    assert module._save_current_config() is True
+    assert config_service.saved_configs[0]["manual_judgment_buttons_visible"] is False
+    assert module.chk_manual_judgment_buttons_visible.isChecked() is False
+    assert module._has_unsaved_changes() is False
+
+    config_service._loaded_configs[7]["manual_judgment_buttons_visible"] = True
+    module._reload_authoritative_config_state(7)
+
+    assert module.chk_manual_judgment_buttons_visible.isChecked() is True
+    assert module._has_unsaved_changes() is False
+
+
+def test_manual_judgment_buttons_visibility_switches_configs_without_state_leakage(
+    qapp,
+) -> None:
+    loaded = {
+        7: _detail_payload(
+            [],
+            config_id=7,
+            config_name="Visible",
+            manual_judgment_buttons_visible=True,
+        ),
+        8: _detail_payload(
+            [],
+            config_id=8,
+            config_name="Hidden",
+            manual_judgment_buttons_visible=False,
+        ),
+    }
+    module = _make_module(config_service=_ConfigServiceStub(loaded_configs=loaded))
+    qapp.processEvents()
+
+    assert module.chk_manual_judgment_buttons_visible.isChecked() is True
+
+    module.config_list.setCurrentRow(1)
+    qapp.processEvents()
+
+    assert module._current_config_id == 8
+    assert module.chk_manual_judgment_buttons_visible.isChecked() is False
+
+    module.config_list.setCurrentRow(0)
+    qapp.processEvents()
+
+    assert module._current_config_id == 7
+    assert module.chk_manual_judgment_buttons_visible.isChecked() is True
+
+
+def test_manual_judgment_buttons_invalid_switch_restores_previous_clean_editor(
+    qapp,
+    monkeypatch,
+) -> None:
+    previous = _detail_payload(
+        [],
+        config_id=7,
+        config_name="Previous",
+        fault_types=["异响"],
+        manual_judgment_buttons_visible=True,
+    )
+    invalid = _detail_payload(
+        [],
+        config_id=8,
+        config_name="Invalid",
+        fault_types=["划伤"],
+    )
+    invalid["manual_judgment_buttons_visible"] = 1
+    config_service = _ConfigServiceStub(
+        loaded_configs={7: previous, 8: invalid}
+    )
+    module = _make_module(config_service=config_service)
+    qapp.processEvents()
+    clean_snapshot = module._capture_editor_snapshot()
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module.config_list.setCurrentRow(1)
+    qapp.processEvents()
+
+    assert module._current_config_id == 7
+    assert module.config_list.currentItem().data(Qt.ItemDataRole.UserRole) == 7
+    assert module.ed_name.text() == "Previous"
+    assert module.chk_manual_judgment_buttons_visible.isChecked() is True
+    assert module.fault_types_editor.text() == "异响"
+    assert module._capture_editor_snapshot() == clean_snapshot
+    assert module._loaded_config_editor_snapshot == clean_snapshot
+    assert module._has_unsaved_changes() is False
+    assert config_service.saved_configs == []
+    assert any(
+        "manual_judgment_buttons_visible must be a boolean" in str(args[-1])
+        for args in warnings
+    )
+
+
+def test_initial_invalid_config_load_resets_to_retryable_safe_empty_state(
+    qapp,
+    monkeypatch,
+) -> None:
+    invalid = _detail_payload([], config_id=7, config_name="Invalid")
+    invalid["manual_judgment_buttons_visible"] = 1
+    config_service = _ConfigServiceStub(loaded_configs={7: invalid})
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module = _make_module(config_service=config_service)
+    qapp.processEvents()
+
+    assert module._current_config_id is None
+    assert module.config_list.currentRow() == -1
+    assert module._loaded_config_editor_snapshot is None
+    assert module._capture_editor_snapshot() is None
+    assert module.detail.isVisible() is False
+    assert module.btn_save.isEnabled() is False
+    assert len(warnings) == 1
+
+    module._on_save()
+
+    assert config_service.begin_calls == 0
+    assert config_service.saved_configs == []
+
+    module.config_list.setCurrentRow(0)
+    qapp.processEvents()
+
+    assert module._current_config_id is None
+    assert module.config_list.currentRow() == -1
+    assert module._loaded_config_editor_snapshot is None
+    assert module._has_unsaved_changes() is False
+    assert config_service.begin_calls == 0
+    assert len(warnings) == 2
+
+
+def test_config_switch_service_read_failure_restores_previous_state_and_retries(
+    qapp,
+    monkeypatch,
+) -> None:
+    loaded = {
+        7: _detail_payload(
+            [_channel_payload(0), _channel_payload(1)],
+            config_id=7,
+            config_name="Previous",
+            manual_judgment_buttons_visible=True,
+        ),
+        8: _detail_payload(
+            [_channel_payload(0)],
+            config_id=8,
+            config_name="Target",
+            manual_judgment_buttons_visible=False,
+        ),
+    }
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service)
+    qapp.processEvents()
+    module._on_channel_tab_clicked(1)
+    before = _config_editor_transaction_state(module)
+    original_load_config = config_service.load_config
+
+    def _fail_target_read(config_id: int):
+        if config_id == 8:
+            raise RuntimeError("target read exploded")
+        return original_load_config(config_id)
+
+    monkeypatch.setattr(config_service, "load_config", _fail_target_read)
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module.config_list.setCurrentRow(1)
+    qapp.processEvents()
+
+    assert _config_editor_transaction_state(module) == before
+    assert module._current_config_id == 7
+    assert module.config_list.currentItem().data(Qt.ItemDataRole.UserRole) == 7
+    assert module.detail.isHidden() is False
+    assert module.btn_save.isEnabled() is True
+    assert len(warnings) == 1
+
+    monkeypatch.setattr(config_service, "load_config", original_load_config)
+    module.config_list.setCurrentRow(1)
+    qapp.processEvents()
+
+    assert module._current_config_id == 8
+    assert module.config_list.currentItem().data(Qt.ItemDataRole.UserRole) == 8
+    assert module.ed_name.text() == "Target"
+    assert module._has_unsaved_changes() is False
+
+
+def test_initial_service_read_failure_resets_safe_state_and_retries(
+    qapp,
+    monkeypatch,
+) -> None:
+    loaded = {
+        7: _detail_payload(
+            [_channel_payload(0)],
+            config_id=7,
+            config_name="Retry target",
+            manual_judgment_buttons_visible=True,
+        ),
+    }
+    config_service = _ConfigServiceStub(
+        loaded_configs=loaded,
+        load_error=RuntimeError("initial read exploded"),
+    )
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module = _make_module(config_service=config_service)
+    qapp.processEvents()
+
+    assert module._current_config_id is None
+    assert module.config_list.currentRow() == -1
+    assert module.detail.isHidden() is True
+    assert module.btn_save.isEnabled() is False
+    assert module._loaded_config_editor_snapshot is None
+    assert module._capture_editor_snapshot() is None
+    assert module._has_unsaved_changes() is False
+    assert len(warnings) == 1
+
+    config_service._load_error = None
+    module.config_list.setCurrentRow(0)
+    qapp.processEvents()
+
+    assert module._current_config_id == 7
+    assert module.config_list.currentItem().data(Qt.ItemDataRole.UserRole) == 7
+    assert module.ed_name.text() == "Retry target"
+    assert module.detail.isHidden() is False
+    assert module.btn_save.isEnabled() is True
+    assert (
+        module._loaded_config_editor_snapshot
+        == module._capture_editor_snapshot()
+    )
+    assert module._has_unsaved_changes() is False
+    assert len(warnings) == 1
+
+
+def test_partial_config_switch_failure_restores_complete_previous_ui_state(
+    qapp,
+    monkeypatch,
+) -> None:
+    previous = _detail_payload(
+        [_channel_payload(0), _channel_payload(1)],
+        config_id=7,
+        config_name="Previous",
+        fault_types=["异响"],
+        manual_judgment_buttons_visible=True,
+    )
+    incoming = _detail_payload(
+        [_channel_payload(0)],
+        config_id=8,
+        config_name="Incoming",
+        fault_types=["划伤"],
+        manual_judgment_buttons_visible=False,
+    )
+    incoming["record_duration"] = 9.0
+    config_service = _ConfigServiceStub(
+        loaded_configs={7: previous, 8: incoming}
+    )
+    ai_service = _AiServiceStub(
+        binding={
+            "enabled": True,
+            "toolchain_id": "tc-1",
+            "timeout_ms": 1000,
+        }
+    )
+    module = _make_module(
+        config_service=config_service,
+        ai_service=ai_service,
+    )
+    qapp.processEvents()
+    module._on_channel_tab_clicked(1)
+    previous_container = module._channel_containers[1]
+    previous_boxes = {
+        box.section_id(): box
+        for box in previous_container.findChildren(CollapsibleGroupBox)
+    }
+    previous_boxes["fft"].set_expanded(False)
+    previous_boxes["spl"].set_expanded(True)
+    clean_snapshot = module._capture_editor_snapshot()
+    section_state = module._capture_collapsible_section_state()
+    selected_channel_index = module._selected_channel_index()
+    original_populate_ai_binding = module._populate_ai_binding
+    current_ids_during_failed_population = []
+
+    def _fail_after_partial_ai_population(config_id: int) -> None:
+        original_populate_ai_binding(config_id)
+        if config_id == 8:
+            current_ids_during_failed_population.append(module._current_config_id)
+            module.chk_ai_enabled.setChecked(False)
+            module.spin_ai_timeout.setValue(9000)
+            module._on_channel_tab_clicked(0)
+            incoming_boxes = {
+                box.section_id(): box
+                for box in module._channel_containers[0].findChildren(
+                    CollapsibleGroupBox
+                )
+            }
+            incoming_boxes["fft"].set_expanded(True)
+            incoming_boxes["spl"].set_expanded(False)
+            raise RuntimeError("partial population exploded")
+
+    monkeypatch.setattr(
+        module,
+        "_populate_ai_binding",
+        _fail_after_partial_ai_population,
+    )
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    module.config_list.setCurrentRow(1)
+    qapp.processEvents()
+
+    assert module._current_config_id == 7
+    assert module.config_list.currentItem().data(Qt.ItemDataRole.UserRole) == 7
+    assert module._capture_editor_snapshot() == clean_snapshot
+    assert module._loaded_config_editor_snapshot == clean_snapshot
+    assert module.ed_name.text() == "Previous"
+    assert module.chk_ai_enabled.isChecked() is True
+    assert module.combo_ai_toolchain.currentData() == "tc-1"
+    assert module.spin_ai_timeout.value() == 1000
+    assert len(module._channel_containers) == 2
+    assert module._capture_collapsible_section_state() == section_state
+    assert module._selected_channel_index() == selected_channel_index == 1
+    assert current_ids_during_failed_population == [7]
+    assert module._has_unsaved_changes() is False
+    assert any("partial population exploded" in str(args[-1]) for args in warnings)
+
+
+def test_discard_mid_population_failure_restores_dirty_editor_transaction(
+    qapp,
+    monkeypatch,
+) -> None:
+    loaded = {
+        7: _detail_payload(
+            [_channel_payload(0), _channel_payload(1)],
+            config_id=7,
+            config_name="Authoritative",
+            manual_judgment_buttons_visible=True,
+        ),
+    }
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service)
+    qapp.processEvents()
+    module._on_channel_tab_clicked(1)
+    module.ed_name.setText("Dirty editor")
+    before = _config_editor_transaction_state(module)
+    assert before["dirty"] is True
+    calls = _inject_mid_population_failure_on_odd_calls(module, monkeypatch)
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    discarded = module._discard_unsaved_config_changes()
+
+    assert discarded is False
+    assert calls == [7, 7]
+    assert _config_editor_transaction_state(module) == before
+    assert config_service.begin_calls == 0
+    assert config_service.saved_configs == []
+    assert any(
+        "authoritative population exploded" in str(args[-1])
+        for args in warnings
+    )
+
+
+def test_explicit_reload_mid_population_failure_restores_clean_transaction(
+    qapp,
+    monkeypatch,
+) -> None:
+    original = _detail_payload(
+        [_channel_payload(0), _channel_payload(1)],
+        config_id=7,
+        config_name="Original",
+        manual_judgment_buttons_visible=True,
+    )
+    config_service = _ConfigServiceStub(loaded_configs={7: original})
+    module = _make_module(config_service=config_service)
+    qapp.processEvents()
+    module._on_channel_tab_clicked(1)
+    before = _config_editor_transaction_state(module)
+    assert before["dirty"] is False
+    incoming = _detail_payload(
+        [_channel_payload(0)],
+        config_id=7,
+        config_name="Reloaded",
+        fault_types=["划伤"],
+        manual_judgment_buttons_visible=False,
+    )
+    incoming["record_duration"] = 9.0
+    config_service._loaded_configs[7] = incoming
+    calls = _inject_mid_population_failure_on_odd_calls(module, monkeypatch)
+
+    with pytest.raises(RuntimeError, match="authoritative population exploded"):
+        module._reload_authoritative_config_state(7)
+
+    assert calls == [7, 7]
+    assert _config_editor_transaction_state(module) == before
+    assert config_service.begin_calls == 0
+    assert config_service.saved_configs == []
+
+
+def test_post_save_reload_mid_population_failure_restores_pre_save_transaction(
+    qapp,
+    monkeypatch,
+) -> None:
+    loaded = {
+        7: _detail_payload(
+            [_channel_payload(0), _channel_payload(1)],
+            config_id=7,
+            config_name="Original",
+            manual_judgment_buttons_visible=True,
+        ),
+    }
+    config_service = _ConfigServiceStub(loaded_configs=loaded)
+    module = _make_module(config_service=config_service)
+    qapp.processEvents()
+    module._on_channel_tab_clicked(1)
+    module.ed_name.setText("Saved name")
+    before = _config_editor_transaction_state(module)
+    assert before["dirty"] is True
+    calls = _inject_mid_population_failure_on_odd_calls(module, monkeypatch)
+
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(base_mod, "db", SimpleNamespace(atomic=lambda: nullcontext()))
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    saved = module._save_current_config(show_success=False)
+
+    assert saved is False
+    assert calls == [7, 7, 7, 7]
+    assert _config_editor_transaction_state(module) == before
+    assert config_service.begin_calls == 1
+    assert config_service.commit_calls == 1
+    assert config_service.rollback_calls == 0
+    assert len(config_service.saved_configs) == 1
+    assert config_service.saved_configs[0]["config_id"] == 7
+    assert config_service.saved_configs[0]["config_name"] == "Saved name"
+    assert any(
+        "authoritative population exploded" in str(args[-1])
+        for args in warnings
+    )
+
+
+def test_fault_types_editor_remains_editable_when_manual_buttons_are_hidden(
+    qapp,
+) -> None:
+    module = _make_module()
+    module._current_config_id = 7
+    module._populate_detail(
+        _detail_payload(
+            [],
+            fault_types=["异响"],
+            manual_judgment_buttons_visible=False,
+        )
+    )
+
+    assert module.chk_manual_judgment_buttons_visible.isChecked() is False
+    assert module.fault_types_editor.isEnabled() is True
+    assert module.btn_manage_fault_types.isEnabled() is True
+
+    module.fault_types_editor.setText("异响, 划伤")
+
+    assert module._collect_data()["fault_types"] == ["异响", "划伤"]
+    assert module._has_unsaved_changes() is True
+
+
+def test_fault_types_editor_populates_collects_and_marks_dirty(qapp) -> None:
+    module = _make_module()
+    module._current_config_id = 7
+    module._populate_detail(
+        _detail_payload([], fault_types=["异响", "漏装"])
+    )
+
+    assert module.fault_types_editor.text() == "异响, 漏装"
+    assert module._collect_data()["fault_types"] == ["异响", "漏装"]
+    assert module._has_unsaved_changes() is False
+
+    module.fault_types_editor.setText(" 异响 , 划伤 ")
+
+    assert module._collect_data()["fault_types"] == ["异响", "划伤"]
+    assert module._has_unsaved_changes() is True
+
+
+def test_fault_types_editor_normalizes_valid_text_and_clears_overlong_input(
+    qapp,
+) -> None:
+    module = _make_module()
+    module._current_config_id = 7
+    module._populate_detail(_detail_payload([]))
+    valid = _fault_editor_text_with_length(4096)
+    module.fault_types_editor.setText(valid)
+
+    assert module.fault_types_editor.text() == ", ".join(
+        f"n{index}" for index in range(32)
+    )
+    assert len(module._collect_data()["fault_types"]) == 32
+
+    invalid = _fault_editor_text_with_length(4097)
+    module.fault_types_editor.setText(invalid)
+    assert module.fault_types_editor.text() == ""
+    assert module._collect_data()["fault_types"] == []
+
+
+def test_fault_types_editor_preserves_text_beyond_qt_default_limit_for_python_validation(
+    qapp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import ui.modules.config as config_module
+
+    module = _make_module()
+    module._current_config_id = 7
+    original = (" " * 40_000) + "X"
+    parser_inputs: list[str] = []
+    real_parser = config_module.parse_fault_types_editor
+
+    def _recording_parser(value: str) -> list[str]:
+        parser_inputs.append(value)
+        return real_parser(value)
+
+    monkeypatch.setattr(
+        config_module,
+        "parse_fault_types_editor",
+        _recording_parser,
+    )
+
+    module.fault_types_editor.setText(original)
+    collected = module._collect_data()
+
+    assert module.fault_types_editor.text() == "X"
+    assert parser_inputs == [original, "X"]
+    assert collected["fault_types"] == ["X"]
+
+
+def test_fault_types_save_uses_authoritative_normalized_reload(
+    qapp,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import model.base_mode as base_mod
+
+    monkeypatch.setattr(
+        base_mod,
+        "db",
+        SimpleNamespace(atomic=lambda: nullcontext()),
+    )
+    config_service = _ConfigServiceStub(
+        loaded_configs={
+            7: _detail_payload([], fault_types=["旧类型"]),
+        }
+    )
+    module = _make_module(config_service=config_service)
+    module._current_config_id = 7
+    module._populate_detail(config_service.load_config(7))
+    module.fault_types_editor.setText(" 异响 , 漏装 ")
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.information",
+        lambda *args: None,
+    )
+    warnings = []
+    monkeypatch.setattr(
+        "ui.modules.config.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+
+    saved = module._save_current_config()
+
+    assert saved is True, warnings
+    assert warnings == []
+    assert config_service.saved_configs[0]["fault_types"] == ["异响", "漏装"]
+    assert module.fault_types_editor.text() == "异响, 漏装"
+    assert module._has_unsaved_changes() is False
 
 
 def _package_preview(
@@ -552,6 +1325,53 @@ def _is_descendant_of(widget: QWidget, ancestor: QWidget) -> bool:
             return True
         current = current.parentWidget()
     return False
+
+
+def _config_editor_transaction_state(module: ConfigModule) -> dict:
+    current_item = module.config_list.currentItem()
+    return {
+        "config_id": module._current_config_id,
+        "selected_config_id": (
+            current_item.data(Qt.ItemDataRole.UserRole)
+            if current_item is not None
+            else None
+        ),
+        "editor_snapshot": module._capture_editor_snapshot(),
+        "clean_snapshot": copy.deepcopy(module._loaded_config_editor_snapshot),
+        "ai_editor": module._capture_ai_binding_editor_state(),
+        "loaded_ai": copy.deepcopy(module._loaded_ai_binding_state),
+        "ai_dirty": module._ai_binding_dirty,
+        "channel_indices": [
+            module._channel_container_index(container)
+            for container in module._channel_containers
+        ],
+        "section_state": module._capture_collapsible_section_state(),
+        "selected_channel_index": module._selected_channel_index(),
+        "dirty": module._has_unsaved_changes(),
+        "detail_hidden": module.detail.isHidden(),
+        "save_enabled": module.btn_save.isEnabled(),
+    }
+
+
+def _inject_mid_population_failure_on_odd_calls(
+    module: ConfigModule,
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[int]:
+    original_populate_ai_binding = module._populate_ai_binding
+    calls: list[int] = []
+
+    def _populate_then_fail(config_id: int) -> None:
+        original_populate_ai_binding(config_id)
+        calls.append(config_id)
+        if len(calls) % 2 == 1:
+            module.chk_ai_enabled.setChecked(False)
+            module.spin_ai_timeout.setValue(9000)
+            if module._channel_containers:
+                module._on_channel_tab_clicked(0)
+            raise RuntimeError("authoritative population exploded")
+
+    monkeypatch.setattr(module, "_populate_ai_binding", _populate_then_fail)
+    return calls
 
 
 def _ancestor_group_title(widget: QWidget | None) -> str | None:
@@ -724,6 +1544,7 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_id(qapp):
     assert set(data) == {
         "config_id",
         "config_name",
+        "manual_judgment_buttons_visible",
         "record_duration",
         "analysis_duration",
         "analysis_window_offset_ms",
@@ -736,8 +1557,9 @@ def test_collect_data_returns_main_config_analysis_offset_and_plc_id(qapp):
         "output_device_name",
         "output_device_hostapi",
         "output_device_samplerate",
-        "selected_channels",
-        "monitor_channel_index",
+            "selected_channels",
+            "fault_types",
+            "monitor_channel_index",
         "vibration_view_channel_index",
         "monitor_gain_db",
         "current_meter",
@@ -826,18 +1648,18 @@ def test_top_level_config_launchers_include_result_dashboard_layout(qapp):
 
 def test_result_dashboard_layout_dialog_confirm_stages_without_saving(qapp):
     layout = {
-        "version": 1,
+        "version": 2,
         "columns": 1,
         "rows": 1,
         "panels": [
             {
-                "id": "summary",
-                "type": "result_summary",
+                "id": "spectrum",
+                "type": "spectrum",
                 "row": 0,
                 "column": 0,
                 "row_span": 1,
                 "column_span": 1,
-                "channel": "none",
+                "channel": "primary_acoustic",
             }
         ],
     }
@@ -865,18 +1687,18 @@ def test_result_dashboard_layout_confirm_marks_config_dirty_for_leave_prompt(
     qapp, monkeypatch
 ):
     layout = {
-        "version": 1,
+        "version": 2,
         "columns": 1,
         "rows": 1,
         "panels": [
             {
-                "id": "summary",
-                "type": "result_summary",
+                "id": "spectrum",
+                "type": "spectrum",
                 "row": 0,
                 "column": 0,
                 "row_span": 1,
                 "column_span": 1,
-                "channel": "none",
+                "channel": "primary_acoustic",
             }
         ],
     }
@@ -909,18 +1731,18 @@ def test_result_dashboard_layout_confirm_marks_config_dirty_for_leave_prompt(
 
 def test_result_dashboard_layout_dialog_x_discards_unconfirmed_edits(qapp):
     layout = {
-        "version": 1,
+        "version": 2,
         "columns": 1,
         "rows": 1,
         "panels": [
             {
-                "id": "summary",
-                "type": "result_summary",
+                "id": "spectrum",
+                "type": "spectrum",
                 "row": 0,
                 "column": 0,
                 "row_span": 1,
                 "column_span": 1,
-                "channel": "none",
+                "channel": "primary_acoustic",
             }
         ],
     }
@@ -945,7 +1767,7 @@ def test_result_dashboard_layout_dialog_x_discards_unconfirmed_edits(qapp):
     data = module._collect_data()
     assert data["result_dashboard_layout"]["rows"] == 1
     assert [panel["id"] for panel in data["result_dashboard_layout"]["panels"]] == [
-        "summary"
+        "spectrum"
     ]
     assert config_service.begin_calls == 0
 
@@ -969,12 +1791,12 @@ def test_malformed_loaded_result_dashboard_layout_stays_invalid_until_dialog_con
     editor = module.findChild(
         ResultDashboardLayoutEditor, "result_dashboard_layout_editor"
     )
-    assert editor.layout_data()["panels"][0]["id"] == "summary"
+    assert editor.layout_data()["panels"][0]["id"] == "stft_acoustic"
     module.findChild(QPushButton, "TopLevelConfigCardConfirmButton").click()
 
     data = module._collect_data()
     assert isinstance(data["result_dashboard_layout"], dict)
-    assert data["result_dashboard_layout"]["panels"][0]["id"] == "summary"
+    assert data["result_dashboard_layout"]["panels"][0]["id"] == "stft_acoustic"
 
 
 def _expected_centered_dialog_pos(dialog: QDialog, owner: QWidget) -> QPoint:
@@ -1606,7 +2428,7 @@ def test_hardware_card_exposes_monitor_controls_and_channel_options(qapp):
     ]
     assert [module.combo_monitor_channel.itemData(i) for i in range(4)] == [0, 1, 2, 3]
     assert module.spin_monitor_gain_db.minimum() == pytest.approx(-60.0)
-    assert module.spin_monitor_gain_db.maximum() == pytest.approx(24.0)
+    assert module.spin_monitor_gain_db.maximum() == pytest.approx(35.0)
     assert module.spin_monitor_gain_db.singleStep() == pytest.approx(1.0)
     assert module.spin_monitor_gain_db.decimals() == 1
     assert module.spin_monitor_gain_db.suffix() == " dB"
@@ -4405,9 +5227,11 @@ def test_outer_transaction_failure_after_begin_save_config_rolls_back_promotions
     )
     golden_service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
     config_service = ConfigService(bus, golden_sample_service=golden_service)
+    managed_input = _create_valid_managed_input()
 
     config_id = ConfigTable.create(
         config_name="Cfg1",
+        input_hardware_device_id=managed_input.hardware_id,
         input_device_name="Mic 1",
         input_device_hostapi="ASIO",
         input_device_samplerate=48_000,
@@ -4441,6 +5265,7 @@ def test_outer_transaction_failure_after_begin_save_config_rolls_back_promotions
         config_id=config_id,
     )
     payload["selected_channels"] = [0]
+    payload["input_hardware_device_id"] = managed_input.hardware_id
     payload["golden_editor_state"] = {
         0: _staged_golden_binding(
             staged_path,
@@ -4569,8 +5394,10 @@ def test_post_commit_failure_reloads_authoritative_config_list_and_detail(
         status=_SignalStub(),
         config_changed=_SignalStub(),
     )
+    managed_input = _create_valid_managed_input()
     config_id = ConfigTable.create(
         config_name="Cfg1",
+        input_hardware_device_id=managed_input.hardware_id,
         input_device_name="Mic 1",
         input_device_hostapi="ASIO",
         input_device_samplerate=48_000,
@@ -4587,7 +5414,7 @@ def test_post_commit_failure_reloads_authoritative_config_list_and_detail(
     module = _make_module(
         config_service=config_service,
         ai_service=_AiServiceStub(),
-        hardware_service=_HardwareServiceStub(),
+        hardware_service=_ManagedHardwareServiceStub(),
         bus=bus,
     )
 
@@ -4636,15 +5463,17 @@ def test_post_commit_commit_pending_save_failure_keeps_new_authoritative_replace
     )
     golden_service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
     config_service = ConfigService(bus, golden_sample_service=golden_service)
+    managed_input = _create_valid_managed_input()
     module = _make_module(
         config_service=config_service,
         ai_service=_AiServiceStub(),
-        hardware_service=_HardwareServiceStub(),
+        hardware_service=_ManagedHardwareServiceStub(),
         bus=bus,
     )
 
     config_id = ConfigTable.create(
         config_name="Cfg1",
+        input_hardware_device_id=managed_input.hardware_id,
         input_device_name="Mic 1",
         input_device_hostapi="ASIO",
         input_device_samplerate=48_000,
@@ -4728,15 +5557,17 @@ def test_post_commit_reload_failure_keeps_new_authoritative_replacement_binding(
     )
     golden_service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
     config_service = ConfigService(bus, golden_sample_service=golden_service)
+    managed_input = _create_valid_managed_input()
     module = _make_module(
         config_service=config_service,
         ai_service=_AiServiceStub(),
-        hardware_service=_HardwareServiceStub(),
+        hardware_service=_ManagedHardwareServiceStub(),
         bus=bus,
     )
 
     config_id = ConfigTable.create(
         config_name="Cfg1",
+        input_hardware_device_id=managed_input.hardware_id,
         input_device_name="Mic 1",
         input_device_hostapi="ASIO",
         input_device_samplerate=48_000,
@@ -4820,15 +5651,17 @@ def test_post_commit_reload_failure_keeps_new_authoritative_cleared_binding(
     )
     golden_service = GoldenSampleService(root_dir=str(tmp_path / "managed"))
     config_service = ConfigService(bus, golden_sample_service=golden_service)
+    managed_input = _create_valid_managed_input()
     module = _make_module(
         config_service=config_service,
         ai_service=_AiServiceStub(),
-        hardware_service=_HardwareServiceStub(),
+        hardware_service=_ManagedHardwareServiceStub(),
         bus=bus,
     )
 
     config_id = ConfigTable.create(
         config_name="Cfg1",
+        input_hardware_device_id=managed_input.hardware_id,
         input_device_name="Mic 1",
         input_device_hostapi="ASIO",
         input_device_samplerate=48_000,

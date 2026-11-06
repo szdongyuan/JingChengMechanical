@@ -44,24 +44,20 @@ def test_review_success_hides_analysis_box_until_selection_mode(qapp):
     assert module.analysis_select_button.text() == "框选分析"
     assert module.selected_window == pytest.approx((1.0, 3.0))
     assert module.canvas.heatmap.chart_interactions.reset_button is None
-    assert module.analysis_select_button.parentWidget() is module
+    assert (
+        module.analysis_select_button.parentWidget()
+        is module.analysis_control_row
+    )
     assert module.analysis_select_button.width() >= 144
     assert module.analysis_select_button.height() >= (
         module.analysis_select_button.sizeHint().height()
     )
     assert module.analysis_select_button.x() == 4
+    assert module.analysis_control_row.geometry().bottom() == module.height() - 1
     assert (
-        module.height()
-        - module.analysis_select_button.geometry().bottom()
-        - 1
-    ) == 0
-    assert module._content_layout.getContentsMargins()[3] == (
-        module._ANALYSIS_SELECT_BOTTOM_RESERVE_PX
+        module.analysis_control_row.geometry().top()
+        > module.canvas.geometry().bottom()
     )
-    assert (
-        module.analysis_select_button.y()
-        - module.canvas.geometry().bottom()
-    ) >= 0
 
     module.move_selection_to_start(2.25)
 
@@ -86,7 +82,7 @@ def test_review_success_hides_analysis_box_until_selection_mode(qapp):
     assert module.replay_button.isVisible() is False
 
 
-def test_review_selection_button_uses_card_bottom_padding_when_embedded(qapp):
+def test_review_selection_button_keeps_permanent_module_host_when_embedded(qapp):
     module, services = _make_module()
     module.selected_display_channel_provider = lambda: 0
     card = Card("STFT时频图", module)
@@ -109,13 +105,10 @@ def test_review_selection_button_uses_card_bottom_padding_when_embedded(qapp):
     button = module.analysis_select_button
 
     assert button.isVisible() is True
-    assert button.parentWidget() is card
+    assert button.parentWidget() is module.analysis_control_row
     assert button.height() >= button.sizeHint().height()
-    assert button.geometry().bottom() == card.height() - 1
-    assert button.geometry().bottom() > module.geometry().bottom()
-    assert module._content_layout.getContentsMargins()[3] == (
-        module._ANALYSIS_SELECT_BOTTOM_RESERVE_PX
-    )
+    assert module.analysis_control_row.parentWidget() is module
+    assert module.analysis_control_row.geometry().bottom() == module.height() - 1
     assert module.analysis_select_button.text() == "框选分析"
 
 
@@ -175,6 +168,37 @@ def test_stale_displayed_config_review_cannot_activate_selection_or_reanalysis(q
     module._begin_reanalysis()
 
     services.factory_mode.begin_reanalysis.assert_not_called()
+
+
+def test_running_to_reviewing_preserves_canvas_geometry_margins_and_ownership(qapp):
+    module, services = _make_module()
+    module.selected_display_channel_provider = lambda: 0
+    card = Card("STFT", module)
+    card.resize(700, 320)
+    card.show()
+    qapp.processEvents()
+    _seed_stft_history(module, services, qapp, channel_index=0)
+    canvas_geometry = module.canvas.geometry()
+    layout_margins = module._content_layout.getContentsMargins()
+    button_parent = module.analysis_select_button.parentWidget()
+    row_geometry = module.analysis_control_row.geometry()
+
+    _emit_reviewing(
+        module,
+        services,
+        _make_review_payload(
+            judgment_payload={
+                "overall": "合格",
+                "analysis_window": (1.0, 3.0),
+            }
+        ),
+    )
+    qapp.processEvents()
+
+    assert module.canvas.geometry() == canvas_geometry
+    assert module._content_layout.getContentsMargins() == layout_margins
+    assert module.analysis_select_button.parentWidget() is button_parent
+    assert module.analysis_control_row.geometry() == row_geometry
 
 
 def test_stale_run_review_cannot_activate_selection_or_reanalysis(qapp):

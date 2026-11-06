@@ -2,34 +2,46 @@ from __future__ import annotations
 
 import gc
 import os
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import numpy as np
 import pytest
+import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6 import sip
 from PyQt6.QtCore import QCoreApplication, QEvent, Qt
-from PyQt6.QtWidgets import QApplication, QWidget
+from PyQt6.QtGui import QPaintEvent
+from PyQt6.QtWidgets import QApplication, QScrollArea, QWidget
 
 try:
     from pyqtgraph.widgets.GraphicsView import GraphicsView
-except Exception:  # pragma: no cover - pyqtgraph import is environment-dependent
+except Exception:
     GraphicsView = None
 else:
     _ORIGINAL_GRAPHICS_VIEW_PAINT_EVENT = GraphicsView.paintEvent
     _NOOP_GRAPHICS_VIEW_PAINT_EVENT = lambda self, event: None
 
+from app.service.factory_review_payloads import FactoryReviewPayload
 from app.service.analysis.frames import StftFrame
-from app.service.result_dashboard_layout import DEFAULT_RESULT_DASHBOARD_LAYOUT
-from app.services_container import (
-    FactoryControllerState,
-    FactoryReviewPayload,
-    FactoryRuntimeStartPayload,
+from app.service.result_history import (
+    ConfigSummaryField,
+    FrozenConfigSummary,
+    ResultConclusion,
+    ResultHistoryCardSnapshot,
+    ResultPhase,
+    ReviewDisplayPayload,
+    RunTerminated,
+    TerminalResultReplaced,
 )
+from app.service.result_history_contracts import ManualJudgmentTarget
+from app.services_container import FactoryControllerState
 from ui.modules.result_dashboard import ResultDashboardModule
+from ui.modules.result import ResultModule
+from ui.modules.result_history import ResultHistoryModule
+from ui.modules.stft import StftModule
 from ui.widgets.cards import Card
 
 
@@ -41,38 +53,31 @@ class _SignalStub:
     def connect(self, callback):
         self._callbacks.append(callback)
 
-    def emit(self, *args, **kwargs):
-        self.emissions.append((args, kwargs))
-        for callback in list(self._callbacks):
-            callback(*args, **kwargs)
+    def emit(self, *args):
+        self.emissions.append(args)
+        for callback in tuple(self._callbacks):
+            callback(*args)
 
 
 class _BusStub:
     def __init__(self):
-        self.config_changed = _SignalStub()
-        self.factory_state_changed = _SignalStub()
-        self.factory_review_changed = _SignalStub()
-        self.factory_display_reset = _SignalStub()
-        self.factory_runtime_start_accepted = _SignalStub()
-        self.factory_runtime_analyzing_entered = _SignalStub()
-        self.stft_updated = _SignalStub()
-        self.fft_updated = _SignalStub()
-        self.spl_updated = _SignalStub()
-        self.loudness_updated = _SignalStub()
-        self.octave_updated = _SignalStub()
-        self.current_trace_updated = _SignalStub()
+        for name in (
+            "config_changed", "factory_state_changed", "factory_review_changed",
+            "factory_display_reset", "factory_runtime_start_accepted",
+            "factory_runtime_analyzing_entered", "stft_updated", "fft_updated",
+            "spl_updated", "loudness_updated", "octave_updated",
+            "current_trace_updated",
+        ):
+            setattr(self, name, _SignalStub())
 
 
 @pytest.fixture(scope="session")
 def qapp():
-    app = QApplication.instance()
-    if app is None:
-        app = QApplication([])
-    return app
+    return QApplication.instance() or QApplication([])
 
 
 @pytest.fixture(autouse=True)
-def _close_top_level_widgets(qapp):
+def _close_widgets(qapp):
     if GraphicsView is not None:
         GraphicsView.paintEvent = _NOOP_GRAPHICS_VIEW_PAINT_EVENT
     yield
@@ -81,7 +86,7 @@ def _close_top_level_widgets(qapp):
         if sip.isdeleted(widget):
             continue
         for child in widget.findChildren(QWidget):
-            if _is_analysis_chart_widget(child):
+            if type(child).__module__ == "ui.widgets.analysis_charts":
                 chart_widgets.append(child)
                 _disable_updates_and_remove_events(child)
                 _close_plot_widget(child)
@@ -103,10 +108,6 @@ def _close_top_level_widgets(qapp):
         qapp.processEvents()
     if GraphicsView is not None:
         GraphicsView.paintEvent = _ORIGINAL_GRAPHICS_VIEW_PAINT_EVENT
-
-
-def _is_analysis_chart_widget(widget: QWidget) -> bool:
-    return type(widget).__module__ == "ui.widgets.analysis_charts"
 
 
 def _disable_updates_and_remove_events(widget: QWidget) -> None:
@@ -135,1275 +136,768 @@ def _close_plot_widget(chart_widget: QWidget) -> None:
         pass
 
 
-def _make_services_with_config(config: dict) -> SimpleNamespace:
+def _services():
     return SimpleNamespace(
         bus=_BusStub(),
         config_service=SimpleNamespace(
-            load_config=MagicMock(return_value=config),
-            load_config_for_result_dashboard=MagicMock(return_value=config),
+            load_config=MagicMock(),
+            load_config_for_result_dashboard=MagicMock(),
         ),
         factory_selection_settings=SimpleNamespace(
-            load_selected_config_ids=MagicMock(return_value=()),
+            load_selected_config_ids=MagicMock(return_value=())
         ),
         factory_mode=SimpleNamespace(
             state=FactoryControllerState(),
             review_payload=FactoryReviewPayload(),
+            begin_reanalysis=MagicMock(),
         ),
     )
 
 
-def _make_services_with_configs(
-    configs_by_id: dict[int, dict],
+def _panel(
+    panel_id: str,
+    panel_type: str,
     *,
-    state: FactoryControllerState | None = None,
-    preferred_config_ids: tuple[int, ...] = (),
-) -> SimpleNamespace:
-    def load_config(config_id: int):
-        return configs_by_id[config_id]
-
-    return SimpleNamespace(
-        bus=_BusStub(),
-        config_service=SimpleNamespace(
-            load_config=MagicMock(side_effect=load_config),
-            load_config_for_result_dashboard=MagicMock(side_effect=load_config),
-        ),
-        factory_selection_settings=SimpleNamespace(
-            load_selected_config_ids=MagicMock(return_value=preferred_config_ids),
-        ),
-        factory_mode=SimpleNamespace(
-            state=state or FactoryControllerState(),
-            review_payload=FactoryReviewPayload(),
-        ),
-    )
-
-
-def _dashboard_layout(
-    panels: list[dict],
-    *,
-    columns: int = 2,
-    rows: int = 1,
-) -> dict:
-    return {
-        "version": 1,
-        "columns": columns,
-        "rows": rows,
-        "panels": panels,
-    }
-
-
-def _summary_panel() -> dict:
-    return {
-        "id": "summary",
-        "type": "result_summary",
-        "row": 0,
-        "column": 0,
-        "row_span": 1,
-        "column_span": 1,
-        "channel": "none",
-    }
-
-
-def _spectrum_panel(panel_id: str, *, column: int = 1) -> dict:
+    row=0,
+    column=0,
+    row_span=1,
+    column_span=1,
+    channel="selected_1",
+):
     return {
         "id": panel_id,
-        "type": "spectrum",
-        "row": 0,
+        "type": panel_type,
+        "row": row,
         "column": column,
-        "row_span": 1,
-        "column_span": 1,
-        "channel": "selected_1",
+        "row_span": row_span,
+        "column_span": column_span,
+        "channel": channel,
     }
 
 
-def _make_stft_frame(
+def _config(
+    panels,
     *,
-    time: float,
-    magnitudes: tuple[float, ...],
-    frequencies: tuple[float, ...] = (100.0, 200.0),
-) -> StftFrame:
-    return StftFrame(
-        time=time,
-        frequencies=np.asarray(frequencies, dtype=float),
-        magnitudes=np.asarray(magnitudes, dtype=float),
+    selected_channels=(0, 1),
+    vibration_channel=1,
+    rows=1,
+    columns=2,
+):
+    return {
+        "config_id": 101,
+        "selected_channels": list(selected_channels),
+        "vibration_view_channel_index": vibration_channel,
+        "result_dashboard_layout": {
+            "version": 2,
+            "rows": rows,
+            "columns": columns,
+            "panels": list(panels),
+        },
+    }
+
+
+def _card(
+    run_id: str,
+    *,
+    revision: int = 0,
+    manual_judgment_buttons_visible: bool = True,
+):
+    return ResultHistoryCardSnapshot(
+        run_id=run_id,
+        config=FrozenConfigSummary(
+            101,
+            "Frozen",
+            (ConfigSummaryField("mode", "history"),),
+            manual_judgment_buttons_visible=(
+                manual_judgment_buttons_visible
+            ),
+        ),
+        sn="SN",
+        trigger_source="manual",
+        started_at=datetime(2026, 7, 26, 1),
+        terminated_at=datetime(2026, 7, 26, 2),
+        phase=ResultPhase.TERMINAL,
+        conclusion=ResultConclusion.OK,
+        reason=None,
+        is_active_run=False,
+        manual_judgment_allowed=True,
+        manual_reanalysis_allowed=True,
+        revision=revision,
+    )
+
+
+def test_dashboard_manual_judgment_buttons_require_frozen_visibility_flag(qapp):
+    module = ResultDashboardModule(_services())
+    targets = []
+    module.manual_judgment_target_changed.connect(targets.append)
+
+    module.apply_history_event(
+        RunTerminated(
+            _card(
+                "hidden",
+                revision=1,
+                manual_judgment_buttons_visible=False,
+            ),
+            review_payload=ReviewDisplayPayload(
+                FactoryReviewPayload(
+                    displayed_config_id=101,
+                    run_id="hidden",
+                ),
+                _config([]),
+            ),
+        )
+    )
+    assert targets == []
+    assert module._manual_judgment_target is None
+
+    module.apply_history_event(
+        RunTerminated(
+            _card("visible", revision=2),
+            review_payload=ReviewDisplayPayload(
+                FactoryReviewPayload(
+                    displayed_config_id=101,
+                    run_id="visible",
+                ),
+                _config([]),
+            ),
+        )
+    )
+    assert targets[-1] == ManualJudgmentTarget(
+        "visible",
+        2,
+        (),
+        True,
+    )
+
+
+def _event(
+    run_id: str,
+    config: dict,
+    *,
+    fft_levels=(1.0, 2.0),
+    chart_payload=None,
+):
+    if chart_payload is None:
+        chart_payload = {
+            0: {
+                "fft": {
+                    "frequencies_hz": [100.0, 200.0],
+                    "levels_db": list(fft_levels),
+                }
+            }
+        }
+    return RunTerminated(
+        _card(run_id),
+        review_payload=ReviewDisplayPayload(
+            FactoryReviewPayload(
+                displayed_config_id=101,
+                run_id=run_id,
+                trigger_source="manual",
+                chart_payload=chart_payload,
+            ),
+            config,
+        ),
+    )
+
+
+def test_dashboard_mounts_only_chart_cards_with_configured_grid_spans(qapp):
+    config = _config(
+        [
+            _panel(
+                "spectrum",
+                "spectrum",
+                row=0,
+                column=1,
+                column_span=2,
+            ),
+            _panel(
+                "vibration",
+                "vibration_pulse",
+                row=1,
+                column=1,
+            ),
+        ],
+        rows=2,
+        columns=3,
+    )
+    module = ResultDashboardModule(_services())
+    module.apply_history_event(_event("run-1", config))
+
+    assert list(module.cards_by_panel_id()) == ["spectrum", "vibration"]
+    assert module.grid_position("spectrum") == (0, 1, 1, 2)
+    assert module.grid_position("vibration") == (1, 1, 1, 1)
+
+
+def test_dashboard_uses_compact_spacing_cards_and_plot_modes(qapp):
+    config = _config([
+        _panel("spectrum", "spectrum"),
+        _panel("spl", "spl", row=1),
+    ], rows=2)
+    module = ResultDashboardModule(_services())
+    module.apply_history_event(_event("run-1", config))
+
+    assert module._grid.spacing() == 2
+    assert all(
+        isinstance(card, Card)
+        for card in module.cards_by_panel_id().values()
+    )
+    assert module.panel_widget("spectrum").plot.compact_display_mode_enabled()
+    assert module.panel_widget("spl").plot.compact_display_mode_enabled()
+
+
+@pytest.mark.parametrize(
+    ("panel_type", "channel", "expected"),
+    [
+        ("spectrum", "selected_1", 0),
+        ("spectrum", "selected_2", 3),
+        ("vibration_pulse", "vibration", 3),
+        ("vibration_pulse", "selected_1", None),
+    ],
+)
+def test_dashboard_resolves_panel_channels_from_frozen_config(
+    qapp,
+    panel_type,
+    channel,
+    expected,
+):
+    config = _config(
+        [_panel("chart", panel_type, channel=channel)],
+        selected_channels=(0, 3),
+        vibration_channel=3,
+    )
+    module = ResultDashboardModule(_services())
+    module.apply_history_event(_event("run-1", config))
+
+    assert (
+        module.panel_widget("chart").selected_display_channel_provider()
+        == expected
     )
 
 
 @pytest.mark.parametrize(
-    ("panel_id", "panel_type", "channel", "vibration_channel"),
+    ("panel_type", "channel", "vibration_channel"),
     [
-        ("stft", "stft", "selected_1", None),
-        ("vib_stft", "vibration_stft", "vibration", 1),
+        ("stft", "selected_1", None),
+        ("vibration_stft", "vibration", 1),
     ],
 )
-def test_stft_dashboard_card_initializes_and_updates_score_metric(
+def test_stft_card_retains_score_metric_and_compact_heatmap(
     qapp,
-    panel_id,
     panel_type,
     channel,
     vibration_channel,
 ):
-    services = _make_services_with_config(
-        {
-            "config_id": 101,
-            "selected_channels": [0, 1],
-            "vibration_view_channel_index": vibration_channel,
-            "result_dashboard_layout": _dashboard_layout(
-                [
-                    _summary_panel(),
-                    {
-                        "id": panel_id,
-                        "type": panel_type,
-                        "row": 0,
-                        "column": 1,
-                        "row_span": 1,
-                        "column_span": 1,
-                        "channel": channel,
-                    },
-                ],
-                columns=2,
-            ),
-        }
+    config = _config(
+        [_panel("stft", panel_type, channel=channel)],
+        vibration_channel=vibration_channel,
     )
-    module = ResultDashboardModule(services)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
-    )
+    config["channels"] = [
+        {"channel_index": index, "stft_score_enabled": True}
+        for index in config["selected_channels"]
+    ]
+    module = ResultDashboardModule(_services())
+    module.apply_history_event(_event("run-1", config, chart_payload={}))
+    panel = module.panel_widget("stft")
+    card = module.cards_by_panel_id()["stft"]
 
-    panel = module.panel_widget(panel_id)
-    card = module.cards_by_panel_id()[panel_id]
-
-    assert panel.current_score_title() == "得分：--"
+    assert panel.canvas.heatmap.compact_display_mode_enabled()
     assert card.title_suffix() == "频谱最低得分：--"
-    assert card.title_metric_value_label.text() == "--"
-
     panel.score_title_changed.emit("得分：88.50")
-
-    assert card.title_suffix() == "频谱最低得分：88.50"
     assert card.title_metric_value_label.text() == "88.50"
 
 
-def test_dashboard_renders_cards_from_layout(qapp):
-    services = _make_services_with_config(
-        {
-            "config_id": 101,
-            "selected_channels": [0, 1],
-            "vibration_view_channel_index": 1,
-            "result_dashboard_layout": {
-                "version": 1,
-                "columns": 2,
-                "rows": 1,
-                "panels": [
-                    {
-                        "id": "summary",
-                        "type": "result_summary",
-                        "row": 0,
-                        "column": 0,
-                        "row_span": 1,
-                        "column_span": 1,
-                        "channel": "none",
-                    },
-                    {
-                        "id": "vib",
-                        "type": "vibration_pulse",
-                        "row": 0,
-                        "column": 1,
-                        "row_span": 1,
-                        "column_span": 1,
-                        "channel": "vibration",
-                    },
-                ],
-            },
-        }
+def test_same_layout_reuses_chart_widget_and_refreshes_channel_binding(qapp):
+    first_config = _config(
+        [_panel("spectrum", "spectrum", channel="selected_1")],
+        selected_channels=(0, 3),
     )
+    second_config = _config(
+        [_panel("spectrum", "spectrum", channel="selected_2")],
+        selected_channels=(0, 3),
+    )
+    module = ResultDashboardModule(_services())
+    module.apply_history_event(_event("run-1", first_config))
+    panel = module.panel_widget("spectrum")
+    assert panel.selected_display_channel_provider() == 0
+
+    module.apply_history_event(_event("run-2", second_config))
+
+    assert module.panel_widget("spectrum") is panel
+    assert panel.selected_display_channel_provider() == 3
+
+
+def test_frozen_config_payload_is_authority_and_global_config_is_not_loaded(qapp):
+    services = _services()
+    config = _config([_panel("spectrum", "spectrum")])
     module = ResultDashboardModule(services)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
-    )
+    module.apply_history_event(_event("run-1", config))
 
-    assert [card.title() for card in module.cards_by_panel_id().values()] == [
-        "结果摘要",
-        "脉冲强度（振动）",
-    ]
-
-
-def test_dashboard_uses_compact_canvas_spacing_and_cards(qapp):
-    services = _make_services_with_config(
-        {
-            "config_id": 101,
-            "selected_channels": [0, 1],
-            "vibration_view_channel_index": None,
-            "result_dashboard_layout": _dashboard_layout(
-                [_summary_panel(), _spectrum_panel("spectrum")],
-                columns=2,
-            ),
-        }
-    )
-    module = ResultDashboardModule(services)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
-    )
-
-    cards = module.cards_by_panel_id()
-    assert module._grid.spacing() == 2
-    assert cards
-    assert all(card.property("dashboardCompact") is True for card in cards.values())
-
-
-def test_dashboard_enables_compact_chart_mode_for_plot_attribute_panels(qapp):
-    panels = [
-        _summary_panel(),
-        {
-            "id": "spl",
-            "type": "spl",
-            "row": 0,
-            "column": 1,
-            "row_span": 1,
-            "column_span": 1,
-            "channel": "selected_1",
-        },
-        {
-            "id": "loudness",
-            "type": "loudness",
-            "row": 0,
-            "column": 2,
-            "row_span": 1,
-            "column_span": 1,
-            "channel": "selected_1",
-        },
-        {
-            "id": "octave",
-            "type": "octave",
-            "row": 1,
-            "column": 0,
-            "row_span": 1,
-            "column_span": 1,
-            "channel": "selected_1",
-        },
-        {
-            "id": "vibration",
-            "type": "vibration_pulse",
-            "row": 1,
-            "column": 1,
-            "row_span": 1,
-            "column_span": 1,
-            "channel": "vibration",
-        },
-    ]
-    services = _make_services_with_config(
-        {
-            "config_id": 101,
-            "selected_channels": [0, 1],
-            "vibration_view_channel_index": 1,
-            "result_dashboard_layout": _dashboard_layout(
-                panels,
-                columns=3,
-                rows=2,
-            ),
-        }
-    )
-    module = ResultDashboardModule(services)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
-    )
-
-    for panel_id in ("spl", "loudness", "octave", "vibration"):
-        panel = module.panel_widget(panel_id)
-        assert panel.plot.compact_display_mode_enabled() is True
-
-
-def test_dashboard_enables_compact_chart_mode_for_stft_heatmap_panels(qapp):
-    services = _make_services_with_config(
-        {
-            "config_id": 101,
-            "selected_channels": [0, 1],
-            "vibration_view_channel_index": None,
-            "result_dashboard_layout": _dashboard_layout(
-                [
-                    _summary_panel(),
-                    {
-                        "id": "stft",
-                        "type": "stft",
-                        "row": 0,
-                        "column": 1,
-                        "row_span": 1,
-                        "column_span": 1,
-                        "channel": "selected_1",
-                    },
-                ],
-                columns=2,
-            ),
-        }
-    )
-    module = ResultDashboardModule(services)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
-    )
-
-    panel = module.panel_widget("stft")
-    assert panel.canvas.heatmap.compact_display_mode_enabled() is True
-
-
-def test_result_summary_metrics_follow_primary_acoustic_channel(qapp):
-    services = _make_services_with_config(
-        {
-            "config_id": 101,
-            "selected_channels": [0, 1],
-            "vibration_view_channel_index": 1,
-            "channels": [
-                {"channel_index": 0, "loudness_unit": "sone"},
-                {"channel_index": 1, "loudness_unit": "sone"},
-            ],
-            "result_dashboard_layout": _dashboard_layout(
-                [_summary_panel()],
-                columns=1,
-            ),
-        }
-    )
-    module = ResultDashboardModule(services)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(
-            selected_config_ids=(101,),
-            active_config_id=101,
-            displayed_config_id=101,
-            run_phase="running",
-        )
-    )
-    services.bus.factory_runtime_start_accepted.emit(
-        FactoryRuntimeStartPayload(
-            config_id=101,
-            run_id="run-101",
-            trigger_source="manual",
-        )
-    )
-
-    summary_panel = module.panel_widget("summary")
-    services.bus.spl_updated.emit(101, "run-101", 1, SimpleNamespace(spl_db=89.0))
-    services.bus.loudness_updated.emit(
-        101,
-        "run-101",
-        1,
-        SimpleNamespace(loudness_sone=8.0),
-    )
-
-    assert summary_panel.lb_spl_metric_value.text() == "--"
-    assert summary_panel.lb_loudness_metric_value.text() == "--"
-
-    services.bus.spl_updated.emit(101, "run-101", 0, SimpleNamespace(spl_db=72.34))
-    services.bus.loudness_updated.emit(
-        101,
-        "run-101",
-        0,
-        SimpleNamespace(loudness_sone=2.345),
-    )
-
-    assert summary_panel.lb_spl_metric_value.text() == "72.3 dB"
-    assert summary_panel.lb_loudness_metric_value.text() == "2.35 sone"
-
-
-def test_result_summary_metrics_follow_live_run_when_panel_created_after_start(qapp):
-    services = _make_services_with_config(
-        {
-            "config_id": 101,
-            "selected_channels": [0, 1],
-            "vibration_view_channel_index": 1,
-            "channels": [
-                {"channel_index": 0, "loudness_unit": "sone"},
-                {"channel_index": 1, "loudness_unit": "sone"},
-            ],
-            "result_dashboard_layout": _dashboard_layout(
-                [_summary_panel()],
-                columns=1,
-            ),
-        }
-    )
-
-    def controller_accepts_runtime_start(_payload):
-        services.bus.factory_state_changed.emit(
-            FactoryControllerState(
-                selected_config_ids=(101,),
-                active_config_id=101,
-                displayed_config_id=101,
-                run_phase="running",
-            )
-        )
-
-    services.bus.factory_runtime_start_accepted.connect(
-        controller_accepts_runtime_start
-    )
-    module = ResultDashboardModule(services)
-
-    services.bus.factory_runtime_start_accepted.emit(
-        FactoryRuntimeStartPayload(
-            config_id=101,
-            run_id="run-101",
-            trigger_source="manual",
-        )
-    )
-
-    summary_panel = module.panel_widget("summary")
-    assert summary_panel is not None
-    services.bus.spl_updated.emit(101, "run-101", 0, SimpleNamespace(spl_db=72.34))
-    services.bus.loudness_updated.emit(
-        101,
-        "run-101",
-        0,
-        SimpleNamespace(loudness_sone=2.345),
-    )
-
-    assert summary_panel.lb_spl_metric_value.text() == "72.3 dB"
-    assert summary_panel.lb_loudness_metric_value.text() == "2.35 sone"
-
-
-def test_duplicate_spectrum_panels_get_different_channel_providers(qapp):
-    services = _make_services_with_config(
-        {
-            "config_id": 101,
-            "selected_channels": [0, 1],
-            "vibration_view_channel_index": 1,
-            "result_dashboard_layout": {
-                "version": 1,
-                "columns": 3,
-                "rows": 1,
-                "panels": [
-                    {
-                        "id": "summary",
-                        "type": "result_summary",
-                        "row": 0,
-                        "column": 0,
-                        "row_span": 1,
-                        "column_span": 1,
-                        "channel": "none",
-                    },
-                    {
-                        "id": "spectrum_a",
-                        "type": "spectrum",
-                        "row": 0,
-                        "column": 1,
-                        "row_span": 1,
-                        "column_span": 1,
-                        "channel": "selected_1",
-                    },
-                    {
-                        "id": "spectrum_b",
-                        "type": "spectrum",
-                        "row": 0,
-                        "column": 2,
-                        "row_span": 1,
-                        "column_span": 1,
-                        "channel": "selected_2",
-                    },
-                ],
-            },
-        }
-    )
-    module = ResultDashboardModule(services)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
-    )
-
-    first = module.panel_widget("spectrum_a")
-    second = module.panel_widget("spectrum_b")
-    assert first.selected_display_channel_provider() == 0
-    assert second.selected_display_channel_provider() == 1
-    assert first.strict_selected_display_channel is True
-    assert second.strict_selected_display_channel is True
-
-
-def test_vibration_panel_selected_binding_returns_none_for_non_vibration_channel(qapp):
-    services = _make_services_with_config(
-        {
-            "config_id": 101,
-            "selected_channels": [0, 1],
-            "vibration_view_channel_index": 1,
-            "result_dashboard_layout": {
-                "version": 1,
-                "columns": 2,
-                "rows": 1,
-                "panels": [
-                    {
-                        "id": "summary",
-                        "type": "result_summary",
-                        "row": 0,
-                        "column": 0,
-                        "row_span": 1,
-                        "column_span": 1,
-                        "channel": "none",
-                    },
-                    {
-                        "id": "vib",
-                        "type": "vibration_pulse",
-                        "row": 0,
-                        "column": 1,
-                        "row_span": 1,
-                        "column_span": 1,
-                        "channel": "selected_1",
-                    },
-                ],
-            },
-        }
-    )
-    module = ResultDashboardModule(services)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
-    )
-
-    vibration_panel = module.panel_widget("vib")
-    assert vibration_panel.selected_display_channel_provider() is None
-    assert vibration_panel.strict_selected_display_channel is True
-
-
-def test_vibration_panel_provider_returns_none_when_vibration_channel_not_configured(qapp):
-    services = _make_services_with_config(
-        {
-            "config_id": 101,
-            "selected_channels": [0],
-            "vibration_view_channel_index": None,
-            "result_dashboard_layout": {
-                "version": 1,
-                "columns": 2,
-                "rows": 1,
-                "panels": [
-                    {
-                        "id": "summary",
-                        "type": "result_summary",
-                        "row": 0,
-                        "column": 0,
-                        "row_span": 1,
-                        "column_span": 1,
-                        "channel": "none",
-                    },
-                    {
-                        "id": "vib",
-                        "type": "vibration_pulse",
-                        "row": 0,
-                        "column": 1,
-                        "row_span": 1,
-                        "column_span": 1,
-                        "channel": "selected_1",
-                    },
-                ],
-            },
-        }
-    )
-    module = ResultDashboardModule(services)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
-    )
-
-    vibration_panel = module.panel_widget("vib")
-    assert vibration_panel.selected_display_channel_provider() is None
-
-
-def test_dashboard_places_cards_with_configured_grid_spans(qapp):
-    services = _make_services_with_config(
-        {
-            "config_id": 101,
-            "selected_channels": [0],
-            "vibration_view_channel_index": None,
-            "result_dashboard_layout": {
-                "version": 1,
-                "columns": 3,
-                "rows": 2,
-                "panels": [
-                    {
-                        "id": "summary",
-                        "type": "result_summary",
-                        "row": 0,
-                        "column": 0,
-                        "row_span": 2,
-                        "column_span": 1,
-                        "channel": "none",
-                    },
-                    {
-                        "id": "spectrum",
-                        "type": "spectrum",
-                        "row": 0,
-                        "column": 1,
-                        "row_span": 1,
-                        "column_span": 2,
-                        "channel": "selected_1",
-                    },
-                ],
-            },
-        }
-    )
-    module = ResultDashboardModule(services)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
-    )
-
-    assert module.grid_position("summary") == (0, 0, 2, 1)
-    assert module.grid_position("spectrum") == (0, 1, 1, 2)
-
-
-def test_dashboard_keeps_configured_cards_present_when_payload_data_missing(qapp):
-    services = _make_services_with_config(
-        {
-            "config_id": 101,
-            "selected_channels": [0, 1],
-            "vibration_view_channel_index": 1,
-            "result_dashboard_layout": {
-                "version": 1,
-                "columns": 3,
-                "rows": 1,
-                "panels": [
-                    {
-                        "id": "summary",
-                        "type": "result_summary",
-                        "row": 0,
-                        "column": 0,
-                        "row_span": 1,
-                        "column_span": 1,
-                        "channel": "none",
-                    },
-                    {
-                        "id": "spectrum",
-                        "type": "spectrum",
-                        "row": 0,
-                        "column": 1,
-                        "row_span": 1,
-                        "column_span": 1,
-                        "channel": "selected_1",
-                    },
-                    {
-                        "id": "vib",
-                        "type": "vibration_pulse",
-                        "row": 0,
-                        "column": 2,
-                        "row_span": 1,
-                        "column_span": 1,
-                        "channel": "vibration",
-                    },
-                ],
-            },
-        }
-    )
-    module = ResultDashboardModule(services)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
-    )
-    before = {
-        panel_id: module.grid_position(panel_id)
-        for panel_id in ("summary", "spectrum", "vib")
-    }
-
-    services.bus.factory_review_changed.emit(FactoryReviewPayload(displayed_config_id=101))
-    qapp.processEvents()
-
-    assert list(module.cards_by_panel_id()) == ["summary", "spectrum", "vib"]
-    assert {
-        panel_id: module.grid_position(panel_id)
-        for panel_id in ("summary", "spectrum", "vib")
-    } == before
-
-
-def test_dashboard_uses_display_config_loader_for_runtime_layout(qapp):
-    display_config = {
-        "config_id": 101,
-        "selected_channels": [0],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": _dashboard_layout([_summary_panel()], columns=1),
-    }
-    services = _make_services_with_config(display_config)
-    module = ResultDashboardModule(services)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
-    )
-
-    assert "summary" in module.cards_by_panel_id()
-    services.config_service.load_config_for_result_dashboard.assert_called_with(101)
+    assert module.displayed_config() == config
     services.config_service.load_config.assert_not_called()
+    services.config_service.load_config_for_result_dashboard.assert_not_called()
 
 
-def test_dashboard_previews_first_selected_config_layout_at_startup(qapp):
-    preferred_config = {
-        "config_id": 202,
-        "selected_channels": [0],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": _dashboard_layout(
-            [_summary_panel(), _spectrum_panel("preferred_spectrum")]
-        ),
-    }
-    services = _make_services_with_configs(
-        {202: preferred_config},
-        state=FactoryControllerState(selected_config_ids=(202,), run_phase="armed"),
-    )
+def test_two_runs_with_same_config_id_keep_distinct_structured_results(qapp):
+    config = _config([_panel("spectrum", "spectrum")])
+    module = ResultDashboardModule(_services())
+    module.apply_history_event(_event("run-1", config, fft_levels=(1, 2)))
+    first_payload = module.panel_widget("spectrum").current_plot_payload()
+    module.apply_history_event(_event("run-2", config, fft_levels=(9, 10)))
+    second_payload = module.panel_widget("spectrum").current_plot_payload()
 
+    module.set_follow_latest(False)
+    module.select_run("run-1")
+
+    assert first_payload != second_payload
+    assert module.projected_run_id() == "run-1"
+    assert module.panel_widget("spectrum").current_plot_payload() == first_payload
+
+
+def test_global_factory_review_and_state_do_not_change_historical_projection(qapp):
+    services = _services()
+    config = _config([_panel("spectrum", "spectrum")])
     module = ResultDashboardModule(services)
+    module.apply_history_event(_event("run-1", config))
+    panel = module.panel_widget("spectrum")
+    payload = panel.current_plot_payload()
 
-    assert list(module.cards_by_panel_id()) == ["summary", "preferred_spectrum"]
-    services.config_service.load_config_for_result_dashboard.assert_called_with(202)
-
-
-def test_dashboard_previews_persisted_preferred_config_when_state_has_no_selection(qapp):
-    preferred_config = {
-        "config_id": 303,
-        "selected_channels": [1],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": _dashboard_layout(
-            [_summary_panel(), _spectrum_panel("persisted_spectrum")]
-        ),
-    }
-    services = _make_services_with_configs(
-        {303: preferred_config},
-        preferred_config_ids=(303,),
+    services.bus.factory_review_changed.emit(
+        FactoryReviewPayload(displayed_config_id=999, run_id="legacy")
     )
-
-    module = ResultDashboardModule(services)
-
-    assert list(module.cards_by_panel_id()) == ["summary", "persisted_spectrum"]
-    services.factory_selection_settings.load_selected_config_ids.assert_called()
-
-
-def test_dashboard_follows_first_selected_config_change_before_runtime(qapp):
-    default_like_config = {
-        "config_id": 101,
-        "selected_channels": [0],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": _dashboard_layout([_summary_panel()], columns=1),
-    }
-    custom_config = {
-        "config_id": 202,
-        "selected_channels": [0],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": _dashboard_layout(
-            [_summary_panel(), _spectrum_panel("custom_spectrum")]
-        ),
-    }
-    services = _make_services_with_configs(
-        {101: default_like_config, 202: custom_config},
-        state=FactoryControllerState(selected_config_ids=(101,), run_phase="armed"),
-    )
-    module = ResultDashboardModule(services)
-
-    assert list(module.cards_by_panel_id()) == ["summary"]
-
     services.bus.factory_state_changed.emit(
-        FactoryControllerState(selected_config_ids=(202,), run_phase="armed")
+        FactoryControllerState(displayed_config_id=999, run_phase="reviewing")
     )
 
-    assert list(module.cards_by_panel_id()) == ["summary", "custom_spectrum"]
-    services.config_service.load_config_for_result_dashboard.assert_called_with(202)
+    assert module.panel_widget("spectrum") is panel
+    assert panel.current_plot_payload() == payload
+    assert module.projected_run_id() == "run-1"
 
 
-def test_dashboard_keeps_panel_widgets_when_config_switch_uses_same_layout(qapp):
-    shared_layout = _dashboard_layout(
-        [_summary_panel(), _spectrum_panel("spectrum")]
+def test_dashboard_cleanup_keeps_projection_callbacks_inside_owned_qt_tree(qapp):
+    module = ResultDashboardModule(_services())
+    module.apply_history_event(
+        _event("run-1", _config([_panel("spectrum", "spectrum")]))
     )
-    first_config = {
+    bus = module.projection_bus()
+    chart = module.panel_widget("spectrum")
+
+    assert bus.parent() is module
+    assert chart.parent() is not None
+    module.close()
+
+
+def test_stft_decision_with_empty_charts_clears_same_run_live_image(qapp):
+    services = _services()
+    services.config_service.load_config.return_value = {
         "config_id": 101,
         "selected_channels": [0],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": shared_layout,
+        "channels": [{"channel_index": 0}],
     }
-    second_config = {
-        "config_id": 202,
-        "selected_channels": [3],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": shared_layout,
-    }
-    services = _make_services_with_configs(
-        {101: first_config, 202: second_config},
-        state=FactoryControllerState(selected_config_ids=(101,), run_phase="armed"),
-    )
-    module = ResultDashboardModule(services)
-    original_spectrum = module.panel_widget("spectrum")
-
+    module = StftModule(services)
+    module.selected_display_channel_provider = lambda: 0
     services.bus.factory_state_changed.emit(
         FactoryControllerState(
-            selected_config_ids=(101, 202),
-            active_config_id=202,
-            displayed_config_id=202,
+            displayed_config_id=101,
             run_phase="running",
         )
     )
-
-    assert module.panel_widget("spectrum") is original_spectrum
-    assert module.panel_widget("spectrum").selected_display_channel_provider() == 3
-
-
-def test_dashboard_keeps_panel_widgets_when_only_panel_channel_binding_changes(qapp):
-    first_layout = _dashboard_layout(
-        [_summary_panel(), _spectrum_panel("spectrum")]
+    services.bus.factory_runtime_start_accepted.emit(
+        SimpleNamespace(config_id=101, run_id="run-1")
     )
-    second_layout = _dashboard_layout(
-        [
-            _summary_panel(),
-            {
-                **_spectrum_panel("spectrum"),
-                "channel": "selected_2",
+    services.bus.stft_updated.emit(
+        101,
+        "run-1",
+        0,
+        StftFrame(
+            time=0.1,
+            frequencies=np.asarray([100.0, 200.0]),
+            magnitudes=np.asarray([-3.0, -4.0]),
+        ),
+    )
+    assert module.canvas.heatmap.has_image() is True
+
+    services.bus.factory_state_changed.emit(
+        FactoryControllerState(
+            displayed_config_id=101,
+            run_phase="reviewing",
+        )
+    )
+    services.bus.factory_review_changed.emit(
+        FactoryReviewPayload(
+            displayed_config_id=101,
+            run_id="run-1",
+            chart_payload={},
+        )
+    )
+
+    assert module.canvas.heatmap.has_image() is False
+
+
+def _decision_payload(
+    run_id: str,
+    config: dict,
+    terminal_revision: str,
+    *,
+    attempt_id: str,
+    history_revision: int,
+) -> ReviewDisplayPayload:
+    return ReviewDisplayPayload(
+        {
+            "_projection_identity": {
+                "attempt_id": attempt_id,
+                "terminal_revision": terminal_revision,
+                "history_revision": history_revision,
             },
-        ]
-    )
-    first_config = {
-        "config_id": 101,
-        "selected_channels": [0, 3],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": first_layout,
-    }
-    second_config = {
-        "config_id": 202,
-        "selected_channels": [0, 3],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": second_layout,
-    }
-    services = _make_services_with_configs(
-        {101: first_config, 202: second_config},
-        state=FactoryControllerState(selected_config_ids=(101,), run_phase="armed"),
-    )
-    module = ResultDashboardModule(services)
-    original_spectrum = module.panel_widget("spectrum")
-
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(
-            selected_config_ids=(101, 202),
-            active_config_id=202,
-            displayed_config_id=202,
-            run_phase="running",
-        )
-    )
-
-    assert module.panel_widget("spectrum") is original_spectrum
-    assert module.panel_widget("spectrum").selected_display_channel_provider() == 3
-
-
-def test_dashboard_replays_runtime_start_when_same_selected_config_starts(qapp):
-    config = {
-        "config_id": 101,
-        "selected_channels": [0],
-        "vibration_view_channel_index": None,
-        "channels": [
-            {"channel_index": 0, "loudness_unit": "sone"},
-        ],
-        "result_dashboard_layout": _dashboard_layout([_summary_panel()], columns=1),
-    }
-    services = _make_services_with_configs(
-        {101: config},
-        state=FactoryControllerState(selected_config_ids=(101,), run_phase="armed"),
-    )
-    module = ResultDashboardModule(services)
-    summary_panel = module.panel_widget("summary")
-
-    services.bus.factory_runtime_start_accepted.emit(
-        FactoryRuntimeStartPayload(
-            config_id=101,
-            run_id="run-101",
-            trigger_source="manual",
-        )
-    )
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(
-            selected_config_ids=(101,),
-            active_config_id=101,
-            displayed_config_id=101,
-            run_phase="running",
-        )
-    )
-    services.bus.spl_updated.emit(
-        101,
-        "run-101",
-        0,
-        SimpleNamespace(spl_db=72.34, time=0.0),
-    )
-    services.bus.loudness_updated.emit(
-        101,
-        "run-101",
-        0,
-        SimpleNamespace(loudness_sone=2.345),
-    )
-
-    assert module.panel_widget("summary") is summary_panel
-    assert summary_panel.lb_spl_metric_value.text() == "72.3 dB"
-    assert summary_panel.lb_loudness_metric_value.text() == "2.35 sone"
-
-
-def test_dashboard_same_layout_config_refresh_updates_summary_metric_metadata(qapp):
-    initial_config = {
-        "config_id": 101,
-        "selected_channels": [0],
-        "vibration_view_channel_index": None,
-        "channels": [
-            {"channel_index": 0, "loudness_unit": "sone"},
-        ],
-        "result_dashboard_layout": _dashboard_layout([_summary_panel()], columns=1),
-    }
-    updated_config = {
-        **initial_config,
-        "channels": [
-            {"channel_index": 0, "loudness_unit": "phon"},
-        ],
-    }
-    current_config = {"value": initial_config}
-    services = _make_services_with_config(initial_config)
-    services.config_service.load_config.side_effect = (
-        lambda _config_id: current_config["value"]
-    )
-    services.config_service.load_config_for_result_dashboard.side_effect = (
-        lambda _config_id: current_config["value"]
-    )
-    module = ResultDashboardModule(services)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(
-            selected_config_ids=(101,),
-            active_config_id=101,
-            displayed_config_id=101,
-            run_phase="running",
-        )
-    )
-    services.bus.factory_runtime_start_accepted.emit(
-        FactoryRuntimeStartPayload(
-            config_id=101,
-            run_id="run-101",
-            trigger_source="manual",
-        )
-    )
-    summary_panel = module.panel_widget("summary")
-    services.bus.loudness_updated.emit(
-        101,
-        "run-101",
-        0,
-        SimpleNamespace(loudness_sone=2.0),
-    )
-
-    assert summary_panel.lb_loudness_metric_value.text().endswith("sone")
-
-    current_config["value"] = updated_config
-    services.bus.config_changed.emit()
-
-    assert module.panel_widget("summary") is summary_panel
-    assert summary_panel.lb_loudness_metric_value.text().endswith("phon")
-
-
-def test_dashboard_rebuilds_when_config_switch_uses_different_layout(qapp):
-    first_config = {
-        "config_id": 101,
-        "selected_channels": [0],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": _dashboard_layout([_summary_panel()], columns=1),
-    }
-    second_config = {
-        "config_id": 202,
-        "selected_channels": [0],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": _dashboard_layout(
-            [_summary_panel(), _spectrum_panel("spectrum")]
-        ),
-    }
-    services = _make_services_with_configs(
-        {101: first_config, 202: second_config},
-        state=FactoryControllerState(selected_config_ids=(101,), run_phase="armed"),
-    )
-    module = ResultDashboardModule(services)
-
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(
-            selected_config_ids=(101, 202),
-            active_config_id=202,
-            displayed_config_id=202,
-            run_phase="running",
-        )
-    )
-
-    assert list(module.cards_by_panel_id()) == ["summary", "spectrum"]
-    assert module.panel_widget("spectrum") is not None
-
-
-def test_dashboard_refresh_hides_cards_before_detaching_visible_widgets(
-    qapp,
-    monkeypatch,
-):
-    config = {
-        "config_id": 101,
-        "selected_channels": [0],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": _dashboard_layout(
-            [_summary_panel(), _spectrum_panel("spectrum")]
-        ),
-    }
-    changed_layout_config = {
-        "config_id": 101,
-        "selected_channels": [0],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": _dashboard_layout([_summary_panel()], columns=1),
-    }
-    services = _make_services_with_config(config)
-    services.config_service.load_config_for_result_dashboard.side_effect = [
+            "chart_payload": {},
+            "judgment_payload": {"overall_pass": True},
+            "summary_payload": {
+                "overall_status": "pass",
+                "overall_label": "通过",
+                "rows": [],
+            },
+        },
         config,
-        changed_layout_config,
-    ]
-    services.factory_mode.state = FactoryControllerState(displayed_config_id=101)
-    module = ResultDashboardModule(services)
-    detach_visibilities = []
-    original_set_parent = Card.setParent
+    )
 
-    def record_set_parent(self, parent):
-        if parent is None:
-            detach_visibilities.append(self.isVisible())
-        return original_set_parent(self, parent)
 
-    monkeypatch.setattr(Card, "setParent", record_set_parent)
+def _decision_event(
+    run_id: str,
+    config: dict,
+    terminal_revision: str,
+    *,
+    attempt_id: str = "attempt-1",
+    history_revision: int = 0,
+):
+    card = _card(run_id, revision=history_revision)
+    return RunTerminated(
+        card,
+        review_payload=_decision_payload(
+            run_id,
+            config,
+            terminal_revision,
+            attempt_id=attempt_id,
+            history_revision=history_revision,
+        ),
+    )
 
-    module.resize(800, 600)
+
+def test_review_page_preserves_pre_feature_layout_without_result_card(qapp):
+    module = ResultDashboardModule(_services())
+    module.apply_history_event(
+        _event("run-1", _config([_panel("spectrum", "spectrum")]))
+    )
+
+    review_page = module.findChild(QWidget, "result_dashboard_review_page")
+    assert review_page is not None
+    assert review_page.layout().count() == 1
+    assert isinstance(review_page.layout().itemAt(0).widget(), QScrollArea)
+    assert review_page.findChildren(ResultModule) == []
+    assert not hasattr(module, "decision_result_widget")
+
+
+def test_dashboard_acknowledges_only_after_visible_history_summary_paints(qapp):
+    terminal_revision = "decision-r1"
+    module = ResultDashboardModule(_services())
+    history = module.findChild(ResultHistoryModule, "result_history_module")
+    history_painted = []
+    dashboard_painted = []
+    history.decisionPainted.connect(
+        lambda revision, painted_at: history_painted.append(
+            (revision, painted_at)
+        )
+    )
+    module.decisionPainted.connect(
+        lambda revision, painted_at: dashboard_painted.append(
+            (revision, painted_at)
+        )
+    )
     module.show()
     qapp.processEvents()
 
-    cards = module.cards_by_panel_id()
-    assert cards
-    assert all(card.isVisible() for card in cards.values())
-
-    services.bus.config_changed.emit()
-    qapp.processEvents()
-
-    assert detach_visibilities
-    assert all(visible is False for visible in detach_visibilities), detach_visibilities
-
-
-def test_hardware_review_config_payload_does_not_rebuild_dashboard(qapp):
-    saved_config = {
-        "config_id": 101,
-        "selected_channels": [0, 1],
-        "vibration_view_channel_index": 1,
-        "result_dashboard_layout": _dashboard_layout(
-            [
-                _summary_panel(),
-                {
-                    "id": "stft_acoustic",
-                    "type": "stft",
-                    "row": 0,
-                    "column": 1,
-                    "row_span": 1,
-                    "column_span": 1,
-                    "channel": "primary_acoustic",
-                },
-            ],
-            columns=2,
-        ),
-    }
-    review_config = {
-        "config_id": 101,
-        "selected_channels": [0, 1],
-        "vibration_view_channel_index": 1,
-        "result_dashboard_layout": _dashboard_layout(
-            [
-                _summary_panel(),
-                {
-                    "id": "replacement",
-                    "type": "spectrum",
-                    "row": 0,
-                    "column": 1,
-                    "row_span": 1,
-                    "column_span": 1,
-                    "channel": "primary_acoustic",
-                },
-            ],
-            columns=2,
-        ),
-    }
-    services = _make_services_with_config(saved_config)
-    module = ResultDashboardModule(services)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
-    )
-    original_panel = module.panel_widget("stft_acoustic")
-
-    services.bus.factory_review_changed.emit(
-        FactoryReviewPayload(
-            displayed_config_id=101,
-            run_id="run-101",
-            trigger_source="manual",
-            config_payload=review_config,
+    module.apply_history_event(
+        _decision_event(
+            "run-1",
+            _config([_panel("spectrum", "spectrum")]),
+            terminal_revision,
         )
     )
-    qapp.processEvents()
 
-    assert list(module.cards_by_panel_id()) == ["summary", "stft_acoustic"]
-    assert module.panel_widget("stft_acoustic") is original_panel
-    assert module.panel_widget("replacement") is None
-    assert services.factory_mode.review_payload.config_payload is review_config
-
-
-def test_dashboard_stft_stays_mounted_and_keeps_live_cache_on_hardware_review(qapp):
-    config = {
-        "config_id": 101,
-        "selected_channels": [0, 1],
-        "vibration_view_channel_index": 1,
-        "result_dashboard_layout": _dashboard_layout(
-            [
-                _summary_panel(),
-                {
-                    "id": "stft_acoustic",
-                    "type": "stft",
-                    "row": 0,
-                    "column": 1,
-                    "row_span": 1,
-                    "column_span": 1,
-                    "channel": "primary_acoustic",
-                },
-            ],
-            columns=2,
-        ),
-    }
-    services = _make_services_with_config(config)
-    module = ResultDashboardModule(services)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="running")
+    summary = history.findChild(
+        QWidget,
+        "result_history_card_summary_overall",
     )
-    services.bus.factory_runtime_start_accepted.emit(
-        FactoryRuntimeStartPayload(
-            config_id=101,
-            run_id="run-101",
-            trigger_source="manual",
-        )
+    caption = history.findChild(
+        QWidget,
+        "result_history_card_summary_caption",
     )
-    stft_panel = module.panel_widget("stft_acoustic")
-    services.bus.stft_updated.emit(
-        101,
-        "run-101",
+    assert summary is not None
+    assert caption is not None
+    assert summary.text() == "通过"
+    assert caption.text() == "结果摘要"
+    assert history_painted == []
+    assert dashboard_painted == []
+    assert history.project_decision_revision(
+        "run-1",
+        "attempt-1",
+        "stale-decision",
         0,
-        _make_stft_frame(time=0.0, magnitudes=(1.0, 2.0)),
+    ) is False
+    assert history.project_decision_revision(
+        "run-1",
+        "stale-attempt",
+        terminal_revision,
+        0,
+    ) is False
+    for _ in range(3):
+        qapp.processEvents()
+    assert len(history_painted) == 1
+    assert len(dashboard_painted) == 1
+    assert history_painted[0][0] == (
+        "run-1",
+        "attempt-1",
+        terminal_revision,
+        0,
     )
+    assert dashboard_painted[0][0] == terminal_revision
+    assert history_painted[0][1] == dashboard_painted[0][1]
+    assert type(dashboard_painted[0][1]) is int
+    assert dashboard_painted[0][1] > 0
+
+
+def test_same_terminal_hash_acknowledges_each_new_attempt_once(qapp):
+    terminal_revision = "same-result-hash"
+    config = _config([_panel("spectrum", "spectrum")])
+    module = ResultDashboardModule(_services())
+    painted = []
+    module.decisionPainted.connect(
+        lambda revision, painted_at: painted.append((revision, painted_at))
+    )
+    module.show()
     qapp.processEvents()
 
-    assert stft_panel.current_image_payload() is not None
-    assert stft_panel.current_render_cache_key() == (101, "run-101", 0)
-
-    review_payload = FactoryReviewPayload(
-        displayed_config_id=101,
-        run_id="run-101",
-        trigger_source="manual",
-        chart_payload={0: {"stft_score": {"score": 87.0}}},
-        config_payload=dict(config),
+    module.apply_history_event(
+        _decision_event(
+            "run-1",
+            config,
+            terminal_revision,
+            attempt_id="attempt-1",
+            history_revision=0,
+        )
     )
-    services.bus.factory_review_changed.emit(review_payload)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
+    for _ in range(3):
+        qapp.processEvents()
+    assert [item[0] for item in painted] == [terminal_revision]
+
+    module.apply_history_event(
+        TerminalResultReplaced(
+            "run-1",
+            0,
+            _card("run-1", revision=1),
+            review_payload=_decision_payload(
+                "run-1",
+                config,
+                terminal_revision,
+                attempt_id="attempt-2",
+                history_revision=1,
+            ),
+        )
     )
-    qapp.processEvents()
-
-    assert module.panel_widget("stft_acoustic") is stft_panel
-    assert stft_panel.current_image_payload() is not None
-    assert stft_panel.current_render_cache_key() == (101, "run-101", 0)
-
-
-def test_dashboard_rebuilds_current_config_layout_on_config_changed(qapp):
-    old_config = {
-        "config_id": 101,
-        "selected_channels": [9],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": _dashboard_layout([_summary_panel()], columns=1),
-    }
-    new_saved_config = {
-        "config_id": 101,
-        "selected_channels": [3],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": _dashboard_layout(
-            [_summary_panel(), _spectrum_panel("spectrum")]
-        ),
-    }
-    services = _make_services_with_config(old_config)
-    services.config_service.load_config_for_result_dashboard.side_effect = [
-        old_config,
-        new_saved_config,
+    assert [item[0] for item in painted] == [terminal_revision]
+    for _ in range(3):
+        qapp.processEvents()
+    assert [item[0] for item in painted] == [
+        terminal_revision,
+        terminal_revision,
     ]
-    module = ResultDashboardModule(services)
+    qapp.processEvents()
+    assert len(painted) == 2
 
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
+
+def test_reselecting_unchanged_painted_run_does_not_acknowledge_twice(qapp):
+    config = _config([_panel("spectrum", "spectrum")])
+    module = ResultDashboardModule(_services())
+    painted = []
+    module.decisionPainted.connect(
+        lambda revision, painted_at: painted.append((revision, painted_at))
     )
-
-    services.bus.factory_review_changed.emit(
-        FactoryReviewPayload(displayed_config_id=101, config_payload=old_config)
-    )
-    assert list(module.cards_by_panel_id()) == ["summary"]
-
-    services.bus.config_changed.emit()
-
-    assert list(module.cards_by_panel_id()) == ["summary", "spectrum"]
-    assert module.grid_position("spectrum") == (0, 1, 1, 1)
-    spectrum_panel = module.panel_widget("spectrum")
-    assert spectrum_panel.selected_display_channel_provider() == 3
-
-
-def test_dashboard_uses_matching_review_config_payload_for_panel_bindings(qapp):
-    db_config = {
-        "config_id": 101,
-        "selected_channels": [0],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": _dashboard_layout(
-            [_summary_panel(), _spectrum_panel("db_spectrum")]
-        ),
-    }
-    review_config = {
-        "config_id": 101,
-        "selected_channels": [6],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": _dashboard_layout(
-            [_summary_panel(), _spectrum_panel("import_spectrum")]
-        ),
-    }
-    services = _make_services_with_config(db_config)
-    module = ResultDashboardModule(services)
-
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
-    )
-    db_panel = module.panel_widget("db_spectrum")
-    assert db_panel.selected_display_channel_provider() == 0
-
-    services.bus.factory_review_changed.emit(
-        FactoryReviewPayload(
-            displayed_config_id=101,
-            config_payload=review_config,
-            trigger_source="import_audio",
-        )
-    )
-
-    assert list(module.cards_by_panel_id()) == ["summary", "import_spectrum"]
-    imported_panel = module.panel_widget("import_spectrum")
-    assert imported_panel.selected_display_channel_provider() == 6
-
-    services.bus.config_changed.emit()
-
-    assert list(module.cards_by_panel_id()) == ["summary", "import_spectrum"]
-    imported_panel = module.panel_widget("import_spectrum")
-    assert imported_panel.selected_display_channel_provider() == 6
-
-
-def test_dashboard_display_reset_restores_saved_layout_after_import_audio_config(qapp):
-    saved_config = {
-        "config_id": 101,
-        "selected_channels": [0],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": _dashboard_layout(
-            [_summary_panel(), _spectrum_panel("saved_spectrum")]
-        ),
-    }
-    imported_config = {
-        "config_id": 101,
-        "selected_channels": [6],
-        "vibration_view_channel_index": None,
-        "result_dashboard_layout": _dashboard_layout(
-            [_summary_panel(), _spectrum_panel("imported_spectrum")]
-        ),
-    }
-    services = _make_services_with_config(saved_config)
-    module = ResultDashboardModule(services)
-    services.bus.factory_state_changed.emit(
-        FactoryControllerState(displayed_config_id=101, run_phase="reviewing")
-    )
-    services.bus.factory_review_changed.emit(
-        FactoryReviewPayload(
-            displayed_config_id=101,
-            run_id="import-101",
-            trigger_source="import_audio",
-            config_payload=imported_config,
-        )
-    )
-
-    assert list(module.cards_by_panel_id()) == ["summary", "imported_spectrum"]
-
-    services.bus.factory_display_reset.emit("next_run_accepted")
+    module.show()
     qapp.processEvents()
 
-    assert list(module.cards_by_panel_id()) == ["summary", "saved_spectrum"]
-    assert module.panel_widget("saved_spectrum").selected_display_channel_provider() == 0
+    for run_id, attempt_id, terminal_revision in (
+        ("run-a", "attempt-a", "hash-a"),
+        ("run-b", "attempt-b", "hash-b"),
+    ):
+        module.apply_history_event(
+            _decision_event(
+                run_id,
+                config,
+                terminal_revision,
+                attempt_id=attempt_id,
+            )
+        )
+        for _ in range(3):
+            qapp.processEvents()
+    assert [item[0] for item in painted] == ["hash-a", "hash-b"]
+
+    module.set_follow_latest(False)
+    module.select_run("run-a")
+    selected_card = module._history_module._card_entries["run-a"][1]
+    QApplication.sendEvent(
+        selected_card,
+        QPaintEvent(selected_card.rect()),
+    )
+    for _ in range(3):
+        qapp.processEvents()
+
+    assert [item[0] for item in painted] == ["hash-a", "hash-b"]
+
+
+@pytest.mark.parametrize('service_path', ['historical_playback', 'final_composition'])
+def test_card_replay_targets_nonselected_run_and_survives_recreation(qapp, qtbot, service_path):
+    from dataclasses import replace
+    from uuid import uuid4
+    from tests.test_result_card_replay import Reader, Playback
+    services = _services()
+    reader, playback = Reader({'selected_channels': [7]}), Playback()
+    services.historical_analysis_reader = reader
+    if service_path == 'historical_playback':
+        services.historical_playback = playback
+    else:
+        services.final_composition = SimpleNamespace(playback=playback)
+    module = ResultDashboardModule(services)
+    run, selected_run = str(uuid4()), str(uuid4())
+    config = _config([])
+    event = _event(run, config)
+    module.apply_history_event(event)
+    module.apply_history_event(_event(selected_run, config))
+    before = module.history_snapshot()
+    card = module._history_module._card_entries[run][1]
+    qtbot.waitUntil(card.replay_button.isEnabled)
+    card.replay_button.menu().actions()[0].trigger()
+    qtbot.waitUntil(lambda: len(playback.requests) == 1 and card.replay_button.isEnabled())
+    assert playback.requests[0][0].run_id == run
+    assert playback.requests[0][0].display_channel_index == 3
+    assert module.history_snapshot() == before
+    snapshot = replace(before, terminal_cards=tuple(
+        replace(c, sn='force recreation') if c.run_id == run else c
+        for c in before.terminal_cards))
+    module._history_module.render_snapshot(snapshot)
+    recreated = module._history_module._card_entries[run][1]
+    assert recreated is not card
+    recreated.replay_button.click()
+    qtbot.waitUntil(lambda: len(playback.requests) == 2 and recreated.replay_button.isEnabled())
+    assert playback.requests[1][0].display_channel_index == 3
+    assert module.history_snapshot() == before
+    module.close()
+    qtbot.waitUntil(lambda: playback.owner is None)
+
+
+@pytest.mark.parametrize('in_flight', [False, True])
+def test_card_replay_resolves_active_service_lazily_and_cleans_original(qapp, qtbot, in_flight):
+    import threading
+    from uuid import uuid4
+    from tests.test_result_card_replay import Reader, Playback
+    independent, shared, replacement = Playback(), Playback(), Playback()
+    class Services(SimpleNamespace):
+        @property
+        def historical_playback(self):
+            self.lookups.append(threading.get_ident())
+            return self.current
+    services = Services(**vars(_services()), current=independent, lookups=[],
+                        historical_analysis_reader=Reader())
+    module = ResultDashboardModule(services)
+    assert services.lookups == []
+    services.current = shared  # production attaches after dashboard construction
+    run = str(uuid4())
+    module.apply_history_event(_event(run, _config([])))
+    card = module._history_module._card_entries[run][1]
+    qtbot.waitUntil(card.replay_button.isEnabled)
+    assert services.lookups == []
+    if in_flight:
+        shared.release = threading.Event()
+    try:
+        card.replay_button.click()
+        qtbot.waitUntil(shared.entered.is_set)
+        if not in_flight:
+            qtbot.waitUntil(card.replay_button.isEnabled)
+        owner = module._card_replay._entries[run].operation.owner
+        services.current = replacement
+        module.close()
+    finally:
+        if shared.release:
+            shared.release.set()
+    from ui.popups.run_audio_replay_dialog import _ACTIVE_WORKERS
+    qtbot.waitUntil(lambda: not _ACTIVE_WORKERS)
+    assert shared.owner is None
+    assert owner in shared.stops
+    assert independent.requests == independent.stops == []
+    assert replacement.requests == replacement.stops == []
+    assert services.lookups == [threading.get_ident()]
+
+
+def test_card_replay_open_menu_survives_unrelated_terminal_event(qapp, qtbot):
+    from uuid import uuid4
+    from tests.test_result_card_replay import Reader, Playback
+    services = _services()
+    services.historical_analysis_reader = Reader()
+    services.historical_playback = playback = Playback()
+    module = ResultDashboardModule(services)
+    module.show()
+    run = str(uuid4())
+    module.apply_history_event(_event(run, _config([])))
+    card = module._history_module._card_entries[run][1]
+    qtbot.waitUntil(card.replay_button.isEnabled)
+    menu = card.replay_button.menu()
+    actions = menu.actions()
+    menu.popup(card.replay_button.mapToGlobal(card.replay_button.rect().bottomLeft()))
+    qtbot.waitUntil(menu.isVisible)
+    module.apply_history_event(_event(str(uuid4()), _config([])))
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    qapp.processEvents()
+    assert module._history_module._card_entries[run][1] is card
+    assert card.replay_button.menu() is menu
+    assert menu.isVisible()
+    assert menu.actions() == actions
+    actions[1].trigger()
+    qtbot.waitUntil(lambda: len(playback.requests) == 1 and card.replay_button.isEnabled())
+    assert playback.requests[0][0].run_id == run
+    assert playback.requests[0][0].display_channel_index == 7
+    assert actions[1].isChecked() and not actions[0].isChecked()
+    module.close()
+
+
+@pytest.mark.parametrize('failure', ['none', 'exception'])
+def test_card_replay_remembers_menu_channel_when_provider_unavailable(qapp, qtbot, failure):
+    from uuid import uuid4
+    from tests.test_result_card_replay import Reader, Playback
+    playback = Playback()
+    class Services(SimpleNamespace):
+        @property
+        def historical_playback(self):
+            if self.current is None and failure == 'exception':
+                raise RuntimeError('not active')
+            return self.current
+    services = Services(**vars(_services()), current=playback,
+                        historical_analysis_reader=Reader())
+    module = ResultDashboardModule(services)
+    run = str(uuid4())
+    module.apply_history_event(_event(run, _config([])))
+    card = module._history_module._card_entries[run][1]
+    qtbot.waitUntil(card.replay_button.isEnabled)
+    actions = card.replay_button.menu().actions()
+    assert actions[0].isChecked()
+    services.current = None
+    actions[1].trigger()
+    assert not card.replay_button.isEnabled()
+    assert '播放服务未就绪' in card.replay_button.toolTip()
+    assert actions[1].isChecked() and not actions[0].isChecked()
+    assert playback.requests == []
+    services.current = playback
+    module.apply_history_event(_event(str(uuid4()), _config([])))
+    assert card.replay_button.isEnabled()
+    assert playback.requests == []
+    card.replay_button.click()
+    qtbot.waitUntil(lambda: len(playback.requests) == 1 and card.replay_button.isEnabled())
+    assert playback.requests[0][0].run_id == run
+    assert playback.requests[0][0].display_channel_index == 7
+    module.close()

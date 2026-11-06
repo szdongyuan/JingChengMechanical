@@ -16,51 +16,6 @@ from app.service.result_dashboard_layout import (
 )
 
 
-def test_default_layout_matches_spec():
-    layout = DEFAULT_RESULT_DASHBOARD_LAYOUT
-
-    assert layout["columns"] == 3
-    assert layout["rows"] == 2
-    assert [panel["type"] for panel in layout["panels"]] == [
-        "result_summary",
-        "stft",
-        "spectrum",
-        "octave",
-        "vibration_frequency_stability",
-        "vibration_pulse",
-    ]
-    assert PANEL_TITLES["stft"] == "时频图（频率Hz，幅值dB）"
-    assert PANEL_TITLES["spectrum"] == "频谱（dB）"
-    assert PANEL_TITLES["octave"] == "倍频程（dB）"
-    assert PANEL_TITLES["spl"] == "声压级（dB）"
-    assert PANEL_TITLES["vibration_stft"] == "时频图（振动）"
-
-
-def test_blank_layout_normalizes_to_default():
-    assert normalize_result_dashboard_layout(None) == DEFAULT_RESULT_DASHBOARD_LAYOUT
-    assert normalize_result_dashboard_layout("") == DEFAULT_RESULT_DASHBOARD_LAYOUT
-    assert normalize_result_dashboard_layout("  \n\t") == DEFAULT_RESULT_DASHBOARD_LAYOUT
-
-
-def test_valid_layout_serializes_to_json_string():
-    text = serialize_result_dashboard_layout(DEFAULT_RESULT_DASHBOARD_LAYOUT)
-
-    assert isinstance(text, str)
-    assert normalize_result_dashboard_layout(text) == DEFAULT_RESULT_DASHBOARD_LAYOUT
-
-
-def test_malformed_layout_is_rejected_for_save_and_import_paths():
-    with pytest.raises(ResultDashboardLayoutError, match="结果展示布局|JSON|invalid"):
-        normalize_result_dashboard_layout("{bad json")
-
-
-def test_display_normalizer_falls_back_for_corrupt_runtime_config():
-    assert (
-        normalize_result_dashboard_layout_for_display("{bad json")
-        == DEFAULT_RESULT_DASHBOARD_LAYOUT
-    )
-
-
 def _panel(
     panel_id: str,
     panel_type: str,
@@ -82,7 +37,12 @@ def _panel(
     }
 
 
-def _layout(*panels: dict, columns: int = 1, rows: int = 1, version: int = 1) -> dict:
+def _layout(
+    *panels: dict,
+    columns: int = 1,
+    rows: int = 1,
+    version: int = 2,
+) -> dict:
     return {
         "version": version,
         "columns": columns,
@@ -91,25 +51,73 @@ def _layout(*panels: dict, columns: int = 1, rows: int = 1, version: int = 1) ->
     }
 
 
+def test_default_layout_is_version_two_chart_only_and_starts_at_origin():
+    layout = DEFAULT_RESULT_DASHBOARD_LAYOUT
+
+    assert layout["version"] == 2
+    assert layout["columns"] == 3
+    assert layout["rows"] == 2
+    assert [panel["type"] for panel in layout["panels"]] == [
+        "stft",
+        "spectrum",
+        "octave",
+        "vibration_frequency_stability",
+        "vibration_pulse",
+    ]
+    assert layout["panels"][0]["row"] == 0
+    assert layout["panels"][0]["column"] == 0
+    assert "result_summary" not in PANEL_TITLES
+    assert "result_summary" not in PANEL_FAMILIES
+    assert PANEL_TITLES["stft"]
+    assert PANEL_TITLES["spectrum"]
+    assert PANEL_TITLES["octave"]
+    assert PANEL_TITLES["spl"]
+    assert PANEL_TITLES["vibration_stft"]
+
+
+def test_blank_layout_normalizes_to_default():
+    assert normalize_result_dashboard_layout(None) == DEFAULT_RESULT_DASHBOARD_LAYOUT
+    assert normalize_result_dashboard_layout("") == DEFAULT_RESULT_DASHBOARD_LAYOUT
+    assert normalize_result_dashboard_layout("  \n\t") == DEFAULT_RESULT_DASHBOARD_LAYOUT
+
+
+def test_valid_layout_serializes_to_json_string():
+    text = serialize_result_dashboard_layout(DEFAULT_RESULT_DASHBOARD_LAYOUT)
+
+    assert isinstance(text, str)
+    assert normalize_result_dashboard_layout(text) == DEFAULT_RESULT_DASHBOARD_LAYOUT
+
+
+def test_malformed_layout_is_rejected_for_save_and_import_paths():
+    with pytest.raises(ResultDashboardLayoutError, match="JSON|invalid"):
+        normalize_result_dashboard_layout("{bad json")
+
+
+def test_display_normalizer_falls_back_for_corrupt_runtime_config():
+    assert (
+        normalize_result_dashboard_layout_for_display("{bad json")
+        == DEFAULT_RESULT_DASHBOARD_LAYOUT
+    )
+
+
 def test_panel_families_match_catalog():
-    assert PANEL_FAMILIES["result_summary"] == "summary"
     assert PANEL_FAMILIES["spectrum"] == "acoustic"
     assert PANEL_FAMILIES["vibration_pulse"] == "vibration"
 
 
 def test_normalization_rejects_non_empty_malformed_layout_shape():
-    with pytest.raises(ResultDashboardLayoutError, match="结果展示布局|layout"):
+    with pytest.raises(ResultDashboardLayoutError, match="layout"):
         normalize_result_dashboard_layout([])
 
 
 def test_validation_rejects_overlapping_panels():
     layout = _layout(
-        _panel("summary", "result_summary"),
-        _panel("copy", "spectrum", channel="primary_acoustic"),
+        _panel("spectrum", "spectrum", channel="primary_acoustic"),
+        _panel("copy", "spectrum", channel="selected_1"),
         columns=2,
     )
 
-    with pytest.raises(ResultDashboardLayoutError, match="重叠|overlap"):
+    with pytest.raises(ResultDashboardLayoutError, match="overlap"):
         validate_result_dashboard_layout(layout)
 
 
@@ -125,173 +133,181 @@ def test_validation_of_large_valid_spans_does_not_iterate_occupied_cells(monkeyp
     )
     rows = 1_000_000_000
     layout = _layout(
-        _panel("summary", "result_summary", row_span=rows),
-        columns=1,
+        _panel(
+            "spectrum",
+            "spectrum",
+            row_span=rows,
+            channel="primary_acoustic",
+        ),
         rows=rows,
     )
 
     assert validate_result_dashboard_layout(layout) == layout
 
 
-def test_validation_rejects_missing_summary():
-    layout = _layout(columns=1, rows=1)
+def test_layout_no_longer_requires_summary_and_allows_empty_panel_list():
+    layout = _layout()
 
-    with pytest.raises(ResultDashboardLayoutError, match="结果摘要|summary"):
-        validate_result_dashboard_layout(layout)
+    assert validate_result_dashboard_layout(layout) == layout
 
 
 def test_validation_rejects_duplicate_panel_ids():
     layout = _layout(
-        _panel("dup", "result_summary"),
-        _panel("dup", "spectrum", column=1, channel="primary_acoustic"),
+        _panel("dup", "spectrum", channel="primary_acoustic"),
+        _panel("dup", "spectrum", column=1, channel="selected_1"),
         columns=2,
     )
 
-    with pytest.raises(ResultDashboardLayoutError, match="唯一|unique|id"):
+    with pytest.raises(ResultDashboardLayoutError, match="unique|id"):
         validate_result_dashboard_layout(layout)
 
 
 def test_validation_rejects_empty_panel_id():
-    layout = _layout(_panel("", "result_summary"))
+    layout = _layout(_panel("", "spectrum", channel="primary_acoustic"))
 
     with pytest.raises(ResultDashboardLayoutError, match="id"):
         validate_result_dashboard_layout(layout)
 
 
-def test_validation_rejects_unknown_layout_version():
-    layout = _layout(_panel("summary", "result_summary"), version=2)
+def test_strict_normalize_rejects_version_one():
+    layout = _layout(
+        _panel("spectrum", "spectrum", channel="primary_acoustic"),
+        version=1,
+    )
 
-    with pytest.raises(ResultDashboardLayoutError, match="版本|version"):
-        validate_result_dashboard_layout(layout)
+    with pytest.raises(ResultDashboardLayoutError, match="version"):
+        normalize_result_dashboard_layout(layout)
+
+
+def test_strict_normalize_rejects_result_summary_panel_type():
+    layout = _layout(_panel("summary", "result_summary"))
+
+    with pytest.raises(ResultDashboardLayoutError, match="panel|type"):
+        normalize_result_dashboard_layout(layout)
+
+
+def test_display_normalize_replaces_entire_legacy_layout_with_v2_default():
+    legacy = {
+        "version": 1,
+        "columns": 2,
+        "rows": 1,
+        "panels": [
+            _panel("summary", "result_summary"),
+            _panel(
+                "legacy-spectrum",
+                "spectrum",
+                column=1,
+                channel="primary_acoustic",
+            ),
+        ],
+    }
+
+    normalized = normalize_result_dashboard_layout_for_display(legacy)
+
+    assert normalized == DEFAULT_RESULT_DASHBOARD_LAYOUT
+    assert normalized["version"] == 2
+    assert "legacy-spectrum" not in {
+        panel["id"] for panel in normalized["panels"]
+    }
 
 
 @pytest.mark.parametrize(
-    ("columns", "rows", "expected"),
+    ("columns", "rows"),
     [
-        (0, 1, "列|columns"),
-        (4, 1, "列|columns"),
-        (1, 0, "行|rows"),
+        (0, 1),
+        (4, 1),
+        (1, 0),
     ],
 )
-def test_validation_rejects_invalid_grid_size(columns, rows, expected):
-    layout = _layout(_panel("summary", "result_summary"), columns=columns, rows=rows)
+def test_validation_rejects_invalid_grid_size(columns, rows):
+    layout = _layout(
+        _panel("spectrum", "spectrum", channel="primary_acoustic"),
+        columns=columns,
+        rows=rows,
+    )
 
-    with pytest.raises(ResultDashboardLayoutError, match=expected):
+    with pytest.raises(ResultDashboardLayoutError):
         validate_result_dashboard_layout(layout)
 
 
 def test_validation_rejects_unknown_panel_type():
     layout = _layout(
-        _panel("summary", "result_summary"),
-        _panel("custom", "custom_widget", column=1, channel="primary_acoustic"),
-        columns=2,
+        _panel("custom", "custom_widget", channel="primary_acoustic"),
     )
 
-    with pytest.raises(ResultDashboardLayoutError, match="面板|panel|type"):
+    with pytest.raises(ResultDashboardLayoutError, match="panel type"):
         validate_result_dashboard_layout(layout)
 
 
 def test_validation_rejects_invalid_channel_key():
-    layout = _layout(
-        _panel("summary", "result_summary"),
-        _panel("spectrum", "spectrum", column=1, channel="bad_channel"),
-        columns=2,
-    )
+    layout = _layout(_panel("spectrum", "spectrum", channel="bad_channel"))
 
-    with pytest.raises(ResultDashboardLayoutError, match="通道|channel"):
-        validate_result_dashboard_layout(layout)
-
-
-def test_validation_rejects_summary_channel_other_than_none():
-    layout = _layout(
-        _panel("summary", "result_summary", channel="primary_acoustic"),
-    )
-
-    with pytest.raises(ResultDashboardLayoutError, match="结果摘要|通道|channel"):
+    with pytest.raises(ResultDashboardLayoutError, match="channel"):
         validate_result_dashboard_layout(layout)
 
 
 def test_validation_rejects_acoustic_panel_with_vibration_channel():
-    layout = _layout(
-        _panel("summary", "result_summary"),
-        _panel("spectrum", "spectrum", column=1, channel="vibration"),
-        columns=2,
-    )
+    layout = _layout(_panel("spectrum", "spectrum", channel="vibration"))
 
-    with pytest.raises(ResultDashboardLayoutError, match="通道|channel"):
+    with pytest.raises(ResultDashboardLayoutError, match="channel"):
         validate_result_dashboard_layout(layout)
 
 
 def test_validation_rejects_vibration_panel_with_acoustic_channel():
     layout = _layout(
-        _panel("summary", "result_summary"),
         _panel(
             "vibration",
             "vibration_pulse",
-            column=1,
             channel="primary_acoustic",
         ),
-        columns=2,
     )
 
-    with pytest.raises(ResultDashboardLayoutError, match="通道|channel"):
+    with pytest.raises(ResultDashboardLayoutError, match="channel"):
         validate_result_dashboard_layout(layout)
 
 
 def test_selected_2_channel_is_rejected_when_only_one_selected_channel():
-    layout = _layout(
-        _panel("summary", "result_summary"),
-        _panel("spectrum", "spectrum", column=1, channel="selected_2"),
-        columns=2,
-    )
+    layout = _layout(_panel("spectrum", "spectrum", channel="selected_2"))
 
-    with pytest.raises(ResultDashboardLayoutError, match="通道2"):
+    with pytest.raises(ResultDashboardLayoutError):
         validate_result_dashboard_layout(layout, selected_channels=[0])
 
 
 def test_validation_rejects_panel_span_out_of_bounds():
     layout = _layout(
-        _panel("summary", "result_summary"),
         _panel(
             "wide",
             "spectrum",
-            column=1,
             column_span=2,
             channel="primary_acoustic",
         ),
-        columns=2,
     )
 
-    with pytest.raises(ResultDashboardLayoutError, match="越界|bounds"):
-        validate_result_dashboard_layout(layout)
-
-
-def test_validation_rejects_duplicate_summary_panels():
-    layout = _layout(
-        _panel("summary_a", "result_summary"),
-        _panel("summary_b", "result_summary", column=1),
-        columns=2,
-    )
-
-    with pytest.raises(ResultDashboardLayoutError, match="一个|exactly one|结果摘要"):
+    with pytest.raises(ResultDashboardLayoutError, match="bounds"):
         validate_result_dashboard_layout(layout)
 
 
 def test_normalization_preserves_panel_order_and_coerces_integer_fields():
     layout = {
-        "version": 1,
+        "version": 2,
         "columns": "2",
         "rows": "1",
         "panels": [
-            _panel("summary", "result_summary", row="0", column="0"),
             _panel(
                 "spectrum",
+                "spectrum",
+                row="0",
+                column="0",
+                channel="primary_acoustic",
+            ),
+            _panel(
+                "spectrum-selected",
                 "spectrum",
                 row="0",
                 column="1",
                 row_span="1",
                 column_span="1",
-                channel="primary_acoustic",
+                channel="selected_1",
             ),
         ],
     }
@@ -301,10 +317,21 @@ def test_normalization_preserves_panel_order_and_coerces_integer_fields():
     assert normalized["columns"] == 2
     assert normalized["rows"] == 1
     assert [panel["id"] for panel in normalized["panels"]] == [
-        "summary",
         "spectrum",
+        "spectrum-selected",
     ]
     assert normalized["panels"][1]["column"] == 1
+
+
+def test_normalization_does_not_mutate_input():
+    layout = _layout(
+        _panel("spectrum", "spectrum", channel="primary_acoustic"),
+    )
+
+    normalized = normalize_result_dashboard_layout(layout)
+    normalized["panels"][0]["id"] = "changed"
+
+    assert layout["panels"][0]["id"] == "spectrum"
 
 
 def test_resolve_primary_acoustic_uses_first_non_vibration_channel():

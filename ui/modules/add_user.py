@@ -20,7 +20,6 @@ from ui.modules.login import encrypt_password
 
 ROLE_MAP = {
     "工程师": "Engineer",
-    "操作员": "Operator",
 }
 
 
@@ -58,7 +57,7 @@ class AddUserWindow(QWidget):
         role_label.setFixedWidth(44)
         role_row.addWidget(role_label)
         self.role_combo = QComboBox()
-        self.role_combo.addItems(["工程师", "操作员"])
+        self.role_combo.addItems(["工程师"])
         self.role_combo.setMinimumHeight(34)
         role_row.addWidget(self.role_combo, 1)
         root.addLayout(role_row)

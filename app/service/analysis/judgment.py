@@ -87,6 +87,7 @@ class JudgmentEngine:
         *,
         channel_column_map: dict[int, int] | None = None,
         loudness_trace_cache: dict[int, dict] | None = None,
+        channel_features: dict[int, object] | None = None,
         run_ai: bool = True,
         allow_golden_runtime_resample: bool = False,
     ) -> JudgmentResult:
@@ -122,6 +123,7 @@ class JudgmentEngine:
             end_sec,
             channel_column_map=channel_column_map,
             loudness_trace_cache=loudness_trace_cache,
+            channel_features=channel_features,
             run_ai=run_ai,
             allow_golden_runtime_resample=allow_golden_runtime_resample,
         )
@@ -138,6 +140,7 @@ class JudgmentEngine:
         *,
         channel_column_map: dict[int, int] | None = None,
         loudness_trace_cache: dict[int, dict] | None = None,
+        channel_features: dict[int, object] | None = None,
         run_ai: bool = True,
         allow_golden_runtime_resample: bool = False,
     ) -> JudgmentResult:
@@ -155,6 +158,7 @@ class JudgmentEngine:
             end_sec,
             channel_column_map=channel_column_map,
             loudness_trace_cache=loudness_trace_cache,
+            channel_features=channel_features,
             run_ai=run_ai,
             allow_golden_runtime_resample=allow_golden_runtime_resample,
         )
@@ -171,6 +175,7 @@ class JudgmentEngine:
         *,
         channel_column_map: dict[int, int] | None = None,
         loudness_trace_cache: dict[int, dict] | None = None,
+        channel_features: dict[int, object] | None = None,
         run_ai: bool = True,
         allow_golden_runtime_resample: bool = False,
     ) -> JudgmentResult:
@@ -201,11 +206,18 @@ class JudgmentEngine:
                 # Spec: use defaults when channel config is missing
                 ch_cfg = _runtime_channel_defaults(ch_idx)
 
+            precomputed = (
+                channel_features.get(ch_idx)
+                if isinstance(channel_features, dict)
+                else None
+            )
             column_index = self._buffer_column_for_channel(ch_idx, channel_column_map)
 
             # Extract single channel
             full_sig: np.ndarray | None = None
-            if buffer.ndim == 2 and 0 <= column_index < buffer.shape[1]:
+            if precomputed is not None:
+                sig = np.asarray(precomputed.calibrated_signal, dtype=np.float64)
+            elif buffer.ndim == 2 and 0 <= column_index < buffer.shape[1]:
                 full_sig = buffer[:, column_index].copy()
                 sig = full_sig[start_idx:end_idx].copy()
             elif buffer.ndim == 1:
@@ -220,15 +232,18 @@ class JudgmentEngine:
 
             # Apply mic calibration
             sensitivity = self._get_sensitivity(mic_cal, ch_idx)
-            full_loudness_sig = (
-                dsp.apply_mic_calibration(full_sig, sensitivity)
-                if full_sig is not None
-                else None
-            )
-            if full_loudness_sig is not None:
-                sig = full_loudness_sig[start_idx:end_idx].copy()
+            if precomputed is not None:
+                calibrated_full = None
             else:
-                sig = dsp.apply_mic_calibration(sig, sensitivity)
+                calibrated_full = (
+                    dsp.apply_mic_calibration(full_sig, sensitivity)
+                    if full_sig is not None
+                    else None
+                )
+                if calibrated_full is not None:
+                    sig = calibrated_full[start_idx:end_idx].copy()
+                else:
+                    sig = dsp.apply_mic_calibration(sig, sensitivity)
 
             # SPL checks
             spl_weighting = ch_cfg.get("spl_weighting", "Z")
@@ -259,29 +274,53 @@ class JudgmentEngine:
             spl_trace_error_message: str | None = None
             spl_average_available = False
             spl_average_error_message: str | None = None
+            spl_signal = calibrated_full if calibrated_full is not None else sig
+            spl_start_sample = start_idx if calibrated_full is not None else 0
+            spl_end_sample = end_idx if calibrated_full is not None else len(sig)
             try:
-                spl_db = float(dsp.compute_spl(
-                    sig,
-                    sample_rate,
-                    spl_weighting,
-                    spl_time_constant,
-                ))
-                _, spl_trace_db = dsp.compute_spl_trace(
-                    sig,
-                    sample_rate,
-                    spl_weighting,
-                    spl_time_constant,
-                    chunk_duration=_SPL_CHUNK_DURATION_SEC,
-                )
-                trace_values = spl_trace_db or [spl_db]
+                if precomputed is not None:
+                    if precomputed.spl_error is not None:
+                        raise RuntimeError(precomputed.spl_error)
+                    spl_trace_db = precomputed.spl_values
+                else:
+                    _, spl_trace_db = dsp.compute_spl_trace(
+                        spl_signal,
+                        sample_rate,
+                        spl_weighting,
+                        spl_time_constant,
+                        chunk_duration=_SPL_CHUNK_DURATION_SEC,
+                        output_start_sample=spl_start_sample,
+                        output_end_sample=spl_end_sample,
+                    )
+                trace_values = list(spl_trace_db)
+                if not trace_values:
+                    trace_values = [-np.inf]
+                spl_db = float(trace_values[-1])
                 spl_min_db, spl_max_db = self._value_bounds(trace_values)
                 spl_trace_available = True
-                spl_pass = self._values_pass_limits(trace_values, spl_lower, spl_upper)
+                spl_pass = self._values_pass_limits(
+                    trace_values,
+                    spl_lower,
+                    spl_upper,
+                )
             except Exception as exc:
                 spl_trace_error_message = str(exc) or exc.__class__.__name__
                 spl_pass = None if spl_constrained else True
             try:
-                spl_average_db = float(dsp.compute_spl_leq(sig, sample_rate, spl_weighting))
+                if precomputed is not None:
+                    if precomputed.spl_average_error is not None:
+                        raise RuntimeError(precomputed.spl_average_error)
+                    spl_average_db = float(precomputed.spl_average_db)
+                else:
+                    spl_average_db = float(
+                        dsp.compute_spl_leq(
+                            spl_signal,
+                            sample_rate,
+                            spl_weighting,
+                            start_sample=spl_start_sample,
+                            end_sample=spl_end_sample,
+                        )
+                    )
                 spl_average_available = True
                 spl_average_pass = self._values_pass_limits(
                     [spl_average_db],
@@ -319,10 +358,16 @@ class JudgmentEngine:
                 loudness_average_upper,
             )
             try:
-                if full_loudness_sig is not None and start_sec > 0.0:
+                if precomputed is not None:
+                    if precomputed.loudness_error is not None:
+                        raise RuntimeError(precomputed.loudness_error)
+                    times_sec = precomputed.loudness_times
+                    loudness_values_sone = precomputed.loudness_values
+                    loudness_max_sone = precomputed.loudness_max_sone
+                elif calibrated_full is not None and start_sec > 0.0:
                     times_sec, loudness_values_sone, loudness_max_sone = (
                         dsp.compute_loudness_trace_for_window(
-                            full_loudness_sig,
+                            calibrated_full,
                             sample_rate,
                             start_sec,
                             end_sec,
@@ -372,6 +417,7 @@ class JudgmentEngine:
                 mic_sensitivity=sensitivity,
                 golden_cache=golden_cache,
                 allow_golden_runtime_resample=allow_golden_runtime_resample,
+                precomputed=precomputed,
             )
 
             # Octave band checks
@@ -384,15 +430,23 @@ class JudgmentEngine:
                 mic_sensitivity=sensitivity,
                 golden_cache=golden_cache,
                 allow_golden_runtime_resample=allow_golden_runtime_resample,
+                precomputed=precomputed,
             )
+
+            fft_required = bool(ch_cfg.get("fft_band_limits")) or str(
+                ch_cfg.get("fft_golden_mode") or "off"
+            ).lower() != "off"
+            octave_required = bool(ch_cfg.get("oct_band_limits")) or str(
+                ch_cfg.get("oct_golden_mode") or "off"
+            ).lower() != "off"
 
             ch_pass = (
                 spl_pass is True
                 and spl_average_pass is True
                 and loudness_pass is True
                 and loudness_average_pass is True
-                and fft_available
-                and octave_available
+                and (fft_available or not fft_required)
+                and (octave_available or not octave_required)
                 and all(b.passed for b in fft_bands)
                 and all(b.passed for b in oct_bands)
             )
@@ -474,6 +528,7 @@ class JudgmentEngine:
         mic_sensitivity: float,
         golden_cache: GoldenReferenceCache,
         allow_golden_runtime_resample: bool = False,
+        precomputed: object | None = None,
     ) -> tuple[list[BandResult], bool, str | None]:
         band_limits = channel_config.get("fft_band_limits", [])
         weighting = self._fft_weighting(channel_config.get("fft_weighting", "Z"))
@@ -521,12 +576,18 @@ class JudgmentEngine:
                 logger.warning("黄金样本加载失败，FFT 对比曲线已忽略: %s", exc)
 
         try:
-            measured_freqs, measured_levels = self._measure_fft(
-                sig,
-                sample_rate,
-                nfft=nfft,
-                weighting=weighting,
-            )
+            if precomputed is not None:
+                if precomputed.fft_error is not None:
+                    raise RuntimeError(precomputed.fft_error)
+                measured_freqs = np.asarray(precomputed.fft_frequencies)
+                measured_levels = np.asarray(precomputed.fft_magnitudes)
+            else:
+                measured_freqs, measured_levels = self._measure_fft(
+                    sig,
+                    sample_rate,
+                    nfft=nfft,
+                    weighting=weighting,
+                )
         except Exception as exc:
             return [], False, str(exc) or exc.__class__.__name__
         if mode == "off":
@@ -568,6 +629,7 @@ class JudgmentEngine:
         mic_sensitivity: float,
         golden_cache: GoldenReferenceCache,
         allow_golden_runtime_resample: bool = False,
+        precomputed: object | None = None,
     ) -> tuple[list[BandResult], bool, str | None]:
         band_limits = channel_config.get("oct_band_limits", [])
         weighting = str(channel_config.get("oct_weighting", "Z") or "Z")
@@ -613,11 +675,17 @@ class JudgmentEngine:
                 logger.warning("黄金样本加载失败，倍频程对比曲线已忽略: %s", exc)
 
         try:
-            measured_centers, measured_levels = self._measure_octave(
-                sig,
-                sample_rate,
-                weighting,
-            )
+            if precomputed is not None:
+                if precomputed.octave_error is not None:
+                    raise RuntimeError(precomputed.octave_error)
+                measured_centers = np.asarray(precomputed.octave_centers)
+                measured_levels = np.asarray(precomputed.octave_levels)
+            else:
+                measured_centers, measured_levels = self._measure_octave(
+                    sig,
+                    sample_rate,
+                    weighting,
+                )
         except Exception as exc:
             return [], False, str(exc) or exc.__class__.__name__
         if mode == "off":
@@ -994,14 +1062,4 @@ class JudgmentEngine:
 
     @staticmethod
     def _get_sensitivity(mic_cal: dict, channel_index: int) -> float:
-        """Extract mic sensitivity from mic_cal dict.
-
-        mic_cal format: {"In1": {"deviation_value": "0.5", ...}, ...}
-        """
-        key = f"In{channel_index + 1}"
-        entry = mic_cal.get(key, {})
-        raw = entry.get("deviation_value", "0")
-        try:
-            return float(raw)
-        except (ValueError, TypeError):
-            return 0.0
+        return dsp.mic_sensitivity_from_calibration(mic_cal, channel_index)

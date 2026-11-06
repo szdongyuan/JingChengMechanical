@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import os
+import sys
+from threading import Thread
 
-from PyQt6.QtCore import QMetaObject, QSize, Qt, QTimer
+from PyQt6.QtCore import QProcess, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QIcon, QPainter, QPixmap
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QHBoxLayout,
     QLabel,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QStackedWidget,
     QToolButton,
     QVBoxLayout,
@@ -19,9 +23,24 @@ from PyQt6.QtWidgets import (
 
 from base.utils import asset_path
 
-from app.services_container import FactoryControllerState, FactoryReviewPayload
+from app.service.multi_run_coordinator_mvp import (
+    ManualJudgmentRequest as CompositeManualJudgmentRequest,
+    OperationResult,
+    OperationStatus,
+    ReanalysisCancelRequest as CompositeReanalysisCancelRequest,
+    ReanalysisRequest as CompositeReanalysisRequest,
+    TerminalConclusion,
+)
+from app.service.multi_run_integration.shutdown import ApplicationShutdownReport
+from app.service.result_history_contracts import (
+    ManualJudgmentRequest as UiManualJudgmentRequest,
+    ReanalysisCancelRequest as UiReanalysisCancelRequest,
+    ReanalysisRequest as UiReanalysisRequest,
+)
+from app.services_container import FactoryControllerState
 from consts.style import APP_QSS
 from ui.widgets.cards import Card
+from ui.widgets.video_preview_overlay import VideoPreviewOverlay
 from ui.modules.workorder import WorkOrderModule
 from ui.modules.control import ControlModule
 from ui.modules.result_dashboard import ResultDashboardModule
@@ -49,20 +68,15 @@ ROLE_PERMISSIONS = {
         "actions": {"切换用户", "修改密码"},
     },
     "操作员": {
-        "tabs": {"测试"},
-        "actions": {"切换用户", "修改密码"},
+        "tabs": {"测试", "数据管理"},
+        "actions": {"切换用户"},
     },
 }
 
 
 class MainWindow(QMainWindow):
     _TEST_PAGE_INDEX = 0
-    _DISPLAY_CHANNEL_PHASES = frozenset(
-        {"running", "analyzing", "reviewing", "reanalyzing", "stopped"}
-    )
-    _COMMITTED_CHART_CHANNEL_PHASES = frozenset(
-        {"reviewing", "reanalyzing", "stopped"}
-    )
+    _manual_judgment_completed = pyqtSignal(object)
 
     def __init__(self, services):
         super().__init__()
@@ -77,10 +91,6 @@ class MainWindow(QMainWindow):
         self.delete_user_window = None
         factory_mode = getattr(self.services, "factory_mode", None)
         self._factory_state = getattr(factory_mode, "state", FactoryControllerState())
-        self._review_payload = getattr(factory_mode, "review_payload", FactoryReviewPayload())
-        self.display_channel_by_config_id: dict[int, int] = {}
-        self._last_selected_display_channel: int | None = None
-        self._review_identity_by_config_id: dict[int, tuple] = {}
         self._selected_plc_bindings: tuple[int, ...] = ()
         self._selected_config_count = 0
         self._selected_unbound_plc_count = 0
@@ -89,6 +99,7 @@ class MainWindow(QMainWindow):
         self._current_main_tab_index = self._TEST_PAGE_INDEX
         self._pending_guarded_tab_index: int | None = None
         self._reverting_main_tab_change = False
+        self._restart_in_progress = False
 
         self.setWindowTitle("智能电机检测")
         icon_path = asset_path("logo.ico")
@@ -122,9 +133,6 @@ class MainWindow(QMainWindow):
         self.tab.currentChanged.connect(self._on_main_tab_changed)
 
         self.services.bus.log.emit("[App] 启动程序")
-        self._record_review_identity(self._review_payload)
-        self._sync_analysis_toolbar()
-        self._refresh_analysis_display_modules()
         self.set_role()
 
     def show_login_window(self, close_main_window=False, window_title="登录"):
@@ -330,9 +338,11 @@ class MainWindow(QMainWindow):
         left_lay.setSpacing(5)
 
         self.workorder = WorkOrderModule(self.services)
-        left_lay.addWidget(Card("工单输入", self.workorder), 1)
+        left_lay.addWidget(Card("工单", self.workorder), 1)
 
         self.control = ControlModule(self.services)
+        self.control.btn_stop.setText("停止测试")
+        self.control.restart_intent.connect(self._restart_application)
         left_lay.addWidget(Card("控制面板", self.control))
 
         self.today_statistics = TodayStatisticsModule(self.services)
@@ -341,9 +351,12 @@ class MainWindow(QMainWindow):
         left_lay.addWidget(self.today_statistics_card)
 
         self.video = VideoModule(self.services)
-        self.video_card = Card("视频预览", self.video)
-        self.video_card.setMinimumHeight(270)
-        left_lay.addWidget(self.video_card)
+        self.services.register_independent_shutdown_resource(
+            self.video.stop_camera
+        )
+        self.video_placeholder = QWidget()
+        self.video_placeholder.setFixedHeight(270)
+        left_lay.addWidget(self.video_placeholder)
 
         content_lay.addWidget(left)
 
@@ -353,10 +366,138 @@ class MainWindow(QMainWindow):
         main_lay.setContentsMargins(0, 0, 0, 0)
         main_lay.setSpacing(12)
 
-        self.result_dashboard = ResultDashboardModule(self.services)
+        self.result_dashboard = ResultDashboardModule(
+            self.services,
+            self.services.result_history_store,
+            self.control.manual_judgment_widget,
+        )
+        self.services.attach_committed_history_observer(
+            self.today_statistics.on_committed_history_event
+        )
+        self.history_adapter = self.services.attach_result_dashboard(
+            self.result_dashboard
+        )
+        self._wire_run_scoped_result_operations()
         main_lay.addWidget(self.result_dashboard, 1)
         content_lay.addWidget(main, 1)
+
+        self.video_card = VideoPreviewOverlay(
+            page,
+            self.video,
+            self.video_placeholder,
+        )
+        QTimer.singleShot(0, self.video_card.sync_geometry)
         return page
+
+    def _wire_run_scoped_result_operations(self) -> None:
+        completion_signal = getattr(
+            self,
+            "_manual_judgment_completed",
+            None,
+        )
+        if callable(getattr(completion_signal, "connect", None)):
+            completion_signal.connect(
+                self.control.handle_manual_judgment_result
+            )
+        self.result_dashboard.manual_judgment_target_changed.connect(
+            self.control.set_manual_judgment_target
+        )
+        self.control.manual_judgment_intent.connect(
+            self.result_dashboard.request_manual_judgment
+        )
+        self.result_dashboard.manual_judgment_requested.connect(
+            self._apply_manual_judgment_request
+        )
+        self.result_dashboard.reanalysis_requested.connect(
+            self._start_reanalysis_request
+        )
+        self.result_dashboard.reanalysis_cancel_requested.connect(
+            self._cancel_reanalysis_request
+        )
+        self.control.stop_intent.connect(self._stop_all_active_runs)
+
+    def _apply_manual_judgment_request(self, request: object) -> None:
+        if type(request) is not UiManualJudgmentRequest:
+            return
+        if request.label == "OK":
+            conclusion = TerminalConclusion.OK
+        elif request.label == "NG":
+            conclusion = TerminalConclusion.NG
+        else:
+            return
+        composite_request = CompositeManualJudgmentRequest(
+            run_id=request.run_id,
+            expected_revision=request.expected_revision,
+            conclusion=conclusion,
+            fault_type=request.fault_type,
+            bounded_note="",
+        )
+        completion_signal = getattr(
+            self,
+            "_manual_judgment_completed",
+            None,
+        )
+        if callable(getattr(completion_signal, "emit", None)):
+            Thread(
+                target=self._commit_manual_judgment,
+                args=(composite_request,),
+                name="manual-judgment-save",
+                daemon=True,
+            ).start()
+            return
+
+        result = self.services.multi_run_coordinator.apply_manual(
+            composite_request
+        )
+        self.control.handle_manual_judgment_result(result)
+
+    def _commit_manual_judgment(
+        self,
+        request: CompositeManualJudgmentRequest,
+    ) -> None:
+        try:
+            result = self.services.multi_run_coordinator.apply_manual(request)
+        except Exception as exc:
+            result = OperationResult(
+                run_id=request.run_id,
+                status=OperationStatus.PERSISTENCE_REJECTED,
+                attempt_id=None,
+                reason=str(exc).strip() or type(exc).__name__,
+            )
+        self._manual_judgment_completed.emit(result)
+
+    def _start_reanalysis_request(self, request: object) -> None:
+        if type(request) is not UiReanalysisRequest:
+            return
+        result = self.services.multi_run_coordinator.start_reanalysis(
+            CompositeReanalysisRequest(
+                run_id=request.run_id,
+                expected_revision=request.expected_revision,
+                start_sec=request.start_sec,
+                end_sec=request.end_sec,
+            )
+        )
+        if (
+            type(result) is OperationResult
+            and result.status is OperationStatus.NOT_FOUND
+        ):
+            self.services.bus.status.emit(
+                "重新分析失败：所选运行记录不存在，可能已被删除"
+            )
+
+    def _cancel_reanalysis_request(self, request: object) -> None:
+        if type(request) is not UiReanalysisCancelRequest:
+            return
+        self.services.multi_run_coordinator.cancel_reanalysis(
+            CompositeReanalysisCancelRequest(
+                run_id=request.run_id,
+                attempt_id=request.operation_id,
+                expected_revision=request.expected_revision,
+            )
+        )
+
+    def _stop_all_active_runs(self) -> None:
+        self.services.multi_run_coordinator.stop_all(5.0)
 
     def _refresh_plc_state_labels(self):
         plc_states = getattr(self.services, "plc_state", {})
@@ -365,7 +506,8 @@ class MainWindow(QMainWindow):
 
         process_state = getattr(self.services, "process_plc_state", "未连接")
         self.selected_plc_state_label.setText(
-            self._selected_plc_status_html(
+            self._plc_status_html(
+                self._visible_plc_ids(plc_states, self._selected_plc_bindings),
                 self._selected_plc_bindings,
                 plc_states,
                 selected_config_count=self._selected_config_count,
@@ -415,8 +557,9 @@ class MainWindow(QMainWindow):
         self._selected_plc_tooltip = "\n".join(tooltip_rows)
 
     @classmethod
-    def _selected_plc_status_html(
+    def _plc_status_html(
         cls,
+        visible_plc_ids: tuple[int, ...],
         plc_ids: tuple[int, ...],
         plc_states: dict,
         *,
@@ -425,6 +568,16 @@ class MainWindow(QMainWindow):
         load_error_count: int,
     ) -> str:
         muted_color = "#64748b"
+        if visible_plc_ids:
+            parts = []
+            for plc_id in visible_plc_ids:
+                state = plc_states.get(plc_id, "未连接")
+                color = cls._plc_state_color(state)
+                parts.append(
+                    f"PLC {plc_id}：<span style='color: {color};'>{state}</span>"
+                )
+            return "　".join(parts)
+
         if selected_config_count == 0:
             return f"PLC：<span style='color: {muted_color};'>未选择配置</span>"
 
@@ -446,6 +599,17 @@ class MainWindow(QMainWindow):
                 f"{load_error_count} 个配置加载失败</span>"
             )
         return "　".join(parts)
+
+    @staticmethod
+    def _visible_plc_ids(plc_states: dict, selected_plc_ids: tuple[int, ...]) -> tuple[int, ...]:
+        state_ids = sorted(
+            plc_id
+            for plc_id in plc_states
+            if type(plc_id) is int and plc_id > 0
+        )
+        if state_ids:
+            return tuple(state_ids)
+        return tuple(selected_plc_ids)
 
     @staticmethod
     def _plc_state_color(state: str) -> str:
@@ -536,6 +700,9 @@ class MainWindow(QMainWindow):
         channel_card = Card("硬件通道启用", channel)
 
         self.plc_settings_module = PlcSettingsModule(self.services)
+        self.services.register_independent_shutdown_resource(
+            self.plc_settings_module.stop_process_param_service
+        )
         self.services.get_process_param_values = self.plc_settings_module.get_process_param_values
         self.plc_settings_card = Card("PLC设置", self.plc_settings_module)
 
@@ -550,10 +717,6 @@ class MainWindow(QMainWindow):
             self.services.bus.log.connect(self._show_latest_log_line)
         if hasattr(self.services.bus, "factory_state_changed"):
             self.services.bus.factory_state_changed.connect(self._on_factory_state_changed)
-        if hasattr(self.services.bus, "factory_review_changed"):
-            self.services.bus.factory_review_changed.connect(self._on_factory_review_changed)
-        if hasattr(self.services.bus, "factory_display_reset"):
-            self.services.bus.factory_display_reset.connect(self._on_factory_display_reset)
         if hasattr(self.services.bus, "config_changed"):
             self.services.bus.config_changed.connect(self._on_plc_binding_data_changed)
         if hasattr(self.services.bus, "plc_changed"):
@@ -575,34 +738,6 @@ class MainWindow(QMainWindow):
                 return normalized
         return ""
 
-    def current_display_channel_index(self) -> int | None:
-        config_id = self._factory_state.displayed_config_id
-        if config_id is None:
-            return None
-        return self.display_channel_by_config_id.get(config_id)
-
-    def _attach_analysis_channel_providers(self) -> None:
-        for module in (
-            self.result,
-            self.stft,
-            self.loudness,
-            self.spl,
-            self.spectrum,
-            self.octave,
-            self.vibration_axis,
-            self.vibration_trend,
-        ):
-            module.selected_display_channel_provider = self.current_display_channel_index
-        for module in (
-            self.loudness,
-            self.spl,
-            self.spectrum,
-            self.octave,
-            self.vibration_axis,
-            self.vibration_trend,
-        ):
-            module.selected_display_channel_sync = self._sync_selected_display_channel
-
     def _on_factory_state_changed(self, state) -> None:
         if isinstance(state, FactoryControllerState):
             self._factory_state = state
@@ -610,48 +745,6 @@ class MainWindow(QMainWindow):
             self._factory_state = FactoryControllerState()
         self._reload_selected_plc_bindings()
         self._refresh_plc_state_labels()
-        self._sync_analysis_toolbar()
-
-    def _on_factory_review_changed(self, review) -> None:
-        if isinstance(review, FactoryReviewPayload):
-            self._review_payload = review
-        else:
-            self._review_payload = FactoryReviewPayload()
-        self._clear_display_channel_for_new_review_identity(self._review_payload)
-        self._sync_analysis_toolbar()
-
-    def _review_identity(self, review: FactoryReviewPayload) -> tuple:
-        return (
-            getattr(review, "displayed_config_id", None),
-            getattr(review, "run_id", None),
-            getattr(review, "trigger_source", None),
-        )
-
-    def _record_review_identity(self, review: FactoryReviewPayload) -> None:
-        config_id = getattr(review, "displayed_config_id", None)
-        if isinstance(config_id, int):
-            self._review_identity_by_config_id[config_id] = self._review_identity(review)
-
-    def _clear_display_channel_for_new_review_identity(
-        self,
-        review: FactoryReviewPayload,
-    ) -> None:
-        config_id = getattr(review, "displayed_config_id", None)
-        if not isinstance(config_id, int):
-            return
-
-        identity = self._review_identity(review)
-        if self._review_identity_by_config_id.get(config_id) != identity:
-            self.display_channel_by_config_id.pop(config_id, None)
-        self._review_identity_by_config_id[config_id] = identity
-
-    def _on_factory_display_reset(self, _reason: str) -> None:
-        config_id = self._factory_state.displayed_config_id
-        if isinstance(config_id, int):
-            self.display_channel_by_config_id.pop(config_id, None)
-        self._review_payload = FactoryReviewPayload()
-        self._sync_analysis_toolbar()
-        self._apply_analysis_display_mode()
 
     def _on_topbar_tab_clicked(self, index: int) -> None:
         current_index = self.tab.currentIndex()
@@ -691,9 +784,6 @@ class MainWindow(QMainWindow):
     def _finalize_main_tab_change(self, index: int) -> None:
         self._current_main_tab_index = index
         self._sync_topbar_selection(index)
-        if index == self._TEST_PAGE_INDEX:
-            self._refresh_analysis_display_modules()
-            self._apply_analysis_display_mode()
 
     def _revert_main_tab_change(self, previous_index: int) -> None:
         self._reverting_main_tab_change = True
@@ -781,374 +871,78 @@ class MainWindow(QMainWindow):
         except ValueError:
             return None
 
-    def _on_analysis_channel_changed(self, channel_index: int) -> None:
-        self._sync_selected_display_channel(channel_index, refresh_modules=False)
-        self._refresh_analysis_display_modules()
-
-    def _sync_selected_display_channel(
-        self,
-        channel_index: int,
-        *,
-        refresh_modules: bool = True,
-    ) -> None:
-        config_id = self._factory_state.displayed_config_id
-        if config_id is None:
+    def _restart_application(self) -> None:
+        if self._restart_in_progress:
             return
 
-        channels = self._resolve_display_channels(config_id)
-        if channel_index not in channels:
+        self._restart_in_progress = True
+        self.control.set_restart_pending(True)
+        if not self._can_leave_main_tab(self.tab.currentIndex()):
+            self._restore_restart_control()
             return
 
-        self._last_selected_display_channel = channel_index
-        self.display_channel_by_config_id[config_id] = channel_index
-        self.analysis_toolbar.set_current_channel(channel_index)
-        self.analysis_toolbar.set_context_label_text(
-            self._build_analysis_toolbar_context(config_id, channel_index)
-        )
-        self._emit_factory_display_channel_changed(config_id, channel_index)
-        self._apply_analysis_display_mode()
-
-        if refresh_modules:
-            self._refresh_analysis_display_modules()
-
-    def _refresh_analysis_display_modules(self) -> None:
-        for name in (
-            "stft",
-            "loudness",
-            "spl",
-            "spectrum",
-            "octave",
-            "vibration_axis",
-            "vibration_trend",
-            "result",
-        ):
-            module = getattr(self, name, None)
-            refresh = getattr(module, "refresh_selected_display_channel", None)
-            if callable(refresh):
-                refresh()
-
-    def _sync_analysis_toolbar(self) -> None:
-        if not hasattr(self, "analysis_toolbar"):
-            return
-
-        config_id = self._factory_state.displayed_config_id
-        if (
-            config_id is None
-            or self._factory_state.run_phase not in self._DISPLAY_CHANNEL_PHASES
-        ):
-            if config_id is not None:
-                self.display_channel_by_config_id.pop(config_id, None)
-            self.analysis_toolbar.set_available_channels([])
-            self.analysis_toolbar.set_context_label_text("")
-            self.analysis_toolbar.hide()
-            self._apply_analysis_display_mode()
-            return
-
-        channels = self._resolve_display_channels(config_id)
-        if not channels:
-            self.display_channel_by_config_id.pop(config_id, None)
-            self.analysis_toolbar.set_available_channels([])
-            self.analysis_toolbar.set_context_label_text("")
-            self.analysis_toolbar.hide()
-            self._apply_analysis_display_mode()
-            return
-
-        current_channel = self._resolve_current_display_channel(config_id, channels)
-        if current_channel is None:
-            self.display_channel_by_config_id.pop(config_id, None)
-            self.analysis_toolbar.set_available_channels([])
-            self.analysis_toolbar.set_context_label_text("")
-            self.analysis_toolbar.hide()
-            self._apply_analysis_display_mode()
-            return
-
-        self.display_channel_by_config_id[config_id] = current_channel
-        self.analysis_toolbar.set_available_channels(
-            channels,
-            self._display_channel_labels_for_config(config_id),
-        )
-        self.analysis_toolbar.set_current_channel(current_channel)
-        self.analysis_toolbar.set_context_label_text(
-            self._build_analysis_toolbar_context(config_id, current_channel)
-        )
-        self.analysis_toolbar.show()
-        self._emit_factory_display_channel_changed(config_id, current_channel)
-        self._apply_analysis_display_mode()
-
-    def _emit_factory_display_channel_changed(
-        self,
-        config_id: int,
-        channel_index: int,
-    ) -> None:
-        signal = getattr(self.services.bus, "factory_display_channel_changed", None)
-        emit = getattr(signal, "emit", None)
-        if callable(emit):
-            emit(config_id, channel_index)
-
-    def _resolve_display_channels(self, config_id: int) -> list[int]:
-        if self._is_current_imported_review(config_id):
-            return self._chart_payload_channels_for_config(config_id)
-        if self._is_transient_imported_review_without_chart_payload(config_id):
-            channels = self._analysis_toolbar_channel_options()
-            stored_channel = self.display_channel_by_config_id.get(config_id)
-            if isinstance(stored_channel, int) and stored_channel in channels:
-                return channels
-        return self._selected_channels_for_config(config_id)
-
-    def _analysis_toolbar_channel_options(self) -> list[int]:
-        if not hasattr(self, "analysis_toolbar"):
-            return []
-        combo = getattr(self.analysis_toolbar, "channel_combo", None)
-        if combo is None:
-            return []
-        channels: list[int] = []
-        for index in range(combo.count()):
-            channel = combo.itemData(index)
-            if isinstance(channel, int) and channel not in channels:
-                channels.append(channel)
-        return channels
-
-    def _resolve_current_display_channel(
-        self,
-        config_id: int,
-        channels: list[int],
-    ) -> int | None:
-        if not channels:
-            return None
-
-        review_channels: list[int] | None = None
-        is_transient_reanalysis_without_chart_payload = False
-        if (
-            self._factory_state.run_phase in self._COMMITTED_CHART_CHANNEL_PHASES
-            and self._review_payload.displayed_config_id == config_id
-        ):
-            is_transient_reanalysis_without_chart_payload = (
-                self._is_transient_reanalysis_review_without_chart_payload(config_id)
-            )
-            if is_transient_reanalysis_without_chart_payload:
-                review_channels = None
-            else:
-                review_channels = self._chart_payload_channels_for_config(config_id)
-
-        def channel_is_available(channel_index: int | None) -> bool:
-            return (
-                channel_index in channels
-                and (review_channels is None or channel_index in review_channels)
-            )
-
-        if is_transient_reanalysis_without_chart_payload:
-            stored_channel = self.display_channel_by_config_id.get(config_id)
-            if isinstance(stored_channel, int) and stored_channel in channels:
-                return stored_channel
-
-        vibration_channel = self._vibration_view_channel_for_config(config_id)
-        if channel_is_available(vibration_channel):
-            stored_channel = self.display_channel_by_config_id.get(config_id)
-            if channel_is_available(stored_channel):
-                return stored_channel
-            return vibration_channel
-
-        if review_channels is not None:
-            stored_channel = self.display_channel_by_config_id.get(config_id)
-            if channel_is_available(stored_channel):
-                return stored_channel
-
-        remembered_channel = self._last_selected_display_channel
-        if channel_is_available(remembered_channel):
-            return remembered_channel
-
-        candidate_channel = channels[0]
-        if review_channels and candidate_channel not in review_channels:
-            for channel in channels:
-                if channel in review_channels:
-                    return channel
-            return None
-
-        return candidate_channel
-
-    def _selected_channels_for_config(self, config_id: int) -> list[int]:
-        config = self._load_config_for_display(config_id)
-        return self._normalize_channels(config.get("selected_channels", []))
-
-    def _config_payload_for_displayed_review(self, config_id: int) -> dict:
-        if self._review_payload.displayed_config_id != config_id:
-            return {}
-        config_payload = getattr(self._review_payload, "config_payload", None)
-        return config_payload if isinstance(config_payload, dict) else {}
-
-    def _load_config_for_display(self, config_id: int) -> dict:
-        payload_config = self._config_payload_for_displayed_review(config_id)
-        if payload_config:
-            return payload_config
-
-        config_service = getattr(self.services, "config_service", None)
-        load_config = getattr(config_service, "load_config", None)
-        if not callable(load_config):
-            return {}
-
+        self.services.bus.log.emit("[App] 重启程序")
+        shutdown_clean = True
         try:
-            config = load_config(config_id)
+            self.control.shutdown()
         except Exception:
-            return {}
-        return config if isinstance(config, dict) else {}
-
-    def _vibration_view_channel_for_config(self, config_id: int) -> int | None:
-        config = self._load_config_for_display(config_id)
-        value = config.get("vibration_view_channel_index")
-        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-            return None
-        selected = self._normalize_channels(config.get("selected_channels", []))
-        return value if value in selected else None
-
-    def _chart_payload_channels_for_config(self, config_id: int) -> list[int]:
-        if self._review_payload.displayed_config_id != config_id:
-            return []
-        chart_payload = getattr(self._review_payload, "chart_payload", None)
-        if not isinstance(chart_payload, dict):
-            return []
-        return self._normalize_channels(chart_payload.keys())
-
-    def _is_transient_reanalysis_review_without_chart_payload(
-        self,
-        config_id: int,
-    ) -> bool:
-        stored_channel = self.display_channel_by_config_id.get(config_id)
-        return (
-            self._factory_state.run_phase in {"reviewing", "reanalyzing"}
-            and isinstance(stored_channel, int)
-            and self._review_payload.displayed_config_id == config_id
-            and getattr(self._review_payload, "chart_payload", None) is None
-            and getattr(self._review_payload, "summary_payload", None) is None
-            and getattr(self._review_payload, "judgment_payload", None) is None
-            and not bool(getattr(self._review_payload, "no_result", False))
-            and getattr(self._review_payload, "error_message", None) is None
-        )
-
-    def _is_transient_imported_review_without_chart_payload(
-        self,
-        config_id: int,
-    ) -> bool:
-        return (
-            getattr(self._review_payload, "trigger_source", None) == "import_audio"
-            and self._is_transient_reanalysis_review_without_chart_payload(config_id)
-        )
-
-    def _display_channel_labels_for_config(self, config_id: int) -> dict[int, str] | None:
-        if not self._is_current_imported_review(config_id):
-            return None
-
-        labels = getattr(self._review_payload, "display_channel_labels", None)
-        if not isinstance(labels, dict):
-            return None
-
-        normalized: dict[int, str] = {}
-        vibration_channel = self._vibration_view_channel_for_config(config_id)
-        for channel, label in labels.items():
-            try:
-                channel_index = int(channel)
-            except (TypeError, ValueError):
-                continue
-            if isinstance(label, str) and label.strip():
-                normalized_label = label.strip()
-                if channel_index == vibration_channel:
-                    normalized_label = self._append_vibration_label(normalized_label)
-                normalized[channel_index] = normalized_label
-        return normalized
-
-    def _is_current_imported_review(self, config_id: int) -> bool:
-        return (
-            getattr(self._review_payload, "trigger_source", None) == "import_audio"
-            and self._factory_state.run_phase in self._COMMITTED_CHART_CHANNEL_PHASES
-            and self._review_payload.displayed_config_id == config_id
-            and isinstance(getattr(self._review_payload, "chart_payload", None), dict)
-        )
-
-    @staticmethod
-    def _normalize_channels(channels) -> list[int]:
-        normalized_channels: list[int] = []
-        for channel in channels or ():
-            try:
-                channel_index = int(channel)
-            except (TypeError, ValueError):
-                continue
-            if channel_index not in normalized_channels:
-                normalized_channels.append(channel_index)
-        return normalized_channels
-
-    def _build_analysis_toolbar_context(self, config_id: int, channel_index: int) -> str:
-        if self._is_current_imported_review(config_id):
-            label = (self._display_channel_labels_for_config(config_id) or {}).get(
-                channel_index
+            shutdown_clean = False
+        try:
+            shutdown_report = self.services.shutdown()
+            shutdown_clean = (
+                shutdown_clean
+                and type(shutdown_report) is ApplicationShutdownReport
+                and shutdown_report.clean is True
             )
-            suffix = label or f"配置 {config_id} / 通道{channel_index + 1}"
-            context = f"导入音频 / {suffix}"
-        else:
-            context = f"配置 {config_id} / 通道{channel_index + 1}"
-        if channel_index == self._vibration_view_channel_for_config(config_id):
-            context = self._append_vibration_context(context)
-        return context
+        except Exception:
+            shutdown_clean = False
 
-    @staticmethod
-    def _append_vibration_label(label: str) -> str:
-        return label if "振动" in label else f"{label}（振动）"
-
-    @staticmethod
-    def _append_vibration_context(context: str) -> str:
-        return context if "振动" in context else f"{context} / 振动"
-
-    def _on_loudness_title_changed(self, title: str) -> None:
-        if not self._is_current_display_vibration():
-            self.loudness_card.set_title(title)
-
-    def _set_stft_score_title(self, text: str) -> None:
-        self.stft_card.set_title_metric("频谱最低得分：", self._stft_score_value(text))
-
-    @staticmethod
-    def _stft_score_value(text: str) -> str:
-        normalized = str(text or "").strip()
-        for separator in ("：", ":"):
-            if separator in normalized:
-                return normalized.split(separator, 1)[1].strip() or "--"
-        return normalized or "--"
-
-    def _is_current_display_vibration(self) -> bool:
-        config_id = self._factory_state.displayed_config_id
-        channel = self.current_display_channel_index()
-        if config_id is None or channel is None:
-            return False
-        return channel == self._vibration_view_channel_for_config(config_id)
-
-    def _apply_analysis_display_mode(self) -> None:
-        if not hasattr(self, "loudness_card"):
+        if not shutdown_clean:
+            QMessageBox.critical(
+                self,
+                "重启软件",
+                "软件关闭失败，未启动新实例。请重试或手动重启软件。",
+            )
+            self._restore_restart_control()
             return
 
-        vibration_mode = self._is_current_display_vibration()
-        if vibration_mode:
-            self.stft_card.set_title("振动纹理")
-            self.spectrum_card.set_title("振动频谱")
-            self.loudness_card.set_title("振动频率稳定性")
-            self.spl_card.set_title("振动脉冲")
-            self.octave_card.set_title("机械频带")
-            self.loudness_stack.setCurrentWidget(self.vibration_axis)
-            self.spl_stack.setCurrentWidget(self.vibration_trend)
-        else:
-            self.stft_card.set_title("时频图（频率Hz，幅值dB）")
-            self.spectrum_card.set_title("频谱（dB）")
-            self.loudness_card.set_title(self.loudness.current_title())
-            self.spl_card.set_title("声压级（dB）")
-            self.octave_card.set_title("倍频程（dB）")
-            self.loudness_stack.setCurrentWidget(self.loudness)
-            self.spl_stack.setCurrentWidget(self.spl)
+        program, arguments = self._restart_command()
+        try:
+            detached_result = QProcess.startDetached(program, arguments)
+            launched = (
+                bool(detached_result[0])
+                if isinstance(detached_result, tuple)
+                else bool(detached_result)
+            )
+        except Exception:
+            launched = False
 
-        self._set_module_vibration_mode(self.stft, vibration_mode)
-        self._set_module_vibration_mode(self.spectrum, vibration_mode)
-        self._set_module_vibration_mode(self.octave, vibration_mode)
+        if not launched:
+            QMessageBox.critical(
+                self,
+                "重启软件",
+                "软件重启失败，未启动新实例。请手动启动软件。",
+            )
+            self._restore_restart_control()
+            return
+
+        app = QApplication.instance()
+        if app is not None:
+            app.quit()
+
+    def _restore_restart_control(self) -> None:
+        self._restart_in_progress = False
+        self.control.set_restart_pending(False)
 
     @staticmethod
-    def _set_module_vibration_mode(module, enabled: bool) -> None:
-        set_vibration_mode = getattr(module, "set_vibration_mode", None)
-        if callable(set_vibration_mode):
-            set_vibration_mode(enabled)
+    def _restart_command() -> tuple[str, list[str]]:
+        arguments = list(sys.argv[1:])
+        if getattr(sys, "frozen", False):
+            return sys.executable, arguments
+        main_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), os.pardir, "main.py")
+        )
+        return sys.executable, [main_path, *arguments]
 
     def closeEvent(self, event: QCloseEvent):
         if not self._can_leave_main_tab(self.tab.currentIndex()):
@@ -1156,35 +950,11 @@ class MainWindow(QMainWindow):
             return
         self.services.bus.log.emit("[App] 关闭程序")
         try:
-            for plc_service in getattr(self.services, "plc_services", {}).values():
-                if plc_service is None:
-                    continue
-                try:
-                    QMetaObject.invokeMethod(
-                        plc_service,
-                        "stop_plc_service",
-                        Qt.ConnectionType.BlockingQueuedConnection,
-                    )
-                except Exception:
-                    pass
-            for plc_thread in getattr(self.services, "plc_threads", {}).values():
-                if plc_thread is None:
-                    continue
-                try:
-                    plc_thread.quit()
-                    plc_thread.wait(2000)
-                except Exception:
-                    pass
+            self.control.shutdown()
         except Exception:
             pass
         try:
             self.services.shutdown()
-        except Exception:
-            pass
-        try:
-            stop_camera = getattr(getattr(self, "video", None), "stop_camera", None)
-            if callable(stop_camera):
-                stop_camera()
         except Exception:
             pass
         super().closeEvent(event)

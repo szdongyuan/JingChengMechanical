@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -7,11 +8,17 @@ import textwrap
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 import app.service.ai_resident_runtime as ai_resident_runtime
+import app.service.ai_subprocess as ai_subprocess_module
 from app.service.ai_resident_runtime import ResidentToolchainRuntime
+from app.service.analysis.scheduler import (
+    AiToolchainSnapshot,
+    canonical_toolchain_lane_key,
+)
 
 
 _FAKE_RESIDENT_SCRIPT = """
@@ -264,6 +271,16 @@ for raw_line in sys.stdin:
             while True:
                 time.sleep(0.1)
         break
+    if message_type == "ready":
+        emit_message(
+            {
+                "message_type": "ready",
+                "protocol_version": 1,
+                "execution_revision": message.get("execution_revision"),
+                "process_instance_id": INSTANCE_ID,
+            }
+        )
+        continue
     if message_type == "analyze":
         handle_analyze(message)
 """
@@ -273,6 +290,74 @@ def _write_fake_resident_script(tmp_path: Path) -> Path:
     script_path = tmp_path / "fake_resident_toolchain.py"
     script_path.write_text(textwrap.dedent(_FAKE_RESIDENT_SCRIPT), encoding="utf-8")
     return script_path
+
+
+_LEGACY_RESIDENT_SCRIPT = """
+from __future__ import annotations
+
+import json
+import os
+import json
+import sys
+import time
+
+
+if len(sys.argv) > 1 and sys.argv[1] == "hang-before-loop":
+    time.sleep(30.0)
+
+for raw_line in sys.stdin:
+    message = json.loads(raw_line)
+    message_type = message.get("message_type")
+    if message_type == "shutdown":
+        break
+    if message_type != "analyze":
+        continue
+    request = message["request"]
+    sys.stdout.write(
+        json.dumps(
+            {
+                "message_type": "result",
+                "request_id": message["request_id"],
+                "response": {
+                    "protocol_version": 1,
+                    "request_id": request["request_id"],
+                    "toolchain_name": "legacy-resident",
+                    "toolchain_version": "0",
+                    "ai_result": {
+                        "ai_label": "ok",
+                        "process_id": os.getpid(),
+                    },
+                },
+            }
+        )
+        + "\\n"
+    )
+    sys.stdout.flush()
+"""
+
+
+def _write_legacy_resident_script(tmp_path: Path) -> Path:
+    script_path = tmp_path / "legacy_resident_toolchain.py"
+    script_path.write_text(
+        textwrap.dedent(_LEGACY_RESIDENT_SCRIPT), encoding="utf-8"
+    )
+    return script_path
+
+
+def _write_legacy_jsonl_manifest(
+    tmp_path: Path,
+    entrypoint_file: str,
+) -> None:
+    (tmp_path / "toolchain_manifest.json").write_text(
+        json.dumps(
+            {
+                "entrypoint_file": entrypoint_file,
+                "execution_mode": "resident_process",
+                "protocol": "UTF-8 JSONL over stdin/stdout",
+            }
+        ),
+        encoding="utf-8",
+    )
 
 
 def _entrypoint(script_path: Path, *extra_args: str) -> str:
@@ -318,6 +403,339 @@ def runtime():
         yield helper
     finally:
         helper.shutdown_all()
+
+
+def test_start_process_preserves_pipes_and_uses_no_console_flags(
+    runtime, monkeypatch
+):
+    captured = {}
+    monkeypatch.setattr(ai_subprocess_module, "os", SimpleNamespace(environ={
+        "PATH": "test-bin", "CUSTOM_AI": "keep", "OMP_NUM_THREADS": "8",
+    }))
+
+    def _popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(stdin=object(), stdout=object(), stderr=object())
+
+    class _Thread:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+    monkeypatch.setattr(ai_resident_runtime.subprocess, "Popen", _popen)
+    monkeypatch.setattr(ai_resident_runtime.threading, "Thread", _Thread)
+    monkeypatch.setattr(
+        ai_resident_runtime,
+        "ai_subprocess_creation_flags",
+        lambda: 0x08000040,
+    )
+
+    runtime._start_process("tc-1", "tool.exe --serve", package_dir="C:/AI")
+
+    assert captured["kwargs"] == {
+        "stdin": subprocess.PIPE,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "bufsize": 1,
+        "cwd": "C:/AI",
+        "creationflags": 0x08000040,
+        "env": {
+            "PATH": "test-bin", "CUSTOM_AI": "keep",
+            "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1", "NUMEXPR_NUM_THREADS": "1",
+        },
+    }
+
+
+def _toolchain_snapshot(
+    tmp_path: Path,
+    entrypoint: str,
+    *,
+    revision: str = "revision-1",
+) -> AiToolchainSnapshot:
+    return AiToolchainSnapshot(
+        toolchain_id="tc-1",
+        runtime_lane_key=canonical_toolchain_lane_key("tc-1"),
+        execution_revision=revision,
+        execution_mode="resident_process",
+        entrypoint=entrypoint,
+        package_dir=str(tmp_path),
+        params_json="{}",
+        timeout_seconds=2.0,
+    )
+
+
+def test_prewarm_is_idempotent_and_revision_exact_without_business_request(
+    tmp_path: Path,
+    runtime,
+    monkeypatch,
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    snapshot = _toolchain_snapshot(tmp_path, _entrypoint(script_path))
+    monkeypatch.setattr(
+        runtime,
+        "_send_request",
+        lambda **_kwargs: pytest.fail("prewarm sent a business analysis request"),
+    )
+
+    first_instance = runtime.prewarm(snapshot)
+    second_instance = runtime.prewarm(snapshot)
+
+    assert first_instance == second_instance
+    assert runtime.readiness(snapshot) is True
+    assert runtime.process_instance_id(snapshot) == first_instance
+    assert len(runtime._processes) == 1
+
+    changed = _toolchain_snapshot(
+        tmp_path,
+        _entrypoint(script_path),
+        revision="revision-2",
+    )
+    changed_instance = runtime.prewarm(changed)
+
+    assert changed_instance != first_instance
+    assert runtime.readiness(snapshot) is True
+    assert runtime.readiness(changed) is True
+    assert len(runtime._processes) == 2
+
+
+def test_manifested_legacy_jsonl_resident_uses_drain_proof_and_stays_warm(
+    tmp_path: Path,
+    runtime,
+):
+    script_path = _write_legacy_resident_script(tmp_path)
+    _write_legacy_jsonl_manifest(tmp_path, Path(sys.executable).name)
+    snapshot = _toolchain_snapshot(tmp_path, _entrypoint(script_path))
+
+    instance_id = runtime.prewarm(snapshot)
+    first = runtime.analyze(
+        toolchain_id=snapshot.toolchain_id,
+        entrypoint=snapshot.entrypoint,
+        package_dir=snapshot.package_dir,
+        execution_revision=snapshot.execution_revision,
+        required_instance_id=instance_id,
+        request_id="legacy-1",
+        request_payload=_request_payload("legacy-1"),
+        artifacts_dir=str(tmp_path / "artifacts"),
+        timeout_ms=2_000,
+    )
+    second = runtime.analyze(
+        toolchain_id=snapshot.toolchain_id,
+        entrypoint=snapshot.entrypoint,
+        package_dir=snapshot.package_dir,
+        execution_revision=snapshot.execution_revision,
+        required_instance_id=instance_id,
+        request_id="legacy-2",
+        request_payload=_request_payload("legacy-2"),
+        artifacts_dir=str(tmp_path / "artifacts"),
+        timeout_ms=2_000,
+    )
+
+    assert runtime.readiness(snapshot) is True
+    assert first["module_status"] == "success"
+    assert second["module_status"] == "success"
+    assert (
+        first["response_payload"]["ai_result"]["process_id"]
+        == second["response_payload"]["ai_result"]["process_id"]
+    )
+    assert runtime.process_instance_id(snapshot) == instance_id
+
+
+def test_legacy_drain_fallback_requires_explicit_jsonl_resident_manifest(
+    tmp_path: Path,
+    runtime,
+):
+    script_path = _write_legacy_resident_script(tmp_path)
+    snapshot = _toolchain_snapshot(tmp_path, _entrypoint(script_path))
+
+    with pytest.raises(TimeoutError, match="resident stdout"):
+        runtime.prewarm(snapshot)
+
+    assert runtime.readiness(snapshot) is False
+
+
+def test_manifested_legacy_process_that_never_drains_probe_is_not_ready(
+    tmp_path: Path,
+):
+    runtime = ResidentToolchainRuntime()
+    try:
+        script_path = _write_legacy_resident_script(tmp_path)
+        _write_legacy_jsonl_manifest(tmp_path, Path(sys.executable).name)
+        snapshot = AiToolchainSnapshot(
+            toolchain_id="tc-1",
+            runtime_lane_key=canonical_toolchain_lane_key("tc-1"),
+            execution_revision="revision-1",
+            execution_mode="resident_process",
+            entrypoint=_entrypoint(script_path, "hang-before-loop"),
+            package_dir=str(tmp_path),
+            params_json="{}",
+            timeout_seconds=0.4,
+        )
+
+        with pytest.raises(TimeoutError):
+            runtime.prewarm(snapshot)
+
+        assert runtime.readiness(snapshot) is False
+    finally:
+        runtime.shutdown_all()
+
+
+def test_unexpected_ready_process_exit_revokes_and_coalesces_one_restart(
+    tmp_path: Path,
+):
+    readiness_events = []
+    runtime = ResidentToolchainRuntime(
+        readiness_changed=lambda snapshot, ready: readiness_events.append(
+            (snapshot.execution_revision, ready)
+        )
+    )
+    try:
+        script_path = _write_fake_resident_script(tmp_path)
+        snapshot = _toolchain_snapshot(tmp_path, _entrypoint(script_path))
+        first_instance = runtime.prewarm(snapshot)
+        cached = next(iter(runtime._processes.values()))
+
+        cached.process.kill()
+        cached.process.wait(timeout=2.0)
+        deadline = time.monotonic() + 4.0
+        saw_revoked = False
+        while time.monotonic() < deadline:
+            saw_revoked = saw_revoked or (snapshot.execution_revision, False) in readiness_events
+            if saw_revoked and runtime.readiness(snapshot):
+                break
+            time.sleep(0.01)
+
+        assert saw_revoked
+        assert runtime.readiness(snapshot) is True
+        assert runtime.process_instance_id(snapshot) != first_instance
+        assert readiness_events.count((snapshot.execution_revision, False)) == 1
+        assert readiness_events.count((snapshot.execution_revision, True)) == 2
+    finally:
+        runtime.shutdown_all()
+
+
+def test_exact_pinned_acquisition_never_cold_creates_after_ready_instance_crash(
+    tmp_path: Path,
+    runtime,
+    monkeypatch,
+):
+    script_path = _write_fake_resident_script(tmp_path)
+    snapshot = _toolchain_snapshot(tmp_path, _entrypoint(script_path))
+    first_instance = runtime.prewarm(snapshot)
+    cached = next(iter(runtime._processes.values()))
+    original_begin = cached.begin_request
+    original_start = runtime._start_process
+    original_acquire = runtime._acquire_process
+    starts = [first_instance]
+    main_thread = threading.current_thread()
+    generic_acquires = []
+    crashed = False
+
+    def crash_before_request(*args, **kwargs):
+        nonlocal crashed
+        if not crashed:
+            crashed = True
+            cached.process.kill()
+            cached.process.wait(timeout=2.0)
+        return original_begin(*args, **kwargs)
+
+    def record_start(*args, **kwargs):
+        created = original_start(*args, **kwargs)
+        starts.append(created.instance_id)
+        return created
+
+    def record_acquire(*args, **kwargs):
+        generic_acquires.append(threading.current_thread() is main_thread)
+        return original_acquire(*args, **kwargs)
+
+    monkeypatch.setattr(cached, "begin_request", crash_before_request)
+    monkeypatch.setattr(runtime, "_start_process", record_start)
+    monkeypatch.setattr(runtime, "_acquire_process", record_acquire)
+
+    result = runtime.analyze(
+        toolchain_id=snapshot.toolchain_id,
+        entrypoint=snapshot.entrypoint,
+        package_dir=snapshot.package_dir,
+        execution_revision=snapshot.execution_revision,
+        required_instance_id=first_instance,
+        request_id="pinned-crash",
+        request_payload=_request_payload("pinned-crash"),
+        artifacts_dir=str(tmp_path / "artifacts"),
+        timeout_ms=2_000,
+    )
+
+    assert result["module_status"] == "process_error"
+    assert True not in generic_acquires
+    deadline = time.monotonic() + 4.0
+    while time.monotonic() < deadline and not runtime.readiness(snapshot):
+        time.sleep(0.01)
+    assert runtime.readiness(snapshot) is True
+    assert runtime.process_instance_id(snapshot) != first_instance
+    assert len(starts) == 2
+
+
+@pytest.mark.parametrize("invalidate", ["stdout", "stderr"])
+def test_live_ready_protocol_invalidation_stops_once_before_coalesced_restart(
+    tmp_path: Path,
+    monkeypatch,
+    invalidate,
+):
+    readiness_events = []
+    stopped_instances = []
+    runtime = ResidentToolchainRuntime(
+        readiness_changed=lambda snapshot, ready: readiness_events.append(
+            (snapshot.execution_revision, ready)
+        )
+    )
+    original_stop = runtime._stop_process
+
+    def record_stop(cached_process, **kwargs):
+        stopped_instances.append(cached_process.instance_id)
+        return original_stop(cached_process, **kwargs)
+
+    monkeypatch.setattr(runtime, "_stop_process", record_stop)
+    try:
+        script_path = _write_fake_resident_script(tmp_path)
+        snapshot = _toolchain_snapshot(tmp_path, _entrypoint(script_path))
+        first_instance = runtime.prewarm(snapshot)
+        cached = next(iter(runtime._processes.values()))
+        if invalidate == "stdout":
+            cached.route_stdout_line("idle protocol noise")
+        else:
+            cached.mark_idle_stderr_invalidated()
+
+        barrier = threading.Barrier(6)
+        results = []
+
+        def probe():
+            barrier.wait()
+            results.append(runtime.readiness(snapshot))
+
+        threads = [threading.Thread(target=probe) for _ in range(5)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(2.0)
+
+        deadline = time.monotonic() + 4.0
+        while time.monotonic() < deadline and not runtime.readiness(snapshot):
+            time.sleep(0.01)
+
+        assert results == [False] * 5
+        assert cached.process.poll() is not None
+        assert stopped_instances.count(first_instance) == 1
+        assert runtime.process_instance_id(snapshot) != first_instance
+        assert readiness_events.count((snapshot.execution_revision, False)) == 1
+        assert readiness_events.count((snapshot.execution_revision, True)) == 2
+    finally:
+        runtime.shutdown_all()
 
 
 def test_reuses_cached_process_for_repeated_requests(tmp_path: Path, runtime):
@@ -594,12 +1012,28 @@ def test_post_response_discard_honors_request_deadline_and_duration(
     tmp_path: Path, runtime, behavior: str, error_fragment: str
 ):
     script_path = _write_fake_resident_script(tmp_path)
+    # Make cold startup exceed the request budget independently of machine load.
+    script_path.write_text(
+        script_path.read_text(encoding="utf-8").replace(
+            "for raw_line in sys.stdin:",
+            "time.sleep(0.2)\nfor raw_line in sys.stdin:",
+        ),
+        encoding="utf-8",
+    )
     entrypoint = _entrypoint(script_path, "ignore-shutdown")
+
+    # Only response handling and discard belong to the short measured deadline.
+    snapshot = _toolchain_snapshot(tmp_path, entrypoint)
+    instance_id = runtime.prewarm(snapshot)
+    assert runtime.readiness(snapshot) is True
 
     started = time.monotonic()
     result = runtime.analyze(
-        toolchain_id="tc-1",
-        entrypoint=entrypoint,
+        toolchain_id=snapshot.toolchain_id,
+        entrypoint=snapshot.entrypoint,
+        package_dir=snapshot.package_dir,
+        execution_revision=snapshot.execution_revision,
+        required_instance_id=instance_id,
         request_id="req-1",
         request_payload=_request_payload("req-1", behavior=behavior),
         artifacts_dir=str(tmp_path / "artifacts"),
@@ -609,6 +1043,7 @@ def test_post_response_discard_honors_request_deadline_and_duration(
 
     assert result["module_status"] == "protocol_error"
     assert error_fragment in result["error_summary"]
+    assert result["process_instance_id"] == instance_id
     assert elapsed_ms < 1000
     assert abs(result["duration_ms"] - elapsed_ms) < 300
     assert runtime.has_cached_process("tc-1") is False
@@ -1232,7 +1667,7 @@ def test_stderr_capture_is_per_run_truncated_and_buffered(
     assert len(first["stderr_excerpt"]) == 2000
     assert first["stderr_excerpt"] == "A" * 2000
     assert second["stderr_excerpt"] == "second-run-stderr"
-    assert runtime._processes["tc-1"].stderr_buffer_char_count <= 64 * 1024
+    assert next(iter(runtime._processes.values())).stderr_buffer_char_count <= 64 * 1024
 
 
 def test_stderr_buffer_caps_multibyte_utf8_bytes(tmp_path: Path, runtime):
@@ -1252,7 +1687,7 @@ def test_stderr_buffer_caps_multibyte_utf8_bytes(tmp_path: Path, runtime):
         timeout_ms=2000,
     )
 
-    cached_process = runtime._processes["tc-1"]
+    cached_process = next(iter(runtime._processes.values()))
 
     assert result["module_status"] == "success"
     assert cached_process.stderr_buffer_byte_count <= 64 * 1024
@@ -1568,7 +2003,7 @@ def test_shutdown_all_sends_best_effort_shutdown_and_forces_terminate_after_grac
         artifacts_dir=str(tmp_path / "artifacts"),
         timeout_ms=1000,
     )
-    cached_process = runtime._processes["tc-1"].process
+    cached_process = next(iter(runtime._processes.values())).process
 
     started = time.monotonic()
     runtime.shutdown_all()

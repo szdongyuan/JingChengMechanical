@@ -89,17 +89,28 @@ class HardwareModule(QWidget):
         self._apply_table_sizing()
 
     def init_fun(self):
-        self.btn_refresh.clicked.connect(self.refresh_devices)
+        self.btn_refresh.clicked.connect(self.force_refresh_devices)
         self.btn_add.clicked.connect(self.add_selected_device)
         self.btn_rename.clicked.connect(self.rename_selected_device)
         self.btn_remove.clicked.connect(self.remove_selected_device)
         self.table.itemSelectionChanged.connect(self._on_table_selection_changed)
 
+    def force_refresh_devices(self, _checked: bool = False):
+        if bool(
+            getattr(self.services, "production_selection_locked", False)
+        ):
+            self.services.bus.log.emit(
+                "常驻录音运行中，已跳过音频后端重置；"
+                "设备热插拔后请重启软件。"
+            )
+        else:
+            try:
+                self.services.hss_service.refresh_available_device()
+            except Exception as exc:
+                self.services.bus.log.emit(f"刷新音频系统失败: {exc}")
+        self.refresh_devices()
+
     def refresh_devices(self):
-        try:
-            self.services.hss_service.refresh_available_device()
-        except Exception as exc:
-            self.services.bus.log.emit(f"刷新音频系统失败: {exc}")
         try:
             self._devices, self._hostapis = (
                 self.services.hss_service.query_devices_and_hostapis(refresh=False)

@@ -4,16 +4,22 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 from scipy.io import wavfile
 
-from app.service.config_service import ConfigService, _GOLDEN_BINDING_FIELDS
+from app.service.config_service import (
+    MONITOR_GAIN_DEFAULT_DB,
+    ConfigService,
+    _GOLDEN_BINDING_FIELDS,
+)
 from app.service.golden_sample_service import GoldenSampleService
 from model.channel_config_table import ChannelConfigTable
 from model.device_table import DeviceTable
+from model.input_hardware_table import InputHardwareTable
 from model.plc_table import PlcTable
 from model.test_config_ai_binding_table import (
     TestConfigAiBindingTable as AiBindingTable,
@@ -23,6 +29,33 @@ from model.test_config_table import TestConfigTable as ConfigTable
 
 class FakeBus:
     config_changed = MagicMock()
+
+
+_INVALID_MANAGED_INPUT_ERROR = (
+    "\u5fc5\u987b\u9009\u62e9\u6709\u6548\u7684\u8f93\u5165\u786c\u4ef6\u8bbe\u5907"
+)
+_UNAVAILABLE_MANAGED_INPUT_ERROR = (
+    "\u6240\u9009\u8f93\u5165\u786c\u4ef6\u8bbe\u5907\u4e0d\u53ef\u7528"
+)
+_MONITOR_CHANNEL_RANGE_ERROR = (
+    "\u76d1\u542c\u901a\u9053\u5fc5\u987b\u5c0f\u4e8e\u8f93\u5165\u901a\u9053\u6570"
+)
+_VIBRATION_CHANNEL_RANGE_ERROR = (
+    "\u632f\u52a8\u89c6\u56fe\u901a\u9053\u5fc5\u987b\u5c0f\u4e8e\u8f93\u5165\u901a\u9053\u6570"
+)
+_MISSING = object()
+
+
+@pytest.fixture(autouse=True)
+def valid_managed_input():
+    return InputHardwareTable.create(
+        hardware_id=1,
+        alias="Managed input",
+        device_name="Managed microphone",
+        hostapi="ASIO",
+        samplerate=48_000,
+        channel_count=4,
+    )
 
 
 def _service(golden_root: Path | None = None) -> ConfigService:
@@ -59,6 +92,7 @@ def _recreate_legacy_config_schema_without_monitor_columns() -> None:
             output_device_hostapi TEXT,
             output_device_samplerate REAL,
             selected_channels TEXT NOT NULL DEFAULT '[]',
+            fault_types_json TEXT NOT NULL DEFAULT '[]',
             analysis_window_offset_ms INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (plc_id) REFERENCES plc_table (id) ON DELETE SET NULL
         )
@@ -173,6 +207,7 @@ def _config_payload(
     monitor_channel_index: int | None = None,
     monitor_gain_db: float | None = 0.0,
     vibration_view_channel_index: int | None = None,
+    fault_types: list[str] | None = None,
 ) -> dict:
     channels = channels or []
     if selected_channels is None:
@@ -190,6 +225,8 @@ def _config_payload(
         "output_device_name": "Speaker 1",
         "output_device_hostapi": "WASAPI",
         "output_device_samplerate": 44_100.0,
+        "input_hardware_device_id": 1,
+        "fault_types": list(fault_types or []),
         "selected_channels": selected_channels,
         "monitor_channel_index": monitor_channel_index,
         "monitor_gain_db": monitor_gain_db,
@@ -201,20 +238,20 @@ def _config_payload(
     return payload
 
 
-def _summary_layout(*, columns: int = 1) -> dict:
+def _chart_layout(*, columns: int = 1) -> dict:
     return {
-        "version": 1,
+        "version": 2,
         "columns": columns,
         "rows": 1,
         "panels": [
             {
-                "id": "summary",
-                "type": "result_summary",
+                "id": "spectrum",
+                "type": "spectrum",
                 "row": 0,
                 "column": 0,
                 "row_span": 1,
                 "column_span": 1,
-                "channel": "none",
+                "channel": "primary_acoustic",
             }
         ],
     }
@@ -295,6 +332,182 @@ def test_create_config_no_channel_rows():
     assert ChannelConfigTable.select().where(ChannelConfigTable.config == config_id).count() == 0
 
 
+def test_fault_types_column_has_exact_orm_definition() -> None:
+    row = next(
+        row
+        for row in ConfigTable._meta.database.execute_sql(
+            "PRAGMA table_info(test_config_table)"
+        ).fetchall()
+        if row[1] == "fault_types_json"
+    )
+
+    assert row[2].upper() == "TEXT"
+    assert bool(row[3]) is True
+    assert row[4] == "'[]'"
+
+
+def test_create_config_explicitly_stores_empty_fault_types() -> None:
+    svc = _service()
+
+    config_id = svc.create_config("Fault defaults")
+
+    stored = ConfigTable.get_by_id(config_id)
+    assert stored.fault_types_json == "[]"
+    assert svc.load_config(config_id)["fault_types"] == []
+
+
+def test_create_config_defaults_manual_judgment_buttons_visible_to_false() -> None:
+    svc = _service()
+
+    config_id = svc.create_config("Manual judgment default")
+
+    stored = ConfigTable.get_by_id(config_id)
+    loaded = svc.load_config(config_id)
+    assert stored.manual_judgment_buttons_visible is False
+    assert loaded["manual_judgment_buttons_visible"] is False
+    assert type(loaded["manual_judgment_buttons_visible"]) is bool
+
+
+def test_manual_judgment_buttons_visible_save_load_and_copy_round_trip() -> None:
+    svc = _service()
+    source_id = svc.create_config("Source")
+    source_payload = _config_payload(
+        source_id,
+        config_name="Source",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    source_payload["manual_judgment_buttons_visible"] = True
+
+    svc.save_config(source_payload)
+
+    source_loaded = svc.load_config(source_id)
+    raw_value = ConfigTable._meta.database.execute_sql(
+        "SELECT manual_judgment_buttons_visible FROM test_config_table WHERE config_id = ?",
+        (source_id,),
+    ).fetchone()[0]
+    assert source_loaded["manual_judgment_buttons_visible"] is True
+    assert raw_value == 1
+
+    copied_payload = dict(source_loaded)
+    copied_payload["config_name"] = "Copied"
+    copied_id = svc.create_imported_config(
+        copied_payload,
+        reserved_config_id=svc.reserve_import_config_id(),
+    )
+
+    assert svc.load_config(copied_id)["manual_judgment_buttons_visible"] is True
+
+
+def test_save_legacy_input_missing_manual_judgment_buttons_visible_defaults_false() -> None:
+    svc = _service()
+    config_id = svc.create_config("Legacy input")
+    ConfigTable.update(manual_judgment_buttons_visible=True).where(
+        ConfigTable.config_id == config_id
+    ).execute()
+    legacy_payload = _config_payload(
+        config_id,
+        config_name="Legacy input",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+
+    svc.save_config(legacy_payload)
+
+    assert svc.load_config(config_id)["manual_judgment_buttons_visible"] is False
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None])
+def test_save_rejects_non_bool_manual_judgment_buttons_visible(value) -> None:
+    svc = _service()
+    config_id = svc.create_config("Invalid manual judgment visibility")
+    payload = _config_payload(
+        config_id,
+        config_name="Invalid manual judgment visibility",
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+    payload["manual_judgment_buttons_visible"] = value
+
+    with pytest.raises(
+        ValueError,
+        match="manual_judgment_buttons_visible must be a boolean",
+    ):
+        svc.save_config(payload)
+
+
+@pytest.mark.parametrize("value", [0, 1, "true", None])
+def test_prepare_import_rejects_non_bool_manual_judgment_buttons_visible(value) -> None:
+    svc = _service()
+    payload = _config_payload(999, config_name="Imported")
+    payload["manual_judgment_buttons_visible"] = value
+
+    with pytest.raises(
+        ValueError,
+        match="manual_judgment_buttons_visible must be a boolean",
+    ):
+        svc.prepare_import_payload(payload)
+
+
+def test_fault_types_save_load_dashboard_and_fresh_list_round_trip() -> None:
+    svc = _service()
+    cfg = ConfigTable.create(config_name="Cfg1")
+    payload = _config_payload(
+        cfg.config_id,
+        fault_types=[" 异响 ", "漏装"],
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+    )
+
+    svc.save_config(payload)
+
+    assert ConfigTable.get_by_id(cfg.config_id).fault_types_json == '["异响","漏装"]'
+    first = svc.load_config(cfg.config_id)
+    dashboard = svc.load_config_for_result_dashboard(cfg.config_id)
+    assert first["fault_types"] == ["异响", "漏装"]
+    assert dashboard["fault_types"] == ["异响", "漏装"]
+    assert first["fault_types"] is not dashboard["fault_types"]
+    first["fault_types"].append("mutated")
+    assert svc.load_config(cfg.config_id)["fault_types"] == ["异响", "漏装"]
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        '["异响", "漏装"]',
+        '[" 异响 "]',
+        '{"fault_types":[]}',
+        "not-json",
+    ],
+)
+def test_load_config_rejects_malformed_or_noncanonical_fault_types(stored: str) -> None:
+    svc = _service()
+    cfg = ConfigTable.create(config_name="Cfg1")
+    ConfigTable.update(fault_types_json=stored).where(
+        ConfigTable.config_id == cfg.config_id
+    ).execute()
+
+    with pytest.raises(ValueError):
+        svc.load_config(cfg.config_id)
+
+
+def test_save_rejects_missing_fault_types_before_opening_transaction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    svc = _service()
+    cfg = ConfigTable.create(config_name="Cfg1")
+    payload = _config_payload(cfg.config_id)
+    payload.pop("fault_types")
+
+    def _unexpected_atomic():
+        raise AssertionError("invalid semantic payload opened a transaction")
+
+    monkeypatch.setattr(ConfigTable._meta.database, "atomic", _unexpected_atomic)
+
+    with pytest.raises(ValueError):
+        svc.save_config(payload)
+
+
 def test_load_config_defaults_missing_result_dashboard_layout():
     svc = _service()
     cfg = ConfigTable.create(config_name="Cfg1", selected_channels="[0]")
@@ -302,7 +515,7 @@ def test_load_config_defaults_missing_result_dashboard_layout():
     loaded = svc.load_config(cfg.config_id)
 
     assert loaded["result_dashboard_layout"]["columns"] == 3
-    assert loaded["result_dashboard_layout"]["panels"][0]["type"] == "result_summary"
+    assert loaded["result_dashboard_layout"]["panels"][0]["type"] == "stft"
 
 
 def test_save_config_persists_result_dashboard_layout():
@@ -313,7 +526,7 @@ def test_save_config_persists_result_dashboard_layout():
         channels=[_channel_payload(0)],
         selected_channels=[0],
     )
-    payload["result_dashboard_layout"] = _summary_layout()
+    payload["result_dashboard_layout"] = _chart_layout()
 
     svc.save_config(payload)
 
@@ -328,7 +541,7 @@ def test_prepare_import_payload_preserves_result_dashboard_layout():
         channels=[_channel_payload(0)],
         selected_channels=[0],
     )
-    source["result_dashboard_layout"] = _summary_layout()
+    source["result_dashboard_layout"] = _chart_layout()
 
     assert svc.prepare_import_payload(source)["result_dashboard_layout"]["columns"] == 1
 
@@ -340,7 +553,7 @@ def test_create_config_writes_default_result_dashboard_layout():
     loaded = svc.load_config(config_id)
 
     assert loaded["result_dashboard_layout"]["columns"] == 3
-    assert loaded["result_dashboard_layout"]["panels"][0]["type"] == "result_summary"
+    assert loaded["result_dashboard_layout"]["panels"][0]["type"] == "stft"
 
 
 def test_load_config_preserves_malformed_layout_so_editor_can_repair_it():
@@ -368,7 +581,7 @@ def test_load_config_for_result_dashboard_falls_back_for_malformed_layout():
     loaded = svc.load_config_for_result_dashboard(cfg.config_id)
 
     assert loaded["result_dashboard_layout"]["columns"] == 3
-    assert loaded["result_dashboard_layout"]["panels"][0]["id"] == "summary"
+    assert loaded["result_dashboard_layout"]["panels"][0]["id"] == "stft_acoustic"
 
 
 def test_load_config_for_result_dashboard_falls_back_when_layout_binding_exceeds_selected_channels():
@@ -378,24 +591,15 @@ def test_load_config_for_result_dashboard_falls_back_when_layout_binding_exceeds
         selected_channels="[0]",
         result_dashboard_layout=json.dumps(
             {
-                "version": 1,
-                "columns": 2,
+                "version": 2,
+                "columns": 1,
                 "rows": 1,
                 "panels": [
-                    {
-                        "id": "summary",
-                        "type": "result_summary",
-                        "row": 0,
-                        "column": 0,
-                        "row_span": 1,
-                        "column_span": 1,
-                        "channel": "none",
-                    },
                     {
                         "id": "spectrum",
                         "type": "spectrum",
                         "row": 0,
-                        "column": 1,
+                        "column": 0,
                         "row_span": 1,
                         "column_span": 1,
                         "channel": "selected_2",
@@ -408,7 +612,7 @@ def test_load_config_for_result_dashboard_falls_back_when_layout_binding_exceeds
     loaded = svc.load_config_for_result_dashboard(cfg.config_id)
 
     assert loaded["result_dashboard_layout"]["columns"] == 3
-    assert loaded["result_dashboard_layout"]["panels"][0]["id"] == "summary"
+    assert loaded["result_dashboard_layout"]["panels"][0]["id"] == "stft_acoustic"
 
 
 def test_prepare_import_payload_rejects_malformed_result_dashboard_layout():
@@ -432,24 +636,15 @@ def test_prepare_import_payload_rejects_unknown_layout_panel_type():
         selected_channels=[0],
     )
     source["result_dashboard_layout"] = {
-        "version": 1,
-        "columns": 2,
+        "version": 2,
+        "columns": 1,
         "rows": 1,
         "panels": [
-            {
-                "id": "summary",
-                "type": "result_summary",
-                "row": 0,
-                "column": 0,
-                "row_span": 1,
-                "column_span": 1,
-                "channel": "none",
-            },
             {
                 "id": "custom",
                 "type": "custom_widget",
                 "row": 0,
-                "column": 1,
+                "column": 0,
                 "row_span": 1,
                 "column_span": 1,
                 "channel": "primary_acoustic",
@@ -469,24 +664,15 @@ def test_prepare_import_payload_rejects_invalid_layout_channel_key():
         selected_channels=[0],
     )
     source["result_dashboard_layout"] = {
-        "version": 1,
-        "columns": 2,
+        "version": 2,
+        "columns": 1,
         "rows": 1,
         "panels": [
-            {
-                "id": "summary",
-                "type": "result_summary",
-                "row": 0,
-                "column": 0,
-                "row_span": 1,
-                "column_span": 1,
-                "channel": "none",
-            },
             {
                 "id": "spectrum",
                 "type": "spectrum",
                 "row": 0,
-                "column": 1,
+                "column": 0,
                 "row_span": 1,
                 "column_span": 1,
                 "channel": "bad_channel",
@@ -529,6 +715,8 @@ def test_load_config_returns_hardware_fields_with_cleaned_trigger_model():
         "output_device_hostapi",
         "output_device_samplerate",
         "selected_channels",
+        "fault_types",
+        "manual_judgment_buttons_visible",
         "monitor_channel_index",
         "monitor_gain_db",
         "vibration_view_channel_index",
@@ -578,6 +766,8 @@ def test_load_config_returns_plc_id_and_not_legacy_plc_text_fields():
         "output_device_hostapi",
         "output_device_samplerate",
         "selected_channels",
+        "fault_types",
+        "manual_judgment_buttons_visible",
         "monitor_channel_index",
         "monitor_gain_db",
         "vibration_view_channel_index",
@@ -603,12 +793,14 @@ def test_save_config_persists_hardware_fields():
             "record_duration": 5.0,
             "analysis_duration": 3.0,
             "scan_triggers_test": False,
+            "fault_types": [],
             "input_device_name": "Mic 1",
             "input_device_hostapi": "ASIO",
             "input_device_samplerate": 48000,
             "output_device_name": "Speaker 1",
             "output_device_hostapi": "WASAPI",
             "output_device_samplerate": 44100,
+            "input_hardware_device_id": 1,
             "selected_channels": [0, 2],
             "channels": [_channel_payload(0), _channel_payload(2)],
         }
@@ -632,7 +824,10 @@ def test_save_config_persists_hardware_fields():
         "output_device_name",
         "output_device_hostapi",
         "output_device_samplerate",
-        "selected_channels",
+            "input_hardware_device_id",
+            "selected_channels",
+            "fault_types",
+            "manual_judgment_buttons_visible",
         "monitor_channel_index",
         "monitor_gain_db",
         "vibration_view_channel_index",
@@ -669,7 +864,7 @@ def test_load_config_defaults_null_monitor_fields_to_selected_channel_and_gain_z
     assert result["monitor_gain_db"] == 0.0
 
 
-def test_load_config_defaults_null_monitor_channel_to_zero_when_input_channels_exist():
+def test_load_config_does_not_default_null_monitor_from_legacy_input_channels():
     svc = _service()
     DeviceTable.create(id=1, input_channel_count="4")
     cfg = ConfigTable.create(
@@ -681,8 +876,94 @@ def test_load_config_defaults_null_monitor_channel_to_zero_when_input_channels_e
 
     result = svc.load_config(cfg.config_id)
 
-    assert result["monitor_channel_index"] == 0
+    assert result["monitor_channel_index"] is None
     assert result["monitor_gain_db"] == 0.0
+
+
+def test_load_config_defaults_null_monitor_to_zero_for_bound_managed_input():
+    svc = _service()
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        input_hardware_device_id=1,
+        selected_channels="[]",
+        monitor_channel_index=None,
+    )
+
+    result = svc.load_config(cfg.config_id)
+
+    assert result["monitor_channel_index"] == 0
+
+
+def test_load_config_preserves_valid_stored_monitor_without_managed_binding():
+    svc = _service()
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        selected_channels="[]",
+        monitor_channel_index=3,
+    )
+
+    result = svc.load_config(cfg.config_id)
+
+    assert result["monitor_channel_index"] == 3
+
+
+@pytest.mark.parametrize(
+    ("hardware_id", "channel_count"),
+    [
+        (999, 4),
+        (1, None),
+        (1, True),
+        (1, 4.0),
+        (1, "4"),
+        (1, 0),
+        (1, -1),
+    ],
+)
+def test_load_config_does_not_default_monitor_for_unavailable_managed_input(
+    monkeypatch,
+    hardware_id,
+    channel_count,
+):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="4")
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        input_hardware_device_id=hardware_id,
+        selected_channels="[]",
+        monitor_channel_index=None,
+    )
+    if hardware_id == 1:
+        monkeypatch.setattr(
+            InputHardwareTable,
+            "get_by_id",
+            lambda _hardware_id: SimpleNamespace(channel_count=channel_count),
+        )
+
+    result = svc.load_config(cfg.config_id)
+
+    assert result["monitor_channel_index"] is None
+
+
+def test_load_config_does_not_default_monitor_when_managed_lookup_raises(
+    monkeypatch,
+):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="4")
+    cfg = ConfigTable.create(
+        config_name="Cfg1",
+        input_hardware_device_id=1,
+        selected_channels="[]",
+        monitor_channel_index=None,
+    )
+
+    def raise_lookup_error(_hardware_id):
+        raise RuntimeError("lookup failed")
+
+    monkeypatch.setattr(InputHardwareTable, "get_by_id", raise_lookup_error)
+
+    result = svc.load_config(cfg.config_id)
+
+    assert result["monitor_channel_index"] is None
 
 
 def test_save_config_persists_monitor_fields_independent_of_selected_channels():
@@ -719,12 +1000,14 @@ def test_save_config_persists_vibration_view_channel():
             "record_duration": 5.0,
             "analysis_duration": 3.0,
             "scan_triggers_test": False,
+            "fault_types": [],
             "input_device_name": "Mic 1",
             "input_device_hostapi": "ASIO",
             "input_device_samplerate": 48000,
             "output_device_name": "Speaker 1",
             "output_device_hostapi": "WASAPI",
             "output_device_samplerate": 44100,
+            "input_hardware_device_id": 1,
             "selected_channels": [0, 2],
             "vibration_view_channel_index": 2,
             "channels": [_channel_payload(0), _channel_payload(2)],
@@ -835,6 +1118,8 @@ def test_save_config_persists_plc_id_and_rejects_missing_plc_rows():
             "analysis_duration": 3.0,
             "analysis_window_offset_ms": 500,
             "scan_triggers_test": False,
+            "fault_types": [],
+            "input_hardware_device_id": 1,
             "plc_id": plc.id,
             "input_device_name": "Mic 1",
             "input_device_hostapi": "ASIO",
@@ -862,6 +1147,7 @@ def test_save_config_persists_plc_id_and_rejects_missing_plc_rows():
                 "record_duration": 5.0,
                 "analysis_duration": 3.0,
                 "scan_triggers_test": False,
+                "input_hardware_device_id": 1,
                 "plc_id": plc.id + 999,
                 "selected_channels": [0],
                 "channels": [_channel_payload(0)],
@@ -879,6 +1165,8 @@ def test_save_config_reports_late_db_level_plc_fk_failure_as_plc_error(monkeypat
         "record_duration": 5.0,
         "analysis_duration": 3.0,
         "scan_triggers_test": False,
+        "fault_types": [],
+        "input_hardware_device_id": 1,
         "plc_id": plc.id,
         "selected_channels": [0],
         "channels": [_channel_payload(0)],
@@ -913,6 +1201,8 @@ def test_save_config_does_not_misreport_non_plc_fk_failure_as_plc_error(monkeypa
         "record_duration": 5.0,
         "analysis_duration": 3.0,
         "scan_triggers_test": False,
+        "fault_types": [],
+        "input_hardware_device_id": 1,
         "plc_id": plc.id,
         "selected_channels": [0],
         "channels": [_channel_payload(0)],
@@ -955,6 +1245,8 @@ def test_save_config_keeps_existing_ai_binding_row_while_offset_stays_config_own
             "analysis_duration": 3.0,
             "analysis_window_offset_ms": 500,
             "scan_triggers_test": False,
+            "fault_types": [],
+            "input_hardware_device_id": 1,
             "input_device_name": "Mic 1",
             "input_device_hostapi": "ASIO",
             "input_device_samplerate": 48000,
@@ -1692,6 +1984,8 @@ def test_save_config_persists_loudness_fields():
             "record_duration": 5.0,
             "analysis_duration": 3.0,
             "scan_triggers_test": False,
+            "fault_types": [],
+            "input_hardware_device_id": 1,
             "selected_channels": [0],
             "channels": [
                 _channel_payload_with_loudness(
@@ -1728,6 +2022,8 @@ def test_save_config_persists_fft_resolution():
             "record_duration": 5.0,
             "analysis_duration": 3.0,
             "scan_triggers_test": False,
+            "fault_types": [],
+            "input_hardware_device_id": 1,
             "selected_channels": [0],
             "channels": [channel],
         }
@@ -1756,6 +2052,8 @@ def test_save_config_persists_fft_x_axis_scale():
             "record_duration": 5.0,
             "analysis_duration": 3.0,
             "scan_triggers_test": False,
+            "fault_types": [],
+            "input_hardware_device_id": 1,
             "selected_channels": [0],
             "channels": [channel],
         }
@@ -1784,6 +2082,8 @@ def test_save_config_persists_fft_weighting():
             "record_duration": 5.0,
             "analysis_duration": 3.0,
             "scan_triggers_test": False,
+            "fault_types": [],
+            "input_hardware_device_id": 1,
             "selected_channels": [0],
             "channels": [channel],
         }
@@ -2023,24 +2323,15 @@ def test_validate_rejects_selected_2_layout_binding_for_one_selected_channel():
     svc = _service()
     data = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
     data["result_dashboard_layout"] = {
-        "version": 1,
-        "columns": 2,
+        "version": 2,
+        "columns": 1,
         "rows": 1,
         "panels": [
-            {
-                "id": "summary",
-                "type": "result_summary",
-                "row": 0,
-                "column": 0,
-                "row_span": 1,
-                "column_span": 1,
-                "channel": "none",
-            },
             {
                 "id": "spectrum",
                 "type": "spectrum",
                 "row": 0,
-                "column": 1,
+                "column": 0,
                 "row_span": 1,
                 "column_span": 1,
                 "channel": "selected_2",
@@ -2057,24 +2348,15 @@ def test_validate_rejects_unknown_layout_panel_type():
     svc = _service()
     data = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
     data["result_dashboard_layout"] = {
-        "version": 1,
-        "columns": 2,
+        "version": 2,
+        "columns": 1,
         "rows": 1,
         "panels": [
-            {
-                "id": "summary",
-                "type": "result_summary",
-                "row": 0,
-                "column": 0,
-                "row_span": 1,
-                "column_span": 1,
-                "channel": "none",
-            },
             {
                 "id": "custom",
                 "type": "custom_widget",
                 "row": 0,
-                "column": 1,
+                "column": 0,
                 "row_span": 1,
                 "column_span": 1,
                 "channel": "primary_acoustic",
@@ -2094,24 +2376,15 @@ def test_validate_rejects_invalid_layout_channel_key():
     svc = _service()
     data = _config_payload(1, channels=[_channel_payload(0)], selected_channels=[0])
     data["result_dashboard_layout"] = {
-        "version": 1,
-        "columns": 2,
+        "version": 2,
+        "columns": 1,
         "rows": 1,
         "panels": [
-            {
-                "id": "summary",
-                "type": "result_summary",
-                "row": 0,
-                "column": 0,
-                "row_span": 1,
-                "column_span": 1,
-                "channel": "none",
-            },
             {
                 "id": "spectrum",
                 "type": "spectrum",
                 "row": 0,
-                "column": 1,
+                "column": 0,
                 "row_span": 1,
                 "column_span": 1,
                 "channel": "bad_channel",
@@ -2139,9 +2412,12 @@ def test_validate_rejects_invalid_monitor_channel(monitor_channel_index):
     assert any("监听通道" in err for err in errors)
 
 
-def test_validate_rejects_monitor_channel_outside_input_channel_count():
+def test_validate_rejects_monitor_channel_outside_managed_channel_count(
+    valid_managed_input,
+):
     svc = _service()
-    DeviceTable.create(id=1, input_channel_count="2")
+    valid_managed_input.channel_count = 2
+    valid_managed_input.save()
     payload = _config_payload(
         1,
         channels=[_channel_payload(0)],
@@ -2152,6 +2428,304 @@ def test_validate_rejects_monitor_channel_outside_input_channel_count():
     errors = svc.validate(payload)
 
     assert any("监听通道" in err and "输入通道" in err for err in errors)
+
+
+def test_validate_uses_managed_channel_count_instead_of_smaller_legacy_channel_count():
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="2")
+    payload = _config_payload(
+        1,
+        channels=[_channel_payload(0), _channel_payload(2)],
+        selected_channels=[0, 2],
+        monitor_channel_index=2,
+        vibration_view_channel_index=2,
+    )
+
+    errors = svc.validate(payload)
+
+    assert "\u76d1\u542c\u901a\u9053\u5fc5\u987b\u5c0f\u4e8e\u8f93\u5165\u901a\u9053\u6570" not in errors
+    assert "\u632f\u52a8\u89c6\u56fe\u901a\u9053\u5fc5\u987b\u5c0f\u4e8e\u8f93\u5165\u901a\u9053\u6570" not in errors
+
+
+def test_validate_uses_managed_channel_count_instead_of_larger_legacy_channel_count(
+    valid_managed_input,
+):
+    svc = _service()
+    valid_managed_input.channel_count = 2
+    valid_managed_input.save()
+    DeviceTable.create(id=1, input_channel_count="4")
+    payload = _config_payload(
+        1,
+        channels=[_channel_payload(0), _channel_payload(2)],
+        selected_channels=[0, 2],
+        monitor_channel_index=2,
+        vibration_view_channel_index=2,
+    )
+
+    errors = svc.validate(payload)
+
+    assert errors.count(
+        "\u76d1\u542c\u901a\u9053\u5fc5\u987b\u5c0f\u4e8e\u8f93\u5165\u901a\u9053\u6570"
+    ) == 1
+    assert errors.count(
+        "\u632f\u52a8\u89c6\u56fe\u901a\u9053\u5fc5\u987b\u5c0f\u4e8e\u8f93\u5165\u901a\u9053\u6570"
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    "hardware_id",
+    [_MISSING, None, True, False, 0, -1, 1.0, "1"],
+)
+def test_validate_reports_invalid_input_hardware_id_once_without_legacy_fallback(
+    hardware_id,
+):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="16")
+    payload = _config_payload(
+        1,
+        selected_channels=[9],
+        monitor_channel_index=9,
+        vibration_view_channel_index=9,
+    )
+    if hardware_id is _MISSING:
+        payload.pop("input_hardware_device_id")
+    else:
+        payload["input_hardware_device_id"] = hardware_id
+
+    errors = svc.validate(payload)
+
+    assert errors.count(_INVALID_MANAGED_INPUT_ERROR) == 1
+
+
+@pytest.mark.parametrize("remove_bound_row", [False, True])
+def test_validate_reports_unavailable_input_hardware_once_without_legacy_fallback(
+    valid_managed_input,
+    remove_bound_row,
+):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="16")
+    payload = _config_payload(
+        1,
+        selected_channels=[9],
+        monitor_channel_index=9,
+        vibration_view_channel_index=9,
+    )
+    if remove_bound_row:
+        valid_managed_input.delete_instance()
+    else:
+        payload["input_hardware_device_id"] = 999
+
+    errors = svc.validate(payload)
+
+    assert errors.count(_UNAVAILABLE_MANAGED_INPUT_ERROR) == 1
+
+
+@pytest.mark.parametrize("channel_count", [None, True, 4.0, "4", 0, -1])
+def test_validate_rejects_invalid_managed_input_channel_count_once(
+    monkeypatch,
+    channel_count,
+):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="16")
+    payload = _config_payload(
+        1,
+        selected_channels=[9],
+        monitor_channel_index=9,
+        vibration_view_channel_index=9,
+    )
+    monkeypatch.setattr(
+        InputHardwareTable,
+        "get_by_id",
+        lambda _hardware_id: SimpleNamespace(channel_count=channel_count),
+    )
+
+    errors = svc.validate(payload)
+
+    assert errors.count(_UNAVAILABLE_MANAGED_INPUT_ERROR) == 1
+
+
+def test_validate_reports_managed_input_lookup_exception_once(monkeypatch):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="16")
+    payload = _config_payload(
+        1,
+        selected_channels=[9],
+        monitor_channel_index=9,
+        vibration_view_channel_index=9,
+    )
+
+    def raise_lookup_error(_hardware_id):
+        raise RuntimeError("lookup failed")
+
+    monkeypatch.setattr(InputHardwareTable, "get_by_id", raise_lookup_error)
+
+    errors = svc.validate(payload)
+
+    assert errors.count(_UNAVAILABLE_MANAGED_INPUT_ERROR) == 1
+
+
+@pytest.mark.parametrize(
+    ("channel_index", "expected_count"),
+    [(3, 0), (4, 1)],
+)
+def test_validate_uses_zero_based_managed_channel_boundaries(
+    channel_index,
+    expected_count,
+):
+    svc = _service()
+    payload = _config_payload(
+        1,
+        selected_channels=[channel_index],
+        monitor_channel_index=channel_index,
+        vibration_view_channel_index=channel_index,
+    )
+
+    errors = svc.validate(payload)
+
+    assert errors.count(_MONITOR_CHANNEL_RANGE_ERROR) == expected_count
+    assert errors.count(_VIBRATION_CHANNEL_RANGE_ERROR) == expected_count
+
+
+def test_validate_allows_null_monitor_and_vibration_with_valid_managed_input():
+    svc = _service()
+    payload = _config_payload(
+        1,
+        selected_channels=[],
+        monitor_channel_index=None,
+        vibration_view_channel_index=None,
+    )
+
+    errors = svc.validate(payload)
+
+    assert _INVALID_MANAGED_INPUT_ERROR not in errors
+    assert _UNAVAILABLE_MANAGED_INPUT_ERROR not in errors
+    assert not any("\u76d1\u542c\u901a\u9053" in error for error in errors)
+    assert not any("\u632f\u52a8\u89c6\u56fe\u901a\u9053" in error for error in errors)
+
+
+def test_validate_resolves_managed_input_once_for_both_channel_fields(monkeypatch):
+    svc = _service()
+    payload = _config_payload(
+        1,
+        selected_channels=[2],
+        monitor_channel_index=2,
+        vibration_view_channel_index=2,
+    )
+    original_get_by_id = InputHardwareTable.get_by_id
+    lookup_ids = []
+
+    def counted_get_by_id(hardware_id):
+        lookup_ids.append(hardware_id)
+        return original_get_by_id(hardware_id)
+
+    monkeypatch.setattr(InputHardwareTable, "get_by_id", counted_get_by_id)
+
+    svc.validate(payload)
+
+    assert lookup_ids == [1]
+
+
+@pytest.mark.parametrize(
+    "hardware_id",
+    [_MISSING, None, True, False, 0, -1, 1.0, "1"],
+)
+def test_validate_factory_runtime_reports_invalid_input_hardware_id_once(
+    hardware_id,
+):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="16")
+    payload = _config_payload(
+        1,
+        selected_channels=[9],
+        vibration_view_channel_index=9,
+    )
+    if hardware_id is _MISSING:
+        payload.pop("input_hardware_device_id")
+    else:
+        payload["input_hardware_device_id"] = hardware_id
+
+    errors = svc.validate_factory_runtime(payload)
+
+    assert errors.count(_INVALID_MANAGED_INPUT_ERROR) == 1
+
+
+@pytest.mark.parametrize("channel_count", [_MISSING, None, True, 4.0, "4", 0, -1])
+def test_validate_factory_runtime_reports_unavailable_input_hardware_once(
+    monkeypatch,
+    channel_count,
+):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="16")
+    payload = _config_payload(
+        1,
+        selected_channels=[9],
+        vibration_view_channel_index=9,
+    )
+    if channel_count is _MISSING:
+        payload["input_hardware_device_id"] = 999
+    else:
+        monkeypatch.setattr(
+            InputHardwareTable,
+            "get_by_id",
+            lambda _hardware_id: SimpleNamespace(channel_count=channel_count),
+        )
+
+    errors = svc.validate_factory_runtime(payload)
+
+    assert errors.count(_UNAVAILABLE_MANAGED_INPUT_ERROR) == 1
+
+
+def test_validate_factory_runtime_reports_managed_lookup_exception_once(
+    monkeypatch,
+):
+    svc = _service()
+    DeviceTable.create(id=1, input_channel_count="16")
+    payload = _config_payload(
+        1,
+        selected_channels=[9],
+        vibration_view_channel_index=9,
+    )
+
+    def raise_lookup_error(_hardware_id):
+        raise RuntimeError("lookup failed")
+
+    monkeypatch.setattr(InputHardwareTable, "get_by_id", raise_lookup_error)
+
+    errors = svc.validate_factory_runtime(payload)
+
+    assert errors.count(_UNAVAILABLE_MANAGED_INPUT_ERROR) == 1
+
+
+def test_validate_factory_runtime_resolves_managed_input_once(monkeypatch):
+    svc = _service()
+    payload = _config_payload(
+        1,
+        selected_channels=[2],
+        vibration_view_channel_index=2,
+    )
+    original_get_by_id = InputHardwareTable.get_by_id
+    lookup_ids = []
+
+    def counted_get_by_id(hardware_id):
+        lookup_ids.append(hardware_id)
+        return original_get_by_id(hardware_id)
+
+    monkeypatch.setattr(InputHardwareTable, "get_by_id", counted_get_by_id)
+
+    errors = svc.validate_factory_runtime(payload)
+
+    assert errors == []
+    assert lookup_ids == [1]
+
+
+def test_config_service_has_no_legacy_managed_channel_count_dependency():
+    source = (
+        Path(__file__).parents[1] / "app" / "service" / "config_service.py"
+    ).read_text(encoding="utf-8")
+
+    assert "DeviceTable" not in source
+    assert "get_channel_count" not in source
+    assert "input_channel_count" not in source
 
 
 def test_validate_accepts_null_vibration_view_channel():
@@ -2213,9 +2787,12 @@ def test_validate_rejects_vibration_view_channel_not_selected():
     assert errors.count("振动视图通道必须来自已选择通道") == 1
 
 
-def test_validate_rejects_vibration_view_channel_outside_input_channel_count():
+def test_validate_rejects_vibration_view_channel_outside_managed_channel_count(
+    valid_managed_input,
+):
     svc = _service()
-    DeviceTable.create(id=1, input_channel_count="2")
+    valid_managed_input.channel_count = 2
+    valid_managed_input.save()
     data = _config_payload(
         1,
         channels=[_channel_payload(0), _channel_payload(2)],
@@ -2245,7 +2822,7 @@ def test_validate_factory_runtime_rejects_invalid_vibration_view_channel(value):
 
 @pytest.mark.parametrize(
     "monitor_gain_db",
-    [True, "0", float("nan"), float("inf"), -60.1, 24.1],
+    [True, "0", float("nan"), float("inf"), -60.1, 35.1],
 )
 def test_validate_rejects_invalid_monitor_gain(monitor_gain_db):
     svc = _service()
@@ -2259,6 +2836,19 @@ def test_validate_rejects_invalid_monitor_gain(monitor_gain_db):
     errors = svc.validate(payload)
 
     assert any("监听增益" in err for err in errors)
+
+
+def test_validate_accepts_new_monitor_gain_upper_bound_without_changing_default():
+    svc = _service()
+    payload = _config_payload(
+        1,
+        channels=[_channel_payload(0)],
+        selected_channels=[0],
+        monitor_gain_db=35.0,
+    )
+
+    assert not any("监听增益" in err for err in svc.validate(payload))
+    assert MONITOR_GAIN_DEFAULT_DB == pytest.approx(0.0)
 
 
 def test_validate_rejects_invalid_loudness_unit():
@@ -2860,6 +3450,8 @@ def test_validate_ignores_disabled_invalid_limit_values():
             "record_duration": 5.0,
             "analysis_duration": 3.0,
             "scan_triggers_test": False,
+            "fault_types": [],
+            "input_hardware_device_id": 1,
             "selected_channels": [0],
             "channels": [channel],
         }
@@ -2945,6 +3537,7 @@ def test_validate_factory_runtime_allows_exact_fit_analysis_window_boundary():
             "record_duration": 0.3,
             "analysis_duration": 0.1,
             "analysis_window_offset_ms": 200,
+            "input_hardware_device_id": 1,
         }
     )
 
@@ -2960,8 +3553,10 @@ def test_validate_allows_unbound_plc_id_and_existing_row_only():
             "config_name": "Cfg1",
             "record_duration": 5.0,
             "analysis_duration": 3.0,
-            "analysis_window_offset_ms": 0,
-            "scan_triggers_test": False,
+                "analysis_window_offset_ms": 0,
+                "scan_triggers_test": False,
+                "fault_types": [],
+                "input_hardware_device_id": 1,
             "plc_id": None,
             "selected_channels": [],
             "channels": [],
@@ -2972,8 +3567,10 @@ def test_validate_allows_unbound_plc_id_and_existing_row_only():
             "config_name": "Cfg1",
             "record_duration": 5.0,
             "analysis_duration": 3.0,
-            "analysis_window_offset_ms": 0,
-            "scan_triggers_test": False,
+                "analysis_window_offset_ms": 0,
+                "scan_triggers_test": False,
+                "fault_types": [],
+                "input_hardware_device_id": 1,
             "plc_id": plc.id,
             "selected_channels": [],
             "channels": [],
@@ -2984,8 +3581,10 @@ def test_validate_allows_unbound_plc_id_and_existing_row_only():
             "config_name": "Cfg1",
             "record_duration": 5.0,
             "analysis_duration": 3.0,
-            "analysis_window_offset_ms": 0,
-            "scan_triggers_test": False,
+                "analysis_window_offset_ms": 0,
+                "scan_triggers_test": False,
+                "fault_types": [],
+                "input_hardware_device_id": 1,
             "plc_id": plc.id + 999,
             "selected_channels": [],
             "channels": [],

@@ -20,7 +20,6 @@ from PyQt6.QtWidgets import (
 
 from app.service.result_dashboard_layout import (
     ALLOWED_CHANNELS_BY_PANEL_FAMILY,
-    CHANNEL_NONE,
     CHANNEL_PRIMARY_ACOUSTIC,
     CHANNEL_SELECTED_1,
     CHANNEL_SELECTED_2,
@@ -32,15 +31,12 @@ from app.service.result_dashboard_layout import (
     MIN_ROWS,
     PANEL_FAMILIES,
     PANEL_FAMILY_ACOUSTIC,
-    PANEL_FAMILY_SUMMARY,
     PANEL_FAMILY_VIBRATION,
-    PANEL_RESULT_SUMMARY,
     PANEL_TITLES,
     normalize_result_dashboard_layout_for_display,
 )
 
 _CHANNEL_LABELS = {
-    CHANNEL_NONE: "无",
     CHANNEL_PRIMARY_ACOUSTIC: "主声学通道",
     CHANNEL_SELECTED_1: "通道1",
     CHANNEL_SELECTED_2: "通道2",
@@ -48,7 +44,6 @@ _CHANNEL_LABELS = {
 }
 
 _DEFAULT_CHANNEL_BY_FAMILY = {
-    PANEL_FAMILY_SUMMARY: CHANNEL_NONE,
     PANEL_FAMILY_ACOUSTIC: CHANNEL_PRIMARY_ACOUSTIC,
     PANEL_FAMILY_VIBRATION: CHANNEL_VIBRATION,
 }
@@ -231,7 +226,7 @@ class ResultDashboardLayoutEditor(QWidget):
         self._layout = normalize_result_dashboard_layout_for_display(raw_layout)
         self._selected_grid_cell = (0, 0)
         panel_ids = [panel["id"] for panel in self._layout["panels"]]
-        self._selected_panel_id = "summary" if "summary" in panel_ids else panel_ids[0]
+        self._selected_panel_id = panel_ids[0] if panel_ids else None
         self._refresh_controls()
 
     def layout_data(self) -> dict:
@@ -245,10 +240,6 @@ class ResultDashboardLayoutEditor(QWidget):
         channel: str | None = None,
     ) -> str | None:
         if panel_type not in PANEL_TITLES:
-            return None
-        if panel_type == PANEL_RESULT_SUMMARY and any(
-            panel["type"] == PANEL_RESULT_SUMMARY for panel in self._layout["panels"]
-        ):
             return None
 
         explicit_target = row is not None or column is not None
@@ -289,12 +280,14 @@ class ResultDashboardLayoutEditor(QWidget):
 
     def remove_panel(self, panel_id: str) -> bool:
         panel = self._find_panel(panel_id)
-        if panel is None or panel["type"] == PANEL_RESULT_SUMMARY:
+        if panel is None:
             return False
         self._layout["panels"] = [
             existing for existing in self._layout["panels"] if existing["id"] != panel_id
         ]
-        self._selected_panel_id = self._layout["panels"][0]["id"]
+        self._selected_panel_id = (
+            self._layout["panels"][0]["id"] if self._layout["panels"] else None
+        )
         self._refresh_controls()
         return True
 
@@ -526,9 +519,7 @@ class ResultDashboardLayoutEditor(QWidget):
     def _refresh_property_controls(self) -> None:
         panel = self._find_panel(self._selected_panel_id)
         has_panel = panel is not None
-        self.remove_panel_button.setEnabled(
-            has_panel and panel["type"] != PANEL_RESULT_SUMMARY
-        )
+        self.remove_panel_button.setEnabled(has_panel)
         self.channel_combo.setEnabled(has_panel)
         self.row_span_spin.setEnabled(has_panel)
         self.column_span_spin.setEnabled(has_panel)
@@ -596,10 +587,7 @@ class ResultDashboardLayoutEditor(QWidget):
         return None
 
     def _unique_panel_id(self, panel_type: str) -> str:
-        if panel_type == PANEL_RESULT_SUMMARY:
-            base = "summary"
-        else:
-            base = panel_type
+        base = panel_type
         used = {panel["id"] for panel in self._layout["panels"]}
         if base not in used:
             return base
@@ -611,16 +599,13 @@ class ResultDashboardLayoutEditor(QWidget):
     def _first_empty_cell(self) -> tuple[int, int] | None:
         for row in range(self._layout["rows"]):
             for column in range(self._layout["columns"]):
-                panel = {
-                    "id": "__candidate__",
-                    "type": PANEL_RESULT_SUMMARY,
-                    "row": row,
-                    "column": column,
-                    "row_span": 1,
-                    "column_span": 1,
-                    "channel": CHANNEL_NONE,
-                }
-                if self._can_place(panel):
+                if not any(
+                    panel["row"] <= row < panel["row"] + panel["row_span"]
+                    and panel["column"]
+                    <= column
+                    < panel["column"] + panel["column_span"]
+                    for panel in self._layout["panels"]
+                ):
                     return row, column
         return None
 
@@ -651,8 +636,6 @@ class ResultDashboardLayoutEditor(QWidget):
 
     @staticmethod
     def _channels_for_family(family: str) -> list[str]:
-        if family == PANEL_FAMILY_SUMMARY:
-            return [CHANNEL_NONE]
         if family == PANEL_FAMILY_ACOUSTIC:
             return [CHANNEL_PRIMARY_ACOUSTIC, CHANNEL_SELECTED_1, CHANNEL_SELECTED_2]
         if family == PANEL_FAMILY_VIBRATION:
